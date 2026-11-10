@@ -96,6 +96,18 @@ sessions, which keep their legacy behavior. It requires a provider with
 and fork dialog preselect it when nothing else is chosen (a same-provider fork
 still starts on its source's profile).
 
+Opting a provider into profiles without a default makes a selection mandatory, so
+clients that don't pick (older API clients, scheduled fresh sandboxes) are rejected
+until they do. Set a default to keep them working.
+
+### Opting out
+
+A provider that stops managing profiles keeps its sessions working: a saved profile
+is ignored, on the session and on its host, and the session launches as one without
+a profile. The saved reference is kept, so opting back in restores it for a session
+whose host is unchanged. A session that got a new host meanwhile has no profile on
+that host and then can't wake until it is detached from it.
+
 `SandboxProfileContext` is a frozen dataclass:
 
 | Field | Meaning |

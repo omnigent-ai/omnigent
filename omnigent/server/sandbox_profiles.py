@@ -273,10 +273,20 @@ class SandboxProfileCatalog:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     def get_session_snapshot(self, session_id: str) -> dict[str, Any] | None:
+        """The session's accepted profile, or ``None`` once its provider stops managing profiles.
+
+        Like :meth:`get_host_snapshot`, so a session saved under a provider that later
+        opts out keeps working as one without a profile. The saved labels are kept.
+        """
         try:
-            return self._store.get_session_snapshot(session_id)
+            snapshot = self._store.get_session_snapshot(session_id)
         except ValueError as exc:
             raise _invalid_reference(exc) from exc
+        if snapshot is None or snapshot["provider"] not in self.managed_providers(
+            snapshot["provider"]
+        ):
+            return None
+        return snapshot
 
     def admit_runner_connection(self, runner_id: str) -> bool:
         """Fence delegated reconnects against stale profiled-runner replacement."""

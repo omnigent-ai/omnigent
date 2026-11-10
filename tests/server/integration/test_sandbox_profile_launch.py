@@ -127,6 +127,71 @@ async def test_unprofiled_session_survives_provider_opt_in(env, controller, oper
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("operation", ["wake", "relaunch", "replace-missing"])
+async def test_profiled_session_survives_provider_opt_out(env, operation):
+    from omnigent.server.managed_hosts import ManagedSandboxDeployment
+
+    class OptedOutLauncher(_Launcher):
+        provider = env.provider
+
+    session_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
+    before = env.conversations.get_conversation(session_id)
+    assert env.recording.allocations == [_PROVIDER_CONFIG]
+
+    opted_in = env.app.state.sandbox_config
+    deployment = ManagedSandboxDeployment.single(
+        dataclasses.replace(
+            env.app.state.sandbox_config.default,
+            manages_profiles=False,
+            launcher_factory=lambda: OptedOutLauncher(env.recording, env.hosts, owner=_OWNER),
+        )
+    )
+    env.app.state.sandbox_config = deployment
+    env.app.state.sandbox_profiles = SandboxProfileCatalog(
+        env.conversations, deployment, env.hosts
+    )
+    env.hosts.set_offline(before.host_id)
+    env.recording.gone = operation == "replace-missing"
+    if operation == "relaunch":
+        env.app.state.managed_launches.begin(session_id)
+        await _run_managed_launch(
+            session_id=session_id,
+            owner=_OWNER,
+            sandbox_config=deployment,
+            repos=(),
+            tracker=env.app.state.managed_launches,
+            conversation_store=env.conversations,
+            host_store=env.hosts,
+            host_registry=None,
+            tunnel_registry=None,
+            relaunch_host=env.hosts.get_host(before.host_id),
+            sandbox_profiles=env.catalog,
+        )
+    else:
+        await env.wake(session_id)
+    launch = env.app.state.managed_launches.get(session_id)
+    assert launch is None or launch.error is None
+    assert env.conversations.get_conversation(session_id).host_id == before.host_id
+    # Launches like a session without a profile; the saved reference is kept.
+    assert env.catalog.get_session_snapshot(session_id) is None
+    assert env.catalog._store.get_session_snapshot(session_id) is not None
+    assert env.recording.allocations == [_PROVIDER_CONFIG] + (
+        [] if operation == "wake" else [None]
+    )
+    if operation != "relaunch":
+        assert env.recording.resumes == [("profile-sandbox-1", None)]
+
+    # Opting back in restores the saved profile: the host keeps its id across replacement.
+    env.app.state.sandbox_config = opted_in
+    env.app.state.sandbox_profiles = SandboxProfileCatalog(env.conversations, opted_in, env.hosts)
+    env.recording.gone = False
+    await env.wake(session_id)
+    launch = env.app.state.managed_launches.get(session_id)
+    assert launch is None or launch.error is None
+    assert env.catalog.get_session_snapshot(session_id) is not None
+    assert env.recording.resumes[-1][1] == _PROVIDER_CONFIG
+
+
 def _with_default_profile(env: _Env, profile_id: str) -> None:
     from omnigent.server.managed_hosts import ManagedSandboxDeployment
 
