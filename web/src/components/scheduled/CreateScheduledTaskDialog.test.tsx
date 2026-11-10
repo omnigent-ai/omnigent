@@ -4497,6 +4497,40 @@ describe("automation harness settings", () => {
   });
 
   it.each([
+    ["ask-for-approval", "an older server", "Default", PREDATES_CODEX_REVIEWER_MODES, null],
+    ["approve-for-me", "an older server", "Default", PREDATES_CODEX_REVIEWER_MODES, null],
+    ["approve-for-me", "a current server", "Approve for me", serverInfo(true), "approve-for-me"],
+  ])(
+    "on edit, a saved Codex %s mode on %s shows %s",
+    async (mode, _server, shown, info, expected) => {
+      const agent = mockHarness("codex-native");
+      render(
+        <CapabilitiesProvider info={info}>
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: agent.id,
+              permissionMode: mode,
+              hostId: "host_1",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent(shown);
+      fireEvent.change(screen.getByLabelText("Instructions"), {
+        target: { value: "Review again" },
+      });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+        prompt: "Review again",
+        permissionMode: expected,
+      });
+    },
+  );
+
+  it.each([
     [false, null],
     [true, "skip"],
   ])(
@@ -5306,6 +5340,27 @@ describe("creating an automation from a session", () => {
         labels: { "omnigent.claude_native.permission_mode": mode },
       };
       renderFromSession({ info });
+
+      expect((await submit()).permissionMode === mode).toBe(kept);
+    },
+  );
+
+  it.each<[string, Partial<ServerInfo>, boolean]>([
+    // Servers that don't advertise the Codex reviewer modes reject them.
+    ["ask-for-approval", {}, false],
+    ["approve-for-me", {}, false],
+    ["ask-for-approval", { scheduled_task_codex_reviewer_modes: true }, true],
+  ])(
+    "starts from the Codex session's %s mode only if automations accept it (%o)",
+    async (mode, info, kept) => {
+      vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
+        data: [...AGENTS, testAgent("ag_codex", "codex-native-ui", { harness: "codex-native" })],
+      } as ReturnType<typeof agentsHook.useAvailableAgents>);
+      sourceSnapshot.current = {
+        id: "conv_src",
+        labels: { "omnigent.codex_native.approval_mode": mode },
+      };
+      renderFromSession({ source: { ...SOURCE, agentId: "ag_codex" }, info });
 
       expect((await submit()).permissionMode === mode).toBe(kept);
     },
