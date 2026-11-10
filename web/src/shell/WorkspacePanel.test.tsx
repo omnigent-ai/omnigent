@@ -2100,19 +2100,45 @@ describe("WorkspacePanel panel picker", () => {
     expect(openTerminalTab).toHaveBeenCalledWith("terminal:zsh");
   });
 
-  it("selects browser and side-chat tabs", () => {
-    writeSessionWorkspaceState("conv_ws", {
-      openBrowsers: ["browser-one"],
-      openSideChats: ["pending:one"],
-    });
-    const { onRightRailTabChange } = renderWorkspace({ showBrowserTab: true });
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Browser 1" }));
-    expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Side chat 1" }));
-    expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
-  });
+  it.each([false, true])(
+    "selects browser and side-chat tabs after approval (dirty preview=%s)",
+    (dirty) => {
+      writeSessionWorkspaceState("conv_ws", {
+        openBrowsers: ["browser-one"],
+        openSideChats: ["pending:one"],
+      });
+      let allowLeaving = () => {};
+      const { onRightRailTabChange } = renderWorkspace({
+        showBrowserTab: true,
+        fileTreeSplitEnabled: dirty,
+        treePreviewPath: dirty ? "src/a.md" : null,
+        fileGuard: dirty
+          ? (_path, _options, commit) => {
+              allowLeaving = commit;
+            }
+          : undefined,
+      });
+      const beforeBrowser = readSessionWorkspaceState("conv_ws");
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+      fireEvent.click(screen.getByRole("menuitem", { name: "Browser 1" }));
+      if (dirty) {
+        expect(readSessionWorkspaceState("conv_ws")).toEqual(beforeBrowser);
+        expect(onRightRailTabChange).not.toHaveBeenCalledWith("browser");
+        act(() => allowLeaving());
+      }
+      expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
+      expect(readSessionWorkspaceState("conv_ws").selectedBrowserId).toBe("browser-one");
+      const beforeSideChat = readSessionWorkspaceState("conv_ws");
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+      fireEvent.click(screen.getByRole("menuitem", { name: "Side chat 1" }));
+      if (dirty) {
+        expect(readSessionWorkspaceState("conv_ws")).toEqual(beforeSideChat);
+        expect(onRightRailTabChange).not.toHaveBeenCalledWith("sidechat");
+        act(() => allowLeaving());
+      }
+      expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
+    },
+  );
 });
 
 it("keeps a contained workspace inline on narrow viewports and scopes its file browser", () => {
@@ -2308,23 +2334,35 @@ describe("WorkspacePanel desktop menu commands", () => {
     expect(onHide).not.toHaveBeenCalled();
   });
 
-  it("opens New Browser Tab over an open file only once its viewer allows it", () => {
-    const allowLeaving: (() => void)[] = [];
-    const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
-      allowLeaving.push(commit);
-    });
-    const { onRightRailTabChange } = renderWorkspace({
-      showBrowserTab: true,
-      openFiles: ["src/a.ts"],
-      selectedFilePath: "src/a.ts",
-      fileGuard,
-    });
-    sendCommand({ command: "new-browser-tab", browserViewId: null });
-    expect(fileGuard).toHaveBeenCalledWith(null, undefined, expect.any(Function));
-    expect(onRightRailTabChange).not.toHaveBeenCalledWith("browser");
-    act(() => allowLeaving[0]!());
-    expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
-  });
+  it.each([false, true])(
+    "opens New Browser Tab only after approval (tree preview=%s)",
+    (preview) => {
+      const allowLeaving: (() => void)[] = [];
+      const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
+        allowLeaving.push(commit);
+      });
+      const { onRightRailTabChange } = renderWorkspace({
+        showBrowserTab: true,
+        openFiles: preview ? [] : ["src/a.ts"],
+        selectedFilePath: preview ? null : "src/a.ts",
+        fileTreeSplitEnabled: preview,
+        treePreviewPath: preview ? "src/a.ts" : null,
+        fileGuard,
+      });
+      for (let attempt = 0; attempt < 3; attempt++) {
+        sendCommand({ command: "new-browser-tab", browserViewId: null });
+        expect(readSessionWorkspaceState("conv_ws").openBrowsers ?? []).toEqual([]);
+        expect(readSessionWorkspaceState("conv_ws").selectedBrowserId ?? null).toBeNull();
+        expect(onRightRailTabChange).not.toHaveBeenCalledWith("browser");
+      }
+      expect(fileGuard).toHaveBeenCalledWith(null, undefined, expect.any(Function));
+      act(() => allowLeaving[2]!());
+      expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
+      const saved = readSessionWorkspaceState("conv_ws");
+      expect(saved.openBrowsers).toHaveLength(1);
+      expect(saved.selectedBrowserId).toBe(saved.openBrowsers![0]);
+    },
+  );
 
   it("does not close a page that a stale shell selection leaves unselected", () => {
     // Unpinned, Changes is an open page tab that Close could remove.
@@ -2633,27 +2671,33 @@ describe("WorkspacePanel desktop menu commands", () => {
     expect(onReveal).toHaveBeenCalledTimes(2);
   });
 
-  it("steps from a file with unsaved edits to another tab only once its viewer allows it", () => {
-    const allow: (() => void)[] = [];
-    const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
-      allow.push(commit);
-    });
-    const { openTerminalTab, onReveal } = renderWorkspace({
-      openFiles: ["src/a.ts"],
-      selectedFilePath: "src/a.ts",
-      openTerminals: ["terminal:zsh"],
-      fileGuard,
-    });
-    // Keep editing: the file stays on screen.
-    sendCommand({ command: "next-tab", browserViewId: null });
-    expect(fileGuard).toHaveBeenCalledWith(null, undefined, expect.any(Function));
-    expect(openTerminalTab).not.toHaveBeenCalled();
-    expect(onReveal).not.toHaveBeenCalled();
+  it.each([false, true])(
+    "steps away from unsaved edits only after approval (tree preview=%s)",
+    (preview) => {
+      writePinnedWorkspaceTabs(["files"]);
+      const allow: (() => void)[] = [];
+      const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
+        allow.push(commit);
+      });
+      const { openTerminalTab, onReveal } = renderWorkspace({
+        openFiles: preview ? [] : ["src/a.ts"],
+        selectedFilePath: preview ? null : "src/a.ts",
+        fileTreeSplitEnabled: preview,
+        treePreviewPath: preview ? "src/a.ts" : null,
+        openTerminals: ["terminal:zsh"],
+        fileGuard,
+      });
+      // Keep editing: the file stays on screen.
+      sendCommand({ command: "next-tab", browserViewId: null });
+      expect(fileGuard).toHaveBeenCalledWith(null, undefined, expect.any(Function));
+      expect(openTerminalTab).not.toHaveBeenCalled();
+      expect(onReveal).not.toHaveBeenCalled();
 
-    act(() => allow[0]!());
-    expect(openTerminalTab).toHaveBeenCalledWith("terminal:zsh");
-    expect(onReveal).toHaveBeenCalledTimes(1);
-  });
+      act(() => allow[0]!());
+      expect(openTerminalTab).toHaveBeenCalledWith("terminal:zsh");
+      expect(onReveal).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("shows a reopened browser tab when a later reopen fails", async () => {
     writeSessionWorkspaceState("conv_two", {
@@ -2880,90 +2924,101 @@ describe("WorkspacePanel desktop menu commands", () => {
     await waitFor(() => expect(browserOpenOrNavigate).toHaveBeenCalledTimes(1));
   });
 
-  describe("Reopen Closed Tab with an open file's edits", () => {
-    function guardedFile() {
-      const allow: (() => void)[] = [];
-      const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
-        allow.push(commit);
-      });
-      return { allow, fileGuard };
-    }
-    const reopen = () => sendCommand({ command: "reopen-closed-tab", browserViewId: null });
-
-    it("keeps a closed file in the history while the open file's edits are kept", () => {
-      const { allow, fileGuard } = guardedFile();
-      const { openFileViewer } = renderWorkspace({
-        conversationId: "conv_keep_file",
-        openFiles: ["src/a.ts", "src/b.ts"],
-        selectedFilePath: "src/b.ts",
-        fileGuard,
-      });
-      fireEvent.click(screen.getByRole("button", { name: "Close a.ts" }));
-
-      reopen();
-      expect(fileGuard).toHaveBeenLastCalledWith("src/a.ts", undefined, expect.any(Function));
-      expect(openFileViewer).not.toHaveBeenCalled();
-      // Keep editing never commits, so the next Reopen Closed Tab asks about a.ts again.
-      reopen();
-      expect(fileGuard).toHaveBeenCalledTimes(2);
-      act(() => allow[1]!());
-      expect(openFileViewer).toHaveBeenCalledExactlyOnceWith("src/a.ts");
-    });
-
-    it.each([
-      ["a blank tab", { exists: false }],
-      ["its last page", { exists: true, url: "https://example.com/" }],
-    ] as const)(
-      "shows a reopened browser tab, %s, only once the open file allows it",
-      async (_name, page) => {
-        writeSessionWorkspaceState("conv_keep_browser", {
-          openBrowsers: ["browser-1"],
-          selectedBrowserId: "browser-1",
+  describe.each([false, true])(
+    "Reopen Closed Tab with unsaved edits (tree preview=%s)",
+    (preview) => {
+      function guardedFile() {
+        const allow: (() => void)[] = [];
+        const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
+          allow.push(commit);
         });
-        browserHasView.mockResolvedValue(page);
+        return { allow, fileGuard };
+      }
+      const reopen = () => sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+
+      it("keeps a closed file in the history while the open file's edits are kept", () => {
         const { allow, fileGuard } = guardedFile();
-        const { onRightRailTabChange, rerender } = renderWorkspace({
-          conversationId: "conv_keep_browser",
-          showBrowserTab: true,
-          rightRailTab: "browser",
+        const { openFileViewer } = renderWorkspace({
+          conversationId: "conv_keep_file",
+          openFiles: ["src/a.ts", "src/b.ts"],
+          selectedFilePath: preview ? null : "src/b.ts",
+          fileTreeSplitEnabled: preview,
+          treePreviewPath: preview ? "src/b.ts" : null,
           fileGuard,
         });
-        const tabName = page.exists ? "example.com" : "Browser 1";
-        await screen.findByRole("tab", { name: tabName });
-        fireEvent.click(screen.getByRole("button", { name: `Close ${tabName}` }));
-        await waitFor(() =>
-          expect(screen.queryByRole("tab", { name: tabName })).not.toBeInTheDocument(),
-        );
-        // A file with unsaved edits is on screen now.
-        rerender({
-          conversationId: "conv_keep_browser",
-          showBrowserTab: true,
-          rightRailTab: "browser",
-          openFiles: ["src/a.ts"],
-          selectedFilePath: "src/a.ts",
-          fileGuard,
-        });
-        onRightRailTabChange.mockClear();
+        fireEvent.click(screen.getByRole("button", { name: "Close a.ts" }));
 
         reopen();
-        expect(fileGuard).toHaveBeenCalledTimes(1);
-        // Keep editing: nothing reopens, and the next Reopen Closed Tab asks again.
+        expect(fileGuard).toHaveBeenLastCalledWith(
+          preview ? null : "src/a.ts",
+          undefined,
+          expect.any(Function),
+        );
+        expect(openFileViewer).not.toHaveBeenCalled();
+        // Keep editing never commits, so the next Reopen Closed Tab asks about a.ts again.
         reopen();
         expect(fileGuard).toHaveBeenCalledTimes(2);
-        expect(browserOpenOrNavigate).not.toHaveBeenCalled();
-        expect(onRightRailTabChange).not.toHaveBeenCalledWith("browser");
-
         act(() => allow[1]!());
-        if (page.exists) {
-          // The page reopens once, then the rail asks again before leaving the file.
-          await waitFor(() => expect(fileGuard).toHaveBeenCalledTimes(3));
-          expect(browserOpenOrNavigate).toHaveBeenCalledTimes(1);
-          act(() => allow[2]!());
-        }
-        expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
-      },
-    );
-  });
+        expect(openFileViewer).toHaveBeenCalledExactlyOnceWith("src/a.ts");
+      });
+
+      it.each([
+        ["a blank tab", { exists: false }],
+        ["its last page", { exists: true, url: "https://example.com/" }],
+      ] as const)(
+        "shows a reopened browser tab, %s, only once the open file allows it",
+        async (_name, page) => {
+          writeSessionWorkspaceState("conv_keep_browser", {
+            openBrowsers: ["browser-1"],
+            selectedBrowserId: "browser-1",
+          });
+          browserHasView.mockResolvedValue(page);
+          const { allow, fileGuard } = guardedFile();
+          const { onRightRailTabChange, rerender } = renderWorkspace({
+            conversationId: "conv_keep_browser",
+            showBrowserTab: true,
+            rightRailTab: "browser",
+            fileGuard,
+          });
+          const tabName = page.exists ? "example.com" : "Browser 1";
+          await screen.findByRole("tab", { name: tabName });
+          fireEvent.click(screen.getByRole("button", { name: `Close ${tabName}` }));
+          await waitFor(() =>
+            expect(screen.queryByRole("tab", { name: tabName })).not.toBeInTheDocument(),
+          );
+          // A file with unsaved edits is on screen now.
+          rerender({
+            conversationId: "conv_keep_browser",
+            showBrowserTab: true,
+            rightRailTab: preview ? "files" : "browser",
+            openFiles: ["src/a.ts"],
+            selectedFilePath: preview ? null : "src/a.ts",
+            fileTreeSplitEnabled: preview,
+            treePreviewPath: preview ? "src/a.ts" : null,
+            fileGuard,
+          });
+          onRightRailTabChange.mockClear();
+
+          reopen();
+          expect(fileGuard).toHaveBeenCalledTimes(1);
+          // Keep editing: nothing reopens, and the next Reopen Closed Tab asks again.
+          reopen();
+          expect(fileGuard).toHaveBeenCalledTimes(2);
+          expect(browserOpenOrNavigate).not.toHaveBeenCalled();
+          expect(onRightRailTabChange).not.toHaveBeenCalledWith("browser");
+
+          act(() => allow[1]!());
+          if (page.exists) {
+            // The page reopens once, then the rail asks again before leaving the file.
+            await waitFor(() => expect(fileGuard).toHaveBeenCalledTimes(3));
+            expect(browserOpenOrNavigate).toHaveBeenCalledTimes(1);
+            act(() => allow[2]!());
+          }
+          expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
+        },
+      );
+    },
+  );
 
   it("records a browser tab closed twice while its close is pending only once", async () => {
     writeSessionWorkspaceState("conv_twice", {

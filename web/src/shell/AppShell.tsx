@@ -1098,6 +1098,8 @@ function AppShellImpl() {
   // of truth shared by the tab-fallback effect below, the rail's mount
   // gate, and the header's collapse toggle, so they can never disagree.
   const fileTreeSplitEnabled = isFeatureEnabled(serverInfo, "workspace_file_tree_split_ui");
+  const treePreviewSelected =
+    fileTreeSplitEnabled && treePreviewPath !== null && selectedFilePath === null;
   const railTabsAvailable = useMemo(
     () =>
       ({
@@ -1617,21 +1619,11 @@ function AppShellImpl() {
   const contentSearchFileRef = useRef<string | null>(null);
   const openFileViewer = useCallback(
     (path: string, options?: OpenFileOptions) =>
-      guardFileNavigation(
-        fileTreeSplitEnabled && treePreviewPath !== null && selectedFilePath === null ? null : path,
-        options,
-        () => {
-          contentSearchFileRef.current = null;
-          commitFileNavigation(path, options);
-        },
-      ),
-    [
-      guardFileNavigation,
-      commitFileNavigation,
-      selectedFilePath,
-      fileTreeSplitEnabled,
-      treePreviewPath,
-    ],
+      guardFileNavigation(treePreviewSelected ? null : path, options, () => {
+        contentSearchFileRef.current = null;
+        commitFileNavigation(path, options);
+      }),
+    [guardFileNavigation, commitFileNavigation, treePreviewSelected],
   );
   const openFileInTree = useCallback(
     (path: string) =>
@@ -2044,7 +2036,7 @@ function AppShellImpl() {
     (next: RightRailTab | null) => {
       const select = () => {
         selectRightRailTab(next);
-        if (selectedFilePath !== null || (fileTreeSplitEnabled && treePreviewPath !== null)) {
+        if (selectedFilePath !== null || (treePreviewSelected && next !== "files")) {
           setSelectedFilePath(null);
           setFileViewerCommentsOpen(false);
           clearFileViewerUrl();
@@ -2055,12 +2047,7 @@ function AppShellImpl() {
           setSelectedTerminalKey(null);
         }
       };
-      if (
-        fileTreeSplitEnabled &&
-        treePreviewPath !== null &&
-        selectedFilePath === null &&
-        next !== "files"
-      ) {
+      if (treePreviewSelected && next !== "files") {
         guardFileNavigation(null, undefined, select);
       } else select();
     },
@@ -2069,36 +2056,30 @@ function AppShellImpl() {
       selectedTerminalKey,
       clearFileViewerUrl,
       selectRightRailTab,
-      fileTreeSplitEnabled,
-      treePreviewPath,
+      treePreviewSelected,
       guardFileNavigation,
     ],
   );
   const closeWorkspacePanel = useCallback(
     (tab: DefaultWorkspaceTab) => {
-      const close = () => {
-        const remaining = openPanels.filter((panel) => panel !== tab);
-        setOpenPanels(remaining);
-        if (rightRailTab === tab) {
-          setRightRailTab(
-            remaining.filter((panel) => railTabsAvailable[panel]).at(-1) ?? fallbackWorkspaceTab,
-          );
-          if (fileTreeSplitEnabled && treePreviewPath !== null && selectedFilePath === null) {
-            setFileViewerCommentsOpen(false);
-            clearFileViewerUrl();
-          }
+      const remaining = openPanels.filter((panel) => panel !== tab);
+      setOpenPanels(remaining);
+      if (rightRailTab === tab) {
+        setRightRailTab(
+          remaining.filter((panel) => railTabsAvailable[panel]).at(-1) ?? fallbackWorkspaceTab,
+        );
+        if (treePreviewSelected) {
+          setFileViewerCommentsOpen(false);
+          clearFileViewerUrl();
         }
-      };
-      close();
+      }
     },
     [
       openPanels,
       rightRailTab,
       fallbackWorkspaceTab,
       railTabsAvailable,
-      fileTreeSplitEnabled,
-      treePreviewPath,
-      selectedFilePath,
+      treePreviewSelected,
       clearFileViewerUrl,
     ],
   );
@@ -2239,7 +2220,7 @@ function AppShellImpl() {
         setRightPanelOpenAnimated(true);
         if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
       };
-      if (fileTreeSplitEnabled && treePreviewPath !== null && selectedFilePath === null) {
+      if (treePreviewSelected) {
         guardFileNavigation(null, undefined, select);
       } else select();
     },
@@ -2247,9 +2228,7 @@ function AppShellImpl() {
       clearFileViewerUrl,
       conversationId,
       setRightPanelOpenAnimated,
-      fileTreeSplitEnabled,
-      treePreviewPath,
-      selectedFilePath,
+      treePreviewSelected,
       guardFileNavigation,
     ],
   );

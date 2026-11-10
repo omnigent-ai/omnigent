@@ -109,6 +109,11 @@ import {
 } from "./workspacePanelTabs";
 import { Button } from "../components/ui/button";
 
+const FILE_TREE_DEFAULT_WIDTH = 260;
+const FILE_TREE_MIN_WIDTH = 200;
+const FILE_PREVIEW_MIN_WIDTH = 320;
+const FILE_TREE_HANDLE_WIDTH = 4;
+
 const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
 );
@@ -720,7 +725,7 @@ interface WorkspacePanelProps {
   fileTreeSplitEnabled?: boolean;
   treePreviewPath?: string | null;
   openFileInTree?: (path: string) => void;
-  onCloseTreePreview?: () => void;
+  onCloseTreePreview: () => void;
   /** Whether the Pull Requests tab is available (same on-disk-workspace gate as Files). */
   showGithubTab: boolean;
   /** Whether Browser soft tabs are available — hidden without a browser bridge. */
@@ -1004,6 +1009,27 @@ function WorkspacePanelImpl({
     selectedFilePath === null &&
     selectedTerminalKey === null;
   const guardFileNavigation = useContext(FileViewerContext)?.guardFileNavigation;
+  const treePreviewSelected =
+    fileTreeSplitEnabled && treePreviewPath !== null && selectedFilePath === null;
+  // Confirm before a tab operation mutates state; async reopens use the latest viewer.
+  const leaveFileRef = useRef<(path: string | null, commit: () => void) => void>((_path, commit) =>
+    commit(),
+  );
+  leaveFileRef.current = (path, commit) => {
+    if ((selectedFilePath !== null || treePreviewSelected) && guardFileNavigation) {
+      guardFileNavigation(treePreviewSelected ? null : path, undefined, commit);
+    } else {
+      commit();
+    }
+  };
+  const selectBrowserTab = (tabId: string) => {
+    const select = () => {
+      browsers.select(tabId);
+      onRightRailTabChange("browser");
+    };
+    if (treePreviewSelected) leaveFileRef.current(null, select);
+    else select();
+  };
   // The browser page that took keyboard focus from this page, if any. Clicking into
   // a page leaves this page's focus where it was, so only the shell can tell.
   // `pending` is the shell's answer while it's still on its way.
@@ -1089,12 +1115,7 @@ function WorkspacePanelImpl({
       onRightRailTabChange("browser");
       onReveal?.();
     };
-    // A new browser tab replaces the file on screen, so its viewer confirms unsaved edits first.
-    if (selectedFilePath !== null && guardFileNavigation) {
-      guardFileNavigation(null, undefined, openBrowser);
-    } else {
-      openBrowser();
-    }
+    leaveFileRef.current(null, openBrowser);
   };
   useDesktopCommand(
     "new-browser-tab",
@@ -1103,6 +1124,14 @@ function WorkspacePanelImpl({
 
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
   const sideChats = useSideChats(conversationId);
+  const selectSideChatTab = (childId: string) => {
+    const select = () => {
+      sideChats.select(childId);
+      onRightRailTabChange("sidechat");
+    };
+    if (treePreviewSelected) leaveFileRef.current(null, select);
+    else select();
+  };
   // Open tabs stay reachable even where this viewer can't start a side chat.
   const hasSideChatTabs = sideChats.tabs.length > 0;
   useEffect(() => {
@@ -1393,15 +1422,8 @@ function WorkspacePanelImpl({
       rememberClosedTab(conversationId, { kind: "panel", tab });
       onClosePanel(tab);
     };
-    if (
-      tab === "files" &&
-      rightRailTab === "files" &&
-      fileTreeSplitEnabled &&
-      treePreviewPath !== null &&
-      selectedFilePath === null &&
-      guardFileNavigation
-    ) {
-      guardFileNavigation(null, undefined, close);
+    if (tab === "files" && rightRailTab === "files" && treePreviewSelected) {
+      leaveFileRef.current(null, close);
     } else close();
   };
   // Resolve shell tab keys to display labels. The terminals list is already
@@ -1549,20 +1571,14 @@ function WorkspacePanelImpl({
       key: `browser:${tabId}`,
       label: browsers.labelFor(tabId, index),
       active: browserSelected && browsers.selected === tabId,
-      select: () => {
-        browsers.select(tabId);
-        onRightRailTabChange("browser");
-      },
+      select: () => selectBrowserTab(tabId),
       disabled: false,
     })),
     ...sideChats.tabs.map((childId) => ({
       key: `sidechat:${childId}`,
       label: chatTabLabels[childId] ?? childId,
       active: sideChatSelected && sideChats.selected === childId,
-      select: () => {
-        sideChats.select(childId);
-        onRightRailTabChange("sidechat");
-      },
+      select: () => selectSideChatTab(childId),
       disabled: false,
     })),
   ];
@@ -1628,9 +1644,12 @@ function WorkspacePanelImpl({
     return () => observer.disconnect();
   }, [filesPanelMounted, fileTreeSplitEnabled, isMobile]);
   const treeColumn = useResizableColumn(
-    260,
-    200,
-    Math.max(200, Math.min(filesWidth / 2, filesWidth - 320 - 4)),
+    FILE_TREE_DEFAULT_WIDTH,
+    FILE_TREE_MIN_WIDTH,
+    Math.max(
+      FILE_TREE_MIN_WIDTH,
+      Math.min(filesWidth / 2, filesWidth - FILE_PREVIEW_MIN_WIDTH - FILE_TREE_HANDLE_WIDTH),
+    ),
     WORKSPACE_FILE_TREE_WIDTH_STORAGE_KEY,
   );
   const splitFiles =
@@ -1638,7 +1657,7 @@ function WorkspacePanelImpl({
     !isMobile &&
     !alwaysOpenFilesInTab &&
     rightRailTab === "files" &&
-    filesWidth >= 524;
+    filesWidth >= FILE_TREE_MIN_WIDTH + FILE_PREVIEW_MIN_WIDTH + FILE_TREE_HANDLE_WIDTH;
   // Desktop Close (⌘W / Ctrl+W) while the rail, or its embedded browser view,
   // has focus: close the tab on screen, or hide the rail on a fixed page.
   // Otherwise AppShell's handler leaves the session.
@@ -1705,18 +1724,6 @@ function WorkspacePanelImpl({
     else if (point.shown && browsers.tabs.includes(point.tabId)) returnPointRef.current = null;
   });
   // Desktop ⇧⌘[ / ⇧⌘] step through the tabs in strip order; ⇧⌘T reopens the last closed one.
-  // Leaves the file on screen, if any, once its viewer allows it (it confirms unsaved
-  // edits). A ref, so a reopen that finishes later asks about the file shown by then.
-  const leaveFileRef = useRef<(path: string | null, commit: () => void) => void>((_path, commit) =>
-    commit(),
-  );
-  leaveFileRef.current = (path, commit) => {
-    if (selectedFilePath !== null && guardFileNavigation) {
-      guardFileNavigation(path, undefined, commit);
-    } else {
-      commit();
-    }
-  };
   const showAdjacentTab = (step: -1 | 1) => {
     const options = panelOptions.filter((option) => !option.disabled);
     const index = options.findIndex((option) => option.active);
@@ -1727,8 +1734,13 @@ function WorkspacePanelImpl({
       target.select();
       onReveal?.();
     };
-    // Opening a file asks about the one on screen itself; any other tab replaces it here.
-    if (target.key.startsWith("file:")) show();
+    // These selections already confirm before changing the active tab.
+    if (
+      target.key.startsWith("file:") ||
+      (treePreviewSelected &&
+        ["browser:", "sidechat:"].some((prefix) => target.key.startsWith(prefix)))
+    )
+      show();
     else leaveFileRef.current(null, show);
   };
   // The session and what its rail shows, apart from the browser tab a reopen selects itself.
@@ -1736,6 +1748,7 @@ function WorkspacePanelImpl({
     conversationId,
     rightRailTab,
     selectedFilePath,
+    treePreviewPath,
     selectedTerminalKey,
     sideChats.selected,
   ].join("\n");
@@ -2009,10 +2022,7 @@ function WorkspacePanelImpl({
                             void closeBrowserTab(tabId);
                           }
                         }}
-                        onClick={() => {
-                          browsers.select(tabId);
-                          onRightRailTabChange("browser");
-                        }}
+                        onClick={() => selectBrowserTab(tabId)}
                       >
                         <GlobeIcon className="size-4 shrink-0" />
                         <span className="max-w-44 truncate">{browsers.labelFor(tabId, index)}</span>
@@ -2054,10 +2064,7 @@ function WorkspacePanelImpl({
                             closeSideChat(childId);
                           }
                         }}
-                        onClick={() => {
-                          sideChats.select(childId);
-                          onRightRailTabChange("sidechat");
-                        }}
+                        onClick={() => selectSideChatTab(childId)}
                       >
                         <TabIcon className="size-4 shrink-0" />
                         <span className="max-w-[16ch] truncate">{label}</span>
@@ -2221,7 +2228,8 @@ function WorkspacePanelImpl({
                   <div
                     {...treeColumn.handleProps}
                     aria-label="Resize file tree"
-                    className="absolute inset-y-0 right-0 w-1 cursor-col-resize hover:bg-primary/30 focus-visible:bg-primary/30 focus-visible:outline-none"
+                    className="absolute inset-y-0 right-0 cursor-col-resize hover:bg-primary/30 focus-visible:bg-primary/30 focus-visible:outline-none"
+                    style={{ width: FILE_TREE_HANDLE_WIDTH }}
                   />
                 )}
               </div>
@@ -2243,7 +2251,7 @@ function WorkspacePanelImpl({
                       mediaActive={open && splitFiles}
                       conversationId={conversationId}
                       path={treePreviewPath}
-                      onClose={onCloseTreePreview!}
+                      onClose={onCloseTreePreview}
                       onCloseTab={onCloseTreePreview}
                       onNavigateTo={openFileViewer}
                       permissionLevel={permissionLevel}

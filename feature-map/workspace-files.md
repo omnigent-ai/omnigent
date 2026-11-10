@@ -64,6 +64,9 @@ tree-file click opens a standalone tab.
 
 - The split belongs to Files. Changes, content-search results, chat file links,
   agent-opened files and URL file deep links still open standalone tabs.
+- Reloading with a file in the URL selects a standalone tab, even when it matches
+  the saved preview. Choose Files to return to that preview. The viewer's previous
+  and next file actions also open standalone tabs.
 - A standalone tab fills the panel. Choose Files to return to the tree and its
   last inline preview; opening a tab does not collapse the tree's folders.
 - The split requires roughly 524 pixels. A narrow panel or grid pane falls back

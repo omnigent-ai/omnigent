@@ -2,6 +2,7 @@ import {
   ArrowDownAZIcon,
   ArrowDownUpIcon,
   ArrowDownWideNarrowIcon,
+  CheckIcon,
   CopyIcon,
   EllipsisIcon,
   ExternalLinkIcon,
@@ -694,6 +695,7 @@ export function FilesPanel({
                       <DropdownMenuItem key={action.key} onSelect={action.onSelect}>
                         {action.icon}
                         {action.label}
+                        {action.active && <CheckIcon className="ml-auto size-4" />}
                       </DropdownMenuItem>
                     ))}
                   </DropdownMenuContent>

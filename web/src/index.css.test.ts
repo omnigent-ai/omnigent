@@ -670,6 +670,7 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
           openFiles: [],
           openFileViewer: () => {},
           onCloseFile: () => {},
+          onCloseTreePreview: () => {},
           onShowScopeView: () => {},
           onCommentsOpenChange: () => {},
           openTerminalTab: () => {},

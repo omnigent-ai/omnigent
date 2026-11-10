@@ -2740,68 +2740,71 @@ describe("file position navigation", () => {
     expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=1");
   });
 
-  it("confirms external navigation before applying it, and does not confirm twice", () => {
-    let guard: FileNavigationGuard | undefined;
-    const unregister = vi.fn();
-    const registerNavigationGuard = vi.fn((next: FileNavigationGuard) => {
-      guard = next;
-      return unregister;
-    });
-    function GuardedViewer({
-      mediaActive = true,
-      open = true,
-    }: {
-      mediaActive?: boolean;
-      open?: boolean;
-    }) {
-      const contextValue = useMemo(
-        () => ({
-          openFile: vi.fn(),
-          registerNavigationGuard,
-          openGithubTab: vi.fn(),
-          isChangedPath: () => false,
-          conversationId: "conv_1",
-          workspaceRoot: null,
-          workspaceHome: null,
-        }),
-        [],
-      );
-      return (
-        <FileViewerContext.Provider value={contextValue}>
-          {viewerTree({
-            open,
-            mediaActive,
-            path: "file1.md",
-            frameless: true,
-            keepNavigationGuard: true,
-          })}
-        </FileViewerContext.Provider>
-      );
-    }
-    const { rerender, unmount } = render(<GuardedViewer />);
-    const draft = screen.getByRole("textbox", { name: "Draft text" });
-    fireEvent.change(draft, { target: { value: "Unsaved draft" } });
-    // Opening the Files drawer hides the rail but must keep its dirty guard registered.
-    rerender(<GuardedViewer mediaActive={false} />);
-    expect(unregister).not.toHaveBeenCalled();
-    // A responsive fallback hides the editor without discarding its draft or guard.
-    rerender(<GuardedViewer open={false} mediaActive={false} />);
-    expect(draft).toHaveValue("Unsaved draft");
-    const navigate = vi.fn();
-    act(() => guard!("file2.md", { line: 12 }, navigate));
-    expect(navigate).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
-    expect(navigate).not.toHaveBeenCalled();
-    expect(draft).toHaveValue("Unsaved draft");
+  it.each([false, true])(
+    "confirms navigation once (keepNavigationGuard=%s)",
+    (keepNavigationGuard) => {
+      let guard: FileNavigationGuard | undefined;
+      const unregister = vi.fn();
+      const registerNavigationGuard = vi.fn((next: FileNavigationGuard) => {
+        guard = next;
+        return unregister;
+      });
+      function GuardedViewer({
+        mediaActive = true,
+        open = true,
+      }: {
+        mediaActive?: boolean;
+        open?: boolean;
+      }) {
+        const contextValue = useMemo(
+          () => ({
+            openFile: vi.fn(),
+            registerNavigationGuard,
+            openGithubTab: vi.fn(),
+            isChangedPath: () => false,
+            conversationId: "conv_1",
+            workspaceRoot: null,
+            workspaceHome: null,
+          }),
+          [],
+        );
+        return (
+          <FileViewerContext.Provider value={contextValue}>
+            {viewerTree({
+              open,
+              mediaActive,
+              path: "file1.md",
+              frameless: true,
+              keepNavigationGuard,
+            })}
+          </FileViewerContext.Provider>
+        );
+      }
+      const { rerender, unmount } = render(<GuardedViewer />);
+      const draft = screen.getByRole("textbox", { name: "Draft text" });
+      fireEvent.change(draft, { target: { value: "Unsaved draft" } });
+      // Opening the Files drawer hides the rail but must keep its dirty guard registered.
+      rerender(<GuardedViewer mediaActive={false} />);
+      expect(unregister).not.toHaveBeenCalled();
+      // A responsive fallback hides the editor without discarding its draft or guard.
+      if (keepNavigationGuard) rerender(<GuardedViewer open={false} mediaActive={false} />);
+      expect(draft).toHaveValue("Unsaved draft");
+      const navigate = vi.fn();
+      act(() => guard!("file2.md", { line: 12 }, navigate));
+      expect(navigate).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+      expect(navigate).not.toHaveBeenCalled();
+      expect(draft).toHaveValue("Unsaved draft");
 
-    // Viewer-owned navigation may already have a guard when it reaches AppShell.
-    act(() => guard!("file2.md", { line: 12 }, () => guard!("file2.md", { line: 12 }, navigate)));
-    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
-    expect(navigate).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText("Unsaved changes")).toBeNull();
-    unmount();
-    expect(unregister).toHaveBeenCalled();
-  });
+      // Viewer-owned navigation may already have a guard when it reaches AppShell.
+      act(() => guard!("file2.md", { line: 12 }, () => guard!("file2.md", { line: 12 }, navigate)));
+      fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+      expect(navigate).toHaveBeenCalledTimes(1);
+      expect(screen.queryByText("Unsaved changes")).toBeNull();
+      unmount();
+      expect(unregister).toHaveBeenCalled();
+    },
+  );
 
   it("asks before a closing tab or a session exit drops unsaved edits", () => {
     let guard: FileNavigationGuard | undefined;

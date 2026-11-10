@@ -6475,6 +6475,9 @@ describe("AppShell tree preview state", () => {
       treePreviewPath: "AGENTS.md",
       openFiles: [],
     });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Files" }));
+    expect(screen.getByTestId("url-params")).toHaveTextContent("file=AGENTS.md");
     fireEvent.click(screen.getByRole("button", { name: "file-viewer: close" }));
     expect(readSessionWorkspaceState("conv_tree").treePreviewPath).toBeNull();
     expect(screen.getByTestId("url-params")).not.toHaveTextContent("file=");
@@ -6496,19 +6499,30 @@ describe("AppShell tree preview state", () => {
     expect(readSessionWorkspaceState("conv_tree").treePreviewPath).toBe("README.md");
     fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
     expect(readSessionWorkspaceState("conv_tree").treePreviewPath).toBe("AGENTS.md");
+    const preview = screen.getByTestId("file-viewer-inline");
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }), { button: 0 });
+    expect(readSessionWorkspaceState("conv_tree").rightRailTab).toBe("files");
+    expect(screen.getByTestId("file-viewer-inline")).toBe(preview);
+    expect(screen.getByTestId("url-params")).toHaveTextContent("file=AGENTS.md");
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+    expect(readSessionWorkspaceState("conv_tree").rightRailTab).toBe("changes");
+    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
   });
 
-  it("keeps URL deep links as soft tabs while retaining the session's tree preview", () => {
-    writeSessionWorkspaceState("conv_tree", { treePreviewPath: "AGENTS.md" });
-    renderShell(
-      "/c/conv_tree?file=README.md",
-      serverInfo({ features: { workspace_file_tree_split_ui: true } }),
-    );
-    expect(readSessionWorkspaceState("conv_tree")).toMatchObject({
-      treePreviewPath: "AGENTS.md",
-      openFiles: ["README.md"],
-      selectedFilePath: "README.md",
-    });
-    expect(screen.getAllByTestId("file-viewer-inline")).toHaveLength(1);
-  });
+  it.each(["AGENTS.md", "README.md"])(
+    "keeps URL deep links as soft tabs with saved preview %s",
+    (treePreviewPath) => {
+      writeSessionWorkspaceState("conv_tree", { treePreviewPath, selectedFilePath: null });
+      renderShell(
+        "/c/conv_tree?file=README.md",
+        serverInfo({ features: { workspace_file_tree_split_ui: true } }),
+      );
+      expect(readSessionWorkspaceState("conv_tree")).toMatchObject({
+        treePreviewPath,
+        openFiles: ["README.md"],
+        selectedFilePath: "README.md",
+      });
+      expect(screen.getAllByTestId("file-viewer-inline")).toHaveLength(1);
+    },
+  );
 });
