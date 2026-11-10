@@ -736,7 +736,11 @@ export function NewProjectButton({
                     setWorkspace({ hostId: dialogHostId, path });
                   }
                 }}
-                description="Choose a default working directory for sessions in this project."
+                description={
+                  repositoryMode
+                    ? "Choose a parent folder for the new checkout."
+                    : "Choose a default working directory for sessions in this project."
+                }
               />
             </CollapsibleContent>
           </Collapsible>

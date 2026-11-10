@@ -2113,14 +2113,14 @@ export function AgentHarnessPicker({
   );
 }
 
-// Drafts survive navigation within this page load, with one slot per source.
-// Successful creation clears only its slot; a page refresh starts clean.
 interface RepositoryOverride {
   // Missing selections follow defaults; an empty array explicitly clears them.
   selections?: LastSandboxRepo[];
   pendingUrl: string;
 }
 
+// Drafts survive navigation within this page load, with one slot per source.
+// Successful creation clears only its slot; a page refresh starts clean.
 interface LandingDraft {
   mcpRegistryServices: string[];
   // `?project=` context the draft was composed under ("" = plain visit).
