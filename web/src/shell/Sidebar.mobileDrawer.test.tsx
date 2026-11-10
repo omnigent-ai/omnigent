@@ -420,6 +420,17 @@ describe("mobile sidebar drawer keyboard dismissal", () => {
     expect(composer).not.toHaveFocus();
   });
 
+  it("keeps the composer focused when the window narrows with the sidebar open", () => {
+    stubMobileLayout(false);
+    const { setOpen } = renderSidebar({ open: true });
+    const composer = focusComposer();
+
+    stubMobileLayout(true);
+    setOpen(true);
+
+    expect(composer).toHaveFocus();
+  });
+
   it("keeps the composer focused when the drawer opens on the desktop layout", () => {
     stubMobileLayout(false);
     const { setOpen } = renderSidebar({ open: false });

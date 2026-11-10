@@ -1066,9 +1066,13 @@ function SidebarImpl({
   // Opening the overlay drawer by swipe leaves the chat composer focused (a tap
   // on the header toggle moves focus itself), and on iOS its soft keyboard then
   // stays up over the drawer. Drop focus held outside the drawer so it goes down.
+  // Only on opening: narrowing the window with the sidebar open keeps focus.
   const overlayOpen = open && mobileLayout && !sideBySide && !inSettings;
+  const wasOpenRef = useRef(open);
   useLayoutEffect(() => {
-    if (!overlayOpen) return;
+    const opened = open && !wasOpenRef.current;
+    wasOpenRef.current = open;
+    if (!opened || !overlayOpen) return;
     const active = document.activeElement;
     if (
       active instanceof HTMLElement &&
@@ -1077,7 +1081,7 @@ function SidebarImpl({
     ) {
       active.blur();
     }
-  }, [overlayOpen]);
+  }, [open, overlayOpen]);
   // The iOS shell disables WebKit's focus reveal: while that padding shrinks the list,
   // center a focused row (an inline rename) when the keyboard opens and on later focus.
   // Centered rather than nearest so the floating Settings action can't cover it.
