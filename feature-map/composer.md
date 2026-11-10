@@ -250,6 +250,15 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   session. Up/Down at the text boundaries browse recalled messages; editing one
   returns to normal caret navigation. Whitespace and queued messages recalled
   for editing remain drafts.
+- `edit-sent-message`: Edit and resend (pencil) on your own sent message copies
+  its text and "@"-mentions into that pane's composer; attachments stay with the
+  original message, which the agent already has. The transcript is unchanged.
+  Sending is a new message, steered or queued like any mid-turn send, and Edit
+  never stops the agent. A non-empty draft asks "Replace your draft?" first.
+  Side chats, grid session panes, and writable sub-agent Workspace tabs edit
+  into their own composer, where "@"-mentions return as attachment markers. Edit
+  is hidden on messages the server hasn't accepted yet, messages with no text,
+  other contributors' messages (shared session or not), and read-only composers.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
   HTTP acknowledgement is lost. Delivery during draft restoration clears the
   untouched draft; user edits remain. The "Something went wrong" card from the
@@ -341,6 +350,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   that session. From the file viewer, **Attach to agent** adds a file token to
   the end of the draft.
 - Send while the agent is working to queue a message, then steer it.
+- Hover one of your sent messages and click Edit and resend (pencil) to copy
+  its text into the message box, revise, and send it as a new message.
+  Attachments stay on the original message.
 - With the in-session message box empty, press Up to recall a previous prompt
   (or the last queued message). While writing a draft, Up stops at the top.
 - With a native session's host offline, send a message; it waits in the queue
@@ -482,7 +494,8 @@ pill; later selections apply on the next turn. For other supported harnesses,
 open the side-chat model pill to choose model/effort before or after its
 first message. Follow the **Side-chat settings** recipe in [Sessions](sessions.md)
 for draft persistence and parent-isolation checks. The microphone beside
-**Ask a side question...** starts dictation.
+**Ask a side question...** starts dictation. Edit and resend (pencil) on a sent
+side-chat message loads it into that side chat's composer, not the main one.
 
 ## Driving it with the repro environment
 
@@ -879,6 +892,17 @@ Other connection providers alone do not enable the managed MCP picker.
   Multiline, whitespace, quotes, and queued drafts have component coverage in
   `web/src/pages/ChatPage.composer.test.tsx`. The new-session and side-chat
   composers have no prompt recall; the vendor terminal owns its own history.
+- **`edit-sent-message`:**
+  `tests/e2e_ui/chat/test_edit_sent_message.py` covers editing a message with
+  an image (only its text is copied), editing mid-turn, and side chats. The
+  replace-draft dialog, pending messages, other authors, and read-only composers
+  have component coverage in `web/src/pages/ChatPage.userBubble.test.tsx`,
+  `web/src/pages/ChatPage.composer.test.tsx`, and
+  `web/src/components/chat/SideChatPane.test.tsx`. Grid session panes and
+  sub-agent Workspace tabs render the same `SideChatPane`, whose Edit logic has
+  component coverage; their own wiring is checked by hand: open
+  a grid pane or a writable Workspace tab, click Edit on a message you sent
+  there, and confirm that pane's composer fills while the main one stays empty.
 - **`delivered-send-recovery`, in-session composer (desktop and mobile):**
   `tests/e2e_ui/mobile/test_composer_after_unacked_send.py::test_composer_stays_empty_after_delivered_but_unacked_send`
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport

@@ -234,6 +234,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, computeIsWorking } from "./ChatPage";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
+import { withSessionMentionHint } from "@/lib/composerMentions";
 import {
   BUILTIN_SLASH_COMMANDS,
   rankedSlashCommandNames,
@@ -7277,6 +7278,157 @@ describe("Composer — editing queued messages", () => {
 
     await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
     expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+  });
+});
+
+describe("Composer — editing a sent message", () => {
+  const CONV = "conv_edit_sent";
+  const sentMessage = { text: "Summarize these [Attached: src/app.ts]" };
+  const toasts: unknown[] = [];
+  const recordToast = (event: Event) => toasts.push((event as CustomEvent).detail.content);
+
+  beforeEach(() => {
+    clearSessionDrafts();
+    // A running turn, which Edit must not stop.
+    useChatStore.setState({
+      conversationId: CONV,
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "running",
+      queuedMessages: [],
+    });
+    toasts.length = 0;
+    window.addEventListener("omnigent:toast", recordToast);
+  });
+
+  afterEach(() => {
+    window.removeEventListener("omnigent:toast", recordToast);
+    cleanup();
+  });
+
+  it("copies the text and @-tags into an empty composer and sends it as a new message", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps({ isWorking: true });
+    renderWithTooltips(<Composer {...props} ref={ref} />);
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+
+    // The sent marker comes back as the file's tag token.
+    expect(textarea()).toHaveValue("Summarize these @src/app.ts");
+    expect(textarea()).toHaveFocus();
+    expect(props.onStop).not.toHaveBeenCalled();
+
+    fireEvent.change(textarea(), { target: { value: "Summarize these, briefly, @src/app.ts" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(props.onSend).toHaveBeenCalledTimes(1);
+    const [sentText, sentFiles] = vi.mocked(props.onSend).mock.calls[0]! as [
+      string,
+      File[] | undefined,
+    ];
+    expect(sentText).toContain("Summarize these, briefly,");
+    expect(sentText).toContain("src/app.ts");
+    expect(sentFiles).toBeUndefined();
+  });
+
+  it("keeps a file and a session with the same name as separate tags", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps();
+    renderWithTooltips(<Composer {...props} ref={ref} />);
+    const session = '[Session: "README.md" id=sess_readme subagent=no]';
+    const sent = withSessionMentionHint(`compare [Attached: README.md] with ${session}`, true);
+
+    act(() => ref.current?.editSentMessage({ text: sent }));
+
+    expect(textarea()).toHaveValue("compare @README.md (file) with @README.md");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    const [sentText] = vi.mocked(props.onSend).mock.calls[0]! as [string];
+    expect(sentText.match(/\[Attached(?: file)?: README\.md\]/g)).toHaveLength(1);
+    expect(sentText.split(session)).toHaveLength(2);
+  });
+
+  it("asks before replacing a draft, keeping it unless the user confirms", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Keep draft" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(textarea()).toHaveValue("half-written thought");
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: "Replace draft" }),
+    );
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(textarea()).toHaveValue("Summarize these @src/app.ts");
+    expect(textarea()).toHaveFocus();
+    expect(toasts).toEqual([]);
+  });
+
+  it("treats an attachment-only draft as a draft, and replacing it drops the attachment", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    const draftFile = new File(["draft"], "draft.txt", { type: "text/plain" });
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [draftFile] },
+    });
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
+
+    await waitFor(() => expect(textarea()).toHaveValue("Summarize these @src/app.ts"));
+    expect(screen.queryByText("draft.txt")).toBeNull();
+  });
+
+  it("dismisses a pending confirmation when the conversation changes", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
+    act(() => ref.current?.editSentMessage(sentMessage));
+    await screen.findByRole("dialog", { name: "Replace your draft?" });
+
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    act(() => useChatStore.setState({ conversationId: CONV }));
+
+    await act(async () => {});
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(textarea()).toHaveValue("half-written thought");
+  });
+
+  it("says so when the composer stops taking input before Replace draft", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const { rerender } = renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
+    act(() => ref.current?.editSentMessage(sentMessage));
+    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+
+    rerender(
+      <TooltipProvider>
+        <Composer {...composerProps({ disabled: true })} ref={ref} />
+      </TooltipProvider>,
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(textarea()).toHaveValue("half-written thought");
+    expect(toasts).toEqual(["The composer can't take a message right now."]);
+  });
+
+  it("ignores Edit while the composer is disabled", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps({ disabled: true })} ref={ref} />);
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+
+    expect(textarea()).toHaveValue("");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(toasts).toEqual(["The composer can't take a message right now."]);
   });
 });
 
