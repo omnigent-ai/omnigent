@@ -539,6 +539,11 @@ def compaction_to_history_items(
                     data=MessageData(
                         role=msg.get("role", "user"),
                         content=msg.get("content", []),
+                        agent=(
+                            msg.get("agent") or msg.get("model") or data.model or "compaction"
+                            if msg.get("role") == "assistant"
+                            else None
+                        ),
                     ),
                 )
             )

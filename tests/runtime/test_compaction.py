@@ -2010,3 +2010,38 @@ def test_route_bare_model_preserves_databricks_and_prefixed_ids() -> None:
         assert _route_bare_model_for_compaction(LLMConfig(model=prefixed)).model == prefixed
     # Bare gpt-* is correctly OpenAI already — unchanged.
     assert _route_bare_model_for_compaction(LLMConfig(model="gpt-4o")).model == "gpt-4o"
+
+
+@pytest.mark.parametrize("provenance", ["agent", "model", "checkpoint_model", "unknown"])
+def test_compaction_snapshot_preserves_assistant_provenance(provenance: str) -> None:
+    snapshot = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Retained assistant output"}],
+        }
+    ]
+    if provenance in {"agent", "model"}:
+        snapshot[0][provenance] = "synthetic_assistant"
+    item = _make_conv_item(
+        "checkpoint",
+        "compaction",
+        CompactionData(
+            summary="Synthetic summary",
+            last_item_id="last_input",
+            token_count=1,
+            model="synthetic_checkpoint" if provenance == "checkpoint_model" else None,
+            compacted_messages=snapshot,
+        ),
+    )
+    [restored] = compaction_to_history_items(item)
+    expected_agent = (
+        "synthetic_assistant"
+        if provenance in {"agent", "model"}
+        else "synthetic_checkpoint"
+        if provenance == "checkpoint_model"
+        else "compaction"
+    )
+    assert isinstance(restored.data, MessageData)
+    assert restored.data.agent == expected_agent
+    assert restored.data.content == snapshot[0]["content"]
