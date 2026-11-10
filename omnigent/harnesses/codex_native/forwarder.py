@@ -2323,6 +2323,8 @@ class _CodexElicitationTaskTracker:
         self._posted_resolutions: set[str] = set()
         self._started_async_questions: set[str] = set()
         self._unanswered_async_questions: dict[str, asyncio.Task[None]] = {}
+        # Items whose web answer is being sent; an answer Codex echoes removes them.
+        self._delivering_async_questions: set[str] = set()
 
     def start(
         self,
@@ -2440,6 +2442,8 @@ class _CodexElicitationTaskTracker:
         if not isinstance(item, dict) or item.get("type") != "userMessage":
             return
         for item_id in _async_question_reply_item_ids(_user_message_text(item)):
+            # Our own reply or a TUI answer: either way Codex has an answer.
+            self._delivering_async_questions.discard(item_id)
             task = self._unanswered_async_questions.pop(item_id, None)
             pending = self._pending.get(task) if task is not None else None
             if task is None or pending is None:
@@ -2532,6 +2536,7 @@ class _CodexElicitationTaskTracker:
         self._posted_resolutions.clear()
         self._started_async_questions.clear()
         self._unanswered_async_questions.clear()
+        self._delivering_async_questions.clear()
 
     async def _run_one(
         self,
@@ -2602,21 +2607,34 @@ class _CodexElicitationTaskTracker:
                 reply = _async_question_reply_text(question, result)
                 if reply is None or answered_natively:
                     return
-                if await _send_codex_async_question_reply(
-                    codex_client,
-                    bridge_dir=bridge_dir,
-                    question=question,
-                    text=reply,
-                ):
+                self._delivering_async_questions.add(item_id)
+                try:
+                    delivered = await _send_codex_async_question_reply(
+                        codex_client,
+                        bridge_dir=bridge_dir,
+                        question=question,
+                        text=reply,
+                        answered=lambda: item_id not in self._delivering_async_questions,
+                    )
+                except asyncio.CancelledError:
+                    # Teardown ended the retries; bounded so a down server can't stall it.
+                    if item_id in self._delivering_async_questions:
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(
+                                _post_async_question_undelivered_notice(
+                                    client, session_id, question, delivery_round
+                                ),
+                                timeout=_DURABLE_ITEM_POST_TIMEOUT_SECONDS,
+                            )
+                    raise
+                if delivered:
                     return
-                title = question.questions[0][1]
-                await _post_assistant_notice(
-                    client,
-                    session_id,
-                    marker=f"async-question-undelivered-{item_id}-{delivery_round}",
-                    text=f'Couldn\'t confirm that Codex received your answer to "{title}". '
-                    "Check the terminal and send your answer again if Codex didn't get it.",
+                await _post_async_question_undelivered_notice(
+                    client, session_id, question, delivery_round
                 )
+                if item_id not in self._delivering_async_questions:
+                    return  # Codex echoed an answer while the notice was posted.
+                self._delivering_async_questions.discard(item_id)
                 delivery_round += 1
                 task = asyncio.current_task()
                 if task is not None:
@@ -2631,6 +2649,7 @@ class _CodexElicitationTaskTracker:
             )
         finally:
             self._unanswered_async_questions.pop(item_id, None)
+            self._delivering_async_questions.discard(item_id)
 
     def _discard_done(self, task: asyncio.Task[None]) -> None:
         """
@@ -6576,12 +6595,39 @@ def _async_question_reply_item_ids(text: str) -> list[str]:
     return item_ids
 
 
+async def _post_async_question_undelivered_notice(
+    client: httpx.AsyncClient,
+    session_id: str,
+    question: _CodexAsyncQuestion,
+    delivery_round: int,
+) -> None:
+    """
+    Tell the user Codex may not have received their async question answer.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param question: Answered Codex async question.
+    :param delivery_round: Card round the answer came from, which keeps
+        each round's notice distinct.
+    :returns: None.
+    """
+    title = question.questions[0][1]
+    await _post_assistant_notice(
+        client,
+        session_id,
+        marker=f"async-question-undelivered-{question.item_id}-{delivery_round}",
+        text=f'Couldn\'t confirm that Codex received your answer to "{title}". '
+        "Check the terminal and send your answer again if Codex didn't get it.",
+    )
+
+
 async def _send_codex_async_question_reply(
     codex_client: CodexAppServerClient,
     *,
     bridge_dir: Path | None,
     question: _CodexAsyncQuestion,
     text: str,
+    answered: Callable[[], bool],
 ) -> bool:
     """
     Deliver an async question reply, retrying a refused or failed send.
@@ -6591,11 +6637,15 @@ async def _send_codex_async_question_reply(
         a child thread, whose only known turn is the asking one.
     :param question: Answered Codex async question.
     :param text: Tagged reply text from :func:`_async_question_reply_text`.
-    :returns: Whether Codex accepted the reply.
+    :param answered: Whether Codex has since echoed an answer to the
+        question, which ends the retries.
+    :returns: Whether Codex accepted the reply or already has an answer.
     """
     for attempt in range(len(_CODEX_ASYNC_QUESTION_RETRY_DELAYS_S) + 1):
         if attempt:
             await asyncio.sleep(_CODEX_ASYNC_QUESTION_RETRY_DELAYS_S[attempt - 1])
+            if answered():
+                return True
         try:
             state = read_bridge_state(bridge_dir) if bridge_dir is not None else None
             if state is not None and state.thread_id != question.thread_id:

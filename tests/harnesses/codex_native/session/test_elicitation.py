@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -819,6 +820,8 @@ def _answer_async_question(
     bridge_dir: Path,
     fake_client: _FakeCodexAppServerClient,
     hook_responses: list[httpx.Response],
+    *,
+    while_delivering: Callable[[httpx.AsyncClient, dict[str, Any]], Awaitable[None]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """
     Drive one async question whose Omnigent hook returns ``hook_responses``.
@@ -827,6 +830,8 @@ def _answer_async_question(
     :param fake_client: Fake Codex app-server client.
     :param hook_responses: Omnigent hook responses, in order, for each time
         the question card is shown.
+    :param while_delivering: Step run with the HTTP client and forwarder
+        context after the question is handled, before waiting for delivery.
     :returns: Elicitation hook bodies and the other session events posted.
     """
     hook_bodies: list[dict[str, Any]] = []
@@ -862,7 +867,9 @@ def _answer_async_question(
                 event=_async_question_event(),
                 codex_client=fake_client,  # type: ignore[arg-type]
             )
-            await context["elicitation_tracker"].drain()
+            if while_delivering is not None:
+                await while_delivering(client, context)
+            await asyncio.wait_for(context["elicitation_tracker"].drain(), timeout=30.0)
 
     asyncio.run(run())
     return hook_bodies, posted_events
@@ -1316,6 +1323,148 @@ def test_forwarder_retries_undelivered_codex_async_question_answer(
     assert state.active_turn_id == final_turn_id
     assert len(hook_bodies) == 1
     assert _undelivered_answer_notices(posted_events) == []
+
+
+@pytest.mark.parametrize(
+    "echoed_reply",
+    [_TUI_ASYNC_QUESTION_REPLY.replace("Alpha", "Beta"), _TUI_ASYNC_QUESTION_REPLY],
+    ids=["tui_answer", "own_reply"],
+)
+def test_forwarder_stops_retrying_codex_async_question_answer_codex_echoes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    echoed_reply: str,
+) -> None:
+    """
+    An answer Codex echoes during a failed send ends the retries.
+
+    The echo is either an answer typed in the TUI or the forwarder's own
+    reply, whose response was lost. Either way Codex has an answer, so the
+    forwarder neither sends it again nor reopens the card.
+
+    :param echoed_reply: Tagged reply text in the echoed ``userMessage``.
+    """
+    monkeypatch.setattr(
+        codex_native_forwarder, "_CODEX_ASYNC_QUESTION_RETRY_DELAYS_S", (0.0, 0.0, 0.0)
+    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    fake_client = _FakeCodexAppServerClient(response={"result": {}})
+    first_send_started = asyncio.Event()
+    reply_echoed = asyncio.Event()
+
+    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Fail the first send once Codex has echoed an answer.
+
+        :param method: JSON-RPC method.
+        :param params: JSON-RPC params.
+        :returns: JSON-RPC response envelope.
+        :raises ConnectionResetError: For the first send.
+        """
+        fake_client.requests.append((method, params))
+        if len(fake_client.requests) == 1:
+            first_send_started.set()
+            await reply_echoed.wait()
+            raise ConnectionResetError("app-server connection lost")
+        return {"result": {}}
+
+    fake_client.request = fake_request  # type: ignore[method-assign]
+
+    async def echo_answer(client: httpx.AsyncClient, context: dict[str, Any]) -> None:
+        """
+        Echo an answer from Codex while the first send is in flight.
+
+        :param client: Forwarder HTTP client.
+        :param context: Forwarder event-handling context.
+        :returns: None.
+        """
+        await asyncio.wait_for(first_send_started.wait(), timeout=30.0)
+        await codex_native_forwarder._handle_event(
+            client,
+            **context,
+            event=_tui_reply_event(echoed_reply),
+            codex_client=fake_client,  # type: ignore[arg-type]
+        )
+        reply_echoed.set()
+
+    hook_bodies, posted_events = _answer_async_question(
+        tmp_path,
+        fake_client,
+        [httpx.Response(200, json={"answers": {"0": {"answers": ["Alpha"]}}})],
+        while_delivering=echo_answer,
+    )
+
+    assert fake_client.requests == [
+        (
+            "turn/steer",
+            {
+                "threadId": "thread_123",
+                "expectedTurnId": "turn_123",
+                "input": [{"type": "text", "text": _TUI_ASYNC_QUESTION_REPLY}],
+            },
+        )
+    ]
+    assert len(hook_bodies) == 1
+    assert _undelivered_answer_notices(posted_events) == []
+
+
+@pytest.mark.parametrize("closed_during", ["send", "retry_delay"])
+def test_forwarder_posts_notice_when_teardown_interrupts_codex_async_question_answer(
+    tmp_path: Path,
+    closed_during: str,
+) -> None:
+    """
+    Forwarder teardown during an answer's delivery still posts the notice.
+
+    A dropped app-server connection tears the forwarder down, which ends the
+    retries before they run out, so the user is told Codex may lack the answer.
+
+    :param closed_during: Delivery step the tracker closes in.
+    """
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    fake_client = _FakeCodexAppServerClient(response={"result": {}})
+    first_send_started = asyncio.Event()
+
+    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Hold the send open, or fail it so the next waits for the retry delay.
+
+        :param method: JSON-RPC method.
+        :param params: JSON-RPC params.
+        :returns: Never returns.
+        :raises ConnectionResetError: When the send fails.
+        """
+        fake_client.requests.append((method, params))
+        first_send_started.set()
+        if closed_during == "send":
+            await asyncio.Future()
+        raise ConnectionResetError("app-server connection lost")
+
+    fake_client.request = fake_request  # type: ignore[method-assign]
+
+    async def close_tracker(client: httpx.AsyncClient, context: dict[str, Any]) -> None:
+        """
+        Tear down the elicitation tracker once the first send has started.
+
+        :param client: Forwarder HTTP client.
+        :param context: Forwarder event-handling context.
+        :returns: None.
+        """
+        await asyncio.wait_for(first_send_started.wait(), timeout=30.0)
+        await asyncio.wait_for(context["elicitation_tracker"].close(), timeout=30.0)
+
+    hook_bodies, posted_events = _answer_async_question(
+        tmp_path,
+        fake_client,
+        [httpx.Response(200, json={"answers": {"0": {"answers": ["Alpha"]}}})],
+        while_delivering=close_tracker,
+    )
+
+    assert len(fake_client.requests) == 1
+    assert len(hook_bodies) == 1
+    assert [
+        event["data"]["source_id"] for event in _undelivered_answer_notices(posted_events)
+    ] == ["async-question-undelivered-call-async-1-0"]
 
 
 @pytest.mark.parametrize("second_answer_source", ["web", "tui"])

@@ -1866,10 +1866,12 @@ describe("BlockStream — elicitation", () => {
         },
       });
       if (event === null) throw new Error("expected an elicitation request");
-      return reduce([event]).find((b): b is ElicitationBlock => b.type === "elicitation");
+      const card = reduce([event]).find((b): b is ElicitationBlock => b.type === "elicitation");
+      if (card === undefined) throw new Error("expected an elicitation card");
+      return card;
     };
 
-    expect(blockFor({ is_blocking: false })?.isBlocking).toBe(false);
+    expect(blockFor({ is_blocking: false }).isBlocking).toBe(false);
     expect(blockFor({})).not.toHaveProperty("isBlocking");
     expect(blockFor({ is_blocking: true })).not.toHaveProperty("isBlocking");
   });

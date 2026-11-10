@@ -136,6 +136,10 @@ implements them separately, so a fix for one harness does not reach the others.
 - `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups,
   including those sent while it works, stay in that thread, and closing it
   leaves the parent usable.
+- `codex-async-questions`: a Codex `request_user_input_async` question shows a
+  card in Chat and Inbox that leaves the composer usable. The answer reaches
+  Codex's current or next turn; a terminal answer closes the card, and Cancel
+  dismisses it without stopping Codex.
 - `codex-plan-mode`: Codex starts in, or switches to, its own Plan mode from the
   composer's Plan row; see `plan-mode` in [composer.md](./composer.md).
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
@@ -353,10 +357,11 @@ separate. See [sessions](./sessions.md) for all side-chat entry points.
 `request_user_input_async`. The question card stays open after the turn ends
 and leaves the composer usable. Answer it in Chat or Inbox; the transcript
 shows only the answer, and Codex's next turn uses it. Cancel dismisses the card
-without stopping Codex. Answering in the terminal closes the card. An answer
-Codex still hasn't received after about 30 seconds of retries posts a notice
-and reopens the card. An open question is not restored after the forwarder
-reconnects.
+without stopping Codex. Answering in the terminal closes the card and stops
+any retries of a web answer. If Codex still hasn't received a web answer after
+about 30 seconds of retries, a notice is posted and the card reopens; if the
+forwarder stops first, only the notice is posted. An open question is not
+restored after the forwarder reconnects.
 
 **Matrix.** "Mock" means the verification instance can drive the harness with
 the mock model; the others need their real CLI and vendor credentials. Test
@@ -599,6 +604,17 @@ Cross-harness journeys:
   model context, distinct native threads on one runner, transcript isolation,
   follow-ups that switch model and effort on the same thread, and a working
   parent after side-chat closure.
+- **`codex-async-questions`:**
+  `tests/harnesses/codex_native/session/test_elicitation.py` (the
+  `*codex_async_question*` tests) drives the forwarder with a fake app-server
+  client: the card, answers steering or starting a turn, terminal answers,
+  retries, teardown, and the undelivered notice with its reopened card.
+  `tests/server/integration/test_sessions_permission_request_hook.py::test_codex_request_user_input_decline_interrupts_only_blocking_questions`
+  and `::test_codex_async_question_delivery_round_reopens_answered_card` cover
+  Cancel and reopening on the server. `web/src/lib/blockStream.test.ts`,
+  `web/src/lib/blocks.test.ts` and `web/src/pages/ChatPage.composer.test.tsx`
+  cover the non-blocking card, working indicator and composer. No test drives
+  a real Codex CLI, the browser, Inbox, or a child thread.
 - **`harness-settings-navigation`:** run
   `web/src/components/onboarding/ImportContextModal.test.tsx` and
   `web/src/pages/SettingsPage.test.tsx`, plus

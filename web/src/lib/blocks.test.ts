@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type { ImageContentBlock, MessageContentBlock } from "./blocks";
+import type { AnyBlock, ElicitationBlock, ImageContentBlock, MessageContentBlock } from "./blocks";
 import {
   attachmentLabel,
   imagePreview,
+  isPendingBlockingElicitation,
   isTextBlock,
   keyedAttachments,
   slashCommandDisplayName,
@@ -241,6 +242,31 @@ describe("isTextBlock", () => {
     expect(isTextBlock({ type: "input_file", filename: "notes.pdf" })).toBe(false);
     const block = { type: "input_text", text: { parts: ["hi"] } } as unknown as MessageContentBlock;
     expect(isTextBlock(block)).toBe(false);
+  });
+});
+
+describe("isPendingBlockingElicitation", () => {
+  const card: ElicitationBlock = {
+    type: "elicitation",
+    ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_1", itemId: null },
+    elicitationId: "elic_1",
+    targetSessionId: null,
+    message: "Codex needs input",
+    phase: "codex_request_user_input",
+    policyName: "codex_native_request_user_input",
+    contentPreview: "{}",
+    requestedSchema: {},
+    url: null,
+    status: "pending",
+    response: null,
+  };
+
+  it("counts only a pending card the turn waits on", () => {
+    expect(isPendingBlockingElicitation(card)).toBe(true);
+    expect(isPendingBlockingElicitation({ ...card, isBlocking: false })).toBe(false);
+    expect(isPendingBlockingElicitation({ ...card, status: "responded" })).toBe(false);
+    const responseEnd = { type: "response_end", ctx: card.ctx, status: "pending", response: null };
+    expect(isPendingBlockingElicitation(responseEnd as AnyBlock)).toBe(false);
   });
 });
 
