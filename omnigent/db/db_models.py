@@ -7,12 +7,13 @@ import hashlib
 import uuid
 from collections.abc import Iterator
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Column,
     Float,
     Index,
     Integer,
@@ -1187,6 +1188,13 @@ class SqlComment(OmnigentBase):
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (CheckConstraint("status IN (1, 2)", name="ck_comments_status"),)
+
+
+# Unmapped schema columns participate in metadata-driven bootstrap without changing ORM queries.
+_comment_table = cast("Table", SqlComment.__table__)
+_comment_table.append_column(
+    Column("anchor_metadata", CompressedText(max_stored_bytes=1_024), nullable=True)
+)
 
 
 def policy_name_cksum(name: str) -> bytes:

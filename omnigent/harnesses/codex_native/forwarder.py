@@ -70,6 +70,7 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -9470,41 +9471,71 @@ async def _post_session_event(
     :returns: The final HTTP response, or ``None`` (see
         :func:`_post_session_event_inner`).
     """
-    result = await _post_session_event_inner(
-        client,
-        session_id,
-        event_type=event_type,
-        data=data,
-        max_attempts=max_attempts,
-        timeout=timeout,
-    )
+    try:
+        result = await _post_session_event_inner(
+            client,
+            session_id,
+            event_type=event_type,
+            data=data,
+            max_attempts=max_attempts,
+            timeout=timeout,
+        )
+    except DatabricksAuthError as exc:
+        # An earlier retry may have reached the server before credentials failed.
+        if event_type in _DEAD_LETTER_EVENT_TYPES:
+            _record_failed_session_event(
+                session_id,
+                event_type=event_type,
+                data=data,
+                result=_PostResult(
+                    response=None,
+                    delivered_ambiguous=True,
+                    transport_error=type(exc).__name__,
+                ),
+                reason="credential resolution failed before acknowledgement",
+            )
+        raise
     response = result.response
     if response is not None and response.status_code < 400:
         _note_forward_success()
     else:
-        _note_forward_failure(event_type, result, session_id)
-        dl_dir = _dead_letter_dir.get()
-        if event_type in _DEAD_LETTER_EVENT_TYPES and dl_dir is not None:
-            http_status = response.status_code if response is not None else None
-            if result.rejection_reason is not None:
-                reason = result.rejection_reason
-            elif response is not None:
-                reason = f"http {response.status_code}"
-            elif result.delivered_ambiguous:
-                reason = "ambiguous transport failure (may already be committed)"
-            else:
-                reason = "proven-undelivered transport failure after retries"
-            append_dead_letter(
-                dl_dir,
-                session_id=session_id,
-                event_type=event_type,
-                payload=data,
-                reason=reason,
-                delivered_ambiguous=result.delivered_ambiguous,
-                http_status=http_status,
-                transport_error=result.transport_error,
-            )
+        _record_failed_session_event(session_id, event_type=event_type, data=data, result=result)
     return response
+
+
+def _record_failed_session_event(
+    session_id: str,
+    *,
+    event_type: str,
+    data: _JsonObject,
+    result: _PostResult,
+    reason: str | None = None,
+) -> None:
+    """Track failed mirroring and retain durable payloads for conservative replay."""
+    _note_forward_failure(event_type, result, session_id)
+    dl_dir = _dead_letter_dir.get()
+    if event_type not in _DEAD_LETTER_EVENT_TYPES or dl_dir is None:
+        return
+    response = result.response
+    if reason is None:
+        if result.rejection_reason is not None:
+            reason = result.rejection_reason
+        elif response is not None:
+            reason = f"http {response.status_code}"
+        elif result.delivered_ambiguous:
+            reason = "ambiguous transport failure (may already be committed)"
+        else:
+            reason = "proven-undelivered transport failure after retries"
+    append_dead_letter(
+        dl_dir,
+        session_id=session_id,
+        event_type=event_type,
+        payload=data,
+        reason=reason,
+        delivered_ambiguous=result.delivered_ambiguous,
+        http_status=response.status_code if response is not None else None,
+        transport_error=result.transport_error,
+    )
 
 
 async def _post_session_event_inner(
