@@ -82,6 +82,9 @@ def test_session_cap_is_enforced_in_the_insert(store: SqlAlchemyInboxItemStore) 
 
     with pytest.raises(InboxSessionCapError):
         store.create(_new(dedupe_key="v1:over"))
+    # A full session reports a repeat of one of its items as a duplicate, not the cap.
+    with pytest.raises(DuplicateInboxItemError):
+        store.create(_new(dedupe_key="v1:0"))
     store.create(_new(dedupe_key="v1:other-session", source_session_id="f" * 32))
 
 

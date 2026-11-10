@@ -40,6 +40,10 @@ def test_other_links() -> None:
     )
     assert canonical_link({"type": "url", "ref": "  "}) is None
     assert canonical_link({"type": "url", "ref": "https://example.test:443/a"}) == "example.test/a"
+    assert canonical_link({"type": "url", "ref": "http://example.test:80/a"}) == "example.test/a"
+    assert canonical_link({"type": "url", "ref": "http://example.test:443/a"}) == (
+        "example.test:443/a"
+    )
     assert canonical_link({"type": "url", "ref": "https://example.test:8443/a"}) != canonical_link(
         {"type": "url", "ref": "https://example.test:9443/a"}
     )
@@ -50,9 +54,11 @@ def test_other_links() -> None:
     [
         {"type": "url", "ref": "https://["},
         {"type": "url", "ref": "https://example.test:99999/a"},
+        {"type": "url", "ref": "javascript:alert(1)"},
+        {"type": "url", "ref": "ftp://example.test/a"},
         {"type": "session", "ref": "s" * 2048},
     ],
-    ids=["unparseable", "bad-port", "too-long-once-canonical"],
+    ids=["unparseable", "bad-port", "script", "non-web-scheme", "too-long-once-canonical"],
 )
 def test_links_the_server_cannot_store_are_rejected(link: dict[str, str]) -> None:
     with pytest.raises(InvalidLinkError):

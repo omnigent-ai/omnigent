@@ -14,6 +14,7 @@ below the minimum-interval floor) is a 400.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import uuid
 from collections.abc import Callable
@@ -30,7 +31,7 @@ from omnigent.db.account_authority import account_generation, current_account_us
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import pending_elicitations
-from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
 from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
@@ -72,6 +73,10 @@ _MANAGED_SANDBOX_WITH_HOST_MSG = (
     "a managed_sandbox task runs in a fresh sandbox each fire; do not set host_id"
 )
 _SESSION_ID_WITHOUT_CONTINUE_MSG = "session_id requires session_mode 'continue'"
+_SOURCE_SESSION_CONTINUE_MSG = (
+    "an automation with source_session_id starts each run in a new session; "
+    "session_mode must be 'new'"
+)
 # A continued session cannot follow a change to these, so the next run starts a new one.
 _SESSION_BOUND_FIELDS = frozenset(
     {"agent_id", "host_id", "workspace", "base_branch", "execution_target"}
@@ -114,6 +119,9 @@ class CreateScheduledTaskRequest(BaseModel):
     execution_target: str = "connected_host"
     # One of the caller's projects to file fired sessions into.
     project_id: str | None = None
+    # A session the caller owns. Create copies it, and every run starts a new
+    # session from that copy; responses carry the copy's id here.
+    source_session_id: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def _validate_create(self) -> CreateScheduledTaskRequest:
@@ -123,6 +131,8 @@ class CreateScheduledTaskRequest(BaseModel):
             raise ValueError(_MANAGED_SANDBOX_WITH_HOST_MSG)
         if self.session_id is not None and self.session_mode != "continue":
             raise ValueError(_SESSION_ID_WITHOUT_CONTINUE_MSG)
+        if self.source_session_id is not None and self.session_mode != "new":
+            raise ValueError(_SOURCE_SESSION_CONTINUE_MSG)
         _validate_worktree_target(
             self.base_branch, self.execution_target, self.host_id, self.workspace
         )
@@ -229,6 +239,7 @@ def _to_response(
         "max_cost_usd": task.max_cost_usd,
         "session_mode": task.session_mode,
         "session_id": task.session_id,
+        "source_session_id": task.source_session_id,
         "workspace": task.workspace,
         "base_branch": task.base_branch,
         "host_id": task.host_id,
@@ -330,6 +341,7 @@ def create_scheduled_tasks_router(
     agent_cache: Any | None = None,
     auth_provider: AuthProvider | None = None,
     artifact_store: ArtifactStore | None = None,
+    file_store: Any | None = None,
     project_store: ProjectStore | None = None,
     automations: DeploymentGate = True,
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
@@ -340,6 +352,8 @@ def create_scheduled_tasks_router(
 
     :param store: The shared :class:`ScheduledTaskStore`.
     :param artifact_store: Holds the copy a task gets of another user's agent.
+    :param file_store: Copies a source session's uploaded files into the
+        session its runs start from. ``None`` copies none.
     :param project_store: Checks the project fired sessions are filed into.
         ``None`` rejects tasks that set a project.
     :param automations: Per-request gate; every route returns 404 while it is off.
@@ -536,6 +550,200 @@ def create_scheduled_tasks_router(
             f"cannot continue this session: {reason}", code=ErrorCode.INVALID_INPUT
         )
 
+    async def _require_source_session(source_id: str, owner: str) -> tuple[Conversation, str]:
+        """A session *owner* can start an automation from, hiding one they can't see.
+
+        :returns: The session and its last finished response, which its copy stops at.
+        """
+        from omnigent.stores.conversation_store import (
+            SCHEDULED_TASK_SOURCE_LABEL_KEY,
+            SIDE_CHAT_LABEL_KEY,
+        )
+
+        conv = await asyncio.to_thread(conversation_store.get_conversation, source_id)
+        if conv is None or (
+            permission_store is not None
+            and not await asyncio.to_thread(
+                permission_store.check_access, owner, source_id, LEVEL_OWNER
+            )
+        ):
+            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+        if conv.parent_conversation_id is not None or conv.labels.get(SIDE_CHAT_LABEL_KEY):
+            raise OmnigentError(
+                "An automation can't start from a sub-agent's session or a side chat",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if conv.labels.get(SCHEDULED_TASK_SOURCE_LABEL_KEY):
+            raise OmnigentError(
+                "An automation already runs from this session", code=ErrorCode.INVALID_INPUT
+            )
+        if conv.agent_id is None:
+            raise OmnigentError("The session has no agent to copy", code=ErrorCode.INVALID_INPUT)
+        from omnigent.server.scheduled.source_session import last_finished_response_id
+
+        # Runs start from the history through the last finished reply, so there must be one.
+        up_to = await asyncio.to_thread(
+            last_finished_response_id,
+            conversation_store,
+            conv.id,
+            running=_session_status_from_cache(conv.id, conv.live_status) == "running",
+        )
+        if up_to is None:
+            raise OmnigentError(
+                "The session has no finished reply to start an automation from yet",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return conv, up_to
+
+    async def _require_openable_attachments(
+        session_id: str, agent: Agent, up_to_response_id: str | None = None
+    ) -> None:
+        """Reject an agent that can't open the files the copied history refers to."""
+        from omnigent.server.routes.sessions.routes_core import (
+            _require_attachment_compatible_history,
+        )
+
+        await asyncio.to_thread(
+            _require_attachment_compatible_history,
+            session_id,
+            agent,
+            conversation_store,
+            file_store,
+            up_to_response_id=up_to_response_id,
+        )
+
+    async def _source_history_carry(agent: Agent) -> bool:
+        from omnigent.server.scheduled.source_session import (
+            SourceHistoryUnsupportedError,
+            carries_native_history,
+        )
+
+        try:
+            return await asyncio.to_thread(carries_native_history, agent)
+        except SourceHistoryUnsupportedError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+
+    async def _copy_history_carry(source: Conversation) -> bool:
+        """Whether the copy, which keeps the session's own agent, rebuilds a native transcript."""
+        from omnigent.server.scheduled.source_session import (
+            SourceHistoryUnsupportedError,
+            carries_native_history,
+        )
+
+        assert source.agent_id is not None  # _require_source_session rejects agentless sessions
+        source_agent = await asyncio.to_thread(agent_store.get, source.agent_id)
+        if source_agent is None:
+            return False
+        try:
+            return await asyncio.to_thread(carries_native_history, source_agent)
+        except SourceHistoryUnsupportedError:
+            return False
+
+    async def _copy_source_session(
+        source: Conversation,
+        *,
+        up_to: str,
+        task_id: str,
+        name: str,
+        owner: str,
+        project_id: str | None,
+        carry: bool,
+    ) -> Conversation:
+        """Copy *source*, through its last finished reply, for the task's runs to start from."""
+        # Its threads can commit after the request is cancelled; the copy is deleted once they do.
+        setup = asyncio.create_task(
+            _copy_and_own_source(
+                source,
+                up_to=up_to,
+                task_id=task_id,
+                name=name,
+                owner=owner,
+                project_id=project_id,
+                carry=carry,
+            )
+        )
+        try:
+            return await asyncio.shield(setup)
+        except asyncio.CancelledError:
+
+            async def settle_and_discard() -> None:
+                # A setup that failed has already deleted its copy.
+                with contextlib.suppress(Exception):
+                    await _delete_session_quietly((await setup).id)
+
+            cleanup = asyncio.create_task(settle_and_discard())
+            while not cleanup.done():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.shield(cleanup)
+            raise
+
+    async def _copy_and_own_source(
+        source: Conversation,
+        *,
+        up_to: str,
+        task_id: str,
+        name: str,
+        owner: str,
+        project_id: str | None,
+        carry: bool,
+    ) -> Conversation:
+        """Copy *source* and grant its owner the copy, deleting the copy if either fails."""
+        from omnigent.server.scheduled.source_session import (
+            SourceCopyIncompleteError,
+            copy_session,
+            source_copy_title,
+        )
+        from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
+
+        # _require_source_session rejects a session without an agent.
+        assert source.agent_id is not None
+        try:
+            copy = await asyncio.to_thread(
+                copy_session,
+                conversation_store=conversation_store,
+                file_store=file_store,
+                artifact_store=artifact_store,
+                source_id=source.id,
+                title=source_copy_title(source.title, name),
+                # The copy keeps the session's agent; each run binds the task's own.
+                agent_id=source.agent_id,
+                created_by=owner,
+                project_id=project_id,
+                carry_history_into_native=carry,
+                labels={SCHEDULED_TASK_SOURCE_LABEL_KEY: task_id},
+                up_to_response_id=up_to,
+            )
+        except SourceCopyIncompleteError as exc:
+            await _delete_session_quietly(exc.copy.id)
+            raise OmnigentError(
+                "Could not copy every file of the session. Try again.",
+                code=ErrorCode.INTERNAL_ERROR,
+            ) from exc
+        try:
+            if permission_store is not None:
+                await asyncio.to_thread(permission_store.ensure_user, owner)
+                await asyncio.to_thread(permission_store.grant, owner, copy.id, LEVEL_OWNER)
+        except Exception:
+            await _delete_session_quietly(copy.id)
+            raise
+        return copy
+
+    async def _delete_session_quietly(session_id: str) -> None:
+        """Delete an unused copy with its file rows; blobs another session still uses stay."""
+        try:
+            if file_store is not None:
+                orphaned = await asyncio.to_thread(file_store.delete_all_for_session, session_id)
+                if artifact_store is not None:
+                    for blob_key in orphaned:
+                        try:
+                            await asyncio.to_thread(artifact_store.delete, blob_key)
+                        except Exception:
+                            # A blob that won't delete must not keep the copy.
+                            _logger.warning("could not delete blob %s", blob_key, exc_info=True)
+            await conversation_store.delete_conversation(session_id)
+        except Exception:
+            _logger.exception("could not delete the unused session copy %s", session_id)
+
     async def _require_mode_fits_session(request: Request, task: ScheduledTask) -> None:
         """Reject a mode change that leaves *task*'s continued session unable to take prompts.
 
@@ -595,6 +803,9 @@ def create_scheduled_tasks_router(
         # sandbox host derived from it.
         task_id = uuid.uuid4().hex
         host_id = body.host_id
+        source: Conversation | None = None
+        source_up_to = ""
+        carry = False
         if body.session_id is not None:
             # A picked session keeps the agent it runs, so the task takes no copy.
             bound = agent
@@ -622,11 +833,29 @@ def create_scheduled_tasks_router(
             if host_id is None and body.execution_target != "managed_sandbox":
                 host_id = picked.host_id
         else:
+            if body.source_session_id is not None:
+                source, source_up_to = await _require_source_session(body.source_session_id, owner)
+                # Runs rebuild the copied history in the task's agent, so it must carry one,
+                # and open the files it refers to.
+                await _source_history_carry(agent)
+                await _require_openable_attachments(source.id, agent, source_up_to)
+                carry = await _copy_history_carry(source)
             bound = await _bind_agent(agent, owner_id)
         project_id: str | None = None
+        source_copy: Conversation | None = None
         try:
             if body.project_id is not None:
                 project_id = await _owned_project_id(project_owner, body.project_id)
+            if source is not None:
+                source_copy = await _copy_source_session(
+                    source,
+                    up_to=source_up_to,
+                    task_id=task_id,
+                    name=body.name,
+                    owner=owner,
+                    project_id=project_id,
+                    carry=carry,
+                )
             task = store.create(
                 scheduled_task_id=task_id,
                 name=body.name,
@@ -641,6 +870,7 @@ def create_scheduled_tasks_router(
                 max_cost_usd=body.max_cost_usd,
                 session_mode=body.session_mode,
                 session_id=body.session_id,
+                source_session_id=source_copy.id if source_copy is not None else None,
                 workspace=workspace,
                 base_branch=body.base_branch,
                 host_id=host_id,
@@ -648,6 +878,8 @@ def create_scheduled_tasks_router(
                 execution_target=body.execution_target,
             )
         except Exception as exc:
+            if source_copy is not None:
+                await _delete_session_quietly(source_copy.id)
             if bound.id != agent.id:
                 agent_store.delete(bound.id)
             if isinstance(exc, RRuleSearchError):
@@ -657,6 +889,11 @@ def create_scheduled_tasks_router(
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
             raise
+        if source_copy is not None:
+            from omnigent.server.routes._sessions.helpers import _announce_session_added
+
+            # Surface the copy in the owner's open sidebars, keyed as they subscribe.
+            _announce_session_added(require_user(request, auth_provider), source_copy.id)
         log_task_created(
             task,
             owner=owner,
@@ -952,6 +1189,8 @@ def create_scheduled_tasks_router(
             fields["session_id"] = None
         target_agent_id = fields.get("agent_id") or existing.agent_id
         agent_changed = target_agent_id != existing.agent_id
+        if existing.source_session_id is not None and target_session_mode != "new":
+            raise OmnigentError(_SOURCE_SESSION_CONTINUE_MSG, code=ErrorCode.INVALID_INPUT)
         new_copy: Agent | None = None
         if agent_changed:
             # A harness switch invalidates the per-agent settings stored beside
@@ -1035,6 +1274,11 @@ def create_scheduled_tasks_router(
                 permission_mode=None,
                 execution_target=target_execution,
             )
+            if agent_changed and existing.source_session_id is not None:
+                # Runs rebuild the copied history in the new agent, so it must carry one
+                # and open the files it refers to.
+                await _source_history_carry(agent)
+                await _require_openable_attachments(existing.source_session_id, agent)
             if switching_to_managed:
                 # A sandbox has no pinned host; its workspace is a repository URL.
                 fields["host_id"] = None
@@ -1121,8 +1365,32 @@ def create_scheduled_tasks_router(
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        _require_owned(scheduled_task_id, owner_id)
-        await asyncio.to_thread(store.delete, scheduled_task_id)
+        task = _require_owned(scheduled_task_id, owner_id)
+        from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
+
+        copy_id = task.source_session_id
+        if copy_id is not None and (
+            await asyncio.to_thread(conversation_store.get_conversation, copy_id) is None
+        ):
+            copy_id = None
+        if copy_id is not None:
+            # The copy stays, like a run's session, but no longer belongs to an automation.
+            # Cleared first: if that fails, the automation and its label stay for a retry.
+            await asyncio.to_thread(
+                conversation_store.delete_label, copy_id, SCHEDULED_TASK_SOURCE_LABEL_KEY
+            )
+        try:
+            await asyncio.to_thread(store.delete, scheduled_task_id)
+        except Exception:
+            if copy_id is not None:
+                # The automation stays, so its copy goes on naming it.
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        copy_id,
+                        {SCHEDULED_TASK_SOURCE_LABEL_KEY: task.id},
+                    )
+            raise
         scheduler = _scheduler(request)
         if scheduler is not None and not getattr(
             request.app.state, "scheduled_task_dispatch_enabled", False

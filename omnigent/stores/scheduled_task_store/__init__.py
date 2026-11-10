@@ -71,6 +71,7 @@ class ScheduledTaskStore(ABC):
         max_cost_usd: float | None = None,
         session_mode: str = "new",
         session_id: str | None = None,
+        source_session_id: str | None = None,
         workspace: str | None = None,
         base_branch: str | None = None,
         host_id: str | None = None,
@@ -100,6 +101,8 @@ class ScheduledTaskStore(ABC):
             firing; ``"continue"`` sends each firing's prompt into one session.
         :param session_id: The existing session a ``"continue"`` task sends
             its prompt to; ``None`` lets its first firing create one.
+        :param source_session_id: The session each firing's new session starts
+            as a copy of, or ``None`` for runs that start empty.
         :param workspace: Runner start path (source repo / working dir).
         :param host_id: The connected host to pin the run to.
         :param project_id: First-class project each fired session is filed

@@ -30,6 +30,9 @@ class Feature(StrEnum):
     CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
+    MCP_DISABLED_SERVERS = "mcp_disabled_servers"
+    MCP_DISABLED_SERVERS_CLAUDE = "mcp_disabled_servers_claude"
+    MCP_DISABLED_SERVERS_CODEX = "mcp_disabled_servers_codex"
     CANVAS = "canvas"
     ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     IMPORT_REVIEW = "import_review"
@@ -128,6 +131,27 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         review_by_release="0.11.0",
     ),
     FeatureDefinition(
+        feature=Feature.MCP_DISABLED_SERVERS,
+        frontend_visible=False,
+        description="Per-harness MCP enablement in Omnigent sessions",
+        owner="server",
+        review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.MCP_DISABLED_SERVERS_CLAUDE,
+        frontend_visible=False,
+        description="Claude MCP enablement at launch",
+        owner="server",
+        review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.MCP_DISABLED_SERVERS_CODEX,
+        frontend_visible=False,
+        description="Codex MCP enablement at launch",
+        owner="server",
+        review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
         feature=Feature.CANVAS,
         description="Web Canvas page: sessions as draggable cards grouped by project",
         owner="web",
@@ -212,6 +236,7 @@ class FeatureFlags:
 # A deployment's per-request gate: a static bool, or a callable read on each request.
 DeploymentGate = bool | Callable[[], bool]
 HarnessInstallGate = DeploymentGate
+McpDisabledServersGate = DeploymentGate
 
 
 def deployment_gate_enabled(gate: DeploymentGate, name: str) -> bool:
@@ -226,6 +251,30 @@ def deployment_gate_enabled(gate: DeploymentGate, name: str) -> bool:
 def harness_install_enabled(gate: HarnessInstallGate) -> bool:
     """Resolve the harness-install gate for the current request."""
     return deployment_gate_enabled(gate, "harness_install")
+
+
+def mcp_disabled_servers_enabled(gate: McpDisabledServersGate) -> bool:
+    """Resolve the MCP deployment gate for the current request, failing closed."""
+    return deployment_gate_enabled(gate, "mcp_disabled_servers")
+
+
+MCP_DISABLED_SERVERS_HARNESS_FEATURES = {
+    "claude": Feature.MCP_DISABLED_SERVERS_CLAUDE,
+    "codex": Feature.MCP_DISABLED_SERVERS_CODEX,
+}
+
+
+def active_harnesses(master: McpDisabledServersGate, features: FeatureFlags) -> list[str]:
+    """Harnesses with complete launch hooks and both release gates enabled."""
+    from omnigent.mcp_disabled_servers import HARNESS_EXECUTORS
+
+    if not mcp_disabled_servers_enabled(master):
+        return []
+    return [
+        harness
+        for harness in HARNESS_EXECUTORS
+        if features.enabled(MCP_DISABLED_SERVERS_HARNESS_FEATURES[harness])
+    ]
 
 
 def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFlags:
