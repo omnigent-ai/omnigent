@@ -80,6 +80,18 @@ Restart server replicas after changing the declaration. User authorization is ne
 resolution, admission and binding can each recheck it as a launch progresses.
 Implement bounded controller timeouts and make authorization calls idempotent.
 
+### Default profile
+
+Set `sandbox.default_profile_id` (or `default_profile_id` on an embedding
+deployment's `ManagedSandboxConfig`) to the ID of a profile a new managed session
+takes when its caller names none, such as API clients that predate profiles and
+scheduled fresh sandboxes. The default is resolved through `list_profiles` and
+`select_profile` exactly like an explicit selection: a caller who cannot use it is
+rejected, and the accepted revision is saved on the session, so wake and
+replacement never move to a newer one. It does not apply to existing unprofiled
+sessions, which keep their legacy behavior. It requires a provider with
+`manages_profiles`; leave it unset to keep a selection mandatory.
+
 `SandboxProfileContext` is a frozen dataclass:
 
 | Field | Meaning |
@@ -207,7 +219,7 @@ profile. Retry after an error or select an ordinary connected host to continue.
 
 | Operation | Reference and behavior |
 | --- | --- |
-| New session, including attachments | Explicit authorized ID/revision; reject before allocating if unavailable. |
+| New session, including attachments | Explicit authorized ID/revision; reject before allocating if unavailable. Without one, take the provider's [default profile](#default-profile) if configured, otherwise reject. |
 | Fresh managed fork / branch clone | Default to the source profile for the same provider, resolve the currently offered revision and show an update notice if changed. User can search and choose another. Revoked/missing source blocks until a valid choice is made. |
 | Fork to an ordinary provider or local host | Do not copy the source profile. |
 | Native `/clear` / implicit `/fork` | Create an unprofiled replacement. Binding to a managed runner reauthorizes and adopts its host's reference before detaching the source; local forks stay unprofiled. |
@@ -219,8 +231,8 @@ profile. Retry after an error or select an ordinary connected host to continue.
 | Last session deleted | Its labels are deleted; capable controllers retain the sandbox assignment. |
 | Host deletion | Existing host metadata marks deletion; surviving sessions can bind an authorized replacement. |
 | Failed allocation / runner startup | Roll back the attempted host/runner binding and clean up fresh infrastructure. Retain a preaccepted selection for retry. |
-| Programmatic managed create | `sys_session_create(placement="managed")` accepts `sandbox_provider`, `sandbox_profile_id`, and `sandbox_profile_revision`, with the same authorization as the composer. Explicit profile selections require the existing `/v1/info` response to advertise `features.sandbox_profiles: true`; otherwise no create request is sent. Provider-only launches retain their existing behavior. |
-| Scheduled fresh sandbox | Creating/updating a task rejects a default provider requiring profiles before saving. Use a connected host or an ordinary default provider. Already-saved unsupported tasks fail closed at launch. |
+| Programmatic managed create | `sys_session_create(placement="managed")` accepts `sandbox_provider`, `sandbox_profile_id`, and `sandbox_profile_revision`, with the same authorization as the composer. Explicit profile selections require the existing `/v1/info` response to advertise `features.sandbox_profiles: true`; otherwise no create request is sent. Provider-only launches retain their existing behavior, or take the default profile on a profile-managing provider that has one. |
+| Scheduled fresh sandbox | Creating/updating a task rejects a default provider requiring profiles before saving, unless that provider has a default profile. Each fire then authorizes and saves the default for its session. Otherwise use a connected host or an ordinary default provider. Already-saved unsupported tasks fail closed at launch. |
 
 Omnigent stores the accepted provider/ID/revision, public display snapshot and
 execution identity under reserved `sandbox_profile:*` session labels. Generic
@@ -273,8 +285,9 @@ preserve its old lifecycle path when no `select_profile` call was made; provider
 that reject all unselected calls must add this compatibility before opting in.
 If scoped lookup is supported, authorize the legacy resource and return `None`
 for its absent assignment. Keep rejecting authorization and transport failures.
-Fresh managed sessions and forks into a new sandbox still require an explicit
-profile. A session with a saved profile never falls back to the legacy path.
+Fresh managed sessions and forks into a new sandbox still require a profile:
+an explicit one, or the provider's default profile. A session with a saved
+profile never falls back to the legacy path.
 
 **Before the first opt-in on an existing deployment, audit the reserved labels.**
 Older servers allowed editors to write `sandbox_profile:*`. A complete old label
@@ -297,9 +310,9 @@ before enabling the feature. Do not run this cleanup against an already-enabled
 deployment: its accepted references are legitimate and must be preserved.
 
 Upgrade every server replica and launch client before opting a provider in. Older
-clients cannot supply a required selection and receive 422; there is no implicit
-default profile. Keep providers used by older clients and fresh-sandbox schedules
-ordinary until those callers support selection. Inventory existing schedules
+clients cannot supply a required selection and receive 422 unless the provider has
+a default profile. Configure one, or keep providers used by older clients and
+fresh-sandbox schedules ordinary until those callers support selection. Inventory existing schedules
 before changing the default provider. Ordinary controllers retain their launch
 behavior with either flag setting. The reserved label namespace applies globally.
 

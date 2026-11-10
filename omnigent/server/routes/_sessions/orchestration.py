@@ -4679,9 +4679,19 @@ async def _run_managed_launch(
                     sandbox_config, None, unprofiled_host=relaunch_host
                 )
             else:
-                await asyncio.to_thread(
-                    sandbox_profiles.require_selection, provider, user_id=owner
+                # A launch without a create-time selection (a scheduled fresh sandbox)
+                # takes the provider's default, saved like an explicit selection.
+                default = await asyncio.to_thread(
+                    sandbox_profiles.default_selection, provider, user_id=owner
                 )
+                if default is None:
+                    await asyncio.to_thread(
+                        sandbox_profiles.require_selection, provider, user_id=owner
+                    )
+                else:
+                    await asyncio.to_thread(sandbox_profiles.bind_session, session_id, default)
+                    sandbox_config = deployment_with_sandbox_profile(sandbox_config, default)
+                    provider = default["provider"]
     except (OmnigentError, HTTPException) as exc:
         reason = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
         tracker.fail(session_id, reason)

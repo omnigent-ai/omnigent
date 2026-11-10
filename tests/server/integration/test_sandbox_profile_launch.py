@@ -127,6 +127,79 @@ async def test_unprofiled_session_survives_provider_opt_in(env, controller, oper
     assert response.status_code == 422
 
 
+def _with_default_profile(env: _Env, profile_id: str) -> None:
+    from omnigent.server.managed_hosts import ManagedSandboxDeployment
+
+    deployment = ManagedSandboxDeployment.single(
+        dataclasses.replace(env.app.state.sandbox_config.default, default_profile_id=profile_id)
+    )
+    env.app.state.sandbox_config = deployment
+    env.app.state.sandbox_profiles = SandboxProfileCatalog(
+        env.conversations, deployment, env.hosts
+    )
+
+
+@pytest.mark.parametrize("transport", ["json", "multipart"])
+async def test_create_without_a_selection_takes_the_default_profile(env, transport):
+    _with_default_profile(env, "build")
+    session_id = await env.settled(await env.create(transport))
+    snapshot = env.catalog.get_session_snapshot(session_id)
+    assert snapshot is not None
+    assert (snapshot["id"], snapshot["revision"]) == ("build", _PROVIDER_PROFILE.revision)
+    assert env.recording.allocations == [_PROVIDER_CONFIG]
+    # Saved like an explicit pick: a wake reauthorizes that exact revision.
+    await env.wake(session_id)
+    assert env.recording.resumes == [("profile-sandbox-1", _PROVIDER_CONFIG)]
+
+
+async def test_default_profile_is_authorized_like_an_explicit_selection(env):
+    _with_default_profile(env, "build")
+    env.recording.allowed_users = set()
+    response = await env.create("json")
+    assert response.status_code == 403, response.text
+    assert env.recording.allocations == []
+
+
+async def test_scheduled_fresh_sandbox_takes_the_default_profile(env):
+    _with_default_profile(env, "build")
+    response = await env.client.post("/v1/sessions", json={"agent_id": env.agent_id})
+    assert response.status_code == 201, response.text
+    session_id = response.json()["id"]
+    conversation = env.conversations.get_conversation(session_id)
+    assert conversation is not None
+    schedules = Mock()
+    schedules.get_running_run_by_conversation.return_value = SimpleNamespace(id="profile-run")
+    deps = FireDeps(
+        scheduled_task_store=schedules,
+        agent_store=env.app.state.agent_store,
+        conversation_store=env.conversations,
+        permission_store=None,
+        host_store=env.hosts,
+        host_registry=None,
+        sandbox_config=env.app.state.sandbox_config,
+        managed_launches=env.app.state.managed_launches,
+        app_state=env.app.state,
+    )
+    _make_managed_sandbox_start(deps)(
+        conversation,
+        SimpleNamespace(
+            user_id=_OWNER,
+            agent_id=env.agent_id,
+            execution_target="managed_sandbox",
+            workspace=None,
+        ),
+        uuid.uuid4().hex,
+        _STAGED_LAUNCH_ERRORS,
+    )
+    launch = env.app.state.managed_launches.get(session_id)
+    assert launch is not None
+    await asyncio.wait_for(launch.settled.wait(), timeout=10)
+    assert launch.error is None, launch.error
+    snapshot = env.catalog.get_session_snapshot(session_id)
+    assert snapshot is not None and snapshot["id"] == "build"
+    assert env.recording.allocations == [_PROVIDER_CONFIG]
+
+
 @pytest.mark.parametrize("mode", ["profile", "ordinary", "flag-off", "legacy-managed"])
 @pytest.mark.parametrize("launch_fails", [False, True])
 async def test_daemon_clear_then_launch_recovers_offline_runner(

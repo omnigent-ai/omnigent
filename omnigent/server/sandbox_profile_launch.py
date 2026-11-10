@@ -21,7 +21,7 @@ async def prepare_profile(
     user_id: str | None = None,
     inherited_session_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Resolve a selection, or inherit from an already-authorized session."""
+    """Resolve a selection, inherit an already-authorized session's, or use the default."""
     catalog = getattr(request.app.state, "sandbox_profiles", None)
     if body.sandbox_profile_id is not None:
         if catalog is None:
@@ -64,7 +64,13 @@ async def prepare_profile(
                 code=ErrorCode.INVALID_INPUT,
             )
     elif body.host_type == "managed":
-        await asyncio.to_thread(catalog.require_selection, body.sandbox_provider, user_id=user_id)
+        snapshot = await asyncio.to_thread(
+            catalog.default_selection, body.sandbox_provider, user_id=user_id
+        )
+        if snapshot is None:
+            await asyncio.to_thread(
+                catalog.require_selection, body.sandbox_provider, user_id=user_id
+            )
     return snapshot
 
 

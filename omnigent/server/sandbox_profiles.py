@@ -158,6 +158,20 @@ class SandboxProfileCatalog:
             for profile in profiles
         ]
 
+    def default_selection(
+        self, provider: str | None, *, user_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Resolve the provider's default for a new session that names no profile, if any."""
+        if self._deployment is None:
+            return None
+        provider = provider or self._deployment.default.provider
+        if provider not in self.managed_providers(provider):
+            return None
+        entry = self._deployment.for_provider(provider)
+        if entry is None or entry.default_profile_id is None:
+            return None
+        return self.resolve(entry.default_profile_id, provider=provider, user_id=user_id)
+
     def require_selection(self, provider: str | None, *, user_id: str | None = None) -> None:
         if self._deployment is None:
             return

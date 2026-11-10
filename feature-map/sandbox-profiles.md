@@ -75,7 +75,10 @@ integration evidence separately; the browser test does not exercise them.
 ## Gotchas
 
 - Empty catalogs for participating providers block launch. There is no Default
-  fallback. Nonparticipating providers have no profile picker.
+  fallback in the picker. Nonparticipating providers have no profile picker.
+- `sandbox.default_profile_id` gives a participating provider a server-side default
+  for creates that name no profile (API clients, scheduled fresh sandboxes). It is
+  authorized and saved like an explicit pick; the composer does not preselect it yet.
 - Discovery is scoped to the selected provider so unrelated outages do not block
   ordinary launches. Listing is advisory; the server reauthorizes selection.
 - A stale or revoked choice requires explicit reselection. Saved sessions cannot
@@ -86,7 +89,8 @@ integration evidence separately; the browser test does not exercise them.
   profile availability. Resource location must survive catalog changes.
 - The example owns image/resource configuration. Core has no configuration schema,
   admin editor, catalog writes, directory connector or identity management.
-- Scheduled fresh sandboxes reject profile-requiring defaults at task create/update.
+- Scheduled fresh sandboxes reject profile-requiring defaults at task create/update
+  unless the default provider has a default profile, which each fire then saves.
   The session-create tool accepts explicit provider/profile/revision fields for managed placement.
   Native `/clear` and `/fork` reauthorize and
   bind the replacement before detaching the source; the last directly bound

@@ -212,6 +212,7 @@ from omnigent.onboarding.sandboxes.base import (
     SandboxGoneError,
     resolve_managed_keepalive_interval_s,
 )
+from omnigent.onboarding.sandboxes.profiles import PROFILE_ID_PATTERN
 
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
@@ -750,6 +751,9 @@ class ManagedSandboxConfig:
         the picker then blocks launch instead of offering Default.
     :param manages_profiles: Static opt-in copied from plugin metadata. Embedding
         deployments set it explicitly for launchers that require profile selection.
+    :param default_profile_id: Profile a new managed session takes when its caller
+        names none, from ``sandbox.default_profile_id``. Authorized and saved like an
+        explicit selection. ``None`` keeps a selection mandatory.
     """
 
     server_url: str
@@ -768,6 +772,7 @@ class ManagedSandboxConfig:
     # Internal continuation permission, scoped to one already-admitted legacy host.
     unprofiled_host_id: str | None = None
     manages_profiles: bool = False
+    default_profile_id: str | None = None
 
 
 class NoReachableModels(Exception):
@@ -2046,6 +2051,20 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                 "300 to 31536000 seconds (5 minutes to 365 days), or null for the provider default"
             )
         token_ttl_s = configured_token_ttl_s
+    default_profile_id = raw.get("default_profile_id")
+    if default_profile_id is not None:
+        if not manages_profiles:
+            raise ValueError(
+                "server config 'sandbox.default_profile_id' requires a provider that "
+                "manages sandbox profiles"
+            )
+        if not isinstance(default_profile_id, str) or not re.fullmatch(
+            PROFILE_ID_PATTERN, default_profile_id
+        ):
+            raise ValueError(
+                "server config 'sandbox.default_profile_id' must be a profile id: "
+                "lowercase letters, digits, '_' or '-', at most 64 characters"
+            )
     return ManagedSandboxConfig(
         server_url=server_url.strip().rstrip("/"),
         launcher_factory=launcher_factory,
@@ -2058,6 +2077,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         model_discovery=model_discovery,
         git_clone=git_clone,
         manages_profiles=manages_profiles,
+        default_profile_id=default_profile_id,
     )
 
 
