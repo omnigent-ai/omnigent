@@ -26,8 +26,9 @@ implements them separately, so a fix for one harness does not reach the others.
   reported unavailable until the user picks an offered one. Display only;
   [automations](automation-templates.md) share this curation while preserving
   saved selections on edit. Project-settings pickers are unchanged.
-- `agent-instructions`: Pi native delivers authored instructions at launch/resume;
-  authors can keep or replace Pi's base prompt and disable automatic context files.
+- `agent-instructions`: supported native startup paths preserve authored instructions
+  and add shared guidance for showing workspace screenshots; Pi authors can keep
+  or replace its base prompt and disable automatic context files.
 - `pi-host-mcp`: managed Pi sessions (pi-native with an Omnigent provider, and the
   Pi gateway executor) also get the MCP servers configured for Claude Code, Codex
   and Cursor; the user's own `~/.pi/agent/mcp.json` entries win and it is not written.
@@ -198,7 +199,13 @@ interface creating the fork. Gateway requests carry `Databricks-Custom-Coding-Ag
 creating interface use `omnigent` as a fallback.
 Routes configured by ug retain the additional `ug` surface.
 
-**Agent instructions (Pi native):** launch an agent whose spec contains inline
+**Agent instructions:** supported native startup paths add Omnigent's guidance
+to embed existing workspace screenshots in replies using their real file paths.
+After upgrading, start a new session or restart/cold-resume an existing one to
+load this guidance. Reopening the Terminal view alone does not update a running
+process.
+
+For Pi native, launch an agent whose spec contains inline
 instructions or references a bundled instruction file. Reopen its terminal and
 check the same authored role is present once. For a custom Pi-native agent,
 `executor.context_files: false` excludes automatic workspace/global notes, and

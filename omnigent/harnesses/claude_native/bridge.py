@@ -120,6 +120,7 @@ from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
+CLAUDE_STARTUP_CONTEXT_FILE = "startup_context.txt"
 
 _logger = logging.getLogger(__name__)
 _INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
@@ -2552,24 +2553,29 @@ def build_hook_settings(
     # far. Python's start-up keeps that message ahead of the Stop record; a
     # curl hook can beat it, and a native sub-agent's parent gets no output.
     turn_end_hook = {"type": "command", "command": python_command}
-    framework_context_parts = [
-        python,
-        "-I",
-        "-m",
-        "omnigent.harnesses.claude_native.hook",
-        "framework-context",
-        "--bridge-dir",
-        str(bridge_dir),
-    ]
-    # Most prompts carry no framework context, so the shell answers those.
-    framework_context_file = shlex.quote(str(bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE))
-    framework_context_hook = {
-        "type": "command",
-        "command": (
-            f"if [ ! -e {framework_context_file} ]; then cat >/dev/null; exit 0; fi; "
-            f"{_python_hook_command(framework_context_parts)} 2>> {observer_stderr}"
-        ),
-    }
+    context_hooks = {}
+    for subcommand, filename in (
+        ("framework-context", CLAUDE_FRAMEWORK_CONTEXT_FILE),
+        ("startup-context", CLAUDE_STARTUP_CONTEXT_FILE),
+    ):
+        context_parts = [
+            python,
+            "-I",
+            "-m",
+            "omnigent.harnesses.claude_native.hook",
+            subcommand,
+            "--bridge-dir",
+            str(bridge_dir),
+        ]
+        # Read context inside the terminal sandbox; absent files need no Python.
+        context_file = shlex.quote(str(bridge_dir / filename))
+        context_hooks[subcommand] = {
+            "type": "command",
+            "command": (
+                f"if [ ! -e {context_file} ]; then cat >/dev/null; exit 0; fi; "
+                f"{_python_hook_command(context_parts)} 2>> {observer_stderr}"
+            ),
+        }
     session_start_hook = {
         "type": "command",
         "command": command,
@@ -2589,7 +2595,7 @@ def build_hook_settings(
         ),
     }
     hooks: dict[str, list[_JsonObject]] = {
-        "SessionStart": [{"hooks": [session_start_hook]}],
+        "SessionStart": [{"hooks": [session_start_hook, context_hooks["startup-context"]]}],
         "SessionEnd": [{"hooks": [hook]}],
         "Stop": [{"hooks": [turn_end_hook]}],
         "StopFailure": [{"hooks": [turn_end_hook]}],
@@ -2598,7 +2604,7 @@ def build_hook_settings(
         # (web-UI message via tmux send-keys, or direct keystrokes
         # into the embedded terminal). The transcript forwarder
         # translates it into ``session.status: running``.
-        "UserPromptSubmit": [{"hooks": [hook, framework_context_hook]}],
+        "UserPromptSubmit": [{"hooks": [hook, context_hooks["framework-context"]]}],
         # ``TaskCreated`` fires when Claude creates a new native task
         # (shown with ``□`` in the TUI). The payload carries ``task_id``
         # and ``task_subject``; the forwarder converts all current tasks
@@ -2977,10 +2983,9 @@ def augment_claude_args(
         / ``"none"`` / list of skill names), mapped to
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
-    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
-        (author-supplied, not framework-composed) to append through Claude
-        Code's native ``--append-system-prompt`` flag, placed before a
-        caller-supplied inline prompt instead of replacing it.
+    :param append_system_prompt: Optional startup instructions, placed before
+        a caller-supplied inline prompt. With a caller prompt file, delivered
+        through SessionStart context so Claude reads the file in its sandbox.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param subagent_router_dir: Directory advertising the runner's
@@ -3028,7 +3033,7 @@ def augment_claude_args(
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
         args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])
     args.extend(["--settings", str(settings_path)])
-    args = _merge_append_system_prompt(args, append_system_prompt)
+    args = _merge_append_system_prompt(args, append_system_prompt, bridge_dir=bridge_dir)
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
     from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
 
@@ -3116,32 +3121,46 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
     return args
 
 
-def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]:
+def _merge_append_system_prompt(
+    args: list[str], extra: str | None, *, bridge_dir: Path
+) -> list[str]:
     """Put ``extra`` before the caller's ``--append-system-prompt`` value.
 
     Claude Code keeps only the last value of the flag, so ``extra`` joins that
     value in place, or a new flag carries it. The scan stops at a bare ``--``.
-    Other caller tokens, including an ``--append-system-prompt-file``, are left
-    as they are. Claude Code 2.1.295+ applies such a file before the inline
-    prompt; 2.1.161 and 2.1.278 refuse to start with both.
+    Caller prompt files stay in Claude's sandbox. With a file flag, deliver only
+    ``extra`` through SessionStart so older CLIs do not receive a second flag.
 
     :param args: Claude CLI argument list to mutate-and-return.
     :param extra: Instructions Omnigent appends, e.g. the agent's instructions.
-    :returns: ``args`` whose last prompt value carries both prompts.
+    :param bridge_dir: Owner-only directory for generated startup context.
+    :returns: ``args`` with inline instructions merged, or caller file flags intact.
     """
+    startup_context = bridge_dir / CLAUDE_STARTUP_CONTEXT_FILE
     if not extra:
+        startup_context.unlink(missing_ok=True)
         return args
     flag = "--append-system-prompt"
-    joined_prefix = f"{flag}="
+    file_flag = f"{flag}-file"
     location: tuple[int, int] | None = None
+    has_prompt_file = False
     idx = 0
     while idx < len(args) and args[idx] != "--":
-        if args[idx].startswith(joined_prefix):
-            location = (idx, len(joined_prefix))
+        if args[idx] == file_flag:
+            has_prompt_file = True
+            idx += 1
+        elif args[idx].startswith(f"{file_flag}="):
+            has_prompt_file = True
+        elif args[idx].startswith(f"{flag}="):
+            location = (idx, len(flag) + 1)
         elif args[idx] == flag and idx + 1 < len(args):
             location = (idx + 1, 0)
             idx += 1
         idx += 1
+    if has_prompt_file:
+        _write_private_file(startup_context, extra)
+        return args
+    startup_context.unlink(missing_ok=True)
     if location is None:
         args.extend([flag, extra])
         return args
