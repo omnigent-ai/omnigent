@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -360,6 +362,68 @@ def test_materialize_cache_creates_or_reuses_non_executable_files(
     assert path.stat().st_mode & 0o111 == 0
     assert materialize_attachment(_zip_block(), tmp_path) == path
     assert list(path.parent.iterdir()) == [path]
+
+
+@pytest.mark.parametrize("operation", ["attachment", "paste", "receipt"])
+@pytest.mark.parametrize("boundary", ["directory", "create", "write"])
+@pytest.mark.parametrize(
+    "storage_errno", [errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC), errno.EIO]
+)
+@pytest.mark.parametrize("raise_storage_errors", [False, True])
+def test_materialize_cache_exposes_only_recoverable_storage_errors_when_requested(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    boundary: str,
+    storage_errno: int,
+    raise_storage_errors: bool,
+) -> None:
+    cache = (
+        attachment_cache_dir(tmp_path)
+        if operation == "attachment"
+        else pasted_text_cache_dir(tmp_path)
+    )
+    open_file, mkdir = os.open, Path.mkdir
+
+    def fail_storage(*_args, **_kwargs):
+        raise OSError(storage_errno, "synthetic cache error")
+
+    def mkdir_cache(path, *args, **kwargs):
+        if path == cache.parent:
+            fail_storage()
+        return mkdir(path, *args, **kwargs)
+
+    def create_file(path, flags, *args, **kwargs):
+        if flags & os.O_CREAT and kwargs.get("dir_fd") is not None:
+            fail_storage()
+        return open_file(path, flags, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        if boundary == "directory":
+            patch.setattr(Path, "mkdir", mkdir_cache)
+        elif boundary == "create":
+            patch.setattr(native_attachments.os, "open", create_file)
+        else:
+            patch.setattr(native_attachments.os, "write", fail_storage)
+        arguments = {"raise_storage_errors": raise_storage_errors}
+
+        def materialize():
+            if operation == "attachment":
+                return materialize_attachment(_zip_block(), tmp_path, **arguments)
+            if operation == "paste":
+                return materialize_text("original input", tmp_path, **arguments)
+            return record_spilled_text("reference", [], tmp_path, **arguments)
+
+        if raise_storage_errors and storage_errno in {
+            errno.ENOSPC,
+            getattr(errno, "EDQUOT", None),
+        }:
+            with pytest.raises(OSError) as raised:
+                materialize()
+            assert raised.value.errno == storage_errno
+        else:
+            assert materialize() is None
+    assert list(cache.glob("*")) == [], "failed cache writes must leave no partial content"
 
 
 def test_materialize_cache_contains_path_traversal(tmp_path: Path) -> None:

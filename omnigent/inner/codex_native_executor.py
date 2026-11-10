@@ -12,14 +12,14 @@ import logging
 import os
 import uuid
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
 
 from websockets.exceptions import WebSocketException
 
 from omnigent.debug_logging import debug_event
-from omnigent.errors import OmnigentError
+from omnigent.errors import _DISK_FULL_ERRNOS, OmnigentError
 from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
@@ -730,13 +730,25 @@ async def _start_codex_turn(
     turn = _json_object(result.get("turn")) if result is not None else None
     turn_id = turn.get("id") if turn is not None else None
     if isinstance(turn_id, str) and turn_id:
-        if record_acknowledged_turn_id(bridge_dir, state, turn_id):
+        if _record_accepted_turn(bridge_dir, state, turn_id):
             _logger.info("Codex native started turn: turn_id=%s", turn_id)
         else:
             _logger.info(
                 "Codex native turn start acknowledged after the active turn changed: turn_id=%s",
                 turn_id,
             )
+
+
+def _record_accepted_turn(
+    bridge_dir: Path, sent_state: CodexNativeBridgeState, turn_id: str
+) -> bool:
+    """A local write failure cannot turn acknowledged input into a resendable refusal."""
+    try:
+        return record_acknowledged_turn_id(bridge_dir, sent_state, turn_id)
+    except OSError as exc:
+        raise InjectionDeliveryAmbiguous(
+            "Codex accepted this message, but its local turn state could not be saved."
+        ) from exc
 
 
 async def _steer_codex_turn(
@@ -762,7 +774,7 @@ async def _steer_codex_turn(
     result = _json_object(response.get("result")) if response is not None else None
     turn_id = result.get("turnId") if result is not None else None
     if isinstance(turn_id, str) and turn_id:
-        if record_acknowledged_turn_id(bridge_dir, state, turn_id):
+        if _record_accepted_turn(bridge_dir, state, turn_id):
             _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
         else:
             _logger.info(
@@ -1101,10 +1113,7 @@ async def _inject_codex_turn_once(
     # Codex authoritatively says A is no longer the active turn (it ended, or a
     # newer turn B replaced it). Clear A only if it is still the bridge's value;
     # a concurrent turn/started(B) must survive this recovery.
-    clear_active_turn_id_if_matches(bridge_dir, expected_turn_id)
-    recovered_state = read_bridge_state(bridge_dir)
-    if recovered_state is None or recovered_state.session_id != state.session_id:
-        raise RuntimeError("Codex native bridge changed while recovering a stale turn")
+    recovered_state = await _recover_stale_turn_when_writable(bridge_dir, state)
     if recovered_state.active_turn_id is not None:
         _logger.info(
             "Codex native stale steer raced with a newer turn; steering turn_id=%s",
@@ -1125,6 +1134,57 @@ async def _inject_codex_turn_once(
         input_items=input_items,
         settings_overrides=settings_overrides,
     )
+
+
+async def _recover_stale_turn_when_writable(
+    bridge_dir: Path, observed: CodexNativeBridgeState
+) -> CodexNativeBridgeState:
+    """Retry only the local write after Codex explicitly rejected stale-turn input."""
+    storage_wait = False
+    while True:
+        _require_codex_binding(bridge_dir, observed)
+        failure = read_bridge_startup_failure(bridge_dir)
+        if failure is not None:
+            raise _CodexNativeInputUndelivered(failure, preserve_session=True)
+        try:
+            clear_active_turn_id_if_matches(
+                bridge_dir, observed.active_turn_id, expected_owner=observed
+            )
+        except OSError as exc:
+            if exc.errno not in _DISK_FULL_ERRNOS:
+                raise
+            if not storage_wait:
+                storage_wait = True
+                log_input_event(
+                    _logger,
+                    "codex_native_storage_wait",
+                    session_id=observed.session_id,
+                    stage="stale_turn_recovery",
+                    outcome="waiting",
+                    os_errno=exc.errno,
+                )
+            await asyncio.sleep(_BRIDGE_STATE_SLOW_POLL_SECONDS)
+            continue
+        current = read_bridge_state(bridge_dir)
+        _require_codex_binding(bridge_dir, observed)
+        if current is None or not _codex_binding_matches(current, observed):
+            raise _CodexNativeInputUndelivered(
+                CodexStartupFailure(
+                    message="Codex native session changed while recovering a stale turn; "
+                    "this message was not delivered.",
+                    remediation="Send the message again in the current session.",
+                ),
+                preserve_session=True,
+            )
+        if storage_wait:
+            log_input_event(
+                _logger,
+                "codex_native_storage_wait",
+                session_id=observed.session_id,
+                stage="stale_turn_recovery",
+                outcome="recovered",
+            )
+        return replace(current, interrupt_generation=observed.interrupt_generation)
 
 
 class CodexNativeExecutor(Executor):
@@ -1186,22 +1246,54 @@ class CodexNativeExecutor(Executor):
         *,
         goal_objective: str | None = None,
     ) -> tuple[CodexNativeBridgeState | None, dict[str, int], list[dict[str, object]]]:
+        """Keep the original input and owner while its local cache waits for capacity."""
         generations = _input_interrupt_generations(self._bridge_dir)
         observed = read_bridge_state(self._bridge_dir)
-        try:
-            input_items: list[dict[str, object]] = (
-                [{"type": "text", "text": goal_objective}]
-                if goal_objective is not None
-                else await asyncio.to_thread(
-                    _content_to_input_items,
-                    content,
-                    self._bridge_dir,
+        storage_wait = False
+        while True:
+            if storage_wait:
+                self._require_prepared_input_owner(observed, generations)
+                failure = read_bridge_startup_failure(self._bridge_dir)
+                if failure is not None:
+                    raise _CodexNativeInputUndelivered(failure, preserve_session=True)
+            try:
+                try:
+                    input_items: list[dict[str, object]] = (
+                        [{"type": "text", "text": goal_objective}]
+                        if goal_objective is not None
+                        else await asyncio.to_thread(
+                            _content_to_input_items,
+                            content,
+                            self._bridge_dir,
+                            session_id=self._request_session_id,
+                        )
+                    )
+                finally:
+                    self._require_prepared_input_owner(observed, generations)
+            except OSError as exc:
+                if exc.errno not in _DISK_FULL_ERRNOS:
+                    raise
+                if not storage_wait:
+                    storage_wait = True
+                    log_input_event(
+                        _logger,
+                        "codex_native_storage_wait",
+                        session_id=self._request_session_id,
+                        stage="input_preparation",
+                        outcome="waiting",
+                        os_errno=exc.errno,
+                    )
+                await asyncio.sleep(_BRIDGE_STATE_SLOW_POLL_SECONDS)
+                continue
+            if storage_wait:
+                log_input_event(
+                    _logger,
+                    "codex_native_storage_wait",
                     session_id=self._request_session_id,
+                    stage="input_preparation",
+                    outcome="recovered",
                 )
-            )
-        finally:
-            self._require_prepared_input_owner(observed, generations)
-        return observed, generations, input_items
+            return observed, generations, input_items
 
     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
         """
@@ -1944,6 +2036,7 @@ def _content_to_input_items(
             bridge_dir,
             input_receipt=current_native_input_receipt(),
             cache_files=cache_files,
+            raise_storage_errors=True,
         )
         items = _SpilledInputItems(items, message_id, tuple((start, end) for start, end in ranges))
     return items
@@ -1996,11 +2089,13 @@ def _collect_input_items(
                 items.append(
                     {
                         "type": "text",
-                        "text": attachment_reference_line(block, bridge_dir),
+                        "text": attachment_reference_line(
+                            block, bridge_dir, raise_storage_errors=True
+                        ),
                     }
                 )
             elif block_type == "input_image":
-                path = materialize_attachment(block, bridge_dir)
+                path = materialize_attachment(block, bridge_dir, raise_storage_errors=True)
                 if path is not None:
                     items.append({"type": "localImage", "path": str(path)})
                 else:
@@ -2053,9 +2148,9 @@ def _spill_oversized_text(
         ):
             break
         path = (
-            materialize_attachment(entry.block, bridge_dir)
+            materialize_attachment(entry.block, bridge_dir, raise_storage_errors=True)
             if entry.block is not None
-            else materialize_text(entry.text, bridge_dir)
+            else materialize_text(entry.text, bridge_dir, raise_storage_errors=True)
         )
         if path is None:
             if entry.kind == "file":
@@ -2143,7 +2238,7 @@ def _file_block_to_input_item(
     :returns: A Codex ``text`` input item referencing the file, or a visible
         could-not-load marker item when the file failed to materialize.
     """
-    path = materialize_attachment(block, bridge_dir)
+    path = materialize_attachment(block, bridge_dir, raise_storage_errors=True)
     if path is not None:
         return _attached_file_item(path)
     return {"type": "text", "text": unresolved_attachment_marker(block)}

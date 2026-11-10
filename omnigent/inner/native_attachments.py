@@ -36,6 +36,7 @@ from typing import Any, Literal
 import httpx
 
 from omnigent.debug_logging import debug_event
+from omnigent.errors import _DISK_FULL_ERRNOS
 from omnigent.native.input_receipt import validate_native_input_receipt
 from omnigent.process_logging import data_dir
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
@@ -280,7 +281,9 @@ def _session_cache_dir(bridge_dir: Path, namespace: str) -> Path:
     return data_dir().resolve() / namespace / key
 
 
-def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Path | None:
+def materialize_attachment(
+    block: Mapping[str, object], bridge_dir: Path, *, raise_storage_errors: bool = False
+) -> Path | None:
     """
     Decode an attachment into the session's cache outside the working directory.
 
@@ -293,6 +296,7 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
         e.g. ``"data:image/png;base64,iVBOR..."``. May also carry a
         ``filename``, e.g. ``"diagram.png"``.
     :param bridge_dir: Session bridge path, used to identify its attachment cache.
+    :param raise_storage_errors: Raise disk/quota failures so preparation can wait.
     :returns: Path to the written file, or ``None`` if the block could
         not be materialized (missing data URI, decode error).
     """
@@ -300,7 +304,12 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
     if decoded is None:
         return None
     raw_bytes, filename = decoded
-    return _materialize_bytes(raw_bytes, filename, attachment_cache_dir(bridge_dir))
+    return _materialize_bytes(
+        raw_bytes,
+        filename,
+        attachment_cache_dir(bridge_dir),
+        raise_storage_errors=raise_storage_errors,
+    )
 
 
 def attachment_content_digest(raw_bytes: bytes) -> str:
@@ -308,7 +317,9 @@ def attachment_content_digest(raw_bytes: bytes) -> str:
     return hashlib.sha256(raw_bytes).hexdigest()[:12]
 
 
-def materialize_text(text: str, bridge_dir: Path) -> Path | None:
+def materialize_text(
+    text: str, bridge_dir: Path, *, raise_storage_errors: bool = False
+) -> Path | None:
     """
     Write *text* into the session's generated-paste cache as a UTF-8 ``.txt`` file.
 
@@ -318,6 +329,7 @@ def materialize_text(text: str, bridge_dir: Path) -> Path | None:
 
     :param text: Text to store, e.g. a message too long to send inline.
     :param bridge_dir: Session bridge path, used to identify its attachment cache.
+    :param raise_storage_errors: Raise disk/quota failures so preparation can wait.
     :returns: Path to the written file, e.g.
         ``.../pasted-text/<key>/pasted_text_1a2b3c4d5e6f.txt``, or ``None`` if
         it could not be written.
@@ -328,7 +340,10 @@ def materialize_text(text: str, bridge_dir: Path) -> Path | None:
         return None
     digest = attachment_content_digest(raw_bytes)
     return _materialize_bytes(
-        raw_bytes, f"pasted_text_{digest}.txt", pasted_text_cache_dir(bridge_dir)
+        raw_bytes,
+        f"pasted_text_{digest}.txt",
+        pasted_text_cache_dir(bridge_dir),
+        raise_storage_errors=raise_storage_errors,
     )
 
 
@@ -351,6 +366,7 @@ def record_spilled_text(
     *,
     input_receipt: object = None,
     cache_files: list[tuple[Path, str, int]] | None = None,
+    raise_storage_errors: bool = False,
 ) -> str | None:
     """Record generated reference occurrences under one native delivery identity."""
     try:
@@ -385,7 +401,12 @@ def record_spilled_text(
         return None
     message_id = f"omnigent-paste-{uuid.uuid4().hex}-{hashlib.sha256(receipt).hexdigest()}"
     name = f"{message_id}.json"
-    path = _materialize_bytes(receipt, name, pasted_text_cache_dir(bridge_dir))
+    path = _materialize_bytes(
+        receipt,
+        name,
+        pasted_text_cache_dir(bridge_dir),
+        raise_storage_errors=raise_storage_errors,
+    )
     return message_id if path is not None and path.name == name else None
 
 
@@ -611,7 +632,9 @@ def _read_cached_file(
         return None
 
 
-def _materialize_bytes(raw_bytes: bytes, filename: str, cache_dir: Path) -> Path | None:
+def _materialize_bytes(
+    raw_bytes: bytes, filename: str, cache_dir: Path, *, raise_storage_errors: bool = False
+) -> Path | None:
     """
     Place *raw_bytes* as *filename* in a session-owned cache.
 
@@ -636,7 +659,9 @@ def _materialize_bytes(raw_bytes: bytes, filename: str, cache_dir: Path) -> Path
             )
         finally:
             os.close(root_fd)
-    except OSError:
+    except OSError as exc:
+        if raise_storage_errors and exc.errno in _DISK_FULL_ERRNOS:
+            raise
         _logger.warning("Refusing to materialize into %s", cache_dir, exc_info=True)
         return None
     try:
@@ -651,7 +676,9 @@ def _materialize_bytes(raw_bytes: bytes, filename: str, cache_dir: Path) -> Path
                 return cache_dir / name
         _logger.warning("Attachment names for %s already hold other content", filename)
         return None
-    except OSError:
+    except OSError as exc:
+        if raise_storage_errors and exc.errno in _DISK_FULL_ERRNOS:
+            raise
         _logger.warning("Failed to materialize attachment %s", filename, exc_info=True)
         return None
     finally:
@@ -717,6 +744,8 @@ def _place_no_follow(
     except FileNotFoundError:
         return _create_no_follow(dir_fd, name, raw_bytes)
     except OSError as exc:
+        if exc.errno in _DISK_FULL_ERRNOS:
+            raise
         return "symlink" if exc.errno == errno.ELOOP else "taken"
     try:
         info = os.fstat(fd)
@@ -726,7 +755,9 @@ def _place_no_follow(
             return "taken"
         try:
             os.fchmod(fd, stat.S_IMODE(info.st_mode) & ~0o111)
-        except OSError:
+        except OSError as exc:
+            if exc.errno in _DISK_FULL_ERRNOS:
+                raise
             # A reused file must not stay executable; if the bits can't be
             # cleared, fall through to the collision name instead.
             return "taken"
@@ -756,6 +787,8 @@ def _create_no_follow(
     except FileExistsError:
         return "taken"
     except OSError as exc:
+        if exc.errno in _DISK_FULL_ERRNOS:
+            raise
         return "symlink" if exc.errno == errno.ELOOP else "taken"
     try:
         view = memoryview(raw_bytes)
@@ -824,7 +857,9 @@ def unresolved_attachment_marker(block: Mapping[str, object]) -> str:
     return f"[Attachment {_MARKER_UNSAFE.sub('_', name)} could not be loaded]"
 
 
-def attachment_reference_line(block: Mapping[str, object], bridge_dir: Path) -> str:
+def attachment_reference_line(
+    block: Mapping[str, object], bridge_dir: Path, *, raise_storage_errors: bool = False
+) -> str:
     """
     Materialize *block* and return the transcript line referencing it.
 
@@ -835,10 +870,11 @@ def attachment_reference_line(block: Mapping[str, object], bridge_dir: Path) -> 
     :param block: Attachment content block (see
         :func:`materialize_attachment`).
     :param bridge_dir: Session bridge path identifying the attachment cache.
+    :param raise_storage_errors: Raise disk/quota failures so preparation can wait.
     :returns: ``"[Attached: <path>]"`` on success, else the visible
         marker from :func:`unresolved_attachment_marker`.
     """
-    path = materialize_attachment(block, bridge_dir)
+    path = materialize_attachment(block, bridge_dir, raise_storage_errors=raise_storage_errors)
     if path is not None:
         return f"[Attached: {path}]"
     return unresolved_attachment_marker(block)

@@ -85,6 +85,7 @@ from omnigent.inner.datamodel import (
 from omnigent.inner.native_attachments import materialize_attachment
 from omnigent.native import native_cost_popup, policy_allow_cache
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
+from tests._helpers.live_server import reserve_port
 
 
 @pytest.fixture(autouse=True)
@@ -15846,7 +15847,7 @@ async def test_turn_ends_session_rotation_and_a_missing_relay_run_the_python_hoo
     Claude writes a turn's final message while its Stop hooks run, and Python's
     start-up keeps that message ahead of the Stop record. ``/clear`` and
     ``/resume`` can rotate the Omnigent session, which the Python hook does
-    with the terminal's credentials. Once the relay is gone, every hook runs it.
+    with the terminal's credentials. A refused relay connection also runs Python.
     """
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, _ScriptedPolicyClient({}))
     python, runs = _fake_hook_python(tmp_path)
@@ -15866,7 +15867,19 @@ async def test_turn_ends_session_rotation_and_a_missing_relay_run_the_python_hoo
     finally:
         relay.close()
     prompt = {"hook_event_name": "UserPromptSubmit"}
-    result = await _run_hook_command(lifecycle_hook, prompt, _TERMINAL_ENV)
+    with reserve_port() as refused_endpoint:
+        relay_env = bridge_dir / "tool_relay.env"
+        relay_env.write_text(
+            "\n".join(
+                f"OMNIGENT_RELAY_URL='http://127.0.0.1:{refused_endpoint.getsockname()[1]}'"
+                if line.startswith("OMNIGENT_RELAY_URL=")
+                else line
+                for line in relay_env.read_text(encoding="utf-8").splitlines()
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result = await _run_hook_command(lifecycle_hook, prompt, _TERMINAL_ENV)
     assert result.returncode == 0, result.stderr
 
     log = runs.read_text()
