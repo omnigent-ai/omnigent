@@ -312,6 +312,17 @@ class RunnerRouter:
         """
         return self._registry.get(runner_id) is not None
 
+    def runner_has_capability(self, runner_id: str, capability: str) -> bool:
+        """
+        Return whether connected runner *runner_id* advertised *capability*.
+
+        :param runner_id: Runner UUID, e.g. ``"runner_0123456789abcdef"``.
+        :param capability: Hello capability token, e.g. ``"mcp_registry"``.
+        :returns: ``False`` when the runner is offline or lacks the token.
+        """
+        connection = self._registry.get(runner_id)
+        return connection is not None and capability in connection.hello.capabilities
+
     def require_mcp_registry_support(self, conversation: Conversation) -> None:
         """Validate the connected runner before sending it a registry-backed agent."""
         from omnigent.host.frames import CAP_MCP_REGISTRY

@@ -646,6 +646,19 @@ function isListed(path: string): boolean {
 
 const viewedBox = (path: string) => screen.getByRole("checkbox", { name: `Viewed ${path}` });
 
+/**
+ * Stores marks as another tab would: the entry changes in storage, and this tab hears only the
+ * `storage` event.
+ */
+function markInOtherTab(marks: Record<string, string[]>) {
+  const key = viewedStorageKey(window.location.origin, "alice", IDENTITY);
+  const newValue = JSON.stringify({ v: 2, marks, updatedAt: Date.now() });
+  localStorage.setItem(key, newValue);
+  act(() => {
+    window.dispatchEvent(new StorageEvent("storage", { key, newValue, storageArea: localStorage }));
+  });
+}
+
 describe("PullRequestChangesTab viewed files", () => {
   beforeEach(() => {
     localStorage.clear();
@@ -688,6 +701,66 @@ describe("PullRequestChangesTab viewed files", () => {
     expect(screen.getByText("0 / 2 files viewed")).toBeInTheDocument();
   });
 
+  it("collapses a file that another tab marks viewed", () => {
+    render(viewedTab({ conversationId: "viewed-remote" }));
+    expect(isCollapsed("a.ts")).toBe(false);
+
+    markInOtherTab({ "a.ts": [unverifiedPatchHash("head1")] });
+
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+  });
+
+  it("keeps a file the reader expanded after another tab marked it viewed", () => {
+    render(viewedTab({ conversationId: "viewed-remote-expand" }));
+    markInOtherTab({ "a.ts": [unverifiedPatchHash("head1")] });
+    fireEvent.click(fileSection("a.ts").querySelector("button")!);
+    expect(isCollapsed("a.ts")).toBe(false);
+
+    // Another mark from the other tab re-reads storage without a new mark on a.ts.
+    markInOtherTab({
+      "a.ts": [unverifiedPatchHash("head1")],
+      "b.ts": [unverifiedPatchHash("head1")],
+    });
+
+    expect(isCollapsed("a.ts")).toBe(false);
+    expect(isCollapsed("b.ts")).toBe(true);
+
+    // Another tab unmarks a.ts: it stays open. Marking it again collapses it.
+    markInOtherTab({ "b.ts": [unverifiedPatchHash("head1")] });
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(false);
+    markInOtherTab({
+      "a.ts": [unverifiedPatchHash("head1")],
+      "b.ts": [unverifiedPatchHash("head1")],
+    });
+    expect(isCollapsed("a.ts")).toBe(true);
+  });
+
+  it("keeps a file the reader expanded when viewed state drops out and returns on the same head", () => {
+    const { rerender } = render(viewedTab({ conversationId: "viewed-remote-reload" }));
+    markInOtherTab({ "a.ts": [unverifiedPatchHash("head1")] });
+    fireEvent.click(fileSection("a.ts").querySelector("button")!);
+    expect(isCollapsed("a.ts")).toBe(false);
+
+    rerender(viewedTab({ conversationId: "viewed-remote-reload", identity: null }));
+    rerender(viewedTab({ conversationId: "viewed-remote-reload" }));
+
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(false);
+  });
+
+  it("expands a file that another tab's mark collapsed once the head moves", () => {
+    const { rerender } = render(viewedTab({ conversationId: "viewed-remote-head", head: "head1" }));
+    markInOtherTab({ "a.ts": [unverifiedPatchHash("head1")] });
+    expect(isCollapsed("a.ts")).toBe(true);
+
+    rerender(viewedTab({ conversationId: "viewed-remote-head", head: "head2" }));
+
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(false);
+  });
+
   it("hides viewed files together with the path filter", () => {
     const store = renderHook(() => useChangesViewState("viewed-hide", PR_URL));
     const files = [changed("src/a.ts"), changed("src/b.ts"), changed("docs/a.md")];
@@ -716,6 +789,30 @@ describe("PullRequestChangesTab viewed files", () => {
 
     expect(screen.getByRole("checkbox", { name: "Hide viewed" })).not.toBeChecked();
     expect(isListed("a.ts")).toBe(true);
+  });
+
+  it("moves focus to the next shown file's Viewed box when Hide viewed removes the file just marked", () => {
+    render(viewedTab({ conversationId: "viewed-focus-next" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Hide viewed" }));
+
+    // The reader's click focuses the box before the file it marks disappears.
+    viewedBox("a.ts").focus();
+    fireEvent.click(viewedBox("a.ts"));
+
+    expect(isListed("a.ts")).toBe(false);
+    expect(viewedBox("b.ts")).toHaveFocus();
+  });
+
+  it("moves focus to Hide viewed when the file just marked was the last one shown", () => {
+    render(viewedTab({ conversationId: "viewed-focus-last" }));
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Hide viewed" }));
+
+    viewedBox("b.ts").focus();
+    fireEvent.click(viewedBox("b.ts"));
+
+    expect(screen.getByText("All 2 files viewed")).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Hide viewed" })).toHaveFocus();
   });
 
   it("resets a changed file's mark on a new head and shows a dismissible notice", () => {

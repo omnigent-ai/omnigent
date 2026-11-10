@@ -338,7 +338,7 @@ async def test_routes_are_off_without_the_feature(stores: SimpleNamespace, tmp_p
     transport = httpx.ASGITransport(app=_app(stores, tmp_path, enabled=False))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         assert (await c.get("/v1/inbox/items")).status_code == 404
-        assert (await c.get("/v1/info")).json()["proactive_agent_enabled"] is False
+        assert (await c.get("/v1/info")).json()["proactive_agent_available"] is False
 
 
 async def test_a_per_request_gate_turns_the_routes_on_and_off(
@@ -352,4 +352,4 @@ async def test_a_per_request_gate_turns_the_routes_on_and_off(
         assert (await c.get("/v1/inbox/items")).status_code == 404
         gate["on"] = True
         assert (await c.get("/v1/inbox/items")).status_code == 200
-        assert (await c.get("/v1/info")).json()["proactive_agent_enabled"] is True
+        assert (await c.get("/v1/info")).json()["proactive_agent_available"] is True

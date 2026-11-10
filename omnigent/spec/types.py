@@ -892,6 +892,7 @@ class ToolGroupsConfig:
     :param comments: ``list_comments`` and ``update_comment``.
     :param policies: ``sys_add_policy`` and ``sys_policy_registry``.
     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
+    :param projects: ``sys_project_list`` and ``sys_session_update``.
     :param user_inbox: ``sys_user_inbox_post`` and ``sys_user_inbox_list``,
         which write to and read the owner's Inbox. Off by default.
     """
@@ -901,6 +902,7 @@ class ToolGroupsConfig:
     comments: bool = True
     policies: bool = True
     agent_discovery: bool = True
+    projects: bool = True
     user_inbox: bool = False
 
 

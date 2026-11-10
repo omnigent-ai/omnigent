@@ -146,7 +146,7 @@ def _parse_cursor(after: str | None) -> tuple[int, str] | None:
 def create_inbox_items_router(
     store: InboxItemStore,
     *,
-    enabled: Callable[[], bool],
+    enabled: Callable[[str], bool],
     conversation_store: ConversationStore,
     agent_store: AgentStore,
     agent_cache: Any,
@@ -156,8 +156,8 @@ def create_inbox_items_router(
     """Build the Inbox items router.
 
     :param store: Store for Inbox items.
-    :param enabled: Whether this request's caller can use Inbox items; every route
-        returns 404 when it is false.
+    :param enabled: Whether Inbox items are on for the caller, given the caller's
+        user id; every route returns 404 when it is false.
     :param conversation_store: Store used to load the posting session.
     :param agent_store: Store used to load that session's agent.
     :param agent_cache: Cache used to load the agent's spec.
@@ -166,15 +166,15 @@ def create_inbox_items_router(
     :returns: The configured router.
     """
 
-    def require_enabled() -> None:
-        if not enabled():
-            raise HTTPException(status_code=404, detail="not found")
-
-    router = APIRouter(dependencies=[Depends(require_enabled)])
-
     def _owner(request: Request) -> str:
         user_id = require_user(request, auth_provider)
         return user_id if user_id is not None else RESERVED_USER_LOCAL
+
+    async def require_enabled(request: Request) -> None:
+        if not await asyncio.to_thread(enabled, _owner(request)):
+            raise HTTPException(status_code=404, detail="not found")
+
+    router = APIRouter(dependencies=[Depends(require_enabled)])
 
     def _posting_agent(source_session_id: str) -> tuple[str, str | None]:
         """Return the source session's agent id and bundle hash, if it may post."""
