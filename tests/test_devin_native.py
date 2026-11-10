@@ -17,6 +17,7 @@ from omnigent.harnesses.devin_native.bridge import (
     build_devin_launch_args,
     build_devin_mcp_server,
     build_devin_native_spawn_env,
+    build_devin_native_terminal_env,
     build_hook_config,
     canonical_devin_permission_mode,
     clear_agent_instructions_preamble,
@@ -735,6 +736,23 @@ class TestSpawnEnv:
         env = build_devin_native_spawn_env("conv_abc123")
         assert env["HARNESS_DEVIN_NATIVE_REQUEST_SESSION_ID"] == "conv_abc123"
         assert Path(env["HARNESS_DEVIN_NATIVE_BRIDGE_DIR"]).is_dir()
+
+    @pytest.mark.usefixtures("_isolated_bridge_root")
+    def test_terminal_env_keeps_variables_forwarded_for_the_session(self) -> None:
+        env = build_devin_native_terminal_env(
+            "conv_abc123",
+            source_env={
+                "PATH": "/usr/bin",
+                "OMNIGENT_RUNNER_SESSION_ENV_NAMES": "ARCATERM_CAPABILITY,ARCATERM_PROJECTS_ROOT",
+                "ARCATERM_CAPABILITY": "capability-for-pane-1",
+                "ARCATERM_PROJECTS_ROOT": "",
+                "UNLISTED_SECRET": "nope",
+            },
+        )
+        assert env["ARCATERM_CAPABILITY"] == "capability-for-pane-1"
+        assert env["ARCATERM_PROJECTS_ROOT"] == ""
+        assert env["PATH"] == "/usr/bin"
+        assert "UNLISTED_SECRET" not in env
 
 
 class TestNormalizeToolResult:

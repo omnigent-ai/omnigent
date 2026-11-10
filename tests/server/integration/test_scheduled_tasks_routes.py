@@ -844,6 +844,7 @@ async def test_create_rejects_invalid_permission_mode(
     )
     assert resp.status_code == 400, resp.text
     assert "Unsupported permission_mode" in resp.text
+    assert "JSON null (not the string 'null') for the agent default" in resp.text
 
 
 async def test_create_rejects_relative_workspace(
