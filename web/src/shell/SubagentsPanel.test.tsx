@@ -1531,7 +1531,7 @@ describe("SubagentsPanel", () => {
     // The depth-3 row's child query is disabled (null id) instead of
     // fetching c3's children.
     expect(useChildSessionsMock).toHaveBeenCalledWith(null, undefined);
-    expect(useChildSessionsMock).not.toHaveBeenCalledWith("c3");
+    expect(useChildSessionsMock.mock.calls.map(([sessionId]) => sessionId)).not.toContain("c3");
   });
 
   it("shows the router's model on a routed sub-agent row, and nothing when unrouted", () => {
@@ -1590,7 +1590,10 @@ it("shows each child cost when the overview flag is enabled", () => {
       </CapabilitiesProvider>
     </MemoryRouter>,
   );
-  expect(screen.getByLabelText("Agent cost: $1.25; excludes subagents")).toBeInTheDocument();
+  expect(
+    screen.getByRole("note", { name: "Agent cost: $1.25; excludes subagents" }),
+  ).toBeInTheDocument();
+  expect(useChildSessionsMock).toHaveBeenCalledWith("root", 10_000);
   useChildSessionsMock.mockClear();
   view.rerender(
     <MemoryRouter>
