@@ -2011,11 +2011,11 @@ class TerminalInstance:
                 )
         except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent cleanup.
             logger.debug("Terminal cleanup telemetry failed (%s)", type(exc).__name__)
-        # Cancel both idle-watcher variants first so they don't race
-        # the socket teardown. Order doesn't matter — they're
-        # independent.
-        await self._stop_idle_watcher()
-        self._stop_idle_watcher_thread()
+        # Stop observation before termination, then join after the process is stopped.
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+        if self._idle_stop_event is not None:
+            self._idle_stop_event.set()
 
         # The watcher and is_alive() both set ``running=False`` when they
         # observe a failure. A private socket can still belong to a live tmux
@@ -2025,6 +2025,9 @@ class TerminalInstance:
             with contextlib.suppress(RuntimeError):
                 await self._tmux("kill-server")
         self.running = False
+
+        await self._stop_idle_watcher()
+        await asyncio.to_thread(self._stop_idle_watcher_thread)
 
         if self._clipboard_bridge is not None:
             await asyncio.to_thread(self._clipboard_bridge.close)
@@ -2328,7 +2331,7 @@ class TerminalInstance:
             if stop_event.wait(interval):
                 return
             if not self.running:
-                if on_exit is not None:
+                if on_exit is not None and not stop_event.is_set():
                     self._fire_watch_callback(on_exit, "exit")
                 return
             try:
@@ -2363,7 +2366,7 @@ class TerminalInstance:
                     consecutive_capture_failures, exit_callback_present=on_exit is not None
                 )
                 self.running = False
-                if on_exit is not None:
+                if on_exit is not None and not stop_event.is_set():
                     self._fire_watch_callback(on_exit, "exit")
                 return
             consecutive_capture_failures = 0
@@ -2382,7 +2385,7 @@ class TerminalInstance:
                     with contextlib.suppress(Exception):
                         self._tmux_output_sync("detach-client", "-s", self.tmux_target)
                 self.running = False
-                if on_exit is not None:
+                if on_exit is not None and not stop_event.is_set():
                     self._fire_watch_callback(on_exit, "exit")
                 return
             # Per-tick out-of-band status hook (e.g. claude-native reading

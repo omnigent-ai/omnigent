@@ -159,6 +159,41 @@ async def test_shutdown_on_empty_registry_is_noop() -> None:
     assert reg.active_conversation_ids() == []
 
 
+def test_hard_exit_cleanup_keeps_owned_socket_claims_and_skips_replacements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = TerminalRegistry()
+    instances = []
+    for name in ("owned", "replaced"):
+        socket_path = tmp_path / f"{name}.sock"
+        socket_path.touch()
+        instance = TerminalInstance(
+            name=name,
+            session_key="main",
+            socket_path=socket_path,
+            private_dir=tmp_path / name,
+            running=True,
+        )
+        instances.append(instance)
+        registry._by_conversation[name] = {(name, "main"): instance}
+    unrelated = tmp_path / "unrelated.sock"
+    unrelated.touch()
+    cleanup = registry.capture_hard_exit_cleanup()
+    registry._by_conversation.clear()
+    replacement = tmp_path / "replacement.sock"
+    replacement.touch()
+    replacement.replace(instances[1].socket_path)
+    commands = []
+    monkeypatch.setattr(
+        registry_mod.subprocess, "run", lambda command, **kwargs: commands.append(command)
+    )
+
+    cleanup()
+
+    assert commands == [[*instances[0]._tmux_base_cmd(), "kill-server"]]
+    assert unrelated.exists() and instances[1].socket_path.exists()
+
+
 async def test_close_expected_leaves_a_successor_on_the_same_key_running(
     tmp_path: Path,
 ) -> None:
@@ -950,7 +985,8 @@ async def test_cleanup_conversation_tolerates_close_exception(tmp_path: Path) ->
     good_instance.close.assert_awaited_once()
 
 
-async def test_shutdown_tolerates_close_exception(tmp_path: Path) -> None:
+@pytest.mark.parametrize("failure", ["exception", "held-close"])
+async def test_shutdown_tolerates_close_exception(tmp_path: Path, failure: str) -> None:
     """
     ``shutdown`` swallows exceptions from individual ``instance.close()``
     calls, just like ``cleanup_conversation``. A stuck instance in one
@@ -958,6 +994,8 @@ async def test_shutdown_tolerates_close_exception(tmp_path: Path) -> None:
     conversations.
     """
     reg = TerminalRegistry()
+    good_closed = asyncio.Event()
+    other_closed_before_release = False
     good = TerminalInstance(
         name="bash",
         session_key="s1",
@@ -965,7 +1003,7 @@ async def test_shutdown_tolerates_close_exception(tmp_path: Path) -> None:
         private_dir=tmp_path / "good",
         running=True,
     )
-    good.close = AsyncMock()  # type: ignore[method-assign]
+    good.close = AsyncMock(side_effect=good_closed.set)  # type: ignore[method-assign]
     bad = TerminalInstance(
         name="bash",
         session_key="s1",
@@ -975,7 +1013,14 @@ async def test_shutdown_tolerates_close_exception(tmp_path: Path) -> None:
     )
 
     async def _explode() -> None:
-        raise RuntimeError("tmux gone")
+        nonlocal other_closed_before_release
+        if failure == "exception":
+            raise RuntimeError("tmux gone")
+        try:
+            await asyncio.wait_for(good_closed.wait(), timeout=1)
+            other_closed_before_release = True
+        except TimeoutError:
+            pass
 
     bad.close = _explode  # type: ignore[method-assign]
 
@@ -988,6 +1033,8 @@ async def test_shutdown_tolerates_close_exception(tmp_path: Path) -> None:
 
     assert reg.active_conversation_ids() == []
     good.close.assert_awaited_once()
+    if failure == "held-close":
+        assert other_closed_before_release, "one held close blocked another owned terminal"
 
 
 def test_multiple_terminals_per_conversation(tmp_path: Path) -> None:

@@ -1208,6 +1208,50 @@ def _parent_is_orphaned(parent_pid: int) -> bool:
     return not _parent_process_is_alive(parent_pid)
 
 
+class _NativeShutdownBackstop:
+    """Retain the first owned resource claims across graceful and forced shutdown paths."""
+
+    def __init__(self, capture: Callable[[], Callable[[], None]], *, grace_s: float = 2.0) -> None:
+        self.capture = capture
+        self.grace_s = grace_s
+        self.cleanup: Callable[[], None] | None = None
+        self.cleanup_started = False
+        self.started = False
+        self.lock = threading.Lock()
+        self.execution_lock = threading.Lock()
+
+    def prepare(self) -> Callable[[], None]:
+        with self.lock:
+            if self.cleanup is None:
+                captured = self.capture()
+
+                def cleanup_once() -> None:
+                    with self.execution_lock:
+                        if self.cleanup_started:
+                            return
+                        self.cleanup_started = True
+                        captured()
+
+                self.cleanup = cleanup_once
+            return self.cleanup
+
+    def start(self) -> None:
+        cleanup = self.prepare()
+        with self.lock:
+            if self.started:
+                return
+            self.started = True
+
+        def finish_cleanup() -> None:
+            time.sleep(self.grace_s)
+            with contextlib.suppress(Exception):
+                cleanup()
+
+        threading.Thread(
+            target=finish_cleanup, name="runner-native-shutdown-backstop", daemon=True
+        ).start()
+
+
 def _run_parent_death_killer(
     parent_pid: int,
     request_shutdown: Callable[[], None],
@@ -1221,6 +1265,7 @@ def _run_parent_death_killer(
     signal_wait_s: float = 2.0,
     idle_grace_s: float = _GRACEFUL_SHUTDOWN_TUNNEL_TIMEOUT_S + 5.0,
     finish_work_max_s: float = 1800.0,
+    prepare_hard_exit_cleanup: Callable[[], Callable[[], None]] | None = None,
     exit_fn: Callable[[int], None] = os._exit,
 ) -> None:
     """Force the runner to exit once its parent (host daemon) dies.
@@ -1270,6 +1315,8 @@ def _run_parent_death_killer(
     :param finish_work_max_s: Bound on finishing in-flight work, e.g. ``1800``.
     :param exit_fn: Hard-exit function, defaults to :func:`os._exit`;
         injectable so tests can observe it without killing the runner.
+    :param prepare_hard_exit_cleanup: Capture owned cleanup before graceful shutdown
+        retires resource registry entries; invoked only after any HUP finishing period.
     :returns: None.
     """
     while not _parent_is_orphaned(parent_pid):
@@ -1305,6 +1352,10 @@ def _run_parent_death_killer(
             if request_idle_shutdown is not None:
                 request_shutdown = request_idle_shutdown
                 grace_s = idle_grace_s
+    hard_exit_cleanup: Callable[[], None] | None = None
+    if prepare_hard_exit_cleanup is not None:
+        with contextlib.suppress(Exception):
+            hard_exit_cleanup = prepare_hard_exit_cleanup()
     request_shutdown()
     time.sleep(grace_s)
     # The hard exit is a backstop reached only when graceful shutdown did not
@@ -1320,6 +1371,9 @@ def _run_parent_death_killer(
     # os._exit skips buffer flushing, so flush logs first for diagnosability.
     with contextlib.suppress(Exception):
         sys.stderr.flush()
+    if hard_exit_cleanup is not None:
+        with contextlib.suppress(Exception):
+            hard_exit_cleanup()
     exit_fn(0)
 
 
@@ -1780,26 +1834,34 @@ def create_app(
 
         :returns: None.
         """
-        _launch_reaper = getattr(app.state, "subagent_launch_reaper", None)
-        if _launch_reaper is not None:
-            _launch_reaper.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await _launch_reaper
-        _pane_reaper = getattr(app.state, "native_pane_reaper", None)
-        if _pane_reaper is not None:
-            await _pane_reaper.shutdown()
-        # Host shutdown skips per-session deletion, so close native servers here.
         from omnigent.runner.native import (
             teardown_all_codex_native_app_servers,
             teardown_all_opencode_native_servers,
         )
 
-        with contextlib.suppress(Exception):
-            await teardown_all_codex_native_app_servers()
-        with contextlib.suppress(Exception):
-            await teardown_all_opencode_native_servers()
+        # Start owned termination before waiting for observer or backend cleanup.
+        native_cleanup = asyncio.gather(
+            _terminal_registry.shutdown(),
+            teardown_all_codex_native_app_servers(),
+            teardown_all_opencode_native_servers(),
+            return_exceptions=True,
+        )
+        try:
+            _launch_reaper = getattr(app.state, "subagent_launch_reaper", None)
+            if _launch_reaper is not None:
+                _launch_reaper.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await _launch_reaper
+            _pane_reaper = getattr(app.state, "native_pane_reaper", None)
+            if _pane_reaper is not None:
+                await _pane_reaper.shutdown()
+        finally:
+            for result in await native_cleanup:
+                if isinstance(result, Exception):
+                    _logger.warning(
+                        "Native resource cleanup failed: error_type=%s", type(result).__name__
+                    )
         await pm.shutdown()
-        await _terminal_registry.shutdown()
         if mcp_manager is not None:
             await mcp_manager.shutdown()
         await server_client.aclose()
@@ -1821,10 +1883,29 @@ def create_app(
                 yield
         finally:
             pr_reports.install(None)
-            await reporter.aclose()
-            await _stop_pm()
+            cleanup = asyncio.create_task(_stop_pm(), name="runner-owned-resource-cleanup")
+            try:
+                await reporter.aclose()
+            finally:
+                await cleanup
 
     app.router.lifespan_context = _lifespan
+
+    def capture_hard_exit_cleanup() -> Callable[[], None]:
+        from omnigent.runner.native.orchestration import capture_codex_native_hard_exit_cleanup
+
+        terminal_cleanup = _terminal_registry.capture_hard_exit_cleanup()
+        backend_cleanup = capture_codex_native_hard_exit_cleanup()
+
+        def cleanup() -> None:
+            try:
+                backend_cleanup()
+            finally:
+                terminal_cleanup()
+
+        return cleanup
+
+    app.state.capture_hard_exit_cleanup = capture_hard_exit_cleanup
     return app
 
 
@@ -2019,6 +2100,12 @@ async def _run_tunnel_from_env() -> None:
     # Set when the host hangs up; the parent-death killer then lets work finish.
     finish_work_event = threading.Event()
     _shutting_down_state = getattr(app.state, "shutting_down", None)
+    capture_cleanup = getattr(app.state, "capture_hard_exit_cleanup", None)
+    native_shutdown = (
+        _NativeShutdownBackstop(cast("Callable[[], Callable[[], None]]", capture_cleanup))
+        if callable(capture_cleanup)
+        else None
+    )
     _install_signal_handlers(
         stop_event,
         adopted_event=adopted_event,
@@ -2027,6 +2114,7 @@ async def _run_tunnel_from_env() -> None:
         mark_shutting_down=(
             _shutting_down_state.set if _shutting_down_state is not None else None
         ),
+        before_shutdown=native_shutdown.start if native_shutdown is not None else None,
     )
     # Set (instead of stop_event) on an idle-reaper shutdown so the tunnel
     # drains its session streams and closes cleanly — the server then sees an
@@ -2167,6 +2255,9 @@ async def _run_tunnel_from_env() -> None:
                 "finish_work": finish_work_event,
                 "has_active_work": _has_active_work,
                 "request_idle_shutdown": _request_finished_work_shutdown,
+                "prepare_hard_exit_cleanup": native_shutdown.prepare
+                if native_shutdown is not None
+                else None,
             },
             name=f"runner-parent-killer:{parent_pid}",
             daemon=True,
@@ -2224,6 +2315,7 @@ def _install_signal_handlers(
     record_reason: Callable[[str], None] | None = None,
     mark_shutting_down: Callable[[], None] | None = None,
     finish_work_event: threading.Event | None = None,
+    before_shutdown: Callable[[], None] | None = None,
 ) -> None:
     """Install process signal handlers that request graceful shutdown.
 
@@ -2242,6 +2334,8 @@ def _install_signal_handlers(
     :param finish_work_event: Optional event set when
         :data:`RUNNER_FINISH_WORK_SIGNAL` arrives (the host requested it on SIGHUP).
         ``None`` skips the handler.
+    :param before_shutdown: Capture owned resources and arm their bounded cleanup
+        before setting the stop event.
     :returns: None.
     """
     loop = asyncio.get_running_loop()
@@ -2256,6 +2350,9 @@ def _install_signal_handlers(
             record_reason(f"received {signal.Signals(sig).name}")
         if mark_shutting_down is not None:
             mark_shutting_down()
+        if before_shutdown is not None:
+            with contextlib.suppress(Exception):
+                before_shutdown()
         stop_event.set()
 
     degraded = False

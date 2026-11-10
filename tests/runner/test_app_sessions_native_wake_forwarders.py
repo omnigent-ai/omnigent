@@ -509,7 +509,9 @@ async def test_teardown_codex_native_app_server_noop_without_registered_server()
 
 
 @pytest.mark.asyncio
-async def test_teardown_all_codex_native_app_servers_closes_every_session() -> None:
+async def test_teardown_all_codex_native_app_servers_closes_every_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     Runner shutdown closes every registered codex app-server.
 
@@ -526,6 +528,22 @@ async def test_teardown_all_codex_native_app_servers_closes_every_session() -> N
     ]
     runs = [_ForwarderRun() for _ in session_ids]
     closed: list[str] = []
+    signalled: list[str] = []
+    refreshed: list[str] = []
+    killed: list[str] = []
+    first_cancelled = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    def terminate(proc: SimpleNamespace) -> None:
+        signalled.append(proc.session_id)
+
+    monkeypatch.setattr("omnigent.inner._proc.terminate_tree", terminate)
+    monkeypatch.setattr(
+        "omnigent.inner._proc.refresh_process_tree", lambda proc: refreshed.append(proc.session_id)
+    )
+    monkeypatch.setattr(
+        "omnigent.inner._proc.kill_tree", lambda proc: killed.append(proc.session_id)
+    )
 
     def _make_parked(run: _ForwarderRun) -> Any:
         async def _parked() -> None:
@@ -534,6 +552,9 @@ async def test_teardown_all_codex_native_app_servers_closes_every_session() -> N
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
                 run.cancelled = True
+                if run is runs[0]:
+                    first_cancelled.set()
+                    await release_cleanup.wait()
                 raise
 
         return _parked
@@ -541,6 +562,7 @@ async def test_teardown_all_codex_native_app_servers_closes_every_session() -> N
     class _FakeAppServer:
         def __init__(self, sid: str) -> None:
             self._sid = sid
+            self.proc = SimpleNamespace(session_id=sid)
 
         async def close(self) -> None:
             closed.append(self._sid)
@@ -552,7 +574,20 @@ async def test_teardown_all_codex_native_app_servers_closes_every_session() -> N
             runner_app_mod._AUTO_CODEX_APP_SERVERS[sid] = _FakeAppServer(sid)
         await asyncio.sleep(0)
 
-        await runner_app_mod.teardown_all_codex_native_app_servers()
+        from omnigent.runner.native.orchestration import capture_codex_native_hard_exit_cleanup
+
+        hard_cleanup = capture_codex_native_hard_exit_cleanup()
+        assert refreshed == session_ids
+
+        teardown = asyncio.create_task(runner_app_mod.teardown_all_codex_native_app_servers())
+        try:
+            await asyncio.wait_for(first_cancelled.wait(), timeout=1)
+            assert signalled == session_ids, (
+                "all owned backends must stop before cancellation waits"
+            )
+        finally:
+            release_cleanup.set()
+            await teardown
 
         assert sorted(closed) == sorted(session_ids), "every app-server must be closed"
         assert all(sid not in runner_app_mod._AUTO_CODEX_APP_SERVERS for sid in session_ids)
@@ -560,6 +595,9 @@ async def test_teardown_all_codex_native_app_servers_closes_every_session() -> N
         assert all(run.cancelled for run in runs), "every forwarder must be cancelled"
         # Idempotent: a second sweep with an empty registry is a no-op.
         await runner_app_mod.teardown_all_codex_native_app_servers()
+        runner_app_mod._AUTO_CODEX_APP_SERVERS[session_ids[0]] = _FakeAppServer("replacement")
+        hard_cleanup()
+        assert killed == session_ids, "a replacement must not be adopted by an earlier shutdown"
     finally:
         for sid in session_ids:
             runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)

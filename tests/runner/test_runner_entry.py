@@ -17,7 +17,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -2472,7 +2472,8 @@ def test_parent_is_orphaned_true_when_reparented() -> None:
     assert _parent_is_orphaned(os.getppid() + 100000) is True
 
 
-def test_run_parent_death_killer_requests_shutdown_then_hard_exits() -> None:
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_run_parent_death_killer_requests_shutdown_then_hard_exits(cleanup_fails: bool) -> None:
     """On parent death the killer asks for graceful shutdown, then hard-exits.
 
     Runs with an already-orphaned parent pid, an injected exit function,
@@ -2485,16 +2486,85 @@ def test_run_parent_death_killer_requests_shutdown_then_hard_exits() -> None:
     events: list[str] = []
     exit_calls: list[int] = []
 
+    def capture_cleanup() -> Callable[[], None]:
+        events.append("capture")
+
+        def cleanup() -> None:
+            events.append("cleanup")
+            if cleanup_fails:
+                raise RuntimeError("synthetic cleanup failure")
+
+        return cleanup
+
     _run_parent_death_killer(
         os.getppid() + 100000,  # already "orphaned"
         lambda: events.append("shutdown"),
         poll_interval_s=0.01,
         grace_s=0.01,
+        prepare_hard_exit_cleanup=capture_cleanup,
         exit_fn=lambda code: (events.append("exit"), exit_calls.append(code)),
     )
 
-    assert events == ["shutdown", "exit"]
+    assert events == ["capture", "shutdown", "cleanup", "exit"]
     assert exit_calls == [0]
+
+
+def test_native_shutdown_backstop_retains_first_claims_across_repeated_stops() -> None:
+    from omnigent.runner._entry import _NativeShutdownBackstop
+
+    captures: list[int] = []
+    cleanups: list[int] = []
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    def capture() -> Callable[[], None]:
+        captures.append(1)
+
+        def cleanup() -> None:
+            cleanups.append(1)
+            entered.set()
+            release.wait()
+            completed.set()
+
+        return cleanup
+
+    backstop = _NativeShutdownBackstop(capture, grace_s=0.01)
+    shutdown_requested = threading.Event()
+    exited = threading.Event()
+    completed_before_exit: list[bool] = []
+
+    def exit_runner(_: int) -> None:
+        completed_before_exit.append(completed.is_set())
+        exited.set()
+
+    parent_killer: threading.Thread | None = None
+    try:
+        original = backstop.prepare()
+        backstop.start()
+        backstop.start()
+        assert backstop.prepare() is original
+        assert entered.wait(timeout=1)
+        parent_killer = threading.Thread(
+            target=_run_parent_death_killer,
+            args=(os.getppid() + 100000, shutdown_requested.set),
+            kwargs={
+                "grace_s": 0,
+                "prepare_hard_exit_cleanup": backstop.prepare,
+                "exit_fn": exit_runner,
+            },
+        )
+        parent_killer.start()
+        assert shutdown_requested.wait(timeout=1)
+        assert not exited.wait(timeout=0.02)
+    finally:
+        release.set()
+        if parent_killer is not None:
+            parent_killer.join(timeout=1)
+    assert completed.wait(timeout=1)
+    assert exited.is_set() and completed_before_exit == [True]
+    assert captures == [1]
+    assert cleanups == [1]
 
 
 def test_run_parent_death_killer_stands_down_when_adopted() -> None:
@@ -2979,11 +3049,13 @@ def test_install_crash_logging_is_idempotent() -> None:
     ("host_owns_global_cleanup", "expected_sweep_orphans"),
     [(True, False), (False, True)],
 )
+@pytest.mark.parametrize("held_cleanup", ["none", "native", "reporter", "launch-reaper"])
 async def test_runner_shutdown_closes_terminal_registry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     host_owns_global_cleanup: bool,
     expected_sweep_orphans: bool,
+    held_cleanup: str,
 ) -> None:
     """The --server local runner shuts down terminal-owned resources.
 
@@ -3005,6 +3077,25 @@ async def test_runner_shutdown_closes_terminal_registry(
     watching = False
     watchdog_roles: list[str] = []
     stall_records: queue.Queue[logging.LogRecord] = queue.Queue()
+    native_cleanup_started = asyncio.Event()
+    release_native_cleanup = asyncio.Event()
+    terminal_cleanup_started = asyncio.Event()
+
+    async def native_cleanup() -> None:
+        if held_cleanup in {"none", "native"}:
+            native_cleanup_started.set()
+        if held_cleanup == "native":
+            await release_native_cleanup.wait()
+
+    async def observe_terminal_cleanup() -> bool:
+        await native_cleanup_started.wait()
+        try:
+            await asyncio.wait_for(terminal_cleanup_started.wait(), timeout=budget(0.2))
+            return True
+        except TimeoutError:
+            return False
+        finally:
+            release_native_cleanup.set()
 
     class Capture(logging.Handler):
         def emit(self, record: logging.LogRecord) -> None:
@@ -3048,6 +3139,12 @@ async def test_runner_shutdown_closes_terminal_registry(
         registry = _TrackingTerminalRegistry(
             conversation_link_base_url=conversation_link_base_url,
         )
+
+        async def shutdown() -> None:
+            terminal_cleanup_started.set()
+            registry.shutdown_called = True
+
+        registry.shutdown = shutdown
         terminal_registries.append(registry)
         return registry
 
@@ -3097,13 +3194,45 @@ async def test_runner_shutdown_closes_terminal_registry(
         lambda: "runner-test-id",
     )
     monkeypatch.setattr(entry_mod, "monitor_event_loop", monitor, raising=False)
+    monkeypatch.setattr(
+        "omnigent.runner.native.teardown_all_codex_native_app_servers", native_cleanup
+    )
+    if held_cleanup == "reporter":
+        from omnigent.runner.pr_reports import PullRequestReporter
+
+        original_close = PullRequestReporter.aclose
+
+        async def close_reporter(self: PullRequestReporter) -> None:
+            native_cleanup_started.set()
+            await release_native_cleanup.wait()
+            await original_close(self)
+
+        monkeypatch.setattr(PullRequestReporter, "aclose", close_reporter)
 
     app = entry_mod.create_app()
     # starlette 1.x removed Router.startup/shutdown; drive the lifespan instead.
     handler = Capture()
     watchdog._logger.addHandler(handler)
+    cleanup_observer = asyncio.create_task(observe_terminal_cleanup())
     try:
         async with app.router.lifespan_context(app):
+            if held_cleanup == "launch-reaper":
+                old_reaper = app.state.subagent_launch_reaper
+                old_reaper.cancel()
+                with suppress(asyncio.CancelledError):
+                    await old_reaper
+                started = asyncio.Event()
+
+                async def held_reaper() -> None:
+                    started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        native_cleanup_started.set()
+                        await release_native_cleanup.wait()
+
+                app.state.subagent_launch_reaper = asyncio.create_task(held_reaper())
+                await started.wait()
             # Block only this test loop until the independent watchdog captures it.
             record = stall_records.get(timeout=budget(2))
             assert watching
@@ -3112,6 +3241,9 @@ async def test_runner_shutdown_closes_terminal_registry(
     finally:
         watchdog._logger.removeHandler(handler)
         handler.close()
+        release_native_cleanup.set()
+
+    assert await cleanup_observer, "native backend cleanup prevented owned terminal termination"
 
     assert watchdog_roles == ["runner"]
     assert not watching
