@@ -29,7 +29,37 @@ export function useSandboxProfileCatalog(
   const profiles = (query.data?.profiles ?? []).filter((p) => enabled && p.provider === provider);
   const required =
     enabled && provider !== null && (query.data?.managed_providers ?? []).includes(provider);
-  const selection = required && value?.provider === provider ? value : null;
+  const explicit = required && value?.provider === provider ? value : null;
+  // With nothing picked, start on the provider's default; it may be beyond the first page.
+  const defaultProfileId =
+    required && explicit === null && provider !== null
+      ? (query.data?.default_profile_ids?.[provider] ?? null)
+      : null;
+  const defaultInPage = profiles.find((p) => p.id === defaultProfileId);
+  const defaultQuery = useQuery({
+    queryKey: [...SANDBOX_PROFILES_QUERY_KEY, provider, "default", defaultProfileId],
+    queryFn: ({ signal }) =>
+      fetchSandboxProfiles(provider ?? undefined, {
+        profileId: defaultProfileId ?? undefined,
+        signal,
+      }),
+    enabled: defaultProfileId !== null && defaultInPage === undefined,
+    staleTime: 30_000,
+    retry: false,
+  });
+  const defaultProfile =
+    defaultInPage ??
+    defaultQuery.data?.profiles.find((p) => p.id === defaultProfileId && p.provider === provider);
+  const selection: SandboxProfileSelection | null =
+    explicit ??
+    (defaultProfileId !== null && defaultProfile !== undefined
+      ? {
+          id: defaultProfile.id,
+          name: defaultProfile.name,
+          provider: defaultProfile.provider,
+          revision: defaultProfile.revision,
+        }
+      : null);
   const selectedQuery = useQuery({
     queryKey: [
       ...SANDBOX_PROFILES_QUERY_KEY,
@@ -54,6 +84,7 @@ export function useSandboxProfileCatalog(
       ? null
       : query.isPending ||
           query.isFetching ||
+          (defaultProfileId !== null && defaultInPage === undefined && defaultQuery.isFetching) ||
           (selection && (selectedQuery.isPending || selectedQuery.isFetching))
         ? "Loading sandbox profiles…"
         : query.isError || (selection && selectedQuery.isError)

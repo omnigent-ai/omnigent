@@ -38,7 +38,9 @@ const rows: SandboxProfile[] = Array.from({ length: 35 }, (_, i) => ({
   revision: "v1",
 }));
 let available: SandboxProfile[];
+let defaults: Record<string, string>;
 beforeEach(() => {
+  defaults = {};
   capability.info = {
     ...FALLBACK_SERVER_INFO,
     managed_sandboxes_enabled: true,
@@ -56,6 +58,7 @@ beforeEach(() => {
       return {
         profiles: found.slice(0, 20),
         managed_providers: ["company"],
+        default_profile_ids: defaults,
         next_cursor: found.length > 20 ? "more" : null,
       };
     });
@@ -94,6 +97,38 @@ async function open(name = "Choose profile") {
   fireEvent.click(await screen.findByRole("button", { name: `Sandbox profile: ${name}` }));
   return screen.findByRole("combobox", { name: "Search sandbox profiles" });
 }
+it("requires a choice when the provider has no default", async () => {
+  mount();
+  expect(
+    await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }),
+  ).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Start" })).toHaveProperty("disabled", true);
+});
+
+it.each([
+  ["on the first page", "profile-3", "Build profile 3"],
+  ["beyond the first page", "profile-30", "Build profile 30"],
+])("preselects the provider default %s", async (_where, id, name) => {
+  defaults = { company: id };
+  mount();
+  expect(await screen.findByRole("button", { name: `Sandbox profile: ${name}` })).toBeTruthy();
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Start" })).toHaveProperty("disabled", false),
+  );
+});
+
+it("keeps an explicit choice over the provider default", async () => {
+  defaults = { company: "profile-3" };
+  const { onChange } = mount();
+  await screen.findByRole("button", { name: "Sandbox profile: Build profile 3" });
+  await open("Build profile 3");
+  fireEvent.click(screen.getByRole("option", { name: /Build profile 5/ }));
+  expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ id: "profile-5" }));
+  expect(
+    await screen.findByRole("button", { name: "Sandbox profile: Build profile 5" }),
+  ).toBeTruthy();
+});
+
 it("caps the menu and finds profiles beyond the first page", async () => {
   const { onChange } = mount();
   const input = await open();

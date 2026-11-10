@@ -78,7 +78,9 @@ integration evidence separately; the browser test does not exercise them.
   fallback in the picker. Nonparticipating providers have no profile picker.
 - `sandbox.default_profile_id` gives a participating provider a server-side default
   for creates that name no profile (API clients, scheduled fresh sandboxes). It is
-  authorized and saved like an explicit pick; the composer does not preselect it yet.
+  authorized and saved like an explicit pick. `GET /v1/sandbox-profiles` reports it as
+  `default_profile_ids`, and the composer and fork dialog preselect it when nothing else
+  is chosen.
 - Discovery is scoped to the selected provider so unrelated outages do not block
   ordinary launches. Listing is advisory; the server reauthorizes selection.
 - A stale or revoked choice requires explicit reselection. Saved sessions cannot

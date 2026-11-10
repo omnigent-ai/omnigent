@@ -91,6 +91,9 @@ rejected, and the accepted revision is saved on the session, so wake and
 replacement never move to a newer one. It does not apply to existing unprofiled
 sessions, which keep their legacy behavior. It requires a provider with
 `manages_profiles`; leave it unset to keep a selection mandatory.
+`GET /v1/sandbox-profiles` reports it in `default_profile_ids`, and the composer
+and fork dialog preselect it when nothing else is chosen (a same-provider fork
+still starts on its source's profile).
 
 `SandboxProfileContext` is a frozen dataclass:
 

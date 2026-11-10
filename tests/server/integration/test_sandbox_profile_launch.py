@@ -152,6 +152,15 @@ async def test_create_without_a_selection_takes_the_default_profile(env, transpo
     assert env.recording.resumes == [("profile-sandbox-1", _PROVIDER_CONFIG)]
 
 
+async def test_profile_list_reports_the_default_for_preselection(env):
+    response = await env.client.get("/v1/sandbox-profiles", params={"provider": env.provider})
+    assert response.status_code == 200, response.text
+    assert response.json()["default_profile_ids"] == {}
+    _with_default_profile(env, "build")
+    response = await env.client.get("/v1/sandbox-profiles", params={"provider": env.provider})
+    assert response.json()["default_profile_ids"] == {env.provider: "build"}
+
+
 async def test_default_profile_is_authorized_like_an_explicit_selection(env):
     _with_default_profile(env, "build")
     env.recording.allowed_users = set()

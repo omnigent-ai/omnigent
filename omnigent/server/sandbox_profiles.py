@@ -158,6 +158,17 @@ class SandboxProfileCatalog:
             for profile in profiles
         ]
 
+    def default_profile_ids(self, provider: str | None = None) -> dict[str, str]:
+        """Configured default profile per profile-managing provider, for client preselection."""
+        if self._deployment is None:
+            return {}
+        defaults = {}
+        for managed in self.managed_providers(provider):
+            entry = self._deployment.for_provider(managed)
+            if entry is not None and entry.default_profile_id is not None:
+                defaults[managed] = entry.default_profile_id
+        return defaults
+
     def default_selection(
         self, provider: str | None, *, user_id: str | None = None
     ) -> dict[str, Any] | None:
