@@ -305,6 +305,9 @@ unchanged. Saved preferences remain available when the flags are re-enabled.
 `/settings/harnesses` or its harness detail pages, or the import review modal
 shown once for the host desktop onboarding just connected → See more. It opens
 only when the server enables the `import_review` release feature.
+A session's `/mcp` panel → Go to Settings opens the harness page for that
+session's host (`?host=<id>`), and keeps that host selected even when it is a
+sandbox host the host pickers hide.
 
 **Harness credential repair:** Settings → Harnesses → a needs-auth harness →
 Settings. Activate either the credential card or its Reconfigure affordance;

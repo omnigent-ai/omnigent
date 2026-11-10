@@ -3748,7 +3748,11 @@ async def _live_mcp_client(adapter: Any) -> AsyncIterator[httpx.AsyncClient]:
 
 
 async def test_live_mcp_routes_reach_only_an_executor_that_reports_them() -> None:
-    from omnigent.inner.executor import LiveMcpHarnessNotRunning, LiveMcpServerUnknown
+    from omnigent.inner.executor import (
+        LiveMcpHarnessNotRunning,
+        LiveMcpReconnectRefused,
+        LiveMcpServerUnknown,
+    )
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
     status_path = "/v1/sessions/conv_live_mcp/mcp-status"
@@ -3780,9 +3784,15 @@ async def test_live_mcp_routes_reach_only_an_executor_that_reports_them() -> Non
         unauthenticated = await client.get(status_path, headers={"Authorization": "Bearer wrong"})
         assert unauthenticated.status_code == 401
 
-    # The harness's refusal comes back with the connections as they stand.
+    # The harness's refusal comes back with the connections as they stand; other
+    # failures keep their text out of the answer.
     for failure, expected_status, expected_body in (
-        (RuntimeError("still unauthorized"), 200, {"reconnect_error": "still unauthorized"}),
+        (
+            LiveMcpReconnectRefused("still unauthorized"),
+            200,
+            {"reconnect_error": "still unauthorized"},
+        ),
+        (RuntimeError("internal detail"), 502, {"error": "mcp_reconnect_failed"}),
         (LiveMcpServerUnknown("docs"), 404, {"error": "mcp_server_unknown"}),
         (LiveMcpHarnessNotRunning("conv_live_mcp"), 409, {"error": "harness_not_running"}),
         (TimeoutError(), 504, {"error": "mcp_reconnect_timeout"}),
@@ -3796,10 +3806,11 @@ async def test_live_mcp_routes_reach_only_an_executor_that_reports_them() -> Non
             resp = await client.post(reconnect_path, json={"name": "docs"})
         assert resp.status_code == expected_status
         assert expected_body.items() <= resp.json().items()
+        assert "internal detail" not in resp.text
 
     # A failed status read reports the harness as running, without the exception's text.
     adapter = ExecutorAdapter(
-        executor_factory=lambda: _LiveMcpExecutor(RuntimeError("still unauthorized")),
+        executor_factory=lambda: _LiveMcpExecutor(LiveMcpReconnectRefused("still unauthorized")),
         session_key="conv_live_mcp",
     )
     executor = adapter._ensure_executor()

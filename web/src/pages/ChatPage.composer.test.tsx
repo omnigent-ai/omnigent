@@ -4370,6 +4370,7 @@ describe("Composer MCP status command", () => {
     hostMcpQueryMock.mockReturnValue({
       data: [
         { name: "search", harness: "claude", plugin: "tools", transport: "http", scope: "user" },
+        { name: "search", harness: "claude", plugin: "crm", transport: "http", scope: "user" },
         {
           name: "wiki",
           harness: "claude",
@@ -4394,6 +4395,8 @@ describe("Composer MCP status command", () => {
         live: true,
         servers: [
           { name: "plugin:tools:search", status: "failed", error: "token expired" },
+          { name: "plugin:crm:search", status: "connected" },
+          { name: "search", status: "pending", scope: "user" },
           { name: "wiki", status: "needs-auth" },
           { name: "glean", status: "connected" },
           { name: "project-db", status: "connected", scope: "project" },
@@ -4408,7 +4411,7 @@ describe("Composer MCP status command", () => {
       error: null,
       clearError: vi.fn(),
     });
-    render(
+    const { rerender } = render(
       <MemoryRouter>
         <Composer {...composerProps({ agents: [agent] })} />
       </MemoryRouter>,
@@ -4416,8 +4419,15 @@ describe("Composer MCP status command", () => {
     fireEvent.change(textarea(), { target: { value: "/mcp" } });
 
     expect(liveMcpQueryMock).toHaveBeenLastCalledWith("conv_mcp", true);
-    // A plugin server's host row matches the CLI's prefixed name.
-    expect(screen.getByTestId("mcp-live-status-search")).toHaveTextContent("Failed: token expired");
+    // Each plugin's host row matches the CLI's prefixed name, and the CLI's own
+    // unprefixed "search" keeps a row of its own.
+    expect(
+      screen.getAllByTestId("mcp-live-status-search").map((status) => status.textContent),
+    ).toEqual([
+      "In this session: Failed: token expired",
+      "In this session: Connected",
+      "In this session: Connecting…",
+    ]);
     expect(screen.getByTestId("mcp-server-row-wiki")).toHaveTextContent("Account: Connected");
     expect(screen.getByTestId("mcp-live-status-wiki")).toHaveTextContent("Needs sign-in");
     // Servers only the CLI loaded still show.
@@ -4432,6 +4442,16 @@ describe("Composer MCP status command", () => {
 
     fireEvent.click(screen.getByTestId("mcp-reconnect-search"));
     expect(reconnect).toHaveBeenCalledWith("plugin:tools:search");
+
+    // A failed re-read keeps its last data, which no longer counts as live.
+    liveMcpQueryMock.mockReturnValue({ ...liveMcpQueryMock(), isError: true });
+    rerender(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [agent] })} />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByTestId("mcp-live-status-wiki")).toBeNull();
+    expect(screen.queryByTestId("mcp-reconnect-search")).toBeNull();
   });
 
   it("notes why a claude-sdk session shows no live state", () => {

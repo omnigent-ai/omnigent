@@ -165,6 +165,33 @@ describe("useReconnectLiveMcpServer", () => {
     expect(result.current.error).toEqual({ name: "docs", message: "still unauthorized" });
   });
 
+  it("shows each session's own reconnect while another session's runs", async () => {
+    const answers: ((response: Response) => void)[] = [];
+    authenticatedFetch.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          answers.push(resolve);
+        }),
+    );
+    const { result, rerender } = renderHook(
+      ({ sessionId }) => useReconnectLiveMcpServer(sessionId),
+      { initialProps: { sessionId: "conv_a" }, wrapper: wrapperFor(client) },
+    );
+    act(() => result.current.reconnect("docs"));
+    await waitFor(() => expect(result.current.reconnectingName).toBe("docs"));
+    rerender({ sessionId: "conv_b" });
+    act(() => result.current.reconnect("wiki"));
+    await waitFor(() => expect(result.current.reconnectingName).toBe("wiki"));
+
+    rerender({ sessionId: "conv_a" });
+    expect(result.current.reconnectingName).toBe("docs");
+    await act(async () => answers[0]!(json({ live: true, servers: [] })));
+    await waitFor(() => expect(result.current.reconnectingName).toBeNull());
+    rerender({ sessionId: "conv_b" });
+    expect(result.current.reconnectingName).toBe("wiki");
+    await act(async () => answers[1]!(json({ live: true, servers: [] })));
+  });
+
   it("keeps the reconnect's snapshot over a read that was already in flight", async () => {
     let answerRead!: (response: Response) => void;
     authenticatedFetch
@@ -190,13 +217,12 @@ describe("useReconnectLiveMcpServer", () => {
 
     act(() => result.current.reconnect.reconnect("docs"));
     await waitFor(() => expect(result.current.live.data?.servers[0]?.status).toBe("connected"));
-    await act(async () => {
-      answerRead(json({ live: true, servers: [{ name: "docs", status: "failed" }] }));
-      // Let the stale read finish parsing and settle, as it would on the wire.
-      await new Promise((resolve) => {
-        setTimeout(resolve, 50);
-      });
-    });
+    act(() => answerRead(json({ live: true, servers: [{ name: "docs", status: "failed" }] })));
+    await waitFor(() =>
+      expect(client.getQueryState(sessionLiveMcpServersQueryKey("conv_a"))?.fetchStatus).toBe(
+        "idle",
+      ),
+    );
     expect(result.current.live.data?.servers[0]?.status).toBe("connected");
     expect(result.current.reconnect.error).toBeNull();
   });

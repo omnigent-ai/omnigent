@@ -54,6 +54,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from omnigent.errors import ErrorCode, HarnessTransportClosedError, OmnigentError
 from omnigent.inner.executor import (
     LiveMcpHarnessNotRunning,
+    LiveMcpReconnectRefused,
     LiveMcpServerStatus,
     LiveMcpServerUnknown,
 )
@@ -983,6 +984,7 @@ class HarnessApp:
 
         :raises LiveMcpHarnessNotRunning: The harness has no MCP connections running.
         :raises LiveMcpServerUnknown: The harness reports no server named *name*.
+        :raises LiveMcpReconnectRefused: The harness tried and gave its reason.
         """
         raise NotImplementedError
 
@@ -1273,10 +1275,13 @@ class HarnessApp:
             return _live_mcp_failure(status.HTTP_404_NOT_FOUND, "mcp_server_unknown")
         except TimeoutError:
             return _live_mcp_failure(status.HTTP_504_GATEWAY_TIMEOUT, "mcp_reconnect_timeout")
-        except Exception as exc:
-            # The CLI's refusal is shown to the user; the traceback stays in the log.
-            _logger.warning("Reconnecting MCP server %r failed", server_name, exc_info=True)
+        except LiveMcpReconnectRefused as exc:
+            _logger.info("The harness refused to reconnect MCP server %r: %s", server_name, exc)
             reconnect_error = _live_mcp_detail(exc) or "Reconnect failed."
+        except Exception:
+            # Other failures can carry internal detail, so only the log gets it.
+            _logger.warning("Reconnecting MCP server %r failed", server_name, exc_info=True)
+            return _live_mcp_failure(status.HTTP_502_BAD_GATEWAY, "mcp_reconnect_failed")
         body: dict[str, Any]
         try:
             body = _live_mcp_body(await self.live_mcp_statuses())

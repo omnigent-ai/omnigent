@@ -174,6 +174,8 @@ export interface McpLiveConnection {
 
 /** One row of the `/mcp` inventory. */
 export interface McpServerRow {
+  /** Unique among the rows when two share a name; defaults to `name`. */
+  key?: string;
   name: string;
   description?: string | null;
   connection?: McpServerConnection;
@@ -288,7 +290,7 @@ function McpConnectionIcon({
         className="mt-0.5 size-3.5 shrink-0 animate-spin text-muted-foreground"
       />
     );
-  if (live?.status === "needs-auth" || (live === undefined && connection === "sign-in-required"))
+  if (live?.status === "needs-auth" || connection === "sign-in-required")
     return (
       <TriangleAlertIcon aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-amber-500" />
     );
@@ -426,10 +428,13 @@ function McpServerRows({
         const live = server.live;
         const liveTrouble = live !== undefined && MCP_RECONNECTABLE.has(live.status);
         const rowReconnectError =
-          reconnectError && reconnectError.name === server.liveName ? reconnectError : null;
+          // Once the row recovers, an old failure no longer describes it.
+          liveTrouble && reconnectError && reconnectError.name === server.liveName
+            ? reconnectError
+            : null;
         return (
           <div
-            key={server.name}
+            key={server.key ?? server.name}
             data-testid={`mcp-server-row-${server.name}`}
             className="rounded-md px-2 py-1.5"
           >
@@ -477,8 +482,8 @@ function McpServerRows({
               {liveTrouble && !needsSignIn && onReconnect && (
                 <McpReconnectAction
                   server={server}
-                  reconnecting={reconnectingName != null && reconnectingName === server.liveName}
-                  disabled={reconnectingName != null}
+                  reconnecting={Boolean(reconnectingName) && reconnectingName === server.liveName}
+                  disabled={Boolean(reconnectingName)}
                   onReconnect={onReconnect}
                 />
               )}

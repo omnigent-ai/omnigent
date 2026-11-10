@@ -679,6 +679,10 @@ class LiveMcpHarnessNotRunning(RuntimeError):
     """The session has no running harness to ask about its MCP servers."""
 
 
+class LiveMcpReconnectRefused(RuntimeError):
+    """The harness answered a reconnect with its own reason; the message is safe to show."""
+
+
 class Executor:
     """Abstract interface for LLM backends and agent harnesses.
 
@@ -769,6 +773,7 @@ class Executor:
 
         :raises LiveMcpHarnessNotRunning: The harness is not running.
         :raises LiveMcpServerUnknown: The harness reports no server named *name*.
+        :raises LiveMcpReconnectRefused: The harness tried and gave its reason.
         :raises TimeoutError: The harness did not answer in time.
         """
         raise NotImplementedError

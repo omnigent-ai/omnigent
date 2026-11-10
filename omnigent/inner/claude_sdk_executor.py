@@ -88,6 +88,7 @@ from .executor import (
     ExecutorError,
     ExecutorEvent,
     LiveMcpHarnessNotRunning,
+    LiveMcpReconnectRefused,
     LiveMcpServerStatus,
     LiveMcpServerUnknown,
     Message,
@@ -1044,6 +1045,11 @@ def _inventory_mcp_server_name(live_name: str) -> str:
 
 # Omnigent's own tool server, which the /mcp panel does not list.
 _OMNIGENT_MCP_SERVER_NAME = "omnigent"
+
+_MCP_BUSY_COMPACT_MESSAGE = (
+    "Claude Code is still busy with an MCP request that timed out, so it can't compact now. "
+    "Send a message to restart it, then run /compact again."
+)
 
 
 def _live_mcp_statuses(response: Mapping[str, object]) -> list[LiveMcpServerStatus]:
@@ -2345,14 +2351,15 @@ class ClaudeSDKExecutor(Executor):
             if status == "connected" and state.mcp_auth.get(name) != "connected"
         }
         try:
-            if signed_in:
-                async with state.mcp_control_lock:
-                    # A panel request may have timed out while this turn waited.
-                    if state.mcp_control_timed_out:
-                        return False
-                    retry = await _reconnect_failed_mcp_servers(state.client, signed_in)
-            else:
-                retry = set()
+            # Wait out a panel request in flight: if it times out, that CLI holds the prompt.
+            async with state.mcp_control_lock:
+                if state.mcp_control_timed_out:
+                    return False
+                retry = (
+                    await _reconnect_failed_mcp_servers(state.client, signed_in)
+                    if signed_in
+                    else set()
+                )
         except TimeoutError:
             logger.warning(
                 "Reconnecting MCP servers timed out; restarting the Claude CLI, "
@@ -2592,6 +2599,9 @@ class ClaudeSDKExecutor(Executor):
         async with asyncio.timeout_at(deadline):
             await state.mcp_control_lock.acquire()
         try:
+            # A CLI still busy with a timed-out request would hold this one too.
+            if state.mcp_control_timed_out:
+                raise TimeoutError
             async with asyncio.timeout_at(deadline):
                 return await request()
         except TimeoutError:
@@ -2613,15 +2623,26 @@ class ClaudeSDKExecutor(Executor):
         state = self._clients.get(session_key)
         if state is None:
             raise LiveMcpHarnessNotRunning(session_key)
-        statuses = await self.live_mcp_statuses(session_key)
-        if statuses is None:
-            raise LiveMcpHarnessNotRunning(session_key)
-        if name not in {status.name for status in statuses}:
-            raise LiveMcpServerUnknown(name)
+
+        # Check and reconnect in one lock hold, so both reach the same CLI.
+        async def check_and_reconnect() -> None:
+            if self._clients.get(session_key) is not state:
+                raise LiveMcpHarnessNotRunning(session_key)
+            response = await state.client.get_mcp_status()
+            if name not in {status.name for status in _live_mcp_statuses(response)}:
+                raise LiveMcpServerUnknown(name)
+            try:
+                await state.client.reconnect_mcp_server(name)
+            except Exception as exc:
+                # The SDK raises a bare Exception carrying the CLI's own error reply.
+                if type(exc) is Exception and exc.__cause__ is None:
+                    raise LiveMcpReconnectRefused(str(exc)) from exc
+                raise
+
         await self._mcp_control(
             state,
-            lambda: state.client.reconnect_mcp_server(name),
-            _MCP_RECONNECT_TIMEOUT_SECONDS,
+            check_and_reconnect,
+            _MCP_STATUS_TIMEOUT_SECONDS + _MCP_RECONNECT_TIMEOUT_SECONDS,
         )
 
     def supports_tool_boundary_interrupt(self) -> bool:
@@ -3114,6 +3135,10 @@ class ClaudeSDKExecutor(Executor):
             return
 
         state = self._clients.get(session_key)
+        if state is not None and prompt == "/compact" and state.mcp_control_timed_out:
+            # The busy CLI would hold the command, and a new one has nothing to compact.
+            yield ExecutorError(message=_MCP_BUSY_COMPACT_MESSAGE)
+            return
         if state is not None and prompt != "/compact":
             # Effort is a launch option, and a CLI busy with a timed-out MCP reconnect
             # holds the prompt. Rebuild with history for conversational turns, but let
@@ -3138,8 +3163,8 @@ class ClaudeSDKExecutor(Executor):
         # whatever ``create_sdk_mcp_server`` returns.
         mcp_servers: dict[str, Any] = {}  # type: ignore[explicit-any]
         if mcp_tools:
-            mcp_servers["omnigent"] = sdk.create_sdk_mcp_server(
-                name="omnigent",
+            mcp_servers[_OMNIGENT_MCP_SERVER_NAME] = sdk.create_sdk_mcp_server(
+                name=_OMNIGENT_MCP_SERVER_NAME,
                 version="1.0.0",
                 tools=mcp_tools,
             )

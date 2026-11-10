@@ -2785,7 +2785,9 @@ function ComposerImpl(
     composerSessionId,
     mcpPanelRequested && sessionHarness === "claude-sdk",
   );
-  const liveMcp = liveMcpQuery.data?.live ? liveMcpQuery.data.servers : undefined;
+  // A failed refetch keeps the last data; showing it would present old state as live.
+  const liveMcp =
+    !liveMcpQuery.isError && liveMcpQuery.data?.live ? liveMcpQuery.data.servers : undefined;
   const liveMcpReconnect = useReconnectLiveMcpServer(composerSessionId);
   const mcpSettingsHarness = nativeMcpHarness
     ? sessionHarness
@@ -3717,10 +3719,12 @@ function ComposerImpl(
       liveByName.delete(liveName);
       return liveMcpRowFields(live);
     };
-    const byName = new Map<string, McpServerRow>(
+    // Keyed by harness identity: two plugins can each ship a server with one name.
+    const rows = new Map<string, McpServerRow>(
       (hostMcpQuery.data ?? []).filter(isSessionHostServer).map((server) => [
-        server.name,
+        `host:${liveMcpNameForHostServer(server)}`,
         {
+          key: `host:${liveMcpNameForHostServer(server)}`,
           name: server.name,
           description:
             [server.plugin && `${server.plugin} plugin`, server.url_host]
@@ -3743,17 +3747,25 @@ function ComposerImpl(
       ]),
     );
     // The CLI also loads servers the host inventory doesn't list, e.g. project ones.
-    for (const live of liveByName.values()) {
-      if (!byName.has(live.name))
-        byName.set(live.name, { name: live.name, ...liveMcpRowFields(live) });
+    // Wait for the inventory, or its servers would flash up here before merging.
+    if (!hostMcpQuery.isLoading) {
+      for (const live of liveByName.values()) {
+        const key = `live:${live.name}`;
+        rows.set(key, { key, name: live.name, ...liveMcpRowFields(live) });
+      }
     }
     const catalogLoaded = !registryCatalog.loading && !registryCatalog.error;
     for (const server of selectedAgent?.mcp_servers ?? []) {
       // A shared name is not a shared endpoint, so an agent server claims none of
       // the host's account state: its Sign in could point at the wrong service.
+      const hostKeys = [...rows.entries()]
+        .filter(([key, row]) => key.startsWith("host:") && row.name === server.name)
+        .map(([key]) => key);
       const row: McpServerRow = {
+        key: hostKeys[0] ?? `agent:${server.name}`,
         name: server.name,
-        description: server.description ?? byName.get(server.name)?.description,
+        description:
+          server.description ?? (hostKeys[0] ? rows.get(hostKeys[0])?.description : undefined),
       };
       // Only a read from this open: a stale row would offer a needless popup.
       if (hasRegistryServers && server.transport === "registry" && catalogLoaded) {
@@ -3772,13 +3784,16 @@ function ComposerImpl(
           row.connection = "unavailable";
         }
       }
-      byName.set(server.name, row);
+      // Take the first host row's place and drop the rest, as the agent's server wins.
+      for (const key of hostKeys.slice(1)) rows.delete(key);
+      rows.set(row.key!, row);
     }
-    return [...byName.values()];
+    return [...rows.values()];
   }, [
     hasRegistryServers,
     isSessionHostServer,
     hostMcpQuery.data,
+    hostMcpQuery.isLoading,
     registryCatalog.error,
     registryCatalog.loading,
     registryCatalog.services,

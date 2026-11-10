@@ -617,6 +617,18 @@ describe("/mcp panel connection state", () => {
       within(screen.getByTestId("mcp-server-row-search")).getByRole("alert"),
     ).toHaveTextContent("Reconnect failed: token expired");
     expect(within(screen.getByTestId("mcp-server-row-wiki")).queryByRole("alert")).toBeNull();
+
+    // Once the row recovers, the old failure is no longer shown.
+    const recovered = rows.map((row) =>
+      row.liveName === "plugin:tools:search" ? { ...row, live: { status: "connected" } } : row,
+    );
+    rerender(
+      panel({
+        mcpServers: recovered,
+        mcpReconnectError: { name: "plugin:tools:search", message: "token expired" },
+      }),
+    );
+    expect(within(screen.getByTestId("mcp-server-row-search")).queryByRole("alert")).toBeNull();
   });
 
   it("offers no Reconnect to a read-only viewer", () => {

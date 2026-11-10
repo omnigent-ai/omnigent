@@ -396,6 +396,11 @@ def test_claude_sdk_mcp_panel_shows_live_state_and_reconnects(
             page = request.getfixturevalue("page")
             _skip_imports_review(page, host.host_id)
             _mark_host_as_sandbox(page, host.host_id)
+            # A hosts refetch still in the patch handler must not fail teardown, even
+            # when an assertion ends the test early.
+            request.addfinalizer(
+                lambda: page.is_closed() or page.unroute_all(behavior="ignoreErrors")
+            )
             page.goto(f"{live_server}/c/{session_id}")
             composer = page.get_by_label("Message the agent")
             expect(composer).to_be_visible(timeout=60_000)
@@ -437,5 +442,3 @@ def test_claude_sdk_mcp_panel_shows_live_state_and_reconnects(
             # A later hosts refetch must keep the linked sandbox host listed.
             expect(page.get_by_test_id("harness-no-host")).to_have_count(0)
             expect(page.get_by_text(_USER_SERVER, exact=True).first).to_be_visible()
-            # A hosts refetch still in the patch handler must not fail browser teardown.
-            page.unroute_all(behavior="ignoreErrors")

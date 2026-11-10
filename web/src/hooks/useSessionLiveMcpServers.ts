@@ -1,6 +1,12 @@
 // The MCP connections a session's running harness holds, and reconnecting one.
 
-import { skipToken, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  skipToken,
+  useMutation,
+  useMutationState,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { useCallback, useState } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { apiErrorFromResponse } from "@/lib/sessionsApi";
@@ -38,6 +44,7 @@ interface LiveMcpReconnectTarget {
 
 // Re-read while a server is still connecting, so the row settles without a reopen.
 const LIVE_MCP_PENDING_POLL_MS = 2_000;
+const LIVE_MCP_RECONNECT_MUTATION_KEY = ["live-mcp-reconnect"] as const;
 
 // A server that predates the route answers its generic 404; a missing session names itself.
 const ROUTE_NOT_FOUND_MESSAGES = new Set([
@@ -105,44 +112,56 @@ export function useSessionLiveMcpServers(sessionId: string | null, enabled: bool
 /** Reconnect one of the session harness's MCP servers; the panel shows the outcome. */
 export function useReconnectLiveMcpServer(sessionId: string | null) {
   const client = useQueryClient();
-  const [error, setError] = useState<(LiveMcpReconnectError & { sessionId: string }) | null>(null);
+  // Keyed by session, so switching away and back keeps each session's failure.
+  const [errors, setErrors] = useState<ReadonlyMap<string, LiveMcpReconnectError>>(new Map());
+  const setError = useCallback((target: string, error: LiveMcpReconnectError | null) => {
+    setErrors((current) => {
+      if (error === null && !current.has(target)) return current;
+      const next = new Map(current);
+      if (error === null) next.delete(target);
+      else next.set(target, error);
+      return next;
+    });
+  }, []);
   // Each reconnect carries its session, so one that settles after a switch stays with it.
-  const mutation = useMutation({
+  const { mutate } = useMutation({
+    mutationKey: LIVE_MCP_RECONNECT_MUTATION_KEY,
     mutationFn: ({ sessionId: target, name }: LiveMcpReconnectTarget) =>
       postLiveMcpReconnect(target, name),
-    onMutate: ({ sessionId: target }) =>
-      setError((current) => (current?.sessionId === target ? null : current)),
+    onMutate: ({ sessionId: target }) => setError(target, null),
     onSuccess: async (result, { sessionId: target, name }) => {
       const { reconnect_error: reconnectError, ...snapshot } = result;
       const queryKey = sessionLiveMcpServersQueryKey(target);
       // A poll that started before the reconnect would overwrite its newer snapshot.
       await client.cancelQueries({ queryKey });
       client.setQueryData(queryKey, snapshot);
-      if (reconnectError) setError({ sessionId: target, name, message: reconnectError });
+      if (reconnectError) setError(target, { name, message: reconnectError });
     },
     onError: (failure: Error, { sessionId: target, name }) => {
-      setError({
-        sessionId: target,
-        name,
-        message: failure.message || "Couldn’t reconnect. Try again.",
-      });
+      setError(target, { name, message: failure.message || "Couldn’t reconnect. Try again." });
       // The harness may have changed state before the request failed.
       void client.invalidateQueries({ queryKey: sessionLiveMcpServersQueryKey(target) });
     },
   });
-  const { mutate } = mutation;
+  // The observer tracks only its latest call, so ask the cache what each session has running.
+  const pendingTargets = useMutationState({
+    filters: { mutationKey: LIVE_MCP_RECONNECT_MUTATION_KEY, status: "pending" },
+    select: (pending) => pending.state.variables as LiveMcpReconnectTarget | undefined,
+  });
   const reconnect = useCallback(
     (name: string) => {
       if (sessionId !== null) mutate({ sessionId, name });
     },
     [mutate, sessionId],
   );
-  const clearError = useCallback(() => setError(null), []);
-  const pending = mutation.isPending ? mutation.variables : undefined;
+  const clearError = useCallback(() => {
+    if (sessionId !== null) setError(sessionId, null);
+  }, [sessionId, setError]);
+  const pending = pendingTargets.find((target) => target?.sessionId === sessionId);
   return {
     reconnect,
-    reconnectingName: pending?.sessionId === sessionId ? pending.name : null,
-    error: error?.sessionId === sessionId ? { name: error.name, message: error.message } : null,
+    reconnectingName: pending?.name ?? null,
+    error: (sessionId !== null && errors.get(sessionId)) || null,
     clearError,
   };
 }
