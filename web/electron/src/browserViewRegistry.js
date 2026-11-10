@@ -229,7 +229,7 @@ function createBrowserViewRegistry({
   }
 
   // Popups never open the system browser (an abuse vector for agent-visited
-  // pages): a Cmd/Ctrl- or middle-clicked link becomes a new in-app tab, others
+  // pages): background-tab clicks go to a supporting renderer as new tabs, others
   // load in this view. loadURL skips will-navigate, so enforce policy here.
   function installWindowOpenPolicy(entry) {
     const wc = entry.view && entry.view.webContents;

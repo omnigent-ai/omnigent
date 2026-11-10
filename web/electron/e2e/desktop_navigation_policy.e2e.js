@@ -1149,7 +1149,13 @@ it(
           const tabs = [];
           global.omnigentTestBrowserRegistries[0].forEach((entry, id) => {
             if (id.startsWith(`browser-tab:${sessionId}:`)) {
-              tabs.push({ id, url: entry.view.webContents.getURL() });
+              const { webContents } = entry.view;
+              tabs.push({
+                id,
+                url: webContents.getURL(),
+                loading: webContents.isLoading(),
+                policyEnforced: entry.navigationPolicyEnforced,
+              });
             }
           });
           return tabs;
@@ -1177,24 +1183,33 @@ it(
       await hold(2500);
       mark("modifier click");
       await link.click({ modifiers: ["ControlOrMeta"] });
-      tabsAfterClick = await eventually(async () => {
+      await eventually(async () => {
         const tabs = await sessionBrowserTabs();
         return tabs.some((tab) => tab.url === linkedUrl) ? tabs : null;
       }, "linked page in a browser tab");
+      await window.getByRole("button", { name: "Close Linked page", exact: true }).waitFor();
+      // Re-read once settled, so a late in-place load of the clicked tab is caught.
+      tabsAfterClick = await eventually(async () => {
+        const tabs = await sessionBrowserTabs();
+        return tabs.every((tab) => !tab.loading) ? tabs : null;
+      }, "browser tabs finished loading");
       mark("linked page loaded");
       await hold(6000);
       mark("end");
       // End the clip on this state rather than on the window closing.
       await desktop.stopDisplayCapture();
       assert.deepEqual(
-        tabsAfterClick.map((tab) => ({ clickedTab: tab.id === original.id, url: tab.url })),
+        tabsAfterClick.map(({ id, url, policyEnforced }) => ({
+          clickedTab: id === original.id,
+          url,
+          policyEnforced,
+        })),
         [
-          { clickedTab: true, url: sourceUrl },
-          { clickedTab: false, url: linkedUrl },
+          { clickedTab: true, url: sourceUrl, policyEnforced: true },
+          { clickedTab: false, url: linkedUrl, policyEnforced: true },
         ],
       );
       await window.getByRole("button", { name: "Close Link source page", exact: true }).waitFor();
-      await window.getByRole("button", { name: "Close Linked page", exact: true }).waitFor();
     } finally {
       fs.mkdirSync(recordDir, { recursive: true });
       fs.writeFileSync(
