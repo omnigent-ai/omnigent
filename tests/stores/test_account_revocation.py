@@ -16,6 +16,8 @@ from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.inbox_item_store import NewInboxItem
+from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
@@ -941,3 +943,43 @@ def test_runner_issuance_rechecks_both_owners_and_binding(db_uri, monkeypatch, c
         else:
             assert pending.result(timeout=15) is None
     assert issued == []
+
+
+def _inbox_item(user_id: str) -> NewInboxItem:
+    return NewInboxItem(
+        user_id=user_id,
+        source_session_id=uuid.uuid4().hex,
+        agent_id=uuid.uuid4().hex,
+        prompt_version=None,
+        kind="info",
+        title="A private suggestion",
+        body_md="Only the account that got it may read it.",
+        links=[],
+        actions=[],
+        chart=None,
+        primary_link=None,
+        topic="private",
+        dedupe_key="v1:private",
+    )
+
+
+def test_deleted_account_inbox_is_not_visible_after_reregistration(db_uri: str) -> None:
+    accounts = SqlAlchemyAccountStore(db_uri)
+    inbox = SqlAlchemyInboxItemStore(db_uri)
+    old = accounts.create_user_with_password("alice", "test-password-hash")
+    with account_authority_scope("alice", old.account_generation):
+        item = inbox.create(_inbox_item("alice"))
+    assert accounts.delete_user("alice") is True
+    new = accounts.create_user_with_password("alice", "replacement-password-hash")
+
+    with account_authority_scope("alice", new.account_generation):
+        assert inbox.list_for_user("alice") == ([], None)
+        assert inbox.get(item.id, "alice") is None
+        assert inbox.get_by_dedupe_key("alice", "v1:private") is None
+    with account_authority_scope("alice", old.account_generation):
+        for write in (
+            lambda: inbox.create(_inbox_item("alice")),
+            lambda: inbox.update(item.id, "alice", state="read", now=1),
+        ):
+            with pytest.raises(OmnigentError, match="revoked"):
+                write()
