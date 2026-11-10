@@ -4791,18 +4791,8 @@ _FRAMEWORK_PROMPT = "Keep framework metadata separate."
             ("--append-system-prompt=Earlier.", "--append-system-prompt="),
             ("--append-system-prompt=Earlier.", f"--append-system-prompt={_FRAMEWORK_PROMPT}"),
         ),
-        (("--append-system-prompt-file", "profile.md"), None),
-        (("--append-system-prompt-file=profile.md",), None),
-        (
-            ("--append-system-prompt-file", "profile.md", "--append-system-prompt", "Review."),
-            (
-                "--append-system-prompt-file",
-                "profile.md",
-                "--append-system-prompt",
-                f"{_FRAMEWORK_PROMPT}\n\nReview.",
-            ),
-        ),
         (("--", "--append-system-prompt=Positional."), None),
+        (("--", "--append-system-prompt-file=missing.md"), None),
     ],
     ids=[
         "no-user-prompt",
@@ -4811,34 +4801,16 @@ _FRAMEWORK_PROMPT = "Keep framework metadata separate."
         "repeated-flags-last-wins",
         "final-empty-value-clears",
         "final-empty-joined-value-clears",
-        "caller-file-separate-value",
-        "caller-file-joined-value",
-        "caller-file-and-prompt",
         "after-end-of-options",
+        "file-after-end-of-options",
     ],
 )
 def test_augment_claude_args_appends_caller_system_prompt(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     user_args: tuple[str, ...],
     merged_args: tuple[str, ...] | None,
 ) -> None:
     """Omnigent's prompt joins the caller's last prompt value, or is added when there is none."""
-    # Claude reads a caller's prompt file itself, so Omnigent must never open it.
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "profile.md").write_text("Reviewer profile.\n", encoding="utf-8")
-
-    def refuse_caller_prompt_file(real_open: Callable[..., Any]) -> Callable[..., Any]:
-        def guarded_open(file: Any, *args: Any, **kwargs: Any) -> Any:
-            if isinstance(file, str | os.PathLike) and os.path.basename(file) == "profile.md":
-                raise AssertionError("Omnigent opened the caller's prompt file")
-            return real_open(file, *args, **kwargs)
-
-        return guarded_open
-
-    monkeypatch.setattr("builtins.open", refuse_caller_prompt_file(io.open))
-    monkeypatch.setattr(io, "open", refuse_caller_prompt_file(io.open))
-    monkeypatch.setattr(os, "open", refuse_caller_prompt_file(os.open))
     omnigent_args = augment_claude_args(
         (),
         bridge_dir=tmp_path,
@@ -4864,6 +4836,86 @@ def test_augment_claude_args_appends_caller_system_prompt(
         assert args == [*merged_args, *omnigent_args]
 
 
+@pytest.mark.parametrize(
+    ("user_args", "inline_prompt"),
+    [
+        (("--append-system-prompt-file", "profile.md"), ""),
+        (("--append-system-prompt-file=profile.md",), ""),
+        (
+            ("--append-system-prompt-file", "profile.md", "--append-system-prompt", "Review."),
+            "Review.",
+        ),
+        (
+            (
+                "--append-system-prompt",
+                "Earlier.",
+                "--append-system-prompt-file=missing.md",
+                "--append-system-prompt-file",
+                "profile.md",
+                "--append-system-prompt=Later.",
+            ),
+            "Later.",
+        ),
+        (
+            (
+                "--append-system-prompt=Earlier.",
+                "--append-system-prompt-file=profile.md",
+                "--append-system-prompt=",
+            ),
+            "",
+        ),
+    ],
+    ids=["file-separate", "file-joined", "file-and-inline", "last-values-win", "empty-inline"],
+)
+def test_augment_claude_args_combines_caller_prompt_file(
+    tmp_path: Path, user_args: tuple[str, ...], inline_prompt: str
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "profile.md"
+    file_text = "Reviewer profile.\n"
+    source.write_text(file_text, encoding="utf-8")
+    bridge_dir = tmp_path / "bridge"
+
+    args = augment_claude_args(
+        ("--resume", "session-id", *user_args),
+        bridge_dir=bridge_dir,
+        workspace=workspace,
+        python_executable="/venv/bin/python",
+        append_system_prompt=_FRAMEWORK_PROMPT,
+    )
+
+    assert args[:2] == ["--resume", "session-id"]
+    assert [arg for arg in args if arg.startswith("--append-system-prompt")] == [
+        "--append-system-prompt-file"
+    ]
+    combined = Path(args[args.index("--append-system-prompt-file") + 1])
+    expected = f"{file_text}\n\n{_FRAMEWORK_PROMPT}"
+    if inline_prompt:
+        expected += f"\n\n{inline_prompt}"
+    assert combined.parent == bridge_dir
+    assert combined.read_text(encoding="utf-8") == expected
+    assert combined.stat().st_mode & 0o777 == 0o600
+    assert source.read_text(encoding="utf-8") == file_text
+
+
+@pytest.mark.parametrize("file_contents", [None, b"\xff"], ids=["missing", "invalid-utf8"])
+def test_augment_claude_args_rejects_unreadable_prompt_file(
+    tmp_path: Path, file_contents: bytes | None
+) -> None:
+    if file_contents is not None:
+        (tmp_path / "profile.md").write_bytes(file_contents)
+
+    with pytest.raises(ValueError, match="Could not read --append-system-prompt-file"):
+        augment_claude_args(
+            ("--append-system-prompt-file", "profile.md"),
+            bridge_dir=tmp_path / "bridge",
+            workspace=tmp_path,
+            python_executable="/venv/bin/python",
+            append_system_prompt=_FRAMEWORK_PROMPT,
+        )
+
+
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
     """Framework preapproval extends rather than replaces the user's allowlist."""
     args = augment_claude_args(
@@ -4882,15 +4934,19 @@ def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None
     ]
 
 
-def test_augment_claude_args_omits_unsupplied_system_prompt(tmp_path: Path) -> None:
+@pytest.mark.parametrize("user_args", [(), ("--append-system-prompt-file", "missing.md")])
+def test_augment_claude_args_omits_unsupplied_system_prompt(
+    tmp_path: Path, user_args: tuple[str, ...]
+) -> None:
     """The bridge does not invent framework policy on its own."""
     args = augment_claude_args(
-        (),
+        user_args,
         bridge_dir=tmp_path,
         python_executable="/venv/bin/python",
     )
 
     assert "--append-system-prompt" not in args
+    assert args[: len(user_args)] == list(user_args)
 
 
 def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> None:

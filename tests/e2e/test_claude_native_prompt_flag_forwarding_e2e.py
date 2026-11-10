@@ -72,7 +72,6 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
-from tests._helpers.compat import release_tuple
 from tests.e2e.conftest import get_mock_message_requests
 
 pytestmark = pytest.mark.skipif(
@@ -271,8 +270,8 @@ def test_caller_prompt_file_and_inline_prompt_reach_claude_with_omnigent(
     """
     Real Claude receives the caller's file, then Omnigent's instructions, then the caller's prompt.
 
-    ``augment_claude_args`` leaves the caller's file flag and puts Omnigent's text before the
-    caller's inline prompt. Only the file case relies on Claude 2.1.295+ applying both flags.
+    ``augment_claude_args`` combines file and inline prompts into one flag so older CLIs
+    receive the same instruction ordering.
 
     :param isolated_mock_llm_server_url: Messages API that records Claude's requests.
     :param tmp_path: Holds the caller's file and Omnigent's bridge directory.
@@ -281,9 +280,6 @@ def test_caller_prompt_file_and_inline_prompt_reach_claude_with_omnigent(
     """
     from omnigent.harnesses.claude_native import bridge
 
-    claude_version = _run_real_claude(["--version"]).split()[0]
-    if with_caller_file and release_tuple(claude_version) < (2, 1, 295):
-        pytest.skip(f"Claude Code {claude_version} refuses both prompt flags together")
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
     profile = tmp_path / "profile.md"
@@ -298,9 +294,14 @@ def test_caller_prompt_file_and_inline_prompt_reach_claude_with_omnigent(
         append_system_prompt="OMNIGENT-MARKER session instructions",
     )
 
-    # Omnigent's text joins the caller's inline flag; its bridge flags are not needed here.
+    prompt_flag = "--append-system-prompt-file" if with_caller_file else "--append-system-prompt"
+    other_flag = "--append-system-prompt" if with_caller_file else "--append-system-prompt-file"
+    assert augmented.count(prompt_flag) == 1, augmented
+    assert other_flag not in augmented, augmented
+    prompt_index = augmented.index(prompt_flag)
+    # Exercise the effective prompt flag without Omnigent's bridge settings or MCP server.
     output = _run_real_claude(
-        ["-p", "hello", *augmented[: len(caller_args)]],
+        ["-p", "hello", *augmented[prompt_index : prompt_index + 2]],
         extra_env={
             "ANTHROPIC_BASE_URL": isolated_mock_llm_server_url,
             "ANTHROPIC_API_KEY": "sk-ant-e2e-placeholder",

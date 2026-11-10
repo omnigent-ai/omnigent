@@ -2977,10 +2977,9 @@ def augment_claude_args(
         / ``"none"`` / list of skill names), mapped to
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
-    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
-        (author-supplied, not framework-composed) to append through Claude
-        Code's native ``--append-system-prompt`` flag, placed before a
-        caller-supplied inline prompt instead of replacing it.
+    :param append_system_prompt: Optional startup instructions, placed before
+        a caller-supplied inline prompt. A caller's prompt file is combined
+        into a private file so older CLIs receive only one prompt flag.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param subagent_router_dir: Directory advertising the runner's
@@ -3028,7 +3027,9 @@ def augment_claude_args(
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
         args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])
     args.extend(["--settings", str(settings_path)])
-    args = _merge_append_system_prompt(args, append_system_prompt)
+    args = _merge_append_system_prompt(
+        args, append_system_prompt, bridge_dir=bridge_dir, workspace=workspace
+    )
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
     from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
 
@@ -3116,32 +3117,67 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
     return args
 
 
-def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]:
+def _merge_append_system_prompt(
+    args: list[str], extra: str | None, *, bridge_dir: Path, workspace: Path | None
+) -> list[str]:
     """Put ``extra`` before the caller's ``--append-system-prompt`` value.
 
     Claude Code keeps only the last value of the flag, so ``extra`` joins that
     value in place, or a new flag carries it. The scan stops at a bare ``--``.
-    Other caller tokens, including an ``--append-system-prompt-file``, are left
-    as they are. Claude Code 2.1.295+ applies such a file before the inline
-    prompt; 2.1.161 and 2.1.278 refuse to start with both.
+    A caller's prompt file precedes the inline prompt. Combine them in a private
+    bridge file because older Claude CLIs reject file and inline flags together.
 
     :param args: Claude CLI argument list to mutate-and-return.
     :param extra: Instructions Omnigent appends, e.g. the agent's instructions.
+    :param bridge_dir: Owner-only directory for a combined prompt file.
+    :param workspace: Session cwd for resolving a caller's relative file path.
     :returns: ``args`` whose last prompt value carries both prompts.
     """
     if not extra:
         return args
     flag = "--append-system-prompt"
-    joined_prefix = f"{flag}="
+    file_flag = f"{flag}-file"
     location: tuple[int, int] | None = None
+    file_value: str | None = None
+    prompt_spans: list[tuple[int, int]] = []
     idx = 0
     while idx < len(args) and args[idx] != "--":
-        if args[idx].startswith(joined_prefix):
-            location = (idx, len(joined_prefix))
-        elif args[idx] == flag and idx + 1 < len(args):
-            location = (idx + 1, 0)
+        option, separator, _value = args[idx].partition("=")
+        if option not in (flag, file_flag):
             idx += 1
+            continue
+        start = idx
+        offset = len(option) + 1 if separator else 0
+        if not separator:
+            if idx + 1 >= len(args):
+                break
+            idx += 1
+        if option == flag:
+            location = (idx, offset)
+        else:
+            file_value = args[idx][offset:]
+        prompt_spans.append((start, idx + 1))
         idx += 1
+    if file_value is not None:
+        source = (workspace or Path.cwd()) / file_value
+        try:
+            file_text = source.read_bytes().decode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(
+                f"Could not read --append-system-prompt-file {source}: {exc}"
+            ) from exc
+        parts = [file_text, extra]
+        if location is not None:
+            value_idx, offset = location
+            if existing := args[value_idx][offset:]:
+                parts.append(existing)
+        combined = bridge_dir / "claude-append-system-prompt.md"
+        _write_private_file(combined, "\n\n".join(parts))
+        for start, end in reversed(prompt_spans):
+            del args[start:end]
+        insert_at = prompt_spans[0][0]
+        args[insert_at:insert_at] = [file_flag, str(combined)]
+        return args
     if location is None:
         args.extend([flag, extra])
         return args
