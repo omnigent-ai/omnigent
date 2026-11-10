@@ -761,6 +761,99 @@ async def test_forwarder_retries_user_item_on_ambiguous_post_failure(tmp_path: P
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("rejection_status", [401, 403])
+@pytest.mark.parametrize("restart", [False, True])
+async def test_forwarder_retains_receipts_until_rejected_credentials_recover(
+    tmp_path: Path, rejection_status: int, restart: bool
+) -> None:
+    """A rejected auth epoch must not consume a durable native receipt."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript = "".join(
+        json.dumps({"type": role, "uuid": source, "message": {"role": role, "content": text}})
+        + "\n"
+        for role, source, text in (
+            ("user", "retained-input", "retain this input"),
+            ("assistant", "retained-reply", "visible reply"),
+        )
+    )
+    transcript_path.write_text(transcript, encoding="utf-8")
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    forwarder._write_forward_state(bridge_dir, state)
+    tracker = forwarder._PostRetryTracker(
+        max_permanent_attempts=2, base_delay_s=0.0, max_delay_s=0.0
+    )
+    dedupe = forwarder._ForwardDedupeState()
+    requests: list[dict[str, Any]] = []
+    accepted: list[dict[str, Any]] = []
+    credentials_repaired = False
+    auth = _CountingAuth()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/v1/sessions/conv_abc/events"
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if payload["type"] == "external_conversation_item":
+            if not credentials_repaired:
+                return httpx.Response(rejection_status, text="Invalid Token")
+            accepted.append(payload)
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test", auth=auth
+    ) as client:
+        for _ in range(4):
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=tracker,
+                dedupe=dedupe,
+            )
+            assert state.byte_offset == 0
+            assert state.seen_source_ids == ()
+            assert forwarder._read_forward_state(bridge_dir).byte_offset == 0
+        assert not (bridge_dir / "dead_letter.jsonl").exists()
+        if restart:
+            state = forwarder._read_forward_state(bridge_dir)
+            tracker = forwarder._PostRetryTracker(
+                max_permanent_attempts=2, base_delay_s=0.0, max_delay_s=0.0
+            )
+            dedupe = forwarder._ForwardDedupeState()
+        credentials_repaired = True
+        for _ in range(2):
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=tracker,
+                dedupe=dedupe,
+            )
+
+    assert [event["data"]["source_id"] for event in accepted] == [
+        "retained-input:0:message",
+        "retained-reply:0:message",
+    ]
+    assert accepted[0] == requests[0]
+    assert all(event["type"] == "external_conversation_item" for event in requests)
+    assert len(requests) == 6
+    assert auth.calls == len(requests)
+    assert state.byte_offset == len(transcript.encode("utf-8"))
+    assert forwarder._read_forward_state(bridge_dir) == state
+    assert transcript_path.read_text(encoding="utf-8") == transcript
+
+
+@pytest.mark.asyncio
 async def test_forwarder_retries_user_item_on_connect_error(tmp_path: Path) -> None:
     """
     A provably-undelivered POST failure is retried, not dropped.
