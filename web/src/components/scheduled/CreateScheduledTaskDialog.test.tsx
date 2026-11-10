@@ -30,6 +30,7 @@ import * as identity from "@/lib/identity";
 import * as sandboxModelsHook from "@/hooks/useSandboxModelOptions";
 import * as hostsHook from "@/hooks/useHosts";
 import * as scheduledHooks from "@/hooks/useScheduledTasks";
+import { registryRequest, type RegistryService } from "@/lib/mcpRegistry";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
@@ -70,6 +71,10 @@ vi.mock("@/hooks/useHostWorktrees", () => ({
   },
 }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
+vi.mock("@/lib/mcpRegistry", () => ({
+  registryRequest: vi.fn(),
+  authorizeRegistryService: vi.fn(),
+}));
 // useHostModelOptions is consumed by the ModelEffortFields sub-form (model
 // dropdown source). Returning no data makes it fall back to the static Claude
 // alias list, which is what a no-host-pinned scheduled task uses anyway.
@@ -497,6 +502,7 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    mcpServices: [],
     sessionMode: "new",
     sessionId: null,
     workspace: null,
@@ -6394,5 +6400,142 @@ describe("creating an automation from a session", () => {
     const { input } = updateMutateAsync.mock.calls[0][0];
     expect(input).toMatchObject({ name: "Rubric refresh", prompt: "" });
     expect(input).not.toHaveProperty("agentId");
+  });
+});
+
+describe("CreateScheduledTaskDialog MCP services", () => {
+  const github: RegistryService = {
+    id: "github",
+    title: "GitHub",
+    description: "",
+    auth: "oauth",
+    connected: true,
+    tools: [],
+    connect_provider: "oauth",
+  };
+  const linear: RegistryService = { ...github, id: "linear", title: "Linear", connected: false };
+
+  function renderWithRegistry(ui: React.ReactElement) {
+    return render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          features: { automations_v2: true },
+          scheduled_task_harness_settings: true,
+          scheduled_task_mcp_services: true,
+          enabled_connections: ["mcp"],
+        }}
+      >
+        {ui}
+      </CapabilitiesProvider>,
+    );
+  }
+
+  beforeEach(() => {
+    vi.mocked(registryRequest).mockResolvedValue({ data: [github, linear] });
+  });
+
+  /** Open the MCP chip's menu and return a service's switch. */
+  async function mcpSwitch(name: string) {
+    fireEvent.click(screen.getByTestId("task-mcp-services-trigger"));
+    return screen.findByRole("switch", { name });
+  }
+
+  it("is hidden without the registry or on a server that rejects task MCP services", () => {
+    renderDialog();
+    expect(screen.queryByTestId("task-mcp-services-trigger")).not.toBeInTheDocument();
+    cleanup();
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, enabled_connections: ["mcp"] }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+      </CapabilitiesProvider>,
+    );
+    expect(screen.queryByTestId("task-mcp-services-trigger")).not.toBeInTheDocument();
+    expect(registryRequest).not.toHaveBeenCalled();
+  });
+
+  it("saves the services a new automation starts with", async () => {
+    renderWithRegistry(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Triage" } });
+    expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("No MCPs");
+    fireEvent.click(await mcpSwitch("GitHub"));
+    await waitFor(() =>
+      expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("MCPs · 1"),
+    );
+    fireEvent.click(screen.getByTestId("task-mcp-services-trigger"));
+    const hostTrigger = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostTrigger);
+    fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].mcpServices).toEqual(["github"]);
+  });
+
+  it("starts a new automation from the services last picked for a new chat", async () => {
+    localStorage.setItem("omnigent:last-mcp-services", JSON.stringify(["github"]));
+    renderWithRegistry(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    expect(await mcpSwitch("GitHub")).toBeChecked();
+  });
+
+  it("blocks saving until every selected service is signed in", async () => {
+    renderWithRegistry(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ mcpServices: ["linear"] })}
+      />,
+    );
+    expect(await screen.findByTestId("task-mcp-services-blocked")).toHaveTextContent(
+      "Sign in to each selected MCP service",
+    );
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+
+    fireEvent.click(await mcpSwitch("Linear"));
+    expect(screen.queryByTestId("task-mcp-services-blocked")).not.toBeInTheDocument();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+  });
+
+  it.each([
+    ["unchanged", false, undefined],
+    ["turned off", true, []],
+  ])("sends the services on edit only when they change (%s)", async (_, turnOff, expected) => {
+    renderWithRegistry(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ mcpServices: ["github"] })}
+      />,
+    );
+    const toggle = await mcpSwitch("GitHub");
+    expect(toggle).toBeChecked();
+    if (turnOff) fireEvent.click(toggle);
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.mcpServices).toEqual(expected);
+  });
+
+  it("leaves a continued session's services alone", async () => {
+    renderWithRegistry(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          sessionMode: "continue",
+          sessionId: "conv_kept",
+          mcpServices: ["linear"],
+        })}
+      />,
+    );
+    const trigger = await screen.findByTestId("task-mcp-services-trigger");
+    expect(trigger).toBeDisabled();
+    expect(trigger).toHaveTextContent("Session's MCPs");
+    // An unsigned service it can't add to the session does not block saving.
+    expect(screen.queryByTestId("task-mcp-services-blocked")).not.toBeInTheDocument();
   });
 });
