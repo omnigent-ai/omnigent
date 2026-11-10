@@ -120,6 +120,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # Gates the automation dialog's Session control; older servers reject the fields.
     assert data["scheduled_task_session_modes"] is True
     assert data["scheduled_task_subhour"] is True
+    # One-time rules need the database scheduler, which this app does not run.
+    assert data["scheduled_task_one_time"] is False
     assert data["automation_trigger_poll_minutes"] == 10
     assert data["scheduled_task_harness_settings"] is True
     # Gates the automation picker's approval-skipping modes; older servers reject them.

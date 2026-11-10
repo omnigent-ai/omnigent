@@ -737,6 +737,65 @@ async def test_create_rejects_invalid_rrule(auth_client: httpx.AsyncClient, db_u
     assert not [row for row in rows if row["event_name"] == "scheduled_task_created"]
 
 
+def _one_time_rule_in(hours: int) -> tuple[str, int]:
+    """A reminder's one-time rule for whole-minute UTC time *hours* from now."""
+    from datetime import UTC, datetime, timedelta
+
+    from omnigent.tools.builtins.scheduled_tasks import reminder_rrule
+
+    when = (datetime.now(UTC) + timedelta(hours=hours)).replace(second=0, microsecond=0)
+    return reminder_rrule(when), int(when.timestamp())
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+async def test_database_scheduler_runs_a_one_time_rule_once(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.server.scheduled.schedule import next_scheduled_time
+
+    info = (await auth_client.get("/v1/info", headers=_headers())).json()
+    assert info["scheduled_task_one_time"] is True
+    rule, fire_at = _one_time_rule_in(hours=2)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(rrule=rule, timezone="UTC"), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    task = store.get(created.json()["id"])
+    assert task is not None
+    assert (task.state, task.next_run_at) == ("active", fire_at)
+
+    # Its only occurrence is claimed with no next run, which completes the task.
+    assert next_scheduled_time(task, fire_at) is None
+    claimed = store.claim_scheduled_run(
+        task, now=fire_at, next_run_at=None, host_id=task.host_id, lease_seconds=120
+    )
+    assert claimed is not None
+    assert store.get(task.id).state == "completed"
+
+    # An edit that keeps the rule is revalidated with the same allowance.
+    renamed = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task.id}",
+        json={"name": "renamed", "session_mode": "new"},
+        headers=_headers(),
+    )
+    assert renamed.status_code == 200, renamed.text
+
+
+async def test_legacy_scheduler_rejects_a_one_time_rule(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    # The legacy timer re-anchors COUNT at each re-arm, so it would fire again.
+    info = (await auth_client.get("/v1/info", headers=_headers())).json()
+    assert info["scheduled_task_one_time"] is False
+    rule, _fire_at = _one_time_rule_in(hours=2)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(rrule=rule), headers=_headers()
+    )
+    assert resp.status_code == 400, resp.text
+    assert "fires only once" in resp.text
+
+
 async def test_create_rejects_unknown_agent(auth_client: httpx.AsyncClient, db_uri: str) -> None:
     _make_user(db_uri)
     resp = await auth_client.post(
@@ -3892,8 +3951,8 @@ async def test_concurrent_schedule_edits_reject_stale_validation(
     validated = asyncio.Barrier(2)
     first_saved = asyncio.Event()
 
-    async def validate_together(rrule, session_mode, execution_target):
-        await validate(rrule, session_mode, execution_target)
+    async def validate_together(rrule, session_mode, execution_target, *, allow_single_fire):
+        await validate(rrule, session_mode, execution_target, allow_single_fire=allow_single_fire)
         await validated.wait()
         if (rrule == recurrence_patch["rrule"]) != recurrence_first:
             await first_saved.wait()

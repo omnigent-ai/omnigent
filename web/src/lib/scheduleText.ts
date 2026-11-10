@@ -348,6 +348,17 @@ export function describeSchedule(rrule: string): string {
   const days = normalizeWeekdays(o.byweekday);
   const interval = typeof o.interval === "number" && o.interval > 1 ? o.interval : 1;
 
+  // A one-time rule, such as a reminder, runs at its first match and then completes.
+  if (o.count === 1) {
+    const months = normalizeNums(o.bymonth);
+    const monthDays = normalizeNums(o.bymonthday);
+    const monthName = months.length === 1 ? MONTH_NAMES[months[0]! - 1] : undefined;
+    if (o.freq === RRule.YEARLY && monthName !== undefined && monthDays.length === 1) {
+      return `Once on ${monthName} ${monthDays[0]}${timeSuffix}`;
+    }
+    return `Once: ${describeSchedule(rrule.replace(/;?\bCOUNT=0*1\b/i, ""))}`;
+  }
+
   if (o.freq === RRule.MINUTELY) {
     // The library's toText() drops minute-rule filters; preserve them verbatim.
     const filtered = Object.entries(o).some(

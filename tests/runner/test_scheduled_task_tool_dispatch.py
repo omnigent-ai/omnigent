@@ -6,8 +6,8 @@ Covers the runner-side half:
   the correct ``/v1/scheduled-tasks`` REST verb + payload over ``server_client``,
   pass the JSON body through verbatim, and translate a server 4xx/5xx and a
   missing id into clean error JSON.
-- Registration: the four ``sys_scheduled_task_*`` names are always registered by
-  ``ToolManager`` (no spec opt-in) and are members of the local-dispatch and
+- Registration: the ``sys_scheduled_task_*`` names and ``sys_reminder_set`` are
+  always registered by ``ToolManager`` (no spec opt-in) and are members of the local-dispatch and
   native-relay tool sets.
 """
 
@@ -35,6 +35,7 @@ _ALL_NAMES = {
     "sys_scheduled_task_list",
     "sys_scheduled_task_update",
     "sys_scheduled_task_delete",
+    "sys_reminder_set",
 }
 _TASK_ID = "0123456789abcdef0123456789abcdef"
 _REVIEW_FIELDS = {"prompt": "Review every issue.", "permission_mode": None}
@@ -543,7 +544,7 @@ async def test_no_server_client_errors() -> None:
 
 
 def test_tools_registered_without_spec_optin() -> None:
-    """All four tools register on a minimal spec (always-on, like policy)."""
+    """All five tools register on a minimal spec (always-on, like policy)."""
     from omnigent.spec.types import AgentSpec
     from omnigent.tools.manager import ToolManager
 
@@ -610,3 +611,163 @@ async def test_update_forwards_session_fields() -> None:
     )
     _, _, body = client.calls[-1]
     assert body == {**_REVIEW_FIELDS, "session_mode": "continue", "session_id": None}
+
+
+# ── sys_reminder_set ─────────────────────────────────────────────────────────
+
+_REMINDER_NOW = "2026-11-10T22:15:30+00:00"
+
+
+class _ReminderClient(_RecordingClient):
+    """Answers ``/v1/info``, the calling session's snapshot, and the task create."""
+
+    def __init__(
+        self,
+        response: _Resp | None = None,
+        *,
+        one_time: bool = True,
+        session: _Resp | None = None,
+    ) -> None:
+        super().__init__(
+            response or _Resp(body={"id": _TASK_ID, "next_run_at": "2026-11-10T23:01:00+00:00"}),
+            info=_Resp(
+                body={"scheduled_task_session_modes": True, "scheduled_task_one_time": one_time}
+            ),
+        )
+        self._session = session or _Resp(body={"id": "conv_1", "agent_id": "ag_1"})
+
+    async def get(self, url: str, *, timeout: object = None) -> _Resp:
+        self.calls.append(("GET", url, None))
+        if url == "/v1/info":
+            return self._info
+        return self._session
+
+
+@pytest.fixture()
+def _frozen_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import datetime
+
+    from omnigent.runner import tool_dispatch
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            return datetime.fromisoformat(_REMINDER_NOW).astimezone(tz)
+
+    monkeypatch.setattr(tool_dispatch, "datetime", _Frozen)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+async def test_reminder_creates_a_one_time_task_that_continues_this_session() -> None:
+    client = _ReminderClient()
+    out = await execute_tool(
+        tool_name="sys_reminder_set",
+        arguments=json.dumps({"message": "Check CI on PR #12.", "delay_seconds": 2700}),
+        server_client=client,
+        conversation_id="conv_1",
+    )
+    assert [call[:2] for call in client.calls] == [
+        ("GET", "/v1/info"),
+        ("GET", "/v1/sessions/conv_1"),
+        ("POST", "/v1/scheduled-tasks"),
+    ]
+    assert client.calls[-1][2] == {
+        "name": "Reminder: Check CI on PR #12.",
+        "prompt": "[Reminder set for 2026-11-10 23:01 UTC]\nCheck CI on PR #12.",
+        "rrule": "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=10;BYHOUR=23;BYMINUTE=1;BYSECOND=0;COUNT=1",
+        "timezone": "UTC",
+        "agent_id": "ag_1",
+        "permission_mode": None,
+        "session_mode": "continue",
+        "session_id": "conv_1",
+    }
+    assert client.headers[-1] == {
+        ORCHESTRATION_SOURCE_HEADER: "conv_1",
+        "x-omnigent-automation-source": "agent",
+    }
+    assert json.loads(out) == {
+        "status": "scheduled",
+        "scheduled_task_id": _TASK_ID,
+        "fire_at": "2026-11-10T23:01:00+00:00",
+        "next_run_at": "2026-11-10T23:01:00+00:00",
+        "message": "Check CI on PR #12.",
+        "cancel_with": "sys_scheduled_task_delete",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+async def test_reminder_is_refused_on_a_server_without_one_time_schedules() -> None:
+    client = _ReminderClient(one_time=False)
+    out = await _execute_scheduled_task_tool(
+        "sys_reminder_set",
+        json.dumps({"message": "ping", "delay_seconds": 600}),
+        server_client=client,
+        conversation_id="conv_1",
+    )
+    assert "does not support one-time reminders" in json.loads(out)["error"]
+    assert [verb for verb, _url, _body in client.calls] == ["GET"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+@pytest.mark.parametrize(
+    "args,conversation_id,error",
+    [
+        ({"message": "ping", "delay_seconds": 600}, None, "requires a session"),
+        ({"message": "  ", "delay_seconds": 600}, "conv_1", "non-empty string"),
+        ({"message": "ping"}, "conv_1", "exactly one"),
+        ({"message": "ping", "delay_seconds": 5}, "conv_1", "at least one minute"),
+    ],
+)
+async def test_reminder_argument_errors_make_no_server_calls(
+    args: dict[str, object], conversation_id: str | None, error: str
+) -> None:
+    client = _ReminderClient()
+    out = await _execute_scheduled_task_tool(
+        "sys_reminder_set",
+        json.dumps(args),
+        server_client=client,
+        conversation_id=conversation_id,
+    )
+    assert error in json.loads(out)["error"]
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+async def test_reminder_reports_an_unreadable_session_without_creating_a_task() -> None:
+    client = _ReminderClient(session=_Resp(status_code=404, body={"error": "not found"}))
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_set",
+            json.dumps({"message": "ping", "at": "2026-11-11T09:00:00Z"}),
+            server_client=client,
+            conversation_id="conv_1",
+        )
+    )
+    assert "could not read this session" in out["error"]
+    assert not [call for call in client.calls if call[0] == "POST"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+async def test_reminder_passes_the_servers_refusal_to_the_agent() -> None:
+    refusal = {
+        "error": {
+            "code": "invalid_input",
+            "message": "cannot continue this session: the session is a sub-agent's session",
+        }
+    }
+    client = _ReminderClient(_Resp(status_code=400, body=refusal))
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_set",
+            json.dumps({"message": "ping", "delay_seconds": 600}),
+            server_client=client,
+            conversation_id="conv_1",
+        )
+    )
+    assert out["error"] == "server returned 400"
+    assert "sub-agent's session" in out["details"]

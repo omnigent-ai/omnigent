@@ -1,0 +1,115 @@
+"""Tests for the ``sys_reminder_set`` schema and its time and rule helpers.
+
+The rule a reminder saves must fire exactly once, at the requested minute, under
+the database scheduler's creation-anchored ``COUNT``; these tests check that
+against the scheduler's own :func:`get_next_fire_time`.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta, timezone
+
+import pytest
+
+from omnigent.server.scheduled.rrule import get_next_fire_time, validate_rrule
+from omnigent.tools.builtins.scheduled_tasks import (
+    MAX_REMINDER_DELAY,
+    SysReminderSetTool,
+    reminder_name,
+    reminder_prompt,
+    reminder_rrule,
+    resolve_reminder_time,
+)
+
+_NOW = datetime(2026, 11, 10, 22, 15, 30, tzinfo=UTC)
+_JUNE_2027 = datetime(2027, 6, 1, tzinfo=UTC)
+
+
+def test_delay_rounds_up_to_the_next_minute() -> None:
+    assert resolve_reminder_time({"delay_seconds": 2700}, _NOW) == datetime(
+        2026, 11, 10, 23, 1, tzinfo=UTC
+    )
+
+
+def test_at_is_converted_to_utc() -> None:
+    when = resolve_reminder_time({"at": "2026-11-12T15:00:00-08:00"}, _NOW)
+    assert when == datetime(2026, 11, 12, 23, 0, tzinfo=UTC)
+    assert resolve_reminder_time({"at": "2026-11-12T23:00:00Z"}, _NOW) == when
+
+
+@pytest.mark.parametrize(
+    "args,error",
+    [
+        ({}, "exactly one"),
+        ({"at": "2026-11-12T15:00:00Z", "delay_seconds": 60}, "exactly one"),
+        ({"at": "2026-11-12T15:00:00"}, "UTC offset"),
+        ({"at": "tomorrow"}, "not an ISO-8601"),
+        ({"at": 5}, "ISO-8601 string"),
+        ({"delay_seconds": True}, "must be a number"),
+        ({"delay_seconds": "60"}, "must be a number"),
+        ({"delay_seconds": float("nan")}, "finite"),
+        ({"delay_seconds": 10}, "at least one minute"),
+        ({"at": "2026-11-10T22:00:00Z"}, "at least one minute"),
+        ({"delay_seconds": MAX_REMINDER_DELAY.total_seconds() + 1}, "at most 364 days"),
+        ({"at": "2027-11-10T22:15:00Z"}, "at most 364 days"),
+    ],
+)
+def test_invalid_times_are_rejected(args: dict[str, object], error: str) -> None:
+    result = resolve_reminder_time(args, _NOW)
+    assert isinstance(result, str)
+    assert error in result
+
+
+@pytest.mark.parametrize(
+    "created,delay",
+    [
+        (_NOW, timedelta(minutes=2)),
+        (_NOW, timedelta(hours=3)),
+        # Crosses a year boundary.
+        (datetime(2026, 12, 31, 23, 50, tzinfo=UTC), timedelta(minutes=20)),
+        # Same calendar date as creation, a few minutes earlier, next year.
+        (_NOW, timedelta(days=364) - timedelta(minutes=30)),
+        # A leap day, which a yearly rule reaches only every fourth year.
+        (_JUNE_2027, datetime(2028, 2, 29, 9, tzinfo=UTC) - _JUNE_2027),
+    ],
+)
+def test_rule_fires_once_at_the_requested_minute(created: datetime, delay: timedelta) -> None:
+    when = resolve_reminder_time({"delay_seconds": delay.total_seconds()}, created)
+    assert isinstance(when, datetime)
+    rule = reminder_rrule(when)
+    validate_rrule(rule, session_mode="continue", allow_single_fire=True)
+    # The task is created a moment after the time is resolved.
+    anchor = created + timedelta(seconds=2)
+    assert get_next_fire_time(rule, anchor, UTC, anchor=anchor) == when
+    assert get_next_fire_time(rule, when, UTC, anchor=anchor) is None
+
+
+def test_rule_ignores_the_callers_offset() -> None:
+    when = resolve_reminder_time(
+        {"at": datetime(2026, 11, 11, 9, 30, tzinfo=timezone(timedelta(hours=9))).isoformat()},
+        _NOW,
+    )
+    assert isinstance(when, datetime)
+    assert reminder_rrule(when) == (
+        "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=11;BYHOUR=0;BYMINUTE=30;BYSECOND=0;COUNT=1"
+    )
+
+
+def test_prompt_and_name() -> None:
+    when = datetime(2026, 11, 12, 23, 0, tzinfo=UTC)
+    assert reminder_prompt("Check CI on PR #12.", when) == (
+        "[Reminder set for 2026-11-12 23:00 UTC]\nCheck CI on PR #12."
+    )
+    assert reminder_name("Check  CI\non PR #12.") == "Reminder: Check CI on PR #12."
+    long_name = reminder_name("x" * 200)
+    assert len(long_name) == len("Reminder: ") + 60
+    assert long_name.endswith("...")
+
+
+def test_schema_requires_only_the_message() -> None:
+    schema = SysReminderSetTool().get_schema()["function"]
+    assert schema["name"] == "sys_reminder_set"
+    params = schema["parameters"]
+    assert params["required"] == ["message"]
+    assert set(params["properties"]) == {"message", "at", "delay_seconds"}
+    assert params["additionalProperties"] is False

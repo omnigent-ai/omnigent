@@ -8,7 +8,8 @@ sync on every mutation so a change takes effect without a restart.
 Ownership mirrors hosts: tasks are scoped to the calling user (``"local"`` when
 auth is disabled). The RRULE is validated on create/update with
 :func:`validate_rrule` — an invalid rule (bad syntax, never-fires, fires-once, or
-below the minimum-interval floor) is a 400.
+below the minimum-interval floor) is a 400. With the database scheduler, an
+explicit ``COUNT=1`` is accepted as a one-time schedule such as a reminder.
 """
 
 from __future__ import annotations
@@ -313,7 +314,18 @@ def _run_to_response(
     }
 
 
-async def _validate_rrule_or_400(rrule: str, session_mode: str, execution_target: str) -> None:
+def one_time_schedules_supported(request: Request) -> bool:
+    """Whether this server runs ``COUNT=1`` schedules once.
+
+    Only the database scheduler counts ``COUNT`` from the task's creation; the
+    legacy timer counts from midnight of each re-arm and would fire again.
+    """
+    return bool(getattr(request.app.state, "scheduled_task_dispatch_enabled", False))
+
+
+async def _validate_rrule_or_400(
+    rrule: str, session_mode: str, execution_target: str, *, allow_single_fire: bool
+) -> None:
     """Raise a 400 ``OmnigentError`` if the RRULE is invalid."""
     try:
         await asyncio.to_thread(
@@ -321,6 +333,7 @@ async def _validate_rrule_or_400(rrule: str, session_mode: str, execution_target
             rrule,
             session_mode=session_mode,
             execution_target=execution_target,
+            allow_single_fire=allow_single_fire,
         )
     except RRuleValidationError as exc:
         raise OmnigentError(f"invalid rrule: {exc}", code=ErrorCode.INVALID_INPUT) from exc
@@ -847,7 +860,12 @@ def create_scheduled_tasks_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
-        await _validate_rrule_or_400(body.rrule, body.session_mode, body.execution_target)
+        await _validate_rrule_or_400(
+            body.rrule,
+            body.session_mode,
+            body.execution_target,
+            allow_single_fire=one_time_schedules_supported(request),
+        )
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_scheduled_permission_mode(body.permission_mode)
         agent, workspace, model_override, reasoning_effort = await _validate_launch_inputs(
@@ -1239,6 +1257,7 @@ def create_scheduled_tasks_router(
                 body.rrule if body.rrule is not None else existing.rrule,
                 target_session_mode,
                 target_execution,
+                allow_single_fire=one_time_schedules_supported(request),
             )
         if target_session_mode == "new":
             if fields.get("session_id") is not None:

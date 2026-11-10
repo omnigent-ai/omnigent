@@ -301,6 +301,9 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_source_sessions: bool = True
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
+    # Scheduled tasks accept an explicit ``COUNT=1`` rule that fires once, such as
+    # a reminder. Only the database scheduler supports it; absent on older servers.
+    scheduled_task_one_time: bool = False
     automation_trigger_poll_minutes: int = 10
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
@@ -3742,6 +3745,8 @@ def create_app(
                 },
                 "scheduled_task_projects": project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
+                "scheduled_task_one_time": automations_enabled
+                and bool(app.state.scheduled_task_dispatch_enabled),
                 "session_move_source_checks": True,
                 "automations_enabled": automations_enabled,
                 "automation_trigger_poll_minutes": trigger_poll_minutes,

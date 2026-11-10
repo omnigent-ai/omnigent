@@ -32,6 +32,7 @@ import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
@@ -86,6 +87,12 @@ from omnigent.tools.builtins.os_env import (
     SysOsReadTool,
     SysOsShellTool,
     SysOsWriteTool,
+)
+from omnigent.tools.builtins.scheduled_tasks import (
+    reminder_name,
+    reminder_prompt,
+    reminder_rrule,
+    resolve_reminder_time,
 )
 from omnigent.tools.builtins.session_message import (
     SysSessionMessageTool,
@@ -441,12 +448,14 @@ _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
 
 # Priority 5l.1: Scheduled-task management — the runner proxies the Omnigent
 # server's /v1/scheduled-tasks REST endpoints (same posture as _POLICY_TOOLS).
+# sys_reminder_set creates a one-time task that continues the calling session.
 _SCHEDULED_TASK_TOOLS = frozenset(
     {
         "sys_scheduled_task_create",
         "sys_scheduled_task_list",
         "sys_scheduled_task_update",
         "sys_scheduled_task_delete",
+        "sys_reminder_set",
     }
 )
 
@@ -4940,6 +4949,97 @@ async def _project_id_for_name(server_client: httpx.AsyncClient, name: str) -> s
     return project_id
 
 
+async def _execute_reminder_set(
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str | None,
+) -> str:
+    """
+    Create a one-time scheduled task that sends a message into this session.
+
+    The task continues the calling session with the session's own agent, so the
+    reminder arrives as a new turn there. It needs a server whose scheduler counts
+    ``COUNT`` from creation, which ``/v1/info`` advertises as
+    ``scheduled_task_one_time``; elsewhere the call is refused before anything is
+    created.
+
+    :param args: Parsed ``sys_reminder_set`` arguments: ``message`` plus ``at`` or
+        ``delay_seconds``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The calling session, e.g. ``"conv_abc123"``.
+    :returns: Tool output JSON with the new ``scheduled_task_id`` and fire time.
+    """
+    tool_name = "sys_reminder_set"
+    if conversation_id is None:
+        return json.dumps({"error": f"{tool_name} requires a session"})
+    message = args.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return json.dumps({"error": f"{tool_name}: message must be a non-empty string"})
+    when = resolve_reminder_time(args, datetime.now(UTC))
+    if isinstance(when, str):
+        return json.dumps({"error": f"{tool_name}: {when}"})
+    try:
+        info = await server_client.get("/v1/info", timeout=30.0)
+        if info.status_code >= 400 or info.json().get("scheduled_task_one_time") is not True:
+            return json.dumps(
+                {
+                    "error": f"{tool_name}: this Omnigent server does not support one-time "
+                    "reminders; use sys_timer_set if it is enabled, or a recurring "
+                    "sys_scheduled_task_create task"
+                }
+            )
+        session = await server_client.get(_session_url(conversation_id), timeout=30.0)
+        if session.status_code >= 400:
+            return json.dumps(
+                {
+                    "error": f"{tool_name}: could not read this session "
+                    f"(server returned {session.status_code})",
+                    "details": session.text[:1000],
+                }
+            )
+        snapshot = _string_object_dict(session.json()) or {}
+        agent_id = snapshot.get("agent_id")
+        if not isinstance(agent_id, str) or not agent_id:
+            return json.dumps({"error": f"{tool_name}: this session has no agent to remind"})
+        resp = await server_client.post(
+            "/v1/scheduled-tasks",
+            json={
+                "name": reminder_name(message),
+                "prompt": reminder_prompt(message, when),
+                "rrule": reminder_rrule(when),
+                "timezone": "UTC",
+                "agent_id": agent_id,
+                # A continued session keeps its own permission mode.
+                "permission_mode": None,
+                "session_mode": "continue",
+                "session_id": conversation_id,
+            },
+            timeout=30.0,
+            headers={
+                ORCHESTRATION_SOURCE_HEADER: conversation_id,
+                "x-omnigent-automation-source": "agent",
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+    if resp.status_code >= 400:
+        return json.dumps(
+            {"error": f"server returned {resp.status_code}", "details": resp.text[:1000]}
+        )
+    task = _string_object_dict(resp.json()) or {}
+    return json.dumps(
+        {
+            "status": "scheduled",
+            "scheduled_task_id": task.get("id"),
+            "fire_at": when.isoformat(),
+            "next_run_at": task.get("next_run_at"),
+            "message": message,
+            "cancel_with": "sys_scheduled_task_delete",
+        }
+    )
+
+
 async def _execute_scheduled_task_tool(
     tool_name: str,
     arguments: str,
@@ -4971,6 +5071,10 @@ async def _execute_scheduled_task_tool(
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
     if not isinstance(args, dict):
         return json.dumps({"error": f"{tool_name}: arguments must be an object"})
+    if tool_name == "sys_reminder_set":
+        return await _execute_reminder_set(
+            args, server_client=server_client, conversation_id=conversation_id
+        )
     if tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update"):
         action = "create" if tool_name == "sys_scheduled_task_create" else "update"
         error = scheduled_task_review_error(args, action=action)

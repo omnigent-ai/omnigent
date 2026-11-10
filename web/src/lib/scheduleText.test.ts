@@ -199,6 +199,17 @@ describe("validateSchedule — 1-hour floor + required selections", () => {
 });
 
 describe("describeSchedule", () => {
+  it("describes a one-time rule as once", () => {
+    expect(
+      describeSchedule(
+        "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=23;BYMINUTE=0;BYSECOND=0;COUNT=1",
+      ),
+    ).toBe("Once on November 12 at 11:00 PM");
+    expect(describeSchedule("FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=1")).toBe(
+      "Once: Every day at 9:00 AM",
+    );
+  });
+
   it.each([
     [1, "Every minute"],
     [10, "Every 10 minutes"],

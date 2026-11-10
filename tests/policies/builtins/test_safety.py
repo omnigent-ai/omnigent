@@ -707,6 +707,47 @@ def test_ask_on_scheduled_task_change_asks_for_create_with_preview(data_name: st
     assert "Task permission setting: agent default (no task override)" in result["reason"]
 
 
+@pytest.mark.parametrize(
+    "timing,shown",
+    [
+        ({"delay_seconds": 2700}, "in 2700 seconds"),
+        ({"at": "2026-11-12T15:00:00-08:00"}, "at 2026-11-12T15:00:00-08:00"),
+    ],
+)
+def test_ask_on_scheduled_task_change_asks_for_a_reminder(
+    timing: dict[str, object], shown: str
+) -> None:
+    """A reminder ASKs with its time and full message, which runs unattended later."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    message = "Check CI on PR #12, then " + "summarize the failures. " * 10
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_reminder_set",
+            "data": {"arguments": {"message": message, **timing}},
+        }
+    )
+    assert result["result"] == "ASK"
+    assert f"set a reminder for this session {shown}" in result["reason"]
+    assert message in result["reason"]
+
+
+@pytest.mark.parametrize("message", [None, "", "   ", 5])
+def test_ask_on_scheduled_task_change_denies_a_reminder_without_message(message) -> None:
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_reminder_set",
+            "data": {"arguments": {"message": message, "delay_seconds": 60}},
+        }
+    )
+    assert result["result"] == "DENY"
+    assert "reminder message" in result["reason"]
+
+
 def test_ask_on_scheduled_task_change_notes_a_continued_sessions_own_mode() -> None:
     """A continuing task's setting doesn't change the mode of the session it continues."""
     from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
