@@ -2040,10 +2040,14 @@ class SessionResponse(BaseModel):
         ``"idle"`` (no loop running), ``"running"`` (loop
         executing), ``"waiting"`` (loop parked on background
         work / sub-agents), or ``"failed"`` (terminal failure).
-        Current read paths collapse ``"waiting"`` -> ``"running"``
-        before building this snapshot; the literal stays a superset
-        of what the runtime can produce so a server that forwards
-        the raw status never 500s on serialization.
+        Read paths collapse ``"waiting"`` -> ``"running"``, because headless
+        clients poll this field to tell when a run is done; the literal stays
+        a superset so a server that forwards the raw status never 500s.
+    :param background_agents: Background agents a finished claude-native
+        turn left running, while the session waits on them. :attr:`status`
+        still reads ``"running"`` then, so older clients keep treating the run
+        as unfinished; clients that know this field show the session as
+        waiting, with its composer free. ``None`` otherwise.
     :param background_task_count: Background shells (claude-native) still
         running as of the last status edge, so a reload re-shows "N shells
         still running" even though the session has settled to ``"idle"``.
@@ -2291,6 +2295,7 @@ class SessionResponse(BaseModel):
     agent_id: str
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
+    background_agents: list[BackgroundTaskInfo] | None = None
     background_task_count: int | None = None
     background_tasks: list[BackgroundTaskInfo] | None = None
     created_at: int
@@ -2535,7 +2540,8 @@ class BackgroundSessionTitleRequest(BaseModel):
     """Private runner request for isolated background title inference."""
 
     prompt: str = Field(min_length=1, max_length=20_000)
-    additional_instructions: str | None = Field(default=None, max_length=4_000)
+    # Fits the server's and the session owner's 4,000-character guidance plus framing.
+    additional_instructions: str | None = Field(default=None, max_length=10_000)
     agent_id: str | None = None
     model_override: str | None = None
     harness_override: str | None = None
@@ -3598,6 +3604,28 @@ HarnessStreamEvent = (
     | SubagentCompletedEvent
     | SubagentToolCallEvent
 )
+
+
+# ── User settings ─────────────────────────────────────────────────
+
+
+class SessionTitleInstructionsRequest(BaseModel):
+    """Replace the caller's title instructions; null or blank clears them.
+
+    The stripped value may hold at most 4,000 characters. The raw bound only
+    caps request size before stripping.
+    """
+
+    instructions: str | None = Field(..., max_length=16_000)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SessionTitleInstructionsResponse(BaseModel):
+    """The caller's saved title instructions and the limit the server enforces."""
+
+    instructions: str | None
+    max_chars: int
 
 
 # ── Projects ──────────────────────────────────────────────────────

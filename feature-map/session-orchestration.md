@@ -27,6 +27,12 @@ MCP independent creation.
   `created_by_session_id` so managers can identify their workers across restarts;
   `sys_session_list` with `include_archived` also lists archived workers, each
   marked `archived`.
+- `list-scope`: `sys_session_list`'s global `sessions` view lists only the
+  caller's own sessions by default, like the sidebar's My view. Sessions other
+  users shared with the caller appear only with `visibility: "shared"` (or
+  `"all"` for both), and those rows carry `owner`. `include_archived` applies to
+  every scope. Runner coverage: `tests/runner/test_discovery_list_pagination.py`;
+  the route's scopes: `tests/server/routes/test_sessions_shared_projects.py`.
 - `kill-switch`: an explicit disable refuses new peer sends and independent
   creates, even if an enable is also listed, and hides the Automations page's
   trigger templates (`/v1/info` reports `features.session_orchestration`). Restart every server replica to
@@ -107,7 +113,7 @@ Preconditions: use an isolated test server with `OMNIGENT_FEATURES=sibling_sessi
 for nested creation journeys; peer messaging and standalone creation use the default settings.
 Own both sessions. Same-host creation requires a connected
 owned host/workspace. Managed creation requires a launch-capable provider in the
-server's sandbox configuration (for example, Modal or Daytona). Internal deployments
+server's sandbox configuration (for example, Modal or Daytona). Other deployments
 can supply their own provider through the existing launcher interface.
 
 For `created-by`, extend the creation journey below: open the worker, reload,
