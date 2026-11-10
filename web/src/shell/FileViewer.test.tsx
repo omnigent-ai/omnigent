@@ -254,6 +254,8 @@ function LocationDisplay() {
 
 interface RenderProps {
   syncUrl?: boolean;
+  syncFilePath?: boolean;
+  keepNavigationGuard?: boolean;
   frameless?: boolean;
   mobileOverlay?: boolean;
   position?: { line: number; column?: number };
@@ -287,6 +289,8 @@ interface RenderProps {
  */
 function viewerTree({
   syncUrl,
+  syncFilePath,
+  keepNavigationGuard,
   frameless,
   mobileOverlay,
   position,
@@ -309,6 +313,8 @@ function viewerTree({
         <LocationDisplay />
         <FileViewer
           syncUrl={syncUrl}
+          syncFilePath={syncFilePath}
+          keepNavigationGuard={keepNavigationGuard}
           frameless={frameless}
           mobileOverlay={mobileOverlay}
           position={position}
@@ -2741,7 +2747,13 @@ describe("file position navigation", () => {
       guard = next;
       return unregister;
     });
-    function GuardedViewer({ mediaActive = true }: { mediaActive?: boolean }) {
+    function GuardedViewer({
+      mediaActive = true,
+      open = true,
+    }: {
+      mediaActive?: boolean;
+      open?: boolean;
+    }) {
       const contextValue = useMemo(
         () => ({
           openFile: vi.fn(),
@@ -2756,7 +2768,13 @@ describe("file position navigation", () => {
       );
       return (
         <FileViewerContext.Provider value={contextValue}>
-          {viewerTree({ open: true, mediaActive, path: "file1.md" })}
+          {viewerTree({
+            open,
+            mediaActive,
+            path: "file1.md",
+            frameless: true,
+            keepNavigationGuard: true,
+          })}
         </FileViewerContext.Provider>
       );
     }
@@ -2766,6 +2784,9 @@ describe("file position navigation", () => {
     // Opening the Files drawer hides the rail but must keep its dirty guard registered.
     rerender(<GuardedViewer mediaActive={false} />);
     expect(unregister).not.toHaveBeenCalled();
+    // A responsive fallback hides the editor without discarding its draft or guard.
+    rerender(<GuardedViewer open={false} mediaActive={false} />);
+    expect(draft).toHaveValue("Unsaved draft");
     const navigate = vi.fn();
     act(() => guard!("file2.md", { line: 12 }, navigate));
     expect(navigate).not.toHaveBeenCalled();
@@ -3025,4 +3046,20 @@ it("keeps grid file viewers independent of shared URL parameters and copies a se
   expect(copied.pathname).toBe("/c/conv_1");
   expect(copied.searchParams.get("file")).toBe("file1.py");
   expect(copied.searchParams.has("comment")).toBe(false);
+});
+
+it("restores an inline preview's file URL only while visible", () => {
+  useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  const props = {
+    frameless: true,
+    syncFilePath: true,
+    path: "notes.md",
+    initialSearch: "comment=stale&line=7",
+  };
+  const { rerender } = renderViewer({ ...props, open: false, keepNavigationGuard: true });
+  expect(screen.getByTestId("url-params")).not.toHaveTextContent("file=");
+  rerender(viewerTree({ ...props, open: true, keepNavigationGuard: true }));
+  expect(screen.getByTestId("url-params")).toHaveTextContent("file=notes.md");
+  expect(screen.getByTestId("url-params")).not.toHaveTextContent("comment=");
+  expect(screen.getByTestId("url-params")).not.toHaveTextContent("line=");
 });

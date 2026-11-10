@@ -28,6 +28,7 @@ import {
   useProjectFolderPageSize,
 } from "@/lib/projectFolderPaginationPreferences";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { useAlwaysOpenFilesInTab } from "@/lib/workspaceTabPreferences";
 import * as host from "@/lib/host";
 import { UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
 import {
@@ -55,6 +56,7 @@ const mocks = vi.hoisted(() => ({
   singleUser: false,
   sessionTitleInstructions: false,
   nestedAgents: false,
+  workspaceFileTreeSplit: false,
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
@@ -86,6 +88,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     sibling_sessions: mocks.nestedAgents,
     enabled_connections: mocks.enabledConnections,
     session_title_instructions: mocks.sessionTitleInstructions,
+    features: { workspace_file_tree_split_ui: mocks.workspaceFileTreeSplit },
   }),
 }));
 vi.mock("@/components/SessionTitleInstructionsControl", () => ({
@@ -282,6 +285,7 @@ beforeEach(() => {
   mocks.accountsEnabled = true;
   mocks.sessionTitleInstructions = false;
   mocks.nestedAgents = false;
+  mocks.workspaceFileTreeSplit = false;
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
   mocks.loginUrl = "/login";
@@ -764,6 +768,28 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
   });
 
+  it("hides the file-opening preference when its feature flag is off", () => {
+    renderPage("/settings/appearance");
+    expect(screen.queryByTestId("always-open-files-in-tab-toggle")).not.toBeInTheDocument();
+  });
+
+  it("persists the file-opening preference when its feature flag is on", () => {
+    mocks.workspaceFileTreeSplit = true;
+    const page = renderPage("/settings/appearance");
+    const toggle = screen.getByRole("switch", { name: "Always open files in a new tab" });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(localStorage.getItem("omnigent:always-open-files-in-tab")).toBe("true");
+
+    page.unmount();
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("always-open-files-in-tab-toggle")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+  });
+
   it("selects and persists the default Workspace tab", () => {
     renderPage("/settings/appearance");
 
@@ -1181,6 +1207,7 @@ describe("SettingsPage", () => {
 
   it("resets every appearance preference back to product defaults", () => {
     localStorage.clear();
+    mocks.workspaceFileTreeSplit = true;
     renderPage("/settings/appearance");
 
     // Tweak a representative set of appearance preferences.
@@ -1194,6 +1221,9 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByTestId("workspace-panel-default-open"));
     fireEvent.click(screen.getByTestId("workspace-tab-default-subagents"));
     fireEvent.click(screen.getByRole("button", { name: "Pin Changes" }));
+    fireEvent.click(screen.getByTestId("always-open-files-in-tab-toggle"));
+    const fileOpening = renderHook(() => useAlwaysOpenFilesInTab());
+    expect(fileOpening.result.current).toBe(true);
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("fold-assistant-narration-toggle"));
     fireEvent.change(screen.getByTestId("project-folder-page-size-input"), {
@@ -1277,6 +1307,12 @@ describe("SettingsPage", () => {
     );
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBeNull();
     expect(localStorage.getItem("omnigent:pinned-workspace-tabs")).toBeNull();
+    expect(localStorage.getItem("omnigent:always-open-files-in-tab")).toBeNull();
+    expect(screen.getByTestId("always-open-files-in-tab-toggle")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    expect(fileOpening.result.current).toBe(false);
     expect(screen.getByRole("button", { name: "Pin Changes" })).toHaveAttribute(
       "aria-pressed",
       "true",

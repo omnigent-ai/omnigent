@@ -37,6 +37,7 @@ import {
   type DefaultWorkspaceTab,
   writeDefaultWorkspaceTab,
   writePinnedWorkspaceTabs,
+  writeAlwaysOpenFilesInTab,
 } from "@/lib/workspaceTabPreferences";
 import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
 import { WorkspacePanel } from "./WorkspacePanel";
@@ -65,12 +66,26 @@ vi.mock("./FileViewer", () => ({
 vi.mock("./FilesPanel", () => ({
   // Echo the fixed scope so tests can prove the Files tab renders the tree
   // (flatView=false) and the Changes tab the changed-only list (flatView=true).
-  FilesPanel: ({ flatView, conversationId }: { flatView: boolean; conversationId: string }) => (
+  FilesPanel: ({
+    flatView,
+    conversationId,
+    onFileSelect,
+    onFileOpenInTree,
+  }: {
+    flatView: boolean;
+    conversationId: string;
+    onFileSelect: (path: string) => void;
+    onFileOpenInTree?: (path: string) => void;
+  }) => (
     <div
       data-testid="files-panel-stub"
       data-session={conversationId}
       data-flat-view={String(flatView)}
-    />
+    >
+      <button type="button" onClick={() => (onFileOpenInTree ?? onFileSelect)("src/a.md")}>
+        Open tree file
+      </button>
+    </div>
   ),
 }));
 vi.mock("./SubagentsPanel", () => ({
@@ -226,6 +241,8 @@ function renderWorkspace(
     changedCount?: number;
     showGithubTab?: boolean;
     showContentSearch?: boolean;
+    fileTreeSplitEnabled?: boolean;
+    treePreviewPath?: string | null;
     showFilesPanel?: boolean;
     showBrowserTab?: boolean;
     openTerminals?: string[];
@@ -248,6 +265,8 @@ function renderWorkspace(
 ) {
   let overrides = initialOverrides;
   const openFileViewer = vi.fn();
+  const openFileInTree = vi.fn();
+  const onCloseTreePreview = vi.fn();
   const onCloseFile = vi.fn();
   const onRightRailTabChange = vi.fn();
   const onClosePanel = vi.fn();
@@ -284,6 +303,10 @@ function renderWorkspace(
         onClosePanel={onClosePanel}
         showFilesPanel={overrides.showFilesPanel ?? true}
         showContentSearch={overrides.showContentSearch}
+        fileTreeSplitEnabled={overrides.fileTreeSplitEnabled}
+        treePreviewPath={overrides.treePreviewPath}
+        openFileInTree={openFileInTree}
+        onCloseTreePreview={onCloseTreePreview}
         showGithubTab={overrides.showGithubTab ?? false}
         showBrowserTab={overrides.showBrowserTab ?? false}
         onReveal={onReveal}
@@ -340,6 +363,7 @@ function renderWorkspace(
       view.rerender(tree());
     },
     openFileViewer,
+    openFileInTree,
     onCloseFile,
     onRightRailTabChange,
     onClosePanel,
@@ -836,18 +860,18 @@ describe("WorkspacePanel content area", () => {
       selectedFilePath: null,
     });
     const panel = screen.getByTestId("files-panel-stub");
-    expect(panel.parentElement).not.toHaveClass("invisible");
+    expect(panel.closest(".invisible")).toBeNull();
 
     rerender({ selectedFilePath: "src/App.tsx" });
     // The viewer owns the slot; the scope panel stays mounted (same node, so
     // tree state survives) inside an invisible wrapper.
     expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
     expect(screen.getByTestId("files-panel-stub")).toBe(panel);
-    expect(panel.parentElement).toHaveClass("invisible");
+    expect(panel.closest(".invisible")).not.toBeNull();
 
     rerender({ selectedFilePath: null });
     expect(screen.getByTestId("files-panel-stub")).toBe(panel);
-    expect(panel.parentElement).not.toHaveClass("invisible");
+    expect(panel.closest(".invisible")).toBeNull();
   });
 
   it("renders the FilesPanel tree scope when no file is active on the Files tab", () => {
@@ -936,7 +960,7 @@ describe("WorkspacePanel shell tabs", () => {
     rerender({ selectedTerminalKey: termKey });
     expect(await screen.findByTestId("terminal-view-stub")).toBeInTheDocument();
     expect(screen.getByTestId("files-panel-stub")).toBe(panel);
-    expect(panel.parentElement).toHaveClass("invisible");
+    expect(panel.closest(".invisible")).not.toBeNull();
   });
 
   it("activates a shell via openTerminalTab when its tab body is clicked", () => {
@@ -3189,5 +3213,75 @@ describe("WorkspacePanel desktop menu commands", () => {
     reopen();
     expect(openFileViewer).toHaveBeenCalledExactlyOnceWith("src/a.ts");
     expect(onReveal).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("WorkspacePanel file tree split", () => {
+  beforeEach(() => {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      width: 600,
+      height: 700,
+      left: 0,
+      top: 0,
+      right: 600,
+      bottom: 700,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+  });
+
+  it.each([false, true])("opens beside one tree in docked/fullscreen mode (%s)", (maximized) => {
+    const { openFileInTree, openFileViewer, rerender } = renderWorkspace({
+      fileTreeSplitEnabled: true,
+      maximized,
+    });
+    expect(screen.getByText("Select a file to view it here")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Open tree file" }));
+    expect(openFileInTree).toHaveBeenCalledWith("src/a.md");
+    expect(openFileViewer).not.toHaveBeenCalled();
+    rerender({ treePreviewPath: "src/a.md" });
+    expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/a.md");
+    expect(screen.getAllByTestId("files-panel-stub")).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "Close a.md" })).not.toBeInTheDocument();
+    const tree = screen.getByTestId("files-panel-stub");
+    rerender({ selectedFilePath: "src/b.md", openFiles: ["src/b.md"] });
+    expect(screen.getAllByTestId("file-viewer-stub")).toHaveLength(1);
+    expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/b.md");
+    expect(screen.getByTestId("files-panel-stub")).toBe(tree);
+    expect(tree.closest(".invisible")).not.toBeNull();
+    rerender({ selectedFilePath: null });
+    expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/a.md");
+  });
+
+  it.each(["flag off", "setting", "narrow", "mobile", "changes"])(
+    "keeps soft-tab routing for %s",
+    (mode) => {
+      if (mode === "setting") writeAlwaysOpenFilesInTab(true);
+      if (mode === "narrow")
+        vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+          width: 300,
+        } as DOMRect);
+      if (mode === "mobile") isMobileMock.mockReturnValue(true);
+      const { openFileViewer, openFileInTree } = renderWorkspace({
+        fileTreeSplitEnabled: mode !== "flag off",
+        rightRailTab: mode === "changes" ? "changes" : "files",
+      });
+      expect(screen.queryByTestId("workspace-files-split")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Open tree file" }));
+      expect(openFileViewer).toHaveBeenCalledWith("src/a.md");
+      expect(openFileInTree).not.toHaveBeenCalled();
+      expect(screen.getAllByTestId("files-panel-stub")).toHaveLength(1);
+    },
+  );
+
+  it("applies the setting live and measures contained panes independently of the viewport", () => {
+    isMobileMock.mockReturnValue(true);
+    renderWorkspace({ fileTreeSplitEnabled: true, contained: true });
+    expect(screen.getByTestId("workspace-files-split")).toBeInTheDocument();
+    act(() => writeAlwaysOpenFilesInTab(true));
+    expect(screen.queryByTestId("workspace-files-split")).not.toBeInTheDocument();
+    act(() => writeAlwaysOpenFilesInTab(false));
+    expect(screen.getByTestId("workspace-files-split")).toBeInTheDocument();
   });
 });

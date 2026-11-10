@@ -236,3 +236,18 @@ describe("sessionWorkspaceState", () => {
     });
   });
 });
+
+it("persists the per-session tree preview and rejects invalid stored paths", () => {
+  writeSessionWorkspaceState("tree_one", { treePreviewPath: "src/a.md", openFiles: [] });
+  writeSessionWorkspaceState("tree_two", { treePreviewPath: null });
+  expect(readSessionWorkspaceState("tree_one")).toEqual({
+    treePreviewPath: "src/a.md",
+    openFiles: [],
+  });
+  expect(readSessionWorkspaceState("tree_two")).toEqual({ treePreviewPath: null });
+  localStorage.setItem(
+    "omnigent:session-workspace-state",
+    JSON.stringify([{ id: "tree_invalid", state: { treePreviewPath: 42 } }]),
+  );
+  expect(readSessionWorkspaceState("tree_invalid")).toEqual({});
+});

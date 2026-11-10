@@ -29,6 +29,8 @@ import {
 } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useDeleteTerminal } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "@/shell/useWorkspaceResources";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { isNativeWrapper, nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
 import { isOwnerLevel } from "@/lib/permissionsApi";
@@ -87,6 +89,8 @@ export function GridSessionPane({
   workspacePanel: GridWorkspacePanelProps;
   onOpenWorkspace: () => void;
 }) {
+  const serverInfo = useServerInfo();
+  const fileTreeSplitEnabled = isFeatureEnabled(serverInfo, "workspace_file_tree_split_ui");
   const { session, isLoading: sessionLoading } = useSession(sessionId);
   const state = useConversationEntryState(sessionId);
   const canEdit = useCanEdit(sessionId);
@@ -224,6 +228,7 @@ export function GridSessionPane({
       openPanels: saved.openPanels ?? [],
       openFiles: saved.openFiles ?? [],
       selectedFilePath: saved.selectedFilePath ?? null,
+      treePreviewPath: saved.treePreviewPath ?? null,
       selectedTerminalKey: saved.selectedTerminalKey ?? null,
     };
   });
@@ -260,20 +265,50 @@ export function GridSessionPane({
   );
   const openFile = useCallback(
     (path: string, options?: OpenFileOptions) => {
-      navigateWorkspace(path, options, () => {
+      navigateWorkspace(
+        fileTreeSplitEnabled && workspace.treePreviewPath && !workspace.selectedFilePath
+          ? null
+          : path,
+        options,
+        () => {
+          onOpenWorkspace();
+          setPosition(citedFilePosition(options));
+          setWorkspace((previous) => ({
+            ...previous,
+            selectedFilePath: path,
+            selectedTerminalKey: null,
+            openFiles: previous.openFiles?.includes(path)
+              ? previous.openFiles
+              : [...(previous.openFiles ?? []), path],
+          }));
+        },
+      );
+    },
+    [
+      navigateWorkspace,
+      onOpenWorkspace,
+      workspace.selectedFilePath,
+      workspace.treePreviewPath,
+      fileTreeSplitEnabled,
+    ],
+  );
+  const openFileInTree = useCallback(
+    (path: string) => {
+      navigateWorkspace(workspace.selectedFilePath ? null : path, undefined, () => {
         onOpenWorkspace();
-        setPosition(citedFilePosition(options));
-        setWorkspace((previous) => ({
-          ...previous,
-          selectedFilePath: path,
+        updateWorkspace({
+          treePreviewPath: path,
+          selectedFilePath: null,
           selectedTerminalKey: null,
-          openFiles: previous.openFiles?.includes(path)
-            ? previous.openFiles
-            : [...(previous.openFiles ?? []), path],
-        }));
+          rightRailTab: "files",
+        });
       });
     },
-    [navigateWorkspace, onOpenWorkspace],
+    [navigateWorkspace, onOpenWorkspace, updateWorkspace, workspace.selectedFilePath],
+  );
+  const closeTreePreview = useCallback(
+    () => updateWorkspace({ treePreviewPath: null }),
+    [updateWorkspace],
   );
   useUiOpenFile(sessionId, selected && canBrowse, openFile);
   const showTab = useCallback((rightRailTab: RightRailTab | null) => {
@@ -513,6 +548,10 @@ export function GridSessionPane({
                   );
                 }}
                 showFilesPanel={showFiles}
+                fileTreeSplitEnabled={fileTreeSplitEnabled}
+                treePreviewPath={canBrowse ? (workspace.treePreviewPath ?? null) : null}
+                openFileInTree={openFileInTree}
+                onCloseTreePreview={closeTreePreview}
                 showGithubTab={showFiles}
                 showBrowserTab={supportsBrowser()}
                 onReveal={onOpenWorkspace}

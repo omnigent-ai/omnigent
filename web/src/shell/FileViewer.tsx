@@ -334,6 +334,10 @@ function useToolbarOverflow(actionsKey: string): {
 
 interface FileViewerProps {
   syncUrl?: boolean;
+  /** An inline preview owns its file URL whenever it becomes visible. */
+  syncFilePath?: boolean;
+  /** Preserve a mounted draft while its responsive layout hides the viewer. */
+  keepNavigationGuard?: boolean;
   agentId?: string | null;
   position?: FilePosition;
   open: boolean;
@@ -397,6 +401,8 @@ export function FileViewer(props: FileViewerProps) {
 
 function FileViewerBody({
   syncUrl = true,
+  syncFilePath = false,
+  keepNavigationGuard = false,
   position,
   open,
   mediaActive = true,
@@ -992,7 +998,7 @@ function FileViewerBody({
 
   const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
   useLayoutEffect(() => {
-    if (!open || !registerNavigationGuard) return;
+    if ((!open && !keepNavigationGuard) || !registerNavigationGuard) return;
     return registerNavigationGuard((destination, options, navigate) => {
       if (destination !== path || (options?.line && viewMode === "editor")) {
         guardDirty(navigate);
@@ -1000,7 +1006,7 @@ function FileViewerBody({
         navigate();
       }
     });
-  }, [open, path, viewMode, guardDirty, registerNavigationGuard]);
+  }, [open, keepNavigationGuard, path, viewMode, guardDirty, registerNavigationGuard]);
 
   useEffect(() => {
     const last = lastNavigationRef.current;
@@ -1160,10 +1166,15 @@ function FileViewerBody({
     if (!syncUrl || !open || !isActiveViewport) return;
     const wantDiff = diffActive && isDiffAvailable;
     const hasDiff = searchParams.has("diff");
-    if (wantDiff === hasDiff) return; // already in sync — no navigate needed
+    const updateFile = syncFilePath && searchParams.get("file") !== path;
+    if (wantDiff === hasDiff && !updateFile) return;
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
+        if (updateFile) {
+          next.set("file", path);
+          for (const key of ["comment", "line", "column", "endLine"]) next.delete(key);
+        }
         if (wantDiff) {
           next.set("diff", "1");
         } else {
@@ -1173,7 +1184,17 @@ function FileViewerBody({
       },
       { replace: true },
     );
-  }, [syncUrl, diffActive, isDiffAvailable, open, isActiveViewport, searchParams, setSearchParams]);
+  }, [
+    syncUrl,
+    syncFilePath,
+    path,
+    diffActive,
+    isDiffAvailable,
+    open,
+    isActiveViewport,
+    searchParams,
+    setSearchParams,
+  ]);
 
   // Toolbar actions, declared once and rendered two ways: inline icon buttons
   // when there's room, or rows in an overflow ("⋯") menu when there isn't.

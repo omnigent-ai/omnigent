@@ -162,10 +162,12 @@ vi.mock("./FilesPanel", () => ({
   // via the FileViewer mock below (data-testid="file-viewer-inline").
   FilesPanel: ({
     onFileSelect,
+    onFileOpenInTree,
     flatView,
     showHidden,
   }: {
     onFileSelect: (path: string) => void;
+    onFileOpenInTree?: (path: string) => void;
     flatView: boolean;
     showHidden: boolean;
   }) => (
@@ -177,14 +179,14 @@ vi.mock("./FilesPanel", () => ({
       <button
         type="button"
         aria-label="files: select README.md"
-        onClick={() => onFileSelect("README.md")}
+        onClick={() => (onFileOpenInTree ?? onFileSelect)("README.md")}
       >
         select
       </button>
       <button
         type="button"
         aria-label="files: select AGENTS.md"
-        onClick={() => onFileSelect("AGENTS.md")}
+        onClick={() => (onFileOpenInTree ?? onFileSelect)("AGENTS.md")}
       >
         select-agents
       </button>
@@ -6435,5 +6437,78 @@ describe("AppShell desktop Close", () => {
     expect(screen.queryByText("home")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
     expect(screen.getByText("home")).toBeInTheDocument();
+  });
+});
+
+describe("AppShell tree preview state", () => {
+  beforeEach(() => {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      width: 600,
+      height: 700,
+      left: 0,
+      top: 0,
+      right: 600,
+      bottom: 700,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: "/workspace", home: null },
+      isLoading: false,
+    } as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_tree", permission_level: null }]);
+    writeSessionWorkspaceState("conv_tree", { open: true, rightRailTab: "files", widthPx: 600 });
+  });
+
+  it("persists inline selection without adding tabs and closes only the preview", () => {
+    renderShell("/c/conv_tree", serverInfo({ features: { workspace_file_tree_split_ui: true } }));
+    fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
+    expect(readSessionWorkspaceState("conv_tree")).toMatchObject({
+      treePreviewPath: "README.md",
+      openFiles: [],
+      selectedFilePath: null,
+    });
+    expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
+    fireEvent.click(screen.getByRole("button", { name: "files: select AGENTS.md" }));
+    expect(readSessionWorkspaceState("conv_tree")).toMatchObject({
+      treePreviewPath: "AGENTS.md",
+      openFiles: [],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "file-viewer: close" }));
+    expect(readSessionWorkspaceState("conv_tree").treePreviewPath).toBeNull();
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("file=");
+  });
+
+  it("defers inline selection and URL changes until the navigation guard allows them", () => {
+    renderShell("/c/conv_tree", serverInfo({ features: { workspace_file_tree_split_ui: true } }), {
+      dirtyFileViewer: true,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
+    expect(readSessionWorkspaceState("conv_tree").treePreviewPath).toBeNull();
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("file=");
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+    expect(readSessionWorkspaceState("conv_tree")).toMatchObject({
+      treePreviewPath: "README.md",
+      openFiles: [],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "files: select AGENTS.md" }));
+    expect(readSessionWorkspaceState("conv_tree").treePreviewPath).toBe("README.md");
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+    expect(readSessionWorkspaceState("conv_tree").treePreviewPath).toBe("AGENTS.md");
+  });
+
+  it("keeps URL deep links as soft tabs while retaining the session's tree preview", () => {
+    writeSessionWorkspaceState("conv_tree", { treePreviewPath: "AGENTS.md" });
+    renderShell(
+      "/c/conv_tree?file=README.md",
+      serverInfo({ features: { workspace_file_tree_split_ui: true } }),
+    );
+    expect(readSessionWorkspaceState("conv_tree")).toMatchObject({
+      treePreviewPath: "AGENTS.md",
+      openFiles: ["README.md"],
+      selectedFilePath: "README.md",
+    });
+    expect(screen.getAllByTestId("file-viewer-inline")).toHaveLength(1);
   });
 });

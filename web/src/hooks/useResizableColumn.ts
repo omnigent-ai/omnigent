@@ -1,13 +1,47 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth = 480) {
-  const [width, setWidth] = useState(defaultWidth);
+export function useResizableColumn(
+  defaultWidth = 176,
+  minWidth = 100,
+  maxWidth = 480,
+  storageKey?: string,
+) {
+  const [preferredWidth, setPreferredWidth] = useState(() => {
+    try {
+      const stored = storageKey ? Number(window.localStorage.getItem(storageKey)) : NaN;
+      return Number.isFinite(stored) && stored > 0 ? stored : defaultWidth;
+    } catch {
+      return defaultWidth;
+    }
+  });
+  const width = Math.max(minWidth, Math.min(maxWidth, preferredWidth));
+  const widthRef = useRef(width);
+  widthRef.current = width;
   const dragging = useRef(false);
   const containerRef = useRef<HTMLElement | null>(null);
   const minRef = useRef(minWidth);
   const maxRef = useRef(maxWidth);
   minRef.current = minWidth;
   maxRef.current = maxWidth;
+
+  const resize = useCallback((nextWidth: number) => {
+    const clamped = Math.max(minRef.current, Math.min(maxRef.current, nextWidth));
+    widthRef.current = clamped;
+    setPreferredWidth(clamped);
+    return clamped;
+  }, []);
+
+  const persistWidth = useCallback(
+    (nextWidth: number) => {
+      if (!storageKey) return;
+      try {
+        window.localStorage.setItem(storageKey, String(nextWidth));
+      } catch {
+        // Resizing still works when browser storage is unavailable.
+      }
+    },
+    [storageKey],
+  );
 
   const onMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -16,17 +50,27 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
     document.body.style.userSelect = "none";
   }, []);
 
+  const onKeyDown = useCallback(
+    (event: React.KeyboardEvent) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      event.preventDefault();
+      persistWidth(resize(widthRef.current + (event.key === "ArrowRight" ? 16 : -16)));
+    },
+    [persistWidth, resize],
+  );
+
   useEffect(() => {
     function onMouseMove(e: MouseEvent) {
       if (!dragging.current || !containerRef.current) return;
       const left = containerRef.current.getBoundingClientRect().left;
-      setWidth(Math.max(minRef.current, Math.min(maxRef.current, e.clientX - left)));
+      resize(e.clientX - left);
     }
     function onMouseUp() {
       if (!dragging.current) return;
       dragging.current = false;
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
+      persistWidth(widthRef.current);
     }
     window.addEventListener("mousemove", onMouseMove);
     window.addEventListener("mouseup", onMouseUp);
@@ -39,7 +83,7 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
         document.body.style.userSelect = "";
       }
     };
-  }, []);
+  }, [persistWidth, resize]);
 
   return {
     /** Pixel width for the left column (apply as inline style). */
@@ -49,9 +93,14 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
     /** Spread onto the resize handle element at the right edge of the left column. */
     handleProps: {
       onMouseDown,
+      onKeyDown,
+      tabIndex: 0,
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize terminal list",
+      "aria-valuenow": width,
+      "aria-valuemin": minWidth,
+      "aria-valuemax": maxWidth,
     },
   };
 }

@@ -44,6 +44,8 @@ import {
   defaultWorkspaceTabs,
   readDefaultWorkspaceTab,
   readPinnedWorkspaceTabs,
+  useAlwaysOpenFilesInTab,
+  WORKSPACE_FILE_TREE_WIDTH_STORAGE_KEY,
 } from "@/lib/workspaceTabPreferences";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -62,6 +64,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { browserViewId, useBrowserTabs } from "@/hooks/useBrowserTabs";
+import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { useInertRef } from "@/hooks/useInertRef";
 import { requestSandboxWake } from "@/hooks/useSandboxAutoWake";
 import { useWorkspaceTabHotkeys } from "@/hooks/useWorkspaceTabHotkeys";
@@ -714,6 +717,10 @@ interface WorkspacePanelProps {
   /** Whether the Files/Changes tabs are available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
   showContentSearch?: boolean;
+  fileTreeSplitEnabled?: boolean;
+  treePreviewPath?: string | null;
+  openFileInTree?: (path: string) => void;
+  onCloseTreePreview?: () => void;
   /** Whether the Pull Requests tab is available (same on-disk-workspace gate as Files). */
   showGithubTab: boolean;
   /** Whether Browser soft tabs are available — hidden without a browser bridge. */
@@ -892,6 +899,10 @@ function WorkspacePanelImpl({
   onClosePanel,
   showFilesPanel,
   showContentSearch = false,
+  fileTreeSplitEnabled = false,
+  treePreviewPath = null,
+  openFileInTree,
+  onCloseTreePreview,
   showGithubTab,
   showBrowserTab,
   onReveal,
@@ -1378,8 +1389,20 @@ function WorkspacePanelImpl({
     if (selectedFilePath !== null) closeFile(selectedFilePath);
   }, [closeFile, selectedFilePath]);
   const closePanel = (tab: DefaultWorkspaceTab) => {
-    rememberClosedTab(conversationId, { kind: "panel", tab });
-    onClosePanel(tab);
+    const close = () => {
+      rememberClosedTab(conversationId, { kind: "panel", tab });
+      onClosePanel(tab);
+    };
+    if (
+      tab === "files" &&
+      rightRailTab === "files" &&
+      fileTreeSplitEnabled &&
+      treePreviewPath !== null &&
+      selectedFilePath === null &&
+      guardFileNavigation
+    ) {
+      guardFileNavigation(null, undefined, close);
+    } else close();
   };
   // Resolve shell tab keys to display labels. The terminals list is already
   // fetched elsewhere for the session, so this shares the same query cache.
@@ -1592,6 +1615,30 @@ function WorkspacePanelImpl({
   // Stays mounted behind a file or shell to keep tree expansion, listing and scroll.
   const filesPanelMounted = showFilesPanel && !pending && scopeView === "files";
   const filesPanelActive = filesPanelMounted && !terminalShown && selectedFilePath === null;
+  const alwaysOpenFilesInTab = useAlwaysOpenFilesInTab();
+  const splitContainerRef = useRef<HTMLDivElement | null>(null);
+  const [filesWidth, setFilesWidth] = useState(0);
+  useEffect(() => {
+    const container = splitContainerRef.current;
+    if (!container || !fileTreeSplitEnabled || isMobile) return;
+    const measure = () => setFilesWidth(container.getBoundingClientRect().width);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [filesPanelMounted, fileTreeSplitEnabled, isMobile]);
+  const treeColumn = useResizableColumn(
+    260,
+    200,
+    Math.max(200, Math.min(filesWidth / 2, filesWidth - 320 - 4)),
+    WORKSPACE_FILE_TREE_WIDTH_STORAGE_KEY,
+  );
+  const splitFiles =
+    fileTreeSplitEnabled &&
+    !isMobile &&
+    !alwaysOpenFilesInTab &&
+    rightRailTab === "files" &&
+    filesWidth >= 524;
   // Desktop Close (⌘W / Ctrl+W) while the rail, or its embedded browser view,
   // has focus: close the tab on screen, or hide the rail on a fixed page.
   // Otherwise AppShell's handler leaves the session.
@@ -2135,23 +2182,81 @@ function WorkspacePanelImpl({
           )}
           {filesPanelMounted && (
             <div
+              ref={(node) => {
+                splitContainerRef.current = node;
+                treeColumn.containerRef.current = node;
+              }}
+              data-testid={splitFiles ? "workspace-files-split" : undefined}
               className={cn(
-                "flex min-h-0 flex-1 flex-col",
+                "flex min-h-0 flex-1",
                 // Not display:none: hidden rows would measure 0px and collapse
                 // the virtualized tree's height, losing its scroll position.
                 !filesPanelActive && "invisible absolute inset-0",
               )}
             >
-              <FilesPanel
-                conversationId={contained ? conversationId : undefined}
-                frameless
-                onFileSelect={openFileViewer}
-                flatView={rightRailTab === "changes"}
-                showHidden={filesPanelShowHidden}
-                onShowHiddenChange={onShowHiddenChange}
-                sort={filesPanelSort}
-                onSortChange={onSortChange}
-              />
+              <div
+                data-testid="workspace-file-tree-column"
+                className={cn(
+                  "relative flex min-h-0 min-w-0 flex-col",
+                  splitFiles ? "shrink-0 border-r" : "flex-1",
+                )}
+                style={splitFiles ? { width: treeColumn.width } : undefined}
+              >
+                <FilesPanel
+                  conversationId={contained ? conversationId : undefined}
+                  frameless
+                  onFileSelect={openFileViewer}
+                  onFileOpenInTree={splitFiles ? openFileInTree : undefined}
+                  showOpenInTab={fileTreeSplitEnabled && !isMobile}
+                  compactTreeControls={
+                    fileTreeSplitEnabled && !isMobile && rightRailTab === "files"
+                  }
+                  flatView={rightRailTab === "changes"}
+                  showHidden={filesPanelShowHidden}
+                  onShowHiddenChange={onShowHiddenChange}
+                  sort={filesPanelSort}
+                  onSortChange={onSortChange}
+                />
+                {splitFiles && (
+                  <div
+                    {...treeColumn.handleProps}
+                    aria-label="Resize file tree"
+                    className="absolute inset-y-0 right-0 w-1 cursor-col-resize hover:bg-primary/30 focus-visible:bg-primary/30 focus-visible:outline-none"
+                  />
+                )}
+              </div>
+              {fileTreeSplitEnabled && filesPanelActive && rightRailTab === "files" && (
+                <div
+                  className={cn(
+                    "flex min-h-0 min-w-0 flex-1 flex-col",
+                    !splitFiles && "invisible absolute inset-0 pointer-events-none",
+                  )}
+                >
+                  {treePreviewPath ? (
+                    <FileViewer
+                      syncUrl={!contained}
+                      syncFilePath
+                      keepNavigationGuard
+                      agentId={agentId}
+                      frameless
+                      open={open && splitFiles}
+                      mediaActive={open && splitFiles}
+                      conversationId={conversationId}
+                      path={treePreviewPath}
+                      onClose={onCloseTreePreview!}
+                      onCloseTab={onCloseTreePreview}
+                      onNavigateTo={openFileViewer}
+                      permissionLevel={permissionLevel}
+                      onCommentsOpenChange={onCommentsOpenChange}
+                      sort={filesPanelSort}
+                    />
+                  ) : splitFiles ? (
+                    <div className="flex flex-1 items-center justify-center p-4 text-center text-sm text-muted-foreground">
+                      Select a file to view it here
+                    </div>
+                  ) : null}
+                </div>
+              )}
             </div>
           )}
           {pending ? (

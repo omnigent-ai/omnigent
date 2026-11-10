@@ -10,6 +10,7 @@ import {
   useWorkspaceDirectories,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
+import { hasCommandModifier } from "@/lib/hotkeys";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { type ChangedSort, compareChangedFiles, type SortableFile } from "./FlatFileList";
@@ -410,6 +411,7 @@ function FolderTreeInner({
   isError,
   error,
   onFileSelect,
+  showOpenInTab = false,
   conversationId,
   showHidden,
   onShowHidden,
@@ -432,7 +434,8 @@ function FolderTreeInner({
   isLoading: boolean;
   isError: boolean;
   error: Error | null;
-  onFileSelect: (path: string) => void;
+  onFileSelect: (path: string, openInTab?: boolean) => void;
+  showOpenInTab?: boolean;
   conversationId: string | undefined;
   showHidden: boolean;
   /** Called when the user clicks "Show hidden files" in the search results. */
@@ -737,6 +740,10 @@ function FolderTreeInner({
     overscan: 12,
     getItemKey: (index) => flatRows[index]?.key ?? index,
   });
+  // A parent scroller's ref attaches after this tree's layout effects, so the
+  // virtualizer misses it on mount; with cached data nothing else re-renders.
+  const [, setScrollParentAttached] = useState(false);
+  useEffect(() => setScrollParentAttached(true), []);
 
   // Once a revealed directory's row exists in the flat tree (its ancestors'
   // lazy listings have landed), smooth-scroll it into view and start the
@@ -814,6 +821,7 @@ function FolderTreeInner({
               key={file.path}
               file={file}
               onFileSelect={onFileSelect}
+              showOpenInTab={showOpenInTab}
               onRevealDir={revealDirectory}
               conversationId={conversationId}
               changedFileMap={changedFileMap}
@@ -895,6 +903,7 @@ function FolderTreeInner({
                   depth={row.depth}
                   open={row.open}
                   onFileSelect={onFileSelect}
+                  showOpenInTab={showOpenInTab}
                   conversationId={conversationId}
                   onTogglePath={togglePath}
                   changedFileMap={changedFileMap}
@@ -945,6 +954,7 @@ function FileRowItem({
   fileStatus,
   bytes,
   onFileSelect,
+  showOpenInTab = false,
   conversationId,
 }: {
   /** Canonical workspace-relative path, used for the download button and title. */
@@ -959,7 +969,8 @@ function FileRowItem({
   depth?: number;
   fileStatus: WorkspaceChangedFile["status"] | undefined;
   bytes: number | null;
-  onFileSelect: (path: string) => void;
+  onFileSelect: (path: string, openInTab?: boolean) => void;
+  showOpenInTab?: boolean;
   conversationId: string | undefined;
 }) {
   const isDeleted = fileStatus === "deleted";
@@ -970,7 +981,11 @@ function FileRowItem({
         ? "text-amber-500 dark:text-amber-400"
         : undefined;
   const { handlers, tooltip } = useCursorTooltip(path);
-  const reveal = useRevealMenu(isDeleted ? null : path);
+  const reveal = useRevealMenu(
+    isDeleted ? null : path,
+    false,
+    showOpenInTab && !isDeleted ? () => onFileSelect(path, true) : undefined,
+  );
 
   return (
     <li className="list-none">
@@ -986,7 +1001,16 @@ function FileRowItem({
         <button
           type="button"
           className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
-          onClick={() => !isDeleted && onFileSelect(path)}
+          onClick={(event) => {
+            if (showOpenInTab && hasCommandModifier(event)) onFileSelect(path, true);
+            else onFileSelect(path);
+          }}
+          onAuxClick={(event) => {
+            if (showOpenInTab && event.button === 1 && !isDeleted) {
+              event.preventDefault();
+              onFileSelect(path, true);
+            }
+          }}
           disabled={isDeleted}
         >
           <WorkspaceFileIcon path={path} />
@@ -1057,12 +1081,14 @@ function FileRowItem({
 function SearchResultRow({
   file,
   onFileSelect,
+  showOpenInTab = false,
   onRevealDir,
   conversationId,
   changedFileMap,
 }: {
   file: WorkspaceFile;
-  onFileSelect: (path: string) => void;
+  onFileSelect: (path: string, openInTab?: boolean) => void;
+  showOpenInTab?: boolean;
   /** Reveal a matched directory in the tree (expand it + ancestors). */
   onRevealDir: (path: string) => void;
   conversationId: string | undefined;
@@ -1079,6 +1105,7 @@ function SearchResultRow({
       fileStatus={changedFileMap.get(file.path)}
       bytes={file.bytes}
       onFileSelect={onFileSelect}
+      showOpenInTab={showOpenInTab}
       conversationId={conversationId}
     />
   );
@@ -1140,12 +1167,14 @@ function TreeFileRow({
   node,
   depth,
   onFileSelect,
+  showOpenInTab = false,
   conversationId,
   fileStatus,
 }: {
   node: FileNode;
   depth: number;
-  onFileSelect: (path: string) => void;
+  onFileSelect: (path: string, openInTab?: boolean) => void;
+  showOpenInTab?: boolean;
   conversationId: string | undefined;
   fileStatus: WorkspaceChangedFile["status"] | undefined;
 }) {
@@ -1157,6 +1186,7 @@ function TreeFileRow({
       fileStatus={fileStatus}
       bytes={node.file.bytes}
       onFileSelect={onFileSelect}
+      showOpenInTab={showOpenInTab}
       conversationId={conversationId}
     />
   );
@@ -1178,6 +1208,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
   depth,
   open,
   onFileSelect,
+  showOpenInTab = false,
   conversationId,
   onTogglePath,
   changedFileMap,
@@ -1189,7 +1220,8 @@ const TreeNodeRow = memo(function TreeNodeRow({
   depth: number;
   /** Whether this directory is expanded (ignored for file nodes). */
   open: boolean;
-  onFileSelect: (path: string) => void;
+  onFileSelect: (path: string, openInTab?: boolean) => void;
+  showOpenInTab?: boolean;
   conversationId: string | undefined;
   onTogglePath: (path: string) => void;
   changedFileMap: Map<string, WorkspaceChangedFile["status"]>;
@@ -1205,6 +1237,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
         node={node}
         depth={depth}
         onFileSelect={onFileSelect}
+        showOpenInTab={showOpenInTab}
         conversationId={conversationId}
         fileStatus={changedFileMap.get(node.file.path)}
       />

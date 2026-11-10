@@ -495,6 +495,9 @@ function AppShellImpl() {
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).selectedFilePath ?? null) : null,
   );
+  const [treePreviewPath, setTreePreviewPath] = useState<string | null>(() =>
+    conversationId ? (readSessionWorkspaceState(conversationId).treePreviewPath ?? null) : null,
+  );
   // Explicit opens override the URL, including opens without a cited position.
   const [fileNavigation, setFileNavigation] = useState<{
     conversationId: string | undefined;
@@ -1094,6 +1097,7 @@ function AppShellImpl() {
   // Per-tab availability for the right workspace rail — the single source
   // of truth shared by the tab-fallback effect below, the rail's mount
   // gate, and the header's collapse toggle, so they can never disagree.
+  const fileTreeSplitEnabled = isFeatureEnabled(serverInfo, "workspace_file_tree_split_ui");
   const railTabsAvailable = useMemo(
     () =>
       ({
@@ -1316,6 +1320,7 @@ function AppShellImpl() {
       setOpenPanels([]);
       setSelectedFilePath(null);
       setOpenFiles([]);
+      setTreePreviewPath(null);
       setSelectedTerminalKey(null);
       setPanelInitialKeyState(null);
     } else {
@@ -1372,6 +1377,7 @@ function AppShellImpl() {
           ? [...persistedFiles, urlFile]
           : persistedFiles;
       const nextSelected = showAgents ? null : (urlFile ?? persisted.selectedFilePath ?? null);
+      setTreePreviewPath(persisted.treePreviewPath ?? null);
       setOpenFiles(nextOpenFiles);
       setSelectedFilePath(nextSelected);
       // The tab strip derives from the live terminal list, so there's nothing to
@@ -1511,10 +1517,11 @@ function AppShellImpl() {
       rightRailTab,
       openPanels,
       openFiles,
+      treePreviewPath,
       selectedFilePath,
       selectedTerminalKey,
     });
-  }, [rightRailTab, openPanels, openFiles, selectedFilePath, selectedTerminalKey]);
+  }, [rightRailTab, openPanels, openFiles, treePreviewPath, selectedFilePath, selectedTerminalKey]);
 
   const handleFilesSortChange = useCallback((s: ChangedSort) => {
     setFilesPanelSort(s);
@@ -1522,9 +1529,10 @@ function AppShellImpl() {
   }, []);
 
   const commitFileNavigation = useCallback(
-    (path: string, options?: OpenFileOptions) => {
+    (path: string, options?: OpenFileOptions, inTree = false) => {
       const position = citedFilePosition(options);
-      setSelectedFilePath(path);
+      setSelectedFilePath(inTree ? null : path);
+      if (inTree) setTreePreviewPath(path);
       setFileNavigation({ conversationId, path, position });
       // A file and a shell tab can't both own the rail's content slot —
       // opening a file deselects any active shell tab (its tab stays in the
@@ -1532,7 +1540,7 @@ function AppShellImpl() {
       setSelectedTerminalKey(null);
       // Add the path to the open tabs if it isn't already open; activating an
       // already-open tab just re-selects it (no duplicate).
-      setOpenFiles((prev) => (prev.includes(path) ? prev : [...prev, path]));
+      if (!inTree) setOpenFiles((prev) => (prev.includes(path) ? prev : [...prev, path]));
       // Close the terminal drawer so the file viewer is unobscured —
       // but only in non-terminal-first sessions, where opening a file
       // and viewing the terminal compete for the same rail slot. In
@@ -1554,7 +1562,7 @@ function AppShellImpl() {
       // Pull the rail to the Files tab when parked on a tab where the viewer
       // won't render (Subagents). The Files tab surfaces the
       // FileViewer inline, so leave it undisturbed.
-      setRightRailTab((prev) => (prev === "subagents" ? "files" : prev));
+      setRightRailTab((prev) => (inTree || prev === "subagents" ? "files" : prev));
       // Reveal the rail so the viewer is actually visible — a session the user
       // collapsed (or one that started collapsed via the Appearance default)
       // would otherwise route the file into an invisible panel. Persist
@@ -1609,11 +1617,29 @@ function AppShellImpl() {
   const contentSearchFileRef = useRef<string | null>(null);
   const openFileViewer = useCallback(
     (path: string, options?: OpenFileOptions) =>
-      guardFileNavigation(path, options, () => {
+      guardFileNavigation(
+        fileTreeSplitEnabled && treePreviewPath !== null && selectedFilePath === null ? null : path,
+        options,
+        () => {
+          contentSearchFileRef.current = null;
+          commitFileNavigation(path, options);
+        },
+      ),
+    [
+      guardFileNavigation,
+      commitFileNavigation,
+      selectedFilePath,
+      fileTreeSplitEnabled,
+      treePreviewPath,
+    ],
+  );
+  const openFileInTree = useCallback(
+    (path: string) =>
+      guardFileNavigation(selectedFilePath !== null ? null : path, undefined, () => {
         contentSearchFileRef.current = null;
-        commitFileNavigation(path, options);
+        commitFileNavigation(path, undefined, true);
       }),
-    [guardFileNavigation, commitFileNavigation],
+    [guardFileNavigation, commitFileNavigation, selectedFilePath],
   );
   const openContentSearchResult = useCallback(
     (path: string, options?: OpenFileOptions) =>
@@ -1645,6 +1671,11 @@ function AppShellImpl() {
       { replace: true },
     );
   }, [setSearchParams]);
+  const closeTreePreview = useCallback(() => {
+    setTreePreviewPath(null);
+    setFileViewerCommentsOpen(false);
+    clearFileViewerUrl();
+  }, [clearFileViewerUrl]);
   const restoreSelectedFileUrl = useCallback(() => {
     if (!selectedFilePath) return;
     setSearchParams(
@@ -2011,31 +2042,65 @@ function AppShellImpl() {
   // open file to reveal the picked tab's scope list.
   const handleRightRailTabChange = useCallback(
     (next: RightRailTab | null) => {
-      selectRightRailTab(next);
-      if (selectedFilePath !== null) {
-        setSelectedFilePath(null);
-        setFileViewerCommentsOpen(false);
-        clearFileViewerUrl();
-      }
-      // Clicking a static nav tab deselects any active shell tab (it stays in
-      // the strip) so the picked tab's content shows in the single slot.
-      if (selectedTerminalKey !== null) {
-        setSelectedTerminalKey(null);
-      }
+      const select = () => {
+        selectRightRailTab(next);
+        if (selectedFilePath !== null || (fileTreeSplitEnabled && treePreviewPath !== null)) {
+          setSelectedFilePath(null);
+          setFileViewerCommentsOpen(false);
+          clearFileViewerUrl();
+        }
+        // Clicking a static nav tab deselects any active shell tab (it stays in
+        // the strip) so the picked tab's content shows in the single slot.
+        if (selectedTerminalKey !== null) {
+          setSelectedTerminalKey(null);
+        }
+      };
+      if (
+        fileTreeSplitEnabled &&
+        treePreviewPath !== null &&
+        selectedFilePath === null &&
+        next !== "files"
+      ) {
+        guardFileNavigation(null, undefined, select);
+      } else select();
     },
-    [selectedFilePath, selectedTerminalKey, clearFileViewerUrl, selectRightRailTab],
+    [
+      selectedFilePath,
+      selectedTerminalKey,
+      clearFileViewerUrl,
+      selectRightRailTab,
+      fileTreeSplitEnabled,
+      treePreviewPath,
+      guardFileNavigation,
+    ],
   );
   const closeWorkspacePanel = useCallback(
     (tab: DefaultWorkspaceTab) => {
-      const remaining = openPanels.filter((panel) => panel !== tab);
-      setOpenPanels(remaining);
-      if (rightRailTab === tab) {
-        setRightRailTab(
-          remaining.filter((panel) => railTabsAvailable[panel]).at(-1) ?? fallbackWorkspaceTab,
-        );
-      }
+      const close = () => {
+        const remaining = openPanels.filter((panel) => panel !== tab);
+        setOpenPanels(remaining);
+        if (rightRailTab === tab) {
+          setRightRailTab(
+            remaining.filter((panel) => railTabsAvailable[panel]).at(-1) ?? fallbackWorkspaceTab,
+          );
+          if (fileTreeSplitEnabled && treePreviewPath !== null && selectedFilePath === null) {
+            setFileViewerCommentsOpen(false);
+            clearFileViewerUrl();
+          }
+        }
+      };
+      close();
     },
-    [openPanels, rightRailTab, fallbackWorkspaceTab, railTabsAvailable],
+    [
+      openPanels,
+      rightRailTab,
+      fallbackWorkspaceTab,
+      railTabsAvailable,
+      fileTreeSplitEnabled,
+      treePreviewPath,
+      selectedFilePath,
+      clearFileViewerUrl,
+    ],
   );
 
   // Auto-open a Browser soft tab on a `navigate` action — agent-issued
@@ -2161,19 +2226,32 @@ function AppShellImpl() {
       // pruned off the list), so a fresh create that's still landing stays
       // selected and its xterm surfaces the instant the terminal appears.
       // `focus: false` shows the shell but leaves keyboard focus where it is.
-      autoFocusTerminalRef.current = focus && conversationId ? { conversationId, key } : null;
-      setSelectedTerminalKey(key);
-      setSelectedFilePath(null);
-      setFileViewerCommentsOpen(false);
-      clearFileViewerUrl();
-      setExecutionLogsKey(null);
-      setFilesPanelOpen(false);
-      setSubagentsPanelOpen(false);
-      setShellsPanelOpen(false);
-      setRightPanelOpenAnimated(true);
-      if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
+      const select = () => {
+        autoFocusTerminalRef.current = focus && conversationId ? { conversationId, key } : null;
+        setSelectedTerminalKey(key);
+        setSelectedFilePath(null);
+        setFileViewerCommentsOpen(false);
+        clearFileViewerUrl();
+        setExecutionLogsKey(null);
+        setFilesPanelOpen(false);
+        setSubagentsPanelOpen(false);
+        setShellsPanelOpen(false);
+        setRightPanelOpenAnimated(true);
+        if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
+      };
+      if (fileTreeSplitEnabled && treePreviewPath !== null && selectedFilePath === null) {
+        guardFileNavigation(null, undefined, select);
+      } else select();
     },
-    [clearFileViewerUrl, conversationId, setRightPanelOpenAnimated],
+    [
+      clearFileViewerUrl,
+      conversationId,
+      setRightPanelOpenAnimated,
+      fileTreeSplitEnabled,
+      treePreviewPath,
+      selectedFilePath,
+      guardFileNavigation,
+    ],
   );
 
   // ⌃` and ⌘⌥T (Ctrl+Alt+T) open a new shell, as does the desktop menu's New
@@ -2929,6 +3007,10 @@ function AppShellImpl() {
                     openPanels={openPanels}
                     onClosePanel={closeWorkspacePanel}
                     showFilesPanel={showFilesPanel}
+                    fileTreeSplitEnabled={fileTreeSplitEnabled}
+                    treePreviewPath={treePreviewPath}
+                    openFileInTree={openFileInTree}
+                    onCloseTreePreview={closeTreePreview}
                     showGithubTab={railTabsAvailable.github}
                     showContentSearch={railTabsAvailable["content-search"]}
                     showBrowserTab={railTabsAvailable.browser}

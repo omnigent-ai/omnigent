@@ -146,6 +146,7 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         data-width={props.width}
         data-terminal={props.selectedTerminalKey ?? ""}
         data-tab={props.rightRailTab ?? ""}
+        data-tree-preview={props.treePreviewPath ?? ""}
         data-end-line={props.filePosition?.endLine}
       >
         <span>{props.selectedFilePath ?? "No file"}</span>
@@ -157,6 +158,12 @@ vi.mock("@/shell/WorkspacePanel", () => ({
           onChange={(event) => setDraft(event.target.value)}
         />
         <div {...props.handleProps} />
+        <button type="button" onClick={() => props.openFileInTree?.("tree.md")}>
+          Preview tree file
+        </button>
+        <button type="button" onClick={props.onCloseTreePreview}>
+          Close tree preview
+        </button>
         <button type="button" onClick={() => props.openFileViewer("other.md")}>
           Open other
         </button>
@@ -599,4 +606,43 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
     "data-width",
     "504",
   );
+});
+
+it("keeps grid tree previews per session and guards inline navigation", () => {
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "tree-files", layout: splitGrid("first", "first", "second", "right")! }}
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  const workspace = screen.getByTestId("workspace-first");
+  fireEvent.click(within(workspace).getByText("Preview tree file"));
+  expect(readSessionWorkspaceState("first")).toMatchObject({
+    treePreviewPath: "tree.md",
+    openFiles: [],
+    selectedFilePath: null,
+    rightRailTab: "files",
+  });
+  expect(readSessionWorkspaceState("second").treePreviewPath).toBeNull();
+  fireEvent.click(within(workspace).getByText("Open other"));
+  expect(readSessionWorkspaceState("first")).toMatchObject({
+    treePreviewPath: "tree.md",
+    openFiles: ["other.md"],
+    selectedFilePath: "other.md",
+  });
+  fireEvent.click(
+    within(screen.getByRole("region", { name: "first (active)" })).getByText("Edit file"),
+  );
+  fireEvent.click(within(workspace).getByText("Preview tree file"));
+  expect(readSessionWorkspaceState("first").selectedFilePath).toBe("other.md");
+  act(() => fixture.discardEdits?.());
+  expect(readSessionWorkspaceState("first").selectedFilePath).toBeNull();
+  fireEvent.click(within(workspace).getByText("Close tree preview"));
+  expect(readSessionWorkspaceState("first")).toMatchObject({
+    treePreviewPath: null,
+    openFiles: ["other.md"],
+  });
 });

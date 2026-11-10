@@ -2,6 +2,9 @@ import {
   ArrowDownAZIcon,
   ArrowDownUpIcon,
   ArrowDownWideNarrowIcon,
+  CopyIcon,
+  EllipsisIcon,
+  ExternalLinkIcon,
   EyeIcon,
   EyeOffIcon,
   FileClockIcon,
@@ -13,6 +16,8 @@ import {
   XIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
+import { copyText } from "@/lib/clipboard";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
 import { useSandboxStarting } from "@/hooks/useSessionReconnect";
@@ -32,12 +37,13 @@ import {
 import { cn } from "@/lib/utils";
 import { BrowseLocationBar } from "./BrowseLocationBar";
 import { CopyPathButton } from "./CopyPathButton";
-import { OpenInMenu } from "./OpenInMenu";
+import { OpenInSplitButton, useOpenInActions } from "./OpenInMenu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
   DropdownMenuTrigger,
@@ -50,6 +56,9 @@ import { useScrollRestore } from "./useScrollRestore";
 interface FilesPanelProps {
   conversationId?: string;
   onFileSelect: (path: string) => void;
+  onFileOpenInTree?: (path: string) => void;
+  showOpenInTab?: boolean;
+  compactTreeControls?: boolean;
   /**
    * Which scope this panel renders: false = full folder tree, true =
    * changed-files-only flat list. Fixed by the caller (the Files vs Changes
@@ -164,9 +173,11 @@ const SORT_OPTIONS: { value: ChangedSort; label: string; Icon: typeof ArrowDownA
 function SortSelector({
   sort,
   onChange,
+  compact = false,
 }: {
   sort: ChangedSort;
   onChange: (next: ChangedSort) => void;
+  compact?: boolean;
 }) {
   const active = SORT_OPTIONS.find((o) => o.value === sort) ?? SORT_OPTIONS[0];
   return (
@@ -180,10 +191,16 @@ function SortSelector({
                 variant="ghost"
                 size="sm"
                 aria-label={`Sort: ${active.label}`}
-                className="shrink-0 gap-[2px] text-muted-foreground hover:text-foreground"
+                className={cn(
+                  "shrink-0 gap-[2px] text-muted-foreground hover:text-foreground",
+                  compact &&
+                    "@max-[400px]/filespanel:w-7 @max-[400px]/filespanel:px-0 @max-[260px]/filespanel:size-6",
+                )}
               >
                 <ArrowDownUpIcon />
-                <span>{active.label}</span>
+                <span className={compact ? "@max-[400px]/filespanel:hidden" : undefined}>
+                  {active.label}
+                </span>
               </Button>
             </DropdownMenuTrigger>
           </TooltipTrigger>
@@ -267,6 +284,9 @@ export function revealFolderInFilesPanel(conversationId: string, absolutePath: s
 export function FilesPanel({
   conversationId: sessionId,
   onFileSelect,
+  onFileOpenInTree,
+  showOpenInTab = false,
+  compactTreeControls = false,
   flatView,
   showHidden,
   onShowHiddenChange,
@@ -383,10 +403,11 @@ export function FilesPanel({
    * 404.
    */
   const openTreeFile = useCallback(
-    (path: string) => {
-      onFileSelect(joinBrowseLocation(locationParam, path));
+    (path: string, openInTab = false) => {
+      const openFile = !openInTab && onFileOpenInTree ? onFileOpenInTree : onFileSelect;
+      openFile(joinBrowseLocation(locationParam, path));
     },
-    [onFileSelect, locationParam],
+    [onFileSelect, onFileOpenInTree, locationParam],
   );
 
   const allFilesQuery = useWorkspaceAllFiles(conversationId, { enabled: !flatView }, locationParam);
@@ -507,6 +528,7 @@ export function FilesPanel({
   // cached before it slept still renders.
   const showAsleepHint = sandboxAsleep && !dataReady;
   const sandboxWaking = useSandboxStarting(conversationId);
+  const openInActions = useOpenInActions(!flatView ? workingDir : null, true);
 
   return (
     <div
@@ -516,18 +538,33 @@ export function FilesPanel({
       )}
     >
       {/* Header — single row: [workingDir] [copy] [refresh] [close?] [open in] */}
-      <div className="flex h-11 shrink-0 items-center gap-[2px] px-2">
+      <div
+        data-files-header
+        className={cn(
+          "flex h-11 shrink-0 items-center gap-[2px] px-2",
+          compactTreeControls && "@max-[380px]/filespanel:px-1",
+        )}
+      >
         {flatView && <h2 className="shrink-0 pl-1 font-medium text-ui">Changes</h2>}
         {!flatView && workingDir && workspaceRoot && (
-          <BrowseLocationBar
-            current={workingDir}
-            workspace={workspaceRoot}
-            hostId={session?.hostId ?? null}
-            canBrowseOutside={isOwnerLevel(session?.permissionLevel ?? null)}
-            reach={envQuery.data?.reachable ?? null}
-            onNavigate={navigateTo}
-            error={locationError}
-          />
+          <div
+            data-files-folder-label
+            className={cn(
+              "flex min-w-0 flex-1",
+              compactTreeControls &&
+                "min-w-[72px] [&_.truncate]:min-w-[72px] @max-[380px]/filespanel:[&_button[data-size=icon-sm]]:size-6 @max-[380px]/filespanel:[&_button[data-testid=browse-location-path]]:px-0",
+            )}
+          >
+            <BrowseLocationBar
+              current={workingDir}
+              workspace={workspaceRoot}
+              hostId={session?.hostId ?? null}
+              canBrowseOutside={isOwnerLevel(session?.permissionLevel ?? null)}
+              reach={envQuery.data?.reachable ?? null}
+              onNavigate={navigateTo}
+              error={locationError}
+            />
+          </div>
         )}
         {servedFromHost && (
           <TooltipProvider>
@@ -535,10 +572,17 @@ export function FilesPanel({
               <TooltipTrigger asChild>
                 <span
                   data-testid="files-host-served-badge"
-                  className="flex shrink-0 items-center gap-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+                  className={cn(
+                    "flex shrink-0 items-center gap-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground",
+                    compactTreeControls && "@max-[380px]/filespanel:p-0",
+                  )}
                 >
                   <MoonIcon className="size-3 shrink-0" />
-                  Asleep
+                  <span
+                    className={compactTreeControls ? "@max-[380px]/filespanel:hidden" : undefined}
+                  >
+                    Asleep
+                  </span>
                 </span>
               </TooltipTrigger>
               <TooltipContent>
@@ -547,32 +591,72 @@ export function FilesPanel({
             </Tooltip>
           </TooltipProvider>
         )}
-        <div className="ml-auto flex items-center gap-[2px]">
-          {!flatView && workingDir && (
-            // Its own provider: the header has no TooltipProvider ancestor
-            // (each control here brings one), unlike the file rows.
+        <div className="ml-auto flex shrink-0 items-center gap-[2px]">
+          <div
+            className={cn(
+              "flex items-center gap-[2px]",
+              compactTreeControls && "@max-[380px]/filespanel:hidden",
+            )}
+          >
+            {!flatView && workingDir && (
+              // Its own provider: the header has no TooltipProvider ancestor
+              // (each control here brings one), unlike the file rows.
+              <TooltipProvider>
+                <CopyPathButton path={workingDir} label="Copy folder path" />
+              </TooltipProvider>
+            )}
             <TooltipProvider>
-              <CopyPathButton path={workingDir} label="Copy folder path" />
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label="Refresh files"
+                    disabled={refreshingFiles}
+                    className="shrink-0 text-muted-foreground hover:text-foreground"
+                    onClick={() => void refreshFiles()}
+                  >
+                    <RefreshCwIcon className={cn(refreshingFiles && "animate-spin")} />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Refresh files</TooltipContent>
+              </Tooltip>
             </TooltipProvider>
-          )}
-          <TooltipProvider>
-            <Tooltip>
-              <TooltipTrigger asChild>
+          </div>
+          {compactTreeControls && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
                 <Button
-                  type="button"
                   variant="ghost"
-                  size="icon-sm"
-                  aria-label="Refresh files"
-                  disabled={refreshingFiles}
-                  className="shrink-0 text-muted-foreground hover:text-foreground"
-                  onClick={() => void refreshFiles()}
+                  size="icon-xs"
+                  aria-label="More file actions"
+                  className="hidden text-muted-foreground @max-[380px]/filespanel:inline-flex"
                 >
-                  <RefreshCwIcon className={cn(refreshingFiles && "animate-spin")} />
+                  <EllipsisIcon />
                 </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom">Refresh files</TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                {workingDir && (
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      void copyText(workingDir).then(
+                        () => toast.success("Folder path copied"),
+                        () => toast.error("Failed to copy folder path"),
+                      );
+                    }}
+                  >
+                    <CopyIcon />
+                    Copy folder path
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuItem disabled={refreshingFiles} onSelect={() => void refreshFiles()}>
+                  <RefreshCwIcon className={cn(refreshingFiles && "animate-spin")} />
+                  Refresh files
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
           {onClose && (
             <button
               type="button"
@@ -583,7 +667,40 @@ export function FilesPanel({
               <XIcon className="size-4" />
             </button>
           )}
-          {!flatView && workingDir && <OpenInMenu path={workingDir} directory />}
+          {!flatView && workingDir && (
+            <>
+              <span
+                className={cn(
+                  "inline-flex",
+                  compactTreeControls && "@max-[380px]/filespanel:hidden",
+                )}
+              >
+                <OpenInSplitButton actions={openInActions} />
+              </span>
+              {compactTreeControls && openInActions.length > 0 && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="outline"
+                      size="icon-xs"
+                      aria-label="Open in IDE"
+                      className="hidden @max-[380px]/filespanel:inline-flex"
+                    >
+                      <ExternalLinkIcon />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    {openInActions.map((action) => (
+                      <DropdownMenuItem key={action.key} onSelect={action.onSelect}>
+                        {action.icon}
+                        {action.label}
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
+            </>
+          )}
         </div>
       </div>
       {/* Content */}
@@ -620,10 +737,33 @@ export function FilesPanel({
       )}
       {!flatView && (
         <div className="shrink-0" onClick={(e) => e.stopPropagation()}>
-          <div className="flex items-center gap-2 px-2 py-2 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch">
-            <div className="flex min-w-0 flex-1 items-center gap-[2px]">
-              <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-lg border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
-                <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
+          <div
+            className={cn(
+              "flex items-center gap-2 px-2 py-2",
+              compactTreeControls
+                ? "@max-[260px]/filespanel:px-1"
+                : "@max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch",
+            )}
+          >
+            <div
+              className={cn(
+                "flex min-w-0 flex-1 items-center gap-[2px]",
+                compactTreeControls &&
+                  "@max-[200px]/filespanel:flex-wrap @max-[260px]/filespanel:[&>button]:size-6",
+              )}
+            >
+              <div
+                className={cn(
+                  "flex min-w-0 flex-1 items-center gap-[6px] rounded-lg border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong",
+                  compactTreeControls && "min-w-[110px] @max-[260px]/filespanel:px-1",
+                )}
+              >
+                <SearchIcon
+                  className={cn(
+                    "size-4 shrink-0 text-muted-foreground",
+                    compactTreeControls && "@max-[260px]/filespanel:hidden",
+                  )}
+                />
                 <input
                   aria-label="Search all files"
                   className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
@@ -633,7 +773,11 @@ export function FilesPanel({
                   value={treeSearch}
                 />
               </div>
-              <SortSelector sort={changedSort} onChange={onSortChange} />
+              <SortSelector
+                sort={changedSort}
+                onChange={onSortChange}
+                compact={compactTreeControls}
+              />
               <TooltipProvider>
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -716,6 +860,7 @@ export function FilesPanel({
             files={allFilesQuery.data?.data}
             {...fileListStatus(allFilesQuery, envQuery)}
             onFileSelect={openTreeFile}
+            showOpenInTab={showOpenInTab}
             conversationId={conversationId}
             showHidden={showHidden}
             onShowHidden={() => onShowHiddenChange(true)}

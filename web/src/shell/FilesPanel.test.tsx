@@ -17,6 +17,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
+import { isMacPlatform } from "@/lib/hotkeys";
 
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/hooks/useHostSshTarget", () => ({ useHostSshTarget: () => null }));
@@ -204,6 +205,8 @@ function renderPanel({
   isSearchTruncated = false,
   reachable = null,
   onFileSelect = vi.fn(),
+  onFileOpenInTree,
+  showOpenInTab = false,
   listsLoaded = true,
   environment,
 }: {
@@ -223,6 +226,8 @@ function renderPanel({
     roots: { path: string; access: string; origin: string }[];
   } | null;
   onFileSelect?: (path: string) => void;
+  onFileOpenInTree?: (path: string) => void;
+  showOpenInTab?: boolean;
   /** False: both list queries are disabled and hold no data (nothing could serve them). */
   listsLoaded?: boolean;
   /** The environment query's state; defaults to a loaded environment. */
@@ -247,7 +252,16 @@ function renderPanel({
     searchResult(treeSearchResults, isSearching, isSearchPlaceholder, isSearchTruncated),
   );
 
-  return render(panelAt(conversationId, { flatView, onFileSelect, showHidden, onClose }));
+  return render(
+    panelAt(conversationId, {
+      flatView,
+      onFileSelect,
+      onFileOpenInTree,
+      showOpenInTab,
+      showHidden,
+      onClose,
+    }),
+  );
 }
 
 /** A fresh routed FilesPanel element, so rerenders re-read the hook mocks. */
@@ -514,6 +528,23 @@ describe("FilesPanel on an asleep sandbox", () => {
 });
 
 describe("FilesPanel scope (fixed by the caller's Files/Changes tab)", () => {
+  it("keeps Changes opens in soft tabs when an inline callback is available", () => {
+    const onFileSelect = vi.fn();
+    const onFileOpenInTree = vi.fn();
+    renderPanel({
+      conversationId: "conv_changes_soft_tab",
+      flatView: true,
+      files: [],
+      changedFiles: [changedFile("README.md")],
+      onFileSelect,
+      onFileOpenInTree,
+      showOpenInTab: true,
+    });
+    fireEvent.click(screen.getByText("README.md"));
+    expect(onFileSelect).toHaveBeenCalledWith("README.md");
+    expect(onFileOpenInTree).not.toHaveBeenCalled();
+  });
+
   it("does not enable the root filesystem listing while showing Changed files", () => {
     renderPanel({
       conversationId: "conv_changed_only",
@@ -2064,30 +2095,44 @@ describe("FilesPanel double-click navigation", () => {
     expect(screen.getByText("src")).toBeInTheDocument();
   });
 
-  it("re-attaches the browsed folder when opening a file the tree named", () => {
-    // Tree paths are relative to where the tree is rooted, but the viewer
-    // resolves against the workspace root -- so after navigating into a
-    // folder, handing it the bare name would open the wrong file (or none).
-    const onFileSelect = vi.fn();
-    renderPanel({
-      conversationId: "conv_open_after_nav",
-      flatView: false,
-      files: [file("src/App.tsx")],
-      workingDir: "/home/user/proj",
-      onFileSelect,
-    });
+  it.each([false, true])(
+    "re-attaches the browsed folder when opening a file (inline=%s)",
+    (inline) => {
+      // Tree paths are relative to where the tree is rooted, but the viewer
+      // resolves against the workspace root -- so after navigating into a
+      // folder, handing it the bare name would open the wrong file (or none).
+      const onFileSelect = vi.fn();
+      const onFileOpenInTree = vi.fn();
+      renderPanel({
+        conversationId: `conv_open_after_nav_${inline}`,
+        flatView: false,
+        files: [file("src/App.tsx")],
+        workingDir: "/home/user/proj",
+        onFileSelect,
+        onFileOpenInTree: inline ? onFileOpenInTree : undefined,
+        showOpenInTab: inline,
+      });
 
-    // Re-rooting swaps the listing for one relative to the NEW root, which is
-    // why the bare name reaches the panel in the first place.
-    useAllFilesMock.mockImplementation((_id: unknown, _opts: unknown, location?: string) =>
-      location === "src"
-        ? allFilesResult([file("App.tsx")])
-        : allFilesResult([file("src/App.tsx")]),
-    );
+      // Re-rooting swaps the listing for one relative to the NEW root, which is
+      // why the bare name reaches the panel in the first place.
+      useAllFilesMock.mockImplementation((_id: unknown, _opts: unknown, location?: string) =>
+        location === "src"
+          ? allFilesResult([file("App.tsx")])
+          : allFilesResult([file("src/App.tsx")]),
+      );
 
-    fireEvent.doubleClick(screen.getByRole("button", { name: "src/" }));
-    fireEvent.click(screen.getByText("App.tsx"));
+      fireEvent.doubleClick(screen.getByRole("button", { name: "src/" }));
+      fireEvent.click(screen.getByText("App.tsx"));
 
-    expect(onFileSelect).toHaveBeenCalledWith("src/App.tsx");
-  });
+      expect(inline ? onFileOpenInTree : onFileSelect).toHaveBeenCalledWith("src/App.tsx");
+      expect(inline ? onFileSelect : onFileOpenInTree).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByText("App.tsx"), {
+        metaKey: isMacPlatform(),
+        ctrlKey: !isMacPlatform(),
+      });
+      expect(onFileSelect).toHaveBeenCalledWith("src/App.tsx");
+      expect(onFileOpenInTree).toHaveBeenCalledTimes(inline ? 1 : 0);
+    },
+  );
 });

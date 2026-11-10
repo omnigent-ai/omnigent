@@ -135,6 +135,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Workspace content search](./workspace-content-search.md) covers runner-backed
   text search, result navigation and its release flag.
 
+- [Workspace file tree](./workspace-files.md) covers inline file previews,
+  standalone tabs, resizing, narrow panels and the local opening preference.
+
 - [Harness acceptance](./harness-acceptance.md) standardizes the SDK/native
   checklist, connects existing bench probes to user journeys, and records
   per-harness coverage gaps separately from observed results. Its
@@ -206,6 +209,7 @@ map an area, remove it here in the same change.
 - Sub-agents and the agent info popover: `tests/e2e_ui/agents/` (only Claude-native
   discovery and idle-runner performance are mapped in Native harnesses)
 - Files and the workspace browser: `tests/e2e_ui/files/`, `tests/browser_ui/files/`
+  (the Workspace tree split, content search and Markdown editor are mapped)
 - Comments: `tests/e2e_ui/comments/`
 - Sharing and session permissions: `tests/e2e_ui/collaboration/`
 - GitHub integration: `tests/e2e_ui/github/`
