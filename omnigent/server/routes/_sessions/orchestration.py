@@ -3208,8 +3208,6 @@ async def _persist_external_conversation_item_unlocked(
                 }
             )
     elif drains_pending_inputs and item.type == "message" and isinstance(item.data, MessageData):
-        # Exact native IDs preserve out-of-order and reformatted messages.
-        # Legacy mirrors use their existing text and positional matching.
         text = _message_text(item.data.content) or ""
         agent_message_candidate = body.data.get("agent_message_candidate") is True
         native_agent = _native_coding_agent_for_session(conv)
@@ -3219,12 +3217,14 @@ async def _persist_external_conversation_item_unlocked(
             and "delivery_attempt_id" in body.data
         )
         if has_delivery_receipt:
-            matched = pending_inputs.MatchedDrain(
-                matched=pending_inputs.resolve_delivery_attempt(
+            try:
+                drained = pending_inputs.resolve_delivery_attempt(
                     session_id, None, body.data["delivery_attempt_id"], hold=True
-                ),
-                skipped=[],
-                match_method="delivery_attempt_id",
+                )
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+            matched = pending_inputs.MatchedDrain(
+                matched=drained, skipped=[], match_method="delivery_attempt_id"
             )
         else:
             matched = pending_inputs.resolve_matching_text(
@@ -3267,7 +3267,17 @@ async def _persist_external_conversation_item_unlocked(
                 pending_inputs.mark_uncertain(session_id)
         if drained is not None:
             cleared_pending_id = drained.pending_id
-            item = _merge_pending_file_blocks(item, drained.content)
+            item = (
+                item.model_copy(
+                    update={
+                        "data": item.data.model_copy(
+                            update={"content": drained.content, "user_authored": True}
+                        )
+                    }
+                )
+                if has_delivery_receipt
+                else _merge_pending_file_blocks(item, drained.content)
+            )
             # A text match preserves the sender recorded at POST time. FIFO
             # settlement alone does not establish authorship of the mirror.
             if (

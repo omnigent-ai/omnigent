@@ -27,29 +27,43 @@ from tests.harnesses.codex_native.forwarder._support import _RecordingClient
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_prompt", [False, True], ids=["file-only", "prompt-first"])
 @pytest.mark.parametrize("failed_append", [False, True])
-async def test_spilled_text_file_receipt_keeps_earlier_inputs_and_correct_upload(
+@pytest.mark.parametrize(
+    "upload_data", [b"small upload", b"x" * 1_100_000], ids=["small", "large"]
+)
+async def test_file_receipt_preserves_earlier_input_and_upload(
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     with_prompt: bool,
     failed_append: bool,
+    upload_data: bytes,
 ) -> None:
-    """Convert, mirror and persist a large upload using its exact native receipt."""
+    """A native client ID settles its input even when file text changes its mirror."""
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="Test", labels={"omnigent.wrapper": "codex-native-ui"})
     first = pending_inputs.record(
         conv.id,
         [{"type": "input_text", "text": "earlier"}, {"type": "input_file", "file_id": "file_old"}],
     )
-    file_block = {"type": "input_file", "filename": "large.txt", "file_id": "file_current"}
+    file_block = {"type": "input_file", "filename": "small.txt", "file_id": "file_current"}
     prompt = [{"type": "input_text", "text": "compare this upload"}] if with_prompt else []
     current_content = [*prompt, file_block]
-    current = pending_inputs.record(conv.id, current_content, created_by="alice@example.com")
+    current = pending_inputs.record(conv.id, current_content, created_by="alice@example.test")
     attempt = pending_inputs.delivery_attributes_for(conv.id, current)["delivery_attempt_id"]
-    data_uri = "data:text/plain;base64," + base64.b64encode(b"x" * 1_100_000).decode()
     native_content = _content_to_input_items(
-        [*prompt, {**file_block, "file_data": data_uri}], tmp_path
+        [
+            *prompt,
+            {
+                **file_block,
+                "file_data": "data:text/plain;base64," + base64.b64encode(upload_data).decode(),
+            },
+        ],
+        tmp_path,
     )
+    if upload_data == b"small upload":
+        assert not hasattr(native_content, "client_message_id")
+    else:
+        assert native_content.client_message_id.startswith("omnigent-paste-")
     client = _RecordingClient()
     await codex_forwarder._post_user_message(
         client,
@@ -78,13 +92,15 @@ async def test_spilled_text_file_receipt_keeps_earlier_inputs_and_correct_upload
     item_id = await _persist_external_conversation_item(conv.id, conv, body, store)
     [saved] = store.list_items(conv.id).data
     assert saved.id == item_id
-    assert saved.data.content[0] == file_block
-    assert saved.created_by == "alice@example.com"
+    assert saved.data.content == current_content
+    assert saved.created_by == "alice@example.test"
     assert pending_inputs.pending_ids(conv.id) == [first]
     receipts = [
         session_stream._sse_safe_attributes(call.args[1]) for call in published.call_args_list
     ]
-    assert [r["cleared_pending_id"] for r in receipts if "cleared_pending_id" in r] == [current]
+    assert [
+        event["cleared_pending_id"] for event in receipts if "cleared_pending_id" in event
+    ] == [current]
 
     newer = pending_inputs.record(conv.id, current_content)
     assert await _persist_external_conversation_item(conv.id, conv, body, store) == item_id
@@ -95,15 +111,18 @@ async def test_spilled_text_file_receipt_keeps_earlier_inputs_and_correct_upload
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("receipt", ["absent", "unknown", "different-session", "invalid", None])
-async def test_native_receipt_miss_does_not_consume_a_matching_pending_message(
+@pytest.mark.parametrize(
+    "receipt", ["absent", "unknown", "different-session", "invalid", "restored", None]
+)
+async def test_plain_native_receipt_miss_preserves_pending_inputs(
     db_uri: str, receipt: str | None
 ) -> None:
-    """Only a missing legacy receipt permits the existing text-matching fallback."""
+    """An explicit receipt miss cannot authorize a text or FIFO match."""
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="Test", labels={"omnigent.wrapper": "codex-native-ui"})
     content = [{"type": "input_text", "text": "identical message"}]
-    pending = pending_inputs.record(conv.id, content)
+    pending = pending_inputs.record(conv.id, content, stable_id="c" * 32)
+    attempt = pending_inputs.delivery_attributes_for(conv.id, pending)["delivery_attempt_id"]
     other_session = f"other-{conv.id}"
     other = pending_inputs.record(other_session, content)
     values = {
@@ -112,8 +131,14 @@ async def test_native_receipt_miss_does_not_consume_a_matching_pending_message(
             "delivery_attempt_id"
         ],
         "invalid": "not-a-server-generated-id",
+        "restored": attempt,
         None: None,
     }
+    if receipt == "restored":
+        pending_inputs.resolve(conv.id, pending)
+        assert (
+            pending_inputs.record(conv.id, content, stable_id="c" * 32, restored=True) == pending
+        )
     data = {
         "item_type": "message",
         "item_data": {"role": "user", "content": content},

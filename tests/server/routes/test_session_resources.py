@@ -11827,10 +11827,13 @@ def _encoded_spilled_content(content: object) -> bytes:
         "delayed_older_echo",
         "stable_attempt_replaced",
         "restored",
+        "restored_file_only",
         "restored_resent",
         "queue_absent",
         "append_failure",
         "metadata_missing",
+        "metadata_missing_pending",
+        "metadata_missing_attempt",
         "metadata_unknown",
         "wrong_content",
         "reprepared_replay",
@@ -11876,12 +11879,15 @@ async def test_spilled_receipt_preserves_exact_queue_ownership(
             0,
             {"type": "input_file", "file_id": "file_report", "filename": "report.txt"},
         )
+    if scenario == "restored_file_only":
+        original = [{"type": "input_file", "file_id": "file_report", "filename": "report.txt"}]
     stable_id = (
         "c" * 32
         if scenario
         in {
             "stable_attempt_replaced",
             "restored",
+            "restored_file_only",
             "restored_resent",
             "settled_stable_attempt_replaced",
             "append_failure_after_cancel",
@@ -11903,7 +11909,10 @@ async def test_spilled_receipt_preserves_exact_queue_ownership(
             if block.get("type") == "input_file":
                 block["file_data"] = (
                     "data:text/plain;base64,"
-                    + base64.b64encode(b"synthetic upload bytes\n").decode()
+                    + base64.b64encode(
+                        b"synthetic upload bytes\n"
+                        * (100 if scenario == "restored_file_only" else 1)
+                    ).decode()
                 )
         with native_input_receipt_scope(build_native_input_receipt(content, identity)):
             items = codex_native_executor._content_to_input_items(resolved, tmp_path / "bridge")
@@ -11934,11 +11943,15 @@ async def test_spilled_receipt_preserves_exact_queue_ownership(
         body.data["delivery_attempt_id"] = older_identity["delivery_attempt_id"]
     if scenario == "metadata_missing":
         body.data.pop("native_input_receipt")
+    elif scenario == "metadata_missing_pending":
+        body.data["native_input_receipt"]["identity"].pop("pending_id")
+    elif scenario == "metadata_missing_attempt":
+        body.data["native_input_receipt"]["identity"].pop("delivery_attempt_id")
     elif scenario == "metadata_unknown":
         body.data["native_input_receipt"]["version"] = 2
     elif scenario == "wrong_content":
         body.data["item_data"]["content"][0]["text"] += " changed"
-    if scenario in {"restored", "restored_resent"}:
+    if scenario in {"restored", "restored_file_only", "restored_resent"}:
         pending_inputs.resolve(session_id, owned_id)
         assert (
             pending_inputs.record(
@@ -12081,6 +12094,8 @@ async def test_spilled_receipt_preserves_exact_queue_ownership(
         "stable_attempt_replaced",
         "restored_resent",
         "metadata_missing",
+        "metadata_missing_pending",
+        "metadata_missing_attempt",
         "metadata_unknown",
         "wrong_content",
     }:

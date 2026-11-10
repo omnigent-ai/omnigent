@@ -1022,6 +1022,10 @@ Cross-harness journeys:
   reference typed into the real TUI. Manually check both composers, a mid-turn
   send, each attachment control and a literal reference in Chat and Terminal;
   confirm one complete history entry and no duplicate delivery after reconnect.
+  Ordinary native client IDs also match only their current delivery attempt;
+  `tests/server/routes/test_native_input_diagnostics.py` covers file-only and
+  out-of-order receipts. Update server and runner together. Bare client IDs
+  cannot rebind restored pending inputs; the versioned receipt remains required.
 - **`chat-render`, `steer`, Codex shell commands from the web composer:**
   A standalone `!command` runs in the session's shell. Its pending bubble settles
   and its output appears below it; attachments, multiple content blocks and `!!`
