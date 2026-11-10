@@ -627,7 +627,7 @@ biometrics and saved passkeys are unavailable (see
 [Passkeys](#passkeys-webauthn)). **Open in browser** hands the current page to
 the default browser; on macOS the popover also points to the cookie button.
 The popover closes when the request finishes or fails, or when the page navigates.
-The same visible-pane rule applies, and conditional (autofill) requests do not
+It waits until the pane is visible, and conditional (autofill) requests do not
 open it. Windows already shows its own WebAuthn dialog, so the shell skips this
 notice there.
 

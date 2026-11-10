@@ -48,7 +48,7 @@ async function launchThisMachineDesktop({ backend, scratch, recordDir, preload =
   } catch (error) {
     // The caller only cleans up a desktop this helper returns.
     await desktop.electronApp.close().catch(() => {});
-    await desktop.stopDisplayCapture();
+    await desktop.stopDisplayCapture().catch(() => {});
     fs.rmSync(desktop.userDataDir, { recursive: true, force: true });
     throw error;
   }

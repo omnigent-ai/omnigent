@@ -46,7 +46,12 @@ setTimeout(async () => {
 
 it(
   "asks for the security key while a Browser tab page waits and can hand the page to the system browser",
-  { skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}`, timeout: 150_000 },
+  {
+    skip:
+      (!deps.ok && `missing deps: ${deps.missing.join(", ")}`) ||
+      (process.platform === "win32" && "Windows draws its own WebAuthn dialog"),
+    timeout: 150_000,
+  },
   async () => {
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "omni-webauthn-"));
     const recordDir = RECORDING
@@ -109,19 +114,22 @@ it(
       ]);
       await pause();
     } finally {
-      if (desktop) {
-        await desktop.window.unrouteAll({ behavior: "wait" });
-        await desktop.electronApp.close();
-        await desktop.stopDisplayCapture();
-        console.log(saveRecording(recordDir, "browser-webauthn-prompt"));
-        fs.rmSync(desktop.userDataDir, { recursive: true, force: true });
+      try {
+        if (desktop) {
+          await desktop.window.unrouteAll({ behavior: "wait" });
+          await desktop.electronApp.close();
+          await desktop.stopDisplayCapture();
+          console.log(saveRecording(recordDir, "browser-webauthn-prompt"));
+          fs.rmSync(desktop.userDataDir, { recursive: true, force: true });
+        }
+      } finally {
+        if (backend) await backend.close();
+        fixture.closeAllConnections();
+        await new Promise((resolve) => {
+          fixture.close(resolve);
+        });
+        fs.rmSync(scratch, { recursive: true, force: true });
       }
-      if (backend) await backend.close();
-      fixture.closeAllConnections();
-      await new Promise((resolve) => {
-        fixture.close(resolve);
-      });
-      fs.rmSync(scratch, { recursive: true, force: true });
     }
   },
 );

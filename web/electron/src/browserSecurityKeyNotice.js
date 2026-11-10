@@ -1,7 +1,7 @@
 "use strict";
 
 const PENDING_CHANNEL = "omnigent:browser-webauthn-pending";
-// Requests the page settles at once (or a page re-requesting in a loop) open no window.
+// Debounce so requests that settle within the delay never open a window.
 const SHOW_DELAY_MS = 300;
 
 function pageOrigin(url) {
@@ -30,7 +30,12 @@ function attachSecurityKeyNotice(contents, { canPrompt, showPrompt, openExternal
   function show() {
     timer = null;
     const origin = pageOrigin(contents.getURL());
-    if (!pending || shown || !origin || !canPrompt(contents)) return;
+    if (!pending || shown || !origin) return;
+    // Keep checking so the notice appears once a hidden or covered pane comes back into view.
+    if (!canPrompt(contents)) {
+      timer = setTimeout(show, SHOW_DELAY_MS);
+      return;
+    }
     const controller = new AbortController();
     shown = controller;
     void Promise.resolve()
@@ -42,7 +47,9 @@ function attachSecurityKeyNotice(contents, { canPrompt, showPrompt, openExternal
         shown = null;
         if (choice === "suppressed") return show();
         const url = contents.getURL();
-        if (choice === "open-in-browser" && pageOrigin(url) === origin) openExternal(url);
+        if (choice !== "open-in-browser" || pageOrigin(url) !== origin) return;
+        // The page is still waiting if the system browser fails to open, so offer the notice again.
+        return Promise.resolve(openExternal(url)).catch(show);
       })
       .catch(() => {
         if (shown === controller) shown = null;

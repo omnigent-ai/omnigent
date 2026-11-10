@@ -12,7 +12,7 @@ const {
 const PAGE = "https://login.example.com/signin/verify";
 const flush = () => new Promise(setImmediate);
 
-function harness({ url = PAGE, canPrompt = () => true } = {}) {
+function harness({ url = PAGE, canPrompt = () => true, launch } = {}) {
   const contents = new EventEmitter();
   let currentUrl = url;
   Object.assign(contents, {
@@ -33,7 +33,10 @@ function harness({ url = PAGE, canPrompt = () => true } = {}) {
         options.signal.addEventListener("abort", () => resolve("dismiss"));
         prompts.push(prompt);
       }),
-    openExternal: (target) => opened.push(target),
+    openExternal: (target) => {
+      opened.push(target);
+      return launch?.();
+    },
     cookieImport: true,
   });
   const report = (pending, frame = contents.mainFrame) =>
@@ -96,6 +99,16 @@ describe("security-key notice for embedded browser pages", () => {
     assert.equal(h.prompts.length, 2);
   });
 
+  it("offers the notice again when the system browser fails to open", async () => {
+    const h = harness({ launch: () => Promise.reject(new Error("no default browser")) });
+    h.report(true);
+    await h.wait();
+    h.prompts[0].choose("open-in-browser");
+    await flush();
+    assert.deepEqual(h.opened, [PAGE]);
+    assert.equal(h.prompts.length, 2);
+  });
+
   it("does not hand a different site to the system browser", async () => {
     const h = harness();
     h.report(true);
@@ -152,7 +165,33 @@ describe("security-key notice for embedded browser pages", () => {
     h.prompts[1].choose("suppressed");
     await flush();
     assert.equal(h.prompts.length, 2);
+    visible = true;
+    await h.wait();
+    assert.equal(h.prompts.length, 3);
     assert.deepEqual(h.opened, []);
+  });
+
+  it("shows once a hidden pane can prompt while the request still waits", async () => {
+    let visible = false;
+    const h = harness({ canPrompt: () => visible });
+    h.report(true);
+    await h.wait();
+    await h.wait();
+    assert.equal(h.prompts.length, 0);
+    visible = true;
+    await h.wait();
+    assert.equal(h.prompts.length, 1);
+  });
+
+  it("stops waiting for a hidden pane once the request settles", async () => {
+    let visible = false;
+    const h = harness({ canPrompt: () => visible });
+    h.report(true);
+    await h.wait();
+    h.report(false);
+    visible = true;
+    await h.wait();
+    assert.equal(h.prompts.length, 0);
   });
 
   for (const [name, options, frame] of [

@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { PENDING_CHANNEL } = require("../src/browserSecurityKeyNotice");
 
 const PRELOAD = fs.readFileSync(path.join(__dirname, "../src/browser_view_preload.js"), "utf8");
 
@@ -48,7 +49,7 @@ function loadObserver({ report } = {}) {
   );
   const pending = () =>
     sent
-      .filter(({ channel }) => channel === "omnigent:browser-webauthn-pending")
+      .filter(({ channel }) => channel === PENDING_CHANNEL)
       .map(({ args }) => args[0]);
   return { realm, pending };
 }
@@ -109,6 +110,10 @@ describe("embedded browser WebAuthn observer", () => {
     const { realm, pending } = loadObserver();
     for (const mediation of ["conditional", "silent", "immediate"]) {
       vm.runInContext(`credentials.get({ publicKey: {}, mediation: "${mediation}" })`, realm);
+      vm.runInContext(
+        `credentials.get(Object.assign(Object.create({ mediation: "${mediation}" }), { publicKey: {} }))`,
+        realm,
+      );
     }
     vm.runInContext("credentials.get({ password: true })", realm);
     vm.runInContext("credentials.get()", realm);
@@ -116,18 +121,21 @@ describe("embedded browser WebAuthn observer", () => {
     assert.deepEqual(pending(), []);
 
     vm.runInContext("credentials.get({ publicKey: {}, mediation: 'required' })", realm);
-    assert.deepEqual(pending(), [true]);
+    vm.runInContext("credentials.get(Object.create({ publicKey: {} }))", realm);
+    assert.deepEqual(pending(), [true, true]);
   });
 
   it("leaves accessor options, unreadable options and native errors to the page", () => {
     const { realm, pending } = loadObserver();
     const reads = vm.runInContext(
-      `const options = { reads: 0, get publicKey() { this.reads += 1; return {}; } };
+      `let reads = 0;
+      const options = { get publicKey() { reads += 1; return {}; } };
       credentials.get(options);
-      options.reads`,
+      credentials.get(Object.create(options));
+      reads`,
       realm,
     );
-    assert.equal(reads, 1, "only the native call runs page getters");
+    assert.equal(reads, 2, "only the native call runs page getters");
     const request = vm.runInContext(
       `credentials.get(new Proxy({ publicKey: {} }, {
         getOwnPropertyDescriptor() { throw new Error("trap"); },

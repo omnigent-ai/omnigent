@@ -4290,7 +4290,7 @@ function createBrowserRegistryForWindow(win) {
               getAnchorBounds: () => view.getBounds(),
               ...options,
             }),
-          openExternal: (url) => void shell.openExternal(url),
+          openExternal: (url) => shell.openExternal(url),
           cookieImport: process.platform === "darwin",
         });
       }
