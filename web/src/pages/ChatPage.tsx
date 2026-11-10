@@ -109,6 +109,7 @@ import {
   isStaleTempConvId,
   isTempConvId,
   joinReturnedParts,
+  restoredDraftTracker,
   retryConversationLoad,
   type ChatState,
   type PendingInitialPrompt,
@@ -3403,13 +3404,26 @@ function ComposerImpl(
     const parts = restoredSendDraft.returnedParts ?? [];
     const unread = joinReturnedParts(parts);
     if (unread.text !== "" || unread.files.length > 0) {
+      const kept = parts.find((part) => part.tempId === undefined)?.draft;
       if (parts.some((part) => part.tempId !== undefined)) {
         pendingFailedSendRestore.current = { draft };
         useChatStore.setState({
-          restoredSendDraft: { ...restoredSendDraft, ...unread, delivered: false },
+          restoredSendDraft: {
+            ...restoredSendDraft,
+            ...unread,
+            replyDraft: kept?.replyDraft,
+            delivered: false,
+          },
+        });
+      } else if (kept?.stableId) {
+        // Only the send the steers joined is left, so a retry reuses its id again.
+        pendingFailedSendRestore.current = { stableId: kept.stableId, draft };
+        useChatStore.setState({
+          restoredSendDraft: restoredDraftTracker(kept),
+          pendingRetryStableId: kept.stableId,
         });
       }
-      const recalled = recallComposerDraft(unread.text);
+      const recalled = recallComposerDraft(unread.text, kept?.replyDraft);
       replaceText(recalled.text, recalled.replyDraft);
       restoreTaggedMentionsRef.current({ files: [], sessions: recalled.sessions });
       attachmentsRef.current.replaceFiles(unread.files);

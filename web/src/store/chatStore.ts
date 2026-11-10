@@ -649,6 +649,8 @@ interface ReturnedPart {
   pendingId?: string;
   text: string;
   files: File[];
+  /** The waiting draft the steers joined, restored as it was once they are all read. */
+  draft?: NonNullable<ConversationState["failedSendDraft"]>;
 }
 
 /**
@@ -3019,13 +3021,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(acceptedPendingId
             ? updateReturnedParts(s, (parts) =>
                 parts.some((part) => part.tempId === tempId)
-                  ? parts.flatMap((part) =>
-                      part.tempId !== tempId
-                        ? [part]
-                        : readBeforeAnswer
-                          ? []
-                          : [{ ...part, pendingId: acceptedPendingId }],
-                    )
+                  ? parts.flatMap((part) => {
+                      if (part.tempId !== tempId) return [part];
+                      if (readBeforeAnswer) return [];
+                      return [{ ...part, pendingId: acceptedPendingId }];
+                    })
                   : null,
               )
             : {}),
@@ -3374,15 +3374,31 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       });
       // What was queued behind it must not go first; it waits for an explicit retry.
       suspendQueuedMessages(sessionId);
-      // A local follow-up must not prevent Interrupt from stopping earlier work.
-      if (
-        state.activeResponse?.state !== "streaming" &&
-        state.sessionStatus !== "running" &&
-        state.sessionStatus !== "waiting" &&
-        state.backgroundTaskCount === 0
-      )
-        return;
     }
+    if (steers.length > 0) {
+      setActive((s) => {
+        if (s.conversationId !== sessionId) return {};
+        // The composer keeps newer input as it is; the steers go after it.
+        const waiting = s.failedSendDraft;
+        const kept =
+          newerDraft || (waiting && committedItemProvesDelivery(s.blocks, waiting))
+            ? null
+            : waiting;
+        return { failedSendDraft: withReturnedSteers(kept, sessionId, steers) };
+      });
+      for (const steer of steers) {
+        if (steer.posted !== true) stopReturnedSends.set(steer.tempId, new Set());
+      }
+    }
+    // A local follow-up must not prevent Interrupt from stopping earlier work.
+    if (
+      initialDraft &&
+      state.activeResponse?.state !== "streaming" &&
+      state.sessionStatus !== "running" &&
+      state.sessionStatus !== "waiting" &&
+      state.backgroundTaskCount === 0
+    )
+      return;
     if (isTempConvId(sessionId)) return;
     // Fire-and-forget interrupt; the server emits session.interrupted
     // + response.incomplete on the open stream, which the pump
@@ -3411,14 +3427,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           state: "cancelled",
           error: null,
         };
-      }
-      if (steers.length > 0) {
-        // The composer keeps newer input as it is; the steers go after it.
-        const kept = newerDraft ? null : s.failedSendDraft;
-        patch.failedSendDraft = withReturnedSteers(kept, sessionId, steers);
-        for (const steer of steers) {
-          if (steer.posted !== true) stopReturnedSends.set(steer.tempId, new Set());
-        }
       }
       return patch;
     });
@@ -8046,18 +8054,25 @@ export function takeFailedSendDraft(
   if (!delivered) patch.pendingRetryStableId = tracked ? (failed.stableId ?? null) : null;
   // A discarded failure must not untrack an earlier draft still in the composer.
   if (tracked && (failed.stableId || failed.returnedParts))
-    patch.restoredSendDraft = {
-      conversationId,
-      stableId: failed.stableId,
-      returnedParts: failed.returnedParts,
-      text: failed.text,
-      files: failed.files,
-      replyDraft: failed.replyDraft,
-      serverRefused: failed.serverRefused,
-      delivered: false,
-    };
+    patch.restoredSendDraft = restoredDraftTracker(failed);
   setterFor(conversationId)(patch);
   return restore ? failed : null;
+}
+
+/** What the composer tracks while it holds `draft` as restored. */
+export function restoredDraftTracker(
+  draft: NonNullable<ConversationState["failedSendDraft"]>,
+): NonNullable<ConversationState["restoredSendDraft"]> {
+  return {
+    conversationId: draft.conversationId,
+    stableId: draft.stableId,
+    returnedParts: draft.returnedParts,
+    text: draft.text,
+    files: draft.files,
+    replyDraft: draft.replyDraft,
+    serverRefused: draft.serverRefused,
+    delivered: false,
+  };
 }
 
 /**
@@ -8104,6 +8119,14 @@ function retractDeliveredSendDraft(
   ) {
     patch.restoredSendDraft = { ...s.restoredSendDraft, delivered: true };
   }
+  // A send that Stop merged steers into keeps its own id; delivery drops its part.
+  Object.assign(
+    patch,
+    updateReturnedParts({ ...s, ...patch }, (parts) => {
+      const left = parts.filter((part) => !delivered(part.draft ?? null));
+      return left.length < parts.length ? left : null;
+    }),
+  );
   // The retry id belongs to the restored draft it came from, so a refused
   // send keeps it: an untouched resend must still dedupe against the item.
   const retryId = s.pendingRetryStableId;
@@ -8147,10 +8170,16 @@ export function joinReturnedParts(parts: readonly ReturnedPart[]): { text: strin
   };
 }
 
+/** The draft waiting for the composer that Stop added steers to, if any. */
+function keptDraft(parts: readonly ReturnedPart[]) {
+  return parts.find((part) => part.tempId === undefined)?.draft;
+}
+
 /**
  * The draft Stop hands back for interrupted steers, after any draft still
  * waiting for the composer. It has no stable id: the server would dedupe a
  * resend against the original send, and the agent may still read some steers.
+ * The waiting draft keeps its own id and reply context on its part.
  *
  * @param kept - The draft to keep ahead of the steers, if any.
  * @param conversationId - The session being stopped.
@@ -8163,7 +8192,7 @@ function withReturnedSteers(
   steers: readonly PendingUserMessage[],
 ): NonNullable<ConversationState["failedSendDraft"]> {
   const parts: ReturnedPart[] = [
-    ...(kept ? (kept.returnedParts ?? [{ text: kept.text, files: kept.files }]) : []),
+    ...(kept ? (kept.returnedParts ?? [{ text: kept.text, files: kept.files, draft: kept }]) : []),
     ...steers.map((p) => ({
       tempId: p.tempId,
       ...(p.pendingId ? { pendingId: p.pendingId } : {}),
@@ -8175,6 +8204,7 @@ function withReturnedSteers(
     conversationId,
     ...joinReturnedParts(parts),
     returnedParts: parts,
+    replyDraft: keptDraft(parts)?.replyDraft,
     serverRefused: false,
     recovered: true,
   };
@@ -8199,14 +8229,14 @@ function updateReturnedParts(
   const failedParts = failed?.returnedParts && update(failed.returnedParts);
   if (failed && failedParts) {
     const unread = failedParts.some((part) => part.tempId !== undefined);
-    patch.failedSendDraft =
-      failedParts.length === 0
-        ? null
-        : {
-            ...failed,
-            ...joinReturnedParts(failedParts),
-            returnedParts: unread ? failedParts : undefined,
-          };
+    patch.failedSendDraft = unread
+      ? {
+          ...failed,
+          ...joinReturnedParts(failedParts),
+          returnedParts: failedParts,
+          replyDraft: keptDraft(failedParts)?.replyDraft,
+        }
+      : (keptDraft(failedParts) ?? null);
   }
   const restored = s.restoredSendDraft;
   const shown = restored?.returnedParts;
@@ -9338,9 +9368,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           committedIds,
           content === null ? [] : [messageContentText(content)],
         );
+        const retracted = retractDeliveredSendDraft(s, committedIds, "consumed");
         return {
-          ...retractDeliveredSendDraft(s, committedIds, "consumed"),
-          ...updateReturnedParts(s, (parts) => {
+          ...retracted,
+          ...updateReturnedParts({ ...s, ...retracted }, (parts) => {
             const unread = parts.filter((part) => part.pendingId !== readId);
             return readId && unread.length < parts.length ? unread : null;
           }),

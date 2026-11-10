@@ -5816,43 +5816,64 @@ describe("Composer reply quotes", () => {
     expect(getSessionDraft("conv_test")).toBeUndefined();
   });
 
-  it("drops each steer returned by Stop from the composer once the agent reads it", () => {
-    const read = (pendingId: string, text: string) =>
+  it.each([
+    { ahead: "nothing", kept: undefined },
+    {
+      ahead: "a failed send",
+      kept: { conversationId: "conv_test", text: "failed", files: [], stableId: "9".repeat(32) },
+    },
+  ])(
+    "drops each steer returned by Stop from the composer once the agent reads it, after $ahead",
+    ({ kept }) => {
+      const read = (itemId: string, text: string, clearedPendingId?: string) =>
+        act(() =>
+          handleSessionEvent({
+            type: "session_input_consumed",
+            itemId,
+            itemType: "message",
+            clearedPendingId,
+            data: { role: "user", content: [{ type: "input_text", text }] },
+          }),
+        );
+      const lead = kept ? `${kept.text}\n\n` : "";
+      render(<Composer {...composerProps()} />);
       act(() =>
-        handleSessionEvent({
-          type: "session_input_consumed",
-          itemId: `item_${pendingId}`,
-          itemType: "message",
-          clearedPendingId: pendingId,
-          data: { role: "user", content: [{ type: "input_text", text }] },
+        useChatStore.setState({
+          failedSendDraft: {
+            conversationId: "conv_test",
+            text: `${lead}change of plan\n\nand this`,
+            files: [],
+            returnedParts: [
+              ...(kept ? [{ text: kept.text, files: [], draft: kept }] : []),
+              { tempId: "pend_1", pendingId: "pending_1", text: "change of plan", files: [] },
+              { tempId: "pend_2", pendingId: "pending_2", text: "and this", files: [] },
+            ],
+            recovered: true,
+          },
         }),
       );
-    render(<Composer {...composerProps()} />);
-    act(() =>
-      useChatStore.setState({
-        failedSendDraft: {
-          conversationId: "conv_test",
-          text: "change of plan\n\nand this",
-          files: [],
-          returnedParts: [
-            { tempId: "pend_1", pendingId: "pending_1", text: "change of plan", files: [] },
-            { tempId: "pend_2", pendingId: "pending_2", text: "and this", files: [] },
-          ],
-          recovered: true,
-        },
-      }),
-    );
-    expect(textarea()).toHaveValue("change of plan\n\nand this");
+      expect(textarea()).toHaveValue(`${lead}change of plan\n\nand this`);
 
-    read("pending_1", "change of plan");
-    expect(textarea()).toHaveValue("and this");
-    expect(useChatStore.getState().restoredSendDraft).toMatchObject({ delivered: false });
+      read("item_1", "change of plan", "pending_1");
+      expect(textarea()).toHaveValue(`${lead}and this`);
+      expect(useChatStore.getState().restoredSendDraft).toMatchObject({ delivered: false });
 
-    read("pending_2", "and this");
-    expect(textarea()).toHaveValue("");
-    expect(useChatStore.getState().restoredSendDraft).toBeNull();
-    expect(getSessionDraft("conv_test")).toBeUndefined();
-  });
+      read("item_2", "and this", "pending_2");
+      if (kept) {
+        // Only the failed send is left; an untouched retry reuses its id.
+        expect(textarea()).toHaveValue(kept.text);
+        expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+          stableId: kept.stableId,
+          delivered: false,
+        });
+        expect(useChatStore.getState().pendingRetryStableId).toBe(kept.stableId);
+        read(kept.stableId, kept.text);
+      }
+      expect(textarea()).toHaveValue("");
+      expect(useChatStore.getState().restoredSendDraft).toBeNull();
+      expect(getSessionDraft("conv_test")).toBeUndefined();
+    },
+  );
 
   it.each([
     { identity: "its stable id", stableId: "8".repeat(32), clearedPendingId: undefined },
