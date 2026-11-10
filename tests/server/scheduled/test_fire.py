@@ -4226,6 +4226,8 @@ async def test_a_run_starts_from_a_copy_of_the_source_session() -> None:
     )
     # The run rebuilds its native transcript from its own copy, never another session's file.
     assert fork["resume_source_native_session"] is False
+    # It plans its own work: the source's journal stays behind.
+    assert fork["copy_journal"] is False
     assert {
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
         FORK_SOURCE_LABEL_KEY,

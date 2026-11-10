@@ -1996,6 +1996,9 @@ async def _copy_source_session_for_run(
             copy_model_settings=False,
             # The copy's provider binding belongs to its agent; another agent resolves its own.
             copy_inference_snapshot=not agent_changed,
+            # The run plans and tracks its own work, as a run in a new session
+            # does; its copied history still shows the source's plan.
+            copy_journal=False,
             terminal_launch_args=launch_args,
             override_terminal_launch_args=True,
         )

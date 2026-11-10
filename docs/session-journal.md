@@ -11,7 +11,8 @@ Each entry has an ID, a position (0, 1, 2, … within the session), the time it
 was appended, the automation run the session was serving (if any), and an
 optional plan step. Entries are never edited, and are deleted only with their
 session. A fork carries the journal its history wrote: all of it, or up to where a fork
-from an earlier message cuts the history. A side chat starts with none.
+from an earlier message cuts the history. A side chat starts with none, and so
+does a run of an automation that starts from a session.
 
 | Kind     | Written by | Fields                                                                       |
 | -------- | ---------- | ---------------------------------------------------------------------------- |
@@ -89,7 +90,9 @@ An automation's prompt asks the agent to read its journal first, write a plan if
 the session has none, and write a status for each step it worked on before its
 final reply. Before each run's prompt, Omnigent labels the session with the run
 (`omnigent.scheduled_task_run`), so the entries written during the run carry its
-ID. See [Automations](AUTOMATIONS.md).
+ID. A run of an automation that starts from a session copies the session's
+history but not its journal, so the run plans its own work. See
+[Automations](AUTOMATIONS.md).
 
 ## Tasks
 
