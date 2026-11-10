@@ -125,6 +125,19 @@ _logger = logging.getLogger(__name__)
 _INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
     "claude_native_injection_cancel_event", default=None
 )
+
+
+@dataclass
+class _InjectionOwner:
+    bridge_dir: Path
+    session_id: str
+    user_input: bool
+    input_started: bool = False
+
+
+_INJECTION_OWNER: ContextVar[_InjectionOwner | None] = ContextVar(
+    "claude_native_injection_owner", default=None
+)
 _INJECTION_LOCKS_GUARD = threading.Lock()
 _INJECTION_LOCKS: dict[str, threading.Lock] = {}
 _INJECTION_LOCK_POLL_INTERVAL_S = 0.1
@@ -747,6 +760,19 @@ class ClaudeMessageNotAccepted(RuntimeError):
     """The submitted draft remained in Claude's input box until the deadline."""
 
 
+class ClaudeSessionChanged(RuntimeError):
+    """The bridge changed conversations while its delivery worker was running."""
+
+    def __init__(self, *, input_started: bool) -> None:
+        detail = (
+            "Delivery could not be confirmed; inspect the original conversation before retrying."
+            if input_started
+            else "The message was not delivered; open the latest conversation and retry."
+        )
+        super().__init__(f"Claude native conversation changed during message delivery. {detail}")
+        self.undelivered = not input_started
+
+
 class ClaudeComposerNotCleared(ClaudeMessageNotAccepted):
     """A draft left in Claude's input box could not be cleared, so nothing was sent."""
 
@@ -756,12 +782,24 @@ class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
 
 
 @contextlib.contextmanager
-def cancellable_injection(cancel_event: threading.Event) -> Iterator[None]:
-    """Bind a cancellation flag inherited by this delivery's ``asyncio.to_thread`` worker."""
+def cancellable_injection(
+    cancel_event: threading.Event,
+    *,
+    bridge_dir: Path | None = None,
+    request_session_id: str | None = None,
+    user_input: bool = True,
+) -> Iterator[None]:
+    """Bind cancellation and conversation ownership for this delivery's thread worker."""
     token = _INJECTION_CANCEL_EVENT.set(cancel_event)
+    owner_token = _INJECTION_OWNER.set(
+        _InjectionOwner(bridge_dir, request_session_id, user_input)
+        if bridge_dir is not None and request_session_id is not None
+        else None
+    )
     try:
         yield
     finally:
+        _INJECTION_OWNER.reset(owner_token)
         _INJECTION_CANCEL_EVENT.reset(token)
 
 
@@ -769,6 +807,11 @@ def _check_injection_cancelled() -> None:
     cancel_event = _INJECTION_CANCEL_EVENT.get()
     if cancel_event is not None and cancel_event.is_set():
         raise ClaudeInjectionCancelled("Claude Code message delivery was cancelled")
+    owner = _INJECTION_OWNER.get()
+    if owner is not None:
+        active_session_id = read_active_session_id(owner.bridge_dir)
+        if active_session_id is not None and active_session_id != owner.session_id:
+            raise ClaudeSessionChanged(input_started=owner.input_started)
 
 
 class TmuxSessionNotAdvertised(RuntimeError):
@@ -6044,10 +6087,29 @@ def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) 
     :raises RuntimeError: If the subprocess exits non-zero or times
         out.
     """
+    owner = _INJECTION_OWNER.get()
+    lock = (
+        _bridge_metadata_write_lock(owner.bridge_dir)
+        if owner is not None
+        else contextlib.nullcontext()
+    )
+    with lock:
+        _invoke_tmux(socket_path, *args, allow_missing_target=allow_missing_target)
+
+
+def _invoke_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) -> None:
+    """Check the delivery owner under its metadata lock before issuing a tmux command."""
     import subprocess
 
     _check_injection_cancelled()
     operation = args[0] if args else ""
+    owner = _INJECTION_OWNER.get()
+    if (
+        owner is not None
+        and owner.user_input
+        and (operation == "paste-buffer" or (operation == "send-keys" and "-l" in args))
+    ):
+        owner.input_started = True
     if operation == "send-keys" and "-t" in args:
         target = args[args.index("-t") + 1]
         args = ("copy-mode", "-q", "-t", target, ";", *args)

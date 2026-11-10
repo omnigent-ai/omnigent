@@ -2189,11 +2189,13 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("delivery", ["message", "steering", "model"])
 @pytest.mark.parametrize("watchdog", [False, True])
+@pytest.mark.parametrize("cleared", [False, True])
 async def test_cancelled_delivery_drains_worker_before_unlocking(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     delivery: str,
     watchdog: bool,
+    cleared: bool,
 ) -> None:
     started = threading.Event()
     release = threading.Event()
@@ -2227,6 +2229,10 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
     monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
     monkeypatch.setattr(claude_native_executor, "inject_slash_command", inject)
     monkeypatch.setattr(claude_native_executor, "kill_session", reap)
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "bridge.json").write_text('{"active_session_id": "conv_old"}')
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_old")
     executor = ClaudeNativeExecutor(tmp_path / "bridge")
     monkeypatch.setattr(
         executor, "_model_command_arg", lambda model: "sonnet" if delivery == "model" else None
@@ -2259,6 +2265,8 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
             task.cancel()
             await asyncio.sleep(0)
             assert not task.done()
+        if cleared:
+            (bridge_dir / "bridge.json").write_text('{"active_session_id": "conv_new"}')
         release.set()
         await asyncio.wait({task}, timeout=2)
         assert task.done(), "cancelled delivery did not finish after its capture was released"
@@ -2266,7 +2274,7 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
             task.result()
         assert finished.is_set()
         assert not executor._inject_lock.locked()
-        assert reaped == [tmp_path / "bridge"]
+        assert reaped == ([] if cleared else [bridge_dir])
         assert commands == []
     finally:
         release.set()
@@ -2275,6 +2283,56 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
         await asyncio.wait({task})
         with contextlib.suppress(asyncio.CancelledError, TimeoutError):
             task.result()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleared_after_paste", [False, True])
+@pytest.mark.parametrize("delivery", ["message", "model"])
+async def test_active_delivery_worker_stops_after_conversation_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cleared_after_paste: bool, delivery: str
+) -> None:
+    """A clear during readiness or after paste must prevent any later submit."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    active_session = bridge_dir / "bridge.json"
+    active_session.write_text('{"active_session_id": "conv_old"}')
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_old")
+    commands: list[list[str]] = []
+
+    def capture(*_args: str) -> str:
+        if not cleared_after_paste:
+            active_session.write_text('{"active_session_id": "conv_new"}')
+        return "────────────────\n❯ \n────────────────\n"
+
+    def run(command: list[str], **_kwargs: Any) -> Any:
+        commands.append(command)
+        active_session.write_text('{"active_session_id": "conv_new"}')
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def inject(*_args: Any, **_kwargs: Any) -> None:
+        claude_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=30)
+        claude_bridge._run_tmux("/tmp/sock", "send-keys", "-l", "-t", "main", "hello")
+        claude_bridge._run_tmux("/tmp/sock", "send-keys", "-t", "main", "Enter")
+
+    monkeypatch.setattr(claude_bridge, "_capture_pane", capture)
+    monkeypatch.setattr("subprocess.run", run)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", inject)
+    executor = ClaudeNativeExecutor(bridge_dir)
+    monkeypatch.setattr(
+        executor, "_model_command_arg", lambda _model: "sonnet" if delivery == "model" else None
+    )
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hello"}], tools=[], system_prompt=""
+        )
+    ]
+
+    assert len(commands) == int(cleared_after_paste)
+    assert all(command[-1] != "Enter" for command in commands)
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].undelivered is (not cleared_after_paste or delivery == "model")
 
 
 @pytest.mark.asyncio
