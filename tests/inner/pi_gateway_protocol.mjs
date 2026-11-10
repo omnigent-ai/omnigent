@@ -209,6 +209,74 @@ const normalized = await options.fetch("unused");
 await normalized.body.cancel();
 await new Promise((resolve) => setImmediate(resolve));
 assert.equal(cancelled, true);
+const parameters = {
+  type: "object",
+  properties: {
+    optional: { type: ["string", "null"], description: "Optional text" },
+    choice: { type: ["integer", "string"] },
+    samples: {
+      type: "array",
+      items: {
+        type: "number",
+        minimum: 0,
+        exclusiveMaximum: 10,
+        multipleOf: 0.5,
+      },
+    },
+    multipleOf: { type: "number", maximum: 100, exclusiveMinimum: 0 },
+    nested: {
+      anyOf: [
+        { type: "object", properties: { type: { type: ["boolean", "null"] } } },
+      ],
+    },
+  },
+  required: ["choice", "samples"],
+};
+const schemaPayload = {
+  messages: [],
+  tools: [{ type: "function", function: { name: "sample", parameters } }],
+};
+const originalPayload = structuredClone(schemaPayload);
+const compatibleParameters = {
+  type: "object",
+  properties: {
+    optional: { type: "string", nullable: true, description: "Optional text" },
+    choice: { anyOf: [{ type: "integer" }, { type: "string" }] },
+    samples: { type: "array", items: { type: "number", minimum: 0 } },
+    multipleOf: { type: "number", maximum: 100 },
+    nested: {
+      anyOf: [
+        {
+          type: "object",
+          properties: { type: { type: "boolean", nullable: true } },
+        },
+      ],
+    },
+  },
+  required: ["choice", "samples"],
+};
+for (const id of [
+  "system.ai.gemini-3-8-flash",
+  "databricks-gemini-4-argon",
+  "gpt-6",
+]) {
+  createStream((_model, _context, received) => {
+    options = received;
+    return {};
+  })({ ...model, id }, { messages: [] }, { onPayload: () => schemaPayload });
+  const outgoing = await options.onPayload({ messages: [], tools: [] });
+  assert.deepEqual(
+    outgoing.tools[0].function.parameters,
+    id.includes("gemini") ? compatibleParameters : parameters,
+  );
+  assert.equal(outgoing.tools[0].function.name, "sample");
+  assert.deepEqual(outgoing.messages, []);
+}
+assert.deepEqual(
+  schemaPayload,
+  originalPayload,
+  "wire adaptation must not change tool validation",
+);
 console.log(
   "fragmentation, signatures, call identities, callbacks, errors and cancellation passed",
 );
