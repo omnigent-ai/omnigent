@@ -3394,6 +3394,42 @@ describe("automation trigger type", () => {
       expect(triggerPromptSource(input.prompt)).toBe("jira");
       expect(input).toMatchObject({ sessionId: null });
     });
+
+    it("keeps a source's prompt-editor draft when switching away and back", async () => {
+      render(dialog({ editingTask: slackTask }));
+      await choose("GitHub");
+      type("task-trigger-scope", "acme/app");
+      fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
+      fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
+      fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+      const editor = screen.getByRole("textbox", { name: "System prompt" });
+      fireEvent.change(editor, {
+        target: { value: `${(editor as HTMLTextAreaElement).value}\nSkip draft pull requests.` },
+      });
+      await choose("Linear");
+      expect(screen.getByTestId("task-trigger-scope")).toHaveValue("");
+      await choose("GitHub");
+      expect(screen.queryByTestId("task-trigger-fields")).not.toBeInTheDocument();
+      expect(screen.getByTestId("task-prompt-input")).toHaveValue("Answer the question.");
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const input = updateMutateAsync.mock.calls[0][0].input;
+      expect(triggerPromptSource(input.prompt)).toBe("github");
+      expect(input.prompt).toContain("acme/app");
+      expect(input.prompt).toContain("Skip draft pull requests.");
+      expect(input).toMatchObject({ sessionId: null });
+    });
+
+    it("asks for instructions again when the saved prompt can't be split", async () => {
+      const unsplitPrompt = `${slackPrompt}\n\nInstructions for each session:\nAlso thank them.`;
+      expect(splitTriggerPrompt(unsplitPrompt).systemPrompt).toBeNull();
+      render(dialog({ editingTask: { ...slackTask, prompt: unsplitPrompt } }));
+      await choose("Jira");
+      expect(screen.getByTestId("task-trigger-instructions")).toHaveValue("");
+      expect(screen.getByTestId("task-trigger-type-note")).toHaveTextContent(
+        "The saved instructions can't be separated from the Slack rules, so enter them again.",
+      );
+    });
   });
 });
 

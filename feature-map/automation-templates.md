@@ -59,11 +59,12 @@ to customize.
   bounded read-only preview when expanded; use Edit automation to change it.
 - `source-switching`: editing a recognized trigger shows Trigger type with the
   five integrations (not Schedule). Picking another one opens that integration's
-  form with the instructions and Harness for matching sessions carried over and
-  empty conditions; a default name follows the source, a custom name is kept.
-  Each integration's draft survives switching back and forth, and switching back
-  to the saved source restores its prompt. A note warns that saving replaces the
-  old trigger, and the save starts a new polling session.
+  form with the instructions, Harness for matching sessions, and worker placement
+  carried over and empty conditions; a default name follows the source, a custom
+  name is kept. Each integration's draft, including an Edit as prompt draft,
+  survives switching back and forth, and switching back to the saved source
+  restores its prompt. A note warns that saving replaces the old trigger, and the
+  save always starts a new polling session (the reset checkbox is locked on).
 - `default-project`: new automations select Omnigent Automation. Saving reuses or
   creates that project; canceling creates nothing. The project picker can choose
   another project or remove the default. Editing preserves the saved project.

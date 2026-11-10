@@ -183,6 +183,12 @@ function TriggerTypeSelect<Type extends AutomationTriggerType>({
   );
 }
 
+/** A source's draft while editing a trigger: its fields, and its prompt editor once edited as a prompt. */
+interface EditSourceDraft {
+  fields: TriggerFields;
+  promptEditor: { prompt: string; systemPrompt: string | null } | null;
+}
+
 /** Restore a saved trigger prompt, applying worker settings changed while switched away. */
 function restoreSourcePrompt(
   userPrompt: string,
@@ -487,14 +493,15 @@ export function CreateScheduledTaskDialog({
   const [triggerFields, setTriggerFields] = useState<TriggerFields>(() =>
     emptyTriggerFields("jira"),
   );
-  // Editing a trigger under another source: the saved prompt editor to restore,
-  // each source's fields, and the worker settings carried into the new prompt.
-  const savedSourcePrompt = useRef<{
-    prompt: string;
-    systemPrompt: string | null;
-    startNewSession: boolean;
+  // Editing a trigger under another source: the source shown, the saved prompt editor to
+  // restore, each source's draft, and the worker settings carried into the new prompt.
+  const [sourceSwitch, setSourceSwitch] = useState<{
+    source: TriggerSource;
+    savedPrompt: string;
+    savedSystemPrompt: string | null;
+    savedStartNewSession: boolean;
   } | null>(null);
-  const editSourceDrafts = useRef<Partial<Record<TriggerSource, TriggerFields>>>({});
+  const editSourceDrafts = useRef<Partial<Record<TriggerSource, EditSourceDraft>>>({});
   const [switchedWorkerSettings, setSwitchedWorkerSettings] =
     useState<TriggerWorkerSettings | null>(null);
   const [switchedWorkerPlacement, setSwitchedWorkerPlacement] =
@@ -523,7 +530,7 @@ export function CreateScheduledTaskDialog({
   useEffect(() => {
     if (open && !wasOpen.current) {
       typeDrafts.current = {};
-      savedSourcePrompt.current = null;
+      setSourceSwitch(null);
       editSourceDrafts.current = {};
       setSwitchedWorkerSettings(null);
       setSwitchedWorkerPlacement(null);
@@ -1009,19 +1016,28 @@ export function CreateScheduledTaskDialog({
 
   // The source an edited trigger watches now: its open form, or its prompt's opening line.
   const editedTriggerSource =
-    trigger ?? triggerPromptSource(effectivePrompt) ?? editingTriggerSource;
+    editingTriggerSource === null
+      ? null
+      : (trigger ?? sourceSwitch?.source ?? editingTriggerSource);
   // The polling session's state tracks the saved source's items, so a switch always resets it.
-  const triggerSourceSwitched =
-    editingTriggerSource !== null && editedTriggerSource !== editingTriggerSource;
+  const triggerSourceSwitched = sourceSwitch !== null;
 
   /** Edit only: watch another integration, or restore the saved prompt for the original one. */
   function handleEditTriggerSourceChange(next: TriggerSource) {
     if (editingTriggerSource === null || editedTriggerSource === null) return;
     if (next === editedTriggerSource) return;
-    if (savedSourcePrompt.current === null) {
-      savedSourcePrompt.current = { prompt, systemPrompt, startNewSession };
+    const saved = sourceSwitch ?? {
+      source: editingTriggerSource,
+      savedPrompt: prompt,
+      savedSystemPrompt: systemPrompt,
+      savedStartNewSession: startNewSession,
+    };
+    if (sourceSwitch !== null) {
+      editSourceDrafts.current[editedTriggerSource] = {
+        fields: triggerFields,
+        promptEditor: trigger === null ? { prompt, systemPrompt } : null,
+      };
     }
-    if (trigger !== null) editSourceDrafts.current[trigger] = triggerFields;
     // A split template prompt's user part is the instructions for each session.
     let instructions = "";
     if (trigger !== null) instructions = triggerFields.instructions;
@@ -1029,29 +1045,34 @@ export function CreateScheduledTaskDialog({
     if (name === TRIGGER_TEMPLATES[editedTriggerSource].name) {
       setName(TRIGGER_TEMPLATES[next].name);
     }
-    if (next === editingTriggerSource) {
-      const saved = savedSourcePrompt.current;
-      savedSourcePrompt.current = null;
+    const draft = next === editingTriggerSource ? null : editSourceDrafts.current[next];
+    const promptEditor =
+      next === editingTriggerSource
+        ? { prompt: saved.savedPrompt, systemPrompt: saved.savedSystemPrompt }
+        : draft?.promptEditor;
+    if (promptEditor) {
       const restored = restoreSourcePrompt(
-        saved.systemPrompt !== null && instructions.trim() !== "" ? instructions : saved.prompt,
-        saved.systemPrompt,
-        trigger !== null ? switchedWorkerSettings : null,
+        promptEditor.systemPrompt !== null && instructions.trim() !== ""
+          ? instructions
+          : promptEditor.prompt,
+        promptEditor.systemPrompt,
+        workerSettings,
       );
       setPrompt(restored.userPrompt);
       setSystemPrompt(restored.systemPrompt);
-      setStartNewSession(saved.startNewSession);
       setTrigger(null);
     } else {
-      if (trigger === null) {
-        setSwitchedWorkerSettings(workerSettings);
-        setSwitchedWorkerPlacement(workerPlacement);
-      }
-      setTriggerFields({
-        ...(editSourceDrafts.current[next] ?? emptyTriggerFields(next)),
-        instructions,
-      });
       setTrigger(next);
+    }
+    setSwitchedWorkerSettings(workerSettings);
+    setSwitchedWorkerPlacement(workerPlacement);
+    if (next === editingTriggerSource) {
+      setStartNewSession(saved.savedStartNewSession);
+      setSourceSwitch(null);
+    } else {
+      setTriggerFields({ ...(draft?.fields ?? emptyTriggerFields(next)), instructions });
       setStartNewSession(true);
+      setSourceSwitch({ ...saved, source: next });
     }
     setSystemPromptOpen(false);
     setEditingSystemPrompt(false);
@@ -1290,6 +1311,10 @@ export function CreateScheduledTaskDialog({
                   Saving replaces the {triggerServiceName(editingTriggerSource)} trigger. The next
                   run starts a new polling session that watches{" "}
                   {triggerServiceName(editedTriggerSource)}.
+                  {sourceSwitch?.savedSystemPrompt === null &&
+                    ` The saved instructions can't be separated from the ${triggerServiceName(
+                      editingTriggerSource,
+                    )} rules, so enter them again.`}
                 </p>
               )}
             </TriggerTypeSelect>
