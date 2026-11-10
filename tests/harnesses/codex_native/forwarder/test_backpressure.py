@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import functools
 import json
 from collections.abc import Callable, Coroutine
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 from omnigent.harnesses.codex_native import forwarder as fwd
 from omnigent.harnesses.codex_native.bridge import (
@@ -18,6 +20,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     write_bridge_state,
 )
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from tests._helpers.polling import poll_until_async
 from tests.harnesses.codex_native.forwarder._support import (
     _posted_cumulative_tokens,
@@ -50,11 +53,13 @@ class _StreamingCodexClient:
         self.queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         self.emitted_at: dict[str, float] = {}
         self.responses: list[tuple[int | str, dict[str, Any]]] = []
+        self.requests: list[tuple[str, dict[str, Any]]] = []
 
     async def connect(self) -> None:
         return None
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        self.requests.append((method, params))
         return {"result": {"thread": {"id": params.get("threadId", _PARENT_THREAD), "turns": []}}}
 
     def is_subscribed_to_thread(self, _thread_id: str) -> bool:
@@ -184,6 +189,200 @@ def _child_tool_items(
         and body.get("type") == "external_conversation_item"
         and body["data"].get("item_type") in {"function_call", "function_call_output"}
     ]
+
+
+@pytest.mark.parametrize("newer_input", [False, True], ids=["quiet", "newer-input"])
+async def test_user_mirror_recovers_after_auth_without_resubmitting_native_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, newer_input: bool
+) -> None:
+    """Recover the original mirror before later messages, without another native send."""
+    _write_parent_bridge(tmp_path)
+    codex = _StreamingCodexClient()
+    credentials_valid = False
+    rejected = asyncio.Event()
+    received = asyncio.Event()
+    accepted: list[dict[str, Any]] = []
+    expected_sources = [f"{_PARENT_THREAD}:{_PARENT_TURN}:user_first"]
+    if newer_input:
+        expected_sources.append(f"{_PARENT_THREAD}:{_PARENT_TURN}:user_second")
+    monkeypatch.setattr(fwd, "_LIVE_MIRROR_RETRY_BASE_SECONDS", 0.01, raising=False)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        if body.get("type") == "external_conversation_item":
+            if not credentials_valid:
+                rejected.set()
+                raise DatabricksAuthError("synthetic credential outage")
+            accepted.append(body["data"])
+            if len(accepted) == len(expected_sources):
+                received.set()
+        return httpx.Response(200, json={}, request=request)
+
+    forwarder = _start_forwarder(tmp_path, codex, handler)
+    try:
+        codex.emit(
+            _event(
+                "item/completed",
+                _PARENT_THREAD,
+                _PARENT_TURN,
+                item={
+                    "type": "userMessage",
+                    "id": "user_first",
+                    "clientId": "a" * 32,
+                    "content": [{"type": "text", "text": "first input"}],
+                },
+            )
+        )
+        await asyncio.wait_for(rejected.wait(), timeout=2)
+        await poll_until_async(lambda: (tmp_path / "dead_letter.jsonl").exists(), timeout_s=2)
+        credentials_valid = True
+        if newer_input:
+            codex.emit(
+                _event(
+                    "item/completed",
+                    _PARENT_THREAD,
+                    _PARENT_TURN,
+                    item={
+                        "type": "userMessage",
+                        "id": "user_second",
+                        "clientId": "b" * 32,
+                        "content": [{"type": "text", "text": "second input"}],
+                    },
+                )
+            )
+        await asyncio.wait_for(received.wait(), timeout=3)
+        await poll_until_async(lambda: not (tmp_path / "dead_letter.jsonl").exists(), timeout_s=2)
+    finally:
+        codex.queue.put_nowait(None)
+        await asyncio.wait_for(forwarder, timeout=5)
+
+    assert [item["source_id"] for item in accepted] == expected_sources
+    assert [item["item_data"]["content"] for item in accepted] == [
+        [{"type": "input_text", "text": text}]
+        for text in (["first input", "second input"] if newer_input else ["first input"])
+    ]
+    assert all(method not in {"turn/start", "turn/steer"} for method, _ in codex.requests)
+
+
+@pytest.mark.parametrize(
+    "repair_journal_first", [False, True], ids=["auth-first", "journal-first"]
+)
+async def test_quiet_native_user_mirror_survives_auth_and_journal_capacity_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repair_journal_first: bool
+) -> None:
+    """A quiet accepted input remains owned until server auth or journal storage recovers."""
+    _write_parent_bridge(tmp_path)
+    codex = _StreamingCodexClient()
+    monkeypatch.setattr(fwd, "_LIVE_MIRROR_RETRY_BASE_SECONDS", 0.01)
+    credentials_valid = False
+    storage_writable = False
+    rejected = asyncio.Event()
+    received = asyncio.Event()
+    accepted: list[dict[str, Any]] = []
+    journal = tmp_path / "dead_letter.jsonl"
+    original_open = Path.open
+    failed_appends = 0
+
+    def full_journal(path, mode="r", *args, **kwargs):
+        nonlocal failed_appends
+        if path == journal and "a" in mode and not storage_writable:
+            failed_appends += 1
+            raise OSError(errno.ENOSPC, "synthetic journal full")
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", full_journal)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        if body.get("type") == "external_conversation_item":
+            assert body["data"]["source_id"] == f"{_PARENT_THREAD}:{_PARENT_TURN}:user_capacity"
+            if not credentials_valid:
+                rejected.set()
+                raise DatabricksAuthError("synthetic credential outage")
+            accepted.append(body["data"])
+            received.set()
+        return httpx.Response(200, json={}, request=request)
+
+    forwarder = _start_forwarder(tmp_path, codex, handler)
+    try:
+        item = _event(
+            "item/completed",
+            _PARENT_THREAD,
+            _PARENT_TURN,
+            item={
+                "type": "userMessage",
+                "id": "user_capacity",
+                "clientId": "c" * 32,
+                "content": [{"type": "text", "text": "preserve original input"}],
+            },
+        )
+        codex.emit(item)
+        await asyncio.wait_for(rejected.wait(), timeout=2)
+        await poll_until_async(lambda: failed_appends > 0, timeout_s=2)
+        assert not journal.exists()
+        if repair_journal_first:
+            storage_writable = True
+            await poll_until_async(journal.exists, timeout_s=2)
+        credentials_valid = True
+        await asyncio.wait_for(received.wait(), timeout=3)
+        codex.emit(item)
+        codex.queue.put_nowait(None)
+        await asyncio.wait_for(forwarder, timeout=3)
+    finally:
+        codex.queue.put_nowait(None)
+        forwarder.cancel()
+        await asyncio.gather(forwarder, return_exceptions=True)
+
+    assert len(accepted) == 1
+    assert accepted[0]["item_data"]["content"] == [
+        {"type": "input_text", "text": "preserve original input"}
+    ]
+    assert all(method not in {"turn/start", "turn/steer"} for method, _ in codex.requests)
+
+
+async def test_forwarder_startup_cancellation_closes_its_recovery_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation at the first startup yield must still close the worker it created."""
+    _write_parent_bridge(tmp_path)
+    codex = _StreamingCodexClient()
+    paused = asyncio.Event()
+    release = asyncio.Event()
+    recoveries: list[fwd._LiveMirrorRecovery] = []
+    original_sleep = fwd._sleep
+    original_start = fwd._LiveMirrorRecovery.start
+
+    async def startup_yield(seconds: float) -> None:
+        if seconds == 0 and not paused.is_set():
+            paused.set()
+            await release.wait()
+        else:
+            await original_sleep(seconds)
+
+    def start_worker(recovery: fwd._LiveMirrorRecovery) -> None:
+        recoveries.append(recovery)
+        original_start(recovery)
+
+    monkeypatch.setattr(fwd, "_sleep", startup_yield)
+    monkeypatch.setattr(fwd._LiveMirrorRecovery, "start", start_worker)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={}, request=request)
+
+    forwarder = _start_forwarder(tmp_path, codex, handler)
+    try:
+        await asyncio.wait_for(paused.wait(), timeout=2)
+        forwarder.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(forwarder, timeout=3)
+        assert len(recoveries) == 1
+        assert recoveries[0].closed
+        assert recoveries[0].task is not None and recoveries[0].task.done()
+    finally:
+        release.set()
+        forwarder.cancel()
+        await asyncio.gather(forwarder, return_exceptions=True)
+        await asyncio.gather(*(recovery.close() for recovery in recoveries))
 
 
 async def test_parent_turn_completion_is_not_delayed_by_subagent_flood(tmp_path: Path) -> None:

@@ -13,7 +13,7 @@ import shlex
 import urllib.error
 import urllib.request
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Coroutine, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,6 +72,11 @@ from omnigent.harnesses.codex_native.elicitation import (
 )
 from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.native._native_forwarder_health import (
+    begin_pending_delivery,
+    clear_pending_delivery,
+    note_pending_delivery_progress,
+)
+from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
 from omnigent.native._native_forwarder_health import (
@@ -80,6 +85,7 @@ from omnigent.native._native_forwarder_health import (
 from omnigent.native._native_post_delivery import (
     RepostResult,
     append_dead_letter,
+    has_replayable_dead_letters,
     post_may_have_been_delivered,
     replay_dead_letters,
 )
@@ -121,6 +127,11 @@ _POST_RETRY_DELAY_SECONDS = 0.1
 _POST_RETRY_MAX_DELAY_SECONDS = 30.0
 _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 _DURABLE_ITEM_POST_TIMEOUT_SECONDS = 5.0
+_LIVE_MIRROR_RETRY_BASE_SECONDS = 1.0
+_LIVE_MIRROR_RETRY_MAX_SECONDS = 30.0
+_LIVE_MIRROR_PASS_SECONDS = 2.0
+_LIVE_MIRROR_POST_SECONDS = 1.0
+_LIVE_MIRROR_MAX_RECORDS = 16
 _SOURCE_ID_MAX_CHARS = 256
 # Startup dead-letter replay budget (#1579). Bounded so a large dead-letter file
 # or a slow/hung server cannot stall forwarder startup: each re-POST is a single
@@ -2662,6 +2673,9 @@ async def supervise_forwarder(
             codex_client=client,
             child_usage_baseline_dir=bridge_dir,
         )
+        mirror_recovery = _LiveMirrorRecovery(ap_client, bridge_dir)
+        mirror_recovery_token = _live_mirror_recovery.set(mirror_recovery)
+        mirror_recovery.start()
         # Released when the live event stream shows the thread became
         # active (its first turn materializes the rollout). Lets the
         # subscribe task park instead of blind-polling ``thread/resume``
@@ -2687,9 +2701,9 @@ async def supervise_forwarder(
             ),
             name="codex-native-forwarder-side-chat",
         )
-        await _sleep(0)
         stream_error: BaseException | None = None
         try:
+            await _sleep(0)
             async for event in client.iter_events():
                 try:
                     superseded_session_id = target.session_id
@@ -2788,6 +2802,7 @@ async def supervise_forwarder(
             # Child lanes run first: their queued handlers use the shared tracker.
             for close in (
                 forwarder_state.close_child_streams,
+                mirror_recovery.close,
                 target.delta_coalescer.close,
                 target.usage_coalescer.close,
                 target.elicitation_tracker.close,
@@ -2797,6 +2812,7 @@ async def supervise_forwarder(
                     await close()
                 except BaseException as exc:  # noqa: BLE001 - finish all closers, even on cancellation.
                     cleanup_errors.append(exc)
+            _live_mirror_recovery.reset(mirror_recovery_token)
             for error in cleanup_errors[1 if stream_error is None else 0 :]:
                 _logger.warning(
                     "Codex forwarder cleanup failed",
@@ -8413,6 +8429,7 @@ async def _post_external_item(
         "item_data": item_data,
         "response_id": response_id,
     }
+    event_type = "external_conversation_item"
     if message_id is not None:
         data["message_id"] = message_id
     if source_id is not None:
@@ -8422,7 +8439,7 @@ async def _post_external_item(
         return await _post_session_event(
             client,
             session_id,
-            event_type="external_conversation_item",
+            event_type=event_type,
             data=data,
             max_attempts=None if source_id is not None else _POST_MAX_ATTEMPTS,
             timeout=_DURABLE_ITEM_POST_TIMEOUT_SECONDS if source_id is not None else None,
@@ -8430,13 +8447,24 @@ async def _post_external_item(
 
     try:
         async with _conversation_item_delivery_scope(session_id):
-            response = await _post()
+            recovery = _live_mirror_recovery.get()
+            if recovery is not None and _session_event_is_idempotent(event_type, data):
+                posted, response = await recovery.deliver(session_id, event_type, data, _post)
+                if not posted:
+                    return False
+                if (
+                    recovery._source_key(session_id, event_type, data)
+                    in recovery.acknowledged_sources
+                ):
+                    return True
+            else:
+                response = await _post()
     except asyncio.CancelledError:
         if source_id is not None and (dl_dir := _dead_letter_dir.get()) is not None:
             append_dead_letter(
                 dl_dir,
                 session_id=session_id,
-                event_type="external_conversation_item",
+                event_type=event_type,
                 payload=data,
                 reason="delivery interrupted before acknowledgement",
                 delivered_ambiguous=True,
@@ -8453,6 +8481,340 @@ async def _post_external_item(
         )
         return False
     return True
+
+
+class _LiveMirrorRecovery:
+    """Retry exact durable mirror payloads while their native process remains connected."""
+
+    def __init__(self, client: httpx.AsyncClient, bridge_dir: Path) -> None:
+        self.client = client
+        self.bridge_dir = bridge_dir
+        self.pending_sessions: set[str] = set()
+        self.lease_sessions: set[str] = set()
+        self.checked_sessions: dict[str, bool] = {}
+        self.checked_revision: tuple[tuple[int, int, int] | None, ...] | None = None
+        self.idle_revision: tuple[tuple[int, int, int] | None, ...] | None = None
+        self.task: asyncio.Task[None] | None = None
+        self.closed = False
+        self.acknowledged_sources: set[tuple[str, str, str]] = set()
+        self.unretained_sources: dict[tuple[str, str, str], _PostResult] = {}
+        self.closed_event = asyncio.Event()
+
+    def start(self) -> None:
+        if not self.closed and self.task is None:
+            self.task = asyncio.create_task(self._retry(), name="codex-native-mirror-recovery")
+
+    def note_pending(self, session_id: str) -> None:
+        if self.closed:
+            return
+        self.pending_sessions.add(session_id)
+        if session_id not in self.lease_sessions:
+            self.lease_sessions.add(session_id)
+            begin_pending_delivery(session_id, self)
+
+    def _revision(self) -> tuple[tuple[int, int, int] | None, ...]:
+        revision: list[tuple[int, int, int] | None] = []
+        for name in ("dead_letter.jsonl.1", "dead_letter.jsonl"):
+            try:
+                stat = (self.bridge_dir / name).stat()
+            except FileNotFoundError:
+                revision.append(None)
+            else:
+                revision.append((stat.st_ino, stat.st_size, stat.st_mtime_ns))
+        return tuple(revision)
+
+    def _selected(
+        self,
+        record: dict[str, object],
+        session_id: str | None = None,
+        blocked_sessions: set[str] | None = None,
+        unacknowledged_only: bool = False,
+    ) -> bool:
+        event_type = record.get("event_type")
+        payload = record.get("payload")
+        record_session_id = record.get("session_id")
+        return (
+            isinstance(record_session_id, str)
+            and (session_id is None or record_session_id == session_id)
+            and (blocked_sessions is None or record_session_id not in blocked_sessions)
+            and isinstance(event_type, str)
+            and isinstance(payload, dict)
+            and _session_event_is_idempotent(event_type, payload)
+            and (
+                not unacknowledged_only
+                or self._source_key(record_session_id, event_type, payload)
+                not in self.acknowledged_sources
+            )
+        )
+
+    @staticmethod
+    def _source_key(
+        session_id: str, event_type: str, data: _JsonObject
+    ) -> tuple[str, str, str] | None:
+        source_id = data.get("source_id")
+        if isinstance(source_id, str) and source_id.strip():
+            return session_id, event_type, source_id
+        return None
+
+    def _acknowledge(self, session_id: str, event_type: str, data: _JsonObject) -> None:
+        key = self._source_key(session_id, event_type, data)
+        if key is not None and key not in self.acknowledged_sources:
+            self.acknowledged_sources.add(key)
+            self.unretained_sources.pop(key, None)
+            self.pending_sessions.discard(session_id)
+            self.checked_sessions.pop(session_id, None)
+            note_pending_delivery_progress(session_id, self)
+
+    async def has_pending(self, session_id: str) -> bool:
+        revision = self._revision()
+        if all(value is None for value in revision):
+            self.pending_sessions.clear()
+            self.checked_sessions.clear()
+            self.checked_revision = revision
+            return False
+        if revision != self.checked_revision:
+            self.checked_sessions.clear()
+            self.checked_revision = revision
+        if session_id not in self.checked_sessions:
+            self.checked_sessions[session_id] = await asyncio.to_thread(
+                has_replayable_dead_letters,
+                self.bridge_dir,
+                retryable_status_codes=_POST_RETRY_STATUS_CODES,
+                record_filter=functools.partial(
+                    self._selected, session_id=session_id, unacknowledged_only=True
+                ),
+            )
+            if self._revision() != revision:
+                self.checked_sessions.clear()
+                self.checked_revision = None
+                return True
+        return self.checked_sessions[session_id]
+
+    def note_unretained(
+        self, session_id: str, event_type: str, data: _JsonObject, result: _PostResult
+    ) -> None:
+        if self.closed:
+            return
+        key = self._source_key(session_id, event_type, data)
+        if key is not None:
+            self.unretained_sources[key] = result
+            self.note_pending(session_id)
+
+    def _journal(
+        self, session_id: str, event_type: str, data: _JsonObject, result: _PostResult
+    ) -> bool:
+        response = result.response
+        written = append_dead_letter(
+            self.bridge_dir,
+            session_id=session_id,
+            event_type=event_type,
+            payload=data,
+            reason=result.rejection_reason or "waiting for durable transcript mirror delivery",
+            delivered_ambiguous=result.delivered_ambiguous,
+            http_status=response.status_code if response is not None else None,
+            transport_error=result.transport_error,
+            rejection_reason=result.rejection_reason,
+        )
+        key = self._source_key(session_id, event_type, data)
+        if written:
+            if key is not None:
+                self.unretained_sources.pop(key, None)
+            if result.rejection_reason is None and (
+                response is None or _should_retry_post_status(response.status_code)
+            ):
+                self.note_pending(session_id)
+        else:
+            self.note_unretained(session_id, event_type, data, result)
+        return written
+
+    async def deliver(
+        self,
+        session_id: str,
+        event_type: str,
+        data: _JsonObject,
+        post: Callable[[], Coroutine[None, None, httpx.Response | None]],
+    ) -> tuple[bool, httpx.Response | None]:
+        key = self._source_key(session_id, event_type, data)
+        try:
+            pending = await self.has_pending(session_id)
+        except OSError:
+            pending = True
+        if pending:
+            if self._journal(session_id, event_type, data, _PostResult(response=None)):
+                return False, None
+            return await self._retain_inline(session_id, event_type, data, post)
+        try:
+            response = await post()
+        except DatabricksAuthError:
+            if key not in self.unretained_sources:
+                raise
+            return await self._retain_inline(session_id, event_type, data, post)
+        if key in self.unretained_sources:
+            return await self._retain_inline(session_id, event_type, data, post)
+        return True, response
+
+    async def _retain_inline(
+        self,
+        session_id: str,
+        event_type: str,
+        data: _JsonObject,
+        post: Callable[[], Coroutine[None, None, httpx.Response | None]],
+    ) -> tuple[bool, httpx.Response | None]:
+        key = self._source_key(session_id, event_type, data)
+        assert key is not None
+        delay = _LIVE_MIRROR_RETRY_BASE_SECONDS
+        while not self.closed:
+            result = self.unretained_sources.get(key, _PostResult(response=None))
+            if self._journal(session_id, event_type, data, result):
+                return False, None
+            permanent = result.rejection_reason is not None or (
+                result.response is not None
+                and not _should_retry_post_status(result.response.status_code)
+            )
+            if not permanent:
+                try:
+                    await self._drain(session_id)
+                    if key in self.acknowledged_sources:
+                        return True, None
+                    if not await self.has_pending(session_id):
+                        try:
+                            response = await post()
+                        except DatabricksAuthError:
+                            if key not in self.unretained_sources:
+                                return False, None
+                        else:
+                            if response is not None and response.status_code < 400:
+                                self._acknowledge(session_id, event_type, data)
+                                return True, response
+                            if key not in self.unretained_sources:
+                                return True, response
+                except OSError:
+                    pass
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.closed_event.wait(), timeout=delay)
+            delay = min(_LIVE_MIRROR_RETRY_MAX_SECONDS, delay * 2)
+        raise asyncio.CancelledError
+
+    async def _drain(self, session_id: str | None = None) -> int:
+        blocked_sessions: set[str] = set()
+        return await replay_dead_letters(
+            self.bridge_dir,
+            repost=functools.partial(self._repost, blocked_sessions=blocked_sessions),
+            retryable_status_codes=_POST_RETRY_STATUS_CODES,
+            logger_name=__name__,
+            max_records=_LIVE_MIRROR_MAX_RECORDS,
+            deadline_seconds=_LIVE_MIRROR_PASS_SECONDS,
+            record_filter=functools.partial(
+                self._selected, session_id=session_id, blocked_sessions=blocked_sessions
+            ),
+        )
+
+    async def _repost(self, record: dict[str, object], blocked_sessions: set[str]) -> RepostResult:
+        session_id = record["session_id"]
+        event_type = record["event_type"]
+        payload = record["payload"]
+        assert isinstance(session_id, str)
+        assert isinstance(event_type, str)
+        assert isinstance(payload, dict)
+        if self._source_key(session_id, event_type, payload) in self.acknowledged_sources:
+            return RepostResult(delivered=True)
+        self.note_pending(session_id)
+        if session_id in blocked_sessions:
+            http_status = record.get("http_status")
+            return RepostResult(
+                delivered=False,
+                delivered_ambiguous=bool(record.get("delivered_ambiguous")),
+                http_status=http_status if isinstance(http_status, int) else None,
+            )
+        try:
+            async with asyncio.timeout(_LIVE_MIRROR_POST_SECONDS):
+                async with _conversation_item_delivery_scope(session_id):
+                    result = await _post_session_event_inner(
+                        self.client,
+                        session_id,
+                        event_type=event_type,
+                        data=payload,
+                        max_attempts=1,
+                        timeout=_LIVE_MIRROR_POST_SECONDS,
+                    )
+        except (DatabricksAuthError, TimeoutError):
+            blocked_sessions.add(session_id)
+            return RepostResult(delivered=False, delivered_ambiguous=True)
+        response = result.response
+        delivered = response is not None and response.status_code < 400
+        if not delivered:
+            blocked_sessions.add(session_id)
+        else:
+            self._acknowledge(session_id, event_type, payload)
+            _note_forward_success()
+        return RepostResult(
+            delivered=delivered,
+            delivered_ambiguous=result.delivered_ambiguous,
+            http_status=response.status_code if response is not None else None,
+            rejection_reason=result.rejection_reason,
+        )
+
+    async def _retry(self) -> None:
+        delay = _LIVE_MIRROR_RETRY_BASE_SECONDS
+        while not self.closed:
+            await _sleep(delay)
+            if self.closed:
+                return
+            try:
+                revision = self._revision()
+                if (
+                    not self.pending_sessions
+                    and not self.unretained_sources
+                    and revision == self.idle_revision
+                ):
+                    continue
+                replayed = await self._drain()
+                checked_revision = self._revision()
+                pending = await asyncio.to_thread(
+                    has_replayable_dead_letters,
+                    self.bridge_dir,
+                    retryable_status_codes=_POST_RETRY_STATUS_CODES,
+                    record_filter=self._selected,
+                )
+                latest_revision = self._revision()
+                pending = (
+                    pending or bool(self.unretained_sources) or checked_revision != latest_revision
+                )
+                self.pending_sessions.clear()
+                self.checked_sessions.clear()
+                self.checked_revision = None
+                self.idle_revision = None if pending else latest_revision
+                if not pending:
+                    self._clear_leases()
+                    self.acknowledged_sources.clear()
+                delay = (
+                    min(_LIVE_MIRROR_RETRY_MAX_SECONDS, delay * 2)
+                    if pending and not replayed
+                    else _LIVE_MIRROR_RETRY_BASE_SECONDS
+                )
+            except Exception as exc:  # noqa: BLE001 - keep retained mirrors recoverable.
+                _logger.warning(
+                    "Codex mirror recovery deferred: error_type=%s", type(exc).__name__
+                )
+                delay = min(_LIVE_MIRROR_RETRY_MAX_SECONDS, delay * 2)
+
+    async def close(self) -> None:
+        self.closed = True
+        self.closed_event.set()
+        if self.task is not None:
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
+        self._clear_leases()
+
+    def _clear_leases(self) -> None:
+        for session_id in self.lease_sessions:
+            clear_pending_delivery(session_id, self)
+        self.lease_sessions.clear()
+
+
+_live_mirror_recovery: ContextVar[_LiveMirrorRecovery | None] = ContextVar(
+    "codex_live_mirror_recovery", default=None
+)
 
 
 async def _post_status(
@@ -9393,6 +9755,7 @@ async def _replay_dead_letters_before_resume(
                 delivered=False,
                 delivered_ambiguous=result.delivered_ambiguous,
                 http_status=None,
+                rejection_reason=result.rejection_reason,
             )
         delivered = response.status_code < 400
         return RepostResult(
@@ -9526,7 +9889,7 @@ def _record_failed_session_event(
             reason = "ambiguous transport failure (may already be committed)"
         else:
             reason = "proven-undelivered transport failure after retries"
-    append_dead_letter(
+    retained = append_dead_letter(
         dl_dir,
         session_id=session_id,
         event_type=event_type,
@@ -9535,7 +9898,19 @@ def _record_failed_session_event(
         delivered_ambiguous=result.delivered_ambiguous,
         http_status=response.status_code if response is not None else None,
         transport_error=result.transport_error,
+        rejection_reason=result.rejection_reason,
     )
+    recovery = _live_mirror_recovery.get()
+    if recovery is not None and _session_event_is_idempotent(event_type, data):
+        if not retained:
+            recovery.note_unretained(session_id, event_type, data, result)
+        elif result.rejection_reason is None and (
+            response is None or _should_retry_post_status(response.status_code)
+        ):
+            key = recovery._source_key(session_id, event_type, data)
+            if key is not None:
+                recovery.unretained_sources.pop(key, None)
+            recovery.note_pending(session_id)
 
 
 async def _post_session_event_inner(

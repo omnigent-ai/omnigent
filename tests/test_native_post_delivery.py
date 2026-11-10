@@ -131,7 +131,7 @@ def test_append_dead_letter_writes_parseable_line(tmp_path: Path) -> None:
 
     :param tmp_path: Pytest temp dir standing in for a bridge dir.
     """
-    append_dead_letter(
+    assert append_dead_letter(
         tmp_path,
         session_id="conv_abc123",
         event_type="external_conversation_item",
@@ -192,7 +192,7 @@ def test_append_dead_letter_never_raises_on_unwritable_dir() -> None:
     """A bogus / unwritable bridge dir is swallowed, not raised."""
     bogus = Path("/this/path/does/not/exist/and/cannot/be/made\x00")
     # Must return without raising despite the invalid path.
-    append_dead_letter(
+    assert not append_dead_letter(
         bogus,
         session_id="conv_abc123",
         event_type="external_conversation_item",

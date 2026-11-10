@@ -883,3 +883,51 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
                 background(conv_id, False)
                 assert app.state.has_active_work() is False
                 assert app.state.has_sandbox_work() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settlement", ["drained", "expired", "successor", "progress"])
+async def test_pending_native_mirror_delivery_survives_parent_hangup_until_settled(
+    monkeypatch: pytest.MonkeyPatch, settlement: str
+) -> None:
+    """Native work can finish while its original transcript still needs delivery."""
+    from types import SimpleNamespace
+
+    from omnigent.native import _native_forwarder_health as health
+    from tests.runner.test_runner_entry import _finish_work_killer
+
+    clock = [100.0]
+    monkeypatch.setattr(health, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    session_id, owner = "conv_pending_mirror", object()
+    app = _scaffold_app()
+    assert not app.state.has_active_work()
+    health.begin_pending_delivery(session_id, owner)
+    successor = object()
+    killer = asyncio.create_task(asyncio.to_thread(_finish_work_killer, app.state.has_active_work))
+    try:
+        assert app.state.has_sandbox_work()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(killer), timeout=0.03)
+        if settlement == "progress":
+            clock[0] += 50
+            health.note_pending_delivery_progress(session_id, owner)
+            clock[0] += 11
+            assert app.state.has_active_work()
+            assert app.state.has_sandbox_work()
+            clock[0] += 50
+        elif settlement == "expired":
+            clock[0] += 61
+        elif settlement == "successor":
+            health.begin_pending_delivery(session_id, successor)
+            health.clear_pending_delivery(session_id, owner)
+            assert app.state.has_active_work()
+            health.clear_pending_delivery(session_id, successor)
+        else:
+            health.clear_pending_delivery(session_id, owner)
+        assert not app.state.has_active_work()
+        assert not app.state.has_sandbox_work()
+        assert await asyncio.wait_for(killer, timeout=1) == ["idle_close", "exit"]
+    finally:
+        health.clear_pending_delivery(session_id, owner)
+        health.clear_pending_delivery(session_id, successor)
+        await asyncio.wait_for(killer, timeout=1)

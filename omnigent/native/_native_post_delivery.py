@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from collections import defaultdict, deque
@@ -65,7 +66,8 @@ def append_dead_letter(
     delivered_ambiguous: bool = False,
     http_status: int | None = None,
     transport_error: str | None = None,
-) -> None:
+    rejection_reason: str | None = None,
+) -> bool:
     """
     Append one undeliverable forward payload to ``{bridge_dir}/dead_letter.jsonl`` (#1120).
 
@@ -93,7 +95,8 @@ def append_dead_letter(
         ``503`` or ``400``; ``None`` for a transport failure that saw no response.
     :param transport_error: Transport-error class name when the POST raised without a
         response, e.g. ``"ConnectError"``; ``None`` when the server responded.
-    :returns: None.
+    :param rejection_reason: Permanent local validation failure, if any.
+    :returns: Whether the payload was written to the journal.
     """
     try:
         path = bridge_dir / _DEAD_LETTER_FILE
@@ -108,6 +111,7 @@ def append_dead_letter(
                 "delivered_ambiguous": delivered_ambiguous,
                 "http_status": http_status,
                 "transport_error": transport_error,
+                "rejection_reason": rejection_reason,
                 "payload": payload,
             }
         )
@@ -127,6 +131,7 @@ def append_dead_letter(
                     if fh.read(1) != b"\n":
                         fh.write(b"\n")
                 fh.write((line + "\n").encode())
+        return True
     except Exception as exc:  # noqa: BLE001 - dead-lettering must never disrupt forwarding.
         _logger.warning(
             "failed to dead-letter undeliverable forward: type=%s session=%s error=%r",
@@ -134,6 +139,7 @@ def append_dead_letter(
             session_id,
             exc,
         )
+        return False
 
 
 # Transport failures proving a POST never reached the server (no bytes
@@ -366,11 +372,13 @@ class RepostResult:
     :param http_status: Final HTTP status code when the server responded, or
         ``None`` for a transport failure that saw no response. Used to refresh
         the retained record's classification.
+    :param rejection_reason: Permanent local validation failure during replay.
     """
 
     delivered: bool
     delivered_ambiguous: bool = False
     http_status: int | None = None
+    rejection_reason: str | None = None
 
 
 def _dead_letter_record_replayable(
@@ -410,6 +418,8 @@ def _dead_letter_record_replayable(
     if not isinstance(record.get("payload"), dict):
         return False
     if "delivered_ambiguous" not in record:
+        return False
+    if record.get("rejection_reason"):
         return False
     if record.get("delivered_ambiguous"):
         payload = record.get("payload")
@@ -625,7 +635,7 @@ async def _replay_dead_letters_locked(
 ) -> int:
     """Drain one snapshot while a separate lock excludes another replayer."""
     log = logging.getLogger(logger_name) if logger_name else _logger
-    entries = _dead_letter_snapshot(bridge_dir)
+    entries = await asyncio.to_thread(_dead_letter_snapshot, bridge_dir)
     updates: dict[str, deque[dict[str, object] | None]] = defaultdict(deque)
     replayed = 0
     attempted = 0
@@ -661,17 +671,43 @@ async def _replay_dead_letters_locked(
             if (
                 entry.get("delivered_ambiguous") != result.delivered_ambiguous
                 or entry.get("http_status") != result.http_status
+                or entry.get("rejection_reason") != result.rejection_reason
             ):
                 replacement = {
                     **entry,
                     "delivered_ambiguous": result.delivered_ambiguous,
                     "http_status": result.http_status,
+                    "rejection_reason": result.rejection_reason,
                 }
                 updates[key].append(replacement)
             else:
                 updates[key].append(entry)
     finally:
-        _apply_dead_letter_updates(bridge_dir, updates)
+        if updates:
+            commit = asyncio.create_task(
+                asyncio.to_thread(_apply_dead_letter_updates, bridge_dir, updates)
+            )
+            cancelled = isinstance(sys.exception(), asyncio.CancelledError)
+            while not commit.done():
+                try:
+                    await asyncio.shield(commit)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:  # noqa: BLE001 - inspect the completed task below.
+                    break
+            try:
+                commit.result()
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception as exc:
+                if not cancelled:
+                    raise
+                _logger.warning(
+                    "Journal update incomplete during cancellation: error_type=%s",
+                    type(exc).__name__,
+                )
+            if cancelled:
+                raise asyncio.CancelledError
     if replayed:
         log.info(
             "replayed %d proven-undelivered dead-lettered forward(s) on startup",
