@@ -351,6 +351,11 @@ export interface Session {
    * the count).
    */
   backgroundTasks?: BackgroundTaskInfo[];
+  /**
+   * Background agents a finished claude-native turn left running, while
+   * {@link status} is ``"waiting"``. Absent otherwise.
+   */
+  backgroundAgents?: BackgroundTaskInfo[];
   createdAt: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
