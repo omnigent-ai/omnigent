@@ -327,10 +327,9 @@ export interface Session {
   /** Current host reachability; absent when the snapshot omits liveness. */
   hostOnline?: boolean;
   /**
-   * Whether this session's host is a dormant resumable managed host the
-   * server can wake on the next message. Carried on the snapshot so the open
-   * view shows a wakeable "asleep" state instead of the terminal host_offline
-   * dead-end. `false`/absent otherwise.
+   * Whether this session's host is a managed host the server can resume on
+   * the next message. Lets the open view show a resumable state instead of a
+   * terminal host_offline. `false`/absent otherwise.
    */
   hostResumable?: boolean;
   /**
@@ -553,8 +552,7 @@ export interface Session {
    * Managed-sandbox launch progress. Present while the session's
    * background sandbox launch is in flight or has failed; `null` for
    * sessions without a managed launch and once the launch succeeds.
-   * Sourced from the server's `_session_sandbox_status_cache` at
-   * snapshot build time so a client opening the session mid-launch
+   * Included in the snapshot so a client that opens the session mid-launch
    * sees the current stage.
    */
   sandboxStatus?: SandboxStatus | null;

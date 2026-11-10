@@ -117,6 +117,11 @@ def test_attachment_marker_stripped() -> None:
     item = _event_to_item(_user_ev("u2", "[Attached: /tmp/x.png]\n\nlook"), _AGENT)
     assert item is not None
     assert item.item_data["content"][0]["text"] == "look"
+    # Workspace-relative markers are inline "@file" mentions and stay put.
+    inline = "compare [Attached: a.ts] with [Attached: b.ts]"
+    item = _event_to_item(_user_ev("u5", inline), _AGENT)
+    assert item is not None
+    assert item.item_data["content"][0]["text"] == inline
 
 
 def test_could_not_load_marker_stripped() -> None:

@@ -31,7 +31,7 @@ from starlette.datastructures import Headers
 
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id
-from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.entities import ScheduledTask, ScheduledTaskRun, StoredFile
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import bundle_location
 from omnigent.server.routes._host_worktree import (
@@ -39,12 +39,31 @@ from omnigent.server.routes._host_worktree import (
     worktree_root_fingerprint,
 )
 from omnigent.server.scheduled import fire as fire_mod
-from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+from omnigent.server.scheduled.fire import (
+    BUSY_QUIET_SECONDS,
+    BUSY_RECHECK_SECONDS,
+    BUSY_SKIP_MAX_SECONDS,
+    FireDeps,
+    build_busy_until,
+    build_on_fire,
+    build_run_now,
+)
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+from omnigent.server.scheduled.source_session import (
+    run_copy_dropped_label_keys,
+    run_prompt_text,
+)
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+    FORK_SOURCE_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_SOURCE_LABEL_KEY,
+    SessionActivity,
+)
 from tests.server.helpers import build_agent_bundle
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
@@ -85,6 +104,8 @@ class _FakeAgent:
 
 
 class FakeAgentStore:
+    supports_user_agents = False
+
     def __init__(self, agents: dict[str, _FakeAgent] | None = None) -> None:
         self.agents = agents or {"ag_1": _FakeAgent("ag_1")}
 
@@ -304,6 +325,8 @@ class FakeConversationStore:
         self.fail_create = fail_create
         self.label_writes: dict[str, dict[str, str]] = {}
         self.deleted: list[str] = []
+        self.forked: list[dict[str, Any]] = []
+        self.host_bindings: list[tuple[str, str, str | None, str | None]] = []
 
     async def delete_conversation(self, conversation_id: str) -> bool:
         self.deleted.append(conversation_id)
@@ -334,6 +357,39 @@ class FakeConversationStore:
 
     def clear_host_binding(self, conversation_id: str, **kwargs: Any) -> None:
         self.updated.append({"id": conversation_id, "clear_host_binding": kwargs})
+
+    def fork_conversation(self, source_conversation_id: str, **kwargs: Any) -> _FakeConversation:
+        self._seq += 1
+        self.forked.append({"source_id": source_conversation_id, **kwargs})
+        return _FakeConversation(
+            id=f"conv_{self._seq}",
+            agent_id=kwargs.get("agent_id") or "",
+            labels=dict(kwargs.get("extra_labels") or {}),
+        )
+
+    def list_items(self, conversation_id: str, **kwargs: Any) -> SimpleNamespace:
+        if conversation_id != "conv_source":
+            return SimpleNamespace(data=[], has_more=False, last_id=None)
+        # An automation's source copy holds the finished reply it was copied through.
+        reply = SimpleNamespace(
+            type="message",
+            status="completed",
+            response_id="resp_source",
+            data=SimpleNamespace(role="assistant"),
+        )
+        return SimpleNamespace(data=[reply], has_more=False, last_id=None)
+
+    def set_host_id(
+        self,
+        conversation_id: str,
+        host_id: str,
+        workspace: str | None = None,
+        git_branch: str | None = None,
+    ) -> _FakeConversation:
+        self.host_bindings.append((conversation_id, host_id, workspace, git_branch))
+        return _FakeConversation(
+            id=conversation_id, agent_id="ag_1", host_id=host_id, workspace=workspace
+        )
 
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
         return _FakeConversation(id=conversation_id, agent_id="ag_1")
@@ -1020,6 +1076,7 @@ async def test_permission_mode_launch_options(
     [
         ("claude-native", "acceptEdits", ["--permission-mode", "acceptEdits"], False),
         ("codex-native", "default", None, False),
+        ("codex-native", "bypass", None, True),
     ],
 )
 async def test_permission_mode_becomes_terminal_launch_args(
@@ -1074,7 +1131,7 @@ async def test_unset_permission_mode_sends_no_launch_args() -> None:
 async def test_incompatible_permission_mode_fails_without_session() -> None:
     """A saved mode for another harness must not silently fall back to defaults."""
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="acceptEdits")})
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="bypassPermissions")})
 
     launch = AsyncMock()
 
@@ -1090,7 +1147,7 @@ async def test_incompatible_permission_mode_fails_without_session() -> None:
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "permission_mode_unsupported"
-    assert "'acceptEdits' is not supported by 'codex-native'" in store.runs[0]["error"]
+    assert "'bypassPermissions' is not supported by 'codex-native'" in store.runs[0]["error"]
     assert "Edit the automation" in store.runs[0]["error"]
     assert store.runs[0]["conversation_id"] is None
 
@@ -2885,13 +2942,13 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
         ),
         (_continued_session(agent_id="ag_other"), {}, "continued_session_incompatible"),
         (_continued_session(), {"base_branch": "HEAD"}, "continued_session_incompatible"),
-        # Under the "new sessions only" contract a reused session keeps its own
-        # mode, so one switched to bypass must not take unattended prompts.
+        # A reused session keeps its own mode, so one switched to a mode that skips
+        # approval must not take prompts from a task that never selected such a mode.
         (
             _continued_session(
                 labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
             ),
-            {},
+            {"permission_mode": "auto"},
             "permission_mode_not_allowed",
         ),
         # Codex's full bypass, as spec-derived launch args emit it, with no label.
@@ -2996,6 +3053,50 @@ async def test_continue_never_replaces_an_unusable_session(
     assert conv_store.created == []
     assert [(run["status"], run["error_code"]) for run in store.runs] == [("failed", error_code)]
     assert "start a new session" in store.runs[0]["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_mode", "session"),
+    [
+        (
+            "bypassPermissions",
+            _continued_session(
+                labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+            ),
+        ),
+        (
+            "full-access",
+            _continued_session(
+                terminal_launch_args=[
+                    "--sandbox",
+                    "danger-full-access",
+                    "--ask-for-approval",
+                    "never",
+                ]
+            ),
+        ),
+        # Any approval-skipping selection opts in; it is not a ceiling on the session's mode.
+        (
+            "dontAsk",
+            _continued_session(
+                labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+            ),
+        ),
+        ("full-access", _continued_session(labels={CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"})),
+    ],
+)
+async def test_continue_accepts_a_session_in_a_mode_the_task_selects(
+    task_mode: str, session: _FakeConversation
+) -> None:
+    """A task that selects a mode skipping approval keeps sending into its session in one."""
+    conv_store = _ExistingConversationStore(session)
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task(permission_mode=task_mode)})
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert [conv.id for conv in launched] == ["conv_prev"]
+    assert [run["status"] for run in store.runs] == ["succeeded"]
 
 
 @pytest.mark.asyncio
@@ -3822,40 +3923,6 @@ async def test_cancelled_session_creation_waits_for_writes_before_cleanup(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("harness", "mode"),
-    [
-        ("claude-native", "bypassPermissions"),
-        ("claude-native", "dontAsk"),
-        ("codex-native", "bypass"),
-        ("codex-native", "full-access"),
-        ("cursor-native", "yolo"),
-        ("antigravity-native", "skip"),
-        ("devin-native", "dangerous"),
-    ],
-)
-async def test_saved_unattended_disallowed_mode_fails_without_session(
-    harness: str, mode: str
-) -> None:
-    """A task saved before the restriction fails at fire instead of running unattended."""
-    conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode=mode)})
-    launch = AsyncMock()
-
-    on_fire = build_on_fire(
-        _claude_agent_deps(store, conv_store, harness=harness), launch_dispatch=launch
-    )
-    await on_fire(0, "task_1")
-    await _drain()
-
-    launch.assert_not_awaited()
-    assert conv_store.created == []
-    assert store.runs[0]["status"] == "failed"
-    assert store.runs[0]["error_code"] == "permission_mode_not_allowed"
-    assert repr(mode) in store.runs[0]["error"]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(("spec_mode", "fires"), [(None, True), ("bypassPermissions", False)])
 async def test_sdk_agent_default_mode_gates_the_fire(spec_mode: str | None, fires: bool) -> None:
     """A Claude SDK spec with no mode runs in auto; one set to bypassPermissions cannot fire."""
@@ -3879,7 +3946,40 @@ async def test_sdk_agent_default_mode_gates_the_fire(spec_mode: str | None, fire
         launch.assert_not_awaited()
         assert conv_store.created == []
         assert store.runs[0]["error_code"] == "permission_mode_not_allowed"
-        assert "the agent's default" in store.runs[0]["error"]
+        assert "spec sets permission mode 'bypassPermissions'" in store.runs[0]["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_mode", "fires"),
+    [(None, False), ("auto", False), ("bypassPermissions", True)],
+)
+async def test_sdk_agent_default_mode_gates_a_continued_session(
+    task_mode: str | None, fires: bool
+) -> None:
+    """A continued session keeps the SDK spec's bypassPermissions default.
+
+    SDK agents take no task mode at save, so these tasks were saved while the agent ran a
+    native harness, and it was then reinstalled under the same id as this SDK agent.
+    Only a task selecting an approval-skipping mode may continue; ``auto`` is refused.
+    """
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task(permission_mode=task_mode)})
+    conv_store = _ExistingConversationStore(_continued_session())
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash")}),
+        agent_cache=FakeAgentCache(harness="claude-sdk", permission_mode="bypassPermissions"),
+    )
+
+    launched = await _fire_once(deps)
+
+    if fires:
+        assert [conv.id for conv in launched] == ["conv_prev"]
+    else:
+        assert launched == []
+        assert store.runs[0]["error_code"] == "permission_mode_not_allowed"
+        assert "spec sets permission mode 'bypassPermissions'" in store.runs[0]["error"]
 
 
 @pytest.mark.parametrize(
@@ -3916,9 +4016,502 @@ async def test_sdk_agent_default_mode_gates_the_fire(spec_mode: str | None, fire
         ({CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"}, None, "bypass"),
     ],
 )
-def test_session_unattended_disallowed_mode(
+def test_session_approval_skipping_mode(
     labels: dict[str, str], launch_args: list[str] | None, expected: str | None
 ) -> None:
     conv = SimpleNamespace(labels=labels, terminal_launch_args=launch_args)
 
-    assert fire_mod.session_unattended_disallowed_mode(conv) == expected
+    assert fire_mod.session_approval_skipping_mode(conv) == expected
+
+
+# ── Runs that start from a copy of a session ───────────────────────────────
+
+
+def test_a_run_from_a_session_sends_its_instructions_or_the_opener_when_empty() -> None:
+    assert run_prompt_text(_task(prompt="Do the work.")) == "Do the work."
+    assert run_prompt_text(_task(source_session_id="conv_source", prompt=" ")) == (
+        "Perform the task from this conversation again."
+    )
+    assert run_prompt_text(_task(source_session_id="conv_source", prompt=" Do it ")) == "Do it"
+
+
+@pytest.mark.asyncio
+async def test_a_run_starts_from_a_copy_of_the_source_session() -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created == []
+    (fork,) = conv_store.forked
+    assert (fork["source_id"], fork["agent_id"], fork["title"]) == (
+        "conv_source",
+        "ag_1",
+        "nightly",
+    )
+    # The run rebuilds its native transcript from its own copy, never another session's file.
+    assert fork["resume_source_native_session"] is False
+    assert {
+        FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+        FORK_SOURCE_LABEL_KEY,
+        SCHEDULED_TASK_SOURCE_LABEL_KEY,
+    } <= fork["dropped_label_keys"]
+    assert fork["extra_labels"][SCHEDULED_TASK_ORIGIN_LABEL_KEY] == "task_1"
+    assert fork["override_terminal_launch_args_set"] is True
+    # The copy is bound where the run executes before it launches.
+    assert conv_store.host_bindings == [("conv_1", "host_1", "/repo", None)]
+    assert [conv.id for conv in launched] == ["conv_1"]
+    assert [run["status"] for run in store.runs] == ["running"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_leaves_out_the_turn_running_in_its_source() -> None:
+    conv_store = FakeConversationStore()
+
+    def _message(response_id: str, role: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            type="message",
+            status="completed",
+            response_id=response_id,
+            data=SimpleNamespace(role=role),
+        )
+
+    # Newest first: the running turn's progress text is stored as a completed message too.
+    page = SimpleNamespace(
+        data=[
+            _message("resp_active", "assistant"),
+            _message("resp_active", "user"),
+            _message("resp_done", "assistant"),
+        ],
+        has_more=False,
+        last_id=None,
+    )
+    conv_store.list_items = lambda conversation_id, **kwargs: page  # type: ignore[method-assign]
+    conv_store.get_conversation = lambda conversation_id: _FakeConversation(  # type: ignore[method-assign]
+        id=conversation_id,
+        agent_id="ag_1",
+        live_status="running" if conversation_id == "conv_source" else None,
+    )
+    store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        pass
+
+    deps = _deps(store, conversation_store=conv_store)
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    (fork,) = conv_store.forked
+    assert fork["up_to_response_id"] == "resp_done"
+
+
+@pytest.mark.asyncio
+async def test_a_run_whose_source_has_no_finished_reply_in_reach_copies_nothing() -> None:
+    conv_store = FakeConversationStore()
+    # A turn longer than the cutoff search reaches, with no finished reply in it.
+    tool_call = SimpleNamespace(
+        type="function_call", status="completed", response_id="resp_active", data=None
+    )
+    endless = SimpleNamespace(data=[tool_call] * 100, has_more=True, last_id="item_last")
+    conv_store.list_items = lambda conversation_id, **kwargs: endless  # type: ignore[method-assign]
+    store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    # Without a cutoff the copy would take the unfinished turn, so the run stops instead.
+    assert conv_store.forked == [] and launched == []
+    (run,) = store.runs
+    assert (run["status"], run.get("error_code")) == ("failed", "source_session_incompatible")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("agent_id", "keeps_binding"), [("ag_1", True), ("ag_2", False)])
+async def test_a_run_on_another_agent_leaves_the_copys_provider_binding(
+    agent_id: str, keeps_binding: bool
+) -> None:
+    conv_store = FakeConversationStore()  # the copy runs ag_1
+    agents = FakeAgentStore({"ag_1": _FakeAgent("ag_1"), "ag_2": _FakeAgent("ag_2")})
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(source_session_id="conv_source", agent_id=agent_id)}
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        pass
+
+    deps = _deps(store, conversation_store=conv_store, agent_store=agents)
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    (fork,) = conv_store.forked
+    assert fork["agent_id"] == agent_id
+    assert fork["copy_inference_snapshot"] is keeps_binding
+
+
+@pytest.mark.asyncio
+async def test_a_run_copy_that_cannot_bind_its_host_is_deleted() -> None:
+    conv_store = FakeConversationStore()
+
+    class _LastRowsFileStore:
+        def list(self, session_id: str, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(data=[], has_more=False, last_id=None)
+
+        def delete_all_for_session(self, session_id: str) -> list[str]:
+            return ["blob_orphaned"]
+
+    class _FailingArtifactStore:
+        def delete(self, key: str) -> None:
+            raise OSError("storage unavailable")
+
+    def _no_host(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("host binding failed")
+
+    conv_store.set_host_id = _no_host  # type: ignore[method-assign]
+    store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        file_store=_LastRowsFileStore(),
+        artifact_store=_FailingArtifactStore(),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    # The copy was made before the bind failed, so the run deletes it rather than orphan
+    # it, even when a blob only it still used won't delete.
+    assert [fork["source_id"] for fork in conv_store.forked] == ["conv_source"]
+    assert conv_store.deleted == ["conv_1"]
+    assert launched == []
+    assert [run["status"] for run in store.runs] == ["failed"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_copies_no_attachment_the_deployment_now_refuses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class _OneZipFileStore:
+        def list(self, session_id: str, **kwargs: Any) -> SimpleNamespace:
+            stored = StoredFile(
+                id="f" * 32, created_at=1, filename="bundle.zip", bytes=5, session_id=session_id
+            )
+            return SimpleNamespace(data=[stored], has_more=False, last_id=stored.id)
+
+    # The policy tightened after the automation was created.
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_denied_extensions": ["zip"]},
+    )
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        file_store=_OneZipFileStore(),
+        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    # Refused before the run's session exists.
+    assert conv_store.forked == [] and launched == []
+    (run,) = store.runs
+    assert (run["status"], run.get("error_code")) == ("failed", "source_session_incompatible")
+    assert "not accepted" in run["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_needs_an_agent_that_opens_the_files_its_source_gained(tmp_path: Path) -> None:
+    from omnigent.entities import MessageData
+
+    class _ZipFileStore:
+        def list(self, session_id: str, **kwargs: Any) -> SimpleNamespace:
+            stored = StoredFile(
+                id="f" * 32, created_at=1, filename="bundle.zip", bytes=5, session_id=session_id
+            )
+            return SimpleNamespace(data=[stored], has_more=False, last_id=stored.id)
+
+    def _message(role: str, content: list[dict[str, str]]) -> SimpleNamespace:
+        data = MessageData(role=role, content=content, agent=None if role == "user" else "pi")
+        return SimpleNamespace(
+            type="message", status="completed", response_id="resp_zip", data=data
+        )
+
+    conv_store = FakeConversationStore()
+    # Attached in the source after the automation was created, and answered there.
+    page = SimpleNamespace(
+        data=[
+            _message("assistant", [{"type": "output_text", "text": "Read it"}]),
+            _message("user", [{"type": "input_file", "file_id": "f" * 32}]),
+        ],
+        has_more=False,
+        last_id=None,
+    )
+    conv_store.list_items = lambda conversation_id, **kwargs: page  # type: ignore[method-assign]
+    store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        file_store=_ZipFileStore(),
+        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    # The task's agent can't open files, so the run stops before copying anything.
+    assert conv_store.forked == [] and launched == []
+    (run,) = store.runs
+    assert (run["status"], run.get("error_code")) == ("failed", "source_session_incompatible")
+    assert "bundle.zip" in run["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_copy_that_cannot_take_every_file_is_deleted(tmp_path: Path) -> None:
+    class _FailingRowFileStore:
+        def list(self, session_id: str, **kwargs: Any) -> SimpleNamespace:
+            stored = StoredFile(
+                id="f" * 32, created_at=1, filename="notes.txt", bytes=5, session_id=session_id
+            )
+            return SimpleNamespace(data=[stored], has_more=False, last_id=stored.id)
+
+        def create(self, **kwargs: Any) -> None:
+            raise RuntimeError("database unavailable")
+
+        def delete_all_for_session(self, session_id: str) -> list[str]:
+            return []
+
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        file_store=_FailingRowFileStore(),
+        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    # The copy's history names a file it lacks, so the run deletes the copy and fails.
+    assert [fork["source_id"] for fork in conv_store.forked] == ["conv_source"]
+    assert conv_store.deleted == ["conv_1"] and launched == []
+    (run,) = store.runs
+    assert (run["status"], run.get("error_code")) == ("failed", "session_create_failed")
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_source_session_fails_the_run_and_pauses_the_task() -> None:
+    conv_store = FakeConversationStore()
+    conv_store.get_conversation = lambda conversation_id: None  # type: ignore[method-assign]
+    store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.forked == [] and launched == []
+    (run,) = store.runs
+    assert (run["status"], run.get("error_code")) == ("failed", "source_session_missing")
+    assert {"id": "task_1", "state": "paused"} in store.updates
+
+
+def test_a_run_on_another_agent_leaves_off_the_copys_mcp_picks() -> None:
+    labels = {"omnigent.mcp_service.jira": "1", "omnigent.ui": "terminal"}
+
+    same_agent = run_copy_dropped_label_keys(labels, agent_changed=False)
+    other_agent = run_copy_dropped_label_keys(labels, agent_changed=True)
+
+    # Presentation is always re-stamped for the run's agent, and the copy's permission
+    # labels never describe the run, which launches with the task's mode.
+    assert {
+        "omnigent.ui",
+        "omnigent.wrapper",
+        "omnigent.claude_native.permission_mode",
+        "omnigent.codex_native.approval_mode",
+    } <= same_agent
+    assert "omnigent.mcp_service.jira" not in same_agent
+    assert "omnigent.mcp_service.jira" in other_agent
+
+
+def _busy_until_check(
+    live_status: str | None,
+    last_scheduled_at: int | None,
+    *,
+    updated_at: int = 0,
+    fired_at: int | None = None,
+    status: str = "succeeded",
+    pending: int | None = None,
+):
+    """The busy check over one session's persisted status and the task's latest run."""
+    session_id = "sess_busy_check"
+    activity = (
+        {}
+        if live_status is None
+        else {
+            session_id: SessionActivity(
+                updated_at,
+                live_status=live_status,
+                pending_elicitation_count=pending,
+                runner_id="runner_busy_check",
+            )
+        }
+    )
+    runs = (
+        []
+        if last_scheduled_at is None
+        else [Mock(scheduled_at=last_scheduled_at, fired_at=fired_at, status=status)]
+    )
+    sched_store = Mock(list_runs=Mock(return_value=(runs, None)))
+    conversation_store = Mock(get_session_activity=Mock(return_value=activity))
+    return build_busy_until(_deps(sched_store, conversation_store=conversation_store))
+
+
+@pytest.mark.parametrize(
+    ("session_mode", "live_status", "minutes_since_last_run", "wait_seconds"),
+    [
+        pytest.param("continue", "running", 2, BUSY_RECHECK_SECONDS, id="turn-in-progress"),
+        # Never later than ten minutes after the latest poll.
+        pytest.param("continue", "waiting", 9, 60, id="waiting-on-approval-until-backstop"),
+        pytest.param(
+            "continue", "running", BUSY_SKIP_MAX_SECONDS // 60, None, id="ten-minute-backstop"
+        ),
+        pytest.param("continue", "idle", 2, None, id="idle"),
+        pytest.param("continue", None, 2, None, id="session-gone"),
+        pytest.param("continue", "running", None, None, id="no-earlier-run"),
+        pytest.param("new", "running", 2, None, id="new-session-each-run"),
+    ],
+)
+async def test_a_busy_session_is_checked_again_later(
+    session_mode, live_status, minutes_since_last_run, wait_seconds
+) -> None:
+    due = 1_800_003_600
+    last = None if minutes_since_last_run is None else due - minutes_since_last_run * 60
+    check = _busy_until_check(live_status, last)
+    task = _task(
+        session_mode=session_mode,
+        session_id="sess_busy_check" if session_mode == "continue" else None,
+        next_run_at=due,
+    )
+    assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)
+
+
+async def test_a_trigger_without_a_session_yet_polls_now() -> None:
+    due = 1_800_003_600
+    check = _busy_until_check("running", due - 60)
+    task = _task(session_mode="continue", session_id=None, next_run_at=due)
+    assert await check(task, due) is None
+
+
+async def test_a_late_poll_counts_the_ten_minutes_from_the_current_time() -> None:
+    due = 1_800_003_600
+    # A Run now went out five minutes before this poll was due.
+    check = _busy_until_check("running", due - 5 * 60)
+    task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
+    assert await check(task, due) == due + BUSY_RECHECK_SECONDS
+    # Dispatched half an hour late, the poll is sent even though the session looks busy.
+    assert await check(task, due + 30 * 60) is None
+
+
+async def test_the_ten_minutes_count_from_when_the_latest_poll_went_out() -> None:
+    due = 1_800_003_600
+    # The latest poll was due half an hour ago but only went out two minutes ago.
+    check = _busy_until_check("running", due - 30 * 60, fired_at=due - 2 * 60)
+    task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
+    assert await check(task, due) == due + BUSY_RECHECK_SECONDS
+
+
+async def test_the_ten_minutes_count_from_the_tasks_latest_firing() -> None:
+    due = 1_800_003_600
+    # The newest run by schedule went out nine minutes ago, but a later firing two
+    # minutes ago is the task's last run.
+    check = _busy_until_check("running", due - 9 * 60, fired_at=due - 9 * 60)
+    task = _task(
+        session_mode="continue",
+        session_id="sess_busy_check",
+        next_run_at=due,
+        last_run_at=due - 2 * 60,
+    )
+    assert await check(task, due) == due + BUSY_RECHECK_SECONDS
+
+
+@pytest.mark.parametrize("status", ["scheduled", "starting"])
+async def test_a_poll_still_being_delivered_counts_as_busy(status) -> None:
+    due = 1_800_003_600
+    # The session looks quiet, but the previous poll is still on its way, e.g. in a sandbox.
+    check = _busy_until_check("idle", due - 60, fired_at=due - 60, status=status)
+    task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
+    assert await check(task, due) == due + BUSY_RECHECK_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("pending", "wait_seconds"),
+    [
+        pytest.param(1, BUSY_RECHECK_SECONDS, id="approval-pending"),
+        pytest.param(0, None, id="nothing-pending"),
+    ],
+)
+async def test_an_idle_native_session_waiting_on_an_approval_counts_as_busy(
+    pending, wait_seconds
+) -> None:
+    due = 1_800_003_600
+    # Quiet for three minutes, and the previous poll went out five minutes ago.
+    check = _busy_until_check("idle", due - 300, updated_at=due - 180, pending=pending)
+    task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
+    assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)
+
+
+async def test_the_backstop_caps_the_quiet_wait() -> None:
+    due = 1_800_003_600
+    # Quiet for only 10 seconds, but the latest poll went out 9.5 minutes ago.
+    check = _busy_until_check("idle", due - 570, updated_at=due - 10)
+    task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
+    assert await check(task, due) == due + 30
+
+
+@pytest.mark.parametrize(
+    ("seconds_since_change", "wait_seconds"),
+    [
+        pytest.param(30, BUSY_QUIET_SECONDS - 30, id="pausing-between-steps"),
+        pytest.param(BUSY_QUIET_SECONDS, None, id="quiet-for-two-minutes"),
+    ],
+)
+async def test_an_idle_session_is_polled_two_quiet_minutes_after_its_last_change(
+    seconds_since_change, wait_seconds
+) -> None:
+    due = 1_800_003_600
+    check = _busy_until_check("idle", due - 5 * 60, updated_at=due - seconds_since_change)
+    task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
+    assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)

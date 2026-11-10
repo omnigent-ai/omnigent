@@ -14,12 +14,13 @@ from pathlib import Path
 import pytest
 
 from omnigent.debug_logging import record_to_row
+from omnigent.harnesses.claude_native.program_status import (
+    ERROR_HOOK_GRACE_S as _GRACE_S,
+)
 from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
 from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
 from omnigent.terminals.program_status import ProgramStatusReader
 
-# The production grace period, from ERROR_HOOK_GRACE_S.
-_GRACE_S = 5.0
 _ERROR_REPORT = {"state": "error", "app": "claude-code", "message": "API Error: 499"}
 # What Claude reports after a turn fails authentication, until the user signs in.
 _AUTH_BLOCKED_REPORT = {
@@ -107,12 +108,52 @@ def test_error_fallback_preserves_available_detail(tmp_path: Path, message: str 
     )
     poller.tick()
     assert published == failures == []
-    clock.now = _GRACE_S
+    clock.now = 10.0
     poller.tick()
     poller.resync()
     poller.tick()
     assert failures == ([message] if message and message.strip() else [])
     assert published == ([] if failures else ["failed"])
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        _ERROR_REPORT,
+        {**_ERROR_REPORT, "message": None},
+        _AUTH_BLOCKED_REPORT,
+        {**_AUTH_BLOCKED_REPORT, "message": None},
+    ],
+)
+def test_delayed_failure_hook_can_settle_before_fallback(
+    tmp_path: Path, report: dict[str, object]
+) -> None:
+    """A delayed detailed hook must not be preceded by a synthetic failure."""
+    path = tmp_path / "program-status.json"
+    _write_report(path, report)
+    clock = _FakeClock()
+    published: list[str] = []
+    failures: list[str] = []
+    turn_active = True
+    poller = _poller(
+        tmp_path,
+        path,
+        published,
+        turn_is_active=lambda: turn_active,
+        failures=failures,
+        clock=clock,
+    )
+
+    poller.tick()
+    clock.now = 7.5
+    poller.resync()
+    poller.tick()
+    assert published == failures == []
+
+    turn_active = False
+    clock.now = 30.0
+    poller.tick()
+    assert published == failures == []
 
 
 def test_auth_block_is_a_failed_turn_while_a_prompt_block_is_work(tmp_path: Path) -> None:
