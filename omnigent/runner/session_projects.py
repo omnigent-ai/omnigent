@@ -52,8 +52,11 @@ async def resolve_project_id(
         raise ValueError("project_name must not be empty")
 
     async def find() -> str | None:
-        project = await _find_project(client, trimmed)
-        return str(project["id"]) if project is not None else None
+        resp = await client.get("/v1/projects", timeout=30.0)
+        if resp.status_code >= 400:
+            raise ValueError(f"could not list projects: {resp.text[:200]}")
+        projects = resp.json().get("data", [])
+        return next((p["id"] for p in projects if p.get("name") == trimmed), None)
 
     existing = await find()
     if existing is not None:
@@ -732,66 +735,3 @@ async def execute_project_update(
     if "icon" in args:
         result["icon"] = icon or None
     return json.dumps(result)
-
-
-async def execute_project_delete(
-    args: dict[str, Any], client: httpx.AsyncClient | None, source_id: str | None
-) -> str:
-    """
-    Delete one of the owner's projects once no unarchived session is filed in it.
-
-    The sidebar's delete archives every member session first; the agent tool
-    refuses instead, so the agent moves or archives sessions explicitly.
-
-    :param args: Tool arguments: ``project`` (name).
-    :param client: HTTP client pointed at the Omnigent server.
-    :param source_id: The calling session, sent as the orchestration source.
-    :returns: JSON with ``project`` and ``status``, or ``error``.
-    """
-    name = _project_name_arg(args.get("project"))
-    if name is None:
-        return json.dumps({"error": "project must be a project name of at most 100 characters"})
-    if client is None or source_id is None:
-        return json.dumps({"error": "sys_project_delete requires an authenticated runner"})
-    if not await _server_checks_source(client, _ORGANIZE_SOURCE_CHECKS):
-        return _unchecked_server_error("sys_project_delete", "a project")
-    project, error = await _owned_project(client, "sys_project_delete", name)
-    if project is None:
-        return json.dumps({"project": name, "error": error})
-    headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
-    try:
-        members, complete = await _project_members(client, name)
-    except (httpx.HTTPError, ValueError) as exc:
-        return json.dumps({"project": name, "error": f"sys_project_delete: {exc}"})
-    if not complete:
-        return json.dumps(
-            {"project": name, "error": "the project has too many sessions to check; not deleted"}
-        )
-    if any(member.get("archived") is not True for member in members):
-        return json.dumps(
-            {
-                "project": name,
-                "error": "project still has sessions; move or archive them with "
-                "sys_session_update first (sys_project_list with this project lists them)",
-            }
-        )
-    # Archived members would otherwise keep pointing at the deleted row.
-    _, not_unfiled = await _refile_members(client, members, project_id="", headers=headers)
-    if not_unfiled:
-        return json.dumps(
-            {
-                "project": name,
-                "error": "some archived sessions could not be removed from the project; "
-                "not deleted",
-                "sessions_not_moved": not_unfiled,
-            }
-        )
-    try:
-        response = await client.delete(
-            f"/v1/projects/{project['id']}", headers=headers, timeout=30.0
-        )
-    except httpx.HTTPError as exc:
-        return json.dumps({"project": name, "error": f"delete could not be confirmed: {exc}"})
-    if response.is_error:
-        return json.dumps({"project": name, "error": _project_refusal(response, None)})
-    return json.dumps({"project": name, "status": "deleted"})

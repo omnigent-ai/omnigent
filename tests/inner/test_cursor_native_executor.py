@@ -275,7 +275,6 @@ class TestBridge:
         assert "sys_project_list" in server["autoApprove"]
         assert "sys_session_update" in server["autoApprove"]
         assert "sys_project_update" in server["autoApprove"]
-        assert "sys_project_delete" in server["autoApprove"]
         assert server["autoApprove"] == sorted(server["autoApprove"])
         assert server["env"]["TMPDIR"]
 

@@ -89,20 +89,18 @@ MCP independent creation.
   its emoji icon, keeping its other stored defaults; like the sidebar's
   rename it re-files sessions that still belong through the legacy label,
   promotes a label-only folder to a project row, and reports any session it
-  could not move. `sys_project_delete` deletes a project only when no
-  unarchived session is filed in it, unlike the sidebar's delete, which
-  archives the members first; it walks every page of members, since the list
-  drops side chats after paging, and removes archived members from the
-  project before deleting the row. Sub-agents follow their parent and a
+  could not move. Agents cannot delete projects: the sessions list hides side
+  chats, so only the server could tell that a project is empty, and it has no
+  check for that yet. Sub-agents follow their parent and a
   family follows its representative for filing; each refusal names the
   session to update instead. An edit-shared caller cannot change a project or
-  create, rename or delete one, or rename, pin or archive a session, while
+  create or rename one, or rename, pin or archive a session, while
   listing stays an ordinary owner read. A session shared with the caller
   but owned by someone else is refused, even when it is already in the target
   project. Project-only updates refuse to run against a server that does not
   advertise `session_move_source_checks` in `/v1/info`; every other write
   needs `session_organize_source_checks`. `tool_groups.projects: false`
-  drops all four tools. Covered by
+  drops all three tools. Covered by
   `tests/server/integration/test_session_orchestration_projects.py::test_project_tools_list_and_file_running_sessions`,
   `::test_organizing_tools_rename_pin_archive_and_manage_projects`,
   `::test_organizing_tools_refuse_a_source_shared_with_edit_access`,
@@ -133,14 +131,14 @@ MCP independent creation.
   sessions, including itself, into an existing or new project. The sidebar folders
   update while the agent keeps running.
 - Ask the same agent to rename, pin or archive a session, find sessions by a
-  word in their title or transcript, rename a project or give it an emoji, or
-  delete an emptied project; the sidebar reflects each change live.
+  word in their title or transcript, or rename a project or give it an emoji;
+  the sidebar reflects each change live.
 - In a native Claude Code session's Chat or agent terminal, ask the same; the
   relay exposes `mcp__omnigent__sys_project_list`,
-  `mcp__omnigent__sys_session_update`, `mcp__omnigent__sys_project_update` and
-  `mcp__omnigent__sys_project_delete`, and the session lands in its folder
+  `mcp__omnigent__sys_session_update` and `mcp__omnigent__sys_project_update`,
+  and the session lands in its folder
   mid-turn (`test_native_claude_files_itself_into_a_project`, nightly). Cursor
-  and Antigravity sessions reach the same four tools through their relay
+  and Antigravity sessions reach the same three tools through their relay
   allowlists, which approve them without an in-terminal prompt.
 - Use the existing Share dialog to share the sender or receiver, then repeat.
   A read-only share of the sender keeps both tools working; an edit share

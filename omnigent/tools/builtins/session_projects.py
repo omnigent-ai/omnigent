@@ -30,7 +30,7 @@ class SysProjectListTool(Tool):
             "only pinned sessions, and include_archived adds archived ones. A session "
             "with moves_with is in a family and shares that session's project. Use "
             "sys_session_update to file, rename, pin or archive a session, and "
-            "sys_project_update or sys_project_delete for the projects themselves."
+            "sys_project_update to rename a project or change its icon."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -199,43 +199,6 @@ class SysProjectUpdateTool(Tool):
                             "type": "string",
                             "maxLength": MAX_PROJECT_ICON_LENGTH,
                             "description": 'One emoji to show for the project; "" removes it.',
-                        },
-                    },
-                    "required": ["project"],
-                    "additionalProperties": False,
-                },
-            },
-        }
-
-
-class SysProjectDeleteTool(Tool):
-    @classmethod
-    def name(cls) -> str:
-        return "sys_project_delete"
-
-    @classmethod
-    def description(cls) -> str:
-        return (
-            "Delete one of the user's projects once no unarchived session is filed in "
-            "it. Move or archive its sessions with sys_session_update first; a project "
-            "that still has sessions is refused. Archived sessions filed in it are "
-            "removed from it first. Sessions are never deleted."
-        )
-
-    def get_schema(self) -> dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name(),
-                "description": self.description(),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "project": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": MAX_PROJECT_NAME_LENGTH,
-                            "description": "Name of the project to delete.",
                         },
                     },
                     "required": ["project"],

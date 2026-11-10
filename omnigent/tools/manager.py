@@ -29,7 +29,6 @@ from omnigent.tools.builtins import (
     SysCallAsyncTool,
     SysCancelAsyncTool,
     SysListModelsTool,
-    SysProjectDeleteTool,
     SysProjectListTool,
     SysProjectUpdateTool,
     SysReadInboxTool,
@@ -555,7 +554,6 @@ class ToolManager:
         self._tools[SysProjectListTool.name()] = SysProjectListTool()
         self._tools[SysSessionUpdateTool.name()] = SysSessionUpdateTool()
         self._tools[SysProjectUpdateTool.name()] = SysProjectUpdateTool()
-        self._tools[SysProjectDeleteTool.name()] = SysProjectDeleteTool()
 
     def _register_task_lifecycle_tools(self) -> None:
         """

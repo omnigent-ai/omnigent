@@ -99,6 +99,10 @@ def require_private_bound_source(
     return source
 
 
+# How many sessions the archive guard walks up from the caller before refusing.
+_MAX_ARCHIVE_LINEAGE_DEPTH = 32
+
+
 def require_archive_outside_source_lineage(
     request: Request, session_id: str, conversations: ConversationStore
 ) -> None:
@@ -107,8 +111,10 @@ def require_archive_outside_source_lineage(
 
     Archiving stops the target and its running sub-agent descendants, so a
     caller archiving an ancestor (its parent, even after the parent moved to
-    another runner, or a side chat's source) would stop itself. Requests
-    without the orchestration-source header are left alone.
+    another runner, or a side chat's source) would stop itself. A lineage
+    deeper than the walk's bound, or a cycle, is refused, since the target's
+    place in it is unknown. Requests without the orchestration-source header
+    are left alone.
     """
     raw_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
     if not raw_source:
@@ -117,10 +123,16 @@ def require_archive_outside_source_lineage(
     source_id = normalize_uuid(raw_source)
     current = conversations.get_conversation(source_id) if source_id else None
     seen: set[str] = set()
-    while current is not None and current.id not in seen and len(seen) < 32:
+    while current is not None:
         if current.id == target:
             raise OmnigentError(
                 "An agent cannot archive its own session or a session it runs under",
+                code=ErrorCode.FORBIDDEN,
+            )
+        if current.id in seen or len(seen) >= _MAX_ARCHIVE_LINEAGE_DEPTH:
+            raise OmnigentError(
+                "An agent cannot archive another session while its own session's "
+                "lineage cannot be checked",
                 code=ErrorCode.FORBIDDEN,
             )
         seen.add(current.id)

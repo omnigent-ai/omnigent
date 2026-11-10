@@ -361,7 +361,6 @@ def test_researcher_drops_every_framework_tool_group() -> None:
         "sys_project_list",
         "sys_session_update",
         "sys_project_update",
-        "sys_project_delete",
     }
     assert "sys_os_shell" in names
     composed = build_instructions_nullable(researcher, None, [])

@@ -56,7 +56,6 @@ from omnigent.tools.builtins.scheduled_tasks import (
     SysScheduledTaskUpdateTool,
 )
 from omnigent.tools.builtins.session_projects import (
-    SysProjectDeleteTool,
     SysProjectListTool,
     SysProjectUpdateTool,
     SysSessionUpdateTool,
@@ -94,7 +93,6 @@ __all__ = [
     "SysCallAsyncTool",
     "SysCancelAsyncTool",
     "SysListModelsTool",
-    "SysProjectDeleteTool",
     "SysProjectListTool",
     "SysProjectUpdateTool",
     "SysReadInboxTool",

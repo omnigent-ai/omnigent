@@ -7,7 +7,6 @@ import pytest
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.session_projects import (
-    execute_project_delete,
     execute_project_list,
     execute_project_update,
     execute_session_update,
@@ -433,28 +432,7 @@ async def test_project_update_maps_unknown_projects_and_name_conflicts():
     assert taken["error"] == "a project named 'Taken' already exists"
 
 
-async def test_project_delete_refuses_a_project_with_sessions():
-    requests: list[httpx.Request] = []
-    async with _client(_project_server(requests, members=[{"id": PARENT}])) as client:
-        result = json.loads(await execute_project_delete({"project": "Q3"}, client, SOURCE))
-    assert "project still has sessions" in result["error"]
-    (listed,) = [r for r in requests if r.url.path == "/v1/sessions"]
-    assert listed.url.params["project"] == "Q3" and listed.url.params["visibility"] == "mine"
-    assert not [r for r in requests if r.method == "DELETE"]
-
-
-async def test_project_delete_removes_an_empty_project_with_the_source_header():
-    requests: list[httpx.Request] = []
-    async with _client(_project_server(requests)) as client:
-        result = json.loads(await execute_project_delete({"project": "Q3"}, client, SOURCE))
-    assert result == {"project": "Q3", "status": "deleted"}
-    (deleted,) = [r for r in requests if r.method == "DELETE"]
-    assert deleted.url.path == f"/v1/projects/{PROJECT_ID}"
-    assert deleted.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
-
-
-@pytest.mark.parametrize("tool", [execute_project_update, execute_project_delete])
-async def test_project_writes_need_the_organize_source_check(tool):
+async def test_project_update_needs_the_organize_source_check():
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -462,7 +440,9 @@ async def test_project_writes_need_the_organize_source_check(tool):
         return httpx.Response(200, json=CHECKED_INFO)
 
     async with _client(handler) as client:
-        result = json.loads(await tool({"project": "Q3", "name": "New"}, client, SOURCE))
+        result = json.loads(
+            await execute_project_update({"project": "Q3", "name": "New"}, client, SOURCE)
+        )
     assert "cannot check the calling session's sharing" in result["error"]
     assert [(r.method, r.url.path) for r in requests] == [("GET", "/v1/info")]
 
@@ -537,31 +517,6 @@ def _paged_project_server(requests: list[httpx.Request], pages: list[list[dict]]
         return httpx.Response(200, json={})
 
     return handler
-
-
-async def test_project_delete_follows_a_filtered_empty_page_to_the_active_member():
-    requests: list[httpx.Request] = []
-    pages = [[], [{"id": PARENT}]]
-    async with _client(_paged_project_server(requests, pages)) as client:
-        result = json.loads(await execute_project_delete({"project": "Q3"}, client, SOURCE))
-    assert "project still has sessions" in result["error"]
-    assert [r.url.params.get("after") for r in requests if r.url.path == "/v1/sessions"] == [
-        None,
-        "1",
-    ]
-    assert not [r for r in requests if r.method in ("PATCH", "DELETE")]
-
-
-async def test_project_delete_unfiles_archived_members_before_deleting():
-    requests: list[httpx.Request] = []
-    archived = {"id": PARENT, "archived": True, "project_id": PROJECT_ID}
-    async with _client(_paged_project_server(requests, [[archived]])) as client:
-        result = json.loads(await execute_project_delete({"project": "Q3"}, client, SOURCE))
-    assert result == {"project": "Q3", "status": "deleted"}
-    patched, deleted = [r for r in requests if r.method in ("PATCH", "DELETE")]
-    assert patched.url.path == f"/v1/sessions/{PARENT}"
-    assert json.loads(patched.content) == {"project_id": "", "labels": {"omni_project": ""}}
-    assert deleted.method == "DELETE" and deleted.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
 
 
 async def test_project_rename_refiles_members_that_belong_through_the_legacy_label():

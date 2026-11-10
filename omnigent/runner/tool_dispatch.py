@@ -92,7 +92,6 @@ from omnigent.tools.builtins.session_message import (
     peer_session_messaging_enabled,
 )
 from omnigent.tools.builtins.session_projects import (
-    SysProjectDeleteTool,
     SysProjectListTool,
     SysProjectUpdateTool,
     SysSessionUpdateTool,
@@ -342,7 +341,6 @@ _PROJECT_TOOLS = frozenset(
         SysProjectListTool.name(),
         SysSessionUpdateTool.name(),
         SysProjectUpdateTool.name(),
-        SysProjectDeleteTool.name(),
     }
 )
 _UI_TOOLS = frozenset({UiOpenFileTool.name()})
@@ -631,7 +629,6 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysProjectListTool,
             SysSessionUpdateTool,
             SysProjectUpdateTool,
-            SysProjectDeleteTool,
             UiOpenFileTool,
             SysAgentGetTool,
             SysAgentListTool,
@@ -7268,7 +7265,6 @@ async def execute_tool(
             output = await execute_message_tool(args, server_client, conversation_id)
         elif tool_name in _PROJECT_TOOLS:
             from omnigent.runner.session_projects import (
-                execute_project_delete,
                 execute_project_list,
                 execute_project_update,
                 execute_session_update,
@@ -7278,7 +7274,6 @@ async def execute_tool(
                 SysProjectListTool.name(): execute_project_list,
                 SysSessionUpdateTool.name(): execute_session_update,
                 SysProjectUpdateTool.name(): execute_project_update,
-                SysProjectDeleteTool.name(): execute_project_delete,
             }[tool_name]
             output = await execute(args, server_client, conversation_id)
         elif tool_name in _SESSION_CREATE_TOOLS:
