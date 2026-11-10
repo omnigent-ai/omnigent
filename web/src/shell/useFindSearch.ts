@@ -76,9 +76,9 @@ export function useFindSearch(
     return () => controller.abort();
   }, [corpus, query, matchCase, onWorker]);
   // A refreshed corpus under the same query keeps the last matches while the worker reruns,
-  // so the occurrence the reader is on survives the wait. A new query drops them.
+  // so the occurrence the reader is on survives the wait; an old failure doesn't. A new query drops them.
   const refreshing = useMemo<FindSearch | null>(
-    () => (settled ? { ...settled.search, searching: true } : null),
+    () => (settled ? { ...settled.search, tooSlow: false, failed: false, searching: true } : null),
     [settled],
   );
 

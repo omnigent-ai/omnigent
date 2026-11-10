@@ -92,6 +92,22 @@ describe("useFindSearch", () => {
     expect(result.current).toMatchObject({ searching: false, matches: [] });
   });
 
+  it.each([
+    ["timed out", { tooSlow: true }],
+    ["failed", { failed: true }],
+  ])("drops a %s result while a refreshed corpus is searched", async (_label, flags) => {
+    const refreshed = deferred<FindOutcome | null>();
+    search.mockResolvedValueOnce({ ...EMPTY, ...flags }).mockReturnValueOnce(refreshed.promise);
+    const { result, rerender } = renderHook(
+      ({ corpus }) => useFindSearch(corpus, "needle", OPTIONS),
+      { initialProps: { corpus: CORPUS } },
+    );
+    await waitFor(() => expect(result.current).toMatchObject({ searching: false, ...flags }));
+
+    rerender({ corpus: OTHER_CORPUS });
+    expect(result.current).toMatchObject({ searching: true, tooSlow: false, failed: false });
+  });
+
   it("drops the previous matches when the query changes", async () => {
     const replaced = deferred<FindOutcome | null>();
     search.mockResolvedValueOnce(FOUND).mockReturnValueOnce(replaced.promise);
