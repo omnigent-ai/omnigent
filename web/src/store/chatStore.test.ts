@@ -6819,6 +6819,7 @@ describe("chatStore — send (file attachments)", () => {
       text: "summarize these photos",
       files: [zip],
       stableId: expect.any(String),
+      fresh: true,
       // A 415 carries no Omnigent error code: the message was never sent.
       serverRefused: false,
     });
@@ -6923,7 +6924,10 @@ describe("chatStore — delivered-but-unacked send", () => {
     const stableId = draft?.stableId;
     expect(stableId).toBeTruthy();
     expect(errorCards()).toEqual([
-      expect.objectContaining({ message: "Failed to fetch", unansweredSend: { stableId } }),
+      expect.objectContaining({
+        message: "Failed to fetch",
+        unansweredSend: { stableId, fresh: true },
+      }),
     ]);
 
     handleSessionEvent({
@@ -6976,7 +6980,7 @@ describe("chatStore — delivered-but-unacked send", () => {
     expect(errorCards()).toEqual([
       expect.objectContaining({
         message: "Load failed",
-        unansweredSend: { stableId: expect.any(String), text: "file a single PR" },
+        unansweredSend: { stableId: expect.any(String), text: "file a single PR", fresh: true },
       }),
     ]);
 
@@ -15271,6 +15275,68 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
   // A restored failed-send draft reconciles against the snapshot too: its
   // `session_input_consumed` proof is never replayed after a reconnect.
+  it.each([
+    { before: "cancelled", incoming: "recorded", expected: "recorded" },
+    { before: "recorded", incoming: "cancelled", expected: "recorded" },
+    { before: undefined, incoming: "cancelled", expected: "cancelled" },
+  ] as const)(
+    "reconnect upserts native $incoming over $before without consuming a newer input or retry",
+    async ({ before, incoming, expected }) => {
+      const id = "conv_native_gap";
+      const anchor = userMessage("native_gap_anchor", "before the gap");
+      const item: MessageItem = {
+        ...(userMessage("native_gap_input", "same input") as MessageItem),
+        native_input_state: incoming,
+      };
+      const initial = before ? [anchor, { ...item, native_input_state: before }] : [anchor];
+      seedSession(id, initial);
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      const newer: PendingUserMessage = {
+        tempId: "newer",
+        pendingId: "pending_newer",
+        content: [{ type: "input_text", text: "same input" }],
+      };
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        blocks: [
+          ...itemsToBlocks(initial),
+          unansweredSendCard({ stableId: item.id, ...{ fresh: false } }),
+        ],
+        pendingUserMessages: [newer],
+        failedSendDraft: {
+          conversationId: id,
+          stableId: item.id,
+          text: "new retry",
+          files: [],
+          fresh: false,
+        },
+      });
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      seedSessionItems(id, [anchor, item]);
+      sinks[0]!.error();
+      await drainAsync();
+      const state = useChatStore.getState();
+      expect(state.blocks.filter((block) => block.ctx.itemId === item.id)).toHaveLength(1);
+      expect(state.blocks.find((block) => block.ctx.itemId === item.id)).toMatchObject({
+        nativeInputState: expected,
+      });
+      expect(state.pendingUserMessages).toEqual([newer]);
+      expect(state.failedSendDraft).toMatchObject({ text: "new retry", fresh: false });
+      expect(
+        state.blocks.some(
+          (block) => block.type === "error" && block.unansweredSend?.stableId === item.id,
+        ),
+      ).toBe(true);
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
+
   it("retracts an ack-lost restored draft and its card when the reconnect snapshot holds its item", async () => {
     const stableId = "c".repeat(32);
     const before = userMessage("draft_pre", "before the gap");
@@ -23446,4 +23512,331 @@ describe("chatStore — sidebar holds for submitted verdicts", () => {
     finishes[1]?.(mockResponse({ queued: false }, { ok: true, status: 202 }));
     await retry;
   });
+});
+
+describe("native input settlement ownership", () => {
+  function receipt(
+    state: unknown,
+    itemId = "native_original",
+    pendingId = "pending_original",
+  ): SessionInputConsumedEvent {
+    return {
+      type: "session_input_consumed",
+      itemType: "message",
+      itemId,
+      clearedPendingId: pendingId,
+      createdBy: "sender@example.test",
+      data: {
+        role: "user",
+        native_input_state: state,
+        content: [{ type: "input_text", text: "same input" }],
+      },
+    };
+  }
+
+  it("promotes only the named cancellation and keeps a newer input on duplicate and late receipts", () => {
+    const original: PendingUserMessage = {
+      tempId: "original_temp",
+      pendingId: "pending_original",
+      author: "sender@example.test",
+      createdAtS: 123,
+      content: [
+        { type: "input_image", file_id: "original_file", filename: "image.png" },
+        { type: "input_text", text: "same input" },
+      ],
+    };
+    const newer: PendingUserMessage = {
+      tempId: "newer_temp",
+      pendingId: "pending_newer",
+      content: [{ type: "input_text", text: "same input" }],
+    };
+    const active = { responseId: "response_newer", state: "streaming" as const, error: null };
+    useChatStore.setState({
+      conversationId: "conv_native",
+      blocks: [],
+      pendingUserMessages: [original, newer],
+      activeResponse: active,
+      status: "streaming",
+    });
+
+    handleSessionEvent(receipt("cancelled"));
+    handleSessionEvent(receipt("cancelled"));
+    const cancelled = useChatStore.getState().blocks[0] as UserMessageBlock;
+    expect(cancelled).toMatchObject({
+      nativeInputState: "cancelled",
+      stableKey: original.tempId,
+      content: original.content,
+      ctx: { createdBy: original.author, clientCreatedAtS: 123 },
+    });
+    expect(useChatStore.getState().pendingUserMessages).toEqual([newer]);
+    handleSessionEvent(receipt("recorded"));
+    handleSessionEvent(receipt("cancelled"));
+    const state = useChatStore.getState();
+    expect(state.blocks).toHaveLength(1);
+    expect(state.blocks[0]).toMatchObject({
+      nativeInputState: "recorded",
+      content: original.content,
+      stableKey: original.tempId,
+    });
+    expect(state.pendingUserMessages).toEqual([newer]);
+    expect(state.activeResponse).toBe(active);
+    expect(state.status).toBe("streaming");
+  });
+
+  it.each(["cancelled", "recorded"])(
+    "does not consume an unrelated pending input for a %s receipt without an exact owner",
+    (state) => {
+      const pending: PendingUserMessage = {
+        tempId: "newer",
+        pendingId: "pending_newer",
+        content: [{ type: "input_text", text: "same input" }],
+      };
+      useChatStore.setState({
+        conversationId: "conv_native",
+        pendingUserMessages: [pending],
+        blocks: [],
+      });
+      handleSessionEvent(receipt(state));
+      handleSessionEvent(receipt(state));
+      expect(useChatStore.getState().pendingUserMessages).toEqual([pending]);
+      expect(useChatStore.getState().blocks).toHaveLength(1);
+    },
+  );
+
+  it.each(["unknown", "", 1, {}])(
+    "does not FIFO-settle an unknown native outcome %j",
+    (outcome) => {
+      useChatStore.setState({
+        conversationId: "conv_native",
+        pendingUserMessages: [
+          { tempId: "legacy", content: [{ type: "input_text", text: "same input" }] },
+        ],
+        blocks: [],
+      });
+      handleSessionEvent(receipt(outcome));
+      expect(useChatStore.getState().pendingUserMessages).toMatchObject([{ tempId: "legacy" }]);
+      expect(useChatStore.getState().blocks).toEqual([]);
+    },
+  );
+
+  it("keeps pending input when a typed receipt omits the pending identity", () => {
+    const pending: PendingUserMessage = {
+      tempId: "newer",
+      pendingId: "pending_newer",
+      content: [{ type: "input_text", text: "same input" }],
+    };
+    useChatStore.setState({
+      conversationId: "conv_native",
+      pendingUserMessages: [pending],
+      blocks: [],
+    });
+    const event = receipt("cancelled");
+    delete event.clearedPendingId;
+    handleSessionEvent(event);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([pending]);
+  });
+
+  it.each([
+    ["cancelled", true, false],
+    ["cancelled", false, false],
+    ["recorded", true, true],
+    ["recorded", false, false],
+  ] as const)("distinguishes %s snapshot from delivery for fresh=%s", (state, fresh, delivered) => {
+    const item: MessageItem = {
+      ...(userMessage("snapshot_delivery", "same input") as MessageItem),
+      native_input_state: state,
+    };
+    expect(committedItemProvesDelivery(itemsToBlocks([item]), { stableId: item.id, fresh })).toBe(
+      delivered,
+    );
+  });
+
+  it.each([
+    "fresh_cancel_error",
+    "fresh_recorded_error",
+    "reused_cancel_error",
+    "reused_recorded_error",
+    "reused_old_ack",
+    "reused_matching_ack",
+    "reused_evicted_ack",
+  ])("accounts for an early callback causally through %s", async (scenario) => {
+    const reused = scenario.startsWith("reused");
+    const recorded = scenario.includes("recorded");
+    const rejects = scenario.endsWith("error");
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+      blocks: [],
+      pendingUserMessages: [],
+      failedSendDraft: null,
+      restoredSendDraft: null,
+    });
+    let finish!: (response: Response) => void;
+    let fail!: (error: Error) => void;
+    let stableId = "";
+    const held = new Promise<Response>((resolve, reject) => {
+      finish = resolve;
+      fail = reject;
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        stableId = (JSON.parse(init.body as string) as { data: { stable_id: string } }).data
+          .stable_id;
+        return held;
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const sending = useChatStore
+      .getState()
+      .send(
+        "same input",
+        "agent_xyz",
+        undefined,
+        reused ? { stableId: "a".repeat(32) } : undefined,
+      );
+    await vi.waitFor(() => expect(stableId).not.toBe(""));
+    const original = useChatStore.getState().pendingUserMessages[0]!;
+    const newer: PendingUserMessage = {
+      tempId: "newer",
+      pendingId: "pending_newer",
+      content: [{ type: "input_text", text: "same input" }],
+    };
+    const active = { responseId: "response_newer", state: "streaming" as const, error: null };
+    useChatStore.setState({
+      pendingUserMessages: [original, newer],
+      activeResponse: active,
+      status: "streaming",
+      sessionStatus: "running",
+    });
+    handleSessionEvent(receipt(recorded ? "recorded" : "cancelled", stableId));
+    expect(useChatStore.getState().pendingUserMessages).toEqual(
+      reused ? [original, newer] : [newer],
+    );
+    if (scenario === "reused_evicted_ack") {
+      for (let index = 0; index < 129; index += 1)
+        handleSessionEvent(receipt("cancelled", `noise_${index}`, `pending_noise_${index}`));
+    }
+    if (rejects) fail(new TypeError("Failed to fetch"));
+    else
+      finish(
+        mockResponse({
+          queued: true,
+          pending_id:
+            scenario === "reused_matching_ack" || scenario === "reused_evicted_ack"
+              ? "pending_original"
+              : "pending_current",
+        }),
+      );
+    await sending;
+    const state = useChatStore.getState();
+    expect(state.activeResponse).toBe(active);
+    expect(state.status).toBe("streaming");
+    if (scenario === "reused_old_ack" || scenario === "reused_evicted_ack") {
+      expect(state.pendingUserMessages).toMatchObject([
+        {
+          tempId: original.tempId,
+          pendingId: scenario === "reused_evicted_ack" ? "pending_original" : "pending_current",
+        },
+        newer,
+      ]);
+    } else expect(state.pendingUserMessages).toEqual([newer]);
+    if (reused && rejects) {
+      expect(state.failedSendDraft).toMatchObject({ stableId, fresh: false, text: "same input" });
+      expect(state.blocks.some((block) => block.type === "error")).toBe(true);
+    } else {
+      expect(state.failedSendDraft).toBeNull();
+      expect(state.blocks.some((block) => block.type === "error")).toBe(false);
+    }
+  });
+
+  it.each([false, true])(
+    "settles an owned failed/restored draft as cancelled without marking delivery (restored=%s)",
+    async (restored) => {
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        abortController: new AbortController(),
+        isNativeTerminalSession: true,
+        blocks: [],
+        pendingUserMessages: [],
+        failedSendDraft: null,
+        restoredSendDraft: null,
+      });
+      let stableId = "";
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          String(input).endsWith("/v1/sessions/conv_existing/events") &&
+          init?.method === "POST"
+        ) {
+          stableId = (JSON.parse(init.body as string) as { data: { stable_id: string } }).data
+            .stable_id;
+          return Promise.reject(new TypeError("Failed to fetch"));
+        }
+        return defaultFetchHandler(input, init);
+      });
+      await useChatStore.getState().send("same input", "agent_xyz");
+      if (restored) expect(takeFailedSendDraft("conv_existing", false)).not.toBeNull();
+      handleSessionEvent(receipt("cancelled", stableId));
+      expect(useChatStore.getState().failedSendDraft).toBeNull();
+      expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+      expect(useChatStore.getState().blocks.filter((block) => block.type === "error")).toEqual([]);
+      if (restored)
+        expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+          delivered: false,
+          cancelled: true,
+        });
+      expect(
+        committedItemProvesDelivery(useChatStore.getState().blocks, { stableId, fresh: true }),
+      ).toBe(false);
+    },
+  );
+
+  it("applies a background settlement without changing the visible conversation", async () => {
+    seedSession("conv_background_native", []);
+    seedSession("conv_visible_native", []);
+    await useChatStore.getState().switchTo("conv_background_native");
+    const entry = conversationRegistry.peek("conv_background_native")!;
+    entry.setState({
+      pendingUserMessages: [
+        {
+          tempId: "original",
+          pendingId: "pending_original",
+          content: [{ type: "input_text", text: "same input" }],
+        },
+      ],
+    });
+    await useChatStore.getState().switchTo("conv_visible_native");
+    handleSessionEvent(receipt("cancelled"), "conv_background_native");
+    expect(entry.getState().pendingUserMessages).toEqual([]);
+    expect(entry.getState().blocks[0]).toMatchObject({ nativeInputState: "cancelled" });
+    expect(useChatStore.getState().blocks).toEqual([]);
+    expect(useChatStore.getState().conversationId).toBe("conv_visible_native");
+  });
+
+  it.each(["cancelled", "recorded"] as const)(
+    "hydrates and upserts %s state without appending or undoing recorded proof",
+    async (initialState) => {
+      const original: MessageItem = {
+        ...(userMessage("native_snapshot", "same input") as MessageItem),
+        native_input_state: initialState,
+      };
+      const cursor = userMessage("snapshot_cursor", "after");
+      seedSession("conv_snapshot_native", [original, cursor]);
+      await useChatStore.getState().switchTo("conv_snapshot_native");
+      expect(useChatStore.getState().blocks[0]).toMatchObject({ nativeInputState: initialState });
+      handleSessionEvent(receipt("recorded", original.id));
+      seedSessionItems("conv_snapshot_native", [
+        { ...original, native_input_state: "cancelled" },
+        cursor,
+      ]);
+      useChatStore.setState({ hasMoreHistory: true, oldestItemId: cursor.id });
+      await useChatStore.getState().loadMoreHistory();
+      expect(
+        useChatStore.getState().blocks.filter((block) => block.ctx.itemId === original.id),
+      ).toHaveLength(1);
+      expect(
+        useChatStore.getState().blocks.find((block) => block.ctx.itemId === original.id),
+      ).toMatchObject({ nativeInputState: "recorded" });
+    },
+  );
 });

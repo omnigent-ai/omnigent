@@ -49,13 +49,19 @@ import type {
   ElicitationBlock,
   ErrorBlock,
   MessageContentBlock,
+  NativeInputState,
   TextDone,
   ToolGroup,
   UserMessageBlock,
 } from "@/lib/blocks";
 import { userInputElicitationKey } from "@/lib/askUserQuestion";
 import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
-import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
+import {
+  LIVE_ITEM_PREFIX,
+  PENDING_FILE_PREFIX,
+  nativeInputState,
+  structuredErrorFields,
+} from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
@@ -585,11 +591,9 @@ export function removeLocalConversation(tempConvId: string): boolean {
  * A user message awaiting its `session.input.consumed` event.
  *
  * Inserted by `send` before the POST is awaited so the bubble renders
- * immediately, then matched FIFO by the consumed handler. FIFO works
- * here because client posts and server consumed events are both
- * strictly ordered within one session — we don't need to correlate by
- * itemId, which would force us to wait for the POST response and
- * miss any consumed event that races ahead of it.
+ * immediately. Legacy receipts retain FIFO matching; typed native outcomes
+ * clear only their exact pending id, including callbacks received before
+ * the POST response supplies that id.
  *
  * `tempId` is a client-only identifier used for two things: rollback
  * on POST failure (filter the array by tempId) and React keying of
@@ -926,6 +930,8 @@ export interface ConversationState {
     text: string;
     files: File[];
     stableId?: string;
+    pendingId?: string;
+    fresh?: boolean;
     replyDraft?: StoredReplyDraft;
     /**
      * The send is known refused (an error answer to the POST, a snapshot
@@ -962,12 +968,15 @@ export interface ConversationState {
   restoredSendDraft: {
     conversationId: string;
     stableId: string;
+    pendingId?: string;
+    fresh?: boolean;
     text: string;
     files: File[];
     replyDraft?: StoredReplyDraft;
     /** Carried over from `failedSendDraft.serverRefused`; see there. */
     serverRefused?: boolean;
     delivered: boolean;
+    cancelled?: boolean;
   } | null;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
@@ -1760,12 +1769,24 @@ interface SendChain {
 const sendChains = new Map<string | symbol, SendChain>();
 
 /**
- * Sends whose POST has not settled, by stable id, flagged `true` once a live
- * `session_input_consumed` named the id. Read by `send()`'s failure path: that
- * acknowledgement proves THIS attempt was taken even when the POST's answer is
- * lost and an earlier refused attempt's item already sits in the transcript.
+ * Open sends distinguish recorded delivery from deliberate cancellation.
+ * Only a freshly generated id identifies an attempt before pending-id adoption.
  */
-const inFlightSends = new Map<string, boolean>();
+interface InFlightSend {
+  outcome: "pending" | "delivered" | "cancelled";
+  tempId: string;
+  fresh: boolean;
+  conversationId: string | null;
+  pendingId?: string;
+}
+const inFlightSends = new Map<string, InFlightSend>();
+interface NativeInputSettlement {
+  itemId: string;
+  state: NativeInputState;
+}
+const nativeInputSettlements = new Map<string, Map<string, NativeInputSettlement>>();
+const MAX_NATIVE_INPUT_SETTLEMENTS = 128;
+const MAX_NATIVE_INPUT_SETTLEMENT_CONVERSATIONS = 64;
 
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
@@ -2010,6 +2031,8 @@ export function initChatStore(client: QueryClient): void {
   workspaceInvalidationTimers.clear();
   backgroundFlushInFlight.clear();
   backgroundFlushCooldownUntil.clear();
+  inFlightSends.clear();
+  nativeInputSettlements.clear();
   // Drop every live conversation: their streams must not outlive the app (or,
   // in tests, leak into the next case).
   conversationRegistry.clear();
@@ -2870,15 +2893,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return state?.pendingUserMessages.some((p) => p.tempId === tempId && p.initialDraft);
     };
 
-    inFlightSends.set(stableId, false);
+    const inFlightSend: InFlightSend = {
+      outcome: "pending",
+      tempId,
+      fresh: opts?.stableId === undefined && reusableRetryId === null,
+      conversationId: submitConversationId,
+    };
     try {
       await waitForPrior();
+      inFlightSends.set(stableId, inFlightSend);
       if (initialDraft && !initialSendPending()) return;
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
       // before the new id is published — a send issued during the bind would
       // otherwise resolve that id, find an empty chain, and overtake this POST.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
+      inFlightSend.conversationId = sessionId;
       // Until this send settles, the server may hold the message without persisting
       // it, so keep its text where a reload can find it (see `unsentSendToRestore`).
       // Only once identity names the sender: unlike `getCurrentAuthorId`, this id
@@ -2957,6 +2987,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           { holdWhenHostOffline: true },
         ),
       );
+      inFlightSend.pendingId = postResult.pendingId;
+      if (postResult.pendingId) {
+        const settlement = nativeInputSettlements.get(sessionId)?.get(postResult.pendingId);
+        if (settlement) {
+          noteInFlightSettlement(inFlightSend, settlement.state);
+          setterFor(sessionId)((s) => adoptNativeInputSettlement(s, tempId, settlement));
+        }
+      }
+      if (isCancelledSend(inFlightSend)) return;
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
       // no session.input.consumed will reconcile this exact optimistic
@@ -3013,6 +3052,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
       if (initialDraft && !initialDispatched && !initialSendPending()) return;
+      const settlementTarget = postedSessionId ?? submitConversationId;
+      const settlementState = settlementTarget === null ? get() : setterForState(settlementTarget);
+      const snapshotState = inFlightSend.fresh
+        ? nativeStateForItem(settlementState?.blocks ?? [], stableId)
+        : undefined;
+      if (snapshotState) noteInFlightSettlement(inFlightSend, snapshotState);
+      if (isCancelledSend(inFlightSend)) {
+        setterFor(settlementTarget)((s) => ({
+          pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+        }));
+        return;
+      }
       const { message, code } = describeSendFailure(err);
       // A codex `/side` that armed the side-chat latch (line ~2103) but then
       // failed — e.g. the host is too old and the server refused — must disarm
@@ -3043,7 +3094,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         });
       }
       const callerHandlesError = heldForHost || opts?.onError !== undefined;
-      if (!heldForHost) opts?.onError?.(message);
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right
@@ -3064,13 +3114,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
       // A live `session_input_consumed` for this very attempt proves the runner
       // took it, whatever became of the POST's answer.
-      let deliveredDespiteFailure = inFlightSends.get(stableId) === true;
+      let deliveredDespiteFailure = inFlightSend.outcome === "delivered";
       let unsettled = false;
       if (
         !deliveredDespiteFailure &&
         !serverRefused &&
         draftSessionId !== null &&
-        hasCommittedItem(draftState.blocks, stableId)
+        committedItemProvesDelivery(draftState.blocks, { stableId })
       ) {
         // Only a snapshot can have put the item in the transcript, and it may
         // predate the runner's verdict (the server persists before it forwards).
@@ -3080,11 +3130,23 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         const verdict = await sendVerdictFromServer(draftSessionId, stableId);
         // The acknowledgement may have landed while that fetch was out; it
         // outranks whatever the fetch said or failed to say.
-        if (inFlightSends.get(stableId) === true) deliveredDespiteFailure = true;
+        const currentDraftState = setterForState(draftSessionId);
+        const nativeState = inFlightSend.fresh
+          ? nativeStateForItem(currentDraftState?.blocks ?? [], stableId)
+          : undefined;
+        if (nativeState) noteInFlightSettlement(inFlightSend, nativeState);
+        if (isCancelledSend(inFlightSend)) {
+          setterFor(draftSessionId)((s) => ({
+            pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+          }));
+          return;
+        }
+        if (inFlightSend.outcome === "delivered") deliveredDespiteFailure = true;
         else if (verdict === "refused") serverRefused = true;
         else if (verdict === "delivered") deliveredDespiteFailure = true;
         else unsettled = true;
       }
+      if (!heldForHost) opts?.onError?.(message);
       if (
         !callerHandlesError &&
         !deliveredDespiteFailure &&
@@ -3097,6 +3159,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             text,
             files: files ?? [],
             stableId,
+            fresh: inFlightSend.fresh,
+            ...(inFlightSend.pendingId ? { pendingId: inFlightSend.pendingId } : {}),
             serverRefused,
             ...(unsettled ? { unsettled: true } : {}),
             ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
@@ -3128,9 +3192,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             ...makeClientErrorBlock(message, code),
             ...(serverRefused
               ? {}
-              : { unansweredSend: { stableId, ...(sentText ? { text: sentText } : {}) } }),
+              : {
+                  unansweredSend: {
+                    stableId,
+                    ...{ fresh: inFlightSend.fresh },
+                    ...(inFlightSend.pendingId ? { pendingId: inFlightSend.pendingId } : {}),
+                    ...(sentText ? { text: sentText } : {}),
+                  },
+                }),
           };
-      if (!alreadyStreaming) {
+      const newerNativeResponse =
+        failGet().activeResponse !== null &&
+        nativeStateForItem(failGet().blocks, stableId) !== undefined;
+      if (!alreadyStreaming && !newerNativeResponse) {
         if (failGet().activeResponse !== null) {
           // A response bubble already exists (the turn started, then failed)
           // — mark it failed so the error rides on that bubble.
@@ -3161,7 +3235,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }
       }
     } finally {
-      inFlightSends.delete(stableId);
+      if (inFlightSends.get(stableId) === inFlightSend) inFlightSends.delete(stableId);
       if (postedSessionId !== null) forgetUnsentSend(postedSessionId, stableId);
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
@@ -3931,6 +4005,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (stale()) return;
       const newBlocks = itemsToBlocks(items);
       pageSet((state) => {
+        const currentBlocks = upsertNativeInputStates(state.blocks, newBlocks);
         // Rebind hydration resets the cursor to the fresh window's top while
         // keeping scrolled-up blocks, so an older page can overlap — dedupe.
         const seen = new Set(
@@ -3938,7 +4013,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         );
         const unique = newBlocks.filter((b) => !b.ctx.itemId || !seen.has(b.ctx.itemId));
         return {
-          blocks: [...unique, ...state.blocks],
+          blocks: [...unique, ...currentBlocks],
           hasMoreHistory: hasMore,
           oldestItemId: items[0]?.id ?? state.oldestItemId,
           loadingMoreHistory: false,
@@ -5317,7 +5392,10 @@ async function bindStream(
     const oldestItemId = items[0]?.id ?? null;
     const unsentDraft = hydratePending ? unsentSendToRestore(id, items) : null;
     set((state) => {
-      const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
+      const currentBlocks = upsertNativeInputStates(
+        withoutNativePreviews(state.blocks, snapshotNativeMessageIds),
+        snapshotBlocks,
+      );
       const bindingPatch = sessionBindingPatch(session, state, launchBeforeFetch);
       const racedOptions = racedNativeModelOptions.get(id);
       const catalogWonBindRace =
@@ -5361,7 +5439,14 @@ async function bindStream(
         ...withoutRebuiltUserInputCards(currentBlocks, unique),
         ...uniquePendingElicitations,
       ];
-      const hasErrorBlock = allBlocks.some((b) => b.type === "error");
+      const draftPatch = reconcileSendDraftWithSnapshot(
+        { ...state, blocks: allBlocks },
+        new Set(items.map((item) => item.id)),
+        session,
+        snapshotBlocks,
+      );
+      const settledBlocks = draftPatch.blocks ?? allBlocks;
+      const hasErrorBlock = settledBlocks.some((b) => b.type === "error");
       // Decide the optimistic user bubbles to render after this bind, and
       // (on cold load) keep the per-conversation stash consistent.
       //
@@ -5444,11 +5529,12 @@ async function bindStream(
           : null;
       return {
         ...effectiveBindingPatch,
+        ...draftPatch,
         // A failure re-read that landed during the fetch is newer than this snapshot.
         ...(state.failedInputs !== stateBeforeFetch.failedInputs
           ? { failedInputs: state.failedInputs, startupPending: state.startupPending }
           : {}),
-        blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
+        blocks: syntheticError !== null ? [...settledBlocks, syntheticError] : settledBlocks,
         pendingUserMessages: snapshotPending,
         ...(unsentDraft !== null && state.failedSendDraft === null
           ? { failedSendDraft: unsentDraft }
@@ -6204,10 +6290,14 @@ async function rehydrateWindowOnReconnect(
   set((s) => {
     const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
     const currentBlocks = withoutDeliveredSendFailureCards(
-      withoutNativePreviews(s.blocks, snapshotNativeMessageIds),
+      upsertNativeInputStates(
+        withoutNativePreviews(s.blocks, snapshotNativeMessageIds),
+        freshBlocks,
+      ),
       freshItemIds,
       gapUserTexts,
       session,
+      freshBlocks,
     );
     const tail = currentBlocks.filter((b) => {
       if (b.ctx.itemId) return !preGapIds.has(b.ctx.itemId);
@@ -6218,7 +6308,9 @@ async function rehydrateWindowOnReconnect(
     const tailIds = new Set(
       tail.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
-    const windowBlocks = freshBlocks.filter((b) => !b.ctx.itemId || !tailIds.has(b.ctx.itemId));
+    const windowBlocks = upsertNativeInputStates(freshBlocks, s.blocks).filter(
+      (b) => !b.ctx.itemId || !tailIds.has(b.ctx.itemId),
+    );
     const merged = mergeReconnectWindow(
       windowBlocks,
       withoutRebuiltUserInputCards(tail, windowBlocks),
@@ -6233,13 +6325,21 @@ async function rehydrateWindowOnReconnect(
         preGapElicitations.cards,
         id,
       ) ?? merged;
+    const draftPatch = reconcileSendDraftWithSnapshot(
+      { ...s, blocks },
+      freshItemIds,
+      session,
+      freshBlocks,
+    );
+    const settledBlocks = draftPatch.blocks ?? blocks;
     return {
       ...statusPatch,
       // Same persisted-item evidence as the reconnect path: a rehydrated item
       // can be a send whose POST died in the gap.
-      ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
+      ...draftPatch,
       blocks:
-        snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks,
+        snapshotCompactionSpinners(settledBlocks, s.activeResponse, statusPatch.activeResponse) ??
+        settledBlocks,
       hasMoreHistory: fresh.hasMore,
       oldestItemId: fresh.items[0]?.id ?? null,
       loadingMoreHistory: false,
@@ -6392,7 +6492,10 @@ async function reconcileOnReconnect(
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   const snapshotItemIds = new Set(items.map((it) => it.id));
   set((s) => {
-    const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
+    const currentBlocks = upsertNativeInputStates(
+      withoutNativePreviews(s.blocks, snapshotNativeMessageIds),
+      snapshotBlocks,
+    );
     const seen = new Set(
       currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
@@ -6406,12 +6509,14 @@ async function reconcileOnReconnect(
       // A gap-committed item can be a send whose POST died in the gap: it
       // retracts the draft, or marks it refused when the snapshot says the
       // runner rejected the forward (see `reconcileSendDraftWithSnapshot`).
-      ...reconcileSendDraftWithSnapshot(s, snapshotItemIds, session),
     };
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement.
     const recoveredUserInputs = unseen.filter(
-      (b) => b.type === "user_message" && !isSystemUserContent(b.content),
+      (b) =>
+        b.type === "user_message" &&
+        b.nativeInputState === undefined &&
+        !isSystemUserContent(b.content),
     ).length;
     if (recoveredUserInputs > 0) {
       patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
@@ -6445,6 +6550,14 @@ async function reconcileOnReconnect(
       committedUserTextsOf(unseen),
       session,
     );
+    const draftPatch = reconcileSendDraftWithSnapshot(
+      { ...s, blocks: nextBlocks },
+      snapshotItemIds,
+      session,
+      snapshotBlocks,
+    );
+    Object.assign(patch, draftPatch);
+    nextBlocks = draftPatch.blocks ?? nextBlocks;
     // Recover elicitation state the dead socket swallowed: gap-fired
     // prompts, gap-resolved cards, and re-parked prompts whose card
     // was auto-cleared. Items can't resupply these (elicitations are
@@ -7909,6 +8022,225 @@ export function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
   return itemId !== "" && blocks.some((block) => block.ctx.itemId === itemId);
 }
 
+function nativeStateForItem(
+  blocks: readonly AnyBlock[],
+  itemId: string | undefined,
+): NativeInputState | undefined {
+  const block = blocks.find(
+    (candidate) => candidate.type === "user_message" && candidate.ctx.itemId === itemId,
+  );
+  return block?.type === "user_message" ? nativeInputState(block.nativeInputState) : undefined;
+}
+
+function mergeNativeInputState(
+  current: NativeInputState | undefined,
+  incoming: NativeInputState,
+): NativeInputState {
+  return current === "recorded" ? current : incoming;
+}
+
+/** Update lifecycle metadata without replacing the authored message or its position. */
+function upsertNativeInputStates(current: AnyBlock[], incoming: readonly AnyBlock[]): AnyBlock[] {
+  const states = new Map<string, NativeInputState>();
+  for (const block of incoming) {
+    const state =
+      block.type === "user_message" ? nativeInputState(block.nativeInputState) : undefined;
+    if (state && block.ctx.itemId)
+      states.set(block.ctx.itemId, mergeNativeInputState(states.get(block.ctx.itemId), state));
+  }
+  let changed = false;
+  const result = current.map((block) => {
+    if (block.type !== "user_message" || !block.ctx.itemId) return block;
+    const incomingState = states.get(block.ctx.itemId);
+    if (!incomingState) return block;
+    const state = mergeNativeInputState(block.nativeInputState, incomingState);
+    if (state === block.nativeInputState) return block;
+    changed = true;
+    return { ...block, nativeInputState: state };
+  });
+  return changed ? result : current;
+}
+
+function legacyReceiptIds(
+  blocks: readonly AnyBlock[],
+  itemIds: ReadonlySet<string>,
+): ReadonlySet<string> {
+  const modern = new Set(
+    blocks
+      .filter(
+        (block) =>
+          block.type === "user_message" && nativeInputState(block.nativeInputState) !== undefined,
+      )
+      .map((block) => block.ctx.itemId),
+  );
+  return new Set([...itemIds].filter((id) => !modern.has(id)));
+}
+
+function noteInFlightSettlement(send: InFlightSend, state: NativeInputState): void {
+  if (send.outcome !== "delivered") send.outcome = state === "recorded" ? "delivered" : "cancelled";
+}
+
+function isCancelledSend(send: InFlightSend): boolean {
+  return send.outcome === "cancelled";
+}
+
+function rememberNativeInputSettlement(
+  conversationId: string,
+  pendingId: string,
+  settlement: NativeInputSettlement,
+): void {
+  const settlements =
+    nativeInputSettlements.get(conversationId) ?? new Map<string, NativeInputSettlement>();
+  const existing = settlements.get(pendingId);
+  if (existing?.state !== "recorded") settlements.set(pendingId, settlement);
+  while (settlements.size > MAX_NATIVE_INPUT_SETTLEMENTS)
+    settlements.delete(settlements.keys().next().value!);
+  nativeInputSettlements.delete(conversationId);
+  nativeInputSettlements.set(conversationId, settlements);
+  while (nativeInputSettlements.size > MAX_NATIVE_INPUT_SETTLEMENT_CONVERSATIONS)
+    nativeInputSettlements.delete(nativeInputSettlements.keys().next().value!);
+}
+
+function adoptNativeInputSettlement(
+  state: ChatState,
+  tempId: string,
+  settlement: NativeInputSettlement,
+): Partial<ChatState> {
+  const pending = state.pendingUserMessages.find((entry) => entry.tempId === tempId);
+  if (!pending) return {};
+  return {
+    pendingUserMessages: state.pendingUserMessages.filter((entry) => entry.tempId !== tempId),
+    blocks: state.blocks.map((block) =>
+      block.type === "user_message" && block.ctx.itemId === settlement.itemId
+        ? {
+            ...block,
+            nativeInputState: mergeNativeInputState(block.nativeInputState, settlement.state),
+            content: withPendingFiles(block.content, pending.content),
+            stableKey: block.stableKey ?? pending.tempId,
+            ctx: {
+              ...block.ctx,
+              ...(block.ctx.createdBy ? {} : pending.author ? { createdBy: pending.author } : {}),
+            },
+          }
+        : block,
+    ),
+  };
+}
+
+interface SendOwnership {
+  stableId?: string;
+  pendingId?: string;
+  fresh?: boolean;
+}
+
+function settlementOwnsSend(
+  send: SendOwnership | null | undefined,
+  itemId: string,
+  pendingId?: string,
+): boolean {
+  return (
+    send != null &&
+    ((pendingId !== undefined && send.pendingId === pendingId) ||
+      (send.fresh === true && send.stableId === itemId))
+  );
+}
+
+function settleNativeSendDraft(
+  state: ChatState,
+  settlement: NativeInputSettlement,
+  pendingId?: string,
+): Partial<ChatState> {
+  const patch: Partial<ChatState> = {};
+  const failedOwned = settlementOwnsSend(state.failedSendDraft, settlement.itemId, pendingId);
+  const restoredOwned = settlementOwnsSend(state.restoredSendDraft, settlement.itemId, pendingId);
+  if (failedOwned) patch.failedSendDraft = null;
+  if (restoredOwned && state.restoredSendDraft && !state.restoredSendDraft.delivered) {
+    patch.restoredSendDraft = {
+      ...state.restoredSendDraft,
+      delivered: settlement.state === "recorded",
+      cancelled: settlement.state === "cancelled",
+    };
+  }
+  if (
+    (failedOwned && state.pendingRetryStableId === state.failedSendDraft?.stableId) ||
+    (restoredOwned && state.pendingRetryStableId === state.restoredSendDraft?.stableId)
+  )
+    patch.pendingRetryStableId = null;
+  const blocks = state.blocks.filter(
+    (block) =>
+      block.type !== "error" ||
+      !settlementOwnsSend(block.unansweredSend, settlement.itemId, pendingId),
+  );
+  if (blocks.length !== state.blocks.length) patch.blocks = blocks;
+  return patch;
+}
+
+function applyNativeInputSettlement(
+  state: ChatState,
+  event: SessionInputConsumedEvent,
+  outcome: NativeInputState,
+  ownTempId?: string,
+): Partial<ChatState> {
+  const pendingId = event.clearedPendingId;
+  const pending = state.pendingUserMessages.find(
+    (entry) =>
+      (pendingId !== undefined && (entry.pendingId === pendingId || entry.tempId === pendingId)) ||
+      entry.tempId === ownTempId,
+  );
+  const current = state.blocks.find(
+    (block) => block.type === "user_message" && block.ctx.itemId === event.itemId,
+  );
+  const effectiveState = mergeNativeInputState(
+    current?.type === "user_message" ? current.nativeInputState : undefined,
+    outcome,
+  );
+  const settlement = { itemId: event.itemId, state: effectiveState };
+  const draftPatch = pendingId ? settleNativeSendDraft(state, settlement, pendingId) : {};
+  let blocks = draftPatch.blocks ?? state.blocks;
+  if (current?.type === "user_message") {
+    blocks = blocks.map((block) =>
+      block === current
+        ? {
+            ...block,
+            nativeInputState: effectiveState,
+            ...(pending
+              ? {
+                  content: withPendingFiles(block.content, pending.content),
+                  stableKey: block.stableKey ?? pending.tempId,
+                }
+              : {}),
+          }
+        : block,
+    );
+  } else {
+    const content = committedContentFor(event, pending?.content ?? null);
+    if (content !== null)
+      blocks = [
+        ...blocks,
+        {
+          ...committedUserBlock(
+            event.itemId,
+            content,
+            pending?.tempId,
+            event.createdBy ?? pending?.author,
+            pending?.createdAtS,
+          ),
+          nativeInputState: effectiveState,
+        },
+      ];
+  }
+  return {
+    ...draftPatch,
+    blocks,
+    ...(pending
+      ? { pendingUserMessages: state.pendingUserMessages.filter((entry) => entry !== pending) }
+      : {}),
+    ...(pendingId
+      ? { failedInputs: state.failedInputs.filter((input) => input.pendingId !== pendingId) }
+      : {}),
+  };
+}
+
 /**
  * Whether a committed item proves a failed send was delivered.
  *
@@ -7924,12 +8256,14 @@ export function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
  */
 export function committedItemProvesDelivery(
   blocks: AnyBlock[],
-  draft: { stableId?: string; serverRefused?: boolean; unsettled?: boolean },
+  draft: { stableId?: string; serverRefused?: boolean; unsettled?: boolean; fresh?: boolean },
 ): boolean {
   return (
     draft.stableId !== undefined &&
     draft.serverRefused !== true &&
     draft.unsettled !== true &&
+    nativeStateForItem(blocks, draft.stableId) !== "cancelled" &&
+    (nativeStateForItem(blocks, draft.stableId) !== "recorded" || draft.fresh === true) &&
     hasCommittedItem(blocks, draft.stableId)
   );
 }
@@ -7978,11 +8312,15 @@ export function takeFailedSendDraft(
   const failed = state?.failedSendDraft;
   if (!state || !failed || failed.conversationId !== conversationId) return null;
   const delivered = committedItemProvesDelivery(state.blocks, failed);
+  const cancelled =
+    failed.fresh === true && nativeStateForItem(state.blocks, failed.stableId) === "cancelled";
   // Added after newer input, the text goes out as a new message.
   const appended = hasDraft && appendsRecovered && failed.recovered === true;
-  const restore = (!hasDraft || appended) && !delivered;
+  const restore = (!hasDraft || appended) && !delivered && !cancelled;
   const tracked = restore && !appended;
   const patch: Partial<ConversationState> = { failedSendDraft: null };
+  if (cancelled && state.pendingRetryStableId === failed.stableId)
+    patch.pendingRetryStableId = null;
   if (!delivered) patch.pendingRetryStableId = tracked ? (failed.stableId ?? null) : null;
   // A discarded failure must not untrack an earlier draft still in the composer.
   if (tracked && failed.stableId)
@@ -7993,6 +8331,8 @@ export function takeFailedSendDraft(
       files: failed.files,
       replyDraft: failed.replyDraft,
       serverRefused: failed.serverRefused,
+      fresh: failed.fresh,
+      pendingId: failed.pendingId,
       delivered: false,
     };
   setterFor(conversationId)(patch);
@@ -8113,7 +8453,7 @@ async function sendVerdictFromServer(
  */
 function unsentSendToRestore(
   conversationId: string,
-  items: readonly { id: string }[],
+  items: readonly { id: string; native_input_state?: unknown }[],
 ): ConversationState["failedSendDraft"] {
   const unsent = peekUnsentSend(conversationId);
   // A send still open in this tab settles on its own.
@@ -8138,7 +8478,12 @@ function unsentSendToRestore(
   }
   const sends = [...(unsent === null ? [] : [unsent]), ...queued].filter(
     // Another account may have signed in to this tab since.
-    (send) => send.authorId === viewerId && !items.some((item) => item.id === send.stableId),
+    (send) =>
+      send.authorId === viewerId &&
+      !items.some(
+        (item) =>
+          item.id === send.stableId && nativeInputState(item.native_input_state) !== "cancelled",
+      ),
   );
   const [first] = sends;
   if (first === undefined) return null;
@@ -8152,7 +8497,13 @@ function unsentSendToRestore(
     text: serializeReplyDraft(joined),
     files: [],
     // A resend of one message reuses its id, which the server dedupes; joined text is a new message.
-    ...(sends.length === 1 ? { stableId: first.stableId } : {}),
+    ...(sends.length === 1 &&
+    !items.some(
+      (item) =>
+        item.id === first.stableId && nativeInputState(item.native_input_state) === "cancelled",
+    )
+      ? { stableId: first.stableId }
+      : {}),
     ...(replyDraft ? { replyDraft } : {}),
     serverRefused: false,
     recovered: true,
@@ -8203,6 +8554,28 @@ function reconcileSendDraftWithSnapshot(
   s: ChatState,
   itemIds: ReadonlySet<string>,
   session: Session,
+  snapshotBlocks: AnyBlock[],
+): Partial<ChatState> {
+  const modern = upsertNativeInputStates(snapshotBlocks, s.blocks);
+  let patch = reconcileLegacySendDraftWithSnapshot(s, legacyReceiptIds(modern, itemIds), session);
+  for (const block of modern) {
+    if (block.type === "user_message" && block.nativeInputState && block.ctx.itemId) {
+      patch = {
+        ...patch,
+        ...settleNativeSendDraft(
+          { ...s, ...patch },
+          { itemId: block.ctx.itemId, state: block.nativeInputState },
+        ),
+      };
+    }
+  }
+  return patch;
+}
+
+function reconcileLegacySendDraftWithSnapshot(
+  s: ChatState,
+  itemIds: ReadonlySet<string>,
+  session: Session,
 ): Partial<ChatState> {
   if (session.lastTaskError?.code !== "runner_rejected_event") {
     return retractDeliveredSendDraft(s, itemIds, "persisted");
@@ -8248,13 +8621,15 @@ function withoutDeliveredSendFailureCards(
   committedIds: ReadonlySet<string>,
   newUserTexts: readonly string[],
   snapshot?: Session,
+  receiptBlocks: readonly AnyBlock[] = blocks,
 ): AnyBlock[] {
+  const legacyCommittedIds = legacyReceiptIds(receiptBlocks, committedIds);
   const unclaimedTexts = newUserTexts.map(withoutAttachedMarkers);
   const kept = blocks.filter((block) => {
     const send = block.type === "error" ? block.unansweredSend : undefined;
     if (send === undefined) return true;
     if (snapshot !== undefined && snapshotRefusesSend(snapshot, send.stableId)) return true;
-    if (committedIds.has(send.stableId)) return false;
+    if (legacyCommittedIds.has(send.stableId)) return false;
     const claimed = send.text === undefined ? -1 : unclaimedTexts.indexOf(send.text);
     if (claimed === -1) return true;
     unclaimedTexts.splice(claimed, 1);
@@ -8285,6 +8660,13 @@ function committedContentFor(
   const serverContent = userContentFromEvent(event);
   if (!serverContent) return pendingContent;
   if (!pendingContent) return serverContent;
+  return withPendingFiles(serverContent, pendingContent);
+}
+
+function withPendingFiles(
+  serverContent: MessageContentBlock[],
+  pendingContent: MessageContentBlock[],
+): MessageContentBlock[] {
   const serverHasFiles = serverContent.some(
     (b) => b.type === "input_image" || b.type === "input_file",
   );
@@ -8457,7 +8839,10 @@ const MAX_SETTLED_SHELL_INPUTS = 64;
  */
 function committedUserTextsOf(blocks: AnyBlock[]): string[] {
   return blocks
-    .filter((b): b is UserMessageBlock => b.type === "user_message")
+    .filter(
+      (b): b is UserMessageBlock =>
+        b.type === "user_message" && nativeInputState(b.nativeInputState) === undefined,
+    )
     .map((b) => messageContentText(b.content))
     .filter((text) => text.length > 0);
 }
@@ -9135,6 +9520,49 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       return;
     }
     case "session_input_consumed": {
+      const inputState = nativeInputState(event.data.native_input_state);
+      if (event.data.native_input_state != null && inputState === undefined) return;
+      if (inputState && event.itemType === "message" && event.data.role === "user") {
+        const current =
+          sourceConversationId === null
+            ? useChatStore.getState()
+            : setterForState(sourceConversationId);
+        const pendingId = event.clearedPendingId;
+        const cached =
+          sourceConversationId && pendingId
+            ? nativeInputSettlements.get(sourceConversationId)?.get(pendingId)
+            : undefined;
+        const knownState = nativeStateForItem(current?.blocks ?? [], event.itemId);
+        const effectiveState = mergeNativeInputState(
+          knownState === "recorded" ||
+            (cached?.itemId === event.itemId && cached.state === "recorded")
+            ? "recorded"
+            : knownState,
+          inputState,
+        );
+        const owner = pendingId
+          ? [...inFlightSends.entries()].find(
+              ([stableId, send]) =>
+                send.conversationId === sourceConversationId &&
+                (send.pendingId === pendingId || (send.fresh && stableId === event.itemId)),
+            )?.[1]
+          : undefined;
+        if (owner) noteInFlightSettlement(owner, effectiveState);
+        if (sourceConversationId && pendingId)
+          rememberNativeInputSettlement(sourceConversationId, pendingId, {
+            itemId: event.itemId,
+            state: effectiveState,
+          });
+        applyToConversation((s) =>
+          applyNativeInputSettlement(s, event, effectiveState, owner?.tempId),
+        );
+        if (
+          sourceConversationId &&
+          ((current?.failedInputs.length ?? 0) > 0 || startupReads.has(sourceConversationId))
+        )
+          void refreshFailedInputs(sourceConversationId);
+        return;
+      }
       applyToConversation({ startupPending: false });
       // A retry from another client may have delivered an undelivered message: clear
       // it now when the receipt names it (native ones do), and re-read either way,
@@ -9156,7 +9584,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // its arrival proves that send was delivered, so retract the draft
       // before it (re)populates the composer with an already-sent prompt,
       // and drop the send's failure card.
-      if (inFlightSends.has(event.itemId)) inFlightSends.set(event.itemId, true);
+      const send = inFlightSends.get(event.itemId);
+      if (send?.conversationId === sourceConversationId) send.outcome = "delivered";
       applyToConversation((s) => {
         const committedIds = new Set([event.itemId]);
         // A late copy of an item already shown is not a new message.

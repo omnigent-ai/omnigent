@@ -5849,34 +5849,71 @@ describe("Composer reply quotes", () => {
     }
   });
 
-  it("keeps the user's edits when the delivered retraction lands", () => {
-    const stableId = "d".repeat(32);
+  it.each(["delivered", "cancelled"] as const)(
+    "keeps the user's edits when the %s retraction lands",
+    (outcome) => {
+      const stableId = "d".repeat(32);
+      render(<Composer {...composerProps()} />);
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: {
+            conversationId: "conv_test",
+            text: "resend me",
+            files: [],
+            stableId,
+          },
+        }),
+      );
+      fireEvent.change(textarea(), { target: { value: "resend me, but edited" } });
+
+      act(() =>
+        useChatStore.setState({
+          restoredSendDraft: {
+            conversationId: "conv_test",
+            stableId,
+            text: "resend me",
+            files: [],
+            delivered: outcome === "delivered",
+            cancelled: outcome === "cancelled",
+          },
+        }),
+      );
+      expect(textarea()).toHaveValue("resend me, but edited");
+      expect(useChatStore.getState().restoredSendDraft).toBeNull();
+    },
+  );
+
+  it("retracts an unchanged cancelled draft without treating it as delivered", () => {
     render(<Composer {...composerProps()} />);
     act(() =>
       useChatStore.setState({
         failedSendDraft: {
           conversationId: "conv_test",
-          text: "resend me",
+          text: "cancelled before recording",
           files: [],
-          stableId,
+          stableId: "cancelled-original",
+          pendingId: "pending-cancelled-original",
         },
       }),
     );
-    fireEvent.change(textarea(), { target: { value: "resend me, but edited" } });
-
+    expect(textarea()).toHaveValue("cancelled before recording");
     act(() =>
-      useChatStore.setState({
-        restoredSendDraft: {
-          conversationId: "conv_test",
-          stableId,
-          text: "resend me",
-          files: [],
-          delivered: true,
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "cancelled-original",
+        itemType: "message",
+        clearedPendingId: "pending-cancelled-original",
+        data: {
+          role: "user",
+          native_input_state: "cancelled",
+          content: [{ type: "input_text", text: "cancelled before recording" }],
         },
       }),
     );
-    expect(textarea()).toHaveValue("resend me, but edited");
+    expect(textarea()).toHaveValue("");
     expect(useChatStore.getState().restoredSendDraft).toBeNull();
+    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+    expect(getSessionDraft("conv_test")).toBeUndefined();
   });
 
   it.each<[string, StoredReplyDraft | undefined, string]>([

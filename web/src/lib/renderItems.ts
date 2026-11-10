@@ -183,6 +183,7 @@ export type Bubble =
       stillSending?: boolean;
       /** Saved startup message the server never delivered (the launch failed). */
       undelivered?: boolean;
+      nativeInputState?: "cancelled" | "recorded";
       content: MessageContentBlock[];
       /** Shell input is literal command text, not Markdown or attachment markers. */
       shellCommand?: string;
@@ -920,6 +921,9 @@ function walkBubbles(
         // Carry the optimistic temp id (when promoted) so bubbleKey holds
         // steady across the optimistic→committed swap — no remount/flink.
         stableKey: b.type === "user_message" ? b.stableKey : undefined,
+        ...(b.type === "user_message" && b.nativeInputState !== undefined
+          ? { nativeInputState: b.nativeInputState }
+          : {}),
       });
       if (chipIndexes !== undefined) {
         for (const chipIndex of chipIndexes) {
@@ -2009,6 +2013,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       Boolean(a.awaitingAgent) !== Boolean(b.awaitingAgent) ||
       Boolean(a.stillSending) !== Boolean(b.stillSending) ||
       Boolean(a.undelivered) !== Boolean(b.undelivered) ||
+      a.nativeInputState !== b.nativeInputState ||
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||

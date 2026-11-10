@@ -238,11 +238,18 @@ export interface ResponseStartBlock {
  * never produces it (its consumers — terminal frontends — render the
  * user input directly, not as a block).
  */
+export type NativeInputState = "cancelled" | "recorded";
+
+export function nativeInputState(value: unknown): NativeInputState | undefined {
+  return value === "cancelled" || value === "recorded" ? value : undefined;
+}
+
 export interface UserMessageBlock {
   type: "user_message";
   ctx: BlockContext;
   /** Same shape as `MessageItem.content` from the items API. */
   content: MessageContentBlock[];
+  nativeInputState?: NativeInputState;
   /**
    * Stable React key for the rendered bubble, set ONLY when this block
    * was promoted from an optimistic `pendingUserMessages` entry on
@@ -483,7 +490,7 @@ export interface ErrorBlock {
    * may still arrive, and its commit retracts the card. `text` is set on a
    * native terminal, whose mirrored message carries no stable id.
    */
-  unansweredSend?: { stableId: string; text?: string };
+  unansweredSend?: { stableId: string; text?: string; pendingId?: string; fresh?: boolean };
   /** A client-only card for a failure carried only by a `failed` session status. */
   fromSessionStatus?: true;
 }

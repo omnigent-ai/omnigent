@@ -1141,6 +1141,15 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
           </div>
         </div>
+        {bubble.nativeInputState === "cancelled" && (
+          <div
+            className="flex max-w-full flex-wrap justify-end gap-x-1 pt-1 text-xs text-muted-foreground"
+            role="status"
+          >
+            <span>Cancelled</span>
+            <span>Stopped before the agent recorded this message.</span>
+          </div>
+        )}
         {bubble.undelivered && (
           <UndeliveredMessageNotice sessionId={sessionId} text={text} content={bubble.content} />
         )}
