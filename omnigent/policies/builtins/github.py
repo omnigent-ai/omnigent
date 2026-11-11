@@ -805,11 +805,12 @@ def _gh_api_endpoint(rest: list[str]) -> str | None:
             "--hostname",
             "-R",
             "--repo",
+            "--cache",
+            "-p",
+            "--preview",
         }
     )
-    flag_only = frozenset(
-        {"--paginate", "--slurp", "--silent", "--verbose", "-i", "--include", "--cache"}
-    )
+    flag_only = frozenset({"--paginate", "--slurp", "--silent", "--verbose", "-i", "--include"})
     i = 0
     while i < len(rest):
         token = rest[i]
