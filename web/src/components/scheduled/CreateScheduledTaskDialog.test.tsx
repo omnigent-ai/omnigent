@@ -901,24 +901,6 @@ describe("agent picker readiness (needs-setup badges)", () => {
     },
   );
 
-  it("shows the model + effort controls for the default (Claude-native) agent", () => {
-    renderDialog();
-    expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
-      "aria-expanded",
-      "true",
-    );
-    // The default effective agent is claude-native-ui (a capable native coding
-    // agent), so its picker offers model/effort, Advanced offers permissions, and
-    // the "uses defaults" hint — shown only when the controls are hidden — is absent.
-    expect(screen.getByTestId("task-launch-settings-field")).toBeInTheDocument();
-    expect(screen.getByTestId("task-permission-trigger")).toBeInTheDocument();
-    expect(pickerOptionLabels("model").length).toBeGreaterThan(1);
-    expect(pickerOptionLabels("effort").length).toBeGreaterThan(1);
-    expect(
-      screen.queryByText("Uses this agent's default permission settings"),
-    ).not.toBeInTheDocument();
-  });
-
   it("feeds the picker a fallback online host so 'needs setup' badges show with no host pinned", () => {
     renderDialog();
     // Fresh state: no host pinned, but the dialog still passes the first online
@@ -2178,9 +2160,18 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
 
   it("renders model + effort for a capable (Claude-native) agent, hides them for a plain agent", () => {
     renderDialog();
+    expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
     // Default effective agent is the capable claude-native harness → controls show:
-    // model and effort in the agent picker, permissions under Advanced.
+    // model and effort in the agent picker, permissions under Advanced, and no
+    // "uses defaults" hint.
     expect(screen.getByTestId("task-launch-settings-field")).toBeInTheDocument();
+    expect(screen.getByTestId("task-permission-trigger")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Uses this agent's default permission settings"),
+    ).not.toBeInTheDocument();
     expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute(
       "data-configurable",
       "claude-native-ui",
@@ -2206,6 +2197,24 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     expect(pickerDetails()).toBe("");
     // The "uses defaults" hint returns when the controls are hidden.
     expect(screen.getByText("Uses this agent's default permission settings")).toBeInTheDocument();
+  });
+
+  it("shows the catalog default model on the trigger, else leaves the agent name", () => {
+    const view = renderDialog();
+    // No override and no catalog default: no Model detail, so the trigger names the agent.
+    expect(pickerDetails()).not.toContain("Model:");
+
+    vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({
+      data: [
+        { id: "sonnet", displayName: "Sonnet", isDefault: true },
+        { id: "opus", displayName: "Opus" },
+      ],
+    } as unknown as ReturnType<typeof hostsHook.useHostModelOptions>);
+    view.rerender(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    expect(pickerDetails()).toMatch(/^Model: Default \(Sonnet\)/);
+
+    pickInPicker("model", "Opus");
+    expect(pickerDetails()).toMatch(/^Model: Opus/);
   });
 
   it("sends the selected model + effort on create for a capable agent", async () => {

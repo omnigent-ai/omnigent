@@ -711,54 +711,6 @@ def test_scheduled_task_custom_schedule_round_trip(page: Page, automations_v2_se
     assert response.json()["timezone"] == "Asia/Singapore"
 
 
-@pytest.mark.parametrize(
-    ("agent_name", "has_settings"),
-    [("codex-native-ui", True), ("hello_world", False)],
-)
-def test_scheduled_task_settings_follow_harness_capabilities(
-    page: Page,
-    live_server: str,
-    agent_name: str,
-    has_settings: bool,
-) -> None:
-    """Codex exposes model/permission settings; a plain SDK agent uses its defaults."""
-    agent_id = _builtin_agent_id(live_server, agent_name)
-    task_name = f"{agent_name} daily"
-    _create_task(live_server, agent_id, task_name, "FREQ=DAILY;BYHOUR=9;BYMINUTE=0")
-
-    _open_automations_page(page, live_server)
-    row = _row_by_name(page, task_name)
-    expect(row).to_be_visible(timeout=30_000)
-    row.hover()
-    row.get_by_test_id("task-row-menu").click()
-    page.get_by_test_id("task-edit").click()
-    page.get_by_role("button", name="Advanced", exact=True).click()
-
-    dialog = page.get_by_test_id("create-scheduled-task-dialog")
-    expect(dialog).to_be_visible(timeout=30_000)
-    if has_settings:
-        expect(page.get_by_test_id("task-permission-control")).to_be_visible()
-        expect(page.get_by_test_id("task-permission-trigger")).to_have_text("Default")
-        _open_agent_settings(page)
-        expect(page.get_by_test_id("task-agent-model-default")).to_have_attribute(
-            "aria-checked", "true"
-        )
-        # With no pinned host/catalog, Codex cannot advertise model-specific efforts.
-        expect(page.get_by_test_id("task-agent-efforts")).to_have_count(0)
-        _close_agent_settings(page)
-    else:
-        expect(page.get_by_test_id("task-permission-control")).to_be_hidden()
-        expect(dialog.get_by_text("Uses this agent")).to_be_visible()
-        _agent_trigger(page).click()
-        expect(
-            page.locator(
-                '[data-harness-menu-row][data-active="true"] '
-                '[data-testid^="new-chat-landing-agent-config-"]'
-            )
-        ).to_have_count(0)
-        page.keyboard.press("Escape")
-
-
 def test_scheduled_task_create_persists_model_and_effort(
     page: Page,
     live_server: str,
@@ -780,7 +732,11 @@ def test_scheduled_task_create_persists_model_and_effort(
 
     page.get_by_test_id("task-name-input").fill("Model effort create")
     page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
+    # A new task starts on Auto permissions and the agent's default model and effort.
+    expect(page.get_by_test_id("task-permission-trigger")).to_have_text("Auto")
     _open_agent_settings(page)
+    for default_row in ("task-agent-model-default", "task-agent-effort-default"):
+        expect(page.get_by_test_id(default_row)).to_have_attribute("aria-checked", "true")
     _pick_agent_setting(page, "task-agent-models", model_label)
     _pick_agent_setting(page, "task-agent-efforts", "High")
     _close_agent_settings(page)
@@ -794,27 +750,6 @@ def test_scheduled_task_create_persists_model_and_effort(
     assert created["host_id"] == claude_ready_host.host_id, created
     assert created["model_override"] == selected_model["id"], created
     assert created["reasoning_effort"] == "high", created
-
-
-def test_scheduled_task_model_effort_controls_visible_for_capable_agent(
-    page: Page,
-    live_server: str,
-) -> None:
-    """Claude Code offers model, effort, and permission settings; a new task starts on Auto."""
-    _open_automations_page(page, live_server)
-    _open_create_dialog(page)
-
-    permission_trigger = page.get_by_test_id("task-permission-trigger")
-    expect(permission_trigger).to_be_visible()
-    expect(permission_trigger).to_have_text("Auto")
-    _open_agent_settings(page)
-    expect(page.get_by_test_id("task-agent-model-default")).to_have_attribute(
-        "aria-checked", "true"
-    )
-    expect(page.get_by_test_id("task-agent-effort-default")).to_have_attribute(
-        "aria-checked", "true"
-    )
-    _close_agent_settings(page)
 
 
 @pytest.mark.usefixtures("online_host")

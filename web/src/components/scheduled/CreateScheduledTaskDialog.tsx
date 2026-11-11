@@ -69,6 +69,7 @@ import {
   type ComposerConfigSection,
 } from "@/components/composer/ComposerConfigSections";
 import { nativeAgentHasModelSettings } from "@/lib/nativeCodingAgents";
+import { harnessReadinessOnHost } from "@/lib/harnessSetup";
 import { ProjectPicker, ProjectRowIcon } from "@/shell/ProjectPicker";
 import { useProjects, useResolveOrCreateProjectId } from "@/hooks/useConversations";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -1074,10 +1075,18 @@ export function CreateScheduledTaskDialog({
   const catalogDefaultModel = harnessSettings.models.find((option) => option.isDefault);
   const pickedModelLabel =
     pickerModelChoices.find((option) => option.id === displayedModel)?.label ?? displayedModel;
+  // The picker hides the model of an unavailable harness; without a model it names the agent.
+  const pickerHost = sandboxMode ? undefined : badgeHost;
+  const selectedReadiness = harnessReadinessOnHost(selectedAgent?.harness, pickerHost);
+  const selectedUnavailableOnHost =
+    selectedAgent !== undefined &&
+    !selectedReadiness.selectable &&
+    selectedReadiness.fallbackRelevant;
+  const showTriggerModel = supportsModel && !selectedUnavailableOnHost;
   const pickerTriggerDetails: { label: string; value: string }[] = [];
-  if (supportsModel && displayedModel) {
+  if (showTriggerModel && displayedModel) {
     pickerTriggerDetails.push({ label: "Model", value: pickedModelLabel });
-  } else if (supportsModel && catalogDefaultModel) {
+  } else if (showTriggerModel && catalogDefaultModel) {
     pickerTriggerDetails.push({
       label: "Model",
       value: `Default (${catalogDefaultModel.displayName ?? catalogDefaultModel.id})`,
@@ -1649,7 +1658,10 @@ export function CreateScheduledTaskDialog({
                             curation.restrictToAgentNames.size > 0 ? agentList : undefined
                           }
                           // Sandboxes provision their own harnesses; host badges only apply to hosts.
-                          host={sandboxMode ? undefined : badgeHost}
+                          host={pickerHost}
+                          // Runs start later, so saved settings stay editable while the
+                          // harness is unavailable on the host.
+                          configurableWhenUnavailable
                           triggerDetails={pickerTriggerDetails}
                           triggerIcon={
                             selectedAgent ? <ComposerAgentIcon agent={selectedAgent} /> : undefined

@@ -1263,6 +1263,7 @@ export function AgentHarnessPicker({
   onPrefetchEntries,
   curatedEntries,
   entriesFailed = false,
+  configurableWhenUnavailable = false,
 }: {
   appearance?: "composer" | "header";
   agentEntries: AvailableAgent[];
@@ -1355,6 +1356,10 @@ export function AgentHarnessPicker({
   /** Whether the roster could not be loaded, so an empty curated list is a
    *  failed fetch rather than the deployment's doing. */
   entriesFailed?: boolean;
+  /** Keep the selected entry's configuration editable when its harness is unavailable on
+   *  the host. Its row still can't be picked; for surfaces that save settings for a later
+   *  launch rather than starting one now. */
+  configurableWhenUnavailable?: boolean;
 }) {
   // Controlled so picking a row can close the menu.
   const [internalOpen, setInternalOpen] = useState(false);
@@ -1555,7 +1560,7 @@ export function AgentHarnessPicker({
         summary={summary}
         description={blurb}
         active={active}
-        editable={editable && !unavailable}
+        editable={editable && (!unavailable || (configurableWhenUnavailable && active))}
         isMobile={isMobile}
         disabled={unavailable}
         tooltip={unavailable ? warningMessage : undefined}

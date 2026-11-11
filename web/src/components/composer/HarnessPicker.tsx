@@ -379,6 +379,7 @@ export function HarnessPickerEntry({
   configContent?: ReactNode;
   editable?: boolean;
   isMobile?: boolean;
+  /** Blocks selecting the row. An editable row still opens its configuration. */
   disabled?: boolean;
   tooltip?: ReactNode;
   tooltipTestId?: string;
@@ -479,9 +480,7 @@ export function HarnessPickerEntry({
                 allowConfigOpen.current = false;
               }}
               onClick={(event) => {
-                if (disabled) {
-                  event.preventDefault();
-                } else if (isEditTarget(event.target)) {
+                if (isEditTarget(event.target)) {
                   if (open) {
                     event.preventDefault();
                     onOpenChange(false);
@@ -490,17 +489,18 @@ export function HarnessPickerEntry({
                   }
                 } else {
                   event.preventDefault();
-                  selectAndClose();
+                  if (!disabled) selectAndClose();
                 }
               }}
               onKeyDown={(event) => {
                 if (event.target !== event.currentTarget) return;
-                if (disabled) event.preventDefault();
-                else if (event.key === "Enter" || event.key === " ") {
+                if (event.key === "ArrowRight") {
+                  allowConfigOpen.current = !open;
+                } else if (disabled) {
+                  event.preventDefault();
+                } else if (event.key === "Enter" || event.key === " ") {
                   event.preventDefault();
                   selectAndClose();
-                } else if (event.key === "ArrowRight") {
-                  allowConfigOpen.current = !open;
                 }
               }}
             >
@@ -530,20 +530,15 @@ export function HarnessPickerEntry({
               else onSelect?.();
             }}
             onClick={(event) => {
-              if (disabled) {
-                event.preventDefault();
-              } else if (editable && isEditTarget(event.target)) {
+              if (editable && isEditTarget(event.target)) {
                 event.preventDefault();
                 onOpenChange(true);
+              } else if (disabled) {
+                event.preventDefault();
               }
             }}
             onKeyDown={(event) => {
-              if (
-                editable &&
-                !disabled &&
-                event.target === event.currentTarget &&
-                event.key === "ArrowRight"
-              ) {
+              if (editable && event.target === event.currentTarget && event.key === "ArrowRight") {
                 event.preventDefault();
                 onOpenChange(true);
               }

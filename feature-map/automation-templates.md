@@ -248,7 +248,9 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   harness such as Cursor below Run on. Selecting an agent keeps Advanced collapsed.
   Open the agent's Edit flyout and expand Advanced to check that only supported
   settings appear, model changes clear unsupported effort choices, and saved
-  selections survive closing and reopening the flyout and the dialog. A new
+  selections survive closing and reopening the flyout and the dialog. On a host
+  where the selected harness is not set up, the picker shows its warning and the
+  flyout still edits or clears the saved model and effort. A new
   automation starts Claude on Auto and Codex on Approve for me, because nobody
   approves an unattended run; choosing Default saves no override. Codex also
   offers Full Access and Bypass approvals & sandbox, and Antigravity offers Skip
