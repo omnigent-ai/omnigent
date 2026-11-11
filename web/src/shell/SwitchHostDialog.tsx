@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangleIcon, GitBranchIcon, MonitorCloudIcon } from "lucide-react";
 import {
   Dialog,
@@ -27,13 +27,19 @@ import { WorkspacePathField } from "./WorkspacePathField";
 import { HostLabel } from "./HostLabel";
 import { normalizeWorkspacePath } from "./NewChatDialog";
 import { useHosts } from "@/hooks/useHosts";
+import { useSession } from "@/hooks/useSession";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import {
+  sandboxOptionLabel,
+  sandboxProfilesEnabled,
+  sandboxProviderOptions,
+} from "@/lib/capabilities";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
 import { randomUUID } from "@/lib/randomUUID";
 import { composeSandboxWorkspace, sandboxRepoProblem } from "@/lib/sandboxRepositories";
+import { SANDBOX_PROFILES_QUERY_KEY, fetchSandboxProfiles } from "@/lib/sandboxProfilesApi";
 import { launchManagedHost, launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import { useChatStore } from "@/store/chatStore";
@@ -146,13 +152,31 @@ function SupportedSwitchHostDialog({
   // Sandbox rows appear only when the server can launch a sandbox and move a
   // session onto it; "loading" keeps them hidden until the boot probe resolves.
   const info = useServerInfo();
-  const sandboxProviderRows = useMemo(
-    () =>
-      info !== "loading" && info.managed_sandboxes_enabled && info.move_to_managed_sandbox
-        ? sandboxProviderOptions(info)
-        : [],
-    [info],
-  );
+  const moveSupported =
+    info !== "loading" && info.managed_sandboxes_enabled && info.move_to_managed_sandbox;
+  // A provider that manages sandbox profiles binds one at session create, so
+  // the server refuses to move a session onto it.
+  const profilesEnabled = moveSupported && sandboxProfilesEnabled(info);
+  const { data: profileCatalog, isError: profileCatalogFailed } = useQuery({
+    queryKey: [...SANDBOX_PROFILES_QUERY_KEY, null],
+    queryFn: ({ signal }) => fetchSandboxProfiles(undefined, { signal }),
+    enabled: profilesEnabled,
+    staleTime: 30_000,
+    retry: false,
+  });
+  // A half-finished switch can leave the session with no host, and the server
+  // only moves a session off a host it still has.
+  const { session } = useSession(sessionId);
+  const sessionHostless = session != null && session.hostId === null;
+  const sandboxProviderRows = useMemo(() => {
+    if (info === "loading" || !moveSupported || sessionHostless) return [];
+    if (!profilesEnabled || profileCatalogFailed) return sandboxProviderOptions(info);
+    if (profileCatalog === undefined) return [];
+    const profiled = new Set(profileCatalog.managed_providers);
+    return sandboxProviderOptions(info).filter(
+      (provider) => !profiled.has(provider ?? info.sandbox_provider ?? ""),
+    );
+  }, [info, moveSupported, sessionHostless, profilesEnabled, profileCatalog, profileCatalogFailed]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 
@@ -185,6 +209,14 @@ function SupportedSwitchHostDialog({
       setSandboxProvider(sandboxProviderRows[0]);
     }
   }, [open, sandboxSelected, selectedHostId, hosts, targetHosts, sandboxProviderRows]);
+
+  // Drop a sandbox pick whose row is gone, e.g. once the session lost its host.
+  useEffect(() => {
+    if (sandboxSelected && !sandboxProviderRows.includes(sandboxProvider)) {
+      setSandboxSelected(false);
+      setSandboxProvider(null);
+    }
+  }, [sandboxSelected, sandboxProvider, sandboxProviderRows]);
 
   // Home listing for the chosen host. Shares the picker's query key, so
   // opening the browser afterwards costs no extra request.
@@ -276,6 +308,7 @@ function SupportedSwitchHostDialog({
     if (!canSwitch) return;
     setSubmitting(true);
     setError(null);
+    let released = false;
     try {
       // Drop the model override alongside the runner binding. A model id is
       // host-bound — the catalog depends on that machine's credentials — so
@@ -285,6 +318,7 @@ function SupportedSwitchHostDialog({
       // keeps this off the transcript: it's part of the move, not a /model.
       await updateSession(sessionId, { runnerId: "", modelOverride: null, silent: true });
       // From here the session is unbound until the launch lands.
+      released = true;
       setStranded(true);
       if (sandboxSelected) {
         // The session's sandbox launch events report progress from here, so
@@ -322,6 +356,9 @@ function SupportedSwitchHostDialog({
       void queryClient.invalidateQueries({ queryKey: terminalsQueryKey(sessionId) });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Couldn't switch hosts. Try again.");
+      // A failed launch may have repointed or cleared the host; refetch so the
+      // picker reflects where the session is bound now.
+      if (released) void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
     } finally {
       setSubmitting(false);
     }

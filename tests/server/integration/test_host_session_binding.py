@@ -8,7 +8,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1421,6 +1421,7 @@ async def test_sandbox_move_failing_partway_restores_the_session_binding(
         ("requested host id taken", 409),
         ("side chat", 400),
         ("already in a sandbox", 400),
+        ("provider manages sandbox profiles", 400),
     ],
 )
 async def test_sandbox_move_refuses_without_touching_the_session(
@@ -1430,7 +1431,7 @@ async def test_sandbox_move_refuses_without_touching_the_session(
     A session whose runner was never released, that has no host to leave, or
     that is a side chat, or a move naming a taken host id, is refused without
     touching the session. So is one already in a sandbox nothing would tear
-    down.
+    down, and a move onto a provider that binds a sandbox profile at create.
     """
     env = managed_session_env
     session_id = await _session_released_from_laptop(env, agent_name="move-guard-agent")
@@ -1452,6 +1453,12 @@ async def test_sandbox_move_refuses_without_touching_the_session(
             token_expires_at=9_999_999_999,
         )
         request = {"host_id": _MOVED_SANDBOX_HOST_ID}
+    elif reason == "provider manages sandbox profiles":
+        deployment = env.app.state.sandbox_config
+        env.app.state.sandbox_config = replace(
+            deployment,
+            configs=tuple(replace(config, manages_profiles=True) for config in deployment.configs),
+        )
     else:
         env.host_store.register_managed_host(
             host_id=_MOVED_SANDBOX_HOST_ID,

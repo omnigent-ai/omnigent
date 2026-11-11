@@ -11,6 +11,8 @@ import { useSession } from "@/hooks/useSession";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { fetchSandboxProfiles } from "@/lib/sandboxProfilesApi";
+import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
 import { launchManagedHost, launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
@@ -65,6 +67,10 @@ vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
 vi.mock("@/hooks/useRecentWorkspaces", () => ({
   useRecentWorkspaces: () => ({ recent: ["/Users/alice/repo"], addRecent: vi.fn() }),
+}));
+vi.mock("@/lib/sandboxProfilesApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxProfilesModule>()),
+  fetchSandboxProfiles: vi.fn(),
 }));
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof SessionsApiModule>()),
@@ -182,6 +188,12 @@ beforeEach(() => {
   updateSessionMock.mockResolvedValue({} as Awaited<ReturnType<typeof updateSession>>);
   launchRunnerMock.mockResolvedValue({ runnerId: "runner_new" });
   launchManagedHostMock.mockResolvedValue({} as Awaited<ReturnType<typeof launchManagedHost>>);
+  vi.mocked(fetchSandboxProfiles).mockReset().mockResolvedValue({
+    profiles: [],
+    managed_providers: [],
+    default_profile_ids: {},
+    next_cursor: null,
+  });
 });
 
 afterEach(() => cleanup());
@@ -436,6 +448,49 @@ describe("SwitchHostDialog", () => {
       expect(screen.getByTestId("switch-host-sandbox-option-modal")).toBeInTheDocument();
       // A fresh provision is never the default while another host is online.
       expect(screen.getByTestId("mock-host-select")).toHaveValue("host_new");
+    });
+
+    it("lists no sandbox once the session has lost its host", () => {
+      // The server only moves a session off a host it still has, e.g. not after
+      // an earlier switch failed partway and left it unbound.
+      vi.mocked(useSession).mockReturnValue({
+        session: {
+          id: "conv_1",
+          agentId: "agent_1",
+          agentName: null,
+          status: "idle",
+          title: null,
+          createdAt: 0,
+          items: [],
+          permissionLevel: null,
+          parentSessionId: null,
+          subAgentName: null,
+          kind: "default",
+          hostId: null,
+          labels: {},
+        },
+        isLoading: false,
+        error: null,
+      });
+      renderDialog(ARCLET_SERVER);
+      expect(screen.queryByTestId("switch-host-sandbox-option-arclet")).toBeNull();
+      expect(screen.getByTestId("mock-host-select")).toHaveValue("host_new");
+    });
+
+    it("leaves out a provider that manages sandbox profiles", async () => {
+      vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+        profiles: [],
+        managed_providers: ["profiled"],
+        default_profile_ids: {},
+        next_cursor: null,
+      });
+      renderDialog({
+        ...ARCLET_SERVER,
+        sandbox_providers: ["arclet", "profiled"],
+        features: { sandbox_profiles: true },
+      });
+      expect(await screen.findByTestId("switch-host-sandbox-option-arclet")).toBeInTheDocument();
+      expect(screen.queryByTestId("switch-host-sandbox-option-profiled")).toBeNull();
     });
 
     it("moves the session onto a new sandbox after releasing its runner", async () => {

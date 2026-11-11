@@ -5125,6 +5125,20 @@ def register_core_routes(
                     "moving it to another sandbox is not supported.",
                     code=ErrorCode.INVALID_INPUT,
                 )
+        # A profiled sandbox binds its profile at session create, which
+        # a move doesn't have; refuse before the session is touched.
+        sandbox_config = getattr(request.app.state, "sandbox_config", None)
+        target_config = (
+            sandbox_config.for_provider(body.sandbox_provider)
+            if sandbox_config is not None
+            else None
+        )
+        if target_config is not None and target_config.manages_profiles:
+            raise OmnigentError(
+                "This sandbox provider uses sandbox profiles, so a session can't be "
+                "moved onto it. Fork the session onto it instead.",
+                code=ErrorCode.INVALID_INPUT,
+            )
         if body.host_id is not None:
             await _check_requested_host_id(request, body.host_id, user_id)
 
