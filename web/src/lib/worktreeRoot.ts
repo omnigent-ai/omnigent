@@ -59,7 +59,7 @@ export function sha256Hex(text: string): string {
 /** A path split like Python's `PurePosixPath` or, for drive/UNC paths, `PureWindowsPath`. */
 interface ParsedPath {
   windows: boolean;
-  /** `"/"`, `"C:\\"`, `"\\\\server\\share\\"`, or `""` for a relative path. */
+  /** `"/"`, `"//"`, `"C:\\"`, `"\\\\server\\share\\"`, or `""` for a relative path. */
   anchor: string;
   parts: string[];
 }
@@ -74,7 +74,9 @@ function parsePath(path: string): ParsedPath {
     return { windows: true, anchor, parts: parts.filter((part) => part !== "" && part !== ".") };
   }
   const parts = path.split("/").filter((part) => part !== "" && part !== ".");
-  return { windows: false, anchor: path.startsWith("/") ? "/" : "", parts };
+  // POSIX keeps exactly two leading slashes as a distinct anchor.
+  const anchor = /^\/\/(?!\/)/.test(path) ? "//" : path.startsWith("/") ? "/" : "";
+  return { windows: false, anchor, parts };
 }
 
 function formatPath({ windows, anchor, parts }: ParsedPath): string {

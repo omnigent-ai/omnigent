@@ -12,6 +12,7 @@ import {
 const POSIX_ROOT = "1a1329852b078cc01f5b390143afdd4bffbbaf52772d4b7c36ff8a435bfcf287";
 const WINDOWS_ROOT = "80ecddbd344246011666ff6a111ee0be2278a0b1ca388463f48dda5983de1a61";
 const DRIVE_ROOT = "826c0d7d3c42f5c52210bfc49965904f2b74650b86e66ce4b14a619735bc8360";
+const DOUBLE_SLASH_ROOT = "83ad6be980ad28b6160784c491e37c87a2df066a6c33fe835abb268a361b9280";
 const UNC_ROOT = "fbeb73f29978309234cc3d43e60feabd9a0d71b873360974863c49c5be27d82c";
 
 describe("sha256Hex", () => {
@@ -45,6 +46,7 @@ describe("recordedWorktreeRoot", () => {
   it.each([
     ["/repo/.worktrees/a/packages/app", POSIX_ROOT, "/repo/.worktrees/a"],
     ["/repo//.worktrees/./a/", POSIX_ROOT, "/repo/.worktrees/a"],
+    ["//x", DOUBLE_SLASH_ROOT, "//x"],
     ["C:/Repo/.worktrees/A/pkg", WINDOWS_ROOT, "C:\\Repo\\.worktrees\\A"],
     ["c:\\repo\\.worktrees\\a", WINDOWS_ROOT, "c:\\repo\\.worktrees\\a"],
     ["C:\\Repo", DRIVE_ROOT, "C:\\"],
@@ -63,6 +65,7 @@ describe("worktreeDirectoryName", () => {
     ["\\\\srv\\share\\wt", "wt"],
     ["C:\\", "C:\\"],
     ["/", "/"],
+    ["//x", "x"],
   ])("names %s %s", (path, name) => {
     expect(worktreeDirectoryName(path)).toBe(name);
   });
