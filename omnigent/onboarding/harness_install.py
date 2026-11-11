@@ -167,6 +167,12 @@ GOOSE_KEY = "goose"
 # is kept here purely as the canonical harness id the readiness layer shares.
 COPILOT_KEY = "copilot"
 
+# Grok Build authenticates against its own credential (``grok login`` →
+# ``~/.grok/auth.json``, or ``XAI_API_KEY``) with no Omnigent-managed
+# credential, and ships via a curl installer rather than npm — so it carries
+# an ``install_hint``, not a ``package``.
+GROK_KEY = "grok"
+
 # Hermes Agent is installed via a curl installer from Nous Research and
 # authenticates through its own ``hermes model`` interactive flow (no
 # Omnigent-managed credentials). The ``hermes`` binary must be on PATH.
@@ -331,6 +337,13 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint="brew install block-goose-cli",
         min_version=_GOOSE_MIN_VERSION,
     ),
+    GROK_KEY: HarnessInstallSpec(
+        "Grok Build",
+        "grok",
+        package=None,
+        install_hint="curl -fsSL https://x.ai/cli/install.sh | bash",
+        login_args=("login", "--device-auth"),
+    ),
     HERMES_KEY: HarnessInstallSpec(
         "Hermes",
         "hermes",
@@ -391,6 +404,12 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "native-agy": GEMINI_FAMILY,
     "goose-native": GOOSE_KEY,
     "native-goose": GOOSE_KEY,
+    # Native Grok (``grok-native``, ``grok agent serve``) wraps the same
+    # ``grok`` CLI as the ACP row (``harness: grok``); both gate on the
+    # same binary.
+    "grok-native": GROK_KEY,
+    "native-grok": GROK_KEY,
+    GROK_KEY: GROK_KEY,
     # Headless Goose (``harness: goose``, drives ``goose acp``) wraps the same
     # ``goose`` CLI as the native TUI, so it gates on the same binary.
     GOOSE_KEY: GOOSE_KEY,

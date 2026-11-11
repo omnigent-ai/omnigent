@@ -195,6 +195,15 @@ CURSOR_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="cursor",
 )
 
+GROK_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="grok",
+    display_name="Grok Build",
+    agent_name="grok-native-ui",
+    harness="grok-native",
+    wrapper_label=GROK_NATIVE_WRAPPER_VALUE,
+    terminal_name="grok",
+)
+
 KIRO_NATIVE_CODING_AGENT = NativeCodingAgent(
     key="kiro",
     display_name="Kiro",
@@ -320,6 +329,7 @@ _BUILTIN_NATIVE_PROVIDERS: tuple[NativeHarnessProvider, ...] = tuple(
         CURSOR_NATIVE_CODING_AGENT,
         KIRO_NATIVE_CODING_AGENT,
         GOOSE_NATIVE_CODING_AGENT,
+        GROK_NATIVE_CODING_AGENT,
         ANTIGRAVITY_NATIVE_CODING_AGENT,
         QWEN_NATIVE_CODING_AGENT,
         KIMI_NATIVE_CODING_AGENT,
@@ -918,6 +928,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         CURSOR_NATIVE_CODING_AGENT,
         KIRO_NATIVE_CODING_AGENT,
         GOOSE_NATIVE_CODING_AGENT,
+        GROK_NATIVE_CODING_AGENT,
         ANTIGRAVITY_NATIVE_CODING_AGENT,
         QWEN_NATIVE_CODING_AGENT,
         KIMI_NATIVE_CODING_AGENT,
