@@ -445,7 +445,7 @@ function makeEventCapturingRegistry(extra = {}) {
       return ev;
     },
     fireContextMenu: (params) => handlers["context-menu"]({}, params),
-    windowOpen: (url) => windowOpenHandler({ url }),
+    windowOpen: (url, disposition) => windowOpenHandler({ url, disposition }),
   };
 }
 
@@ -1364,6 +1364,61 @@ describe("browserViewRegistry — child window.open is denied (S3)", () => {
     assert.deepEqual(windowOpen("file:///etc/passwd"), { action: "deny" });
     assert.deepEqual(windowOpen("javascript:alert(1)"), { action: "deny" });
     assert.deepEqual(loaded, []);
+  });
+
+  it("asks a supporting renderer for a new tab for a Cmd/Ctrl-clicked link only", () => {
+    const { registry, windowOpen, loaded, sent } = makeEventCapturingRegistry();
+    const viewId = "browser-tab:conv_1:tab_1";
+    registry.openOrNavigate(viewId, "https://example.com/", undefined, { agent: true });
+    const openTabRequests = () => sent.filter((s) => s.channel === "browser-open-tab");
+    loaded.length = 0;
+
+    assert.deepEqual(windowOpen("https://example.com/older-ui", "background-tab"), {
+      action: "deny",
+    });
+    assert.deepEqual(loaded, ["https://example.com/older-ui"], "an older UI keeps in-place loads");
+
+    registry.setOpenTabSupported(true);
+    loaded.length = 0;
+    assert.deepEqual(windowOpen("https://example.com/new-tab", "background-tab"), {
+      action: "deny",
+    });
+    assert.deepEqual(windowOpen("https://example.com/blank-target", "foreground-tab"), {
+      action: "deny",
+    });
+    assert.deepEqual(windowOpen("https://example.com/new-window", "new-window"), {
+      action: "deny",
+    });
+    assert.deepEqual(loaded, [
+      "https://example.com/blank-target",
+      "https://example.com/new-window",
+    ]);
+    assert.deepEqual(openTabRequests(), [
+      {
+        channel: "browser-open-tab",
+        payload: { conversationId: viewId, url: "https://example.com/new-tab" },
+      },
+    ]);
+
+    registry.setOpenTabSupported(false);
+    loaded.length = 0;
+    windowOpen("https://example.com/after-reload", "background-tab");
+    assert.deepEqual(loaded, ["https://example.com/after-reload"]);
+    assert.equal(openTabRequests().length, 1);
+  });
+
+  it("applies the popup policy before forwarding a Cmd/Ctrl-clicked link", () => {
+    const { registry, windowOpen, loaded, sent } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    registry.setOpenTabSupported(true);
+    loaded.length = 0;
+    windowOpen("http://169.254.169.254/latest/meta-data/", "background-tab");
+    windowOpen("file:///etc/passwd", "background-tab");
+    assert.deepEqual(loaded, []);
+    assert.deepEqual(
+      sent.map((s) => s.channel).filter((channel) => channel.startsWith("browser-")),
+      ["browser-view-created", "browser-nav-blocked"],
+    );
   });
 });
 
