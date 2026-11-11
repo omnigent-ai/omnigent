@@ -269,10 +269,7 @@ function setAgents(agents: AvailableAgent[]): void {
   >);
 }
 
-function renderLanding(
-  cachedSessionIds: string[] = [],
-  infoOverrides: Partial<ServerInfo> = {},
-): void {
+function renderLanding(cachedSessionIds: string[] = [], infoOverrides: Partial<ServerInfo> = {}) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -321,7 +318,7 @@ function renderLanding(
       </QueryClientProvider>
     );
   }
-  render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  return render(<NewChatLandingScreen />, { wrapper: Wrapper });
 }
 
 /**
@@ -1346,6 +1343,47 @@ describe("NewChatLandingScreen create flow", () => {
     renderLanding();
     expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("restore this draft");
   });
+
+  it.each([false, true])(
+    "clears only the submitted prompt from another mounted landing (newer edits: %s)",
+    async (hasNewerEdits) => {
+      let resolveCreate!: (response: Response) => void;
+      vi.mocked(authenticatedFetch).mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveCreate = resolve;
+        }) as ReturnType<typeof authenticatedFetch>,
+      );
+
+      const parked = renderLanding();
+      await waitForWorkspaceSeed();
+      typeMessage("submitted prompt");
+      parked.unmount();
+
+      const creator = renderLanding();
+      fireEvent.click(within(creator.container).getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+
+      // A second landing can mount before the creating landing unmounts. It
+      // restores the same parked prompt, but must not spend it again.
+      const next = renderLanding();
+      const nextInput = within(next.container).getByTestId("new-chat-landing-input");
+      expect(nextInput).toHaveValue("submitted prompt");
+      if (hasNewerEdits) {
+        fireEvent.change(nextInput, { target: { value: "newer draft" } });
+      }
+
+      await act(async () => {
+        resolveCreate({ ok: true, json: async () => ({ id: "conv_started" }) } as Response);
+      });
+      const expected = hasNewerEdits ? "newer draft" : "";
+      expect(nextInput).toHaveValue(expected);
+
+      creator.unmount();
+      next.unmount();
+      const fresh = renderLanding();
+      expect(within(fresh.container).getByTestId("new-chat-landing-input")).toHaveValue(expected);
+    },
+  );
 
   it("records the launched workspace under its host without corrupting other recents", async () => {
     // Write-back hygiene for omnigent:recent-workspaces: the launched path

@@ -2150,12 +2150,21 @@ const LANDING_IMPORT_DISMISSED_STORAGE_KEY = "omnigent:landing-import-dismissed"
 interface LandingDraftState {
   draft: LandingDraft | null;
   revision: number;
+  createListeners: Set<(submittedDraft: LandingDraft) => void>;
 }
 const landingDrafts = new Map<string | null, LandingDraftState>();
 
 function writeLandingDraft(state: LandingDraftState, draft: LandingDraft | null): void {
   state.draft = draft;
   state.revision += 1;
+}
+
+function sameLandingInput(left: LandingDraft, right: LandingDraft): boolean {
+  return (
+    left.message === right.message &&
+    left.files.length === right.files.length &&
+    left.files.every((file, index) => file === right.files[index])
+  );
 }
 
 // Test-only: clears the preserved landing draft so each case starts from a
@@ -2240,7 +2249,11 @@ function NewChatLandingContent({
   siblingSource?: Awaited<ReturnType<typeof getSessionSlim>>;
 }) {
   const [draftState] = useState(() => {
-    const state = landingDrafts.get(siblingSourceId) ?? { draft: null, revision: 0 };
+    const state = landingDrafts.get(siblingSourceId) ?? {
+      draft: null,
+      revision: 0,
+      createListeners: new Set<(submittedDraft: LandingDraft) => void>(),
+    };
     landingDrafts.set(siblingSourceId, state);
     return state;
   });
@@ -2912,6 +2925,7 @@ function NewChatLandingContent({
   // snapshot is dropped instead of resurrected.
   const submittedRef = useRef(false);
   const submittedDraftRevisionRef = useRef<number | null>(null);
+  const submittedDraftRef = useRef<LandingDraft | null>(null);
   // Whether this composer is still on screen. The create POST can outlive
   // it — the user opens another session while the session bootstraps — and
   // the post-create navigation must not follow them there.
@@ -2958,6 +2972,25 @@ function NewChatLandingContent({
       }
     };
   }, [draftState]);
+
+  useEffect(() => {
+    const clearSubmittedInput = (submittedDraft: LandingDraft) => {
+      if (submittedRef.current || !sameLandingInput(draftRef.current, submittedDraft)) return;
+      draftRef.current = {
+        ...draftRef.current,
+        message: "",
+        files: [],
+        mentions: { files: [], sessions: [] },
+      };
+      setMessage("");
+      restoreFiles([]);
+      clearTaggedMentionsRef.current();
+    };
+    draftState.createListeners.add(clearSubmittedInput);
+    return () => {
+      draftState.createListeners.delete(clearSubmittedInput);
+    };
+  }, [draftState, restoreFiles]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
   const { addRecentHarness } = useRecentHarnesses();
@@ -5867,6 +5900,7 @@ function NewChatLandingContent({
   function returnDraftToUser(temporaryConversationId?: string) {
     submittedRef.current = false;
     submittedDraftRevisionRef.current = null;
+    submittedDraftRef.current = null;
     const originalDraft =
       temporaryConversationId && !hasPendingLocalMessage(temporaryConversationId)
         ? { ...draftRef.current, message: "", files: [] }
@@ -5979,6 +6013,7 @@ function NewChatLandingContent({
       }
       // Spend the draft only once provisioning starts, after the laptop credential check.
       submittedDraftRevisionRef.current = draftState.revision;
+      submittedDraftRef.current = draftRef.current;
       submittedRef.current = true;
       trackClick("new_chat.start_session", "button");
       if (sandboxRepoSelections.length > 0) {
@@ -6564,6 +6599,11 @@ function NewChatLandingContent({
       // screen stashed, so the next visit starts clean.
       if (submittedDraftRevisionRef.current === draftState.revision) {
         writeLandingDraft(draftState, null);
+      }
+      if (submittedDraftRef.current !== null) {
+        for (const listener of draftState.createListeners) {
+          listener(submittedDraftRef.current);
+        }
       }
 
       // `localConv` is set only when a real agent id was resolved up front.
