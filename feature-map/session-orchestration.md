@@ -2,9 +2,9 @@
 
 An agent in a session that is private or shared read-only can send work to
 another session owned by the same user, then read its status/history. It can also create private sibling
-workers grouped in the left sidebar on its host or a new managed sandbox when
-`sibling_sessions` is enabled in `OMNIGENT_FEATURES`; otherwise workers appear
-as standalone sessions. Peer messaging is enabled
+workers grouped in the left sidebar on its host or a new managed sandbox by
+default. Set `OMNIGENT_FEATURES=-sibling_sessions` for standalone workers instead.
+Peer messaging is enabled
 by default; `-session_orchestration` is its server kill switch and also blocks
 MCP independent creation.
 
@@ -153,6 +153,14 @@ MCP independent creation.
 - As an admin, open Settings → Admin → General and change **Nested agent destinations**.
   Open **Add nested agent** from a session and inspect its host picker, then try the
   same disallowed destination through the API or MCP.
+- **Add nested agent** starts in the source checkout even when the project or user
+  defaults request new worktrees. Directory and worktree controls remain editable;
+  switching away and back restores the source directory. A manually created worktree
+  defaults to the selected checkout's actual branch, including `master`, with an
+  editable base branch. Browser
+  coverage: `tests/browser_ui/chat/test_nested_agent_workspace.py` (desktop/mobile,
+  mocked backend); default and explicit worktree payloads:
+  `web/src/shell/NewChatDialog.flow.test.tsx`.
 - Open an independent worker in Chat or Terminal and follow its "Created by"
   link. On mobile web, the same link is in the header. Ask the manager to list
   its sessions and match `created_by_session_id` to its own session ID.
@@ -167,8 +175,8 @@ MCP independent creation.
 
 ## Driving it with the repro environment
 
-Preconditions: use an isolated test server with `OMNIGENT_FEATURES=sibling_sessions`
-for nested creation journeys; peer messaging and standalone creation use the default settings.
+Preconditions: use an isolated test server with default settings for nested
+creation and peer messaging; set `OMNIGENT_FEATURES=-sibling_sessions` for standalone creation.
 Own both sessions. Same-host creation requires a connected
 owned host/workspace. Managed creation requires a launch-capable provider in the
 server's sandbox configuration (for example, Modal or Daytona). Other deployments
