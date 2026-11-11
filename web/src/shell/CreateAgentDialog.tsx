@@ -262,7 +262,7 @@ export function CreateAgentForm({
 
   return (
     <form onSubmit={(event) => void handleSubmit(event)} className="flex min-h-0 flex-col gap-4">
-      {notice && <p className="text-ui text-muted-foreground">{notice}</p>}
+      {notice && <p className="text-sm text-muted-foreground">{notice}</p>}
       <div className="-mx-1 flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto px-1">
         <fieldset disabled={pending} className="contents">
           <AgentFormFields {...fields} />

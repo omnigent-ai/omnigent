@@ -5,8 +5,29 @@ import {
   imagePreview,
   isTextBlock,
   keyedAttachments,
+  slashCommandDisplayName,
+  slashCommandEchoText,
   structuredErrorFields,
 } from "./blocks";
+
+describe("slash command display names", () => {
+  it.each([
+    ["claude-native-ui:build-summary", "build-summary"],
+    ["codex-native-ui:build-summary", "build-summary"],
+    ["claude-native-ui:docs:review", "docs:review"],
+    ["dev-productivity:simplify", "dev-productivity:simplify"],
+    ["custom-native-ui:review", "custom-native-ui:review"],
+    ["effort", "effort"],
+    ["claude-native-ui:", "claude-native-ui:"],
+    ["", ""],
+  ])("displays %s as %s", (name, displayName) => {
+    expect(slashCommandDisplayName(name)).toBe(displayName);
+    expect(slashCommandEchoText(name, "")).toBe(`/${displayName}`);
+    expect(slashCommandEchoText(name, "src/main.ts --verbose")).toBe(
+      `/${displayName} src/main.ts --verbose`,
+    );
+  });
+});
 
 describe("structuredErrorFields", () => {
   it("keeps classified failures and informational notices intact", () => {

@@ -30,7 +30,7 @@ import json
 import os
 import shutil
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -146,6 +146,28 @@ async def test_stale_continuation_without_model_is_rejected() -> None:
 
     with pytest.raises(OmnigentError, match="model is required"):
         await HarnessApp()._start_or_inject_turn(request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_frames", [1, 2])
+async def test_disconnect_during_initial_envelope_releases_turn(initial_frames: int) -> None:
+    class App(HarnessApp):
+        async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+            pass
+
+    app = App()
+    request = CreateResponseRequest(model="test-agent", input="hello")
+    response = await app._start_or_inject_turn(request)
+    assert isinstance(response.body_iterator, AsyncGenerator)
+    async with contextlib.aclosing(response.body_iterator) as stream:
+        for _ in range(initial_frames):
+            await anext(stream)
+
+    followup = await app._start_or_inject_turn(request)
+    assert followup.status_code == 200
+    frames = [frame async for frame in followup.body_iterator]
+    assert b"event: response.completed" in frames[-1]
+    assert not app._in_flight
 
 
 @pytest.mark.asyncio
