@@ -296,19 +296,20 @@ describe("PullRequestChangesTab", () => {
   });
 
   it.each([
-    { selected: true, mode: "changes", reducedMotion: false },
-    { selected: false, mode: "changes", reducedMotion: false },
-    { selected: true, mode: "commits", reducedMotion: true },
+    { selected: true, mode: "changes", reducedMotion: false, earlier: false },
+    { selected: false, mode: "changes", reducedMotion: false, earlier: false },
+    { selected: true, mode: "commits", reducedMotion: true, earlier: false },
+    { selected: true, mode: "changes", reducedMotion: false, earlier: true },
   ] as const)(
-    "reveals review context from $mode after loading and mounting (selected: $selected)",
-    async ({ selected, mode, reducedMotion }) => {
+    "reveals review context from $mode after loading and mounting (selected: $selected, earlier: $earlier)",
+    async ({ selected, mode, reducedMotion, earlier }) => {
       const cancelHighlight = vi.fn();
       mocks.animateComment
         .mockReset()
         .mockReturnValue({ cancel: cancelHighlight } as unknown as Animation);
       const media = window.matchMedia("(prefers-reduced-motion: reduce)");
       vi.spyOn(window, "matchMedia").mockReturnValue({ ...media, matches: reducedMotion });
-      const conversationId = `local-comment-loading-${mode}-${selected}`;
+      const conversationId = `local-comment-loading-${mode}-${selected}-${earlier}`;
       const view = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
       act(() => view.result.current.setMode(mode));
       const comment = {
@@ -322,7 +323,7 @@ describe("PullRequestChangesTab", () => {
           side: "RIGHT",
           line: 2,
           start_line: null,
-          head_sha: "head",
+          head_sha: earlier ? "previous-head" : "head",
           base_sha: "base",
         },
       } as Comment;
@@ -366,10 +367,11 @@ describe("PullRequestChangesTab", () => {
       const focus = vi.spyOn(HTMLElement.prototype, "focus").mockImplementationOnce(() => {});
       tab.rerender(PATCH);
       await waitFor(() =>
-        expect(diffOf("b.ts")?.querySelector("[data-local-review-comment]")).toHaveFocus(),
+        expect(document.querySelector('[data-local-review-comment="local-comment"]')).toHaveFocus(),
       );
       await waitFor(() => expect(navigation.result.current).toBeUndefined());
       expect(view.result.current.mode).toBe("changes");
+      expect(view.result.current.shownEarlierCommentPaths.has("b.ts")).toBe(earlier);
       expect(focus.mock.calls.length).toBeGreaterThan(1);
       expect(mocks.animateComment).toHaveBeenCalledWith(
         [
@@ -385,6 +387,87 @@ describe("PullRequestChangesTab", () => {
       expect(cancelHighlight).toHaveBeenCalledTimes(2);
     },
   );
+
+  it("toggles earlier comments per file without hiding current comments", async () => {
+    const conversationId = "earlier-comments";
+    const localComment = (id: string, path: string, head: string, base = "base") =>
+      ({
+        id,
+        conversation_id: conversationId,
+        path,
+        body: id,
+        status: "draft",
+        anchor_metadata: {
+          pr_url: prUrlFor(conversationId),
+          side: "RIGHT",
+          line: 1,
+          head_sha: head,
+          base_sha: base,
+        },
+      }) as Comment;
+    comments.data = [
+      localComment("current-a", "a.ts", "head"),
+      localComment("earlier-a", "a.ts", "previous-head"),
+      localComment("earlier-b", "b.ts", "head", "previous-base"),
+      localComment("earlier-gone", "gone.ts", "previous-head"),
+    ];
+    const thread = {
+      id: "outdated-thread",
+      path: "a.ts",
+      outdated: true,
+      resolved: false,
+    } as ReviewThread;
+    const tab = renderTab({
+      conversationId,
+      files: [changed("a.ts"), changed("b.ts")],
+      patch: A + B,
+      threads: [thread],
+    });
+    const toggleEarlier = async (path: string, label: string) => {
+      fireEvent.pointerDown(screen.getByRole("button", { name: `More actions for ${path}` }), {
+        button: 0,
+      });
+      fireEvent.click(await screen.findByRole("menuitem", { name: label }));
+    };
+    expect(screen.getByText("current-a")).toBeInTheDocument();
+    expect(screen.queryByText("earlier-a")).toBeNull();
+    expect(screen.queryByText("earlier-b")).toBeNull();
+    expect(screen.queryByText("earlier-gone")).toBeNull();
+    expect(document.querySelector('[data-review-thread="outdated-thread"]')).toBeNull();
+
+    await toggleEarlier("a.ts", "Show earlier comments");
+    expect(screen.getByText("earlier-a")).toBeInTheDocument();
+    expect(document.querySelector('[data-review-thread="outdated-thread"]')).not.toBeNull();
+    expect(screen.getByText("current-a")).toBeInTheDocument();
+    expect(screen.queryByText("earlier-b")).toBeNull();
+    await toggleEarlier("a.ts", "Hide earlier comments");
+    expect(screen.queryByText("earlier-a")).toBeNull();
+    expect(screen.getByText("current-a")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Next unresolved conversation" }));
+    expect(document.querySelector('[data-review-thread="outdated-thread"]')).not.toBeNull();
+    await toggleEarlier("b.ts", "Show earlier comments");
+    expect(screen.getByText("earlier-b")).toBeInTheDocument();
+    await toggleEarlier("gone.ts", "Show earlier comments");
+    expect(screen.getByText("earlier-gone")).toBeInTheDocument();
+    await toggleEarlier("gone.ts", "Hide earlier comments");
+    expect(screen.queryByText("earlier-gone")).toBeNull();
+
+    tab.unmount();
+    comments.data = comments.data.map((comment) => ({
+      ...comment,
+      conversation_id: "another-pr",
+      anchor_metadata: { ...comment.anchor_metadata!, pr_url: prUrlFor("another-pr") },
+    }));
+    renderTab({
+      conversationId: "another-pr",
+      files: [changed("a.ts"), changed("b.ts")],
+      patch: A + B,
+    });
+    expect(screen.getByText("current-a")).toBeInTheDocument();
+    expect(screen.queryByText("earlier-b")).toBeNull();
+    await toggleEarlier("b.ts", "Show earlier comments");
+    expect(screen.getByText("earlier-b")).toBeInTheDocument();
+  });
 
   it("clears the path filter to navigate to a thread on a filtered-out file", () => {
     const conversationId = "changes-tab-nav";

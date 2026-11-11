@@ -3640,6 +3640,9 @@ it("saves a local comment as agent context and retains earlier revisions", async
   state.diff = { ...state.diff!, head_sha: "c".repeat(40) };
   fireEvent.mouseDown(screen.getByRole("tab", { name: "Summary" }));
   fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+  expect(screen.queryByText(/Earlier revision/)).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "More actions for hello.py" }));
+  await userEvent.click(screen.getByRole("menuitem", { name: "Show earlier comments" }));
   expect(screen.getAllByText(/Earlier revision/).length).toBeGreaterThan(0);
   const card = within(screen.getAllByRole("region", { name: "Local review comment" })[0]!);
   expect(

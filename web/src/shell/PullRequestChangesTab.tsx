@@ -513,11 +513,38 @@ export function PullRequestChangesTab({
       ),
     [sessionComments.data, selectedPrUrl],
   );
+  const earlierLocalCommentIds = useMemo(
+    () =>
+      new Set(
+        localComments
+          .filter(
+            (comment) =>
+              comment.anchor_metadata?.head_sha !== prDiff.data?.head_sha ||
+              comment.anchor_metadata?.base_sha !== prDiff.data?.base_sha,
+          )
+          .map((comment) => comment.id),
+      ),
+    [localComments, prDiff.data?.head_sha, prDiff.data?.base_sha],
+  );
   useEffect(() => {
     if (selected) markCommentsSeen(localComments.map((comment) => comment.id));
   }, [selected, localComments]);
   const view = useChangesViewState(conversationId, data.selected_pr_url ?? pr.url);
-  const { revealedPaths, reveal, clearReveal, find, setPathFilter, setHideViewed, setMode } = view;
+  const {
+    revealedPaths,
+    reveal,
+    clearReveal,
+    find,
+    setPathFilter,
+    setHideViewed,
+    setMode,
+    shownEarlierCommentPaths,
+    setEarlierCommentsShown,
+  } = view;
+  const shownLocalComments = localComments.filter(
+    (comment) =>
+      !earlierLocalCommentIds.has(comment.id) || shownEarlierCommentPaths.has(comment.path),
+  );
   const navigationTarget = useLocalReviewNavigation(conversationId);
   const scrollRef = useRef<HTMLDivElement>(null);
   const commentHighlight = useRef<Animation | null>(null);
@@ -549,6 +576,9 @@ export function PullRequestChangesTab({
     }
     setPathFilter("");
     setHideViewed(false);
+    if (earlierLocalCommentIds.has(navigationTarget.id)) {
+      setEarlierCommentsShown(navigationTarget.path, true);
+    }
     reveal(navigationTarget.path);
     // Tabs can mount their content after this effect; diff slots also settle asynchronously.
     let frame = 0;
@@ -595,6 +625,8 @@ export function PullRequestChangesTab({
     localComments,
     sessionComments.isSuccess,
     sessionComments.isFetching,
+    earlierLocalCommentIds,
+    setEarlierCommentsShown,
   ]);
   // The filter input shows in the sidebar; while the sidebar is collapsed it opens inline.
   const [filterOpen, setFilterOpen] = useState(false);
@@ -1176,6 +1208,11 @@ export function PullRequestChangesTab({
       ? `Search covers the fetched patch: ${patchFileCount} of ${listing.data?.total_count ?? files.length} files${withoutText > 0 ? `, ${withoutText} without text` : ""}`
       : null;
 
+  const earlierCommentsControl = (path: string) => ({
+    shown: shownEarlierCommentPaths.has(path),
+    onToggle: () => setEarlierCommentsShown(path, !shownEarlierCommentPaths.has(path)),
+  });
+
   // Header actions for one file. Deleted files open at the base revision; others
   // at the rendered head, so a newer polled head never changes the link. A commit's
   // files open at that commit, and a file the commit deletes has no page to open.
@@ -1199,6 +1236,15 @@ export function PullRequestChangesTab({
         previousPath={renamedFrom}
         openLabel={`Open in ${providerLabel}`}
         openUrl={openUrl}
+        earlierComments={
+          reviewing &&
+          (threadsByFile.get(file.path)?.some((thread) => thread.outdated) ||
+            localComments.some(
+              (comment) => comment.path === file.path && earlierLocalCommentIds.has(comment.id),
+            ))
+            ? earlierCommentsControl(file.path)
+            : undefined
+        }
         openUnavailableReason={
           patchView && file.status === "deleted"
             ? commitView
@@ -1276,6 +1322,15 @@ export function PullRequestChangesTab({
     else if (visibleFiles.includes(file))
       threadsByFile.set(file.path, [...(threadsByFile.get(file.path) ?? []), thread]);
   }
+  const unavailableLocalComments = reviewing
+    ? localComments.filter(
+        (comment) => !canShowFiles || !files.some((file) => file.path === comment.path),
+      )
+    : [];
+  const unavailableCommentPaths = new Set([
+    ...earlierThreads.map((thread) => thread.path),
+    ...unavailableLocalComments.map((comment) => comment.path),
+  ]);
   const unresolved = threads.filter((thread) => !thread.resolved);
   const navigateThread = (direction: number) => {
     const index = unresolved.findIndex((thread) => thread.id === focusedThread?.id);
@@ -1285,6 +1340,7 @@ export function PullRequestChangesTab({
     const file = files.find(
       (entry) => entry.path === next.path || filesByPath.get(entry.path)?.prevName === next.path,
     );
+    if (next.outdated) setEarlierCommentsShown(file?.path ?? next.path, true);
     if (file) {
       // A thread on a file a filter hides has no mounted section, so clear that filter first.
       // The path filter goes only when it hides the file; hide-viewed goes only for a viewed one.
@@ -1591,10 +1647,12 @@ export function PullRequestChangesTab({
                     />
                   ) : undefined
                 }
-                threads={threadsByFile.get(file.path) ?? []}
+                threads={(threadsByFile.get(file.path) ?? []).filter(
+                  (thread) => !thread.outdated || shownEarlierCommentPaths.has(file.path),
+                )}
                 threadContext={threadContext}
                 matchingRevision={matchingRevision}
-                localComments={localComments.filter((comment) => comment.path === file.path)}
+                localComments={shownLocalComments.filter((comment) => comment.path === file.path)}
                 canCommentLocally={
                   serverInfo !== "loading" &&
                   serverInfo.comment_anchor_metadata === true &&
@@ -1603,25 +1661,58 @@ export function PullRequestChangesTab({
               />
             ))
           )}
-          {earlierThreads.length > 0 && (
+          {unavailableCommentPaths.size > 0 && (
             <div className="p-3">
               <p className="text-ui font-medium">Earlier conversations and unavailable diffs</p>
-              {earlierThreads.map((thread) => (
-                <div key={thread.id}>
-                  <p className="mt-3 break-all text-xs text-muted-foreground">{thread.path}</p>
-                  <PullRequestReviewThread thread={thread} context={threadContext} showContext />
+              {[...unavailableCommentPaths].map((path) => (
+                <div key={path}>
+                  <div className="mt-3 flex items-center justify-between gap-2">
+                    <p className="break-all text-xs text-muted-foreground">{path}</p>
+                    <PullRequestFileActions
+                      path={path}
+                      previousPath={null}
+                      openLabel={`Open in ${providerLabel}`}
+                      openUrl={null}
+                      openUnavailableReason="Diff unavailable"
+                      earlierComments={
+                        earlierThreads.some((thread) => thread.path === path && thread.outdated) ||
+                        unavailableLocalComments.some(
+                          (comment) =>
+                            comment.path === path && earlierLocalCommentIds.has(comment.id),
+                        )
+                          ? earlierCommentsControl(path)
+                          : undefined
+                      }
+                    />
+                  </div>
+                  {earlierThreads
+                    .filter(
+                      (thread) =>
+                        thread.path === path &&
+                        (!thread.outdated || shownEarlierCommentPaths.has(path)),
+                    )
+                    .map((thread) => (
+                      <PullRequestReviewThread
+                        key={thread.id}
+                        thread={thread}
+                        context={threadContext}
+                        showContext
+                      />
+                    ))}
+                  {shownLocalComments
+                    .filter((comment) => comment.path === path)
+                    .map((comment) => (
+                      <LocalReviewComment
+                        key={comment.id}
+                        comment={comment}
+                        canEdit={canEdit}
+                        outdated={earlierLocalCommentIds.has(comment.id)}
+                      />
+                    ))}
                 </div>
               ))}
             </div>
           )}
-          {localComments
-            .filter((comment) => !canShowFiles || !files.some((file) => file.path === comment.path))
-            .map((comment) => (
-              <div key={comment.id} className="px-3">
-                <p className="text-xs">{comment.path}</p>
-                <LocalReviewComment comment={comment} canEdit={canEdit} outdated />
-              </div>
-            ))}
         </div>
       </div>
       {sessionComments.isError && (
