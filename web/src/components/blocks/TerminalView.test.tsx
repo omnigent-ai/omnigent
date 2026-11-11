@@ -85,9 +85,9 @@ const terminalSessionMock = vi.hoisted(() => ({
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
-    pasteCommand: ReturnType<typeof vi.fn>;
     sendInput: ReturnType<typeof vi.fn>;
     setInputTransform: ReturnType<typeof vi.fn>;
+    pasteCommand: ReturnType<typeof vi.fn>;
   }[],
 }));
 
@@ -100,13 +100,13 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
     focus = vi.fn();
+    sendInput = vi.fn();
+    setInputTransform = vi.fn();
+    applicationCursorKeys = () => false;
     pasteCommand = vi.fn((_text: string, onResult: (error: string | null) => void) => {
       onResult(null);
       return vi.fn();
     });
-    sendInput = vi.fn();
-    setInputTransform = vi.fn();
-    applicationCursorKeys = () => false;
 
     constructor(
       container: HTMLDivElement,
@@ -135,9 +135,9 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
         focus: this.focus,
-        pasteCommand: this.pasteCommand,
         sendInput: this.sendInput,
         setInputTransform: this.setInputTransform,
+        pasteCommand: this.pasteCommand,
       });
     }
   },
