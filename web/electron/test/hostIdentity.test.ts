@@ -1,8 +1,14 @@
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { execFileSync } = require("node:child_process");
-const { performance } = require("node:perf_hooks");
-const { createHostThisMachineChecker, isHostThisMachine } = require("../src/hostIdentity");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import path from "node:path";
+import { performance } from "node:perf_hooks";
+
+import {
+  createHostThisMachineChecker,
+  isHostThisMachine,
+  type HostIdentityCli,
+} from "../src/hostIdentity.ts";
 
 it("imports browser IPC and checks injected identities without desktop js-yaml", () => {
   execFileSync(process.execPath, [
@@ -14,6 +20,13 @@ it("imports browser IPC and checks injected identities without desktop js-yaml",
        assert.notEqual(name, "js-yaml", "Browser IPC must not load desktop js-yaml");
        return load.call(this, name, ...args);
      };
+     // ES module imports bypass Module._load; resolve hooks see them and requires alike.
+     Module.registerHooks({
+       resolve(specifier, context, nextResolve) {
+         assert.notEqual(specifier, "js-yaml", "Browser IPC must not load desktop js-yaml");
+         return nextResolve(specifier, context);
+       },
+     });
      const { isHostThisMachine, SESSION_HOST_PROTOCOL } = require(process.argv[1]);
      require(process.argv[2]);
      assert.equal(SESSION_HOST_PROTOCOL, 1);
@@ -21,8 +34,8 @@ it("imports browser IPC and checks injected identities without desktop js-yaml",
        { hostId: "local", serverUrl: "https://server.example" },
        { readLocalHostId: () => "local", liveDaemonRecordFor: () => ({ host_id: "local" }) },
      ), true);`,
-    require.resolve("../src/hostIdentity"),
-    require.resolve("../src/browserIpc"),
+    path.join(import.meta.dirname, "../src/hostIdentity.ts"),
+    path.join(import.meta.dirname, "../src/browserIpc.js"),
   ]);
 });
 
@@ -76,7 +89,7 @@ describe("isHostThisMachine", () => {
   ]) {
     it(name, () => {
       let enrollmentReads = 0;
-      const cli = {
+      const cli: HostIdentityCli = {
         readLocalHostId: () => localId,
         liveDaemonRecordFor: (serverUrl) => {
           enrollmentReads++;

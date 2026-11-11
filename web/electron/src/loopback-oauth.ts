@@ -2,27 +2,60 @@
 // sign-ins. The caller builds the authorize URL; this module owns the one-shot
 // loopback listener, state check, timeout, cancellation, and the landing page.
 
-"use strict";
-
-const http = require("node:http");
-const crypto = require("node:crypto");
+import crypto from "node:crypto";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 
 /** Bound on how long we wait for the human to finish signing in in the browser. */
-const LOOPBACK_TIMEOUT_MS = 300_000;
+export const LOOPBACK_TIMEOUT_MS = 300_000;
 
-function base64url(buf) {
+/** A fixed heading and detail line for the browser tab. */
+export type LandingPage = [heading: string, detail: string];
+
+/** The browser tab's copy: after a code, an `error` callback, or a callback without a code. */
+export interface LoopbackPages {
+  received: LandingPage;
+  failed: LandingPage;
+  incomplete: LandingPage;
+}
+
+export interface LoopbackAuthorizationOptions {
+  hostname: string;
+  callbackPath: string;
+  redirectUri: (port: number) => string;
+  authorizeUrl: (redirectUri: string, state: string) => string;
+  openExternal: (url: string) => Promise<unknown>;
+  pages: LoopbackPages;
+  signal?: AbortSignal | undefined;
+  timeoutMs?: number;
+  onOpened?: () => void;
+}
+
+/** The accepted callback's query parameters and the redirect URI it arrived on. */
+export interface LoopbackCallback {
+  params: URLSearchParams;
+  redirectUri: string;
+}
+
+export interface Pkce {
+  verifier: string;
+  challenge: string;
+}
+
+export function base64url(buf: Buffer): string {
   return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 /** A PKCE (S256) verifier and its challenge. */
-function makePkce() {
+export function makePkce(): Pkce {
   const verifier = base64url(crypto.randomBytes(64));
   const challenge = base64url(crypto.createHash("sha256").update(verifier).digest());
   return { verifier, challenge };
 }
 
-const escapeHtml = (text) => String(text).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
-const page = ([heading, detail]) =>
+export const escapeHtml = (text: unknown): string =>
+  String(text).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+const page = ([heading, detail]: LandingPage) =>
   '<html><body style="font-family:system-ui;text-align:center;padding:60px">' +
   `<h2>${escapeHtml(heading)}</h2><p>${escapeHtml(detail)}</p></body></html>`;
 
@@ -36,24 +69,10 @@ const page = ([heading, detail]) =>
  * the timeout (`code: "LOOPBACK_TIMEOUT"`), a browser that can't be opened
  * (`code: "BROWSER_UNAVAILABLE"`), or `signal` aborting.
  *
- * @param {{
- *   hostname: string,
- *   callbackPath: string,
- *   redirectUri: (port: number) => string,
- *   authorizeUrl: (redirectUri: string, state: string) => string,
- *   openExternal: (url: string) => Promise<unknown>,
- *   pages: { received: [string, string], failed: [string, string], incomplete: [string, string] },
- *   signal?: AbortSignal,
- *   timeoutMs?: number,
- *   onOpened?: () => void,
- * }} options
- *   `hostname` is the interface to listen on (`localhost` or `127.0.0.1`);
- *   `callbackPath` the only path the listener answers. `pages` are fixed
- *   heading/detail pairs for the browser tab: `received` after a code, `failed`
- *   after an `error` callback, `incomplete` after a callback without a code.
- * @returns {Promise<{ params: URLSearchParams, redirectUri: string }>}
+ * `hostname` is the interface to listen on (`localhost` or `127.0.0.1`);
+ * `callbackPath` the only path the listener answers.
  */
-async function runLoopbackAuthorization({
+export async function runLoopbackAuthorization({
   hostname,
   callbackPath,
   redirectUri: redirectUriFor,
@@ -63,16 +82,16 @@ async function runLoopbackAuthorization({
   signal,
   timeoutMs = LOOPBACK_TIMEOUT_MS,
   onOpened,
-}) {
+}: LoopbackAuthorizationOptions): Promise<LoopbackCallback> {
   signal?.throwIfAborted();
   const state = base64url(crypto.randomBytes(24));
-  let redirectUri;
+  let redirectUri: string;
 
   return new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
       let reqUrl;
       try {
-        reqUrl = new URL(req.url, "http://localhost");
+        reqUrl = new URL(String(req.url), "http://localhost");
       } catch {
         reqUrl = null;
       }
@@ -90,7 +109,7 @@ async function runLoopbackAuthorization({
       }
       // Validate before answering: the desktop still has to exchange the code and
       // create the session, so this page must not claim sign-in succeeded.
-      const fail = (error, copy) => {
+      const fail = (error: Error, copy: LandingPage) => {
         res.writeHead(400, { "Content-Type": "text/html" });
         res.end(page(copy));
         cleanup();
@@ -135,7 +154,7 @@ async function runLoopbackAuthorization({
 
     function onAbort() {
       cleanup();
-      reject(signal.reason);
+      reject(signal?.reason);
     }
 
     server.on("error", (e) => {
@@ -155,15 +174,15 @@ async function runLoopbackAuthorization({
         server.close();
         return;
       }
-      redirectUri = redirectUriFor(server.address().port);
+      redirectUri = redirectUriFor((server.address() as AddressInfo).port);
       openExternal(authorizeUrl(redirectUri, state)).then(
         () => onOpened?.(),
-        (e) => {
+        (e: unknown) => {
           // Can't hand off to the browser — fail fast instead of waiting out the
           // auth timeout with a window the user can't complete.
           cleanup();
           reject(
-            Object.assign(new Error(`could not open the system browser: ${e.message}`), {
+            Object.assign(new Error(`could not open the system browser: ${(e as Error).message}`), {
               code: "BROWSER_UNAVAILABLE",
             }),
           );
@@ -172,5 +191,3 @@ async function runLoopbackAuthorization({
     });
   });
 }
-
-module.exports = { LOOPBACK_TIMEOUT_MS, base64url, escapeHtml, makePkce, runLoopbackAuthorization };

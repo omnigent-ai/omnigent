@@ -1,21 +1,20 @@
-// Unit tests for the OIDC window session lifecycle (src/oidc-auth.js), run with
+// Unit tests for the OIDC window session lifecycle (src/oidc-auth.ts), run with
 // `node --test`. The cookie jar, window, and credentials are in-memory fakes;
 // /v1/me is a fetch stub that accepts exactly the tokens the test allows.
 
-"use strict";
+import { describe, it, mock, beforeEach, afterEach } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 
-const { describe, it, mock, beforeEach, afterEach } = require("node:test");
-const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
-const Module = require("node:module");
-
-const origLoad = Module["_load"];
-Module["_load"] = function (request, ...rest) {
-  if (request === "electron") return { shell: {}, safeStorage: {} };
-  return origLoad.call(this, request, ...rest);
-};
-
-const { createOidcAuth, oidcAuthRoute } = require("../src/oidc-auth");
+import { diagnostics } from "../src/diagnostics.ts";
+import type { MintedSession } from "../src/oidc-credentials.ts";
+import {
+  createOidcAuth,
+  oidcAuthRoute,
+  type RenewalTimer,
+  type SessionCookie,
+  type SessionCookieDetails,
+} from "../src/oidc-auth.ts";
 
 const SERVER = "https://omni.example";
 const COOKIE = "__Host-ap_session";
@@ -24,6 +23,20 @@ const tick = () =>
     setImmediate(resolve);
   });
 
+/** A rejection, with the `code` the module attaches. */
+interface CodedError extends Error {
+  code?: string;
+}
+
+/** The session cookie the fake jar is handed; tests may omit what they don't check. */
+type CookieInput = Pick<SessionCookieDetails, "url" | "name" | "value"> &
+  Partial<SessionCookieDetails>;
+
+/** The `Cookie` header the module sends to /v1/me. */
+function cookieHeader(init: RequestInit): string {
+  return (init.headers as Record<string, string>).Cookie ?? "";
+}
+
 beforeEach(() => {
   mock.method(console, "log", () => {});
   mock.method(console, "warn", () => {});
@@ -31,15 +44,15 @@ beforeEach(() => {
 afterEach(() => mock.restoreAll());
 
 function fakeSession() {
-  const jar = new Map();
+  const jar = new Map<string, SessionCookie>();
   const cookies = Object.assign(new EventEmitter(), {
     jar,
-    calls: [],
-    async get({ name }) {
+    calls: [] as CookieInput[],
+    async get({ name }: { name: string }) {
       const cookie = jar.get(name);
       return cookie ? [cookie] : [];
     },
-    async set(details) {
+    async set(details: CookieInput) {
       cookies.calls.push(details);
       if (jar.has(details.name))
         cookies.emit("changed", {}, jar.get(details.name), "overwrite", true);
@@ -52,7 +65,7 @@ function fakeSession() {
       jar.set(details.name, cookie);
       cookies.emit("changed", {}, cookie, "explicit", false);
     },
-    async remove(_url, name) {
+    async remove(_url: string, name: string) {
       const cookie = jar.get(name);
       jar.delete(name);
       if (cookie) cookies.emit("changed", {}, cookie, "explicit", true);
@@ -61,9 +74,17 @@ function fakeSession() {
   return { cookies };
 }
 
-function fakeWindow() {
+interface FakeWindow {
+  webContents: EventEmitter;
+  loads: string[];
+  destroyed: boolean;
+  isDestroyed: () => boolean;
+  loadURL: (url: string) => Promise<void>;
+}
+
+function fakeWindow(): FakeWindow {
   const webContents = new EventEmitter();
-  const win = {
+  const win: FakeWindow = {
     webContents,
     loads: [],
     destroyed: false,
@@ -76,41 +97,51 @@ function fakeWindow() {
 }
 
 /** Fire a navigation event and report whether a listener prevented it. */
-function navigate(win, eventName, url, ...rest) {
+function navigate(win: FakeWindow, eventName: string, url: string, ...rest: boolean[]) {
   let prevented = false;
   win.webContents.emit(eventName, { preventDefault: () => (prevented = true) }, url, ...rest);
   return prevented;
 }
 
-function harness({ refresh, signIn, accepted = new Set(["valid"]) } = {}) {
+interface HarnessOptions {
+  refresh?: () => Promise<MintedSession>;
+  signIn?: () => Promise<MintedSession>;
+  accepted?: Set<string>;
+}
+
+interface FakeTimer {
+  fn: () => void;
+  delay: number;
+  cleared?: boolean;
+}
+
+function harness({ refresh, signIn, accepted = new Set(["valid"]) }: HarnessOptions = {}) {
   const session = fakeSession();
   const credentials = {
     refreshSession: mock.fn(refresh ?? (async () => ({ token: "valid", expiresIn: 3600 }))),
     signInWithBrowser: mock.fn(signIn ?? (async () => ({ token: "valid", expiresIn: 28800 }))),
     signOut: mock.fn(async () => {}),
   };
-  const origins = new Map();
-  const authRequired = [];
-  const signedOut = [];
-  const timers = [];
-  const fetchFn = mock.fn(async (url, init) => {
+  const origins = new Map<FakeWindow, string>();
+  const authRequired: { win: FakeWindow; serverUrl: string; error: unknown }[] = [];
+  const signedOut: { win: FakeWindow; serverUrl: string; complete: boolean }[] = [];
+  const timers: FakeTimer[] = [];
+  const fetchFn = mock.fn(async (url: string, init: RequestInit) => {
     assert.equal(url, `${SERVER}/v1/me`);
-    const token = init.headers.Cookie.split("=")[1];
+    const token = cookieHeader(init).split("=")[1] ?? "";
     return { status: accepted.has(token) ? 200 : 401 };
   });
-  const auth = createOidcAuth({
+  const auth = createOidcAuth<FakeWindow>({
     session,
     credentials,
     getOrigin: (win) => origins.get(win) ?? null,
     onAuthRequired: (win, serverUrl, error) => authRequired.push({ win, serverUrl, error }),
     onSignedOut: (win, serverUrl, details) => signedOut.push({ win, serverUrl, ...details }),
     fetchFn,
-    setTimeoutFn: (fn, delay) => {
-      const timer = { fn, delay };
-      timers.push(timer);
-      return timer;
-    },
-    clearTimeoutFn: (timer) => {
+    // Timer handles are 1-based indexes into `timers`.
+    setTimeoutFn: (fn, delay) => timers.push({ fn, delay }),
+    clearTimeoutFn: (id: RenewalTimer | undefined) => {
+      const timer = typeof id === "number" ? timers[id - 1] : undefined;
       if (timer) timer.cleared = true;
     },
   });
@@ -150,22 +181,20 @@ describe("ensureSession", () => {
     const h = harness();
     await h.session.cookies.set({ url: SERVER, name: COOKIE, value: "stale" });
     assert.equal(await h.auth.ensureSession(SERVER, COOKIE), "renewed");
-    assert.equal(h.session.cookies.jar.get(COOKIE).value, "valid");
+    assert.equal(h.session.cookies.jar.get(COOKIE)?.value, "valid");
     assert.equal(h.credentials.signInWithBrowser.mock.callCount(), 0);
   });
 
   it("never opens the browser for a restore", async () => {
     const noGrant = Object.assign(new Error("none"), { code: "NO_STORED_TOKEN" });
     const h = harness({ refresh: async () => Promise.reject(noGrant) });
-    await assert.rejects(h.auth.ensureSession(SERVER, COOKIE), (e) => e === noGrant);
+    await assert.rejects(h.auth.ensureSession(SERVER, COOKIE), (e: unknown) => e === noGrant);
     assert.equal(h.credentials.signInWithBrowser.mock.callCount(), 0);
   });
 
   it("signs in through the browser on Connect and installs the session cookie", async () => {
-    const recorded = [];
-    mock.method(require("../src/diagnostics.ts").diagnostics, "record", (...args) =>
-      recorded.push(args),
-    );
+    const recorded: unknown[][] = [];
+    mock.method(diagnostics, "record", (...args: unknown[]) => recorded.push(args));
     const noGrant = Object.assign(new Error("none"), { code: "NO_STORED_TOKEN" });
     const h = harness({ refresh: async () => Promise.reject(noGrant) });
     let announced = 0;
@@ -176,13 +205,14 @@ describe("ensureSession", () => {
     assert.equal(outcome, "signed-in");
     assert.equal(announced, 1);
     const [details] = h.session.cookies.calls;
+    assert.ok(details);
     assert.equal(details.url, SERVER);
     assert.equal(details.name, COOKIE);
     assert.equal(details.value, "valid");
     assert.equal(details.httpOnly, true);
     assert.equal(details.secure, true);
     assert.equal(details.path, "/");
-    assert.ok(details.expirationDate > Date.now() / 1000 + 28000);
+    assert.ok((details.expirationDate ?? 0) > Date.now() / 1000 + 28000);
     assert.deepEqual(recorded, [
       ["oidc_session", { origin: SERVER, outcome: "browser" }],
       ["oidc_session", { origin: SERVER, outcome: "signed_in" }],
@@ -194,7 +224,7 @@ describe("ensureSession", () => {
     const h = harness({ refresh: async () => Promise.reject(offline) });
     await assert.rejects(
       h.auth.ensureSession(SERVER, COOKIE, { interactive: true }),
-      (e) => e === offline,
+      (e: unknown) => e === offline,
     );
     assert.equal(h.credentials.signInWithBrowser.mock.callCount(), 0);
   });
@@ -207,7 +237,7 @@ describe("ensureSession", () => {
     });
     await assert.rejects(
       h.auth.ensureSession(SERVER, COOKIE, { interactive: true }),
-      (e) => e.code === "SESSION_REJECTED",
+      (e: CodedError) => e.code === "SESSION_REJECTED",
     );
   });
 });
@@ -218,7 +248,7 @@ describe("session verification", () => {
       const noGrant = Object.assign(new Error("none"), { code: "NO_STORED_TOKEN" });
       const h = harness({ refresh: async () => Promise.reject(noGrant) });
       h.fetchFn.mock.mockImplementation(async (_url, init) => ({
-        status: init.headers.Cookie.endsWith("=valid") ? 200 : status,
+        status: cookieHeader(init).endsWith("=valid") ? 200 : status,
       }));
       // oxlint-disable-next-line no-await-in-loop -- one case at a time.
       await h.session.cookies.set({ url: SERVER, name: COOKIE, value: "stale" });
@@ -241,7 +271,7 @@ describe("session verification", () => {
     const h = harness({ refresh: async () => ({ token: "unknown", expiresIn: 60 }) });
     await assert.rejects(
       h.auth.ensureSession(SERVER, COOKIE),
-      (e) => e.code === "SESSION_REJECTED",
+      (e: CodedError) => e.code === "SESSION_REJECTED",
     );
     assert.equal(h.session.cookies.jar.has(COOKIE), false);
   });
@@ -257,7 +287,7 @@ describe("sign-out robustness", () => {
     await h.session.cookies.set({ url: SERVER, name: COOKIE, value: "valid" });
     assert.equal(await h.auth.signOutWindow(win), false);
     assert.equal(h.signedOut.length, 1);
-    assert.equal(h.signedOut[0].complete, false, "the connect screen must not claim success");
+    assert.equal(h.signedOut[0]?.complete, false, "the connect screen must not claim success");
     assert.equal(h.session.cookies.jar.has(COOKIE), false);
   });
 });
@@ -298,7 +328,7 @@ describe("window lifecycle", () => {
     await tick();
     await tick();
     assert.equal(h.authRequired.length, 1);
-    assert.equal(h.authRequired[0].error, dead);
+    assert.equal(h.authRequired[0]?.error, dead);
     assert.deepEqual(win.loads, []);
     assert.equal(h.auth.isAttached(win), false);
   });
@@ -311,15 +341,15 @@ describe("window lifecycle", () => {
     await tick();
     navigate(win, "will-navigate", `${SERVER}/auth/login`);
     assert.equal(h.authRequired.length, 1);
-    assert.equal(h.authRequired[0].error.code, "SESSION_REJECTED");
+    assert.equal((h.authRequired[0]?.error as CodedError | undefined)?.code, "SESSION_REJECTED");
     assert.equal(h.credentials.refreshSession.mock.callCount(), 1);
   });
 
   it("reloads a page that asked to sign in during a background renewal", async () => {
-    let release;
+    let release = () => {};
     const h = harness({
       refresh: () =>
-        new Promise((resolve) => {
+        new Promise<MintedSession>((resolve) => {
           release = () => resolve({ token: "valid", expiresIn: 3600 });
         }),
     });
@@ -342,7 +372,7 @@ describe("window lifecycle", () => {
     await tick();
     await tick();
     assert.equal(h.credentials.refreshSession.mock.callCount(), 1);
-    assert.equal(h.session.cookies.jar.get(COOKIE).value, "valid");
+    assert.equal(h.session.cookies.jar.get(COOKIE)?.value, "valid");
     assert.deepEqual(win.loads, []);
   });
 
@@ -370,6 +400,7 @@ describe("window lifecycle", () => {
     h.connect();
     await tick();
     const timer = h.timers.at(-1);
+    assert.ok(timer);
     assert.ok(timer.delay > 3_400_000 && timer.delay < 3_600_000, `delay ${timer.delay}`);
     timer.fn();
     await tick();
@@ -395,10 +426,10 @@ describe("window lifecycle", () => {
   });
 
   it("keeps a renewal that finishes after sign-out from signing back in", async () => {
-    let release;
+    let release = () => {};
     const h = harness({
       refresh: () =>
-        new Promise((resolve) => {
+        new Promise<MintedSession>((resolve) => {
           release = () => resolve({ token: "valid", expiresIn: 3600 });
         }),
     });

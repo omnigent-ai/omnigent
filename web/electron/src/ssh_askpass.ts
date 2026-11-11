@@ -1,5 +1,3 @@
-"use strict";
-
 /**
  * Route ssh's prompts (password, key passphrase, 2FA code, new host key) to
  * the desktop app instead of a terminal.
@@ -11,10 +9,10 @@
  * socket guarded by a one-time token. Answers are never written to disk.
  */
 
-const crypto = require("node:crypto");
-const fs = require("node:fs");
-const net = require("node:net");
-const path = require("node:path");
+import crypto from "node:crypto";
+import fs from "node:fs";
+import net from "node:net";
+import path from "node:path";
 
 const MAX_REQUEST_BYTES = 64 * 1024;
 
@@ -49,22 +47,12 @@ socket.on("end", () => {
 socket.on("error", () => process.exit(1));
 `;
 
-/**
- * Single-quote `value` for /bin/sh.
- *
- * @param {string} value
- * @returns {string}
- */
-function shellQuote(value) {
+/** Single-quote `value` for /bin/sh. */
+export function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-/**
- * @param {unknown} given
- * @param {string} expected
- * @returns {boolean}
- */
-function tokensMatch(given, expected) {
+function tokensMatch(given: unknown, expected: string): boolean {
   if (typeof given !== "string") return false;
   // Compare encoded bytes: timingSafeEqual throws on buffers of different lengths.
   const givenBytes = Buffer.from(given);
@@ -74,20 +62,33 @@ function tokensMatch(given, expected) {
   );
 }
 
-/**
- * Start the prompt socket and write the helper into `dir`.
- *
- * @param {{
- *   dir: string,
- *   onPrompt: (request: { prompt: string, hint: string, signal: AbortSignal }) => Promise<string | null>,
- *   execPath?: string,
- * }} options `dir` must be private to this user (mode 0700). `onPrompt`
- *   resolves with the answer, or null when the user cancels; `signal` aborts
- *   when ssh stops waiting for the answer.
- * @returns {Promise<{ env: Record<string, string>, close: () => void }>} The
- *   environment to give ssh, and a function that stops the socket.
- */
-async function createAskpass({ dir, onPrompt, execPath = process.execPath }) {
+/** One prompt from ssh; `signal` aborts when ssh stops waiting for the answer. */
+export interface AskpassRequest {
+  prompt: string;
+  hint: string;
+  signal: AbortSignal;
+}
+
+export interface AskpassOptions {
+  /** Must be private to this user (mode 0700). */
+  dir: string;
+  /** Resolves with the answer, or null when the user cancels. */
+  onPrompt: (request: AskpassRequest) => Promise<string | null>;
+  execPath?: string;
+}
+
+/** The environment to give ssh, and a function that stops the socket. */
+export interface Askpass {
+  env: Record<string, string>;
+  close: () => void;
+}
+
+/** Start the prompt socket and write the helper into `dir`. */
+export async function createAskpass({
+  dir,
+  onPrompt,
+  execPath = process.execPath,
+}: AskpassOptions): Promise<Askpass> {
   const token = crypto.randomBytes(24).toString("hex");
   const socketPath = path.join(dir, "a");
   const helperPath = path.join(dir, "askpass.js");
@@ -106,7 +107,7 @@ async function createAskpass({ dir, onPrompt, execPath = process.execPath }) {
     socket.on("close", () => asked.abort());
     socket.setEncoding("utf8");
     socket.on("error", () => {});
-    const onData = (chunk) => {
+    const onData = (chunk: string) => {
       request += chunk;
       const newline = request.indexOf("\n");
       if (newline < 0) {
@@ -114,22 +115,24 @@ async function createAskpass({ dir, onPrompt, execPath = process.execPath }) {
         return;
       }
       socket.off("data", onData);
-      let parsed;
+      let parsed: unknown;
       try {
         parsed = JSON.parse(request.slice(0, newline));
       } catch {
         socket.destroy();
         return;
       }
-      if (!tokensMatch(parsed?.token, token)) {
+      // The request is untrusted JSON; read it the way `parsed?.[key]` would.
+      const fields = (parsed ?? {}) as Record<string, unknown>;
+      if (!tokensMatch(fields.token, token)) {
         socket.destroy();
         return;
       }
       Promise.resolve()
         .then(() =>
           onPrompt({
-            prompt: String(parsed.prompt ?? ""),
-            hint: String(parsed.hint ?? ""),
+            prompt: String(fields.prompt ?? ""),
+            hint: String(fields.hint ?? ""),
             signal: asked.signal,
           }),
         )
@@ -140,7 +143,7 @@ async function createAskpass({ dir, onPrompt, execPath = process.execPath }) {
     };
     socket.on("data", onData);
   });
-  await new Promise((resolve, reject) => {
+  await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(socketPath, () => {
       server.off("error", reject);
@@ -158,5 +161,3 @@ async function createAskpass({ dir, onPrompt, execPath = process.execPath }) {
     close: () => server.close(),
   };
 }
-
-module.exports = { createAskpass, shellQuote };

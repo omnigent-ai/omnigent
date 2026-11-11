@@ -1,12 +1,32 @@
-"use strict";
+import { performance } from "node:perf_hooks";
 
-const { performance } = require("node:perf_hooks");
+export const SESSION_HOST_PROTOCOL = 1;
 
-const SESSION_HOST_PROTOCOL = 1;
+/** The local identity and enrollment reads from `omnigent_cli`, injected so this loads without it. */
+export interface HostIdentityCli {
+  readLocalHostId: () => string | null | undefined;
+  liveDaemonRecordFor: (
+    serverUrl: string,
+  ) => { host_id?: string | null | undefined } | null | undefined;
+}
+
+/** A session's host and the server it is on. */
+export interface HostContext {
+  hostId: string | null | undefined;
+  serverUrl: string;
+}
+
+export interface HostThisMachineCheckerOptions {
+  cli: HostIdentityCli;
+  now?: () => number;
+}
 
 /** Return whether the host is this machine and its live daemon serves the server.
  * Records without host_id are accepted; host-ID equality routes, enrollment authenticates. */
-function isHostThisMachine({ hostId, serverUrl }, cli = require("./omnigent_cli")) {
+export function isHostThisMachine(
+  { hostId, serverUrl }: HostContext,
+  cli: HostIdentityCli,
+): boolean {
   if (!hostId || hostId !== cli.readLocalHostId()) return false;
   const record = cli.liveDaemonRecordFor(serverUrl);
   if (record === null || record === undefined) return false;
@@ -15,8 +35,11 @@ function isHostThisMachine({ hostId, serverUrl }, cli = require("./omnigent_cli"
 }
 
 /** Cache local identity/enrollment checks for at most one second per host/server pair. */
-function createHostThisMachineChecker({ cli, now = () => performance.now() } = {}) {
-  const snapshots = new Map();
+export function createHostThisMachineChecker({
+  cli,
+  now = () => performance.now(),
+}: HostThisMachineCheckerOptions): (context: HostContext) => boolean {
+  const snapshots = new Map<string, { eligible: boolean; expiresAt: number }>();
   return ({ hostId, serverUrl }) => {
     if (!hostId) return false;
     const timestamp = now();
@@ -31,5 +54,3 @@ function createHostThisMachineChecker({ cli, now = () => performance.now() } = {
     return eligible;
   };
 }
-
-module.exports = { createHostThisMachineChecker, isHostThisMachine, SESSION_HOST_PROTOCOL };
