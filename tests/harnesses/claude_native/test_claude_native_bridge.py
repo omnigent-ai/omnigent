@@ -12743,6 +12743,19 @@ def test_a_read_only_viewer_opened_during_readiness_holds_the_input(
     assert sends == []
 
 
+@pytest.mark.parametrize(
+    "pane",
+    [
+        "▔" * 80 + "\n" + _CLIPPED_SIDE_CHAT_HISTORY_PANE,
+        _CLIPPED_SIDE_CHAT_HISTORY_PANE.replace("x to clear history · ", ""),
+        _CLIPPED_SIDE_CHAT_HISTORY_PANE + "\n──────────────────────────────\nStarting Claude…",
+    ],
+    ids=["complete-overlay", "incomplete-footer", "old-footer"],
+)
+def test_other_panes_are_not_held_as_clipped_side_chat_history(pane: str) -> None:
+    assert _occupying_surface(pane) != claude_native_bridge._SIDE_CHAT_HISTORY_SURFACE
+
+
 def _picker_bridge_dir(tmp_path: Path) -> Path:
     """
     Create a bridge dir advertising a tmux pane.

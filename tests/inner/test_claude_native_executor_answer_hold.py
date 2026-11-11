@@ -271,6 +271,8 @@ async def test_stopping_a_held_turn_keeps_the_pane(
     with pytest.raises(asyncio.CancelledError):
         await turn
 
+    pane.pending_polls = 0
+    await asyncio.sleep(0)
     assert pane.kills == 0
     assert pane.deliveries == 1
     assert pane.delivered == []
