@@ -77,6 +77,8 @@
     "demo-check-test.yml",
     "demo-check.yml",
     "dependabot-automerge.yml",
+    "dependabot-regen-publish.yml",
+    "dependabot-regen.yml",
     "discord-watch-rotation-maintain.yml",
     "discord-watch-rotation.yml",
     "docker-build.yml",
