@@ -1,11 +1,14 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import { useHosts } from "@/hooks/useHosts";
 import { WORKTREE_ROOT_LABEL_KEY } from "@/lib/worktreeRoot";
 import { conversation } from "@/test/sidebarMockHelpers";
 
 import { ArchiveWorktreeList, archiveWorktreeTargets } from "./ArchivePrompt";
+
+vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+const useHostsMock = vi.mocked(useHosts);
 
 // Server `worktree_root_fingerprint` of "/repo/.worktrees/a" and "C:\\repo\\.worktrees\\a".
 const ROOT_A_FINGERPRINT = "1a1329852b078cc01f5b390143afdd4bffbbaf52772d4b7c36ff8a435bfcf287";
@@ -95,37 +98,36 @@ describe("archiveWorktreeTargets", () => {
 
 describe("ArchiveWorktreeList", () => {
   it("names each worktree, and its host only when the targets span hosts", () => {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { enabled: false } } });
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "Build box" }],
+    } as unknown as ReturnType<typeof useHosts>);
     const { rerender } = render(
-      <QueryClientProvider client={queryClient}>
-        <ArchiveWorktreeList worktrees={[{ hostId: "host_1", path: "/repo/wt", branch: "a" }]} />
-      </QueryClientProvider>,
+      <ArchiveWorktreeList worktrees={[{ hostId: "host_1", path: "/repo/wt", branch: "a" }]} />,
     );
     expect(screen.getByTestId("archive-worktree-name")).toHaveTextContent(/^wt$/);
 
     rerender(
-      <QueryClientProvider client={queryClient}>
-        <ArchiveWorktreeList
-          worktrees={[{ hostId: null, path: "\\\\srv\\share\\wt", branch: "a" }]}
-        />
-      </QueryClientProvider>,
+      <ArchiveWorktreeList
+        worktrees={[{ hostId: null, path: "\\\\srv\\share\\wt", branch: "a" }]}
+      />,
     );
     expect(screen.getByTestId("archive-worktree-name")).toHaveTextContent(/^wt$/);
     expect(screen.queryByTestId("archive-worktree-host")).not.toBeInTheDocument();
 
+    // A host missing from the host list falls back to its id; a hostless target says so.
     rerender(
-      <QueryClientProvider client={queryClient}>
-        <ArchiveWorktreeList
-          worktrees={[
-            { hostId: "host_1", path: "/repo/wt", branch: "a" },
-            { hostId: "host_2", path: "/repo/wt", branch: "b" },
-          ]}
-        />
-      </QueryClientProvider>,
+      <ArchiveWorktreeList
+        worktrees={[
+          { hostId: "host_1", path: "/repo/wt", branch: "a" },
+          { hostId: "host_2", path: "/repo/wt", branch: "b" },
+          { hostId: null, path: null, branch: "c" },
+        ]}
+      />,
     );
     expect(screen.getAllByTestId("archive-worktree-host").map((host) => host.textContent)).toEqual([
-      "host_1",
+      "Build box",
       "host_2",
+      "No host",
     ]);
   });
 });
