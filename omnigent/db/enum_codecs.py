@@ -112,11 +112,17 @@ SCHEDULED_TASK_STATE: dict[str, int] = {
     "active": 1,
     "paused": 2,
     "deleted": 3,
+    "completed": 4,
 }
 
 SCHEDULED_TASK_EXECUTION_TARGET: dict[str, int] = {
     "connected_host": 1,
     "managed_sandbox": 2,
+}
+
+SCHEDULED_TASK_SESSION_MODE: dict[str, int] = {
+    "new": 1,
+    "continue": 2,
 }
 
 SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
@@ -329,6 +335,16 @@ def encode_scheduled_task_execution_target(name: str) -> int:
 def decode_scheduled_task_execution_target(code: int) -> str:
     """Decode a ``scheduled_tasks.execution_target`` int code to its name."""
     return _decode(SCHEDULED_TASK_EXECUTION_TARGET, code, field="scheduled_tasks.execution_target")
+
+
+def encode_scheduled_task_session_mode(name: str) -> int:
+    """Encode a ``scheduled_tasks.session_mode`` name to its int code."""
+    return _encode(SCHEDULED_TASK_SESSION_MODE, name, field="scheduled_tasks.session_mode")
+
+
+def decode_scheduled_task_session_mode(code: int) -> str:
+    """Decode a ``scheduled_tasks.session_mode`` int code to its name."""
+    return _decode(SCHEDULED_TASK_SESSION_MODE, code, field="scheduled_tasks.session_mode")
 
 
 def encode_scheduled_task_run_status(name: str) -> int:

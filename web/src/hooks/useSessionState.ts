@@ -1,5 +1,6 @@
 // Per-row state derivation for the sidebar badge.
-// Priority: awaiting > running > error > no badge.
+// Priority: awaiting (web prompts, then terminal prompts) > running > disconnected
+// > error > background work > no badge.
 //
 // Liveness (runner / host reachability) is no longer a sidebar state:
 // it surfaces in the open-session view (see `useSessionLiveness`), so the
@@ -13,8 +14,10 @@ import type { Conversation } from "@/hooks/useConversations";
 import type { LatestSessionError } from "@/lib/sessionError";
 
 export type SessionState =
-  | { kind: "awaiting"; count: number }
-  | { kind: "running" }
+  // `terminalReason`: no web card; the agent is parked on a prompt in its terminal.
+  | { kind: "awaiting"; count: number; terminalReason?: string }
+  // `background`: the turn ended but work outlives it (a background shell or a Codex goal).
+  | { kind: "running"; background?: true }
   | { kind: "error" }
   | { kind: "disconnected" }
   | { kind: "unseen" }
@@ -25,14 +28,41 @@ export type SessionState =
   | { kind: "starting" };
 
 export function getSessionState(
-  conversation: Pick<Conversation, "status" | "pending_elicitations_count"> | undefined | null,
+  conversation:
+    | Pick<
+        Conversation,
+        "status" | "pending_elicitations_count" | "background_work_running" | "blocked_on"
+      >
+    | undefined
+    | null,
   latestError: LatestSessionError | null = null,
 ): SessionState | null {
   const pending = conversation?.pending_elicitations_count ?? 0;
   if (pending > 0) return { kind: "awaiting", count: pending };
+  if (conversation?.status === "running" && conversation.blocked_on) {
+    return { kind: "awaiting", count: 0, terminalReason: conversation.blocked_on };
+  }
   if (conversation?.status === "running") return { kind: "running" };
   if (latestError === "disconnected") return { kind: "disconnected" };
-  if (latestError === "recovered_disconnect") return null;
-  if (conversation?.status === "failed" || latestError === "error") return { kind: "error" };
+  const failed = conversation?.status === "failed" || latestError === "error";
+  if (failed && latestError !== "recovered_disconnect") return { kind: "error" };
+  if (conversation?.background_work_running) return { kind: "running", background: true };
   return null;
+}
+
+/**
+ * Whether archiving would interrupt the agent: a turn is running or waiting on
+ * an approval, or background work outlives the last turn.
+ */
+export function isSessionWorking(
+  conversation: Pick<
+    Conversation,
+    "status" | "pending_elicitations_count" | "background_work_running"
+  >,
+): boolean {
+  return (
+    conversation.status === "running" ||
+    (conversation.pending_elicitations_count ?? 0) > 0 ||
+    conversation.background_work_running === true
+  );
 }

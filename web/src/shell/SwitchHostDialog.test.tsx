@@ -13,6 +13,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { launchManagedHost, launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 // Heavy children have their own suites; stub them so this one stays on the
 // dialog's two-call move and its recovery from a half-finished switch.
@@ -65,7 +66,8 @@ vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
 vi.mock("@/hooks/useRecentWorkspaces", () => ({
   useRecentWorkspaces: () => ({ recent: ["/Users/alice/repo"], addRecent: vi.fn() }),
 }));
-vi.mock("@/lib/sessionsApi", () => ({
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
   launchManagedHost: vi.fn(),
   launchRunner: vi.fn(),
   updateSession: vi.fn(),

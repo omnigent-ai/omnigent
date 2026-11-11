@@ -15,11 +15,13 @@ summary, and the tool row, and asserts on what the user sees in the
 shell terminal panel:
 
   - the panel shows ``$ <command>`` and the parsed ``exit 0`` status, not
-    the raw Parameters JSON (which stays behind the Raw toggle);
+    the raw Input JSON (which stays behind the Raw toggle);
   - the long output line must FIT the panel (``scrollWidth`` no wider
     than ``clientWidth``), i.e. wrap instead of forcing a horizontal
     scrollbar;
-  - turning word wrap off switches the line to horizontal scrolling.
+  - turning word wrap off switches the line to horizontal scrolling;
+  - with Settings > Terminal theme pinned to dark under a light app, the
+    reloaded panel renders in the dark terminal palette, selection included.
 
 On the buggy build the line overflows horizontally by hundreds of
 pixels, so the final assertion fails — that failure is the reproduction.
@@ -213,11 +215,11 @@ def test_tool_output_long_line_wraps_instead_of_clipping(
 
     # The panel reads like a terminal: the command (its `$` prompt is CSS-only)
     # and the exit status parsed from sys_os_shell's JSON result; the
-    # Parameters JSON stays behind Raw.
+    # Input JSON stays behind Raw.
     terminal = page.get_by_test_id("shell-tool-terminal")
     expect(terminal).to_contain_text("python3 -c")
     expect(terminal.get_by_text("exit 0", exact=True)).to_be_visible()
-    expect(page.get_by_text("Parameters", exact=True)).to_have_count(0)
+    expect(page.get_by_role("button", name="Copy input", exact=True)).to_have_count(0)
 
     # Regression guard: the long output line fits the panel width — no
     # horizontal clipping/scrolling needed to read it.
@@ -242,3 +244,21 @@ def test_tool_output_long_line_wraps_instead_of_clipping(
     # same line to horizontal scrolling instead of wrapping.
     terminal.get_by_role("button", name="Disable word wrap").click()
     page.wait_for_function(_SCROLLS, timeout=8_000)
+
+    # The terminal theme setting paints the shell panel too: pin a dark
+    # terminal under the light app, then reload the persisted turn.
+    page.evaluate(
+        "() => { localStorage.setItem('web-theme', 'light');"
+        " localStorage.setItem('omnigent:terminal-theme', 'dark'); }"
+    )
+    page.reload()
+    _expand_tool_output(page)
+    terminal = page.get_by_test_id("shell-tool-terminal")
+    expect(terminal).to_have_attribute("data-terminal-theme", "dark")
+    expect(terminal).to_have_css("background-color", "rgb(10, 10, 10)")
+    # Selected text stays light on the dark panel instead of taking the light
+    # app's dark selection text.
+    selected_text = terminal.evaluate(
+        "(el) => getComputedStyle(el.querySelector('pre code span'), '::selection').color"
+    )
+    assert selected_text == "rgb(228, 228, 231)"

@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import os
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
 import threading
+import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from omnigent import cli_auth
-from omnigent.harnesses.pi_native import auth_refresh
+from omnigent.harnesses.pi_native import auth_command, auth_refresh, credentials
 from omnigent.runner import _entry as runner_entry
 from tests._helpers.polling import poll_until_async
 
@@ -140,3 +149,244 @@ async def test_interrupted_mint_does_not_write_late_result(
         release.set()
         await poll_until_async(finished.is_set, timeout_s=5)
     assert _bearer(path) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cache_origin", [None, "legacy", "other-workspace"])
+async def test_slow_model_auth_is_warmed_shared_and_refreshed_outside_pi_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cache_origin: str | None,
+) -> None:
+    if os.name != "posix" or shutil.which("node") is None:
+        pytest.skip("the native Pi token wrapper requires POSIX and Node")
+    monkeypatch.setattr(auth_command, "AUTH_TIMEOUT_MS", 100)
+    token_file = tmp_path / "token"
+    token_file.write_text("first-private-token")
+    calls = tmp_path / "calls"
+    script = (
+        "import pathlib,time,sys; time.sleep(0.4); "
+        "p=pathlib.Path(sys.argv[1]); "
+        "p.write_text(p.read_text()+'x' if p.exists() else 'x'); "
+        "print(pathlib.Path(sys.argv[2]).read_text())"
+    )
+    command = shlex.join([sys.executable, "-c", script, str(calls), str(token_file)])
+    wrapped = auth_command.wrap_auth_command(
+        tmp_path, "primary", command, refresh_interval_ms=900_000
+    )
+    auth_command.wrap_auth_command(tmp_path, "secondary", command, refresh_interval_ms=900_000)
+    auth_dir = tmp_path / auth_command.AUTH_DIR_NAME
+    if cache_origin is not None:
+        config = json.loads(next(auth_dir.glob("auth-*.json")).read_text())
+        stale = {"token": "wrong-workspace-token", "expiresAt": time.time() * 1000 + 900_000}
+        if cache_origin == "other-workspace":
+            stale["cwd"] = str(tmp_path)
+        Path(config["cachePath"]).write_text(json.dumps(stale))
+        result = await asyncio.to_thread(
+            subprocess.run, shlex.split(wrapped[1:]), capture_output=True, text=True, timeout=2
+        )
+        assert result.returncode == 1, "a foreign/legacy cache must not bypass the slow helper"
+        assert result.stdout == ""
+    await auth_command.refresh_model_auth(auth_dir, workspace=Path.cwd())
+    assert calls.read_text() == "x", "gateway surfaces must share one cached mint"
+
+    def request() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(shlex.split(wrapped[1:]), capture_output=True, text=True, timeout=2)
+
+    for _ in range(2):
+        result = await asyncio.to_thread(request)
+        assert result.returncode == 0
+        assert result.stdout == "first-private-token"
+        assert result.stderr == ""
+    assert calls.read_text() == "x"
+    cache = next(auth_dir.glob("token-*.json"))
+    assert stat.S_IMODE(cache.stat().st_mode) == 0o600
+    assert all("private-token" not in path.read_text() for path in auth_dir.glob("*.result.json"))
+
+    token_file.write_text("second-private-token")
+    cached = json.loads(cache.read_text())
+    cached["expiresAt"] = time.time() * 1000 + 100_000
+    cached["cachedAt"] = cached["expiresAt"] - 900_000
+    cache.write_text(json.dumps(cached))
+    await auth_command.refresh_model_auth(auth_dir, workspace=Path.cwd())
+    assert calls.read_text() == "xx"
+    assert (await asyncio.to_thread(request)).stdout == "second-private-token"
+
+    cached = json.loads(cache.read_text())
+    cached["expiresAt"] = time.time() * 1000 + 100_000
+    cached["cachedAt"] = cached["expiresAt"] - 900_000
+    cache.write_text(json.dumps(cached))
+    token_file.unlink()
+    await auth_command.refresh_model_auth(auth_dir, workspace=Path.cwd())
+    assert json.loads(cache.read_text()) == cached
+    assert "exited 1" in caplog.text
+    assert "private-token" not in caplog.text
+    assert (await asyncio.to_thread(request)).stdout == "second-private-token"
+
+    # An expired cache must never turn a failed mint into a successful request.
+    cached["expiresAt"] = 0
+    cache.write_text(json.dumps(cached))
+    result = await asyncio.to_thread(request)
+    assert result.returncode == 1
+    assert result.stdout == ""
+
+    async def fail_to_spawn(*args, **kwargs):
+        raise OSError("private-token")
+
+    monkeypatch.setattr(auth_command.asyncio, "create_subprocess_exec", fail_to_spawn)
+    await auth_command.refresh_model_auth(auth_dir, workspace=Path.cwd())
+    assert "failed to start" in caplog.text
+    assert "OSError" in caplog.text
+    assert "private-token" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_model_auth_refresh_ignores_removed_provider_configs(tmp_path: Path) -> None:
+    if os.name != "posix" or shutil.which("node") is None:
+        pytest.skip("the native Pi token wrapper requires POSIX and Node")
+    calls = tmp_path / "mints"
+    provider = credentials.PiProviderConfig(
+        provider_id="primary",
+        base_url="http://localhost/v1",
+        api="openai-completions",
+        model="mock-auth",
+        api_key=f"!printf x >> {shlex.quote(str(calls))}; printf private-token",
+        auth_header=True,
+        auth_refresh_interval_ms=900_000,
+    )
+    rendered = provider.to_models_config()
+    rendered["providers"]["secondary"] = dict(rendered["providers"]["primary"])
+    credentials.write_pi_models_config(tmp_path, provider, rendered)
+    auth_dir = tmp_path / auth_command.AUTH_DIR_NAME
+    await auth_command.refresh_model_auth(auth_dir, workspace=Path.cwd())
+    assert calls.read_text() == "x"
+    for cache in auth_dir.glob("token-*.json"):
+        cache.unlink()
+
+    # Relaunch the same session with a new command and caching disabled.
+    credentials.write_pi_models_config(
+        tmp_path, replace(provider, api_key="!printf current-token", auth_refresh_interval_ms=0)
+    )
+    await auth_command.refresh_model_auth(auth_dir, workspace=Path.cwd())
+    assert calls.read_text() == "x", "a removed provider must never mint again"
+    assert not list(auth_dir.glob("token-*.json"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refresh_exit_code", [0, 7])
+async def test_model_auth_refresh_preserves_request_failure_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refresh_exit_code: int
+) -> None:
+    if os.name != "posix" or shutil.which("node") is None:
+        pytest.skip("the native Pi token wrapper requires POSIX and Node")
+    monkeypatch.setattr(auth_command, "AUTH_TIMEOUT_MS", 500)
+    started, release = tmp_path / "started", tmp_path / "release"
+    script = (
+        "import pathlib,sys,time; pathlib.Path(sys.argv[1]).touch(); "
+        "\nwhile not pathlib.Path(sys.argv[2]).exists(): time.sleep(0.01)\n"
+        f"print('private-token'); sys.exit({refresh_exit_code})"
+    )
+    wrapped = auth_command.wrap_auth_command(
+        tmp_path,
+        "primary",
+        shlex.join([sys.executable, "-c", script, str(started), str(release)]),
+        refresh_interval_ms=900_000,
+    )
+    result = await asyncio.to_thread(
+        subprocess.run,
+        shlex.split(wrapped[1:]),
+        capture_output=True,
+        text=True,
+        timeout=5,
+        env={**os.environ, "OMNIGENT_PI_NATIVE_PID": "123"},
+    )
+    assert result.returncode == 1
+    auth_dir = tmp_path / auth_command.AUTH_DIR_NAME
+    result_path = next(auth_dir.glob("*.result.json"))
+    request_failure = result_path.read_text()
+    assert json.loads(request_failure)["kind"] == "timeout"
+    started.unlink()
+    task = asyncio.create_task(auth_command.refresh_model_auth(auth_dir, workspace=Path.cwd()))
+    try:
+        await poll_until_async(started.exists, timeout_s=5)
+        assert result_path.read_text() == request_failure
+        release.touch()
+        await asyncio.wait_for(task, timeout=5)
+        assert result_path.read_text() == request_failure
+    finally:
+        if not task.done():
+            await _cancel(task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ["cancel", "timeout"])
+async def test_interrupted_model_refresh_reaps_helper_without_publishing_token(
+    tmp_path: Path,
+    interruption: str,
+) -> None:
+    if os.name != "posix" or shutil.which("node") is None:
+        pytest.skip("the native Pi token wrapper requires POSIX and Node")
+    from omnigent.inner._proc import process_alive
+
+    pid_file = tmp_path / "pid"
+    script = (
+        "import os,pathlib,sys,time; "
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+        "time.sleep(30); print('late-private-token')"
+    )
+    auth_command.wrap_auth_command(
+        tmp_path,
+        "primary",
+        shlex.join([sys.executable, "-c", script, str(pid_file)]),
+        refresh_interval_ms=900_000,
+        refresh_timeout_ms=1_000 if interruption == "timeout" else 20_000,
+    )
+    auth_dir = tmp_path / auth_command.AUTH_DIR_NAME
+    task = asyncio.create_task(auth_command.refresh_model_auth(auth_dir, workspace=Path.cwd()))
+    try:
+        await poll_until_async(lambda: pid_file.exists() and pid_file.read_text(), timeout_s=5)
+        if interruption == "timeout":
+            await asyncio.wait_for(asyncio.shield(task), timeout=5)
+    finally:
+        if not task.done():
+            await _cancel(task)
+    pid = int(pid_file.read_text())
+    await poll_until_async(lambda: not process_alive(pid), timeout_s=5)
+    assert not list(auth_dir.glob("token-*.json"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remaining_s", [-10, 120, 3_600])
+async def test_model_auth_cache_respects_jwt_expiry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remaining_s: int
+) -> None:
+    if os.name != "posix" or shutil.which("node") is None:
+        pytest.skip("the native Pi token wrapper requires POSIX and Node")
+    expires_at = time.time() + remaining_s
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": expires_at}).encode()).decode()
+    token = f"header.{payload.rstrip('=')}.signature"
+    calls = tmp_path / "mints"
+    wrapped = auth_command.wrap_auth_command(
+        tmp_path,
+        "primary",
+        f"printf x >> {shlex.quote(str(calls))}; printf %s {shlex.quote(token)}",
+        refresh_interval_ms=900_000,
+    )
+    auth_dir = tmp_path / auth_command.AUTH_DIR_NAME
+    await auth_command.refresh_model_auth(auth_dir, workspace=Path.cwd())
+    cache = json.loads(next(auth_dir.glob("token-*.json")).read_text())
+    assert cache["expiresAt"] <= expires_at * 1000
+    result = await asyncio.to_thread(
+        subprocess.run, shlex.split(wrapped[1:]), capture_output=True, text=True, timeout=2
+    )
+    assert result.returncode == 0
+    assert result.stdout == token
+    assert calls.read_text() == ("xx" if remaining_s < 0 else "x")
+    if remaining_s == 120:
+        monkeypatch.setattr(auth_command, "time", SimpleNamespace(time=lambda: expires_at - 80))
+        await auth_command.refresh_model_auth(auth_dir, workspace=Path.cwd())
+        assert calls.read_text() == "x", "short-lived JWTs must not mint on every poll"
+        monkeypatch.setattr(auth_command, "time", SimpleNamespace(time=lambda: expires_at - 40))
+        await auth_command.refresh_model_auth(auth_dir, workspace=Path.cwd())
+        assert calls.read_text() == "xx", "refresh before the effective lifetime ends"

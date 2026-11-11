@@ -50,10 +50,13 @@ function pasteEvent({
     // they must be skipped, not attached.
     items.push({ kind: "file", type: "image/png", getAsFile: () => null });
   }
-  const event = { clipboardData: { items }, preventDefault };
+  const getData = (type: string) => (type === "text/plain" ? (text ?? "") : "");
+  const target = document.createElement("textarea");
+  const event = { clipboardData: { items, getData }, currentTarget: target, preventDefault };
   return {
     event: event as unknown as React.ClipboardEvent<HTMLTextAreaElement>,
     preventDefault,
+    target,
   };
 }
 
@@ -196,35 +199,40 @@ describe("useComposerAttachments", () => {
     expect(result.current.files).toEqual([]);
   });
 
-  it("onPaste attaches clipboard files and claims the event", () => {
+  it("onPaste attaches clipboard files and claims the event without inserting text", () => {
     const { result } = renderHook(() => useComposerAttachments());
-    const { event, preventDefault } = pasteEvent({ files: [pngFile(), textFile()] });
+    const { event, preventDefault, target } = pasteEvent({
+      text: "shot.png",
+      files: [pngFile(), textFile()],
+    });
 
     act(() => result.current.onPaste(event));
 
     expect(preventDefault).toHaveBeenCalledTimes(1);
     expect(result.current.files.map((f) => f.name)).toEqual(["shot.png", "notes.txt"]);
+    expect(target.value).toBe("");
   });
 
-  it("onPaste leaves a text-only paste to the browser", () => {
+  it("onPaste inserts a text-only paste as typed input", () => {
     const { result } = renderHook(() => useComposerAttachments());
-    const { event, preventDefault } = pasteEvent({ text: "hello world" });
+    const { event, preventDefault, target } = pasteEvent({ text: "hello world" });
 
     act(() => result.current.onPaste(event));
 
-    expect(preventDefault).not.toHaveBeenCalled();
+    expect(preventDefault).toHaveBeenCalledTimes(1);
+    expect(target.value).toBe("hello world");
     expect(result.current.files).toEqual([]);
   });
 
   it("onPaste ignores non-file kinds and null file payloads", () => {
     const { result } = renderHook(() => useComposerAttachments());
-    const { event, preventDefault } = pasteEvent({ text: "hi", nullFile: true });
+    const { event, target } = pasteEvent({ text: "hi", nullFile: true });
 
     act(() => result.current.onPaste(event));
 
-    // No usable file → nothing attached and the paste stays native.
-    expect(preventDefault).not.toHaveBeenCalled();
+    // No usable file → nothing attached; the text is inserted instead.
     expect(result.current.files).toEqual([]);
+    expect(target.value).toBe("hi");
   });
 
   it("replaceFiles swaps the list wholesale and revalidates the replacement", () => {

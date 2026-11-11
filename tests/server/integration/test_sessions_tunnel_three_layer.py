@@ -342,6 +342,7 @@ class _TunnelStack:
     ap_client: httpx.AsyncClient
     ap_app: FastAPI
     fake_pm: FakeProcessManager
+    runner_app: FastAPI
 
 
 @pytest_asyncio.fixture()
@@ -437,7 +438,9 @@ async def tunnel_three_layer_stack(tmp_path: Path) -> AsyncIterator[_TunnelStack
     )
 
     try:
-        yield _TunnelStack(ap_client=ap_client, ap_app=ap_app, fake_pm=fake_pm)
+        yield _TunnelStack(
+            ap_client=ap_client, ap_app=ap_app, fake_pm=fake_pm, runner_app=runner_app
+        )
     finally:
         # Cancel any AP-side background tasks (SSE relays, etc.) the
         # production lifespan would have owned. ``create_app`` does not
@@ -2337,7 +2340,9 @@ async def test_patch_rebind_stamps_runner_liveness(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error_code", ["runner_disconnected", "runner_failed_to_start"])
+@pytest.mark.parametrize(
+    "error_code", ["runner_disconnected", "runner_failed_to_start", "runner_process_crash"]
+)
 @pytest.mark.parametrize("child_runner", ["previous-runner", _RUNNER_ID])
 @pytest.mark.parametrize("fail_first", [None, "parent", "child"])
 async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
@@ -2443,7 +2448,35 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
 @pytest.mark.parametrize(
-    "scenario", ["reconnect", "expired", "host_back_without_runner", "unreadable", "host_online"]
+    "scenario",
+    [
+        "reconnect",
+        "expired",
+        "host_back_without_runner",
+        "host_back_relaunched",
+        "host_back_launch_refused",
+        "host_back_stopped_before_relaunch",
+        "host_back_rebound_before_relaunch",
+        "remote_idle_during_hold",
+        "remote_failed_during_hold",
+        "new_turn_during_hold",
+        "stale_idle_during_hold",
+        "queued_status_during_hold",
+        "relay_cleanup_expired",
+        "relay_cleanup_host_back_relaunched",
+        "relay_replaced_during_hold",
+        "relay_advanced_during_hold",
+        "snapshot_unreadable",
+        "batched_snapshot",
+        "unreadable",
+        "host_online",
+        "host_flaps_reconnect",
+        "host_flaps_back_without_runner",
+        "host_flaps_expired",
+        "host_back_unreadable",
+        "cancelled",
+        "shutdown",
+    ],
 )
 async def test_runner_disconnect_holds_turn_while_host_offline(
     tunnel_three_layer_stack: _TunnelStack,
@@ -2457,21 +2490,60 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
     runner. An unreadable host row mid-hold keeps holding. A host that stayed
     online fails the turn at the grace, as before.
     """
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.host.frames import (
+        HostHelloFrame,
+        HostLaunchRunnerFrame,
+        HostStopRunnerFrame,
+        decode_host_frame,
+    )
+    from omnigent.runner.identity import token_bound_runner_id
     from omnigent.runtime import get_conversation_store
+    from omnigent.server import app as server_app
+    from omnigent.server import session_live_state
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions.common import _RelayHandle
+    from tests._helpers.polling import poll_until_async
 
+    remove_relay = scenario.startswith("relay_cleanup_")
+    unreadable_snapshot = scenario == "snapshot_unreadable"
+    batched_snapshot = scenario == "batched_snapshot"
+    if remove_relay:
+        scenario = scenario.removeprefix("relay_cleanup_")
+    elif unreadable_snapshot:
+        scenario = "expired"
+    elif batched_snapshot:
+        scenario = "reconnect"
+    newer_owner_scenarios = {
+        "new_turn_during_hold",
+        "relay_replaced_during_hold",
+        "relay_advanced_during_hold",
+    }
+    relay_tasks: list[asyncio.Task[None]] = []
     ap_app = tunnel_three_layer_stack.ap_app
+    real_resolver = ap_app.state.runner_router.client_for_session_resources
+    real_ensure_relay = sessions_module._ensure_runner_relay
+    local_host_return = scenario in {
+        "host_back_relaunched",
+        "host_back_launch_refused",
+        "host_back_stopped_before_relaunch",
+        "host_back_rebound_before_relaunch",
+    }
     grace = 0.2
-    hold = 1.0 if scenario == "expired" else 30.0
+    hold = {"expired": 1.0, "host_flaps_expired": 1.5}.get(scenario, 30.0)
     monkeypatch.setattr(sessions_module, "RUNNER_DISCONNECT_GRACE_S", grace)
     monkeypatch.setattr(sessions_module, "HOST_OFFLINE_HOLD_S", hold)
     monkeypatch.setattr(sessions_module, "HOST_OFFLINE_RECHECK_S", 0.05)
     _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
     host_checks: list[str] = []
+    first_host_check: float | None = None
     # What the host row reads: offline, back online, or unreadable.
     host_row: list[bool | None] = [scenario != "host_online"]
 
     async def scripted_host_row_offline(host_store: object, host_id: str) -> bool | None:
+        nonlocal first_host_check
+        if first_host_check is None:
+            first_host_check = asyncio.get_running_loop().time()
         host_checks.append(host_id)
         return host_row[0]
 
@@ -2482,6 +2554,15 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             await asyncio.sleep(0.01)
 
     monkeypatch.setattr(sessions_module, "_host_row_offline", scripted_host_row_offline)
+    relaunched_session_ids: list[str] = []
+    relaunch_finished = asyncio.Event()
+    recovery_finished = asyncio.Event()
+    executed_turns: list[str] = []
+    host_task: asyncio.Task[None] | None = None
+    forwarder_task: asyncio.Task[None] | None = None
+    host_conn = None
+    status_write_started = threading.Event()
+    release_status_write = threading.Event()
 
     response = await tunnel_three_layer_stack.ap_client.post(
         "/v1/sessions",
@@ -2495,10 +2576,104 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
     store = get_conversation_store()
     store.replace_runner_id(session_id, runner_id)
     store.set_host_id(session_id, host_id, workspace="/tmp/host-offline")
+    snapshot_ids = {session_id}
+    if batched_snapshot:
+        monkeypatch.setattr(server_app, "_HOST_HOLD_SNAPSHOT_BATCH_SIZE", 2)
+        for _ in range(4):
+            extra = store.create_conversation(runner_id=runner_id)
+            store.set_host_id(extra.id, host_id, workspace="/tmp/host-offline")
+            store.set_session_live_status(extra.id, "running")
+            sessions_module._session_status_cache[extra.id] = "running"
+            snapshot_ids.add(extra.id)
+    if scenario.endswith("_during_hold"):
+        store.set_session_live_status(
+            session_id,
+            "idle"
+            if scenario in {"stale_idle_during_hold", "queued_status_during_hold"}
+            else "running",
+        )
+        store.set_background_work_running(session_id, True, runner_id=runner_id)
+    if scenario == "host_back_relaunched":
+        original_input = store.append(
+            session_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="held-turn",
+                    stable_id="a" * 32,
+                    data=MessageData(
+                        role="user", content=[{"type": "input_text", "text": "old work"}]
+                    ),
+                )
+            ],
+        )[0]
+        real_run_turn = _EchoHarness.run_turn
+
+        async def record_turn(self: Any, request: Any, ctx: Any) -> None:
+            executed_turns.append(ctx.response_id)
+            await real_run_turn(self, request, ctx)
+
+        monkeypatch.setattr(_EchoHarness, "run_turn", record_turn)
+
+    if scenario.endswith("_before_relaunch"):
+        real_mark_offline = sessions_module._mark_runner_sessions_offline
+
+        async def settle_then_change_owner(*args: Any, **kwargs: Any) -> None:
+            await real_mark_offline(*args, **kwargs)
+            if scenario == "host_back_stopped_before_relaunch":
+                sessions_module._intentional_stop_sessions[session_id] = runner_id
+                sessions_module._session_status_cache[session_id] = "idle"
+                store.set_session_live_status(session_id, "idle")
+            else:
+                store.replace_runner_id(session_id, "runner-newer-work")
+                sessions_module._session_status_cache[session_id] = "running"
+
+        monkeypatch.setattr(
+            sessions_module, "_mark_runner_sessions_offline", settle_then_change_owner
+        )
 
     communicator = await _connect_runner_tunnel(ap_app, runner_id)
     await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
     sessions_module._session_status_cache[session_id] = "running"
+    snapshot_calls: list[tuple[Any, tuple[Any, ...]]] = []
+    submit_live_state = session_live_state.submit
+
+    def record_snapshot(description: str, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        if description == "runner_host_hold_snapshot":
+            snapshot_calls.append((fn, args))
+            if unreadable_snapshot:
+
+                def fail_snapshot(*_args: Any) -> None:
+                    raise RuntimeError("snapshot read unavailable")
+
+                fn = fail_snapshot
+        return submit_live_state(description, fn, *args, **kwargs)
+
+    monkeypatch.setattr(session_live_state, "submit", record_snapshot)
+
+    def install_relay() -> _RelayHandle:
+        task = asyncio.create_task(asyncio.Event().wait())
+        relay_tasks.append(task)
+        relay = _RelayHandle(runner_id, task, asyncio.Event(), running_event_count=7)
+        sessions_module._runner_relay_tasks[session_id] = relay
+        return relay
+
+    if remove_relay or scenario in {"relay_replaced_during_hold", "relay_advanced_during_hold"}:
+        install_relay()
+        sessions_module._session_active_response_cache[session_id] = "held-turn"
+    if scenario == "queued_status_during_hold":
+        write_status = store.set_session_live_status
+
+        def delayed_status_write(sid: str, status: str) -> None:
+            if sid == session_id and status == "running":
+                status_write_started.set()
+                assert release_status_write.wait(timeout=budget(10.0))
+            write_status(sid, status)
+
+        monkeypatch.setattr(store, "set_session_live_status", delayed_status_write)
+        session_live_state.forget_live_status(session_id)
+        session_live_state.persist_live_status(session_id, "running")
+        assert await asyncio.to_thread(status_write_started.wait, budget(5.0))
     reconnect: ApplicationCommunicator | None = None
 
     async def _failed() -> dict[str, str]:
@@ -2516,19 +2691,187 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
         if scenario == "host_online":
             await asyncio.wait_for(_failed(), timeout=budget(5.0))
             return
+        if scenario == "queued_status_during_hold":
+            await poll_until_async(lambda: bool(host_checks), timeout_s=budget(5.0))
+            release_status_write.set()
         # Past the grace and re-checking the host, the turn is held rather than failed.
         await asyncio.wait_for(_host_checked(3), timeout=budget(5.0))
         assert sessions_module._session_status_cache.get(session_id) == "running"
         assert host_checks[0] == host_id
+        if unreadable_snapshot:
+            assert len(snapshot_calls) == 1
+            assert snapshot_calls[0] == (store.get_session_activity, ([session_id],))
+        if batched_snapshot:
+            assert snapshot_calls
+            assert all(fn == store.get_session_activity for fn, _ in snapshot_calls)
+            batches = [args[0] for _, args in snapshot_calls]
+            assert all(0 < len(batch) <= 2 for batch in batches)
+            assert sum(len(batch) for batch in batches) == len(snapshot_ids)
+            assert {sid for batch in batches for sid in batch} == snapshot_ids
+        if remove_relay:
+            sessions_module._runner_relay_tasks.pop(session_id).task.cancel()
 
+        if scenario.endswith("_during_hold"):
+            launch = AsyncMock()
+            monkeypatch.setattr(sessions_module, "_launch_runner_on_host", launch)
+            if scenario != "stale_idle_during_hold":
+                host_conn = ap_app.state.host_registry.register(
+                    host_id,
+                    AsyncMock(),
+                    HostHelloFrame(
+                        version="0.1.0-test", frame_protocol_version=1, name="returned-host"
+                    ),
+                    owner=None,
+                )
+            if scenario.startswith("remote_") or scenario == "queued_status_during_hold":
+                terminal_status = "failed" if scenario == "remote_failed_during_hold" else "idle"
+                store.set_session_live_status(session_id, terminal_status)
+                if terminal_status == "failed":
+                    store.set_labels(
+                        session_id,
+                        {
+                            "omnigent.last_task_error_code": "native_turn_error",
+                            "omnigent.last_task_error_message": "Recorded on another replica",
+                        },
+                    )
+            elif scenario == "new_turn_during_hold":
+                sessions_module._publish_status(session_id, "running", response_id="newer-turn")
+            elif scenario == "relay_replaced_during_hold":
+                install_relay()
+            elif scenario == "relay_advanced_during_hold":
+                sessions_module._runner_relay_tasks[session_id].running_event_count += 1
+            host_row[0] = False
+            hold_task = next(
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == f"runner-disconnect-grace-{runner_id}"
+            )
+            await asyncio.wait_for(hold_task, timeout=budget(5.0))
+            await asyncio.wrap_future(
+                session_live_state.submit("drain_hold_cleanup", lambda: None)
+            )
+            refreshed = store.get_conversation(session_id)
+            assert refreshed is not None
+            assert refreshed.background_work_running == (scenario in newer_owner_scenarios)
+            error = sessions_module._last_task_error_from_labels(refreshed.labels)
+            if scenario == "stale_idle_during_hold":
+                assert error is not None and error["code"] == "runner_disconnected"
+            elif scenario in newer_owner_scenarios:
+                assert sessions_module._session_status_cache[session_id] == "running"
+                assert sessions_module._session_active_response_cache[session_id] == (
+                    "newer-turn" if scenario == "new_turn_during_hold" else "held-turn"
+                )
+                assert error is None
+            else:
+                assert refreshed.live_status == terminal_status
+                assert session_id not in sessions_module._session_status_cache
+                assert (error or {}).get("code") == (
+                    "native_turn_error" if terminal_status == "failed" else None
+                )
+            launch.assert_not_awaited()
+            return
+
+        if scenario in ("cancelled", "shutdown"):
+            hold_task = next(
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == f"runner-disconnect-grace-{runner_id}"
+            )
+            if scenario == "cancelled":
+                hold_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await hold_task
+            else:
+                from omnigent.server import shutdown_state
+
+                monkeypatch.setattr(shutdown_state, "server_shutting_down", lambda: True)
+                await asyncio.wait_for(hold_task, timeout=budget(5.0))
+            assert sessions_module._session_status_cache.get(session_id) == "running"
+            assert (
+                sessions_module._last_task_error_from_labels(
+                    store.get_conversation(session_id).labels
+                )
+                is None
+            )
+            return
+        if scenario.startswith("host_flaps_") or scenario == "host_back_unreadable":
+            # Each brief host return must earn a fresh, uninterrupted runner grace.
+            for _ in range(1 if scenario == "host_back_unreadable" else 2):
+                host_row[0] = False
+                await asyncio.wait_for(_host_checked(1), timeout=budget(5.0))
+                host_row[0] = None if scenario == "host_back_unreadable" else True
+                await asyncio.sleep(grace * 2)
+                assert sessions_module._session_status_cache.get(session_id) == "running"
         if scenario == "unreadable":
             # Re-checks that can't read the host row outlast the grace twice over.
             host_row[0] = None
             await asyncio.wait_for(_host_checked(10), timeout=budget(5.0))
             assert sessions_module._session_status_cache.get(session_id) == "running"
-        if scenario == "host_back_without_runner":
+        if local_host_return or scenario in (
+            "host_back_without_runner",
+            "host_flaps_back_without_runner",
+        ):
             host_row[0] = False
-        if scenario in ("reconnect", "unreadable"):
+            await asyncio.wait_for(_host_checked(1), timeout=budget(5.0))
+            if local_host_return:
+                monkeypatch.setattr(
+                    ap_app.state.runner_router, "client_for_session_resources", real_resolver
+                )
+                monkeypatch.setattr(sessions_module, "_ensure_runner_relay", real_ensure_relay)
+                real_recover = sessions_module._publish_runner_recovered_status
+
+                async def record_recovery(sid: str, *args: Any, **kwargs: Any) -> None:
+                    await real_recover(sid, *args, **kwargs)
+                    if sid == session_id:
+                        recovery_finished.set()
+
+                monkeypatch.setattr(
+                    sessions_module, "_publish_runner_recovered_status", record_recovery
+                )
+                host_conn = ap_app.state.host_registry.register(
+                    host_id,
+                    AsyncMock(),
+                    HostHelloFrame(
+                        version="0.1.0-test", frame_protocol_version=1, name="returned-host"
+                    ),
+                    owner=None,
+                )
+
+                async def serve_host() -> None:
+                    nonlocal reconnect, forwarder_task
+                    while (payload := await host_conn.outbound_queue.get()) is not None:
+                        frame = decode_host_frame(payload.data)
+                        if isinstance(frame, HostStopRunnerFrame):
+                            host_conn.pending_stops.pop(frame.request_id).set_result(
+                                {"status": "stopped"}
+                            )
+                        elif isinstance(frame, HostLaunchRunnerFrame):
+                            relaunched_session_ids.append(frame.session_id)
+                            replacement_id = token_bound_runner_id(frame.binding_token)
+                            if scenario == "host_back_launch_refused":
+                                host_conn.pending_launches.pop(frame.request_id).set_result(
+                                    {"status": "failed", "error": "test launch refused"}
+                                )
+                                relaunch_finished.set()
+                                continue
+                            host_conn.pending_launches.pop(frame.request_id).set_result(
+                                {"status": "launched", "runner_id": replacement_id}
+                            )
+                            reconnect = await _connect_runner_tunnel(ap_app, replacement_id)
+                            await _send_hello_and_wait(
+                                reconnect, ap_app, replacement_id, harnesses=[_TEST_HARNESS_NAME]
+                            )
+                            forwarder_task = asyncio.create_task(
+                                _forward_requests_to_runner(
+                                    reconnect, tunnel_three_layer_stack.runner_app
+                                )
+                            )
+                            relaunch_finished.set()
+
+                host_task = asyncio.create_task(serve_host())
+            await asyncio.sleep(grace / 2)
+            assert sessions_module._session_status_cache.get(session_id) == "running"
+        if scenario in ("reconnect", "unreadable", "host_flaps_reconnect", "host_back_unreadable"):
             reconnect = await _connect_runner_tunnel(ap_app, runner_id)
             await _send_hello_and_wait(
                 reconnect, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
@@ -2536,14 +2879,98 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             await asyncio.sleep(grace * 2)
             assert sessions_module._session_status_cache.get(session_id) == "running"
             return
+        if scenario.endswith("_before_relaunch"):
+            hold_task = next(
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == f"runner-disconnect-grace-{runner_id}"
+            )
+            await asyncio.wait_for(hold_task, timeout=budget(5.0))
+            assert relaunched_session_ids == []
+            expected_runner = runner_id if "stopped" in scenario else "runner-newer-work"
+            expected_status = "idle" if "stopped" in scenario else "running"
+            assert store.get_conversation(session_id).runner_id == expected_runner
+            assert sessions_module._session_status_cache[session_id] == expected_status
+            return
         # Expiry, or one more grace after the host returned: the turn fails.
-        error = await asyncio.wait_for(_failed(), timeout=budget(5.0))
+        timeout = budget(5.0)
+        if scenario == "host_flaps_expired":
+            # Returning hosts cannot restart or extend the original absolute hold.
+            assert first_host_check is not None
+            timeout = first_host_check + hold + 0.3 - asyncio.get_running_loop().time()
+        error = await asyncio.wait_for(_failed(), timeout=timeout)
+        if local_host_return:
+            # Settle the old turn before launch rotates its binding, keeping the cause
+            # across a replacement runner's passive reconnect.
+            assert error["code"] == "runner_interrupted"
+            assert "restarted during this turn" in error["message"]
+            assert "running again" not in error["message"]
+            await asyncio.wait_for(relaunch_finished.wait(), timeout=budget(5.0))
+            assert relaunched_session_ids == [session_id]
+            assert store.get_conversation(session_id).runner_id != runner_id
+            if scenario == "host_back_launch_refused":
+                assert sessions_module._session_status_cache[session_id] == "failed"
+                return
+            await asyncio.wait_for(recovery_finished.wait(), timeout=budget(5.0))
+            assert executed_turns == []
+            assert store.get_item(session_id, original_input.id) == original_input
+
+            # A queued follow-up keeps its identity and runs once on the replacement.
+            event = {
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "stable_id": "b" * 32,
+                    "content": [{"type": "input_text", "text": "new work"}],
+                },
+            }
+            sent = await tunnel_three_layer_stack.ap_client.post(
+                f"/v1/sessions/{session_id}/events",
+                json=event,
+                headers={"x-omnigent-background-session-titles": "off"},
+            )
+            assert sent.status_code == 202, sent.text
+            assert sent.json()["item_id"] == "b" * 32
+
+            def completed_followup() -> bool:
+                return sessions_module._session_status_cache.get(session_id) == "idle" and any(
+                    item.type == "message"
+                    and isinstance(item.data, MessageData)
+                    and item.data.role == "assistant"
+                    for item in store.list_items(session_id).data
+                )
+
+            await poll_until_async(completed_followup, timeout_s=budget(5.0))
+            assert store.get_item(session_id, "b" * 32) is not None
+            assert len(executed_turns) == 1
+            assert store.get_item(session_id, original_input.id) == original_input
+            return
         assert error["code"] == "runner_disconnected"
-        assert ("did not come back within" in error["message"]) == (scenario == "expired")
+        assert ("did not come back within" in error["message"]) == (
+            scenario in ("expired", "host_flaps_expired")
+        )
         assert ("came back without the runner" in error["message"]) == (
-            scenario == "host_back_without_runner"
+            scenario in ("host_back_without_runner", "host_flaps_back_without_runner")
         )
     finally:
+        release_status_write.set()
+        sessions_module._runner_relay_tasks.pop(session_id, None)
+        sessions_module._session_active_response_cache.pop(session_id, None)
+        for task in relay_tasks:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        sessions_module._intentional_stop_sessions.pop(session_id, None)
+        if host_task is not None:
+            host_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await host_task
+        if host_conn is not None:
+            ap_app.state.host_registry.deregister(host_id, conn=host_conn)
+        if forwarder_task is not None:
+            forwarder_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await forwarder_task
         if reconnect is not None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await reconnect.send_input({"type": "websocket.disconnect", "code": 1000})

@@ -47,6 +47,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests.e2e._native_resume_helpers import (
     cli_env,
     omnigent_console_script,
@@ -124,9 +125,10 @@ def test_codex_native_session_config_preserves_native_effort(
 
     env = cli_env()
     # Isolate the journey from the invoking machine: the bridge root
-    # (~/.omnigent/codex-native) derives from HOME, and the copy *source* from
-    # CODEX_HOME (defaulted to ~/.codex — pinned explicitly for determinism).
+    # (~/.omnigent/codex-native) derives from the data dir, and the copy *source*
+    # from CODEX_HOME (defaulted to ~/.codex — pinned explicitly for determinism).
     env["HOME"] = str(home_dir)
+    env["OMNIGENT_DATA_DIR"] = str(home_dir / ".omnigent")
     env["CODEX_HOME"] = str(codex_src)
 
     omni = str(omnigent_console_script())
@@ -159,3 +161,4 @@ def test_codex_native_session_config_preserves_native_effort(
         )
     finally:
         handle.terminate()
+        reap_leaked_omnigent_processes(home_dir / ".omnigent")

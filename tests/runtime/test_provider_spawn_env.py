@@ -568,6 +568,24 @@ def test_claude_sdk_falls_back_to_first_available_anthropic_credential(
     assert _resolve_provider_for_build(spec, harness_type="claude-sdk") is None
 
 
+@pytest.mark.parametrize("model", ["databricks-claude-opus-4-8", "system.ai.claude-opus-4-8"])
+def test_databricks_model_id_alone_launches_claude_sdk_on_the_gateway(
+    config_home: Path, model: str
+) -> None:
+    """A spec with no auth whose model is a Databricks id launches through Databricks.
+
+    sys_session_send localizes a gateway child's model to the ``system.ai.``
+    spelling, so that spelling must route like the legacy one.
+    """
+    spec = _make_spec(harness="claude-sdk", model=model)
+
+    provider = _resolve_provider_for_build(spec, harness_type="claude-sdk", for_launch=True)
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert provider is not None and provider.kind == "databricks"
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
+
+
 @pytest.fixture
 def managed_claude_settings(config_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Use an isolated enterprise Claude credential instead of host settings."""
@@ -1661,7 +1679,7 @@ def test_codex_cli_config_default_pins_model_provider(config_home: Path) -> None
     assert "HARNESS_CODEX_GATEWAY_BASE_URL" not in env
     assert "HARNESS_CODEX_GATEWAY_AUTH_COMMAND" not in env
     # No model pinned either — codex keeps its own default model against
-    # the pinned provider (matching how isaac configures it).
+    # the pinned provider (matching how a wrapper configures it).
     assert "HARNESS_CODEX_MODEL" not in env
 
 
@@ -1669,7 +1687,7 @@ def test_codex_subscription_default_pins_builtin_openai(config_home: Path) -> No
     """A codex ``subscription`` default pins the built-in ``openai`` provider.
 
     The executor bridges the user's ~/.codex/config.toml, whose custom
-    default model_provider (e.g. isaac's Databricks Unity Gateway) would
+    default model_provider (e.g. a Databricks Unity Gateway) would
     otherwise silently hijack a Subscription selection. Failure means
     "Subscription" stops meaning "ChatGPT login" on machines with a custom
     config.toml default.

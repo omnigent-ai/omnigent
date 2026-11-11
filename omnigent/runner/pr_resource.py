@@ -5,6 +5,9 @@ PR, else the PR of the workspace's branch) and which git provider serves it,
 and keeps the session's tracked PRs and their cached titles. Every step that
 talks to a forge goes through that provider's
 :class:`~omnigent.runner.git_providers.PullRequestFacet`.
+
+Servers that track a session's PRs vouch for the PR a request targets
+(:func:`server_tracking`), so it is served even if this host never recorded it.
 """
 
 from __future__ import annotations
@@ -13,10 +16,12 @@ import logging
 import re
 import subprocess
 import time
-from collections.abc import Callable
+from collections import OrderedDict
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
-from contextlib import suppress
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any
@@ -31,11 +36,15 @@ from omnigent.git_providers import (
     providers,
     resolve_remote,
 )
+from omnigent.runner import pr_reports
 from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
+    CommitsFacet,
+    PinnedRevisionFacet,
     ProviderCapabilities,
     PullRequestFacet,
     ReviewerRef,
+    ReviewThreadsFacet,
     local_git,
     unsupported_remote_info,
 )
@@ -43,6 +52,11 @@ from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, Sessi
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
 
 _logger = logging.getLogger(__name__)
+
+# Whether the server vouches for the request's PR, and its first PR for requests that select none.
+_SERVER_TRACKING: ContextVar[tuple[bool, str | None]] = ContextVar(
+    "server_tracked_pull_request", default=(False, None)
+)
 
 # Cache failed lookups too so inaccessible PRs do not add work to every poll.
 _PR_TITLE_CACHE_SECONDS = 300.0
@@ -202,17 +216,51 @@ def _serving_facet(root: str, reference: PullRequestRef | None) -> PullRequestFa
     return _facet(_resolve(root, reference).provider)
 
 
+@contextmanager
+def server_tracking(server_tracked: object, default_pr_url: object = None) -> Iterator[None]:
+    """Serve the PR the server tracks for the session, even if this host never recorded it.
+
+    :param server_tracked: The request's ``server_tracked`` value; servers that
+        track the session's PRs send ``True`` (``"1"`` in a query string).
+    :param default_pr_url: The server's first PR, served when the request selects none.
+    """
+    tracked = server_tracked is True or server_tracked in ("1", "true")
+    default = default_pr_url if tracked and isinstance(default_pr_url, str) else None
+    token = _SERVER_TRACKING.set((tracked, default or None))
+    try:
+        yield
+    finally:
+        _SERVER_TRACKING.reset(token)
+
+
 def _selected_pr(session_id: str, pr_url: str) -> SessionPullRequest:
     reference = PullRequestRef.from_url(pr_url)
-    for entry in SessionPrRegistry(session_id).list():
+    tracked, _ = _SERVER_TRACKING.get()
+    try:
+        entries = SessionPrRegistry(session_id).list()
+    except ValueError:
+        if not tracked:
+            raise
+        entries = []
+    for entry in entries:
         if entry.url == reference.url:
             return entry
+    if tracked:
+        now = time.time()
+        return SessionPullRequest(
+            **reference.model_dump(),
+            relationship="attached",
+            source="server",
+            first_seen_at=now,
+            last_seen_at=now,
+        )
     raise ValueError("This pull request is not associated with the session")
 
 
 def _default_pr(session_id: str | None, pr_url: str | None) -> SessionPullRequest | None:
     if session_id is None:
         return None
+    pr_url = pr_url or _SERVER_TRACKING.get()[1]
     if pr_url:
         return _selected_pr(session_id, pr_url)
     entries = SessionPrRegistry(session_id).list()
@@ -222,15 +270,10 @@ def _default_pr(session_id: str | None, pr_url: str | None) -> SessionPullReques
 def _cannot_serve(info: dict[str, Any], capabilities: ProviderCapabilities) -> bool:
     """Whether a provider's workspace info shows that it cannot serve the workspace.
 
-    True when its CLI, if it has one, is present and signed in, yet no
-    repository resolved and the panel offers no other account to try.
+    True when no repository resolved and the panel offers no other account to try.
     """
     auth = info.get("auth")
     if info.get("available") is not True or not isinstance(auth, dict):
-        return False
-    cli = auth.get("cli")
-    if not auth.get("authenticated") or (isinstance(cli, dict) and not cli.get("available")):
-        # The panel shows the provider's install or sign-in guidance instead.
         return False
     repo = info.get("repo")
     if info.get("pr") is not None or (isinstance(repo, dict) and repo.get("name_with_owner")):
@@ -386,6 +429,7 @@ def _associate_discovered_pr(
             registry.record(
                 [inferred], relationship="inferred", source="branch", timestamp=timestamp
             )
+            pr_reports.notify(registry.session_id)
             if any(entry.url == inferred.url for entry in registry.list()):
                 candidate["selected_pr_url"] = inferred.url
                 try:
@@ -405,6 +449,49 @@ def _associate_discovered_pr(
             candidate["pr"] = None
             candidate.pop("selected_pr_url", None)
             candidate.setdefault("warnings", []).append("Could not associate this pull request.")
+
+
+# (session, checkout, pushed state) already checked, so repeat git calls cost one local read.
+_CHECKED_CHECKOUTS: OrderedDict[tuple[str, str, str], None] = OrderedDict()
+_CHECKED_CHECKOUTS_LOCK = Lock()
+
+
+def infer_checkout_pr(session_id: str, checkout: str) -> None:
+    """Infer the PR of *checkout*'s branch, as the panel does for the workspace's.
+
+    Agents often push from a checkout other than the session workspace, such as a
+    worktree. Discovery runs once per pushed commit: until a remote-tracking ref
+    points at HEAD, the branch has no PR to find.
+    """
+    try:
+        code, pushed = _git_output(
+            [
+                "for-each-ref",
+                "--points-at=HEAD",
+                "--format=%(objectname) %(refname)",
+                "refs/remotes/",
+            ],
+            cwd=checkout,
+        )
+        if code != 0 or not pushed.strip():
+            return
+        key = (session_id, checkout, pushed)
+        with _CHECKED_CHECKOUTS_LOCK:
+            if key in _CHECKED_CHECKOUTS:
+                return
+            _CHECKED_CHECKOUTS[key] = None
+            while len(_CHECKED_CHECKOUTS) > 1024:
+                _CHECKED_CHECKOUTS.popitem(last=False)
+        registry = SessionPrRegistry(session_id)
+        for resolution in _workspace_providers(checkout):
+            candidate = _discovery_info(checkout, resolution)
+            pr = candidate.get("pr")
+            # Recording again would demote a PR the session already attached or worked on.
+            if isinstance(pr, dict) and any(e.url == pr.get("url") for e in registry.list()):
+                continue
+            _associate_discovered_pr(checkout, registry, candidate, time.time())
+    except Exception:  # optional inference must never affect the tool call
+        _logger.warning("Could not infer the PR of %s", checkout, exc_info=True)
 
 
 def _background_discovery(
@@ -434,7 +521,10 @@ def _background_discovery(
 
 
 def pr_info(
-    root: str, *, session_id: str | None = None, pr_url: str | None = None
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
 ) -> dict[str, Any]:
     """Read the selected session PR and discover untracked providers from all remotes.
 
@@ -454,8 +544,13 @@ def pr_info(
     request_deadline = time.monotonic() + _PR_TITLE_REQUEST_SECONDS
     registry = SessionPrRegistry(session_id)
     entries = registry.list()
-    reference = _selected_pr(session_id, pr_url) if pr_url else entries[0] if entries else None
+    default_url = pr_url or _SERVER_TRACKING.get()[1]
+    reference = (
+        _selected_pr(session_id, default_url) if default_url else entries[0] if entries else None
+    )
     tracked_providers = {entry.provider for entry in entries}
+    if reference is not None:
+        tracked_providers.add(reference.provider)
     resolutions = (
         []
         if pr_url
@@ -803,6 +898,160 @@ def update_pr_reviewers(
     return facet.edit_reviewers(root, reference, add=add_refs, remove=remove_refs)
 
 
+def _comment_body(body: object) -> str:
+    """Validate Markdown consistently for conversation comments and review replies."""
+    if not isinstance(body, str):
+        raise ValueError("Expected body to be a string")
+    if not body.strip():
+        raise ValueError("A comment cannot be empty")
+    if len(body) > _MAX_BODY_CHARS:
+        raise ValueError(f"A comment can be at most {_MAX_BODY_CHARS} characters")
+    return body
+
+
+def _review_target(
+    session_id: str | None, pr_url: str | None, *, replying: bool = False, creating: bool = False
+) -> tuple[ReviewThreadsFacet, SessionPullRequest]:
+    facet, reference = _capable_target(
+        session_id,
+        pr_url,
+        capable=lambda capabilities: (
+            capabilities.review_thread_creation
+            if creating
+            else capabilities.review_thread_replies
+            if replying
+            else capabilities.review_threads
+        ),
+        unselected="Select a pull request to read or reply to a conversation",
+        unsupported="Review conversations on {kind} are not supported",
+    )
+    if not isinstance(facet, ReviewThreadsFacet):
+        raise ValueError("This provider does not support review conversations")
+    return facet, reference
+
+
+def _review_identifier(value: str) -> str:
+    if not value or len(value) > 1024 or any(character.isspace() for character in value):
+        raise ValueError("Invalid review conversation identifier or cursor")
+    return value
+
+
+def pr_review_threads(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    after: str = "",
+    head_sha: str = "",
+    base_sha: str = "",
+) -> dict[str, Any]:
+    """Read published conversations, requiring pinned revisions for pagination."""
+    facet, reference = _review_target(session_id, pr_url)
+    if after and (not _COMMIT_SHA.fullmatch(head_sha) or not _COMMIT_SHA.fullmatch(base_sha)):
+        raise ValueError("Expected full head and base commit SHAs")
+    return facet.review_threads(
+        root,
+        reference,
+        after=_review_identifier(after) if after else "",
+        head_sha=head_sha,
+        base_sha=base_sha,
+    )
+
+
+def pr_review_thread_comments(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    thread_id: str,
+    after: str,
+) -> dict[str, Any]:
+    """Read additional replies from a conversation on the selected PR."""
+    facet, reference = _review_target(session_id, pr_url)
+    return facet.review_thread_comments(
+        root, reference, thread_id=_review_identifier(thread_id), after=_review_identifier(after)
+    )
+
+
+def reply_to_pr_review_thread(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    thread_id: str,
+    body: object = None,
+) -> dict[str, Any]:
+    """Post a validated reply through the selected PR's provider."""
+    comment_body = _comment_body(body)
+    facet, reference = _review_target(session_id, pr_url, replying=True)
+    return facet.reply_to_review_thread(
+        root, reference, thread_id=_review_identifier(thread_id), body=comment_body
+    )
+
+
+def create_pr_review_thread(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    body: object = None,
+    anchor: object = None,
+) -> dict[str, Any]:
+    """Publish a new conversation on a line or same-side range at a known revision."""
+    comment_body = _comment_body(body)
+    facet, reference = _review_target(session_id, pr_url, creating=True)
+    if not isinstance(anchor, dict):
+        raise ValueError("Select lines in the diff before commenting")
+    path = anchor.get("path")
+    if (
+        not isinstance(path, str)
+        or not path
+        or path.startswith("/")
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+    ):
+        raise ValueError("Expected a repository-relative file path")
+    if not isinstance(anchor.get("side"), str) or anchor["side"] not in {"LEFT", "RIGHT"}:
+        raise ValueError("Select lines on one side of the diff")
+    line, start = anchor.get("line"), anchor.get("start_line")
+    if (
+        type(line) is not int
+        or line < 1
+        or (start is not None and (type(start) is not int or start < 1 or start >= line))
+    ):
+        raise ValueError("Expected a positive line or increasing line range")
+    for field in ("head_sha", "base_sha"):
+        if not isinstance(anchor.get(field), str) or not _COMMIT_SHA.fullmatch(anchor[field]):
+            raise ValueError("Expected full head and base commit SHAs")
+    return facet.create_review_thread(
+        root,
+        reference,
+        body=comment_body,
+        anchor={
+            key: anchor.get(key)
+            for key in ("path", "side", "line", "start_line", "head_sha", "base_sha")
+        },
+    )
+
+
+def create_pr_comment(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    body: object = None,
+) -> dict[str, Any]:
+    """Post a non-empty Markdown comment to the selected tracked PR."""
+    body = _comment_body(body)
+    facet, reference = _capable_target(
+        session_id,
+        pr_url,
+        capable=lambda capabilities: capabilities.comment_posting,
+        unselected="Select a pull request to post a comment",
+        unsupported="Posting comments on {kind} is not supported",
+    )
+    return facet.create_comment(root, reference, body=body)
+
+
 def _details_target(
     session_id: str | None, pr_url: str | None
 ) -> tuple[PullRequestFacet, SessionPullRequest]:
@@ -921,26 +1170,113 @@ def upload_pr_attachment(
     )
 
 
+def _full_revision(head_sha: str | None, base_sha: str | None) -> tuple[str, str]:
+    """Return both SHAs of a pinned read, rejecting a partial or malformed pair."""
+    if (
+        not head_sha
+        or not base_sha
+        or not _COMMIT_SHA.fullmatch(head_sha)
+        or not _COMMIT_SHA.fullmatch(base_sha)
+    ):
+        raise ValueError("Expected full head and base commit SHAs")
+    return head_sha, base_sha
+
+
 def pr_changed_files(
-    root: str, *, session_id: str | None = None, pr_url: str | None = None
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    head_sha: str | None = None,
+    base_sha: str | None = None,
 ) -> dict[str, Any]:
-    """List the selected PR's changed files; empty when no provider serves it."""
+    """List the selected PR's changed files; empty when no provider serves it.
+
+    With ``head_sha``/``base_sha``, a provider with :class:`PinnedRevisionFacet` lists
+    that revision, echoing it only when verified; other providers list the current revision.
+    """
     reference = _default_pr(session_id, pr_url)
     facet = _serving_facet(root, reference)
     if facet is None:
         return {"object": "list", "data": [], "has_more": False}
+    if reference and (head_sha or base_sha) and isinstance(facet, PinnedRevisionFacet):
+        head, base = _full_revision(head_sha, base_sha)
+        return facet.pinned_changed_files(root, reference, head_sha=head, base_sha=base)
     return facet.changed_files(root, reference)
 
 
 def pr_diff(
-    root: str, *, session_id: str | None = None, pr_url: str | None = None
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    head_sha: str | None = None,
+    base_sha: str | None = None,
 ) -> dict[str, Any]:
     """Return the selected PR as one unified diff; empty when no provider serves it."""
     reference = _default_pr(session_id, pr_url)
     facet = _serving_facet(root, reference)
     if facet is None:
         return {"object": PR_DIFF_OBJECT, "patch": ""}
+    if reference and (head_sha or base_sha) and isinstance(facet, PinnedRevisionFacet):
+        head, base = _full_revision(head_sha, base_sha)
+        return facet.pinned_diff(root, reference, head_sha=head, base_sha=base)
     return facet.pr_diff(root, reference)
+
+
+def _commits_target(
+    session_id: str | None, pr_url: str | None
+) -> tuple[CommitsFacet, SessionPullRequest]:
+    """Return the selected tracked PR and its facet, which must list commits."""
+    facet, reference = _capable_target(
+        session_id,
+        pr_url,
+        capable=lambda capabilities: capabilities.commit_history,
+        unselected="Select a pull request to list its commits",
+        unsupported="Listing commits is not supported for {kind}",
+    )
+    if not isinstance(facet, CommitsFacet):
+        raise ValueError("This provider does not list pull request commits")
+    return facet, reference
+
+
+def _commit_sha(value: object, field: str) -> str:
+    """Return a full commit id, since an abbreviation can later name a different commit."""
+    if not isinstance(value, str) or not _COMMIT_SHA.fullmatch(value):
+        raise ValueError(f"Expected {field} to be a full commit SHA")
+    return value
+
+
+def pr_commits(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    head_sha: object = None,
+) -> dict[str, Any]:
+    """List the selected PR's commits, oldest first, at the displayed head.
+
+    :raises ValueError: Without a selected tracked PR, when its provider cannot list
+        commits, or when ``head_sha`` is not a full commit id.
+    """
+    facet, reference = _commits_target(session_id, pr_url)
+    return facet.commits(root, reference, head_sha=_commit_sha(head_sha, "head_sha"))
+
+
+def pr_commit_diff(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    commit_sha: object = None,
+) -> dict[str, Any]:
+    """Return one commit of the selected PR as a unified diff.
+
+    :raises ValueError: Without a selected tracked PR, when its provider cannot list
+        commits, or when ``commit_sha`` is not a full commit id.
+    """
+    facet, reference = _commits_target(session_id, pr_url)
+    return facet.commit_diff(root, reference, commit_sha=_commit_sha(commit_sha, "commit_sha"))
 
 
 def pr_file_diff(

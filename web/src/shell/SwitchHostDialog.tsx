@@ -25,11 +25,7 @@ import { parentOf, resolveWorkspacePath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { HostLabel } from "./HostLabel";
-import {
-  composeSandboxWorkspace,
-  normalizeWorkspacePath,
-  sandboxRepoProblem,
-} from "./NewChatDialog";
+import { normalizeWorkspacePath } from "./NewChatDialog";
 import { useHosts } from "@/hooks/useHosts";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
@@ -37,6 +33,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
 import { randomUUID } from "@/lib/randomUUID";
+import { composeSandboxWorkspace, sandboxRepoProblem } from "@/lib/sandboxRepositories";
 import { launchManagedHost, launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import { useChatStore } from "@/store/chatStore";

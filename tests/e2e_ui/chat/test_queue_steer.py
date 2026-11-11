@@ -62,6 +62,8 @@ async def _drive_steer(base_url: str, session_id: str) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
+        # Queue busy follow-ups instead of steering them (Always steer defaults on).
+        await page.add_init_script("localStorage.setItem('omnigent:always-steer', 'false')")
         try:
             # Every (session_id, text) POSTed to a /events endpoint. Each is
             # acked immediately; no session.status event ever follows, so the

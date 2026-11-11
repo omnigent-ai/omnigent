@@ -335,8 +335,12 @@ async def test_claude_native_retried_shell_command_mirror_leaves_the_queue_alone
 
 
 @pytest.mark.asyncio
-async def test_claude_native_lost_shell_message_is_still_reported_as_not_recorded() -> None:
-    """A shell message with no matching input mirror still reports delivery failure."""
+async def test_claude_native_shell_message_recorded_after_a_later_prompt_is_not_lost() -> None:
+    """A shell message queued behind a turn is recorded after a later prompt, not lost.
+
+    Claude holds a queued ``!cmd`` until the turn ends but folds a plain prompt
+    sent after it in at the next tool call, so the prompt's mirror arrives first.
+    """
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _persist_external_conversation_item
 
@@ -345,7 +349,7 @@ async def test_claude_native_lost_shell_message_is_still_reported_as_not_recorde
     sid = "64a784c3aa907d1774f44313546947c6"
     conv = store.get_conversation(sid)
     assert conv is not None
-    pending_inputs.record(sid, [{"type": "input_text", "text": "!never ran"}])
+    pending_inputs.record(sid, [{"type": "input_text", "text": "!echo held"}])
     pending_inputs.record(sid, [{"type": "input_text", "text": "still here?"}])
 
     try:
@@ -355,14 +359,15 @@ async def test_claude_native_lost_shell_message_is_still_reported_as_not_recorde
             _user_mirror("still here?", "claude:still-here:0"),
             store,  # type: ignore[arg-type]
         )
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _shell_mirror("input", "claude:echo-held:0", input="echo held"),
+            store,  # type: ignore[arg-type]
+        )
 
-        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
-        lost_error = store.appended_items[1].data
-        assert lost_error.code == "native_prompt_not_recorded"
-        assert lost_error.level is None
-        assert store.appended_items[0].data.content == [
-            {"type": "input_text", "text": "!never ran"}
-        ]
+        assert [item.type for item in store.appended_items] == ["message", "terminal_command"]
+        assert all(item.type != "error" for item in store.appended_items)
         assert pending_inputs.snapshot_for(sid) == []
     finally:
         pending_inputs.reset_for_tests()

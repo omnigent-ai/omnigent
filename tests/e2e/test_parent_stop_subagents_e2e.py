@@ -29,6 +29,7 @@ import pytest
 import yaml
 
 from dev.repro_env.runtime import write_model_config
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.server.routes.sessions import RUNNER_DISCONNECT_GRACE_S
@@ -184,9 +185,10 @@ def test_native_parent_teardown_preserves_child_outcome(
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
         launcher = bin_dir / "codex"
+        # Before "$@": Codex ignores top-level -c once the subcommand has its own.
         launcher.write_text(
-            f'#!/bin/sh\nexec {shlex.quote(codex)} "$@" '
-            "-c mcp_servers.omnigent.startup_timeout_sec=60\n"
+            f"#!/bin/sh\nexec {shlex.quote(codex)} "
+            '-c mcp_servers.omnigent.startup_timeout_sec=60 "$@"\n'
         )
         launcher.chmod(0o755)
         base_env["PATH"] = f"{bin_dir}{os.pathsep}{base_env['PATH']}"
@@ -295,7 +297,21 @@ def test_native_parent_teardown_preserves_child_outcome(
             client.post,
             "/v1/sessions",
             bundle_files({"parent.yaml": yaml.safe_dump(spec).encode()}),
-            metadata={"host_id": host["host_id"], "workspace": str(workspace)},
+            metadata={
+                "host_id": host["host_id"],
+                "workspace": str(workspace),
+                # Codex's own default asks before each Omnigent tool call; the
+                # mocked automatic reviewer approves the dispatch instead.
+                **(
+                    {
+                        "terminal_launch_args": PERMISSION_LAUNCH_ARGS["codex-native"][
+                            "approve-for-me"
+                        ]
+                    }
+                    if harness == "codex"
+                    else {}
+                ),
+            },
         )
         response.raise_for_status()
         parent_id = response.json()["session_id"]

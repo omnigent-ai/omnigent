@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnigent-sandbox-profile-example"
+version = "0.1.0"
+description = "Customer-owned sandbox profiles from a local JSON catalog"
+requires-python = ">=3.12"
+dependencies = ["omnigent>=0.21.0.dev0,<1"]
+
+[project.entry-points."omnigent.sandbox_providers"]
+profile_demo = "omnigent.community.sandbox.profile_demo:contribution"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["omnigent.community.sandbox.profile_demo*"]
+namespaces = true

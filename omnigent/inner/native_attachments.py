@@ -465,8 +465,11 @@ UNRESOLVED_ATTACHMENT_MARKER_PATTERN = r"\[Attachment [^\]]+ could not be loaded
 
 # TUI forwarders strip local file paths from mirrored chat bubbles.
 # Codex's binary file inputs also use the "[Attached file: ...]" shape.
+# Only absolute paths are materialized uploads; a workspace-relative marker is
+# an inline "@file" mention from the web composer and stays in the sentence.
 ATTACHMENT_MARKER_STRIP_PATTERN = (
-    rf"\[Attached(?: file)?:[^\]]*\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN}"
+    r"\[Attached(?: file)?: (?:/|[A-Za-z]:[\\/]|\\\\)[^\]]*\]"
+    rf"|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN}"
 )
 
 
@@ -812,7 +815,15 @@ async def resolve_session_item_file_references(
     :returns: The same items with resolvable attachment blocks rewritten
         to carry ``image_url`` / ``file_data`` data URIs.
     """
+    messages: list[dict[str, Any]] = []
     for item in items:
+        if item.get("type") == "compaction":
+            snapshot = item.get("compacted_messages")
+            if isinstance(snapshot, list):
+                messages.extend(message for message in snapshot if isinstance(message, dict))
+        else:
+            messages.append(item)
+    for item in messages:
         content = item.get("content")
         if item.get("type") != "message" or not isinstance(content, list):
             continue

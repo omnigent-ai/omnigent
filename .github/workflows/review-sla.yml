@@ -23,7 +23,7 @@ concurrency:
 jobs:
   sweep:
     if: github.repository == 'omnigent-ai/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       # Job-level permissions REPLACE the workflow-level block, so restate read.

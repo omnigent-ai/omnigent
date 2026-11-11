@@ -348,9 +348,9 @@ class ExecutorError(ExecutorEvent):
         call started has already reported its prompt size, and
         discarding it freezes the context-occupancy meter at the
         previous turn's value exactly when the session is in trouble.
-    :param preserve_session: The executor is idle and safe to reuse after this
-        failure. Set only when no prompt or tool work remains in progress.
-        Defaults to ``False`` so failed turns receive normal teardown.
+    :param preserve_session: The executor released its per-call resources and is
+        safe to reuse without teardown. Native submission bridges may preserve
+        independently running work after a lost reply. Defaults to ``False``.
     :param code: Semantic failure code the turn error should carry, e.g.
         ``"databricks_sign_in_pending"``. ``None`` lets the harness adapter
         fall back to its generic classification of the failure.
@@ -467,6 +467,11 @@ class MessageSplit:
 
     persisted: list[Message]
     transient: list[Message]
+
+
+def without_tool_history(messages: list[Message]) -> list[Message]:
+    """Drop ``tool_call`` / ``tool_result`` items, which only a fresh-session replay uses."""
+    return [msg for msg in messages if msg.get("role") not in ("tool_call", "tool_result")]
 
 
 def split_transient_tail(
@@ -649,6 +654,35 @@ class InjectionDeliveryAmbiguous(Exception):
     """
 
 
+@dataclass(frozen=True)
+class LiveMcpServerStatus:
+    """One MCP server's connection as a running harness reports it.
+
+    :param name: The harness's name for the server, e.g. ``"plugin:notes:notes"``.
+    :param status: ``"connected"``, ``"failed"``, ``"needs-auth"``, ``"pending"``
+        or ``"disabled"``.
+    :param error: Why the server failed, when the harness says.
+    :param scope: Where the server is configured, e.g. ``"user"`` or ``"managed"``.
+    """
+
+    name: str
+    status: str
+    error: str | None = None
+    scope: str | None = None
+
+
+class LiveMcpServerUnknown(LookupError):
+    """The running harness reports no MCP server with the requested name."""
+
+
+class LiveMcpHarnessNotRunning(RuntimeError):
+    """The session has no running harness to ask about its MCP servers."""
+
+
+class LiveMcpReconnectRefused(RuntimeError):
+    """The harness answered a reconnect with its own reason; the message is safe to show."""
+
+
 class Executor:
     """Abstract interface for LLM backends and agent harnesses.
 
@@ -688,6 +722,14 @@ class Executor:
         """
         return False
 
+    def replays_tool_history(self) -> bool:
+        """Whether history handed to this executor keeps recorded tool calls and outputs.
+
+        Off by default: an executor that renders history as prompt text would
+        inline every tool output on each fresh session.
+        """
+        return False
+
     def max_context_tokens(self) -> int | None:
         return None
 
@@ -715,6 +757,35 @@ class Executor:
         """Whether ``enqueue_session_message()`` is expected to work during a running turn."""
         return False
 
+    def supports_live_mcp_control(self) -> bool:
+        """Whether ``live_mcp_statuses()`` and ``reconnect_live_mcp_server()`` are implemented."""
+        return False
+
+    async def live_mcp_statuses(self, session_key: str) -> list[LiveMcpServerStatus] | None:
+        """Return the session's MCP connections, or ``None`` when its harness is not running.
+
+        :raises TimeoutError: The harness did not answer in time.
+        """
+        raise NotImplementedError
+
+    async def reconnect_live_mcp_server(self, session_key: str, name: str) -> None:
+        """Ask the session's running harness to reconnect one MCP server.
+
+        :raises LiveMcpHarnessNotRunning: The harness is not running.
+        :raises LiveMcpServerUnknown: The harness reports no server named *name*.
+        :raises LiveMcpReconnectRefused: The harness tried and gave its reason.
+        :raises TimeoutError: The harness did not answer in time.
+        """
+        raise NotImplementedError
+
+    def preserves_message_content_blocks(self) -> bool:
+        """Whether fresh and queued input must retain original content block boundaries."""
+        return False
+
+    def preserves_empty_initiating_message(self) -> bool:
+        """Whether an empty final user message must survive history filtering."""
+        return False
+
     def supports_tool_boundary_interrupt(self) -> bool:
         """Whether queued user input can be applied by interrupting after a tool boundary."""
         return False
@@ -722,6 +793,10 @@ class Executor:
     def supports_stepwise_internal_turns(self) -> bool:
         """Whether the executor can pause and resume its own agent loop between turns."""
         return False
+
+    def close_timeout(self) -> float:
+        """Budget in seconds for background resource cleanup."""
+        return 3.0
 
     async def close(self) -> None:
         """Release executor-wide resources.

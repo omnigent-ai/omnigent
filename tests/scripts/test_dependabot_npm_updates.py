@@ -9,11 +9,19 @@ from urllib.parse import quote
 import pytest
 import yaml
 
+from tests.scripts.test_dependabot_automerge import (
+    BASE,
+    HEAD,
+    PREFIX,
+    ROOT,
+    run_cli,
+    set_changed_files,
+    set_git_files,
+)
 from tests.scripts.test_dependabot_automerge import api as api
 from tests.scripts.test_dependabot_automerge import evaluate_fixture as evaluate_fixture
 from tests.scripts.test_dependabot_automerge import expanded_update as expanded_update
 from tests.scripts.test_dependabot_automerge import policy_module as policy_module
-from tests.scripts.test_dependabot_automerge import run_cli, set_changed_files
 
 pytestmark = pytest.mark.parametrize("expanded_update", ["npm"], indirect=True)
 
@@ -354,6 +362,9 @@ def test_peer_context_changes_with_compatible_upgrades(evaluate_fixture, specifi
         files = list(api["files"]["web/package.json"])
         files[index] = json.dumps(manifest)
         api["files"]["web/package.json"] = tuple(files)
+    if specifier == "catalog:":
+        workspace = "packages: [web]\ncatalog: {consumer: 1.0.0}\n"
+        api["files"]["pnpm-workspace.yaml"] = (workspace, workspace)
     save_locks(api, before, after)
     assert evaluate()["packages"] == ["clsx==2.1.1", "picocolors==1.1.0"]
 
@@ -375,15 +386,72 @@ def test_multiple_removed_and_added_versions_pair_in_order(evaluate_fixture):
     }
 
 
-@pytest.mark.parametrize("name", ["pdfjs-dist", "react-pdf", "@openai/codex", "electron"])
-@pytest.mark.parametrize("direction", ["added", "removed"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "pdfjs-dist",
+        "react-pdf",
+        "@openai/codex",
+        "electron",
+        "electron-builder",
+        "electron-builder-squirrel-windows",
+        "dmg-builder",
+        "electron-updater",
+        "electron-winstaller",
+        "electron-publish",
+        "app-builder-lib",
+        "app-builder-bin",
+        "builder-util",
+        "builder-util-runtime",
+        "@vscode/vsce",
+        "@vscode/vsce-sign",
+        "wrangler",
+        "katex",
+        "shiki",
+        "@shikijs/core",
+        "vite",
+        "tailwindcss",
+        "@tailwindcss/vite",
+        "@tailwindcss/node",
+        "@tailwindcss/postcss",
+    ],
+)
+def test_manual_package_patterns_require_review(policy_module, expanded_update, name):
+    from tests.scripts.test_dependabot_automerge import ROOT
+
+    policy = json.loads((ROOT / ".github/dependabot-automerge.json").read_text())["npm"]
+    with pytest.raises(policy_module.NeedsReview, match=f"{name} requires human review"):
+        policy_module.require_package(name, policy)
+
+
+@pytest.mark.parametrize(
+    "name", ["@openai/codex", "electron-updater", "wrangler", "@shikijs/core"]
+)
+@pytest.mark.parametrize("direction", ["added", "removed", "direct"])
 def test_sensitive_transitives_stay_manual(evaluate_fixture, policy_module, name, direction):
     api, evaluate = evaluate_fixture
-    before, after = graph_update(api)
-    target, pin = (before, "2.1.0") if direction == "removed" else (after, "2.1.1")
-    add_package(api, target, name, "1.0.0")
-    target["snapshots"][f"clsx@{pin}"]["dependencies"][name] = "1.0.0"
-    save_locks(api, before, after)
+    if direction == "direct":
+        api["files"] = {
+            path: tuple(
+                yaml.safe_dump(json.loads(json.dumps(yaml.safe_load(text)).replace("clsx", name)))
+                if path.endswith(".yaml")
+                else text.replace("clsx", name)
+                for text in pair
+            )
+            for path, pair in api["files"].items()
+        }
+        api["registry"] = {
+            url.replace("clsx", quote(name, safe="")): json.loads(
+                json.dumps(metadata).replace("clsx", name)
+            )
+            for url, metadata in api["registry"].items()
+        }
+    else:
+        before, after = graph_update(api)
+        target, pin = (before, "2.1.0") if direction == "removed" else (after, "2.1.1")
+        add_package(api, target, name, "1.0.0")
+        target["snapshots"][f"clsx@{pin}"]["dependencies"][name] = "1.0.0"
+        save_locks(api, before, after)
     with pytest.raises(policy_module.NeedsReview, match="human review"):
         evaluate()
 
@@ -405,7 +473,7 @@ def test_ordinary_minor_updates_use_the_parent_default_policy(evaluate_fixture):
     assert evaluate()["packages"] == ["ordinary-web-library==2.2.0"]
 
 
-@pytest.mark.parametrize("consumer", ["web/electron", "editors/vscode", "."])
+@pytest.mark.parametrize("consumer", [".github/ci-deps", "uncovered/workspace", "."])
 @pytest.mark.parametrize("section", ["dependencies", "optionalDependencies"])
 def test_shared_transitive_changes_need_non_web_coverage(
     evaluate_fixture, policy_module, consumer, section
@@ -439,21 +507,28 @@ def test_web_can_upgrade_without_changing_another_consumers_old_version(evaluate
 @pytest.mark.parametrize(
     "selector",
     [
-        "picocolors",
         "picocolors@>=1.0.0 <2.0.0",
         "clsx>picocolors",
         "clsx>unchanged-child",
         "clsx@>=2>unchanged-child",
     ],
 )
+@pytest.mark.parametrize("changed", [False, True])
 def test_transitive_compatibility_overrides_remain_manual(
-    evaluate_fixture, policy_module, selector
+    evaluate_fixture, policy_module, selector, changed
 ):
     api, evaluate = evaluate_fixture
-    save_locks(api, *graph_update(api))
-    workspace = yaml.safe_dump({"packages": ["web"], "overrides": {selector: "1.1.0"}})
-    api["files"]["pnpm-workspace.yaml"] = (workspace, workspace)
-    with pytest.raises(policy_module.NeedsReview, match="compatibility override"):
+    locks = graph_update(api)
+    workspaces = []
+    for index, lock in enumerate(locks):
+        override = {selector: "1.1.1" if changed and index else "1.1.0"}
+        lock["overrides"] = override
+        workspaces.append(yaml.safe_dump({"packages": ["web"], "overrides": override}))
+    save_locks(api, *locks)
+    api["files"]["pnpm-workspace.yaml"] = tuple(workspaces)
+    with pytest.raises(
+        policy_module.NeedsReview, match="a compatibility override requires review"
+    ):
         evaluate()
 
 
@@ -509,3 +584,295 @@ def test_added_transitive_versions_must_pass_merge_advisory_inventory(
     assert any(call[:2] == ["pr", "merge"] for call in calls) == (inventory == "complete"), (
         process.stdout
     )
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    [
+        "web/electron",
+        "editors/vscode",
+        "sdks/web-extension",
+        "examples/extensions/hello-page/web",
+        "deploy/cloudflare",
+        "shared",
+    ],
+)
+@pytest.mark.parametrize("fault", [None, "scripts"])
+def test_shared_workspace_update_requires_consuming_steps(
+    evaluate_fixture, policy_module, consumer, fault
+):
+    api, evaluate = evaluate_fixture
+    before, after = (yaml.safe_load(text) for text in api["files"]["pnpm-lock.yaml"])
+    consumers = ["web/electron", "editors/vscode"] if consumer == "shared" else [consumer]
+    for importer in consumers:
+        for lock in (before, after):
+            lock["importers"][importer] = copy.deepcopy(lock["importers"]["web"])
+        api["files"][f"{importer}/package.json"] = api["files"]["web/package.json"]
+    if fault == "scripts":
+        old_manifest, new_manifest = api["files"][f"{consumers[0]}/package.json"]
+        changed = json.loads(new_manifest)
+        changed["scripts"] = {"postinstall": "arbitrary-command"}
+        api["files"][f"{consumers[0]}/package.json"] = old_manifest, json.dumps(changed)
+    save_locks(api, before, after)
+    if fault:
+        with pytest.raises(
+            policy_module.NeedsReview, match="manifest scripts or other settings changed"
+        ):
+            evaluate()
+        return
+    result = evaluate()
+    assert result["packages"] == ["clsx==2.1.1"]
+    expected = (
+        [
+            {"workflow": "docker-build.yml", "job": "Docker build", "step": step}
+            for step in (
+                "Cloudflare Worker and container dry-run",
+                "Build and smoke-test the Cloudflare image",
+            )
+        ]
+        if consumer == "deploy/cloudflare"
+        else [
+            {
+                "workflow": "web-tests.yml",
+                "job": "web test",
+                "step": "Test and build workspace consumers",
+            }
+        ]
+    )
+    assert result["consumer_steps"] == expected
+    assert all(step["workflow"] in result["workflows"] for step in expected)
+
+
+@pytest.mark.parametrize("catalog", ["", "build"])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "settings",
+        "major",
+        "downgrade",
+        "lock_mismatch",
+        "override",
+        "override_lock_mismatch",
+        "integrity",
+        "source",
+        "young",
+    ],
+)
+def test_catalog_and_override_pins_preserve_workspace_policy(
+    evaluate_fixture, policy_module, catalog, fault
+):
+    api, evaluate = evaluate_fixture
+    locks = [yaml.safe_load(text) for text in api["files"]["pnpm-lock.yaml"]]
+    workspaces = []
+    for lock, pin in zip(locks, ["2.1.0", "2.1.1"], strict=True):
+        entries = {"clsx": pin}
+        workspace = {"packages": ["web"], "overrides": {"clsx": "catalog:" + catalog}}
+        workspace.update({"catalogs": {catalog: entries}} if catalog else {"catalog": entries})
+        lock["overrides"] = entries.copy()
+        lock["catalogs"] = {catalog or "default": {"clsx": {"specifier": pin, "version": pin}}}
+        lock["importers"]["web"]["dependencies"]["clsx"]["specifier"] = "catalog:" + catalog
+        workspaces.append(workspace)
+    if fault == "settings":
+        workspaces[1]["minimumReleaseAge"] = 0
+    elif fault in {"major", "downgrade"}:
+        entries = workspaces[1]["catalogs"][catalog] if catalog else workspaces[1]["catalog"]
+        entries["clsx"] = "3.0.0" if fault == "major" else "2.0.0"
+    elif fault == "lock_mismatch":
+        locks[1]["catalogs"][catalog or "default"]["clsx"]["specifier"] = "2.1.0"
+    elif fault in {"override", "override_lock_mismatch"}:
+        workspaces[1]["overrides"]["clsx"] = "^2.1.1" if fault == "override" else "2.1.2"
+    elif fault in {"integrity", "source", "young"}:
+        metadata = api["registry"]["https://registry.npmjs.org/clsx"]
+        if fault == "young":
+            metadata["time"]["2.1.1"] = "2100-01-01T00:00:00Z"
+        else:
+            key = "integrity" if fault == "integrity" else "tarball"
+            metadata["versions"]["2.1.1"]["dist"][key] = "untrusted"
+    api["files"]["pnpm-workspace.yaml"] = tuple(
+        yaml.safe_dump(workspace) for workspace in workspaces
+    )
+    manifest = json.dumps({"dependencies": {"clsx": "catalog:" + catalog}})
+    api["files"]["web/package.json"] = (manifest, manifest)
+    save_locks(api, *locks)
+    if fault:
+        reason = {
+            "settings": "pnpm settings changed",
+            "major": "Major updates require review",
+            "downgrade": "Not an upgrade",
+            "lock_mismatch": "catalog/lock mismatch",
+            "override": "npm version requirement shape changed",
+            "override_lock_mismatch": "compatibility override/lock mismatch",
+            "integrity": "npm integrity or source mismatch",
+            "source": "npm integrity or source mismatch",
+            "young": "cooldown",
+        }[fault]
+        with pytest.raises(policy_module.NeedsReview, match=reason):
+            evaluate()
+    else:
+        assert evaluate()["packages"] == ["clsx==2.1.1"]
+
+
+@pytest.mark.parametrize("prefix", ["", "^"])
+def test_simple_override_bump_preserves_ordinary_update_policy(evaluate_fixture, prefix):
+    api, evaluate = evaluate_fixture
+    locks = [yaml.safe_load(text) for text in api["files"]["pnpm-lock.yaml"]]
+    workspaces = []
+    for lock, pin in zip(locks, ["2.1.0", "2.1.1"], strict=True):
+        lock["overrides"] = {"clsx": prefix + pin}
+        workspaces.append(yaml.safe_dump({"packages": ["web"], "overrides": lock["overrides"]}))
+    api["files"]["pnpm-workspace.yaml"] = tuple(workspaces)
+    save_locks(api, *locks)
+    assert evaluate()["packages"] == ["clsx==2.1.1"]
+
+
+@pytest.mark.parametrize("section", ["catalog", "overrides"])
+@pytest.mark.parametrize("value", [None, 211, ["2.1.1"], {"version": "2.1.1"}])
+def test_malformed_workspace_value_does_not_abort_later_prs(
+    tmp_path, expanded_update, section, value
+):
+    _, api = expanded_update
+    valid_files = copy.deepcopy(api["files"])
+    workspace = yaml.safe_dump({"packages": ["web"], section: {"clsx": "^2.1.0"}})
+    valid_files["pnpm-workspace.yaml"] = workspace, workspace
+    if section == "overrides":
+        valid_files["pnpm-lock.yaml"] = tuple(
+            yaml.safe_dump({**yaml.safe_load(text), "overrides": {"clsx": "^2.1.0"}})
+            for text in valid_files["pnpm-lock.yaml"]
+        )
+    malformed = copy.deepcopy(valid_files)
+    malformed["pnpm-workspace.yaml"] = (
+        workspace,
+        yaml.safe_dump({"packages": ["web"], section: {"clsx": value}}),
+    )
+    bad_head = "d" * 40
+    pull = copy.deepcopy(api["routes"][f"{PREFIX}/pulls/123"])
+    pull.update(number=124)
+    pull["head"]["sha"] = bad_head
+    api["routes"][f"{PREFIX}/pulls/124"] = pull
+    api["routes"][f"{PREFIX}/pulls/124/reviews?per_page=100&page=1"] = []
+    api["routes"][f"{PREFIX}/compare/{BASE}...{bad_head}"] = {"merge_base_commit": {"sha": BASE}}
+    set_changed_files(api, malformed, number=124, head=bad_head)
+    set_changed_files(api, valid_files)
+    api["pulls"] = [{"number": 124}, {"number": 123}]
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert (
+        "#124: human review or retry required: clsx: npm requirement must be a string"
+        in process.stdout
+    )
+    assert any(call[:3] == ["pr", "merge", "123"] for call in calls), process.stdout
+
+
+@pytest.mark.parametrize("specifier", ["^2.1.0", "~2.1.0", "2.1.1", "~2.0.0"])
+def test_unchanged_simple_overrides_allow_compatible_resolutions(
+    evaluate_fixture, policy_module, specifier
+):
+    api, evaluate = evaluate_fixture
+    before, after = (yaml.safe_load(text) for text in api["files"]["pnpm-lock.yaml"])
+    for lock in (before, after):
+        lock["overrides"] = {"clsx": specifier}
+    workspace = yaml.safe_dump({"packages": ["web"], "overrides": {"clsx": specifier}})
+    api["files"]["pnpm-workspace.yaml"] = (workspace, workspace)
+    save_locks(api, before, after)
+    if specifier == "~2.0.0":
+        with pytest.raises(
+            policy_module.NeedsReview, match="resolution violates compatibility override"
+        ):
+            evaluate()
+    else:
+        assert evaluate()["packages"] == ["clsx==2.1.1"]
+
+
+@pytest.mark.parametrize("conclusion", ["success", "skipped", "failure", "missing"])
+@pytest.mark.parametrize("stale", [False, True])
+def test_shared_update_through_worker_checks_executed_consumer_step(
+    tmp_path, expanded_update, conclusion, stale
+):
+    _ecosystem, api = expanded_update
+    before, after = (yaml.safe_load(text) for text in api["files"]["pnpm-lock.yaml"])
+    consumer = "editors/vscode"
+    for lock in (before, after):
+        lock["importers"][consumer] = copy.deepcopy(lock["importers"]["web"])
+    api["files"][f"{consumer}/package.json"] = api["files"]["web/package.json"]
+    save_locks(api, before, after)
+    if stale:
+        for name in ("web-tests.yml", "security-gate.yml"):
+            path = f".github/workflows/{name}"
+            workflow = (ROOT / path).read_text()
+            api["files"][path] = workflow, workflow
+    set_changed_files(api, api["files"])
+    jobs = api["routes"]["repos/example/project/actions/runs/16/jobs?per_page=100&page=1"]["jobs"]
+    job = next(job for job in jobs if job["name"] == "web test")
+    if conclusion != "missing":
+        job["steps"] = [{"name": "Test and build workspace consumers", "conclusion": conclusion}]
+    if stale:
+        tip = "c" * 40
+        set_git_files(api, tip, {path: pair[0] for path, pair in api["files"].items()})
+        api["routes"][f"{PREFIX}/git/ref/heads/main"]["object"]["sha"] = tip
+        api["routes"][f"{PREFIX}/compare/{tip}...{HEAD}"] = {"merge_base_commit": {"sha": BASE}}
+        api["routes"][f"{PREFIX}/pulls/123"]["commits"] = 1
+        api["routes"][f"{PREFIX}/pulls/123/commits?per_page=100&page=1"] = [
+            {"sha": HEAD, "parents": [{"sha": BASE}]}
+        ]
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert any(call[:2] == ["pr", "merge"] for call in calls) == (
+        conclusion == "success" and not stale
+    ), process.stdout
+    assert any(call[:3] == ["api", "--method", "PUT"] for call in calls) == (
+        conclusion == "success" and stale
+    ), process.stdout
+    if conclusion != "success":
+        assert (
+            "waiting for executed consumer step Test and build workspace consumers"
+            in process.stdout
+        )
+
+
+@pytest.mark.parametrize(
+    "pin,spec,expected",
+    [
+        ("0.2.4", "^0.2.3", True),
+        ("0.3.0", "^0.2.3", False),
+        ("0.0.3", "^0.0.3", True),
+        ("0.0.4", "^0.0.3", False),
+        ("1.2.9", "~1.2.3", True),
+        ("1.3.0", "~1.2.3", False),
+        ("1.2.2", "~1.2.3", False),
+    ],
+)
+def test_npm_range_boundaries(policy_module, expanded_update, pin, spec, expected):
+    assert policy_module.npm_satisfies(pin, spec) is expected
+
+
+@pytest.mark.parametrize(
+    "workspace,spec,reason",
+    [
+        ({"catalogs": []}, "catalog:build", "pnpm catalogs must be an object"),
+        ({"catalog": None}, "catalog:", "pnpm catalog must be an object"),
+        ({"catalogs": {"build": []}}, "catalog:build", "pnpm catalog must be an object"),
+        ({"catalog": {"clsx": None}}, "catalog:", "npm requirement must be a string"),
+    ],
+)
+def test_catalog_reference_shapes_fail_closed(
+    policy_module, expanded_update, workspace, spec, reason
+):
+    with pytest.raises(policy_module.NeedsReview, match=reason):
+        policy_module.npm_specifier("clsx", spec, workspace)
+
+
+@pytest.mark.parametrize("specifier", [">=1.0.0", "workspace:*"])
+def test_unsupported_catalog_requirements_need_review(evaluate_fixture, policy_module, specifier):
+    api, evaluate = evaluate_fixture
+    locks = [yaml.safe_load(text) for text in api["files"]["pnpm-lock.yaml"]]
+    for lock in locks:
+        add_package(api, lock, "legacy-catalog", "1.0.0")
+        lock["catalogs"] = {
+            "default": {"legacy-catalog": {"specifier": specifier, "version": "1.0.0"}}
+        }
+    workspace = yaml.safe_dump({"packages": ["web"], "catalog": {"legacy-catalog": specifier}})
+    api["files"]["pnpm-workspace.yaml"] = (workspace, workspace)
+    save_locks(api, *locks)
+    with pytest.raises(policy_module.NeedsReview, match="Unsupported npm requirement"):
+        evaluate()

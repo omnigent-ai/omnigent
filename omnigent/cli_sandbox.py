@@ -3,9 +3,8 @@
 ``omnigent sandbox …`` bootstraps an Omnigent host inside a sandbox
 from one of the registered providers (``--provider``) so that sessions
 on it are reachable from the server-hosted UI, TUI, and ``omnigent
-resume``. Provider availability is build-dependent — the Databricks
-Lakebox launcher ships only internally — so cli.py registers this group
-only when at least one provider is available.
+resume``. Provider availability depends on the build, so cli.py registers this
+group only when at least one provider is available.
 
 The provider-agnostic step implementations live in
 :mod:`omnigent.onboarding.sandboxes`.
@@ -424,8 +423,7 @@ def sandbox_connect(
     )
 
 
-# Internal lakebox alias — hidden from the top-level --help pending
-# removal; still fully invocable.
+# Hidden lakebox alias; still fully invocable.
 @click.group("lakebox", hidden=True)
 @click.pass_context
 def lakebox(ctx: click.Context) -> None:
