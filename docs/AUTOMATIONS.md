@@ -202,7 +202,7 @@ Switching to `execution_target: "managed_sandbox"` clears both stored pins. Omit
 | `POST` | `/v1/scheduled-tasks/{id}/run` | Run now (202). |
 | `GET` | `/v1/scheduled-tasks/{id}/runs` | Run history. |
 
-A create request may also set `first_run_at` (epoch seconds) when the server advertises `scheduled_task_one_time`: the task is then created only if its first run, computed from its actual creation time in the same write, falls at that moment, and the request otherwise fails with a 400 and saves nothing. Other servers reject the field.
+A create request may also set `first_run_at` (epoch seconds) when the server advertises `scheduled_task_one_time`: the task is then created only if its first run, computed from the task's recorded creation timestamp and checked in the same write, falls at that moment, and the request otherwise fails with a 400 and saves nothing. Other servers reject the field.
 
 A task response carries `id`, `name`, `prompt`, `rrule`, `owner_user_id`, `agent_id`, `timezone`, `created_at`, `model_override`, `reasoning_effort`, `permission_mode`, `max_cost_usd`, `session_mode`, `session_id`, `source_session_id`, `workspace`, `host_id`, `execution_target`, `project_id`, `state`, `last_run_at`, `last_run_status`, `last_run_conversation_id`, `next_run_at`, and `updated_at`.
 

@@ -130,7 +130,7 @@ class ScheduledTaskStore(ABC):
         :param delegation_ref: Names the authorization grant a deployment uses to
             act as the owner when the task fires; never a credential.
         :param first_run_at: Epoch seconds the first run must fall at, checked
-            against the schedule computed from the task's actual creation time, in
+            against the schedule computed from the task's recorded creation timestamp, in
             the same write. ``None`` skips the check.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ScheduledTaskFirstRunMismatchError: If ``first_run_at`` is set and

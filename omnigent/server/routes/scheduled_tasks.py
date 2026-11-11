@@ -141,8 +141,9 @@ class CreateScheduledTaskRequest(BaseModel):
     # session from that copy; responses carry the copy's id here.
     source_session_id: str | None = Field(default=None, min_length=1)
     # Epoch seconds the first run must fall at, checked against the schedule the
-    # task gets at its actual creation. A one-time reminder sends it so a request
-    # that arrives late is refused instead of moving to the rule's next match.
+    # task gets from its recorded creation timestamp. A one-time reminder sends it
+    # so a request that arrives late is refused instead of moving to the rule's
+    # next match.
     first_run_at: int | None = Field(default=None, gt=0, le=_MAX_FIRST_RUN_AT)
 
     @model_validator(mode="after")
