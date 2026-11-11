@@ -1,6 +1,6 @@
-// Types of the objects preload.js exposes with contextBridge (types only). The web
-// imports them with `import type` and makes every member optional for older shells;
-// here a member is optional only when the current preload adds it conditionally.
+// Types of the objects the preloads expose to their pages with contextBridge (types only).
+// The web imports them with `import type` and makes the main-window bridge's members optional
+// for older shells; here a member is optional only when the current preload adds it conditionally.
 
 /** Unsubscribes a bridge listener. */
 export type Unsubscribe = () => void;
@@ -742,4 +742,196 @@ export interface ElectronSetupBridge {
 export interface ElectronMainWindowBridges {
   omnigentDesktop: ElectronDesktopBridge;
   omnigentSetup: ElectronSetupBridge;
+}
+
+/** Theme the shell resolved for a bundled page. */
+export type ResolvedTheme = "light" | "dark";
+
+/** `omnigentDesktop.updates` in the update overlay: full status, update notices included. */
+export interface ElectronUpdateOverlayUpdatesBridge {
+  getConfig: () => Promise<UpdateConfig>;
+  getStatus: () => Promise<UpdateStatus>;
+  check: () => Promise<void>;
+  download: () => Promise<void>;
+  installNow: () => Promise<void>;
+  setConfig: (patch: Partial<UpdateConfig>) => Promise<UpdateConfig>;
+  onStatus: (callback: (status: UpdateStatus) => void) => Unsubscribe;
+}
+
+/** Each global update_overlay_preload exposes, and its bridge. */
+export interface ElectronUpdateOverlayBridges {
+  /** The shape the web `updateBridge()` reads, so the reused banner works unchanged. */
+  omnigentDesktop: { kind: "electron"; updates: ElectronUpdateOverlayUpdatesBridge };
+  omnigentUpdateOverlay: {
+    /** Report the card height in pixels; 0 hides the overlay. */
+    reportHeight: (height: number) => void;
+    onTheme: (callback: (theme: ResolvedTheme) => void) => Unsubscribe;
+  };
+}
+
+/** What the About page shows. */
+export interface AboutInfo {
+  desktopVersion: string;
+  platformName: string;
+  /** PNG data URL of the app icon, or null when none could be read. */
+  appIconDataUrl: string | null;
+  cli: CliStatus;
+}
+
+/** `window.omnigentAbout`: the bundled About window's bridge. */
+export interface ElectronAboutBridge {
+  getInfo: () => Promise<AboutInfo>;
+  getDesktopUpdateStatus: () => Promise<UpdateStatus>;
+  /** Check now; resolves the status after the check. */
+  checkDesktopUpdates: () => Promise<UpdateStatus>;
+  downloadDesktopUpdate: () => Promise<void>;
+  installDesktopUpdate: () => Promise<void>;
+  onDesktopUpdateStatus: (callback: (status: UpdateStatus) => void) => Unsubscribe;
+  close: () => void;
+}
+
+/** The user's answer to a permission request; "dismiss" grants nothing and keeps the site undecided. */
+export type BrowserPermissionChoice = "allow-once" | "always-allow" | "deny" | "dismiss";
+
+/** The request the permission prompt describes. */
+export interface BrowserPermissionInfo {
+  origin: string;
+  /** Whether allowing reloads the page. */
+  reload: boolean;
+}
+
+/** `window.omnigentBrowserPermission`: the permission prompt's bridge. */
+export interface ElectronBrowserPermissionBridge {
+  getInfo: () => Promise<BrowserPermissionInfo>;
+  choose: (choice: BrowserPermissionChoice) => Promise<void>;
+}
+
+/** Find-in-page match counts. */
+export interface FindResult {
+  active: number;
+  matches: number;
+}
+
+export interface FindQueryOptions {
+  /** Search forward (the default). */
+  forward?: boolean;
+  /** Step through matches of the current query instead of starting over. */
+  findNext?: boolean;
+}
+
+/** `window.omnigentFind`: the find bar's bridge. Its listeners cannot be removed. */
+export interface ElectronFindBridge {
+  /** Run or continue a search; empty text clears the highlight. */
+  query: (text: string, opts?: FindQueryOptions) => void;
+  close: () => void;
+  onResult: (callback: (result: FindResult) => void) => void;
+  /** Cmd/Ctrl+F re-activated the open bar. */
+  onActivate: (callback: () => void) => void;
+}
+
+/** `window.omnigentReconnectOverlay`. */
+export interface ElectronReconnectOverlayBridge {
+  /** Stop reconnecting and return the window to the setup page. */
+  cancel: () => void;
+}
+
+/** `window.omnigentReturnBanner`. */
+export interface ElectronReturnBannerBridge {
+  /** Navigate the parent window back to the remembered server URL. */
+  goBack: () => void;
+  /** Hide the banner without navigating. */
+  dismiss: () => void;
+}
+
+/** One workspace the account can sign in to. */
+export interface WorkspaceChoice {
+  workspaceId: string;
+  name: string;
+  fqdn: string;
+}
+
+/** `window.workspacePicker`: the workspace picker modal's bridge. */
+export interface ElectronWorkspacePickerBridge {
+  list: () => Promise<WorkspaceChoice[]>;
+  choose: (workspaceId: string) => void;
+  cancel: () => void;
+}
+
+/** The rendered size a connect console reports so the shell can fit its window. */
+export interface ConsoleContentSize {
+  height: number;
+  /** The page's current phase, as the page names it. */
+  phase?: string | undefined;
+}
+
+/** How a connect console's run ended. */
+export interface ConsoleDone {
+  ok: boolean;
+  error: string | null;
+}
+
+export interface ArcaConnectInit {
+  serverUrl: string;
+  command: string;
+  /** Why the console opened (e.g. a preview reconnect), or null. */
+  reason: string | null;
+}
+
+export interface ArcaConnectStarted {
+  /** Whether this command is the sign-in that precedes connecting. */
+  login: boolean;
+  command: string;
+}
+
+/** `window.arcaConnect`: the Arca connect console's bridge. Its listeners cannot be removed. */
+export interface ElectronArcaConnectBridge {
+  confirm: () => void;
+  cancel: () => void;
+  resizeToContent: (size: ConsoleContentSize) => void;
+  onInit: (callback: (init: ArcaConnectInit) => void) => void;
+  onStarted: (callback: (started: ArcaConnectStarted) => void) => void;
+  /** A chunk of live stdout/stderr. */
+  onOutput: (callback: (text: string) => void) => void;
+  onDone: (callback: (done: ConsoleDone) => void) => void;
+}
+
+export interface SshConnectInit {
+  serverUrl: string;
+  destination: string;
+  commands: string[];
+}
+
+export interface SshConnectStatus {
+  step: string;
+  code?: string;
+}
+
+export interface SshConnectPrompt {
+  id: number;
+  /** confirm, secret, text or install. */
+  kind: string;
+  text: string;
+}
+
+/** An answer to a prompt, or `cancel: true` to decline it. */
+export interface SshConnectAnswer {
+  id: number;
+  answer?: string;
+  cancel?: boolean;
+}
+
+/** `window.sshConnect`: the SSH connect console's bridge. Its listeners cannot be removed. */
+export interface ElectronSshConnectBridge {
+  confirm: () => void;
+  cancel: () => void;
+  answer: (payload: SshConnectAnswer) => void;
+  resizeToContent: (size: ConsoleContentSize) => void;
+  onInit: (callback: (init: SshConnectInit) => void) => void;
+  onStarted: (callback: (started: Record<string, never>) => void) => void;
+  onStatus: (callback: (status: SshConnectStatus) => void) => void;
+  onPrompt: (callback: (prompt: SshConnectPrompt) => void) => void;
+  /** ssh stopped waiting for that prompt's answer. */
+  onPromptClosed: (callback: (closed: { id: number }) => void) => void;
+  onOutput: (callback: (text: string) => void) => void;
+  onDone: (callback: (done: ConsoleDone) => void) => void;
 }

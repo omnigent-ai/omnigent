@@ -1,5 +1,3 @@
-"use strict";
-
 /**
  * Preload for the SHELL-OWNED Arca connect console (arca-connect/index.html).
  * Deliberately narrow: the page can confirm/cancel its own flow and receive
@@ -8,26 +6,33 @@
  * carry the minimum possible capability.
  */
 
-const { contextBridge, ipcRenderer } = require("electron");
+import { contextBridge, ipcRenderer } from "electron";
+import type { ElectronArcaConnectBridge } from "./ipc/bridge.ts";
+import { createRendererIpc } from "./ipc/renderer.ts";
 
-/** Subscribe to a main→console channel, passing the payload through. */
-function on(channel, callback) {
-  ipcRenderer.on(channel, (_event, payload) => callback(payload));
-}
+const ipc = createRendererIpc(ipcRenderer);
 
 contextBridge.exposeInMainWorld("arcaConnect", {
   /** The user confirmed — run the command. Accepted only from this window. */
-  confirm: () => ipcRenderer.send("arca-connect:confirm"),
+  confirm: () => ipc.send("arca-connect:confirm"),
   /** Cancel / close the console (kills a mid-run command). */
-  cancel: () => ipcRenderer.send("arca-connect:cancel"),
+  cancel: () => ipc.send("arca-connect:cancel"),
   /** Resize the shell-owned window to the rendered page, within main-owned bounds. */
-  resizeToContent: (size) => ipcRenderer.send("arca-connect:resize", size),
+  resizeToContent: (size) => ipc.send("arca-connect:resize", size),
   /** `{ serverUrl, command }` once the flow is ready. */
-  onInit: (callback) => on("arca-connect:init", callback),
+  onInit: (callback) => {
+    ipc.on("arca-connect:init", (payload) => callback(payload));
+  },
   /** `{ login, command }` when a command was spawned. */
-  onStarted: (callback) => on("arca-connect:started", callback),
+  onStarted: (callback) => {
+    ipc.on("arca-connect:started", (payload) => callback(payload));
+  },
   /** A chunk of live stdout/stderr. */
-  onOutput: (callback) => on("arca-connect:output", callback),
+  onOutput: (callback) => {
+    ipc.on("arca-connect:output", (payload) => callback(payload));
+  },
   /** `{ ok, error }` once the connect, and any sign-in it needed, finishes. */
-  onDone: (callback) => on("arca-connect:done", callback),
-});
+  onDone: (callback) => {
+    ipc.on("arca-connect:done", (payload) => callback(payload));
+  },
+} satisfies ElectronArcaConnectBridge);

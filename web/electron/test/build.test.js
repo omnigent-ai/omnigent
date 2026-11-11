@@ -85,16 +85,17 @@ it("bundled main-process code applies test overrides only in an unpackaged app",
 });
 
 it("bundles each preload as one file that requires only electron", async (t) => {
-  const { bundlePreload, listPreloadFiles } = await import("../scripts/build.mjs");
+  const { bundlePreload, listPreloadFiles, preloadBundleName } =
+    await import("../scripts/build.mjs");
   const outDir = temporaryOutDir(t);
   const preloadFiles = await listPreloadFiles();
-  assert.ok(preloadFiles.includes("preload.js"));
-  assert.ok(preloadFiles.includes("find_preload.js"));
+  assert.ok(preloadFiles.includes("preload.ts"));
+  assert.ok(preloadFiles.includes("find_preload.ts"));
 
   for (const fileName of preloadFiles) {
     // oxlint-disable-next-line no-await-in-loop -- Builds share one output directory.
     await bundlePreload({ fileName, outDir });
-    const bundle = fs.readFileSync(path.join(outDir, fileName), "utf8");
+    const bundle = fs.readFileSync(path.join(outDir, preloadBundleName(fileName)), "utf8");
     const requires = new Set(
       [...bundle.matchAll(/\brequire\(\s*["'`]([^"'`]+)/g)].map((m) => m[1]),
     );
@@ -102,7 +103,23 @@ it("bundles each preload as one file that requires only electron", async (t) => 
       [...requires].every((specifier) => specifier === "electron"),
       fileName,
     );
+    // The sources are ES modules, so the CommonJS bundle must stay strict.
+    assert.ok(bundle.startsWith('"use strict";'), fileName);
   }
+  // paths.preloadPath and each window's webPreferences.preload load these names.
   const outputs = fs.readdirSync(outDir).filter((file) => file.endsWith(".js"));
-  assert.deepEqual(outputs.sort(), [...preloadFiles].sort());
+  assert.deepEqual(outputs.sort(), [
+    "about_preload.js",
+    "arca_connect_preload.js",
+    "browser_permission_preload.js",
+    "connection_loading_preload.js",
+    "find_preload.js",
+    "popup_preload.js",
+    "preload.js",
+    "reconnect_overlay_preload.js",
+    "return_banner_preload.js",
+    "ssh_connect_preload.js",
+    "update_overlay_preload.js",
+    "workspace_picker_preload.js",
+  ]);
 });

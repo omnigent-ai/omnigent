@@ -14,9 +14,9 @@ import { BUNDLE_DIR, PACKAGE_ROOT } from "../src/paths.ts";
 
 const SRC_DIR = path.join(PACKAGE_ROOT, "src");
 
-// Preload bundles keep their src/ file names (paths.preloadPath). The .js
-// files load as CommonJS only while package.json has no "type": "module".
-const PRELOAD_FILE = /(^|_)preload\.js$/;
+// Each src/<name>.ts preload bundles to app/<name>.js (paths.preloadPath). The
+// .js files load as CommonJS only while package.json has no "type": "module".
+const PRELOAD_FILE = /(^|_)preload\.ts$/;
 
 // Runtime dependencies stay in node_modules, so the packaged dependency set is unchanged.
 const RUNTIME_DEPENDENCIES = ["electron", "electron-updater", "js-yaml"];
@@ -43,9 +43,9 @@ function isExternal(id) {
  * One self-contained CommonJS file. No minification: injected-page script
  * builders stringify code that must reach the page unchanged.
  *
- * @param {{ entry: string, outDir: string, fileName: string, target: string, watch?: boolean }} options
+ * @param {{ entry: string, outDir: string, fileName: string, target: string, watch?: boolean, strict?: boolean | "auto" }} options
  */
-function bundleCommonJs({ entry, outDir, fileName, target, watch = false }) {
+function bundleCommonJs({ entry, outDir, fileName, target, watch = false, strict = "auto" }) {
   return build({
     configFile: false,
     root: PACKAGE_ROOT,
@@ -67,6 +67,7 @@ function bundleCommonJs({ entry, outDir, fileName, target, watch = false }) {
           format: "cjs",
           entryFileNames: fileName,
           codeSplitting: false,
+          strict,
         },
       },
     },
@@ -88,8 +89,17 @@ export async function listPreloadFiles() {
 }
 
 /**
+ * The bundle a preload entry builds to.
+ *
+ * @param {string} fileName Preload entry file name in src/.
+ */
+export function preloadBundleName(fileName) {
+  return fileName.replace(PRELOAD_FILE, "$1preload.js");
+}
+
+/**
  * Bundle one preload. A sandboxed preload can only require("electron"), never
- * a shared chunk, so each preload is its own build.
+ * a shared chunk, so each preload is its own build with shared code inlined.
  *
  * @param {{ fileName: string, outDir: string, watch?: boolean }} options
  */
@@ -97,9 +107,11 @@ export function bundlePreload({ fileName, outDir, watch = false }) {
   return bundleCommonJs({
     entry: path.join(SRC_DIR, fileName),
     outDir,
-    fileName,
+    fileName: preloadBundleName(fileName),
     target: RENDERER_TARGET,
     watch,
+    // ES module sources are strict; keep the CommonJS bundle strict too.
+    strict: true,
   });
 }
 

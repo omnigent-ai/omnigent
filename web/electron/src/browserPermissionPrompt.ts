@@ -1,11 +1,11 @@
 import type { BrowserWindowConstructorOptions, Rectangle } from "electron";
 import { pathToFileURL } from "node:url";
+import type { BrowserPermissionChoice } from "./ipc/bridge.ts";
+
+export type { BrowserPermissionChoice };
 
 export const PROMPT_WIDTH = 380;
 export const PROMPT_HEIGHT = 250;
-
-/** The user's answer; "dismiss" grants nothing and keeps the site undecided. */
-export type BrowserPermissionChoice = "allow-once" | "always-allow" | "deny" | "dismiss";
 
 const CHOICES: ReadonlySet<string> = new Set(["allow-once", "always-allow", "deny", "dismiss"]);
 

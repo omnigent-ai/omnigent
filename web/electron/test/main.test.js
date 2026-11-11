@@ -26,7 +26,6 @@ const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
 
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
-const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 const setupSource = readFileSync(path.join(__dirname, "../setup/index.html"), "utf8");
 
 const wait = (ms = 10) =>
@@ -42,6 +41,17 @@ async function until(condition, label, deadline = Date.now() + 1000) {
   await until(condition, label, deadline);
 }
 const urlHelpers = require("../src/url.ts");
+const { bundledPreloadSource, runPreload } = require("./preloadHarness.ts");
+
+/** The main-window bridges, run from the bundled preload. */
+async function mainWindowBridges() {
+  const run = runPreload(await bundledPreloadSource("preload"));
+  return {
+    desktop: run.exposed.get("omnigentDesktop"),
+    setup: run.exposed.get("omnigentSetup"),
+    invokes: run.invokes,
+  };
+}
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
@@ -2734,11 +2744,12 @@ describe("browser permission wiring", () => {
 });
 
 describe("setup clipboard IPC wiring", () => {
-  it("exposes a narrow copy action through the setup bridge", () => {
-    assert.match(
-      preloadSource,
-      /copyText:\s*\(text\)\s*=>\s*ipcRenderer\.invoke\("omnigent:copy-setup-text",\s*text\)/,
-    );
+  it("exposes a narrow copy action through the setup bridge", async () => {
+    const { setup, invokes } = await mainWindowBridges();
+    await setup.copyText("https://host.example/ml/omnigents");
+    assert.deepEqual(invokes, [
+      { channel: "omnigent:copy-setup-text", args: ["https://host.example/ml/omnigents"] },
+    ]);
   });
 
   it("checks the setup-page sender before writing to the clipboard", () => {
@@ -2784,33 +2795,35 @@ describe("macOS activation wiring", () => {
 });
 
 describe("managed server preference wiring", () => {
-  it("exposes managed servers only through the setup-page bridge", () => {
-    assert.match(
-      preloadSource,
-      /getManagedServers:\s*\(\)\s*=>\s*ipcRenderer\.invoke\("omnigent:get-managed-servers"\)/,
-    );
+  it("exposes managed servers only through the setup-page bridge", async () => {
+    const { desktop, setup, invokes } = await mainWindowBridges();
+    assert.equal(desktop.getManagedServers, undefined);
+    await setup.getManagedServers();
+    assert.deepEqual(invokes, [{ channel: "omnigent:get-managed-servers", args: [] }]);
     assert.match(
       liveCode,
       /ipcMain\.handle\("omnigent:get-managed-servers"[\s\S]{0,180}!isSetupPageSender\(event\)[\s\S]{0,180}return managedServerUrls\(\)/,
     );
   });
 
-  it("offers the onboarding remote environment only behind the host picker's gate plus arca", () => {
-    assert.match(
-      preloadSource,
-      /getRunnerOptions:\s*\(url\)\s*=>\s*ipcRenderer\.invoke\("omnigent:get-runner-options",\s*url\)/,
-    );
+  it("offers the onboarding remote environment only behind the host picker's gate plus arca", async () => {
+    const { setup, invokes } = await mainWindowBridges();
+    await setup.getRunnerOptions("https://host.example/");
+    assert.deepEqual(invokes, [
+      { channel: "omnigent:get-runner-options", args: ["https://host.example/"] },
+    ]);
     assert.match(
       liveCode,
       /ipcMain\.handle\("omnigent:get-runner-options"[\s\S]{0,120}!isSetupPageSender\(event\)[\s\S]{0,200}typeof url === "string" &&\s*databricksInternalFeaturesEnabled\(\) &&\s*isDatabricksManagedServerUrl\(url\);\s*return \{ remote: internal && arca\.resolveArcaPath\(\) !== null, bundledCli: internal \}/,
     );
   });
 
-  it("wires the onboarding connect to the page, and signs in before connecting a laptop", () => {
-    assert.match(
-      preloadSource,
-      /connectRunner:\s*\(url, runner\)\s*=>\s*ipcRenderer\.invoke\("omnigent:connect-runner",\s*url,\s*runner\)/,
-    );
+  it("wires the onboarding connect to the page, and signs in before connecting a laptop", async () => {
+    const { setup, invokes } = await mainWindowBridges();
+    await setup.connectRunner("https://host.example/", "local");
+    assert.deepEqual(invokes, [
+      { channel: "omnigent:connect-runner", args: ["https://host.example/", "local"] },
+    ]);
     // The harness's host stubs can't observe this order; the remote path's
     // gates, opt-in and cancellation are exercised through the harness.
     const start = liveCode.indexOf('ipcMain.handle("omnigent:connect-runner"');
@@ -2823,11 +2836,10 @@ describe("managed server preference wiring", () => {
     );
   });
 
-  it("exposes the onboarding runner handoff to the page", () => {
-    assert.match(
-      preloadSource,
-      /takeOnboardingRunner:\s*\(\)\s*=>\s*ipcRenderer\.invoke\("omnigent:take-onboarding-runner"\)/,
-    );
+  it("exposes the onboarding runner handoff to the page", async () => {
+    const { desktop, invokes } = await mainWindowBridges();
+    await desktop.takeOnboardingRunner();
+    assert.deepEqual(invokes, [{ channel: "omnigent:take-onboarding-runner", args: [] }]);
   });
 
   it("preserves a managed path while still expanding bare workspace roots", () => {
@@ -3356,7 +3368,7 @@ describe("window-open policy wiring (src/main.js)", () => {
       [
         "Allowed popups no longer force preload: POPUP_PRELOAD + sandbox: true, so a child",
         "window can inherit the SHELL preload's IPC bridges while showing third-party",
-        "sign-in pages. Restore both overrides (see popup_preload.js).",
+        "sign-in pages. Restore both overrides (see popup_preload.ts).",
       ].join(" "),
     );
   });

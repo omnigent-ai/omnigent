@@ -1,68 +1,53 @@
-const { describe, it } = require("node:test");
+const { before, describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
-const vm = require("node:vm");
+const { bundledPreloadSource, runPreload } = require("./preloadHarness.ts");
 
-const PRELOAD = fs.readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
+let PRELOAD = "";
+before(async () => {
+  PRELOAD = await bundledPreloadSource("preload");
+});
 
 function loadPreload({ platform = "linux", fullScreen = false } = {}) {
-  const exposed = new Map();
-  const listeners = new Map();
   const windowListeners = new Map();
-  const invokes = [];
-  const sends = [];
   const attributes = new Set();
   let updateStatus = { state: "idle" };
-  const ipcRenderer = {
-    invoke: async (channel, args) => {
-      invokes.push({ channel, args });
+  const run = runPreload(PRELOAD, {
+    platform,
+    invoke: (channel) => {
       if (channel === "omnigent:get-update-status") return updateStatus;
       if (channel === "omnigent:is-full-screen") return fullScreen;
       return null;
     },
-    send: (channel, args) => sends.push({ channel, args }),
-    on: (channel, listener) => listeners.set(channel, listener),
-    removeListener: (channel, listener) => {
-      if (listeners.get(channel) === listener) listeners.delete(channel);
-    },
-  };
-  vm.runInNewContext(PRELOAD, {
-    console,
-    process: { platform },
-    document: {
-      documentElement: {
-        style: { setProperty: () => {} },
-        toggleAttribute: (name, force) => {
-          if (force) attributes.add(name);
-          else attributes.delete(name);
+    globals: {
+      document: {
+        documentElement: {
+          style: { setProperty: () => {} },
+          toggleAttribute: (name, force) => {
+            if (force) attributes.add(name);
+            else attributes.delete(name);
+          },
         },
       },
+      window: {
+        addEventListener: (name, listener) => windowListeners.set(name, listener),
+      },
     },
-    window: {
-      addEventListener: (name, listener) => windowListeners.set(name, listener),
-    },
-    require: (specifier) => {
-      assert.equal(specifier, "electron");
-      return {
-        contextBridge: { exposeInMainWorld: (name, value) => exposed.set(name, value) },
-        ipcRenderer,
-        webFrame: { getZoomFactor: () => 1 },
-        webUtils: { getPathForFile: (file) => file.path },
-      };
+    electron: {
+      webFrame: { getZoomFactor: () => 1 },
+      webUtils: { getPathForFile: (file) => file.path },
     },
   });
   return {
-    desktop: exposed.get("omnigentDesktop"),
+    desktop: run.exposed.get("omnigentDesktop"),
     setStatus: (status) => {
       updateStatus = status;
     },
-    emit: (channel, payload) => listeners.get(channel)?.({}, payload),
+    emit: run.emit,
     emitWindow: (name) => windowListeners.get(name)?.(),
     hasAttribute: (name) => attributes.has(name),
-    hasListener: (channel) => listeners.has(channel),
-    invokes,
-    sends,
+    hasListener: run.hasListener,
+    invokes: run.invokes,
+    sends: run.sends,
   };
 }
 
@@ -82,12 +67,15 @@ describe("local folder bridge", () => {
   it("forwards the folder chooser and resolves dropped file paths", async () => {
     const h = loadPreload();
     await h.desktop.chooseDirectory("/Users/me");
-    assert.deepEqual(h.invokes.at(-1), { channel: "omnigent:choose-directory", args: "/Users/me" });
+    assert.deepEqual(h.invokes.at(-1), {
+      channel: "omnigent:choose-directory",
+      args: ["/Users/me"],
+    });
     // main, not the preload, decides whether the page may see the path.
     await h.desktop.getPathForFile({ path: "/Users/me/app" });
     assert.deepEqual(h.invokes.at(-1), {
       channel: "omnigent:dropped-file-path",
-      args: "/Users/me/app",
+      args: ["/Users/me/app"],
     });
   });
 });
@@ -97,14 +85,17 @@ describe("browser action bridge", () => {
     const h = loadPreload();
     const params = { ref: 2, text: "hello" };
     await h.desktop.browserPerformAction("conversation", "type", params);
-    const { channel, args } = h.invokes.at(-1);
+    const {
+      channel,
+      args: [args],
+    } = h.invokes.at(-1);
     assert.equal(channel, "omnigent:browser-perform-action");
     assert.equal(args.conversationId, "conversation");
     assert.equal(args.action, "type");
     assert.deepEqual(args.params, params);
     await h.desktop.browserExecute("conversation", "legacy input");
     assert.equal(h.invokes.at(-1).channel, "omnigent:browser-execute");
-    assert.equal(h.invokes.at(-1).args.js, "legacy input");
+    assert.equal(h.invokes.at(-1).args[0].js, "legacy input");
   });
 });
 
@@ -156,7 +147,7 @@ describe("server-page update bridge", () => {
     assert.deepEqual(
       h.invokes
         .filter(({ channel }) => channel === "omnigent:browser-set-recent-session-switch-supported")
-        .map(({ args }) => args.supported),
+        .map(({ args }) => args[0].supported),
       [true, false],
     );
   });
@@ -178,7 +169,7 @@ describe("server-page update bridge", () => {
     assert.deepEqual(
       h.invokes
         .filter(({ channel }) => channel === "omnigent:browser-set-open-tab-supported")
-        .map(({ args }) => args.supported),
+        .map(({ args }) => args[0].supported),
       [true, false],
     );
   });
@@ -235,21 +226,21 @@ describe("desktop command bridge", () => {
     assert.deepEqual(JSON.parse(JSON.stringify(h.sends)), [
       {
         channel: "omnigent:set-desktop-command-state",
-        args: { commands: ["close", "3"], sessionPinned: false, sessionArchived: true },
+        args: [{ commands: ["close", "3"], sessionPinned: false, sessionArchived: true }],
       },
       {
         channel: "omnigent:set-desktop-command-state",
-        args: { commands: [], sessionPinned: false, sessionArchived: false },
+        args: [{ commands: [], sessionPinned: false, sessionArchived: false }],
       },
     ]);
 
     await h.desktop.closeWindow();
-    assert.deepEqual(h.invokes.at(-1), { channel: "omnigent:close-window", args: undefined });
+    assert.deepEqual(h.invokes.at(-1), { channel: "omnigent:close-window", args: [] });
 
     await h.desktop.confirmQuit({ dontAskAgain: "yes" });
     assert.deepEqual(JSON.parse(JSON.stringify(h.invokes.at(-1))), {
       channel: "omnigent:confirm-quit",
-      args: { dontAskAgain: false },
+      args: [{ dontAskAgain: false }],
     });
   });
 });
@@ -262,11 +253,11 @@ describe("browser view bridge", () => {
     assert.deepEqual(JSON.parse(JSON.stringify(h.invokes.slice(-2))), [
       {
         channel: "omnigent:browser-set-active",
-        args: { conversationId: "browser-tab:s:t", focus: false },
+        args: [{ conversationId: "browser-tab:s:t", focus: false }],
       },
       {
         channel: "omnigent:browser-set-active",
-        args: { conversationId: "browser-tab:s:t", focus: true },
+        args: [{ conversationId: "browser-tab:s:t", focus: true }],
       },
     ]);
   });
@@ -288,19 +279,18 @@ describe("global show shortcut bridge", () => {
     await h.desktop.setGlobalShortcut({ enabled: true, accelerator: "Control+Shift+K", extra: 1 });
     assert.deepEqual(JSON.parse(JSON.stringify(h.invokes.at(-1))), {
       channel: "omnigent:set-global-shortcut",
-      args: { enabled: true, accelerator: "Control+Shift+K" },
+      args: [{ enabled: true, accelerator: "Control+Shift+K" }],
     });
     // Turning off sends no chord, so the shell keeps its saved one.
     await h.desktop.setGlobalShortcut({ enabled: false, extra: 1 });
     assert.deepEqual(JSON.parse(JSON.stringify(h.invokes.at(-1))), {
       channel: "omnigent:set-global-shortcut",
-      args: { enabled: false },
+      args: [{ enabled: false }],
     });
     await h.desktop.setGlobalShortcut({ enabled: false, accelerator: "Alt+J" });
-    assert.deepEqual(JSON.parse(JSON.stringify(h.invokes.at(-1))).args, {
-      enabled: false,
-      accelerator: "Alt+J",
-    });
+    assert.deepEqual(JSON.parse(JSON.stringify(h.invokes.at(-1))).args, [
+      { enabled: false, accelerator: "Alt+J" },
+    ]);
 
     await h.desktop.recordGlobalShortcut();
     assert.equal(h.invokes.at(-1).channel, "omnigent:record-global-shortcut");
@@ -318,7 +308,7 @@ describe("system dictation bridge", () => {
     await h.desktop.startSystemDictation();
     assert.deepEqual(h.invokes.at(-1), {
       channel: "omnigent:start-system-dictation",
-      args: undefined,
+      args: [],
     });
   });
 });
