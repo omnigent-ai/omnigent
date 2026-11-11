@@ -6,6 +6,7 @@ import {
   type ComponentProps,
   type CSSProperties,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -14,6 +15,7 @@ import {
 } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { ShellCommandContext, ShellCommandDraftContext } from "./ShellCommandContext";
 import {
   Outlet,
   useLocation,
@@ -29,6 +31,8 @@ import { useCanvasSidebar } from "@/canvas/useCanvasSidebar";
 import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useConversations";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
+import { useOpenSessionRow } from "@/hooks/useOpenSessionRow";
+import type { Session, SessionStatus } from "@/lib/types";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
@@ -244,11 +248,54 @@ function resolveTerminalViewKey(stored: string | null, agentKey: string): string
   return stored !== null && stored !== CHAT_VIEW_STORAGE_VALUE ? stored : agentKey;
 }
 
+/**
+ * Working fields for an off-window session's archive confirmation. The streamed
+ * open-session row decides, or the snapshot until it loads; a row fetched by id
+ * lacks the background flag until the stream settles it, so the snapshot's stands
+ * in. The live store only adds work, since a fresh bind starts idle.
+ */
+function offWindowArchiveState(
+  row: Conversation | null,
+  snapshot: Pick<Session, "status" | "pendingElicitations" | "backgroundTaskCount">,
+  boundStatus: SessionStatus | null,
+  boundBackgroundTaskCount: number,
+): Pick<Conversation, "status" | "pending_elicitations_count" | "background_work_running"> {
+  const snapshotBackground =
+    snapshot.status === "waiting" || (snapshot.backgroundTaskCount ?? 0) > 0;
+  const reportedStatus: string | undefined = row ? row.status : snapshot.status;
+  let status: Conversation["status"] = "idle";
+  if (boundStatus === "running" || reportedStatus === "running") status = "running";
+  else if (reportedStatus === "failed") status = "failed";
+  return {
+    status,
+    pending_elicitations_count: row
+      ? (row.pending_elicitations_count ?? 0)
+      : (snapshot.pendingElicitations?.length ?? 0),
+    // `waiting` is the loop parked on background work, which rows report separately.
+    background_work_running:
+      (row?.background_work_running ?? snapshotBackground) ||
+      reportedStatus === "waiting" ||
+      boundStatus === "waiting" ||
+      boundBackgroundTaskCount > 0,
+  };
+}
+
 export function AppShell() {
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const setDraft = useCallback((key: string, command: string | null) => {
+    setDrafts((current) => {
+      if (command !== null) return { ...current, [key]: command };
+      const { [key]: _discarded, ...remaining } = current;
+      return remaining;
+    });
+  }, []);
+  const draftContext = useMemo(() => ({ drafts, setDraft }), [drafts, setDraft]);
   return (
     <GridSessionsProvider>
       <MobileHeaderControlsProvider>
-        <AppShellImpl />
+        <ShellCommandDraftContext.Provider value={draftContext}>
+          <AppShellImpl />
+        </ShellCommandDraftContext.Provider>
       </MobileHeaderControlsProvider>
     </GridSessionsProvider>
   );
@@ -261,6 +308,7 @@ function GridSessionMain(props: ComponentProps<"main">) {
 }
 
 function AppShellImpl() {
+  const shellDrafts = useContext(ShellCommandDraftContext);
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
@@ -799,6 +847,18 @@ function AppShellImpl() {
   const isKnownTopLevel =
     activeConv != null ||
     (activeSessionMatchesRoute && activeSession != null && activeSession.parentSessionId == null);
+  // The off-window archive confirmation's sources; see `offWindowArchiveState`.
+  const openSessionRow = useOpenSessionRow(
+    !conversationsLoading && !activeConv && isKnownTopLevel && isOwnerLevel(permissionLevel)
+      ? (serverConversationId ?? null)
+      : null,
+  );
+  const boundSessionStatus = useChatStore((s) =>
+    s.conversationId === serverConversationId ? s.sessionStatus : null,
+  );
+  const boundBackgroundTaskCount = useChatStore((s) =>
+    s.conversationId === serverConversationId ? s.backgroundTaskCount : 0,
+  );
   const actionConversation = useMemo<Conversation | null>(() => {
     if (!isKnownTopLevel || !isOwnerLevel(permissionLevel)) return null;
     if (activeConv) return activeConv;
@@ -822,8 +882,24 @@ function AppShellImpl() {
       agent_name: activeSession.agentName,
       family: activeSession.family,
       git_branch: activeSession.gitBranch ?? null,
+      // `useArchivePrompt` applies `isSessionWorking` to these.
+      ...offWindowArchiveState(
+        openSessionRow,
+        activeSession,
+        boundSessionStatus,
+        boundBackgroundTaskCount,
+      ),
     };
-  }, [activeConv, activeSession, activeSessionMatchesRoute, isKnownTopLevel, permissionLevel]);
+  }, [
+    activeConv,
+    activeSession,
+    activeSessionMatchesRoute,
+    boundBackgroundTaskCount,
+    boundSessionStatus,
+    isKnownTopLevel,
+    openSessionRow,
+    permissionLevel,
+  ]);
   // Header action gating, hoisted so the desktop buttons and the mobile
   // three-dot menu render the exact same set (they can't drift apart).
   // Stop session is not a header action — it lives in the sidebar row's
@@ -2103,15 +2179,18 @@ function AppShellImpl() {
   // phone's drawer even where this viewer or harness can't start side chats.
   const [hasSideChatTabs, setHasSideChatTabs] = useState(false);
 
-  function openTerminalsPanel(key: string) {
-    setSelectedFilePath(null); // close file viewer
-    clearFileViewerUrl();
-    setExecutionLogsKey(null); // close execution-logs panel
-    setFilesPanelOpen(false); // close files drawer
-    setSubagentsPanelOpen(false); // close mobile agents drawer
-    setShellsPanelOpen(false); // close mobile shells drawer
-    setPanelInitialKey(key);
-  }
+  const openTerminalsPanel = useCallback(
+    (key: string) => {
+      setSelectedFilePath(null); // close file viewer
+      clearFileViewerUrl();
+      setExecutionLogsKey(null); // close execution-logs panel
+      setFilesPanelOpen(false); // close files drawer
+      setSubagentsPanelOpen(false); // close mobile agents drawer
+      setShellsPanelOpen(false); // close mobile shells drawer
+      setPanelInitialKey(key);
+    },
+    [clearFileViewerUrl, setPanelInitialKey],
+  );
 
   // Open a shell as a tab in the desktop workspace rail (the mobile path
   // still uses ``openTerminalsPanel`` → full-screen drawer). Adds the key to
@@ -2178,6 +2257,48 @@ function AppShellImpl() {
   );
   useNewShellHotkey(launchShellFromShortcut, shellLaunchable);
   useDesktopCommand("new-terminal", shellLaunchable ? launchShellFromShortcut : null);
+
+  const shellCommandAction = useMemo(() => {
+    const commandShells = (boundAgent?.terminals ?? []).filter((name) =>
+      ["bash", "sh", "zsh", "fish", "shell"].includes(name),
+    );
+    if (!isOwnerLevel(permissionLevel) || gridRoute || commandShells.length === 0) return null;
+    return {
+      disabled: !shellLaunchable,
+      open: (command: string, language: string) => {
+        if (!shellLaunchable || !conversationId || !command.trim()) return;
+        const shell = commandShells.includes(language)
+          ? language
+          : resolveDefaultShell(commandShells);
+        if (!shell) return;
+        void createTerminal.mutateAsync(shell).then(
+          (info) => {
+            shellDrafts?.setDraft(`${conversationId}:${info.id}`, command);
+            if (railSelectionRef.current.conversationId !== conversationId) return;
+            guardFileNavigation(null, undefined, () => {
+              if (railSelectionRef.current.conversationId !== conversationId) return;
+              const key = terminalTabKey(info);
+              if (isMobileViewport()) openTerminalsPanel(key);
+              else openTerminalTab(key);
+            });
+          },
+          (error: unknown) =>
+            toast.error(error instanceof Error ? error.message : "Couldn't open the shell."),
+        );
+      },
+    };
+  }, [
+    boundAgent?.terminals,
+    permissionLevel,
+    gridRoute,
+    shellLaunchable,
+    conversationId,
+    createTerminal,
+    shellDrafts,
+    guardFileNavigation,
+    openTerminalsPanel,
+    openTerminalTab,
+  ]);
 
   // Desktop Close (⌘W / Ctrl+W), once the workspace rail has passed on it:
   // leave the open session or page for the new-session page; from the
@@ -2873,7 +2994,9 @@ function AppShellImpl() {
                 >
                   <SubagentPanelOpenerContext.Provider value={openSubagentInPanel}>
                     <RenderErrorBoundary name="this page" resetKey={location.pathname}>
-                      <Outlet />
+                      <ShellCommandContext.Provider value={shellCommandAction}>
+                        <Outlet />
+                      </ShellCommandContext.Provider>
                     </RenderErrorBoundary>
                   </SubagentPanelOpenerContext.Provider>
                 </GridSessionMain>
@@ -3076,7 +3199,7 @@ function AppShellImpl() {
         AgentInfoButton popover, opened from the header's three-dot menu. */}
           {hasAgentInfo && (
             <Dialog open={agentInfoOpen} onOpenChange={setAgentInfoOpen}>
-              <DialogContent>
+              <DialogContent className="max-h-[85vh] overflow-y-auto">
                 <DialogHeader>
                   <DialogTitle>Agent</DialogTitle>
                   <DialogDescription className="sr-only">

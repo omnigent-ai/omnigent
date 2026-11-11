@@ -148,6 +148,7 @@ from omnigent.stores.session_journal_store import (
     delete_journal_entries_batch,
     delete_journal_heads,
 )
+from omnigent.util.session_lifecycle import title_without_closed_marker
 
 _logger = logging.getLogger(__name__)
 
@@ -6162,8 +6163,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             fork_title = (
                 title
                 if title is not None
+                # A legacy closed child's title carries the closed marker,
+                # which would seal the fork as well.
                 else (
-                    f"Fork of {source.title}"
+                    f"Fork of {title_without_closed_marker(source.title)}"
                     if source.title
                     else f"Fork of {source_conversation_id[:16]}…"
                 )

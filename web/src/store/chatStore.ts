@@ -783,6 +783,13 @@ export interface ConversationState {
    */
   backgroundTasks: BackgroundTaskInfo[];
   /**
+   * Background agents a finished claude-native turn left running, while
+   * `sessionStatus` is `waiting`. The turn is over, so the composer sends right
+   * away; the working indicator names these instead of shimmering. Empty
+   * otherwise.
+   */
+  backgroundAgents: BackgroundTaskInfo[];
+  /**
    * Why a still-`running` session is parked, e.g. "permission prompt".
    * Terminal-backed agents can block on a dialog the web UI does not
    * mirror, so the working indicator names it instead of shimmering with
@@ -1677,6 +1684,16 @@ function waitForInitialDispatch(conversationId: string, tempId: string): Promise
   });
 }
 
+/** Shared empty list, so edges that carry no agents don't re-render readers. */
+const EMPTY_BACKGROUND_AGENTS: BackgroundTaskInfo[] = [];
+
+/** The background agents a snapshot names; only a `waiting` snapshot carries them. */
+function snapshotBackgroundAgents(session: Session): BackgroundTaskInfo[] {
+  return session.status === "waiting"
+    ? (session.backgroundAgents ?? EMPTY_BACKGROUND_AGENTS)
+    : EMPTY_BACKGROUND_AGENTS;
+}
+
 /** Settle a seeded model from a snapshot, under the condition `sessionBindingPatch` uses at bind. */
 function snapshotModelPatch(
   session: Session,
@@ -2201,6 +2218,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sessionStatus: "idle",
   backgroundTaskCount: 0,
   backgroundTasks: [],
+  backgroundAgents: [],
   blockedOn: null,
   isNativeTerminalSession: false,
   nativeVendorOwnsModel: false,
@@ -2979,6 +2997,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             patch.sessionStatus = "idle";
             patch.backgroundTaskCount = 0;
             patch.backgroundTasks = [];
+            patch.backgroundAgents = [];
           }
           return patch;
         });
@@ -3152,6 +3171,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           sessionStatus: "idle",
           backgroundTaskCount: 0,
           backgroundTasks: [],
+          backgroundAgents: [],
         });
       } else {
         // Sent alongside an already-streaming turn (or a stranded latch): the
@@ -3265,6 +3285,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             patch.sessionStatus = "idle";
             patch.backgroundTaskCount = 0;
             patch.backgroundTasks = [];
+            patch.backgroundAgents = [];
           }
           return patch;
         });
@@ -3355,6 +3376,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         sessionStatus: "idle",
         backgroundTaskCount: 0,
         backgroundTasks: [],
+        backgroundAgents: [],
         blockedOn: null,
       };
       if (s.activeResponse?.state === "streaming") {
@@ -5492,6 +5514,7 @@ async function bindStream(
         // the snapshot (server keeps it sticky past the trailing PTY `idle`).
         backgroundTaskCount: session.backgroundTaskCount ?? 0,
         backgroundTasks: session.backgroundTasks ?? [],
+        backgroundAgents: snapshotBackgroundAgents(session),
         blockedOn: null,
         // This conversation's own effective effort, which is what a warm switch
         // back re-projects (it does not re-bind, so it cannot recompute it).
@@ -5745,6 +5768,7 @@ function reconnectStatusPatch(
   // returns to "N background tasks still running" rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
   patch.backgroundTasks = session.backgroundTasks ?? [];
+  patch.backgroundAgents = snapshotBackgroundAgents(session);
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
@@ -8925,6 +8949,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           patch.backgroundTaskCount = 0;
           patch.backgroundTasks = [];
         }
+        // Only a claude-native `waiting` edge names background agents; any other
+        // edge ends that wait (the agent finished or a new turn started).
+        patch.backgroundAgents =
+          event.status === "waiting" ? (event.backgroundAgents ?? []) : EMPTY_BACKGROUND_AGENTS;
         if (event.status === "failed" && s.blocks.some(isLiveProvisionalBlock)) {
           patch.blocks = s.blocks.map((block) =>
             isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted

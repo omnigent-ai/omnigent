@@ -892,6 +892,8 @@ class ToolGroupsConfig:
     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
     :param journal: The ``sys_journal_*`` tools (4): the session's plan, step
         statuses and notes.
+    :param projects: ``sys_project_list``, ``sys_project_update`` and
+        ``sys_session_update``.
     """
 
     browser: bool = True
@@ -900,6 +902,7 @@ class ToolGroupsConfig:
     policies: bool = True
     agent_discovery: bool = True
     journal: bool = True
+    projects: bool = True
 
 
 @dataclass
