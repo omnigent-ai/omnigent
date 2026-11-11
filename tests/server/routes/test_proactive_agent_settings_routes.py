@@ -20,6 +20,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.proactive_agent_settings_store import (
+    WORKSPACE_SETTINGS_USER,
     ProactiveAgentSettingsStore,
 )
 
@@ -134,6 +135,15 @@ async def test_the_workspace_setting_overrides_every_user(db_uri: str, tmp_path:
         )
         assert off.status_code == 200, off.text
         await client.put("/v1/proactive-agent/settings/me", json={"enabled": True}, headers=_ALICE)
+        # An external identity spelled like the reserved workspace owner cannot
+        # reach the workspace row through its own setting.
+        sentinel = {"X-Forwarded-Email": WORKSPACE_SETTINGS_USER}
+        for enabled in (True, False):
+            spoof = await client.put(
+                "/v1/proactive-agent/settings/me", json={"enabled": enabled}, headers=sentinel
+            )
+            assert spoof.status_code in (401, 403), spoof.text
+        assert (await _settings(client, _ADMIN))["workspace_enabled"] is False
 
         alice = await _settings(client, _ALICE)
         assert (alice["workspace_enabled"], alice["user_enabled"], alice["enabled"]) == (

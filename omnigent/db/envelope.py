@@ -128,6 +128,9 @@ class EnvelopedJSON(BoundedBinary):
 
     def __init__(self, max_stored_bytes: int) -> None:
         super().__init__(max_stored_bytes)
+        # SQLAlchemy's type cache key reads constructor arguments by name, so
+        # two differently bounded columns must not share one bind processor.
+        self.max_stored_bytes = max_stored_bytes
 
     def process_bind_param(self, value: Any, dialect: Dialect) -> bytes | None:
         return None if value is None else super().process_bind_param(seal(value), dialect)
