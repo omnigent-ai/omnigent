@@ -745,7 +745,7 @@ class TestConstructor(unittest.TestCase):
         helper = executor._extra_env["OMNIGENT_CLAUDE_API_KEY_HELPER"]
         # Proves the selector is --profile, not --host. A regression to --host
         # makes a two-profiles-one-host workspace yield an empty token → 401.
-        self.assertIn('databricks auth token --profile "oss"', helper)
+        self.assertIn("databricks auth token --profile oss", helper)
         # Scope to the CLI mint: it selects by --profile. The sdk fallback
         # separately passes --host for its own workspace guard (identity is
         # still pinned by --profile), so assert on the mint, not the whole helper.
@@ -1935,7 +1935,7 @@ class TestResolveGatewayEnv(unittest.TestCase):
             "https://adb-12345.azuredatabricks.net/ai-gateway/anthropic",
         )
         self.assertIn(
-            'databricks auth token --profile "my-oauth-profile"',
+            "databricks auth token --profile my-oauth-profile",
             env["OMNIGENT_CLAUDE_API_KEY_HELPER"],
         )
 
