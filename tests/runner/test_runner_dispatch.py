@@ -96,7 +96,10 @@ from omnigent.runtime.harnesses._executor_adapter import (
 )
 from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultEvent
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+from omnigent.runtime.prompt import (
+    EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+    WORKSPACE_IMAGE_INSTRUCTION,
+)
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
@@ -8051,7 +8054,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
 
     # agent_name forwarded to the server-side filter.
     assert sessions_params.get("agent_name") == "researcher"
-    assert sessions_params.get("visibility") == "all"
+    assert sessions_params.get("visibility") == "mine"
     # Both sessions projected with status + connectivity from the single
     # shared-runner status lookup.
     assert out["sessions"] == [
@@ -12615,7 +12618,9 @@ _CONTRACT_CALLER_INSTRUCTIONS = "Caller-supplied instructions."
 
 def _contract_composed_instructions(*parts: str) -> str:
     """Compose expected author/request text with framework guidance."""
-    return "\n\n".join((*parts, EMBEDDED_BROWSER_PRIORITY_INSTRUCTION))
+    return "\n\n".join(
+        (*parts, EMBEDDED_BROWSER_PRIORITY_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION)
+    )
 
 
 async def _contract_run_no_harness(
@@ -13579,7 +13584,7 @@ _SIGN_IN_PROMPT_SCREEN = (
     "\n\thttps://databricks.okta.com/oauth2/v1/authorize?client_id=0oa1&state=T4IU\n\n"
 )
 _SIGNED_IN_SCREENS = {
-    # Codex draws inline: dbcert's lines stay above its banner.
+    # Codex draws inline: the launcher's lines stay above its banner.
     "codex-native": (
         _SIGN_IN_PROMPT_SCREEN + "dbcert: All credentials successfully written\n"
         "╭── OpenAI Codex (v0.156.1) ──╮\n"

@@ -34,13 +34,20 @@ struct OmnigentWebView: UIViewRepresentable {
   static func connectionErrorMessage(
     for error: Error, databricksInternalFeaturesEnabled: Bool
   ) -> String {
-    let nsError = error as NSError
-    if databricksInternalFeaturesEnabled, nsError.domain == NSURLErrorDomain,
-      [NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed].contains(nsError.code)
+    let failure = transportFailure(of: error)
+    if databricksInternalFeaturesEnabled, failure.domain == NSURLErrorDomain,
+      [NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed].contains(failure.code)
     {
       return "Couldn’t reach the server. Check your device’s compliance status in Jamf."
     }
     return error.localizedDescription
+  }
+
+  /// Workspace sign-in wraps the transport error, so look through it for the original code.
+  private static func transportFailure(of error: Error) -> DatabricksTransportFailure {
+    if case .networkUnavailable(let failure)? = error as? DatabricksSessionError { return failure }
+    if case .networkUnavailable(let failure)? = error as? DatabricksOAuthError { return failure }
+    return DatabricksTransportFailure(error)
   }
 
   func makeCoordinator() -> Coordinator {
@@ -72,9 +79,10 @@ struct OmnigentWebView: UIViewRepresentable {
     webView.allowsBackForwardNavigationGestures = false
     webView.isFindInteractionEnabled = true
     webView.isOpaque = false
-    webView.backgroundColor = .clear
-    webView.underPageBackgroundColor = .clear
-    webView.scrollView.backgroundColor = .clear
+    // The rounded keyboard exposes WebKit's backing surfaces below the page.
+    webView.backgroundColor = DesignTokens.nativeBackground
+    webView.underPageBackgroundColor = DesignTokens.nativeBackground
+    webView.scrollView.backgroundColor = DesignTokens.nativeBackground
     webView.scrollView.contentInsetAdjustmentBehavior = .never
 
     // Allow Safari Web Inspector to attach to the web content. Since iOS 16.4 a
@@ -1734,7 +1742,9 @@ struct OmnigentWebView: UIViewRepresentable {
       let nsError = error as NSError
       guard nsError.code != NSURLErrorCancelled else { return }
       if webStore != nil {
-        showWorkspaceFailure(DatabricksSessionError.networkUnavailable)
+        let failure = DatabricksTransportFailure(error)
+        NSLog("[omnigent] workspace page load failed: \(failure)")
+        showWorkspaceFailure(DatabricksSessionError.networkUnavailable(failure))
         return
       }
       parent.model.isLoading = false

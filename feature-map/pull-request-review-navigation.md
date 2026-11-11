@@ -2,8 +2,8 @@
 
 Move through a pull request's Changes tab: filter the changed files by path, find
 text in the fetched patch, copy and open files at the reviewed revision, and mark
-files viewed with progress and hide-viewed controls. Viewed marks are kept in this
-browser only. A file stays viewed on a new head while its diff hunks are unchanged,
+files viewed with progress and hide-viewed controls, and browse the pull request's
+commits one at a time. Viewed marks are kept in this browser only. A file stays viewed on a new head while its diff hunks are unchanged,
 and a changed file is flagged.
 
 ## Sub-features
@@ -27,7 +27,8 @@ and a changed file is flagged.
   `Opening files isn’t supported for <provider>`.
 - `viewed`: Per-file **Viewed** checkbox in each file header. Marking collapses the
   file; unmarking leaves it as it is. Viewed files show a check and a dimmed name in
-  the file list. Viewed controls are hidden when viewed state is unavailable.
+  the file list. A mark made in another tab on the same head also collapses the file.
+  Viewed controls are hidden when viewed state is unavailable.
 - `progress`: `X / Y files viewed`, with `(partial)` when the changed-file list is
   truncated. A bar sits beside it outside the mobile layout; mobile shows the text only.
 - `hide-viewed`: **Hide viewed** toggle, off by default. When every file the path
@@ -40,16 +41,13 @@ and a changed file is flagged.
   changed, until **Dismiss** or until every changed file is marked. A file that can't
   be compared (binary, pure rename, missing from the fetched diff, or cut short) loses
   its mark without a badge or notice.
-- `stack`: A GitHub PR stacked on another PR shows `Stacked on #N <title>` above
-  the files, with `(merged)` for a merged parent. A PR whose base branch is the
-  parent's head branch shows only that row, since its diff already starts at the
-  parent. A PR on the default branch whose commits include another same-repo PR's
-  head (fork-model stacks) also gets **This PR only**, off by default. On, it lists
-  only the changes since the parent's head, without review conversations, viewed
-  controls or context expansion, and reads `No changes since the parent PR.` when
-  there are none. With no PR parent, a `## 🥞 Stacked PR` description link to
-  `files/<parent>..<head>` names the parent commit instead. PRs with no parent
-  show no row.
+- `commits`: A **Changes | Commits** switch starts the toolbar on GitHub pull requests
+  whose list is pinned to a head. The commit list runs oldest first with title, short
+  sha, author and date; **Search commits** matches sha, title or author, ignoring case.
+  More than 250 commits shows `History limited to 250 commits`. Selecting a commit
+  shows its patch with the same file list, diff and find bar, plus **Back to commits**,
+  **Previous commit** and **Next commit**. A commit view has no viewed controls, review
+  conversations or drafts, or context expansion, and **Open in** uses the commit's sha.
 
 ## How to get to it (user POV)
 
@@ -125,21 +123,22 @@ new head where only `main.py` changes. `README.md` keeps its mark, `main.py` sho
   show **Changed since viewed**, and the notice should show. Files the commit leaves
   alone keep their marks.
 
-### stack
+### commits
 
-`tests/e2e_ui/github/test_github_tab.py::test_stacked_pr_shows_its_own_changes`
-covers `rail`. For a fork-model stack it checks the `Stacked on #4241` row and its
-link, turns on **This PR only** and checks that only the PR's own file remains,
-then turns it off and checks the full list is back. For a same-repo stack it checks
-the row has no toggle.
+`tests/e2e_ui/github/test_github_tab.py::test_changes_commits_view_lists_and_opens_a_commit`
+covers `rail`. It checks the viewed controls in Changes, switches to Commits, searches
+the list, opens a commit and checks that only its file is listed and the viewed
+controls are gone, steps with **Next commit**, and returns with **Back to commits**.
 
-- `composer-desktop`, `composer-mobile` and `canvas`: Open Changes on a PR stacked
-  on another open PR. Confirm the `Stacked on #N` row. On a fork-model stack, click
-  **This PR only** and confirm files that only the parent changed disappear, then
-  click it again to restore them.
+- `composer-desktop`, `composer-mobile` and `canvas`: Open Changes on a GitHub pull
+  request with several commits and choose **Commits**. Search by an author's name and
+  confirm the list narrows. Open a commit: only its files should be listed, with no
+  **Viewed** checkbox or **Hide viewed**. Use **Next commit**, then **Back to commits**,
+  then **Changes**, and confirm your viewed marks are unchanged.
 
 Component coverage for these helpers and views lives in
 `web/src/shell/PullRequestChangesTab.test.tsx`,
+`web/src/shell/PullRequestCommitsList.test.tsx`,
 `web/src/shell/PullRequestFileSection.test.tsx`,
 `web/src/shell/pullRequestReview.test.ts`,
 `web/src/shell/useChangesViewState.test.ts` and
@@ -172,11 +171,12 @@ Component coverage for these helpers and views lives in
 - **Open uses the list's revision, not the newest head.** A commit pushed while you
   read does not change the link until the list reloads. The link goes to the file
   without a line anchor.
-- **Open and viewed need a pinned list.** GitLab and Azure DevOps lists do not report
-  their revision, so **Open in** shows `Revision unknown`, and the Viewed checkbox,
-  progress row and Hide viewed are all hidden. A workspace-branch list (no pull
-  request selected) behaves the same way. Real GitLab and Azure DevOps pull requests
-  have not been exercised; these results come from the code paths.
+- **Open and viewed need a pinned list.** GitHub, GitLab and Azure DevOps lists report
+  the revision they show, so **Open in** and the Viewed checkbox work for each. A
+  workspace-branch list (no pull request selected) reports no revision, so **Open in**
+  shows `Revision unknown`, and the Viewed checkbox, progress row and Hide viewed are
+  all hidden. Real GitLab and Azure DevOps pull requests have not been exercised; these
+  results come from the code paths.
 - **Viewed marks are browser-local.** They do not sync to GitHub or other browsers.
   They are separate for each Omnigent server, signed-in user and pull request, and
   clearing site data removes them. If the browser refuses storage, your changes stay in
@@ -197,20 +197,17 @@ Component coverage for these helpers and views lives in
   notice. A mark recorded only that way stays silent even after the file's hunks
   become comparable; the badge needs at least one comparable mark. Stand-ins from other
   heads are discarded before the current mark is recorded, and the current mark counts
-  toward the three-hash limit. Files whose names git quotes (non-ASCII or special
-  characters) have no parsed diff in the Changes tab, so they always behave this way.
+  toward the three-hash limit.
 - **Filter and Hide viewed are not kept across reloads.** Hide viewed starts off.
 - **Thread navigation can clear a filter.** Previous and Next unresolved
   conversation reveal a conversation on a file the path filter or Hide viewed hides,
   clearing that filter first and showing `Filter cleared to show <file>`. Other
   conversations on hidden files stay hidden with their files.
-- **Known rough edges.** Marking a file while Hide viewed is on removes it from the
-  list and drops keyboard focus. Marks made in another tab on the same head show as
-  checked but do not collapse the file until the Changes view remounts (for example
-  after a reload) or the head changes.
-- **This PR only is GitHub-only and lookup-based.** The parent is looked up when the
-  Changes tab opens and reused for five minutes per head. The commit walk checks at most
-  the PR's newest 100 commits and is skipped when GitHub's 250-commit list stops
-  before the head. A parent in another repository is not found.
+- **Commits need GitHub and a current server.** GitLab and Azure DevOps show Changes
+  only. If the Omnigent server predates the commit view, the switch disappears for that
+  pull request and the toast `Commits need an updated Omnigent server.` appears.
+- **The commit list follows the list's head.** A newer push does not reload it until
+  the Changes list reloads. A commit's patch is fixed by its sha. GitHub truncates the
+  diff of a commit that touches more than 300 files, with no warning shown.
 - **Canvas requires its release feature.** Check it is enabled before using the
   `canvas` entry.

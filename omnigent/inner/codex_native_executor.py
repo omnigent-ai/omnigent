@@ -25,7 +25,11 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexMessage,
     CodexParams,
     client_for_transport,
+    codex_resume_current_model_provider,
+    codex_resume_unconfigured_model_provider,
+    input_too_large_limits,
     is_compaction_steer_refusal,
+    is_project_hooks_config_refusal,
     is_server_draining_error,
     is_stale_active_turn_error,
     resolve_codex_effort_for_model,
@@ -106,11 +110,28 @@ _BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
 _COMPACTION_WAIT_TIMEOUT_SECONDS = 60.0
 _DELIVERY_RPC_TIMEOUT_SECONDS = 30.0
 _DELIVERY_RECEIPT_TIMEOUT_SECONDS = 2.0
+_MAX_CODEX_TEXT_INPUT_CHARS = 1 << 20
 _CODEX_COMPACTING_FAILURE = CodexStartupFailure(
     message="Codex is still compacting, so this message was not delivered.",
     code="codex_compacting",
     title="Codex is compacting",
     remediation="Wait for compaction to finish, then send your message again.",
+)
+_CODEX_PROVIDER_CHANGED_FAILURE = CodexStartupFailure(
+    message="Codex rejected this message because the conversation's model provider "
+    "differs from, or is missing in, its current configuration.",
+    code="codex_provider_changed",
+    title="Codex provider configuration changed",
+    remediation="Select and configure the intended provider, restart the session terminal, "
+    "then retry this message.",
+)
+_CODEX_PROJECT_CONFIG_INVALID_FAILURE = CodexStartupFailure(
+    message="Codex could not read this project's hooks configuration, so this message "
+    "was not delivered.",
+    code="codex_project_config_invalid",
+    title="Codex project configuration needs attention",
+    remediation="Check that the project's .codex path is a directory and its config.toml "
+    "is readable, then retry this message.",
 )
 _CODEX_DELIVERY_UNCONFIRMED_FAILURE = CodexStartupFailure(
     message="Codex did not confirm this message. It may already be running.",
@@ -126,6 +147,21 @@ _CODEX_SHELL_AUTHORIZATION_REQUIRED = CodexStartupFailure(
     remediation="Update the Omnigent server and runner, then send the command again "
     "as the session owner.",
 )
+
+
+def _input_too_large_failure(actual_chars: int, max_chars: int) -> CodexStartupFailure:
+    """Describe Codex refusing a message over its input limit."""
+    sizes = (
+        f" ({actual_chars:,} characters; the limit is {max_chars:,})"
+        if actual_chars and max_chars
+        else ""
+    )
+    return CodexStartupFailure(
+        message=f"This message is too long for Codex{sizes}, so it was not delivered.",
+        code="codex_input_too_large",
+        title="Message too long",
+        remediation="Shorten the message or attach large content as a file, then send it again.",
+    )
 
 
 class _CodexNativeInputUndelivered(RuntimeError):
@@ -435,6 +471,8 @@ async def _native_delivery_request_once(
             outcome = "rpc_rejected_draining"
         elif isinstance(exc, CodexAppServerResponseError) and is_compaction_steer_refusal(exc):
             outcome = "rpc_rejected_compacting"
+        elif isinstance(exc, CodexAppServerResponseError) and input_too_large_limits(exc):
+            outcome = "rpc_rejected_input_too_large"
         log_input_event(
             _logger,
             "codex_native_delivery_finished",
@@ -1271,6 +1309,17 @@ class CodexNativeExecutor(Executor):
                             startup_failure = exc.failure
                             undelivered = True
                             preserve_session = exc.preserve_session
+                        elif (
+                            codex_resume_current_model_provider(exc) is not None
+                            or codex_resume_unconfigured_model_provider(exc) is not None
+                        ):
+                            startup_failure = _CODEX_PROVIDER_CHANGED_FAILURE
+                            undelivered = True
+                            preserve_session = True
+                        elif is_project_hooks_config_refusal(exc):
+                            startup_failure = _CODEX_PROJECT_CONFIG_INVALID_FAILURE
+                            undelivered = True
+                            preserve_session = True
                         elif isinstance(
                             exc, CodexAppServerResponseError
                         ) and is_server_draining_error(exc):
@@ -1281,6 +1330,13 @@ class CodexNativeExecutor(Executor):
                         ) and is_compaction_steer_refusal(exc):
                             startup_failure = _CODEX_COMPACTING_FAILURE
                             undelivered = True
+                        elif isinstance(exc, CodexAppServerResponseError) and (
+                            limits := input_too_large_limits(exc)
+                        ):
+                            # Codex validated and refused the input; the session is unaffected.
+                            startup_failure = _input_too_large_failure(*limits)
+                            undelivered = True
+                            preserve_session = True
                         _logger.exception(
                             "Codex native turn injection failed",
                             extra=with_input_attributes(
@@ -1441,7 +1497,8 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
     URI inline as text would blow past the app-server's 1 MiB input
     limit. Files inline their decoded text when they are textual;
     binary files are materialized and referenced by path in a text
-    item so the model can open them with its tools.
+    item so the model can open them with its tools. Text files also use
+    that path when their combined text and the prompt exceed the input limit.
 
     :param content: Message content, e.g. a string or a list of content
         blocks like ``{"type": "input_text", "text": "..."}`` and
@@ -1453,6 +1510,7 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
         return [{"type": "text", "text": content}] if content else []
     if isinstance(content, list):
         items: list[dict[str, object]] = []
+        file_blocks: list[tuple[int, dict[str, object]]] = []
         for raw_block in content:
             block = _json_object(raw_block)
             if block is None:
@@ -1484,7 +1542,17 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
             elif block_type == "input_file":
                 file_item = _file_block_to_input_item(block, bridge_dir)
                 if file_item is not None:
+                    file_data = block.get("file_data")
+                    if isinstance(file_data, str) and file_data.startswith("data:text/"):
+                        file_blocks.append((len(items), block))
                     items.append(file_item)
+        if sum(len(text) for item in items if isinstance(text := item.get("text"), str)) > (
+            _MAX_CODEX_TEXT_INPUT_CHARS
+        ):
+            for index, block in file_blocks:
+                file_item = _file_block_to_input_item(block, bridge_dir, inline_text=False)
+                if file_item is not None:
+                    items[index] = file_item
         return items
     if content is None:
         return []
@@ -1512,6 +1580,8 @@ def _apply_resize_notice_to_latest_image(
 def _file_block_to_input_item(
     block: Mapping[str, object],
     bridge_dir: Path,
+    *,
+    inline_text: bool = True,
 ) -> dict[str, object] | None:
     """
     Convert an ``input_file`` block into a Codex input item.
@@ -1526,12 +1596,13 @@ def _file_block_to_input_item(
         ``file_data`` data URI, e.g.
         ``"data:text/plain;base64,aGVsbG8="``.
     :param bridge_dir: Session bridge path identifying the attachment cache.
-    :returns: A Codex ``text`` input item; a visible could-not-load
-        marker item when the file failed to materialize; or ``None``
-        for an empty text file.
+    :param inline_text: Whether text files fit in the turn's text budget.
+    :returns: A Codex ``text`` input item; a visible could-not-load marker
+        when normal delivery fails; or ``None`` for empty text or a failed
+        optional spill, letting the caller retain its original inline item.
     """
     file_data = block.get("file_data")
-    if isinstance(file_data, str) and file_data.startswith("data:"):
+    if inline_text and isinstance(file_data, str) and file_data.startswith("data:"):
         try:
             parsed = parse_data_uri(file_data)
             if parsed.mime_type.startswith("text/"):
@@ -1546,6 +1617,8 @@ def _file_block_to_input_item(
         # matching _ATTACHMENT_MARKER_RE in
         # omnigent/entities/conversation.py. Keep in sync.
         return {"type": "text", "text": f"[Attached file: {path}]"}
+    if not inline_text:
+        return None
     return {"type": "text", "text": unresolved_attachment_marker(block)}
 
 

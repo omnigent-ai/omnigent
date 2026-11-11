@@ -48,11 +48,6 @@ Payload contract:
 - With ``commit_history``, the commits are a ``list`` of ``session.github.commit``
   objects: ``sha``, ``title``, ``author``, and ``date``, with ``has_more``. One
   commit's patch is a ``session.github.pr_diff``.
-- With ``stacked_prs``, the stack is a ``session.github.pr_stack`` with ``head_sha``
-  and ``parent``: null, or ``{number, url, title, state, head_sha, source}``, where
-  ``source`` is ``base_branch``, ``commit``, or ``description``. Its incremental diff
-  is a ``session.github.pr_stack_diff`` with ``patch``, ``files`` (changed files),
-  ``has_more``, ``head_sha``, and ``parent_sha``.
 
 Additive fields:
 
@@ -101,8 +96,6 @@ CHANGED_FILE_OBJECT = "session.github.changed_file"
 FILE_DIFF_OBJECT = "session.github.file_diff"
 PR_DIFF_OBJECT = "session.github.pr_diff"
 COMMIT_OBJECT = "session.github.commit"
-PR_STACK_OBJECT = "session.github.pr_stack"
-PR_STACK_DIFF_OBJECT = "session.github.pr_stack_diff"
 PR_LABELS_OBJECT = "session.github.pr_labels"
 MERGE_OPTIONS_OBJECT = "session.github.merge_options"
 PR_MERGE_OBJECT = "session.github.pr_merge"
@@ -148,8 +141,6 @@ class ProviderCapabilities:
         the description through :meth:`PullRequestFacet.upload_attachment`.
     :ivar commit_history: The PR's commits can be listed and each one's patch read
         through the optional :class:`CommitsFacet`.
-    :ivar stacked_prs: The PR's parent in a stack can be found, and the diff from
-        the parent's head read, through the optional :class:`StackFacet`.
     """
 
     account_switching: bool
@@ -166,24 +157,68 @@ class ProviderCapabilities:
     details_editing: bool = False
     attachment_uploads: bool = False
     commit_history: bool = False
-    stacked_prs: bool = False
 
     def to_json(self) -> dict[str, bool]:
         """Return the capabilities as the payload's ``capabilities`` object."""
         return asdict(self)
 
 
+def read_pinned_revision(
+    current: Callable[[], tuple[str, str] | None],
+    read: Callable[[], dict[str, Any]],
+    *,
+    head_sha: str,
+    base_sha: str,
+    moved: str,
+) -> dict[str, Any]:
+    """Read at the pinned revision, verifying it before and after the read.
+
+    Raises ``ValueError(moved)`` when a completed check shows another revision. Echoes
+    the pins only when both checks match. Otherwise the read's data comes back without
+    them, so the panel shows no revision it could not verify.
+
+    :param current: The PR's ``(head, base)`` now, or ``None`` when it cannot be read.
+    :param read: The read itself, returning its payload.
+    """
+    pinned = (head_sha, base_sha)
+    before = current()
+    if before is not None and before != pinned:
+        raise ValueError(moved)
+    result = read()
+    after = current()
+    if after is not None and after != pinned:
+        raise ValueError(moved)
+    if before is None or after is None:
+        return result
+    return {**result, "head_sha": head_sha, "base_sha": base_sha}
+
+
+@runtime_checkable
+class PinnedRevisionFacet(Protocol):
+    """Optional support for reading the changed files and patch at an exact revision."""
+
+    def pinned_diff(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """Return the whole PR's patch, echoing ``head_sha``/``base_sha`` when verified.
+
+        Raise ``ValueError`` when the PR's head or base is no longer the pinned revision.
+        """
+        ...
+
+    def pinned_changed_files(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """Return the changed files, echoing ``head_sha``/``base_sha`` when verified.
+
+        Raise as ``pinned_diff`` does.
+        """
+        ...
+
+
 @runtime_checkable
 class ReviewThreadsFacet(Protocol):
     """Optional review conversation support, independent of the base provider protocol."""
-
-    def review_diff(
-        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
-    ) -> dict[str, Any]: ...
-
-    def review_changed_files(
-        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
-    ) -> dict[str, Any]: ...
 
     def review_threads(
         self, root: str, reference: PullRequestRef, *, after: str, head_sha: str, base_sha: str
@@ -214,21 +249,6 @@ class CommitsFacet(Protocol):
         self, root: str, reference: PullRequestRef, *, commit_sha: str
     ) -> dict[str, Any]:
         """Return one commit's patch, a ``session.github.pr_diff``."""
-        ...
-
-
-@runtime_checkable
-class StackFacet(Protocol):
-    """Optional stacked-PR support, gated by :attr:`ProviderCapabilities.stacked_prs`."""
-
-    def stack(self, root: str, reference: PullRequestRef, *, head_sha: str) -> dict[str, Any]:
-        """Return the PR's parent in its stack at ``head_sha``, a ``session.github.pr_stack``."""
-        ...
-
-    def stack_diff(
-        self, root: str, reference: PullRequestRef, *, head_sha: str, parent_sha: str
-    ) -> dict[str, Any]:
-        """Return the ``session.github.pr_stack_diff`` from ``parent_sha`` to ``head_sha``."""
         ...
 
 

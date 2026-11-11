@@ -2,7 +2,7 @@
 // could still serve it; an asleep sandbox must not keep the panel spinning.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, renderHook, waitFor } from "@testing-library/react";
+import { cleanup, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
@@ -15,7 +15,7 @@ vi.mock("@/store/chatStore", () => ({
 
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
-import { usePullRequestInfo, usePullRequestInfos, usePullRequestStack } from "./usePullRequests";
+import { usePullRequestInfo, usePullRequestInfos } from "./usePullRequests";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
 const hostOnlineMock = vi.mocked(useSessionHostOnline);
@@ -116,60 +116,5 @@ describe("usePullRequestInfo runner-offline retry", () => {
     await vi.advanceTimersByTimeAsync(3_500);
 
     expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(3);
-  });
-});
-
-describe("usePullRequestStack", () => {
-  it("pins the lookup to the head and treats a host without stacks as no stack", async () => {
-    onlineMock.mockReturnValue(true);
-    hostOnlineMock.mockReturnValue(true);
-    fetchMock.mockResolvedValue({ ok: false, status: 404 } as Response);
-    const client = new QueryClient();
-    const prUrl = "https://github.com/org/repo/pull/2";
-    const { result } = renderHook(
-      () => usePullRequestStack("conv_stack", prUrl, "a".repeat(40), true),
-      {
-        wrapper: ({ children }) => (
-          <QueryClientProvider client={client}>{children}</QueryClientProvider>
-        ),
-      },
-    );
-
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(result.current.data).toBeNull();
-    const url = new URL(String(fetchMock.mock.calls[0][0]), "http://app");
-    expect(url.pathname).toBe("/v1/sessions/conv_stack/resources/github/stack");
-    expect(url.searchParams.get("pr_url")).toBe(prUrl);
-    expect(url.searchParams.get("head_sha")).toBe("a".repeat(40));
-  });
-
-  it("reports a 404 that names its reason instead of hiding it as an older host", async () => {
-    onlineMock.mockReturnValue(true);
-    hostOnlineMock.mockReturnValue(true);
-    fetchMock.mockResolvedValue({
-      ok: false,
-      status: 404,
-      json: async () => ({ error: { message: "workspace directory does not exist on host" } }),
-    } as Response);
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const { result } = renderHook(
-      () =>
-        usePullRequestStack(
-          "conv_stack_gone",
-          "https://github.com/org/repo/pull/2",
-          "a".repeat(40),
-          true,
-        ),
-      {
-        wrapper: ({ children }) => (
-          <QueryClientProvider client={client}>{children}</QueryClientProvider>
-        ),
-      },
-    );
-
-    await waitFor(() => expect(result.current.isError).toBe(true));
-    expect((result.current.error as Error).message).toBe(
-      "workspace directory does not exist on host",
-    );
   });
 });

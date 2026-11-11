@@ -1,21 +1,19 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen } from "@testing-library/react";
 import type { FileDiffMetadata } from "@pierre/diffs";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 import type { PullRequestChangedFile } from "@/hooks/usePullRequests";
+import type { ReviewThread } from "@/lib/pullRequestReviewThreads";
 import { LARGE_DIFF_THRESHOLD, PullRequestFileSection } from "./PullRequestFileSection";
 
-const composerDraft = vi.hoisted(() => ({ anchor: null as unknown }));
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
   ...(await importOriginal<typeof UsePullRequestsModule>()),
   usePullRequestReviewThreadComposer: () => ({
-    draft: { pending: false, body: "", error: null, anchor: composerDraft.anchor },
+    draft: { pending: false, anchor: null },
     stale: false,
     selectLines: vi.fn(),
     cancel: vi.fn(),
-    setBody: vi.fn(),
-    post: vi.fn(),
   }),
 }));
 // Like @pierre/diffs: rows live in an open shadow root and are rebuilt on every
@@ -63,6 +61,16 @@ vi.mock("@pierre/diffs/react", async () => {
   };
 });
 
+// A conversation on a line the stub diff doesn't place, so it counts without rendering a thread body.
+const THREAD = {
+  id: "t1",
+  path: "src/app.ts",
+  line: 2,
+  side: "RIGHT",
+  resolved: false,
+  comments: { data: [] },
+} as unknown as ReviewThread;
+
 const FILE: PullRequestChangedFile = {
   path: "src/app.ts",
   name: "app.ts",
@@ -77,34 +85,40 @@ function renderSection(
   props: Partial<React.ComponentProps<typeof PullRequestFileSection>> = {},
   unifiedLineCount = 3,
 ) {
-  const fileDiff = { name: FILE.path, type: "change", unifiedLineCount } as FileDiffMetadata;
+  const fileDiff = {
+    name: FILE.path,
+    type: "change",
+    unifiedLineCount,
+    hunks: [],
+  } as unknown as FileDiffMetadata;
   const onToggleCollapsed = vi.fn();
+  // Unplaced conversations render their own queries, so the section gets a query client.
+  const queryClient = new QueryClient();
   const element = (overrides: typeof props) => (
-    <PullRequestFileSection
-      file={FILE}
-      fileDiff={fileDiff}
-      options={{}}
-      registerRef={() => {}}
-      collapsed={false}
-      onToggleCollapsed={onToggleCollapsed}
-      threads={[]}
-      threadContext={{
-        conversationId: "conv",
-        prUrl: "pr",
-        account: null,
-        canReply: false,
-        loadComments: () => {},
-        loadingComments: null,
-      }}
-      matchingRevision
-      {...overrides}
-    />
+    <QueryClientProvider client={queryClient}>
+      <PullRequestFileSection
+        file={FILE}
+        fileDiff={fileDiff}
+        options={{}}
+        registerRef={() => {}}
+        collapsed={false}
+        onToggleCollapsed={onToggleCollapsed}
+        threads={[]}
+        threadContext={{
+          conversationId: "conv",
+          prUrl: "pr",
+          account: null,
+          canReply: false,
+          loadComments: () => {},
+          loadingComments: null,
+        }}
+        matchingRevision
+        {...overrides}
+      />
+    </QueryClientProvider>
   );
-  const provided = (overrides: typeof props) => (
-    <TooltipProvider>{element(overrides)}</TooltipProvider>
-  );
-  const result = render(provided(props));
-  return { onToggleCollapsed, rerender: (next: typeof props) => result.rerender(provided(next)) };
+  const result = render(element(props));
+  return { onToggleCollapsed, rerender: (next: typeof props) => result.rerender(element(next)) };
 }
 
 class FakeHighlight {
@@ -122,20 +136,6 @@ describe("PullRequestFileSection overrides", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
-    composerDraft.anchor = null;
-  });
-
-  it("hides a saved draft while asked to and shows it again afterwards", () => {
-    composerDraft.anchor = { side: "RIGHT", line: 4, head_sha: "", base_sha: "" };
-    const draft = () => screen.queryByRole("region", { name: "New review conversation" });
-    const { rerender } = renderSection();
-    expect(draft()).toBeInTheDocument();
-
-    rerender({ hideDraft: true });
-    expect(draft()).toBeNull();
-
-    rerender({ hideDraft: false });
-    expect(draft()).toBeInTheDocument();
   });
 
   it("mounts the diff when forced and keeps it mounted after the flag clears", () => {
@@ -234,5 +234,35 @@ describe("PullRequestFileSection overrides", () => {
     expect(screen.getByRole("button", { name: /app\.ts/ })).not.toContainElement(
       screen.getByRole("button", { name: "Copy path" }),
     );
+  });
+
+  it("shows no review features while review is off, and keeps the file's own actions", () => {
+    const threads = [THREAD];
+    renderSection({
+      reviewable: false,
+      forceMount: true,
+      threads,
+      headerActions: <button type="button">Copy path</button>,
+      reviewActions: <button type="button">Viewed control</button>,
+    });
+
+    expect(screen.getByTestId("diff")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy path" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Viewed control" })).toBeNull();
+    expect(screen.queryByTitle("1 conversation")).toBeNull();
+    expect(screen.queryByRole("region", { name: "New review conversation" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Select lines" }));
+    expect(selectedOf()).toBeNull();
+  });
+
+  it("shows the review actions and the thread's conversation count while review is on", () => {
+    renderSection({
+      forceMount: true,
+      threads: [THREAD],
+      reviewActions: <button type="button">Viewed control</button>,
+    });
+
+    expect(screen.getByRole("button", { name: "Viewed control" })).toBeInTheDocument();
+    expect(screen.getByTitle("1 conversation")).toBeInTheDocument();
   });
 });

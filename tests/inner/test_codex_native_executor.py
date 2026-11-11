@@ -695,6 +695,108 @@ def test_persistent_draining_delivery_is_bounded_and_keeps_input_undelivered(
     assert state.active_turn_id == active_turn_id
 
 
+_PROJECT_CONFIG_REFUSAL = (
+    "failed to load configuration: Failed to read project hooks config file "
+    "/workspace/project/.codex/config.toml: Not a directory (os error 20)"
+)
+
+
+@pytest.mark.parametrize(
+    ("rpc_code", "data", "message", "failure_code"),
+    [
+        (
+            -32600,
+            {"type": "modelProviderMismatch", "currentModelProvider": "gateway"},
+            "provider unavailable",
+            "codex_provider_changed",
+        ),
+        (
+            -32600,
+            {"type": "modelProviderNotConfigured", "modelProvider": "previous"},
+            "provider unavailable",
+            "codex_provider_changed",
+        ),
+        (-32600, {"type": "modelProviderMismatch"}, "provider unavailable", None),
+        (
+            -32600,
+            {"type": "anotherError", "currentModelProvider": "gateway"},
+            "provider unavailable",
+            None,
+        ),
+        (
+            -32603,
+            {"type": "modelProviderMismatch", "currentModelProvider": "gateway"},
+            "provider unavailable",
+            None,
+        ),
+        (-32600, {}, _PROJECT_CONFIG_REFUSAL, "codex_project_config_invalid"),
+        (-32603, {}, _PROJECT_CONFIG_REFUSAL, None),
+        (-32600, {}, "other failure: " + _PROJECT_CONFIG_REFUSAL, None),
+        (
+            -32600,
+            {},
+            _PROJECT_CONFIG_REFUSAL.replace("Not a directory (os error 20)", "permission denied"),
+            None,
+        ),
+        (
+            -32600,
+            {},
+            _PROJECT_CONFIG_REFUSAL.replace("/.codex/config.toml", "/unrelated.toml"),
+            None,
+        ),
+    ],
+    ids=[
+        "mismatch",
+        "missing-provider",
+        "missing-detail",
+        "unrelated-type",
+        "internal-error",
+        "project-config",
+        "config-internal-error",
+        "config-quoted-error",
+        "config-other-cause",
+        "config-other-path",
+    ],
+)
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["start", "steer"])
+def test_configuration_refusal_retains_input_without_changing_routing(
+    draining_client,
+    tmp_path: Path,
+    rpc_code: int,
+    data: dict[str, str],
+    message: str,
+    failure_code: str | None,
+    active_turn_id: str | None,
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    before = read_bridge_state(tmp_path)
+    draining_client.delivery_errors = [
+        CodexAppServerResponseError({"code": rpc_code, "message": message, "data": data})
+    ]
+
+    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "keep this input")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is (failure_code is not None)
+    assert failure.preserve_session is (failure_code is not None)
+    assert failure.retryable is False
+    assert failure.code == failure_code
+    if failure_code is not None:
+        assert failure.remediation is not None
+        if failure_code == "codex_provider_changed":
+            assert "provider" in failure.remediation
+            assert "restart" in failure.remediation.lower()
+        else:
+            assert ".codex" in failure.remediation
+            assert "directory" in failure.remediation
+    assert draining_client.accepted_inputs == []
+    assert draining_client.connections == draining_client.closes == 1
+    assert [method for method, _ in draining_client.requests] == [
+        "turn/steer" if active_turn_id else "turn/start"
+    ]
+    assert read_bridge_state(tmp_path) == before
+
+
 @pytest.mark.parametrize(
     "error",
     [
@@ -758,6 +860,70 @@ def test_similar_draining_errors_are_not_retried(
     assert draining_client.connections == 1
     assert len(draining_client.requests) == 1
     assert draining_client.accepted_inputs == []
+
+
+@pytest.mark.parametrize(
+    ("data", "expected_message"),
+    [
+        pytest.param(
+            {"input_error_code": "input_too_large", "max_chars": 1048576, "actual_chars": 1271319},
+            "This message is too long for Codex (1,271,319 characters; the limit is "
+            "1,048,576), so it was not delivered.",
+            id="with-sizes",
+        ),
+        pytest.param(
+            {"input_error_code": "input_too_large"},
+            "This message is too long for Codex, so it was not delivered.",
+            id="without-sizes",
+        ),
+    ],
+)
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["start", "steer"])
+def test_input_too_large_refusal_is_undelivered(
+    draining_client,
+    data: dict[str, object],
+    expected_message: str,
+    active_turn_id: str | None,
+    tmp_path: Path,
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    draining_client.delivery_errors = [
+        CodexAppServerResponseError(
+            {
+                "code": -32602,
+                "message": "Input exceeds the maximum length of 1048576 characters.",
+                "data": data,
+            }
+        )
+    ]
+
+    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "huge paste")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is True
+    assert failure.preserve_session is True
+    assert failure.code == "codex_input_too_large"
+    assert failure.message == expected_message
+    assert len(draining_client.requests) == 1
+    assert draining_client.accepted_inputs == []
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == active_turn_id
+
+
+def test_other_invalid_params_error_is_not_undelivered(draining_client, tmp_path: Path) -> None:
+    _seed_bridge(tmp_path)
+    draining_client.delivery_errors = [
+        CodexAppServerResponseError(
+            {"code": -32602, "message": "invalid params", "data": {"input_error_code": "other"}}
+        )
+    ]
+
+    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is False
+    assert failure.code is None
 
 
 @pytest.mark.parametrize(
@@ -2048,6 +2214,167 @@ def test_input_file_text_is_inlined_as_a_text_item(
     # No image channel item for a file, and no uploads dir written.
     assert all(item["type"] != "localImage" for item in items)
     assert not (attachment_cache_dir(tmp_path)).exists()
+
+
+@pytest.mark.parametrize("delivery", ["idle", "active-turn", "live-queue"])
+@pytest.mark.parametrize(
+    ("prompt_chars", "file_sizes"),
+    [
+        pytest.param(20, [1048577], id="one-large-file"),
+        pytest.param(20, [600000, 600000], id="aggregate-files"),
+        pytest.param(700000, [400000], id="prompt-and-file"),
+    ],
+)
+def test_text_attachments_over_input_limit_are_referenced_without_losing_bytes(
+    delivery: str,
+    prompt_chars: int,
+    file_sizes: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """File contents must not push an otherwise valid prompt past Codex's cap."""
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id=None if delivery == "idle" else "turn_existing")
+    files = [(chr(ord("a") + index) * size).encode() for index, size in enumerate(file_sizes)]
+    content: list[dict[str, Any]] = [
+        {
+            "type": "input_file",
+            "filename": f"notes-{index}.txt",
+            "file_data": "data:text/plain;base64," + base64.b64encode(data).decode(),
+        }
+        for index, data in enumerate(files)
+    ]
+    prompt = "p" * prompt_chars
+    content.append({"type": "input_text", "text": prompt})
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def run() -> None:
+        if delivery == "live-queue":
+            assert await executor.enqueue_session_message("main", content)
+        else:
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": content}], [], ""
+                )
+            ]
+            assert [type(event) for event in events] == [TurnComplete]
+
+    asyncio.run(run())
+
+    method, params = _FakeCodexNativeClient.requests[-1]
+    assert method == ("turn/start" if delivery == "idle" else "turn/steer")
+    items = params["input"]
+    assert sum(len(item.get("text", "")) for item in items) <= 1048576
+    assert items[-1] == {"type": "text", "text": prompt}
+    for item, data in zip(items[:-1], files, strict=True):
+        reference = item["text"]
+        assert reference.startswith("[Attached file: ") and reference.endswith("]")
+        assert (
+            Path(reference.removeprefix("[Attached file: ").removesuffix("]")).read_bytes() == data
+        )
+
+
+@pytest.mark.parametrize(
+    "write_errno", [errno.ENOSPC, errno.EACCES], ids=["disk-full", "cache-denied"]
+)
+@pytest.mark.parametrize("delivery", ["idle", "active-turn", "live-queue"])
+def test_failed_text_attachment_spill_preserves_original_for_native_refusal(
+    draining_client,
+    write_errno: int,
+    delivery: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active_turn_id = None if delivery == "idle" else "turn_existing"
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    text = "a" * 1048577
+    prompt = "inspect the original file"
+    content = [
+        {"type": "input_text", "text": prompt},
+        {
+            "type": "input_file",
+            "filename": "notes.txt",
+            "file_data": "data:text/plain;base64," + base64.b64encode(text.encode()).decode(),
+        },
+    ]
+    draining_client.delivery_errors = [
+        CodexAppServerResponseError(
+            {
+                "code": -32602,
+                "message": "Input exceeds the maximum length of 1048576 characters.",
+                "data": {"input_error_code": "input_too_large"},
+            }
+        )
+    ]
+
+    def fail_cache_write(*args, **kwargs):
+        raise OSError(write_errno, "attachment cache unavailable")
+
+    monkeypatch.setattr("omnigent.inner.native_attachments._place_no_follow", fail_cache_write)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def run() -> None:
+        if delivery == "live-queue":
+            assert not await executor.enqueue_session_message("main", content)
+        else:
+            [failure] = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": content}], [], ""
+                )
+            ]
+            assert isinstance(failure, ExecutorError)
+            assert failure.undelivered is True
+            assert failure.preserve_session is True
+            assert failure.code == "codex_input_too_large"
+
+    asyncio.run(run())
+
+    assert draining_client.accepted_inputs == []
+    [(_, params)] = draining_client.requests
+    items = params["input"]
+    assert items[0] == {"type": "text", "text": prompt}
+    assert len(items[1]["text"]) == len(text)
+    assert items[1] == {"type": "text", "text": text}
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == active_turn_id
+
+
+def test_text_attachment_at_input_limit_stays_inline(tmp_path: Path) -> None:
+    prompt = "inspect this file"
+    text = "a" * (1048576 - len(prompt))
+    content = [
+        {"type": "input_text", "text": prompt},
+        {
+            "type": "input_file",
+            "file_data": "data:text/plain;base64," + base64.b64encode(text.encode()).decode(),
+        },
+    ]
+
+    assert codex_native_executor._content_to_input_items(content, tmp_path) == [
+        {"type": "text", "text": prompt},
+        {"type": "text", "text": text},
+    ]
+    assert not attachment_cache_dir(tmp_path).exists()
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_oversized_authored_text_is_preserved_for_native_refusal(
+    structured: bool, tmp_path: Path
+) -> None:
+    text = "p" * 1048577
+    content = [{"type": "input_text", "text": text}] if structured else text
+
+    assert codex_native_executor._content_to_input_items(content, tmp_path) == [
+        {"type": "text", "text": text}
+    ]
+    assert not attachment_cache_dir(tmp_path).exists()
 
 
 def test_input_file_binary_is_materialized_and_referenced_by_path(

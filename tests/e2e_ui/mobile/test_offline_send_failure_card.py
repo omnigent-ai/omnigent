@@ -144,17 +144,24 @@ def test_failure_card_clears_once_reconnect_recovers_the_delivered_send(
             session_id = created.json()["id"]
 
             poll_until(lambda: _launches(host.log_path), timeout_s=30)
-            (first_runner, first_pid), *_ = _launches(host.log_path)
+            (first_runner, _first_pid), *_ = _launches(host.log_path)
             poll_until(lambda: _runner_online(client, first_runner), timeout_s=45)
 
             page.goto(f"{network.url}/c/{session_id}")
             composer = page.locator(_COMPOSER)
             expect(composer).to_be_visible(timeout=30_000)
 
-            # The session's runner goes away, so the next send relaunches one.
+            expect(page.get_by_test_id("error-pill")).to_have_count(0)
+            # The public Stop protocol marks the runner exit as intentional.
             hold = _LaunchHold(host.log_path, skip=len(_launches(host.log_path)))
-            os.kill(first_pid, signal.SIGKILL)
+            stopped = client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "stop_session", "data": {}},
+                timeout=30.0,
+            )
+            stopped.raise_for_status()
             poll_until(lambda: not _runner_online(client, first_runner), timeout_s=30)
+            expect(page.get_by_test_id("error-pill")).to_have_count(0)
 
             composer.tap()
             composer.fill(_PROMPT)

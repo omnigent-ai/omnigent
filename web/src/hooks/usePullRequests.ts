@@ -42,6 +42,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
+import { useSyncExternalStore } from "react";
 import {
   appendReviewReply,
   type ReviewComment,
@@ -229,8 +230,8 @@ export interface PullRequestCapabilities {
   details_editing?: boolean;
   /** Images and videos can be uploaded into the description; absent from older hosts. */
   attachment_uploads?: boolean;
-  /** The PR's parent in a stack and the changes since it can be read; absent from older hosts. */
-  stacked_prs?: boolean;
+  /** The PR's commits can be listed and read one at a time; absent from older hosts. */
+  commit_history?: boolean;
 }
 
 /** Why the panel can't show pull request content.
@@ -739,19 +740,28 @@ export interface PullRequestDiffResponse {
   message?: string;
 }
 
-async function fetchPullRequestDiff(
+/** GET one patch resource of the session's GitHub panel: the whole PR, or one commit. */
+async function fetchPullRequestPatch(
   conversationId: string,
-  prUrl?: string,
-  revision?: string,
+  resource: "diff" | "commit-diff",
+  query: string,
 ): Promise<PullRequestDiffResponse> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff${pinnedPrQuery(prUrl, revision)}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/${resource}${query}`,
   );
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
   }
   if (!res.ok) throw await errorFromResponse(res);
   return (await res.json()) as PullRequestDiffResponse;
+}
+
+async function fetchPullRequestDiff(
+  conversationId: string,
+  prUrl?: string,
+  revision?: string,
+): Promise<PullRequestDiffResponse> {
+  return fetchPullRequestPatch(conversationId, "diff", pinnedPrQuery(prUrl, revision));
 }
 
 /**
@@ -779,112 +789,143 @@ export function usePullRequestDiff(
   });
 }
 
-/** The PR this one is stacked on, found from its base branch, commits or description. */
-export interface PullRequestStackParent {
-  /** Null when only the description's stack link names the parent's head. */
-  number: number | null;
-  url: string | null;
-  title: string | null;
-  /** "OPEN" or "MERGED", or null when unknown. */
-  state: string | null;
-  head_sha: string;
-  /** `base_branch` stacks already diff against the parent, so they offer no PR-only view. */
-  source: "base_branch" | "commit" | "description";
+/** One commit of the pull request, as the Commits view lists it. */
+export interface PullRequestCommit {
+  object: "session.github.commit";
+  sha: string;
+  /** The first line of the commit message. */
+  title: string;
+  author: string | null;
+  /** The git author date, ISO 8601. */
+  date: string | null;
 }
 
-export interface PullRequestStack {
-  object: "session.github.pr_stack";
-  head_sha: string;
-  parent: PullRequestStackParent | null;
-}
+/** The most commits the server lists for one pull request (GitHub's own limit). */
+export const PULL_REQUEST_COMMITS_LIMIT = 250;
 
-/** The PR's own changes: its parent's head compared with its head. */
-export interface PullRequestStackDiff {
-  object: "session.github.pr_stack_diff";
-  patch: string;
-  files: PullRequestChangedFile[];
-  has_more: boolean;
-  warning?: string;
-  head_sha: string;
-  parent_sha: string;
-}
-
-/** Whether a 404 is the bare "not found" of a host or server that predates the route. */
-export function isMissingRoute(message: string): boolean {
-  return /^(404\b.*|(resource( 'github')? )?not found)$/i.test(message.trim());
-}
-
-async function fetchPinnedPullRequestResource<T>(
-  conversationId: string,
-  resource: string,
-  query: Record<string, string>,
-): Promise<T | null> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/${resource}?${new URLSearchParams(query)}`,
-  );
-  if (res.status === 404) {
-    const error = await errorFromResponse(res);
-    if (isMissingRoute(error.message)) return null;
-    throw error;
+/**
+ * The server or runner predates the commit routes. A 404 is the only answer they give to a commit
+ * read; every other failure is a 400, 502 or 503 and keeps its own error.
+ */
+export class PullRequestCommitsUnsupportedError extends Error {
+  constructor() {
+    super(
+      "This Omnigent server doesn't support pull request commits. Update it to browse commits.",
+    );
   }
+}
+
+// PRs whose server lacks the commit routes, kept for the page's life so the switch stays hidden.
+const commitsUnsupportedPrs = new Set<string>();
+const commitsUnsupportedListeners = new Set<() => void>();
+
+function commitsKey(conversationId: string, prUrl: string | undefined): string {
+  return JSON.stringify([conversationId, prUrl ?? ""]);
+}
+
+/** Classifies a failed commit read: a 404 marks the PR unsupported, and any other error passes through. */
+function commitReadError(error: unknown, conversationId: string, prUrl: string): unknown {
+  if (!(error instanceof PullRequestApiError) || error.status !== 404) return error;
+  commitsUnsupportedPrs.add(commitsKey(conversationId, prUrl));
+  for (const listener of commitsUnsupportedListeners) listener();
+  return new PullRequestCommitsUnsupportedError();
+}
+
+/** Whether this PR's server lacks the commit routes, so its Commits view is unavailable. */
+export function usePullRequestCommitsUnsupported(
+  conversationId: string | undefined,
+  prUrl: string | undefined,
+): boolean {
+  return useSyncExternalStore(
+    (listener) => {
+      commitsUnsupportedListeners.add(listener);
+      return () => {
+        commitsUnsupportedListeners.delete(listener);
+      };
+    },
+    () => commitsUnsupportedPrs.has(commitsKey(conversationId ?? "", prUrl)),
+  );
+}
+
+export interface PullRequestCommitsResult {
+  object: "list";
+  /** Oldest first; at most {@link PULL_REQUEST_COMMITS_LIMIT}, with `has_more` when the PR has more. */
+  data: PullRequestCommit[];
+  has_more: boolean;
+}
+
+async function fetchPullRequestCommits(
+  conversationId: string,
+  prUrl: string,
+  headSha: string,
+): Promise<PullRequestCommitsResult> {
+  const query = new URLSearchParams({ pr_url: prUrl, head_sha: headSha });
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/commits?${query}`,
+  );
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
   }
-  if (!res.ok) throw await errorFromResponse(res);
-  return (await res.json()) as T;
+  if (!res.ok) throw commitReadError(await errorFromResponse(res), conversationId, prUrl);
+  return (await res.json()) as PullRequestCommitsResult;
 }
 
 /**
- * Find the PR's parent in its stack at `headSha`. Resolves to null when the host
- * predates stacks. The answer is reused for five minutes, since parents change rarely.
+ * The PR's commit list, pinned to the head the Changes list shows. Enabled only
+ * once that head is known, so the list and the file list describe one revision.
  */
-export function usePullRequestStack(
+export function usePullRequestCommits(
   conversationId: string | undefined,
   prUrl: string | undefined,
-  headSha: string | undefined,
+  headSha: string | null,
   enabled: boolean,
 ) {
   const serveable = useWorkspaceServeable(conversationId);
   const retry = useRunnerOfflineRetry(serveable !== false);
   return useQuery({
-    queryKey: ["github-pr-stack", conversationId, prUrl, headSha],
-    queryFn: () =>
-      fetchPinnedPullRequestResource<PullRequestStack>(conversationId!, "stack", {
-        pr_url: prUrl!,
-        head_sha: headSha!,
-      }),
+    queryKey: ["github-pr-commits", conversationId, prUrl, headSha],
+    queryFn: () => fetchPullRequestCommits(conversationId!, prUrl!, headSha!),
     enabled: enabled && !!conversationId && !!prUrl && !!headSha && serveable !== false,
     retry,
     retryDelay: runnerOfflineRetryDelay,
-    staleTime: 5 * 60_000,
+    staleTime: 30_000,
     gcTime: 30 * 60_000,
   });
 }
 
-/** Fetch the changes from the parent's head to the PR's head, for the PR-only view. */
-export function usePullRequestStackDiff(
+async function fetchPullRequestCommitDiff(
+  conversationId: string,
+  prUrl: string,
+  commitSha: string,
+): Promise<PullRequestDiffResponse> {
+  const query = new URLSearchParams({ pr_url: prUrl, commit_sha: commitSha });
+  return fetchPullRequestPatch(conversationId, "commit-diff", `?${query}`).catch(
+    (error: unknown) => {
+      throw commitReadError(error, conversationId, prUrl);
+    },
+  );
+}
+
+/**
+ * One commit's patch, read by its full id. Enabled only while a commit is open.
+ * A commit's patch never changes, so it stays fresh for the whole cache lifetime.
+ */
+export function usePullRequestCommitDiff(
   conversationId: string | undefined,
   prUrl: string | undefined,
-  headSha: string | undefined,
-  parentSha: string | undefined,
-  enabled: boolean,
+  commitSha: string | null,
 ) {
   const serveable = useWorkspaceServeable(conversationId);
   const retry = useRunnerOfflineRetry(serveable !== false);
   return useQuery({
-    queryKey: ["github-pr-stack-diff", conversationId, prUrl, headSha, parentSha],
-    queryFn: () =>
-      fetchPinnedPullRequestResource<PullRequestStackDiff>(conversationId!, "stack-diff", {
-        pr_url: prUrl!,
-        head_sha: headSha!,
-        parent_sha: parentSha!,
-      }),
-    enabled:
-      enabled && !!conversationId && !!prUrl && !!headSha && !!parentSha && serveable !== false,
+    queryKey: ["github-pr-commit-diff", conversationId, prUrl, commitSha],
+    queryFn: () => fetchPullRequestCommitDiff(conversationId!, prUrl!, commitSha!),
+    enabled: !!conversationId && !!prUrl && !!commitSha && serveable !== false,
     retry,
     retryDelay: runnerOfflineRetryDelay,
-    // Both ends are fixed commits, so the comparison never changes.
-    staleTime: Infinity,
+    // Only a response that carries the patch is final; an unavailable one is retried like any other.
+    staleTime: (query) =>
+      query.state.data && !query.state.data.unavailable_reason ? Infinity : 30_000,
     gcTime: 30 * 60_000,
   });
 }

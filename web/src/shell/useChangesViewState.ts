@@ -10,35 +10,46 @@ export interface FindState {
   regex: boolean;
 }
 
+/** What the Changes tab shows: the PR's changed files, its commit list, or one commit's patch. */
+export type ChangesMode = "changes" | "commits" | "commit";
+
 interface ChangesView {
   pathFilter: string;
   hideViewed: boolean;
+  /** The commit list's search, kept while the reader moves between commits and the list. */
+  commitQuery: string;
+  /** The Changes tab's source; `commit` needs `commitSha`. */
+  mode: ChangesMode;
+  commitSha: string | null;
   /** Files expanded temporarily (find, deep links), apart from the reader's collapse state. */
   revealedPaths: ReadonlySet<string>;
   find: FindState;
   /** The head whose "changed files lost their viewed marks" notice the reader dismissed. */
   dismissedResetHead: string | null;
-  /** Show only a stacked PR's own changes instead of the whole diff against its base. */
-  ownChangesOnly: boolean;
 }
 
 export interface ChangesViewState extends ChangesView {
   setPathFilter: (query: string) => void;
+  setCommitQuery: (query: string) => void;
   setHideViewed: (hide: boolean) => void;
   reveal: (path: string) => void;
   clearReveal: (path: string) => void;
   setFind: (patch: Partial<FindState>) => void;
   setDismissedResetHead: (head: string | null) => void;
-  setOwnChangesOnly: (ownChangesOnly: boolean) => void;
+  /** Shows the changed files or the commit list, leaving any open commit. */
+  setMode: (mode: "changes" | "commits") => void;
+  openCommit: (commitSha: string) => void;
 }
 
 const EMPTY_VIEW: ChangesView = {
   pathFilter: "",
   hideViewed: false,
+  commitQuery: "",
+  mode: "changes",
+  commitSha: null,
   revealedPaths: new Set(),
   find: { open: false, query: "", matchCase: false, regex: false },
   dismissedResetHead: null,
-  ownChangesOnly: false,
 };
 // Never evicted: records are small and per PR; add eviction if this grows.
 const views = new Map<string, ChangesView>();
@@ -72,12 +83,14 @@ export function useChangesViewState(conversationId: string, prUrl: string): Chan
   const actions = useMemo<Omit<ChangesViewState, keyof ChangesView>>(
     () => ({
       setPathFilter: (pathFilter) => update(key, () => ({ pathFilter })),
+      setCommitQuery: (commitQuery) => update(key, () => ({ commitQuery })),
       setHideViewed: (hideViewed) => update(key, () => ({ hideViewed })),
       reveal: (path) => update(key, (current) => withRevealed(current, path, true)),
       clearReveal: (path) => update(key, (current) => withRevealed(current, path, false)),
       setFind: (patch) => update(key, (current) => ({ find: { ...current.find, ...patch } })),
       setDismissedResetHead: (dismissedResetHead) => update(key, () => ({ dismissedResetHead })),
-      setOwnChangesOnly: (ownChangesOnly) => update(key, () => ({ ownChangesOnly })),
+      setMode: (mode) => update(key, () => ({ mode, commitSha: null })),
+      openCommit: (commitSha) => update(key, () => ({ mode: "commit", commitSha })),
     }),
     [key],
   );

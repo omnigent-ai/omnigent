@@ -644,59 +644,6 @@ async def test_commits_route_pins_head_and_diff_route_reads_one_commit(
     assert foreign.json()["detail"] == "That commit is not part of the selected pull request."
 
 
-async def test_stack_routes_find_the_parent_and_read_the_incremental_diff(
-    tracked: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    head, parent = "a" * 40, "c" * 40
-    pr = {
-        "head": {"sha": head, "repo": {"full_name": "example/two"}},
-        "base": {"sha": "b" * 40, "ref": "main", "repo": {"default_branch": "main"}},
-        "body": f"## \N{PANCAKES} Stacked PR\n[diff](https://x/files/{parent}..{head})",
-    }
-
-    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
-        if "--input" in args:
-            return 0, json.dumps({"data": {"repository": {"c0": None}}}), ""
-        if args[-1] == "repos/example/two/pulls/42":
-            return 0, json.dumps(pr), ""
-        if args[-1] == "repos/example/two/pulls/42/commits?per_page=100":
-            return 0, json.dumps([[{"sha": parent}, {"sha": head}]]), ""
-        assert args[-1] == f"repos/example/two/compare/{parent}...{head}"
-        if "Accept: application/vnd.github.diff" in args:
-            return 0, "own-patch", ""
-        return 0, json.dumps({"files": [{"filename": "own.py", "status": "modified"}]}), ""
-
-    monkeypatch.setattr(github, "_gh", gh)
-    app = create_runner_app(
-        runner_workspace=Path(tracked),
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://runner"
-    ) as client:
-        stack = await client.get(
-            "/v1/sessions/session/resources/github/stack",
-            params={"pr_url": B, "head_sha": head},
-        )
-        diff = await client.get(
-            "/v1/sessions/session/resources/github/stack-diff",
-            params={"pr_url": B, "head_sha": head, "parent_sha": parent},
-        )
-        unpinned = await client.get(
-            "/v1/sessions/session/resources/github/stack-diff",
-            params={"pr_url": B, "head_sha": head},
-        )
-
-    assert stack.status_code == 200, stack.text
-    assert stack.json()["parent"]["head_sha"] == parent
-    assert stack.json()["parent"]["source"] == "description"
-    assert diff.status_code == 200, diff.text
-    assert diff.json()["patch"] == "own-patch"
-    assert [entry["path"] for entry in diff.json()["files"]] == ["own.py"]
-    assert unpinned.status_code == 400
-    assert unpinned.json()["detail"] == "Expected parent_sha to be a full commit SHA"
-
-
 @pytest.fixture
 def context_api(monkeypatch: pytest.MonkeyPatch) -> dict[str, tuple[int, str, str]]:
     responses = {

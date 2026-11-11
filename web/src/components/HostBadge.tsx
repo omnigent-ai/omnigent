@@ -268,8 +268,8 @@ export function HostBadge({
   }
   if (!badge) return null;
 
-  // An offline resumable managed host is idle-stopped; reconnecting asks the
-  // server to resume it rather than handing out `omnigent host`.
+  // An offline resumable managed host is resumed by the server on reconnect,
+  // not by handing out `omnigent host`.
   const reconnectable = badge.status === "offline" && !!onReconnect;
   const statusWord = reconnectable ? RECONNECT_WORD : STATUS_WORD[badge.status];
   const title = `Host ${badge.label}, ${statusWord}`;

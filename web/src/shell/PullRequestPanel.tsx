@@ -102,8 +102,6 @@ import {
   normalizePullRequestInfo,
   usePullRequestChangedFiles,
   usePullRequestDiff,
-  usePullRequestStack,
-  usePullRequestStackDiff,
   usePullRequestInfo,
   useSetPullRequestPreference,
   useUpdateSessionPr,
@@ -124,8 +122,6 @@ import { PullRequestLabels } from "./PullRequestLabels";
 import { mergeButtonState, PullRequestMerge } from "./PullRequestMerge";
 import { PullRequestReviewers } from "./PullRequestReviewers";
 import { PanelMessage, PullRequestChangesTab } from "./PullRequestChangesTab";
-import { canShowOwnChanges, stackParentOf } from "./PullRequestStackBar";
-import { useChangesViewState } from "./useChangesViewState";
 import { IconButton } from "./PullRequestFileSection";
 
 export { LARGE_DIFF_THRESHOLD } from "./PullRequestFileSection";
@@ -1067,8 +1063,8 @@ export function PullRequestPanel({
           "github-review-threads",
           "github-changed-files",
           "github-pr-diff",
-          "github-pr-stack",
-          "github-pr-stack-diff",
+          "github-pr-commits",
+          "github-pr-commit-diff",
           "session-pull-requests",
         ].map((key) => queryClient.invalidateQueries({ queryKey: [key, conversationId] })),
       );
@@ -1541,27 +1537,6 @@ function PullRequestPanelDetails({
   // Summary (checks + PR body), Comments, and Changes (the stacked diff).
   // Summary is the landing tab — like GitHub's PR page opening on the
   // Conversation view.
-  const changesTabOpen =
-    active && activeTab === "changes" && !sandboxAsleep && serveable !== false && hasPr;
-  const stack = usePullRequestStack(
-    conversationId,
-    prUrl,
-    headSha,
-    changesTabOpen && !!info.data?.capabilities?.stacked_prs,
-  );
-  const stackParent = stackParentOf(stack);
-  // Keyed like the Changes tab's view state, which writes this toggle.
-  const ownChangesOnly = useChangesViewState(
-    conversationId,
-    prUrl ?? info.data?.pr?.url ?? "",
-  ).ownChangesOnly;
-  const stackDiff = usePullRequestStackDiff(
-    conversationId,
-    prUrl,
-    headSha,
-    stackParent?.head_sha,
-    changesTabOpen && ownChangesOnly && canShowOwnChanges(stackParent),
-  );
   const reviews = usePullRequestReviewThreads(
     conversationId,
     prUrl,
@@ -1677,21 +1652,25 @@ function PullRequestPanelDetails({
           hint={
             panelState.remoteHost ? (
               <>
-                The workspace’s remote is on{" "}
-                <span className="font-mono">{panelState.remoteHost}</span>, which isn’t a supported
-                git provider.
+                Omnigent couldn’t identify the git provider for{" "}
+                <span className="font-mono">{panelState.remoteHost}</span>.
               </>
             ) : (
-              "This workspace’s remote isn’t on a supported git provider."
+              "Omnigent couldn’t identify this workspace’s git provider."
             )
           }
-          // A GitHub Enterprise host the user never signed in to lands here.
           note={
             panelState.remoteHost && (
               <>
-                For a GitHub Enterprise host, run{" "}
+                On the execution host, run{" "}
+                <span className="font-mono">
+                  glab auth login --hostname {panelState.remoteHost}
+                </span>{" "}
+                for GitLab or{" "}
                 <span className="font-mono">gh auth login --hostname {panelState.remoteHost}</span>{" "}
-                on the host.
+                for GitHub Enterprise. For a GitHub SSH alias, run{" "}
+                <span className="font-mono">git config --local omnigent.gitprovider github</span> in
+                this checkout, then refresh for installation or sign-in help.
               </>
             )
           }
@@ -1926,8 +1905,6 @@ function PullRequestPanelDetails({
           prDiff={prDiff}
           reviews={reviews}
           identity={identity}
-          stack={info.data?.capabilities?.stacked_prs ? stack : undefined}
-          stackDiff={stackDiff}
         />
       </Tabs>
     </TooltipProvider>

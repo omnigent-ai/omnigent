@@ -306,15 +306,11 @@ async function disconnectHost(cliCommand, serverUrl) {
 
 /**
  * Ensure the CLI is authenticated for a server before connecting a host to it.
- * Local (loopback) servers need no auth. For a remote server, this asks the
- * server itself (a `GET /v1/me` probe via {@link module:omnigent_cli.probeServerAuth})
- * rather than trusting the on-disk token file — a Databricks pointer record has
- * no readable expiry, so a stale file would otherwise falsely report "authed"
- * and skip the login that should open the browser. When not authed it runs
- * `omnigent login <url>` (browser/OIDC/Databricks), which is idempotent: a
- * live-but-expired Databricks access token refreshes silently with no browser,
- * and only a dead grant opens the sign-in browser. Managed `isaac omni` hosts
- * always prepare their app-specific grant: a legacy token can pass the probe.
+ * Local (loopback) servers need no auth. For a remote server, this probes the
+ * server (via {@link module:omnigent_cli.probeServerAuth}) instead of trusting the
+ * on-disk token file, which may be stale. When not authed it runs `omnigent login <url>`,
+ * which is idempotent and opens the browser only for a dead grant. Hosts started
+ * through `isaac omni` always log in, since a legacy token can pass the probe.
  *
  * Returns ok for an already-authed unmanaged CLI, when the server is unreachable (so the connect
  * attempt can raise its own, clearer error), or after a successful login. On

@@ -8,7 +8,6 @@ import {
   computeLinkedPullRequestPollInterval,
   computePullRequestPollInterval,
   fetchPullRequestInfo,
-  isMissingRoute,
   normalizePullRequestInfo,
   pullRequestNotFoundReason,
   type PullRequestAccount,
@@ -90,21 +89,6 @@ describe("pullRequestNotFoundReason", () => {
     expect(pullRequestNotFoundReason("Resource 'terminal' not found")).toBe("no_os_env");
     expect(pullRequestNotFoundReason(undefined)).toBe("no_os_env");
     expect(pullRequestNotFoundReason("")).toBe("no_os_env");
-  });
-});
-
-describe("isMissingRoute", () => {
-  it.each(["Not Found", "Resource not found", "Resource 'github' not found", "404 Not Found"])(
-    "treats %s as a route an older host lacks",
-    (message) => expect(isMissingRoute(message)).toBe(true),
-  );
-
-  it.each([
-    "Session has no filesystem; GitHub API unavailable.",
-    "workspace directory does not exist on host",
-    "Resource 'terminal' not found",
-  ])("keeps %s, which names its reason", (message) => {
-    expect(isMissingRoute(message)).toBe(false);
   });
 });
 

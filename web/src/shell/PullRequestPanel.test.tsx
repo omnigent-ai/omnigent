@@ -53,7 +53,6 @@ const state = vi.hoisted(() => ({
   // The whole-PR diff response; the panel parses its patch into per-file diffs.
   diff: null as PullRequestDiffResponse | null,
   diffError: null as Error | null,
-  stack: { data: undefined, error: null } as { data?: unknown; error: unknown },
   canEdit: true,
   updateSessionPr: vi.fn(),
   realPrHooks: false,
@@ -131,8 +130,9 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
       error: state.diffError,
       isFetching: false,
     }),
-    usePullRequestStack: () => state.stack,
-    usePullRequestStackDiff: vi.fn(() => ({ data: undefined, error: null })),
+    usePullRequestCommits: () => ({ data: undefined, isLoading: false, error: null }),
+    usePullRequestCommitDiff: () => ({ data: undefined, isLoading: false, error: null }),
+    usePullRequestCommitsUnsupported: () => false,
     fetchPullRequestFileContents: async () => ({ before: "old", after: "new" }),
     // The account selector (shown in the repo-unresolved empty state) calls this;
     // stub the mutation shape it reads.
@@ -207,7 +207,6 @@ import {
   usePullRequestChangedFiles,
   usePullRequestRepoLabels,
   usePullRequestReviewCandidates,
-  usePullRequestStackDiff,
 } from "@/hooks/usePullRequests";
 
 import {
@@ -395,7 +394,6 @@ beforeEach(() => {
   state.parsedFiles = [{ name: "hello.py" }, { name: "src/app.ts" }];
   state.diff = { object: "session.github.pr_diff", patch: "PATCH" };
   state.diffError = null;
-  state.stack = { data: undefined, error: null };
   state.canEdit = true;
   state.repoLabels = { data: undefined, isPending: true, isError: false, error: null };
   state.updateLabels = { mutate: vi.fn(), isError: false, error: null };
@@ -1525,39 +1523,6 @@ describe("PullRequestPanel", () => {
     expect(localStorage.getItem(key)).toContain("hello.py");
   });
 
-  it("fetches the PR's own changes once This PR only is on", async () => {
-    const url = state.info!.data!.pr!.url;
-    state.info!.data!.pr!.head_sha = "head";
-    state.info!.data!.selected_pr_url = url;
-    state.info!.data!.capabilities = {
-      account_switching: false,
-      base_remote_selection: false,
-      line_counts: false,
-      linked_pr_diff: false,
-      stacked_prs: true,
-    };
-    state.stack = {
-      data: {
-        parent: {
-          number: 41,
-          url: "",
-          title: "Parent",
-          state: "OPEN",
-          head_sha: "parent",
-          source: "commit",
-        },
-      },
-      error: null,
-    };
-    const stackDiff = vi.mocked(usePullRequestStackDiff);
-    renderChanges();
-    expect(stackDiff).toHaveBeenLastCalledWith("conv_1", url, "head", "parent", false);
-
-    fireEvent.click(await screen.findByRole("button", { name: "This PR only" }));
-
-    expect(stackDiff).toHaveBeenLastCalledWith("conv_1", url, "head", "parent", true);
-  });
-
   it("stacks a diff section per changed file", async () => {
     renderChanges();
     const diffs = await screen.findAllByTestId("diff");
@@ -1876,30 +1841,40 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByText("GitHub")).toBeNull();
   });
 
-  it("tells a GitHub Enterprise user to sign in to the remote's host", () => {
-    state.info = {
-      data: {
-        object: "session.github.info",
-        available: false,
-        reason: "unsupported_remote",
-        remote_host: "git.example.com",
-        provider: null,
-      },
-      isLoading: false,
-      error: null,
-      isFetching: false,
-    };
-    renderPanel();
-    // A second line under the sentence about the host; the command is set as code.
-    const hint = screen.getByText(/which isn’t a supported/);
-    const note = screen.getByText(/For a GitHub Enterprise host, run/);
-    expect(note).not.toBe(hint);
-    expect(hint.compareDocumentPosition(note) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(note).toHaveTextContent(
-      "For a GitHub Enterprise host, run gh auth login --hostname git.example.com on the host.",
-    );
-    expect(screen.getByText("gh auth login --hostname git.example.com")).toHaveClass("font-mono");
-  });
+  it.each(["git.example.com", "github.com-work"])(
+    "shows provider setup for unrecognized host %s",
+    (remoteHost) => {
+      state.info = {
+        data: {
+          object: "session.github.info",
+          available: false,
+          reason: "unsupported_remote",
+          remote_host: remoteHost,
+          provider: null,
+        },
+        isLoading: false,
+        error: null,
+        isFetching: false,
+      };
+      renderPanel();
+      // A second line under the sentence about the host; commands are set as code.
+      const hint = screen.getByText(/couldn’t identify the git provider/);
+      const note = screen.getByText(/On the execution host, run/);
+      expect(note).not.toBe(hint);
+      expect(hint.compareDocumentPosition(note) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(note).toHaveTextContent(
+        `On the execution host, run glab auth login --hostname ${remoteHost} for GitLab or gh auth login --hostname ${remoteHost} for GitHub Enterprise.`,
+      );
+      expect(screen.getByText(`glab auth login --hostname ${remoteHost}`)).toHaveClass("font-mono");
+      expect(screen.getByText(`gh auth login --hostname ${remoteHost}`)).toHaveClass("font-mono");
+      expect(note).toHaveTextContent(
+        "For a GitHub SSH alias, run git config --local omnigent.gitprovider github in this checkout, then refresh for installation or sign-in help.",
+      );
+      expect(screen.getByText("git config --local omnigent.gitprovider github")).toHaveClass(
+        "font-mono",
+      );
+    },
+  );
 
   it("leaves out the sign-in line when the remote's host is unknown", () => {
     state.info = {
@@ -1915,10 +1890,11 @@ describe("PullRequestPanel", () => {
     };
     renderPanel();
     expect(
-      screen.getByText("This workspace’s remote isn’t on a supported git provider."),
+      screen.getByText("Omnigent couldn’t identify this workspace’s git provider."),
     ).toBeInTheDocument();
     expect(screen.queryByText(/GitHub Enterprise/)).toBeNull();
     expect(screen.queryByText(/gh auth login/)).toBeNull();
+    expect(screen.queryByText(/glab auth login/)).toBeNull();
   });
 
   describe("header when no provider is known", () => {
@@ -2118,6 +2094,30 @@ describe("PullRequestPanel", () => {
       expect(screen.getByText("glab")).toHaveClass("font-mono");
       expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
       expect(screen.queryByText(/GitHub/)).toBeNull();
+    });
+
+    it("shows a GitLab merge request authenticated by a token without a CLI", () => {
+      const { repo, pr } = state.info!.data!;
+      state.info!.data = {
+        ...gitlab({ cli: null }),
+        repo,
+        pr: { ...pr!, url: "https://git.example.com/acme/app/-/merge_requests/6000" },
+      };
+      renderPanel();
+      expect(screen.getByText("chore: dummy PR")).toBeInTheDocument();
+      expect(screen.queryByText(/CLI not found/)).toBeNull();
+    });
+
+    it("shows the GitLab token error without asking to install a CLI", () => {
+      state.info!.data = gitlab({
+        authenticated: false,
+        cli: null,
+        hint: "Check `GITLAB_TOKEN` on the execution host.",
+      });
+      renderPanel();
+      expect(screen.getByText("Can’t reach the upstream repo")).toBeInTheDocument();
+      expect(screen.getByText("GITLAB_TOKEN")).toHaveClass("font-mono");
+      expect(screen.queryByText(/CLI not found/)).toBeNull();
     });
 
     it("shows the host's sign-in hint when the repo can't be reached", () => {
@@ -2468,8 +2468,8 @@ describe("PullRequestPanel", () => {
       "github-review-threads",
       "github-changed-files",
       "github-pr-diff",
-      "github-pr-stack",
-      "github-pr-stack-diff",
+      "github-pr-commits",
+      "github-pr-commit-diff",
       "session-pull-requests",
     ]);
   });
