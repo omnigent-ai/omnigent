@@ -3937,6 +3937,7 @@ function FilterMenuSub({
       <DropdownMenuItem
         className="mobile-touch-target"
         data-testid="session-filter-menu-back"
+        aria-label={`Back from ${label}`}
         onSelect={(event) => {
           event.preventDefault();
           pages.setOpen(null);

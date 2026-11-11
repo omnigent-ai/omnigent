@@ -4324,7 +4324,9 @@ describe("Sidebar view options", () => {
 
       fireEvent.click(within(menu).getByTestId("session-grouping-menu"));
       expect(screen.getAllByRole("menu")).toEqual([menu]);
-      expect(within(menu).getByTestId("session-filter-menu-back")).toHaveTextContent("Grouping");
+      expect(within(menu).getByRole("menuitem", { name: "Back from Grouping" })).toHaveTextContent(
+        "Grouping",
+      );
       expect(within(menu).getByRole("menuitemradio", { name: "Harness" })).toBeInTheDocument();
       expect(within(menu).queryByTestId("session-ordering-menu")).toBeNull();
 
@@ -4343,6 +4345,10 @@ describe("Sidebar view options", () => {
         show: ["branch"],
       });
       // Reopening starts from the main list, not the last submenu.
+      const reopened = openMenu();
+      fireEvent.click(within(reopened).getByTestId("session-grouping-menu"));
+      fireEvent.keyDown(reopened, { key: "Escape" });
+      expect(screen.queryByRole("menu")).toBeNull();
       expect(within(openMenu()).getByTestId("session-grouping-menu")).toBeInTheDocument();
     } finally {
       matchMedia.mockRestore();
