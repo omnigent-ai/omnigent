@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.scheduled import session_triggers
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.server.conftest import ControllableMockClient
 from tests.server.integration import test_scheduled_tasks_routes as routes_tests
 from tests.server.integration.test_scheduled_tasks_routes import (
@@ -224,3 +226,30 @@ async def test_a_failed_reader_lookup_does_not_stop_a_session_delete(
     assert sent == []
     runs = (await client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())).json()
     assert runs["runs"] == []
+
+
+async def test_the_inbox_lists_an_event_automations_failure_only_to_opted_in_clients(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    created = await client.post("/v1/scheduled-tasks", json=_trigger_body(), headers=_headers())
+    task_id = created.json()["id"]
+    run_id = uuid.uuid4().hex
+    SqlAlchemyScheduledTaskStore(db_uri).create_run(
+        run_id=run_id,
+        scheduled_task_id=task_id,
+        status="failed",
+        scheduled_at=100,
+        finished_at=101,
+        error_code="host_offline",
+    )
+    # An older client opens an Inbox item's task, which it would get as 404.
+    older = await client.get("/v1/scheduled-tasks/inbox", headers=_headers())
+    assert older.status_code == 200, older.text
+    assert older.json()["data"] == []
+    current = await client.get("/v1/scheduled-tasks/inbox?event_triggers=1", headers=_headers())
+    assert [(item["task_id"], item["run_id"]) for item in current.json()["data"]] == [
+        (task_id, run_id)
+    ]
+    url = f"/v1/scheduled-tasks/{task_id}"
+    assert (await client.get(url, headers=_headers())).status_code == 404
+    assert (await client.get(f"{url}?event_triggers=1", headers=_headers())).status_code == 200

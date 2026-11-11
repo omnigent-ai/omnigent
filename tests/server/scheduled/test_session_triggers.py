@@ -122,6 +122,31 @@ def test_filters_narrow_the_sessions_that_fire(stores: _Stores) -> None:
     assert [e["session_id"] for e in stores.events(by_project)] == [match.id]
 
 
+def test_one_tasks_recording_failure_leaves_later_matches_their_run(
+    monkeypatch: pytest.MonkeyPatch, stores: _Stores
+) -> None:
+    first, second = stores.task(), stores.task()
+    conv = stores.session()
+    record = stores.tasks.record_event_run
+    failed: list[str] = []
+
+    def fail_first(task: ScheduledTask, **kwargs: Any) -> Any:
+        if not failed:
+            failed.append(task.id)
+            raise RuntimeError("store unavailable")
+        return record(task, **kwargs)
+
+    monkeypatch.setattr(stores.tasks, "record_event_run", fail_first)
+    _notify("turn.completed", conv.id, occurrence="r1")
+    [failed_id] = failed
+    [recorded] = [t for t in (first, second) if t.id != failed_id]
+    assert [e["session_id"] for e in stores.events(recorded)] == [conv.id]
+    assert stores.events(first if failed_id == first.id else second) == []
+    # The worker keeps serving: the next event reaches both tasks.
+    _notify("turn.completed", conv.id, occurrence="r2")
+    assert len(stores.events(first)) + len(stores.events(second)) == 3
+
+
 def test_events_without_an_occurrence_never_collide(
     stores: _Stores, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -354,7 +354,9 @@ describe("error path", () => {
 it("requests bounded automation Inbox pages and preserves empty continuations", async () => {
   fetchMock.mockResolvedValue(mockResponse({ data: [], next_cursor: "100:task" }));
   expect(await listAutomationFailures(null)).toEqual({ data: [], nextCursor: "100:task" });
-  expect(String(fetchMock.mock.calls[0]![0])).toBe("/v1/scheduled-tasks/inbox?limit=50");
+  expect(String(fetchMock.mock.calls[0]![0])).toBe(
+    "/v1/scheduled-tasks/inbox?limit=50&event_triggers=1",
+  );
   fetchMock.mockResolvedValue(
     mockResponse({
       data: [
@@ -384,7 +386,7 @@ it("requests bounded automation Inbox pages and preserves empty continuations", 
     nextCursor: null,
   });
   expect(String(fetchMock.mock.calls[1]![0])).toBe(
-    "/v1/scheduled-tasks/inbox?limit=50&after=100%3Atask",
+    "/v1/scheduled-tasks/inbox?limit=50&after=100%3Atask&event_triggers=1",
   );
 });
 

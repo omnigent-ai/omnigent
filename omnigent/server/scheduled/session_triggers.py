@@ -50,7 +50,7 @@ SessionEventType = Literal[
 ]
 SESSION_EVENT_TYPES: tuple[str, ...] = get_args(SessionEventType)
 
-# A loop between automations, or a burst of turns, stops at this many accepted events a minute.
+# Limits new event runs per task over a rolling minute; coalesced events may exceed this.
 MAX_EVENT_RUNS_PER_MINUTE = 10
 # Tasks read per query while listing a workspace's session-triggered tasks.
 _TASK_PAGE_SIZE = 500
@@ -395,44 +395,70 @@ def _record(
     document = event.document(conv)
     now = int(time.time())
     for task, config in matched:
-        if not config.matches(event.type, conv):
-            continue
-        if not config.include_own_sessions and _is_own_session(task, conv, root):
-            continue
-        # Single-user servers have no grants: every session is the owner's.
-        if task.user_id is not None and wiring.permission_store is not None:
-            if readers is not None:
-                if task.user_id not in readers:
-                    continue
-            elif not _holds_grant(wiring, task.user_id, root_id):
-                continue
-        trigger_key = event.trigger_key
-        outcome = wiring.scheduled_task_store.record_event_run(
-            task,
-            now=now,
+        try:
+            _record_for_task(
+                wiring, task, config, event, conv, root, root_id, readers, document, now
+            )
+        except Exception:
+            # One task's failure (a store error, a bad row) must not cost later matches their run.
+            _logger.exception(
+                "Recording session event %s on %s for task %s failed",
+                event.type,
+                event.session_id,
+                task.id,
+            )
+
+
+def _record_for_task(
+    wiring: _Wiring,
+    task: ScheduledTask,
+    config: SessionTriggerConfig,
+    event: SessionEvent,
+    conv: Conversation,
+    root: Conversation,
+    root_id: str,
+    readers: frozenset[str] | None,
+    document: dict[str, Any],
+    now: int,
+) -> None:
+    if not config.matches(event.type, conv):
+        return
+    if not config.include_own_sessions and _is_own_session(task, conv, root):
+        return
+    # Single-user servers have no grants: every session is the owner's.
+    if task.user_id is not None and wiring.permission_store is not None:
+        if readers is not None:
+            if task.user_id not in readers:
+                return
+        elif not _holds_grant(wiring, task.user_id, root_id):
+            return
+    trigger_key = event.trigger_key
+    outcome = wiring.scheduled_task_store.record_event_run(
+        task,
+        now=now,
+        trigger_key=trigger_key,
+        host_id=occurrence_host_id(task, trigger_key),
+        event=document,
+        coalesce=task.session_mode == "continue",
+        max_runs_per_minute=MAX_EVENT_RUNS_PER_MINUTE,
+    )
+    log = _logger.warning if outcome == "rate_limited" else _logger.info
+    log(
+        "Session event %s on %s for task %s: %s",
+        event.type,
+        event.session_id,
+        task.id,
+        outcome,
+        extra=debug_event(
+            "scheduled_event_run_recorded",
+            task_id=task.id,
+            task_workspace_id=task.workspace_id,
             trigger_key=trigger_key,
-            host_id=occurrence_host_id(task, trigger_key),
-            event=document,
-            coalesce=task.session_mode == "continue",
-            max_runs_per_minute=MAX_EVENT_RUNS_PER_MINUTE,
-        )
-        log = _logger.warning if outcome == "rate_limited" else _logger.info
-        log(
-            "Session event %s on %s for task %s: %s",
-            event.type,
-            event.session_id,
-            task.id,
-            outcome,
-            extra=debug_event(
-                "scheduled_event_run_recorded",
-                task_id=task.id,
-                task_workspace_id=task.workspace_id,
-                trigger_key=trigger_key,
-                event_type=event.type,
-                session_id=event.session_id,
-                outcome=outcome,
-            ),
-        )
+            event_type=event.type,
+            session_id=event.session_id,
+            outcome=outcome,
+        ),
+    )
 
 
 def render_event_prompt(prompt: str, event: dict[str, Any] | None) -> str:

@@ -384,14 +384,13 @@ def _validate_trigger_or_400(
     return config.model_dump(exclude_none=True)
 
 
-def _reads_event_triggers(request: Request) -> bool:
-    """Whether the caller asked for event-triggered tasks, which have no ``rrule``.
-
-    Clients loaded before event triggers existed expect every task to have a rule
-    and cannot show one without it, so lists and reads omit such tasks unless the
-    client sends ``event_triggers=1``.
-    """
-    return request.query_params.get("event_triggers") in {"1", "true"}
+# Clients loaded before event triggers existed expect every task to have a rule and
+# cannot show one without it, so lists, reads and the Inbox feed omit such tasks
+# unless the client asks for them.
+_EVENT_TRIGGERS_QUERY = Query(
+    default=False,
+    description="Include event-triggered automations, which have no rrule.",
+)
 
 
 def _validate_timezone_or_400(timezone: str) -> None:
@@ -1057,7 +1056,9 @@ def create_scheduled_tasks_router(
         )
 
     @router.get("/scheduled-tasks")
-    async def list_scheduled_tasks(request: Request) -> dict[str, list[dict[str, Any]]]:
+    async def list_scheduled_tasks(
+        request: Request, event_triggers: bool = _EVENT_TRIGGERS_QUERY
+    ) -> dict[str, list[dict[str, Any]]]:
         """List the caller's scheduled tasks.
 
         Lazy-on-read stale backstop: before returning, force-fail any of this
@@ -1072,7 +1073,7 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         tasks = [t for t in store.list(owner_user_id=owner_id) if _owns_task(t, owner_id)]
-        if not _reads_event_triggers(request):
+        if not event_triggers:
             tasks = [t for t in tasks if t.rrule is not None]
         task_ids = [t.id for t in tasks]
         running = store.list_running_runs_for_tasks(task_ids)
@@ -1096,6 +1097,7 @@ def create_scheduled_tasks_router(
         request: Request,
         limit: int = Query(default=50, ge=1, le=100),
         after: str | None = Query(default=None, max_length=64),
+        event_triggers: bool = _EVENT_TRIGGERS_QUERY,
     ) -> AutomationFailurePage:
         """Latest sessionless failures; session-linked failures use the session Inbox."""
         owner = _owner(request)
@@ -1117,6 +1119,7 @@ def create_scheduled_tasks_router(
             check_generation=current_account_user() is not None,
             after=cursor,
             limit=limit,
+            include_event_triggered=event_triggers,
         )
         return AutomationFailurePage(
             data=failures,
@@ -1127,12 +1130,13 @@ def create_scheduled_tasks_router(
     async def get_scheduled_task(
         request: Request,
         scheduled_task_id: str,
+        event_triggers: bool = _EVENT_TRIGGERS_QUERY,
     ) -> dict[str, Any]:
         """Fetch one of the caller's scheduled tasks."""
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         task = _require_owned(scheduled_task_id, owner_id)
-        if task.rrule is None and not _reads_event_triggers(request):
+        if task.rrule is None and not event_triggers:
             raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         running = store.list_running_runs_for_tasks([task.id])
         force_fail_stale_runs(store, running)

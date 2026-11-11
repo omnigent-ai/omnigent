@@ -899,6 +899,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         check_generation: bool = False,
         after: tuple[int, str] | None = None,
         limit: int = 50,
+        include_event_triggered: bool = True,
     ) -> tuple[builtins.list[AutomationFailure], tuple[int, str] | None]:
         """Bound discovery by the owner/task index, then read one indexed run/task."""
         if not 1 <= limit <= 100:
@@ -911,6 +912,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 SqlScheduledTask.state,
                 SqlScheduledTask.account_generation,
                 SqlScheduledTask.user_id,
+                SqlScheduledTask.trigger_provider,
             ).where(
                 SqlScheduledTask.workspace_id == current_workspace_id(),
                 SqlScheduledTask.user_id == owner_user_id,
@@ -935,6 +937,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     task.user_id != owner_user_id
                     or task.state == encode_scheduled_task_state("deleted")
                     or (check_generation and task.account_generation != generation)
+                    or (not include_event_triggered and task.trigger_provider is not None)
                 ):
                     continue
                 run = session.execute(
