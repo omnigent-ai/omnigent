@@ -305,6 +305,20 @@ def _forget_service(service: HostService) -> None:
         ) from exc
 
 
+def validate_user_host_service(
+    server_url: str | None,
+    *,
+    environment: Mapping[str, str],
+) -> None:
+    """Raise :class:`HostServiceError` if the host service cannot be defined.
+
+    :param server_url: Remote server URL, or ``None`` for local mode.
+    :param environment: Environment the service would persist.
+    """
+    _service_for_current_platform()
+    _service_command(server_url, _clean_environment(environment))
+
+
 def enable_user_host_service(
     server_url: str | None,
     *,

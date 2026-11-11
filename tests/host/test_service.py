@@ -235,21 +235,57 @@ def test_wrapper_launched_service_survives_interpreter_cache_cleanup(
     ]
 
 
-def test_service_refuses_wrapper_missing_from_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("configured", "wrapper_mode", "error"),
+    [
+        pytest.param("wrapper omni", None, "Cannot find 'wrapper'", id="missing"),
+        pytest.param("wrapper omni", 0o644, "Cannot find 'wrapper'", id="not-executable"),
+        pytest.param(
+            "wrapper 'omni", 0o755, "Cannot parse OMNIGENT_WRAPPER_COMMAND", id="bad-quote"
+        ),
+    ],
+)
+def test_service_refuses_unusable_wrapper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str,
+    wrapper_mode: int | None,
+    error: str,
 ) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     monkeypatch.setattr(service.platform, "system", lambda: "Linux")
     calls = _capture_runs(monkeypatch)
+    if wrapper_mode is not None:
+        (tmp_path / "wrapper").write_text("#!/bin/sh\n")
+        (tmp_path / "wrapper").chmod(wrapper_mode)
+    environment = {"PATH": str(tmp_path), "OMNIGENT_WRAPPER_COMMAND": configured}
 
-    with pytest.raises(service.HostServiceError, match="Cannot find 'wrapper'"):
-        service.enable_user_host_service(
-            None,
-            environment={"PATH": str(tmp_path), "OMNIGENT_WRAPPER_COMMAND": "wrapper omni"},
-        )
+    with pytest.raises(service.HostServiceError, match=error):
+        service.validate_user_host_service(None, environment=environment)
+    with pytest.raises(service.HostServiceError, match=error):
+        service.enable_user_host_service(None, environment=environment)
 
     assert calls == []
     assert not (tmp_path / "xdg/systemd/user/omnigent-host.service").exists()
+
+
+@pytest.mark.parametrize("by_path", [False, True], ids=["path-lookup", "absolute-path"])
+def test_wrapper_command_keeps_quoted_words(tmp_path: Path, by_path: bool) -> None:
+    wrapper = tmp_path / "tool dir" / "my wrapper"
+    wrapper.parent.mkdir()
+    wrapper.write_text("#!/bin/sh\n")
+    wrapper.chmod(0o755)
+    executable = shlex.quote(str(wrapper) if by_path else wrapper.name)
+
+    command = service._service_command(
+        None,
+        {
+            "PATH": str(wrapper.parent),
+            "OMNIGENT_WRAPPER_COMMAND": f"{executable} 'omni cli' --flag",
+        },
+    )
+
+    assert command == [str(wrapper), "omni cli", "--flag", "host", "service-entry", "--local"]
 
 
 def test_systemd_unit_escapes_specifiers_and_literal_dollars() -> None:
