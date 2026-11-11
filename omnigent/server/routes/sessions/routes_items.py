@@ -74,6 +74,7 @@ class _NdjsonResponse(StreamingResponse):
 
     media_type = "application/x-ndjson"
 
+
 # ``?descendants=true`` depth: the default matches the CLI tree and the web
 # Agents rail; the cap bounds the in-memory walk.
 _DEFAULT_DESCENDANT_DEPTH = 3
