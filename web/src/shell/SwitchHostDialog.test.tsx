@@ -11,7 +11,7 @@ import { useSession } from "@/hooks/useSession";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
-import { SANDBOX_PROFILES_QUERY_KEY, fetchSandboxProfiles } from "@/lib/sandboxProfilesApi";
+import { fetchSandboxProfiles } from "@/lib/sandboxProfilesApi";
 import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
 import { launchManagedHost, launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
@@ -132,6 +132,10 @@ const SANDBOX_SERVER: Partial<ServerInfo> = {
   move_to_managed_sandbox: true,
   sandbox_provider: "modal",
   sandbox_providers: ["modal"],
+  sandbox_provider_capabilities: {
+    modal: { accepts_session_move: true },
+    e2b: { accepts_session_move: true },
+  },
   request_managed_sandbox_host_id: true,
 };
 
@@ -482,76 +486,36 @@ describe("SwitchHostDialog", () => {
       expect(screen.getByTestId("mock-host-select")).toHaveValue("host_new");
     });
 
-    it("leaves out a provider that manages sandbox profiles", async () => {
-      vi.mocked(fetchSandboxProfiles).mockResolvedValue({
-        profiles: [],
-        managed_providers: ["profiled"],
-        default_profile_ids: {},
-        next_cursor: null,
-      });
-      renderDialog({
-        ...SANDBOX_SERVER,
-        sandbox_providers: ["modal", "profiled"],
-        features: { sandbox_profiles: true },
-      });
-      expect(await screen.findByTestId("switch-host-sandbox-option-modal")).toBeInTheDocument();
-      expect(screen.queryByTestId("switch-host-sandbox-option-profiled")).toBeNull();
-    });
+    it.each([false, true])(
+      "leaves out a provider a session can't move onto (profile discovery on: %s)",
+      (profileDiscovery) => {
+        const server = {
+          ...SANDBOX_SERVER,
+          sandbox_providers: ["modal", "profiled", "unreported"],
+          sandbox_provider_capabilities: {
+            modal: { accepts_session_move: true },
+            // Manages sandbox profiles, which the server won't move a session onto.
+            profiled: { accepts_session_move: false },
+            // Says nothing about moves, so it is left out too.
+            unreported: { multi_repo: true },
+          },
+          features: { sandbox_profiles: profileDiscovery },
+        };
+        renderDialog(server);
+        expect(screen.getByTestId("switch-host-sandbox-option-modal")).toBeInTheDocument();
+        expect(screen.queryByTestId("switch-host-sandbox-option-profiled")).toBeNull();
+        expect(screen.queryByTestId("switch-host-sandbox-option-unreported")).toBeNull();
+        cleanup();
 
-    it("offers no sandbox while it can't tell which providers use profiles", async () => {
-      vi.mocked(fetchSandboxProfiles).mockRejectedValueOnce(new Error("profiles unavailable"));
-      onlyOriginHostOnline();
-      renderDialog({
-        ...SANDBOX_SERVER,
-        sandbox_providers: ["modal", "profiled"],
-        features: { sandbox_profiles: true },
-      });
-      // Nothing to pick, so nothing can release the runner; the dialog says why.
-      expect(await screen.findByTestId("switch-host-sandboxes-unavailable")).toBeVisible();
-      expect(screen.queryByTestId("switch-host-no-targets")).toBeNull();
-      expect(screen.queryByTestId("switch-host-sandbox-option-modal")).toBeNull();
-      expect(screen.queryByTestId("switch-host-button")).toBeNull();
-      expect(updateSessionMock).not.toHaveBeenCalled();
-
-      vi.mocked(fetchSandboxProfiles).mockResolvedValueOnce({
-        profiles: [],
-        managed_providers: ["profiled"],
-        default_profile_ids: {},
-        next_cursor: null,
-      });
-      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-      expect(await screen.findByTestId("switch-host-sandbox-option-modal")).toBeInTheDocument();
-      expect(screen.queryByTestId("switch-host-sandbox-option-profiled")).toBeNull();
-    });
-
-    it("offers no sandbox when refreshing a cached profile catalog fails", async () => {
-      onlyOriginHostOnline();
-      const client = renderDialog({
-        ...SANDBOX_SERVER,
-        sandbox_providers: ["modal", "profiled"],
-        features: { sandbox_profiles: true },
-      });
-      expect(await screen.findByTestId("switch-host-sandbox-option-modal")).toBeInTheDocument();
-
-      // The cached catalog may predate a provider starting to require profiles.
-      vi.mocked(fetchSandboxProfiles).mockRejectedValueOnce(new Error("profiles unavailable"));
-      await act(async () => {
-        await client.refetchQueries({ queryKey: [...SANDBOX_PROFILES_QUERY_KEY, null] });
-      });
-
-      expect(await screen.findByTestId("switch-host-sandboxes-unavailable")).toBeVisible();
-      expect(screen.queryByTestId("switch-host-sandbox-option-modal")).toBeNull();
-      expect(screen.queryByTestId("switch-host-button")).toBeNull();
-      expect(updateSessionMock).not.toHaveBeenCalled();
-    });
-
-    it("says it is checking the sandboxes while profile discovery runs", async () => {
-      vi.mocked(fetchSandboxProfiles).mockReturnValue(new Promise(() => {}));
-      onlyOriginHostOnline();
-      renderDialog({ ...SANDBOX_SERVER, features: { sandbox_profiles: true } });
-      expect(await screen.findByTestId("switch-host-sandboxes-checking")).toBeVisible();
-      expect(screen.queryByTestId("switch-host-no-targets")).toBeNull();
-    });
+        // With nothing else to pick, nothing can release the runner.
+        onlyOriginHostOnline();
+        renderDialog({ ...server, sandbox_providers: ["profiled", "unreported"] });
+        expect(screen.getByTestId("switch-host-no-targets")).toBeVisible();
+        expect(screen.queryByTestId("switch-host-button")).toBeNull();
+        expect(updateSessionMock).not.toHaveBeenCalled();
+        expect(fetchSandboxProfiles).not.toHaveBeenCalled();
+      },
+    );
 
     it("moves the session onto a new sandbox after releasing its runner", async () => {
       conversationRegistry.acquire("conv_1");

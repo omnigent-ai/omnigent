@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import { AlertTriangleIcon, GitBranchIcon, MonitorCloudIcon } from "lucide-react";
 import {
   Dialog,
@@ -31,15 +31,10 @@ import { useSession } from "@/hooks/useSession";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import {
-  sandboxOptionLabel,
-  sandboxProfilesEnabled,
-  sandboxProviderOptions,
-} from "@/lib/capabilities";
+import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
 import { randomUUID } from "@/lib/randomUUID";
 import { composeSandboxWorkspace, sandboxRepoProblem } from "@/lib/sandboxRepositories";
-import { SANDBOX_PROFILES_QUERY_KEY, fetchSandboxProfiles } from "@/lib/sandboxProfilesApi";
 import { launchManagedHost, launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import { captureLaunchStatus, useChatStore } from "@/store/chatStore";
@@ -151,36 +146,21 @@ function SupportedSwitchHostDialog({
   const info = useServerInfo();
   const moveSupported =
     info !== "loading" && info.managed_sandboxes_enabled && info.move_to_managed_sandbox;
-  // A provider that manages sandbox profiles binds one at session create, so
-  // the server refuses to move a session onto it.
-  const profilesEnabled = moveSupported && sandboxProfilesEnabled(info);
-  const {
-    data: profileCatalog,
-    isError: profileCatalogFailed,
-    refetch: retryProfileCatalog,
-  } = useQuery({
-    queryKey: [...SANDBOX_PROFILES_QUERY_KEY, null],
-    queryFn: ({ signal }) => fetchSandboxProfiles(undefined, { signal }),
-    enabled: profilesEnabled,
-    staleTime: 30_000,
-    retry: false,
-  });
   // A half-finished switch can leave the session with no host, and the server
   // only moves a session off a host it still has.
   const { session } = useSession(sessionId);
   const sessionHostless = session != null && session.hostId === null;
   const sandboxProviderRows = useMemo(() => {
     if (info === "loading" || !moveSupported || sessionHostless) return [];
-    if (!profilesEnabled) return sandboxProviderOptions(info);
-    // Until it is known which providers use profiles, offering none keeps a
-    // pick from releasing the runner for a move the server would refuse. A
-    // failed refresh counts as unknown too: the cached catalog may be stale.
-    if (profileCatalog === undefined || profileCatalogFailed) return [];
-    const profiled = new Set(profileCatalog.managed_providers);
+    // Only providers the server says take a moved session (not one that manages
+    // sandbox profiles): picking another would release the runner for a move it
+    // refuses.
     return sandboxProviderOptions(info).filter(
-      (provider) => !profiled.has(provider ?? info.sandbox_provider ?? ""),
+      (provider) =>
+        info.sandbox_provider_capabilities?.[provider ?? info.sandbox_provider ?? ""]
+          ?.accepts_session_move === true,
     );
-  }, [info, moveSupported, sessionHostless, profilesEnabled, profileCatalog, profileCatalogFailed]);
+  }, [info, moveSupported, sessionHostless]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 
@@ -374,10 +354,6 @@ function SupportedSwitchHostDialog({
 
   const noTargets =
     hosts !== undefined && targetHosts.length === 0 && sandboxProviderRows.length === 0;
-  // Sandboxes are withheld until it's known which providers use profiles; say
-  // so instead of implying there is nowhere to move the session.
-  const sandboxesUnknown =
-    profilesEnabled && !sessionHostless && (profileCatalog === undefined || profileCatalogFailed);
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -391,26 +367,7 @@ function SupportedSwitchHostDialog({
           </DialogDescription>
         </DialogHeader>
 
-        {noTargets && sandboxesUnknown && profileCatalogFailed ? (
-          <div
-            role="alert"
-            className="flex items-center gap-2 text-xs text-muted-foreground"
-            data-testid="switch-host-sandboxes-unavailable"
-          >
-            <span>Couldn't check which sandboxes can take this session.</span>
-            <Button variant="link" size="xs" onClick={() => void retryProfileCatalog()}>
-              Try again
-            </Button>
-          </div>
-        ) : noTargets && sandboxesUnknown ? (
-          <p
-            role="status"
-            className="text-xs text-muted-foreground"
-            data-testid="switch-host-sandboxes-checking"
-          >
-            Checking which sandboxes can take this session…
-          </p>
-        ) : noTargets ? (
+        {noTargets ? (
           <p className="text-xs text-muted-foreground" data-testid="switch-host-no-targets">
             No other hosts are online. Connect one with <code>omnigent host</code> and try again.
           </p>

@@ -1430,7 +1430,10 @@ it does on a `host_type: "managed"` fork:
 
 Servers that support this route report `move_to_managed_sandbox` on
 `GET /v1/info`; clients should not release a session's runner for a
-move on a server that doesn't.
+move on a server that doesn't. A provider takes a moved session only if
+its `sandbox_provider_capabilities` entry reports `accepts_session_move`
+(one that manages sandbox profiles doesn't); treat a provider that
+doesn't say as one that can't.
 
 Moves an existing session onto a new server-provisioned sandbox — the
 sandbox counterpart of `POST /v1/hosts/{host_id}/runners`. Release the

@@ -140,9 +140,9 @@ the header menu), and each place is a separate entry point.
   the session there with the same launch progress a new sandbox session shows.
   A refused launch keeps the dialog open, with the old host offered again. The
   reconnect dialog's Switch host opens the same picker, so a session whose
-  machine is offline can recover onto a new sandbox too. Providers that manage
-  sandbox profiles aren't offered, nor is any sandbox while that's unknown or
-  once the session has no host.
+  machine is offline can recover onto a new sandbox too. Only providers whose
+  `/v1/info` capabilities report `accepts_session_move` are offered (not those
+  that manage sandbox profiles), and none once the session has no host.
 
 - `clone`: copy a session into a new workspace, including a typed `~` path.
   Participating sandbox providers require a [profile selection](sandbox-profiles.md)
