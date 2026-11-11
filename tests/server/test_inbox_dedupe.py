@@ -68,7 +68,7 @@ def test_other_links() -> None:
         {"type": "url", "ref": "example.com/no-scheme"},
         {"type": "url", "ref": "https://user:secret@example.com/a"},
         {"type": "url", "ref": "ftp://example.test/a"},
-        {"type": "session", "ref": "s" * 2048},
+        {"type": "url", "ref": "https://example.com/" + "a" * 2048},
         {"type": "session", "ref": "https://example.com/c/abc"},
     ],
     ids=[
