@@ -291,10 +291,11 @@ def register_agent_routes(
             selection_headers[AUTOMATIONS_HEADER] = "1" if automations_available() else "0"
         inbox_enabled_for = getattr(request.app.state, "proactive_agent_enabled_for", None)
         if inbox_enabled_for is not None:
-            # For the session's owner, whoever downloads the bundle for it. A
-            # child session belongs to its root's owner. The Inbox is optional,
-            # so a failing settings read turns it off rather than failing the
-            # bundle download.
+            # The deployment gate is the downloader's, like every other request;
+            # the settings are the session owner's, whoever downloads the bundle
+            # for it, and a child session belongs to its root's owner. The Inbox
+            # is optional, so a failing settings read turns it off rather than
+            # failing the bundle download.
             try:
                 owner = (
                     await asyncio.to_thread(

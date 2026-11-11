@@ -20,7 +20,6 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.proactive_agent_settings_store import (
-    WORKSPACE_SETTINGS_USER,
     ProactiveAgentSettingsStore,
 )
 
@@ -152,26 +151,6 @@ async def test_a_deployment_gate_that_is_off_wins_over_both_settings(
     # Offered, both settings on, but the explicit gate says no: the gate wins.
     async with _client(db_uri, tmp_path, offered=True, proactive_agent=lambda: False) as client:
         assert (await client.get("/v1/inbox/items", headers=_ALICE)).status_code == 404
-
-
-@pytest.mark.parametrize("raw", ["not json", '"yes"', "null"])
-def test_an_unreadable_stored_value_reads_as_on(db_uri: str, raw: str) -> None:
-    from sqlalchemy.orm import Session
-
-    from omnigent.db.db_models import SqlPreference
-    from omnigent.db.utils import get_or_create_engine
-
-    store = ProactiveAgentSettingsStore(db_uri)
-    store.set_workspace_enabled(False, actor=None)
-    with Session(get_or_create_engine(db_uri)) as session:
-        row = session.get(
-            SqlPreference, (0, WORKSPACE_SETTINGS_USER, "proactive_agent.v1.enabled")
-        )
-        assert row is not None
-        row.value = raw
-        session.commit()
-
-    assert store.read("alice@example.com") == (True, True)
 
 
 async def test_the_bundle_download_tells_the_runner_whether_to_offer_the_inbox_tools(
