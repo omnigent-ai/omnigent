@@ -16,8 +16,9 @@ adds a ``provider`` value and its JSON shapes, not columns:
 * ``scheduled_task_event_receipts``: one row per event occurrence a task
   accepted, unique per task, so an occurrence that joined another occurrence's
   run is still recognized when it is delivered again.
-* ``ix_scheduled_task_runs_task_status`` finds a task's runs by status, such as
-  its unclaimed pending run, without scanning its history.
+* ``ix_scheduled_task_runs_task_status`` finds a task's runs by status and key
+  prefix, such as its unclaimed pending event run, without scanning its history
+  or its pending Run now requests.
 
 The JSON columns are read and written whole and never filtered in SQL, so they
 are stored compressed, at most 16,383 bytes each.
@@ -49,6 +50,11 @@ depends_on: str | Sequence[str] | None = None
 
 # Below the 16,384-byte bound on any one column value.
 _JSON_MAX_STORED_BYTES = 16_383
+# Tasks the downgrade guard reads per query, in primary-key order.
+_GUARD_BATCH = 500
+# Dialects that ignore VARCHAR lengths and store a value of any size.
+_SQLITE_FAMILY = frozenset({"sqlite", "cloudflare_d1"})
+_RECEIPT_KEY_CHECK = "ck_scheduled_task_event_receipts_key_bytes"
 
 
 def upgrade() -> None:
@@ -72,11 +78,17 @@ def upgrade() -> None:
         )
         batch_op.create_index(
             "ix_scheduled_task_runs_task_status",
-            ["workspace_id", "scheduled_task_id", "status", "scheduled_at", "id"],
+            ["workspace_id", "scheduled_task_id", "status", "trigger_key", "id"],
         )
+    # SQLite ignores VARCHAR lengths: 256 characters at up to four bytes each.
+    key_check = (
+        [sa.CheckConstraint("length(CAST(trigger_key AS BLOB)) <= 1024", name=_RECEIPT_KEY_CHECK)]
+        if op.get_bind().dialect.name in _SQLITE_FAMILY
+        else []
+    )
     op.create_table(
         "scheduled_task_event_receipts",
-        sa.Column("workspace_id", sa.BigInteger(), nullable=False, server_default="0"),
+        sa.Column("workspace_id", sa.BigInteger(), nullable=False),
         sa.Column("id", Uuid16(), nullable=False),
         sa.Column("scheduled_task_id", Uuid16(), nullable=False),
         sa.Column(
@@ -95,6 +107,7 @@ def upgrade() -> None:
             "trigger_key",
             name="uq_scheduled_task_event_receipts_occurrence",
         ),
+        *key_check,
     )
     op.create_index(
         "ix_scheduled_task_event_receipts_age",
@@ -107,12 +120,7 @@ def downgrade() -> None:
     """Drop the event-trigger schema and require ``rrule`` again, if no task lacks one."""
     if context.is_offline_mode():
         raise RuntimeError("Downgrade requires a live connection to check task rules")
-    tasks = sa.table("scheduled_tasks", sa.column("rrule"))
-    ruleless = sa.select(tasks.c.rrule).where(tasks.c.rrule.is_(None)).limit(1)
-    if op.get_bind().execute(ruleless).first():
-        raise RuntimeError(
-            "Delete the event-triggered scheduled tasks, which have no rrule, before downgrading"
-        )
+    _refuse_while_a_task_has_no_rule()
     op.drop_index(
         "ix_scheduled_task_event_receipts_age", table_name="scheduled_task_event_receipts"
     )
@@ -123,3 +131,31 @@ def downgrade() -> None:
     with op.batch_alter_table("scheduled_tasks") as batch_op:
         batch_op.alter_column("rrule", existing_type=sa.String(512), nullable=False)
         batch_op.drop_column("trigger_config")
+
+
+def _refuse_while_a_task_has_no_rule() -> None:
+    """Read every task in primary-key batches, before any DDL, and refuse on a NULL rule."""
+    tasks = sa.table(
+        "scheduled_tasks", sa.column("workspace_id"), sa.column("id"), sa.column("rrule")
+    )
+    columns = (tasks.c.workspace_id, tasks.c.id)
+    bind = op.get_bind()
+    after: tuple[object, object] | None = None
+    while True:
+        page = sa.select(*columns, tasks.c.rrule).order_by(*columns).limit(_GUARD_BATCH)
+        if after is not None:
+            page = page.where(
+                sa.or_(
+                    tasks.c.workspace_id > after[0],
+                    sa.and_(tasks.c.workspace_id == after[0], tasks.c.id > after[1]),
+                )
+            )
+        rows = bind.execute(page).all()
+        if any(row.rrule is None for row in rows):
+            raise RuntimeError(
+                "Delete the event-triggered scheduled tasks, which have no rrule, "
+                "before downgrading"
+            )
+        if len(rows) < _GUARD_BATCH:
+            return
+        after = (rows[-1].workspace_id, rows[-1].id)
