@@ -6563,6 +6563,12 @@ async def _launch_runner_on_host_impl(
             host_conn,
             replace_move_claim=replace_move_claim,
         )
+        from omnigent.server.managed_hosts import is_move_claim
+
+        if is_move_claim(fresh.runner_id) and not replace_move_claim:
+            # Refused for the move, which launches nothing: the move's own
+            # launch, waiting on this lock, must not take it for its result.
+            return attempt
         # Re-insert so the plain dict's insertion order is newest-last, then
         # evict from the front once past the cap.
         _relaunch_last_attempt.pop(conv.id, None)

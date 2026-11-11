@@ -1627,6 +1627,83 @@ async def test_relaunch_that_reads_a_move_claim_is_refused(
     assert conv is not None and conv.runner_id == claim
 
 
+async def test_move_launch_queued_behind_a_refused_relaunch_still_starts(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A relaunch refused for a move, such as a terminal recovery while the sandbox
+    binds, isn't recorded as the session's launch: the move's own launch queued
+    behind it still starts the sandbox's runner, rather than taking the refusal
+    as its result and abandoning the sandbox.
+    """
+    import threading
+    from typing import cast
+
+    from omnigent.server.managed_hosts import is_move_claim, new_move_claim
+    from omnigent.server.routes._sessions.helpers import _launch_runner_on_host_impl
+
+    env = managed_session_env
+    session_id = await _session_released_from_laptop(env, agent_name="move-relaunch-memo-agent")
+    claim = new_move_claim()
+    assert env.conv_store.set_runner_id(session_id, claim)
+    # The sandbox host is bound; its runner isn't started yet.
+    env.conv_store.set_host_id(session_id, _MOVED_SANDBOX_HOST_ID, "/workspace")
+    seen = env.conv_store.get_conversation(session_id)
+    assert seen is not None
+    reading, release = threading.Event(), threading.Event()
+    get_conversation = env.conv_store.get_conversation
+
+    def first_read_waits(conversation_id: str) -> Conversation | None:
+        if not reading.is_set():
+            reading.set()
+            release.wait(timeout=10)
+        return get_conversation(conversation_id)
+
+    monkeypatch.setattr(env.conv_store, "get_conversation", first_read_waits)
+    admissions: list[str] = []
+
+    class _Registry:
+        async def admit_launch(self, conn: object, conversation_id: str, **_: object) -> None:
+            admissions.append(conversation_id)
+
+        def mcp_disabled_servers_active_harnesses(self) -> tuple[str, ...]:
+            return ()
+
+        def send_text(self, conn: object, text: str) -> None:
+            # The runner is bound by now; the host's answer isn't under test.
+            raise ConnectionError("host gone")
+
+        def get(self, host_id: str) -> None:
+            return None
+
+    registry = cast(Any, _Registry())
+
+    def host_conn() -> Any:
+        return SimpleNamespace(host_id=_MOVED_SANDBOX_HOST_ID, pending_launches={})
+
+    recovery = asyncio.create_task(
+        _launch_runner_on_host_impl(seen, env.conv_store, registry, host_conn())
+    )
+    assert await asyncio.to_thread(reading.wait, 10)
+    move = asyncio.create_task(
+        _launch_runner_on_host_impl(
+            seen, env.conv_store, registry, host_conn(), replace_move_claim=True
+        )
+    )
+    await asyncio.sleep(0)
+    release.set()
+    refused, started = await asyncio.gather(recovery, move)
+
+    assert refused.error_code == "session_binding_changed"
+    assert started.error_code is None
+    assert admissions == [session_id]
+    conv = get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id == started.runner_id
+    assert not is_move_claim(conv.runner_id)
+
+
 async def test_move_cancelled_during_its_detach_restores_the_whole_binding(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,
