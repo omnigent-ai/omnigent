@@ -21,6 +21,7 @@ import { absoluteTime, formatDuration, relativeTime } from "@/lib/relativeTime";
 import {
   finishedTaskCount,
   isRestart,
+  linkedToPrevious,
   noteBody,
   planName,
   planTally,
@@ -540,26 +541,42 @@ function statusLine(item: StepProgress, pending: readonly string[]): ReactNode {
   }
 }
 
-/** One segment per task; hovering one says which task it is and where it stands. */
+/** Past this many tasks, the strip has no room for links between its segments. */
+const MAX_LINKED_TASKS = 40;
+
+/**
+ * One segment per task; hovering one says which task it is and where it stands.
+ * A plan links neighboring segments when one task waits on the other, so a gap
+ * means the two can run at the same time.
+ */
 function ProgressStrip({
   progress,
+  fromPlan,
   onSelect,
 }: {
   progress: readonly StepProgress[];
+  /** Whether the tasks are a plan's steps, the only tasks that say what they wait on. */
+  fromPlan: boolean;
   onSelect: (stepId: string) => void;
 }) {
   const names = new Map(progress.map((item) => [item.step.id, item.step.name]));
   const done = new Set(
     progress.filter((item) => item.state === "done").map((item) => item.step.id),
   );
+  const links =
+    fromPlan && progress.length <= MAX_LINKED_TASKS
+      ? linkedToPrevious(progress.map((item) => item.step))
+      : null;
+  const roomy = progress.length <= 24;
   return (
     <TooltipProvider delayDuration={100} skipDelayDuration={400} disableHoverableContent>
       <div
         className={cn(
           "-my-[5px] flex h-4 items-center",
-          progress.length > 16 ? "gap-px" : "gap-[3px]",
+          links ? (roomy ? "gap-1.5" : "gap-1") : progress.length > 16 ? "gap-px" : "gap-[3px]",
         )}
         data-testid="tasks-progress"
+        data-links={links ? "true" : undefined}
       >
         {progress.map((item, index) => {
           const pending = item.step.depends_on
@@ -577,9 +594,19 @@ function ProgressStrip({
                   type="button"
                   aria-label={`Task ${index + 1}, ${item.step.name}: ${STATE_LABELS[item.state]}`}
                   onClick={() => onSelect(item.step.id)}
-                  className="group flex h-full min-w-0 flex-1 cursor-pointer items-center focus-visible:outline-none"
+                  className="group relative flex h-full min-w-0 flex-1 cursor-pointer items-center focus-visible:outline-none"
                   data-testid="tasks-progress-segment"
+                  data-linked={links?.[index] || undefined}
                 >
+                  {links?.[index] && (
+                    <span
+                      aria-hidden
+                      className={cn(
+                        "absolute top-1/2 right-full h-0.5 -translate-y-1/2 bg-border-strong",
+                        roomy ? "w-1.5" : "w-1",
+                      )}
+                    />
+                  )}
                   <span
                     className={cn(
                       "h-1.5 w-full rounded-full transition-[height] duration-150 group-hover:h-2 group-focus-visible:h-2 group-focus-visible:ring-2 group-focus-visible:ring-ring/50",
@@ -695,7 +722,7 @@ function TasksHeader({
           )}
         </p>
       </div>
-      <ProgressStrip progress={progress} onSelect={onSelect} />
+      <ProgressStrip progress={progress} fromPlan={plan !== null} onSelect={onSelect} />
     </header>
   );
 }

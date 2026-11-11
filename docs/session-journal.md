@@ -124,7 +124,9 @@ task was done or failed. Tasks waiting for you are pink, and an idle list
 with tasks the agent could still run says "Stopped" ("Run ended" after an
 automation run), so it never looks about to run. A summary line and a strip
 count the tasks in each state, and stay at the top as you scroll: hover a
-segment of the strip for that task's status, or click it to jump to the task. When the agent replans, the new
+segment of the strip for that task's status, or click it to jump to the task. In
+a plan, the strip links two neighboring tasks when one waits on the other, so a
+gap between them means they can run at the same time. When the agent replans, the new
 tasks simply appear. A task's chevron opens what it waits on, its goal and its
 history: each status and note, oldest first. Tasks from the agent's own list
 show only their name and state.
