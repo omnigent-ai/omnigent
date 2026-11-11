@@ -29,3 +29,18 @@ def without_claude_session_id_arg(args: Sequence[str]) -> list[str]:
             continue
         kept.append(arg)
     return kept
+
+
+# @deprecated, remove in 0.22.0 with the runner's legacy-prompt handling:
+# clients before 0.20.0 stored ``-p`` in the persisted launch args.
+def claude_legacy_launch_prompt(args: Sequence[str] | None) -> str | None:
+    """
+    Return the ``-p`` prompt older clients stored ahead of the launch flags.
+
+    :param args: Persisted pass-through args, e.g.
+        ``["hello", "--permission-mode", "auto"]``.
+    :returns: The leading positional, e.g. ``"hello"``, or ``None``.
+    """
+    if not args or args[0].startswith("-"):
+        return None
+    return args[0]

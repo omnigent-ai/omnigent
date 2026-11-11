@@ -182,24 +182,33 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
     [["--session-id", "0c5d1a52-8f8e-4c55-a0b1-5e2f4d8f0a11"], ["--session-id=0c5d1a52"]],
     ids=["separate-value", "joined-value"],
 )
+@pytest.mark.parametrize(
+    ("legacy_prompt", "fork_keeps_it"),
+    [(None, False), ("Q1", False), ("Run the new task", True)],
+    ids=["no-legacy-prompt", "legacy-prompt-already-ran", "legacy-prompt-not-run"],
+)
 async def test_rewind_gives_the_fork_a_fresh_claude_session_id(
     client: httpx.AsyncClient,
     db_uri: str,
     live_runner: LiveRunner,
     item_index: int,
     session_id_args: list[str],
+    legacy_prompt: str | None,
+    fork_keeps_it: bool,
 ) -> None:
-    """A source launched with ``--session-id`` doesn't pass that used id to its rewound fork.
+    """A rewound fork doesn't reuse its source's ``--session-id`` or replay its startup prompt.
 
     Rewound to the first prompt, the fork has no transcript to resume, so a kept
-    id would reach Claude's launch and be refused; its other launch args stay.
+    id would reach Claude's launch and be refused, and the leading prompt a
+    pre-0.20 client stored, which the source already ran, would run again. A
+    stored prompt not yet run, and the other launch args, carry over.
     """
     store = SqlAlchemyConversationStore(db_uri)
     source_id = await create_placed_session(client, store)
+    flags = ["--permission-mode", "acceptEdits", *session_id_args, "--verbose"]
+    leading = [legacy_prompt] if legacy_prompt is not None else []
     store.update_conversation(
-        source_id,
-        harness_override="claude-native",
-        terminal_launch_args=["--permission-mode", "acceptEdits", *session_id_args, "--verbose"],
+        source_id, harness_override="claude-native", terminal_launch_args=[*leading, *flags]
     )
     items = item_ids(store, source_id)
 
@@ -210,15 +219,11 @@ async def test_rewind_gives_the_fork_a_fresh_claude_session_id(
     assert resp.status_code == 200, resp.text
     fork = store.get_conversation(resp.json()["session_id"])
     assert fork is not None
-    assert fork.terminal_launch_args == ["--permission-mode", "acceptEdits", "--verbose"]
+    kept = leading if fork_keeps_it else []
+    assert fork.terminal_launch_args == [*kept, "--permission-mode", "acceptEdits", "--verbose"]
     source = store.get_conversation(source_id)
     assert source is not None
-    assert source.terminal_launch_args == [
-        "--permission-mode",
-        "acceptEdits",
-        *session_id_args,
-        "--verbose",
-    ]
+    assert source.terminal_launch_args == [*leading, *flags]
 
 
 @pytest.mark.parametrize(

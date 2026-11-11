@@ -296,7 +296,10 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.session_pull_request_store import SessionSummary
 from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_client_surface
-from omnigent.util.claude_launch_args import without_claude_session_id_arg
+from omnigent.util.claude_launch_args import (
+    claude_legacy_launch_prompt,
+    without_claude_session_id_arg,
+)
 from omnigent.util.cost_plan import (
     reserved_cost_control_keys,
 )
@@ -5142,9 +5145,15 @@ def register_core_routes(
             extra_labels[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = override_launch_args[1]
 
         # A continuation is a new session, so it can't reuse the explicit Claude
-        # ``--session-id`` its source launched with; the other launch args carry over.
+        # ``--session-id`` its source launched with, nor replay a legacy startup
+        # prompt the source already ran; the other launch args carry over.
         if continue_source and not launch_args_set and source.terminal_launch_args:
             fresh_launch_args = without_claude_session_id_arg(source.terminal_launch_args)
+            legacy_prompt = claude_legacy_launch_prompt(fresh_launch_args)
+            if legacy_prompt is not None and await asyncio.to_thread(
+                _user_prompt_in_history, source.id, legacy_prompt
+            ):
+                fresh_launch_args = fresh_launch_args[1:]
             if fresh_launch_args != source.terminal_launch_args:
                 override_launch_args, launch_args_set = fresh_launch_args, True
 
@@ -6214,6 +6223,30 @@ def register_core_routes(
             ),
             attachments=attachments,
         )
+
+    def _user_prompt_in_history(session_id: str, prompt: str) -> bool:
+        """
+        Report whether *prompt* is the exact text of a user message in *session_id*.
+
+        :param session_id: Session to search, e.g. ``"conv_abc"``.
+        :param prompt: Text to find, e.g. ``"Fix the parser"``.
+        :returns: Whether any user message carries that text block.
+        """
+        after: str | None = None
+        while True:
+            page = conversation_store.list_items(
+                session_id, limit=1000, after=after, order="asc", type="message"
+            )
+            for item in page.data:
+                if (
+                    isinstance(item.data, MessageData)
+                    and item.data.role == "user"
+                    and any(part.get("text") == prompt for part in item.data.content)
+                ):
+                    return True
+            if not page.has_more or page.last_id is None:
+                return False
+            after = page.last_id
 
     def _rewind_prompt(session_id: str, item_id: str) -> MessageData:
         """
