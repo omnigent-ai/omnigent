@@ -192,7 +192,7 @@ def create_inbox_items_router(
             if conversation is not None and conversation.agent_id
             else None
         )
-        if agent is None:
+        if conversation is None or agent is None:
             raise OmnigentError(
                 "Inbox posts require the session's agent", code=ErrorCode.FORBIDDEN
             )
@@ -201,8 +201,9 @@ def create_inbox_items_router(
         ).spec
         # A named child session runs its sub-agent's spec, whose tool groups
         # are the ones the runner registered.
-        if conversation.sub_agent_name:
-            spec = _sub_agent_spec(spec, conversation.sub_agent_name) or spec
+        sub_agent_name = conversation.sub_agent_name
+        if sub_agent_name:
+            spec = _sub_agent_spec(spec, sub_agent_name) or spec
         if not spec.tool_groups.user_inbox:
             raise OmnigentError(
                 "Inbox posts require an agent with the user_inbox tool group",
