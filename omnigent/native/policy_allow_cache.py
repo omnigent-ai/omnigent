@@ -28,12 +28,15 @@ import math
 import os
 import secrets
 import shlex
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from filelock import FileLock
-from filelock import Timeout as FileLockTimeout
+try:
+    import fcntl
+except ImportError:  # Windows: _locked uses filelock instead.
+    fcntl = None  # type: ignore[assignment]
 
 _logger = logging.getLogger(__name__)
 
@@ -53,22 +56,46 @@ _LOCK_TIMEOUT_S = 5.0
 
 # POSIX shell run before the hook command; see guarded_hook_command. Only the
 # first 2 KB is matched: patterns over a large payload are quadratic in dash.
-_GUARD_SCRIPT = r"""payload=$(cat)
-if [ ! -e @REVOKED@ ] && [ -r @CACHE@ ] && read -r allow_until _ < @CACHE@ &&
-  [ "$(date +%s)" -lt "$allow_until" ] 2>/dev/null; then
+# Without an open window the hook runs on its own stdin, so the shell reads
+# nothing and starts no extra process; an expiry of 0 skips even `date`.
+# outer succeeds when its argument, the text before a key, is just "{" once
+# its strings are dropped and the objects and arrays it closes are removed,
+# innermost first. Dropping strings first keeps brackets inside them from
+# closing anything; text with a backslash escape defers, since an escaped
+# quote would end a string early.
+_GUARD_SCRIPT = r"""if [ ! -e @REVOKED@ ] && [ -r @CACHE@ ] && read -r allow_until _ < @CACHE@ &&
+  [ "$allow_until" -gt 0 ] 2>/dev/null && [ "$(date +%s)" -lt "$allow_until" ]; then
+  payload=$(cat)
+  outer() {
+    rest=$1
+    case $rest in *\\*) return 1 ;; esac
+    plain=
+    while case $rest in *'"'*'"'*) true ;; *) false ;; esac; do
+      plain=$plain${rest%%'"'*}
+      rest=${rest#*'"'}
+      rest=${rest#*'"'}
+    done
+    rest=$plain$rest
+    while pre=${rest%%[]\}]*}; [ "$pre" != "$rest" ]; do
+      case ${rest#"$pre"} in '}'*) open='{' ;; *) open='[' ;; esac
+      case $pre in *"$open"*) ;; *) return 1 ;; esac
+      rest=${pre%"$open"*}${rest#"$pre"?}
+    done
+    case ${rest#'{'} in "$rest"|*[{[]*) return 1 ;; esac
+  }
   head=$(printf '%.2048s' "$payload")
   event=${head#*'"hook_event_name":'}
-  event_before=${head%%'"hook_event_name":'*}
   tool=${head#*'"tool_name":'}
-  tool_before=${head%%'"tool_name":'*}
-  case ${event_before#'{'} in "$event_before"|*[{[]*) event= ;; esac
-  case ${tool_before#'{'} in "$tool_before"|*[{[]*) tool= ;; esac
+  outer "${head%%'"hook_event_name":'*}" || event=
+  outer "${head%%'"tool_name":'*}" || tool=
   case ${event# } in
     '"UserPromptSubmit"'*) exit 0 ;;
     '"PreToolUse"'*|'"PostToolUse"'*) case ${tool# } in '"'[!'"']*) exit 0 ;; esac ;;
   esac
+  printf '%s' "$payload" | { @COMMAND@; }
+  exit
 fi
-printf '%s' "$payload" | { @COMMAND@; }"""
+{ @COMMAND@; }"""
 
 
 def allow_cache_seconds(response: object) -> float | None:
@@ -114,7 +141,7 @@ def generation(bridge_dir: Path) -> str | None:
                 current = _new_generation()
                 _write_state(bridge_dir, 0, current, mutations)
                 _clear_revocation(bridge_dir)
-    except (OSError, FileLockTimeout):
+    except OSError:
         _logger.warning("Could not create the policy allow cache", exc_info=True)
         return None
     return current
@@ -156,7 +183,7 @@ def record(
                 and not _revoked(bridge_dir)
             ):
                 _write_state(bridge_dir, int(requested_at + seconds), current, mutations)
-    except (OSError, FileLockTimeout):
+    except OSError:
         _logger.warning("Could not update the policy allow cache", exc_info=True)
 
 
@@ -194,11 +221,14 @@ def guarded_hook_command(bridge_dir: Path, command: str) -> str:
 
     While the window is open, prompts and tool events that name their tool
     exit 0 with no output, which is how the hooks express ALLOW. Only keys of
-    the outer JSON object count: the text before a key must start with ``{``
-    and open no other object or array, so a name nested in tool input is
-    ignored. A tool event without a top-level name is malformed and still
-    reaches the server, which rejects it. Everything else runs *command* with
-    the same stdin.
+    the outer JSON object count: the text before a key, less its strings and
+    the objects and arrays it closes, must be ``{`` alone. Closed metadata
+    objects before the keys, such as Claude Code's ``"effort": {"level":
+    "medium"}``, are allowed; a name nested in tool input is ignored, whatever
+    the field order or brackets inside strings. A backslash escape before a
+    key only costs the shortcut. A tool event without a top-level name is
+    malformed and still reaches the server, which rejects it. Everything else
+    runs *command* with the same stdin.
 
     :param bridge_dir: The session's native bridge directory.
     :param command: POSIX shell command that evaluates the hook, e.g.
@@ -222,7 +252,7 @@ def _reset_generation(bridge_dir: Path, *, mutation_delta: int) -> None:
             mutations = max(_read_state(bridge_dir)[2] + mutation_delta, 0)
             _write_state(bridge_dir, 0, _new_generation(), mutations)
             _clear_revocation(bridge_dir)
-    except (OSError, FileLockTimeout):
+    except OSError:
         _logger.warning("Could not invalidate the policy allow cache", exc_info=True)
         # The lock holder may still write a window; the marker outlives that.
         try:
@@ -250,14 +280,45 @@ def _new_generation() -> str:
 
 @contextmanager
 def _locked(bridge_dir: Path) -> Iterator[None]:
-    """Serialize cache updates across hook processes and relay threads."""
+    """
+    Serialize cache updates across hook processes and relay threads.
+
+    Every hook takes this lock, so on POSIX it is a plain ``flock`` rather than
+    ``filelock``, whose import costs a few milliseconds per hook.
+
+    :raises TimeoutError: If the lock stays held for the timeout; it is an
+        ``OSError``, as is ``filelock.Timeout``.
+    """
     if not bridge_dir.is_dir():
-        # filelock would recreate a bridge directory that cleanup removed.
+        # Creating the lock file would recreate a bridge directory that cleanup removed.
         raise FileNotFoundError(bridge_dir)
-    # A new lock object per use: some filelock releases share one object's
-    # lock across threads, and the relay updates the cache from several.
-    with FileLock(str(bridge_dir / _LOCK_FILENAME), timeout=_LOCK_TIMEOUT_S):
+    path = bridge_dir / _LOCK_FILENAME
+    if fcntl is None:
+        from filelock import FileLock
+
+        # A new lock object per use: some filelock releases share one object's
+        # lock across threads, and the relay updates the cache from several.
+        with FileLock(str(path), timeout=_LOCK_TIMEOUT_S):
+            yield
+        return
+    # flock holds per open file description, so a descriptor of its own per
+    # use also keeps the relay's threads apart.
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + _LOCK_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"policy allow cache lock held for {_LOCK_TIMEOUT_S}s"
+                    ) from None
+                time.sleep(0.01)
         yield
+    finally:
+        os.close(fd)
 
 
 def _read_state(bridge_dir: Path) -> tuple[int, str | None, int]:

@@ -33,12 +33,21 @@ import json
 import logging
 import os
 import pathlib
+import shutil
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import ExitStack, contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
 
@@ -65,6 +74,7 @@ from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.models.model_override import is_databricks_model_id
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
+from omnigent.telemetry.surface import harness_client_surface
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
@@ -78,6 +88,10 @@ from .executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    LiveMcpHarnessNotRunning,
+    LiveMcpReconnectRefused,
+    LiveMcpServerStatus,
+    LiveMcpServerUnknown,
     Message,
     ReasoningChunk,
     TextChunk,
@@ -92,6 +106,7 @@ from .executor import (
 )
 from .native_attachments import framework_notices, unresolved_attachment_marker
 from .sandbox import (
+    SandboxPolicy,
     create_exec_launcher,
     get_backend,
     resolve_sandbox,
@@ -110,6 +125,14 @@ _GATEWAY_AUTH_REFRESH_MS = 900_000
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 # Claude Code floors a thinking budget at this size and requires max_tokens above it.
 _CLAUDE_CODE_MIN_THINKING_BUDGET_TOKENS = 1024
+
+# A fresh client's replayed history may fill this share of the context window,
+# leaving room for Claude Code's prompt, tools and reply before it can compact.
+_REPLAYED_HISTORY_WINDOW_SHARE = 0.5
+# Overcounts English and code tokens, and approximates one token per CJK character.
+_REPLAYED_HISTORY_BYTES_PER_TOKEN = 3
+# An image's token cost does not follow its encoded size; this also floors a PDF's estimate.
+_REPLAYED_ATTACHMENT_TOKEN_ESTIMATE = 2_000
 
 # Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
 # request headers. The Databricks Unity Gateway only serves Claude requests
@@ -319,6 +342,8 @@ class _ClaudeClient(Protocol):
     ) -> None: ...
     async def set_model(self, model: str | None) -> None: ...
     async def interrupt(self) -> None: ...
+    async def get_mcp_status(self) -> Mapping[str, object]: ...
+    async def reconnect_mcp_server(self, server_name: str) -> None: ...
 
     # receive_response yields heterogeneous SDK message objects — kept
     # as ``Any`` so the caller can ``isinstance``-narrow onto the SDK's
@@ -419,6 +444,8 @@ class _ClaudeSDK(Protocol):
 
 _CONNECT_TIMEOUT_SECONDS = 60.0
 _QUERY_START_TIMEOUT_SECONDS = 30.0
+_MCP_STATUS_TIMEOUT_SECONDS = 10.0
+_MCP_RECONNECT_TIMEOUT_SECONDS = 30.0
 # When the response stream is quiet for this long we emit a warning,
 # but keep waiting — a long-running native tool can legitimately block
 # the stream far longer than any fixed deadline.
@@ -621,6 +648,87 @@ def _render_prior_content_blocks(content: object) -> list[_JsonObject]:
             _text_block(json.dumps(_redact_inline_base64(raw_block), ensure_ascii=True))
         )
     return rendered
+
+
+def _has_replayable_history(messages: list[Message]) -> bool:
+    """Whether a fresh client must replay turns before the latest user message."""
+    return sum(msg.get("role") == "user" for msg in messages) > 1
+
+
+def _resolve_replay_context_window(
+    declared_window: int | None, model: str | None, model_override: str | None
+) -> int:
+    """
+    Resolve the context window a fresh client's history replay is sized for.
+
+    :param declared_window: The spec's ``executor.context_window``, or ``None``.
+    :param model: The spec model, e.g. ``"claude-sonnet-4-5"``, or ``None``.
+    :param model_override: The session's model override, which takes
+        precedence over the declared window.
+    :returns: The window in tokens, or the shared fallback when unknown
+        or not positive.
+    """
+    from omnigent.llms.context_window import (
+        DEFAULT_CONTEXT_WINDOW,
+        resolve_effective_context_window,
+    )
+
+    try:
+        window = resolve_effective_context_window(
+            declared_window, model, model_override=model_override
+        )
+    except ValueError:
+        # A malformed AP_CONTEXT_WINDOW_OVERRIDE must not fail every restarted turn.
+        logger.warning("ClaudeSDKExecutor: unreadable context window override", exc_info=True)
+        return DEFAULT_CONTEXT_WINDOW
+    return window if window and window > 0 else DEFAULT_CONTEXT_WINDOW
+
+
+def _render_prior_message(message: Message) -> list[_JsonObject]:
+    """
+    Render one prior message as role-labelled blocks for the history replay.
+
+    :param message: A prior inner :class:`Message`.
+    :returns: Anthropic content blocks opening with the message's role.
+    """
+    role = str(message.get("role", "user")).replace("_", " ")
+    raw_content = message.get("content")
+    rendered = [] if raw_content is None else _render_prior_content_blocks(raw_content)
+    if not rendered:
+        rendered = [_text_block("")]
+    # Label the message inline when it opens with text; an attachment
+    # that leads the message gets the label on its own line instead.
+    if rendered[0].get("type") == "text":
+        rendered[0] = _text_block(f"{role}: {rendered[0]['text']}")
+    else:
+        rendered.insert(0, _text_block(f"{role}:"))
+    return rendered
+
+
+def _estimated_replay_tokens(blocks: list[_JsonObject]) -> int:
+    """
+    Estimate the prompt tokens one rendered prior message adds to a replay.
+
+    :param blocks: The message's blocks from :func:`_render_prior_message`.
+    :returns: A deliberately high estimate, so the replay stays under budget.
+    """
+    tokens = 0
+    for block in blocks:
+        source = block.get("source")
+        if block.get("type") == "text":
+            text = block.get("text")
+        elif isinstance(source, dict) and source.get("type") == "text":
+            text = source.get("data")
+        elif block.get("type") == "document" and isinstance(source, dict):
+            # A PDF is billed per page, so its encoded size stands in for its page count.
+            payload_tokens = len(str(source.get("data", ""))) // _REPLAYED_HISTORY_BYTES_PER_TOKEN
+            tokens += max(_REPLAYED_ATTACHMENT_TOKEN_ESTIMATE, payload_tokens)
+            continue
+        else:
+            tokens += _REPLAYED_ATTACHMENT_TOKEN_ESTIMATE
+            continue
+        tokens += len(str(text).encode("utf-8")) // _REPLAYED_HISTORY_BYTES_PER_TOKEN
+    return tokens
 
 
 def _parse_data_uri(uri: str) -> tuple[str, str]:
@@ -894,6 +1002,64 @@ def _best_effort_close(resource: _Stream | _Process) -> None:
 _CLAUDE_API_KEY_HELPER_ENV_KEY = "OMNIGENT_CLAUDE_API_KEY_HELPER"
 
 
+class _ManagedMcpRelay:
+    """Omnigent's tools served to one CLI through the ``omnigent`` entry in ``managed-mcp.json``.
+
+    Claude Code refuses the in-process SDK server while that file exists, so the CLI
+    launches the shared ``serve-mcp`` relay itself and finds its bridge through ``env``.
+    Its control socket gets a private directory, which a sandbox can grant on its own.
+    """
+
+    def __init__(
+        self, tools: list[ToolSpec], tool_executor: ToolExecutor, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        from omnigent.harnesses.claude_native.bridge import (
+            managed_mcp_relay_env,
+            prepare_acp_mcp_bridge_dir,
+            prepare_relay_socket_dir,
+            start_tool_relay,
+        )
+
+        self._bridge_dir = prepare_acp_mcp_bridge_dir()
+        # Windows control servers listen on loopback TCP instead of a socket file.
+        self._socket_dir: pathlib.Path | None = None
+        try:
+            if os.name != "nt":
+                self._socket_dir = prepare_relay_socket_dir()
+            self._relay = start_tool_relay(
+                bridge_dir=self._bridge_dir,
+                tools=list(tools),
+                tool_executor=tool_executor,
+                loop=loop,
+            )
+        except BaseException:
+            self._remove_dirs()
+            raise
+        self.env = managed_mcp_relay_env(self._bridge_dir, socket_dir=self._socket_dir)
+
+    @property
+    def bridge_dir(self) -> pathlib.Path:
+        """The private directory this relay's ``serve-mcp`` reads and writes."""
+        return self._bridge_dir
+
+    @property
+    def socket_dir(self) -> pathlib.Path | None:
+        """The private directory for ``serve-mcp``'s control socket, if it uses one."""
+        return self._socket_dir
+
+    def close(self) -> None:
+        """Stop the relay and remove its directories."""
+        try:
+            self._relay.close()
+        finally:
+            self._remove_dirs()
+
+    def _remove_dirs(self) -> None:
+        shutil.rmtree(self._bridge_dir, ignore_errors=True)
+        if self._socket_dir is not None:
+            shutil.rmtree(self._socket_dir, ignore_errors=True)
+
+
 @dataclass
 class _ClaudeClientState:
     client: _ClaudeClient
@@ -901,6 +1067,153 @@ class _ClaudeClientState:
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
     effort: str | None = None
+    # Host-reported account state of each Claude MCP server when last checked.
+    mcp_auth: dict[str, str] = field(default_factory=dict)
+    # A status or reconnect request from the /mcp panel timed out, so the CLI may
+    # still be busy with it and would hold the next prompt.
+    mcp_control_timed_out: bool = False
+    # The CLI answers MCP control requests one at a time; the panel and turn-start
+    # reconnects take turns rather than queue behind each other's budgets.
+    mcp_control_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Serves Omnigent's tools to this client's CLI under an enterprise MCP config.
+    mcp_relay: _ManagedMcpRelay | None = None
+    # This client's own sandbox launcher, which exposes the managed config and its relay.
+    cli_launcher: str | None = None
+
+
+def _recording_consents(
+    gate: Callable[[str, ToolArgs, object], Awaitable[object]], consents: _RelayConsents
+) -> Callable[[str, ToolArgs, object], Awaitable[object]]:
+    """Wrap the CLI's permission gate so the relay honours what it approved."""
+    from claude_agent_sdk import PermissionResultAllow
+
+    async def can_use_tool(tool_name: str, tool_input: ToolArgs, perm_ctx: object) -> object:
+        verdict = await gate(tool_name, tool_input, perm_ctx)
+        if tool_name.startswith(_OMNIGENT_MCP_PREFIX) and isinstance(
+            verdict, PermissionResultAllow
+        ):
+            consents.record(tool_name.removeprefix(_OMNIGENT_MCP_PREFIX), tool_input)
+        return verdict
+
+    return can_use_tool
+
+
+async def _close_managed_mcp_relay(state: _ClaudeClientState) -> None:
+    """Release a gone CLI's relay and launcher; the relay's shutdown blocks briefly."""
+    relay, launcher = state.mcp_relay, state.cli_launcher
+    state.mcp_relay = state.cli_launcher = None
+    await asyncio.to_thread(_release_client_cli, relay, launcher)
+
+
+def _release_client_cli(relay: _ManagedMcpRelay | None, launcher: str | None) -> None:
+    try:
+        if relay is not None:
+            relay.close()
+    finally:
+        if launcher is not None:
+            with suppress(OSError):
+                os.unlink(launcher)
+
+
+def _claude_mcp_auth_statuses() -> dict[str, str]:
+    """The host sign-in manager's account state for each Claude MCP server, by name."""
+    try:
+        from omnigent.host.mcp_inventory import read_auth_status_overlay
+
+        overlay = read_auth_status_overlay(pathlib.Path.home())
+    except Exception:
+        logger.warning("Reading MCP auth status failed", exc_info=True)
+        return {}
+    return {
+        name: fields["auth_status"]
+        for (harness, name), fields in overlay.items()
+        if harness == "claude"
+    }
+
+
+def _inventory_mcp_server_name(live_name: str) -> str:
+    """The host inventory's name for a server; the CLI adds ``plugin:<plugin>:`` to plugin ones."""
+    prefix, plugin_sep, rest = live_name.partition(":")
+    if prefix == "plugin" and plugin_sep:
+        _plugin, server_sep, server = rest.partition(":")
+        if server_sep and server:
+            return server
+    return live_name
+
+
+# Omnigent's own tool server, which the /mcp panel does not list.
+_OMNIGENT_MCP_SERVER_NAME = "omnigent"
+
+_MCP_BUSY_COMPACT_MESSAGE = (
+    "Claude Code is still busy with an MCP request that timed out, so it can't compact now. "
+    "Send a message to restart it, then run /compact again."
+)
+
+
+def _live_mcp_statuses(response: Mapping[str, object]) -> list[LiveMcpServerStatus]:
+    """The CLI's MCP connections from a ``get_mcp_status`` response, without Omnigent's own."""
+    statuses: list[LiveMcpServerStatus] = []
+    servers = response.get("mcpServers")
+    for server in servers if isinstance(servers, list) else []:
+        if not isinstance(server, Mapping):
+            continue
+        name, status = server.get("name"), server.get("status")
+        if not isinstance(name, str) or not isinstance(status, str):
+            continue
+        if name == _OMNIGENT_MCP_SERVER_NAME:
+            continue
+        error, scope = server.get("error"), server.get("scope")
+        statuses.append(
+            LiveMcpServerStatus(
+                name=name,
+                status=status,
+                error=error if isinstance(error, str) and error else None,
+                scope=scope if isinstance(scope, str) and scope else None,
+            )
+        )
+    return statuses
+
+
+async def _reconnect_failed_mcp_servers(client: _ClaudeClient, names: set[str]) -> set[str]:
+    """Reconnect the named servers the CLI reports failed; return those to check again.
+
+    :raises TimeoutError: The CLI did not answer in time and is still busy with the request.
+    """
+    try:
+        response = await asyncio.wait_for(
+            client.get_mcp_status(), timeout=_MCP_STATUS_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        raise
+    except Exception:
+        logger.warning("Reading MCP status before reconnect failed", exc_info=True)
+        return names
+    retry: set[str] = set()
+    # (live CLI name, host inventory name) of each server to reconnect.
+    failed: list[tuple[str, str]] = []
+    servers = response.get("mcpServers")
+    for server in servers if isinstance(servers, list) else []:
+        live_name = server.get("name") if isinstance(server, Mapping) else None
+        if not isinstance(live_name, str):
+            continue
+        name = _inventory_mcp_server_name(live_name)
+        if name not in names:
+            continue
+        status = server.get("status")
+        if status == "pending":
+            retry.add(name)
+        elif status in ("failed", "needs-auth"):
+            failed.append((live_name, name))
+
+    # The CLI handles control requests one at a time, so the reconnects share one budget.
+    async with asyncio.timeout(_MCP_RECONNECT_TIMEOUT_SECONDS):
+        for live_name, name in failed:
+            try:
+                await client.reconnect_mcp_server(live_name)
+            except Exception:
+                logger.warning("Reconnecting MCP server %r failed", live_name, exc_info=True)
+                retry.add(name)
+    return retry
 
 
 @dataclass(frozen=True)
@@ -920,6 +1233,8 @@ class PreparedClaudeCli:
 
     cli_path: str | None
     enable_native_tools: bool
+    # Policy the wrapper applies; a CLI needing extra grants gets its own launcher from it.
+    sandbox: SandboxPolicy | None = None
 
 
 def _ensure_sdk() -> ModuleType:
@@ -939,6 +1254,43 @@ def _ensure_sdk() -> ModuleType:
 # ``_stable_tool_executor``. Every other tool (Claude Code's ``Skill`` and
 # ``ToolSearch``, or a user-configured MCP server) runs inside the CLI.
 _OMNIGENT_MCP_PREFIX = "mcp__omnigent__"
+# Permission modes in which Omnigent's tools are pre-approved (``allowed_tools``), so the
+# CLI asks no consent for them.
+_OMNIGENT_TOOLS_PREAPPROVED_MODES = ("auto", "bypassPermissions")
+
+
+class _RelayConsents:
+    """Omnigent tool calls the CLI's permission gate approved, each honoured once.
+
+    The managed relay accepts any caller holding its token, which anything in the
+    CLI's sandbox can read, so it asks consent for a call the gate did not approve.
+    A call the gate approved is not asked about again. An approval unused for
+    :attr:`TTL_S` lapses.
+    """
+
+    TTL_S = 300.0
+
+    def __init__(self) -> None:
+        self._approved: list[tuple[str, str, float]] = []
+
+    @staticmethod
+    def _key(arguments: Mapping[str, object]) -> str:
+        return json.dumps(arguments, sort_keys=True, default=str)
+
+    def record(self, tool_name: str, arguments: Mapping[str, object]) -> None:
+        """Remember that the gate approved ``tool_name`` with ``arguments``."""
+        self._approved.append((tool_name, self._key(arguments), time.monotonic()))
+
+    def consume(self, tool_name: str, arguments: Mapping[str, object]) -> bool:
+        """Use up one approval for this exact call; ``False`` when there is none."""
+        now = time.monotonic()
+        self._approved = [item for item in self._approved if now - item[2] < self.TTL_S]
+        key = self._key(arguments)
+        for index, (name, approved_key, _at) in enumerate(self._approved):
+            if name == tool_name and approved_key == key:
+                del self._approved[index]
+                return True
+        return False
 
 
 def _tool_call_metadata(tool_block: _ToolUseBlockObj) -> dict[str, object]:
@@ -954,6 +1306,20 @@ def _tool_call_metadata(tool_block: _ToolUseBlockObj) -> dict[str, object]:
         "call_id": tool_block.id,
         "internally_executed": not tool_block.name.startswith(_OMNIGENT_MCP_PREFIX),
     }
+
+
+def _mark_mcp_error(response: McpResponse) -> McpResponse:
+    """Flag an SDK MCP handler response as a tool error, in both spellings.
+
+    ``claude_agent_sdk.create_sdk_mcp_server`` builds the wire result from the
+    handler's snake_case ``is_error`` only (``CallToolResult(isError=
+    result.get("is_error", False))``), so a response carrying just ``isError``
+    reaches the model as a success. ``isError`` is kept for native MCP
+    clients and existing readers of these dicts.
+    """
+    response["is_error"] = True
+    response["isError"] = True
+    return response
 
 
 def _build_mcp_tools(
@@ -983,16 +1349,18 @@ def _build_mcp_tools(
         def _make_handler(tool_name: str) -> Callable[[ToolArgs], Awaitable[McpResponse]]:
             async def handler(args: ToolArgs) -> McpResponse:
                 if tool_executor is None:
-                    return {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": json_dumps_transport_safe(
-                                    {"error": f"No tool executor for '{tool_name}'"}
-                                ),
-                            }
-                        ],
-                    }
+                    return _mark_mcp_error(
+                        {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": json_dumps_transport_safe(
+                                        {"error": f"No tool executor for '{tool_name}'"}
+                                    ),
+                                }
+                            ],
+                        }
+                    )
                 try:
                     # ``tool_executor`` is declared as ``Awaitable[ToolResult]``
                     # so we always await. The isinstance guard below preserves
@@ -1012,18 +1380,19 @@ def _build_mcp_tools(
                     if result.get("blocked") is True or (
                         "error" in result and result.get("error")
                     ):
-                        response["isError"] = True
+                        return _mark_mcp_error(response)
                     return response
                 except Exception as exc:  # noqa: BLE001 — tool handler converts any error to MCP error response
-                    return {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": json_dumps_transport_safe({"error": str(exc)}),
-                            }
-                        ],
-                        "isError": True,
-                    }
+                    return _mark_mcp_error(
+                        {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": json_dumps_transport_safe({"error": str(exc)}),
+                                }
+                            ],
+                        }
+                    )
 
             return handler
 
@@ -1035,6 +1404,8 @@ def _build_mcp_tools(
 def _augment_system_prompt_for_omnigent_mcp_tools(
     system_prompt: str,
     tool_schemas: list[ToolSpec],
+    *,
+    managed_entry: bool = False,
 ) -> str:
     """
     Add Claude SDK-specific MCP tool-name guidance to the system prompt.
@@ -1044,6 +1415,10 @@ def _augment_system_prompt_for_omnigent_mcp_tools(
     as ``mcp__omnigent__<bare_name>``. Bundled agent prompts and skills use
     bare names because other executors call those directly, so the SDK needs
     a bridge note to stop the model from trying a non-existent bare tool first.
+
+    With ``managed_entry`` the tools come from the ``omnigent`` entry in
+    ``managed-mcp.json``, which managed policy Omnigent can't read may still drop,
+    so the note says what a missing tool means.
     """
     tool_names = [
         name for schema in tool_schemas if isinstance((name := schema.get("name")), str) and name
@@ -1070,6 +1445,12 @@ def _augment_system_prompt_for_omnigent_mcp_tools(
             "Claude SDK tool naming: Omnigent tools are exposed as MCP tools. "
             "When instructions mention a bare Omnigent tool name, invoke "
             "`mcp__omnigent__<tool_name>` rather than the bare name."
+        )
+    if managed_entry:
+        note += (
+            " They come from your organization's managed `omnigent` MCP server; "
+            "if no `mcp__omnigent__` tool is available, that server did not load in "
+            "this session, so say so instead of retrying."
         )
 
     if not system_prompt:
@@ -1211,6 +1592,18 @@ def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _Gatew
     )
 
 
+def _init_mcp_server_names(data: Mapping[str, object]) -> tuple[str, ...]:
+    """Extract valid server names from an SDK init event."""
+    servers = data.get("mcp_servers", [])
+    if not isinstance(servers, list):
+        return ()
+    return tuple(
+        row["name"]
+        for row in servers
+        if isinstance(row, dict) and isinstance(row.get("name"), str)
+    )
+
+
 def _claude_settings_payload(
     api_key_helper: str | None, model_overrides: dict[str, str]
 ) -> str | None:
@@ -1232,10 +1625,8 @@ def _claude_settings_payload(
 def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
     """Read the ``env`` block of Claude Code's user ``settings.json``.
 
-    Uses ``$CLAUDE_CONFIG_DIR/settings.json`` when set, else
-    ``~/.claude/settings.json``, matching Claude Code's user settings scope.
-    As in Claude Code, ``~`` in ``CLAUDE_CONFIG_DIR`` is not expanded and a
-    relative value is relative to the CLI's working directory.
+    The file is located by
+    :func:`omnigent.onboarding.ambient.read_claude_user_settings`.
 
     :param cwd: The CLI's working directory, e.g. ``"/home/user/repo"``;
         ``None`` means this process's working directory.
@@ -1243,14 +1634,10 @@ def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
         ``{"ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example"}``; empty
         when the file is missing, unreadable, or has no ``env`` object.
     """
-    configured = os.environ.get("CLAUDE_CONFIG_DIR")
-    config_dir = pathlib.Path(configured) if configured else pathlib.Path.home() / ".claude"
-    settings_path = pathlib.Path(cwd or "") / config_dir / "settings.json"
-    try:
-        settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    env = settings.get("env") if isinstance(settings, dict) else None
+    from omnigent.onboarding.ambient import read_claude_user_settings
+
+    settings = read_claude_user_settings(cwd)
+    env = settings.get("env") if settings is not None else None
     if not isinstance(env, dict):
         return {}
     return {
@@ -1305,19 +1692,17 @@ def _resolve_gateway_env(
         corresponding base URL or auth command.
     """
     host = host_override.rstrip("/") if host_override else None
-    if host is None and base_url_override is not None and auth_command_override is not None:
+    generic_provider = (
+        host is None and base_url_override is not None and auth_command_override is not None
+    )
+    if generic_provider:
         # Generic-provider gateway: explicit base_url + auth command,
         # no Databricks host or profile required (e.g. ApiKeyAuth with
         # a mock LLM server URL).
-        return {
-            "ANTHROPIC_BASE_URL": base_url_override,
-            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(
-                auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS
-            ),
-            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
-            _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command_override,
-        }
-    if host is None:
+        assert base_url_override is not None and auth_command_override is not None
+        base_url = base_url_override
+        auth_command = auth_command_override
+    elif host is None:
         # Only the workspace host is needed here: the auth command mints the
         # bearer at request time. Resolving the host (rather than a static
         # ``(host, token)`` credential pair) keeps OAuth U2M profiles working
@@ -1361,9 +1746,10 @@ def _resolve_gateway_env(
         "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(
             auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS
         ),
-        _ANTHROPIC_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
         _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command,
     }
+    if not generic_provider:
+        gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV] = _DATABRICKS_CODING_AGENT_HEADER
     # DATABRICKS-PATCH(claude-sdk-gateway-betas)
     # Blanket-disabling betas makes Claude Code strip `interleaved-thinking`,
     # after which the Databricks gateway rejects the malformed thinking blocks
@@ -1376,9 +1762,10 @@ def _resolve_gateway_env(
     if is_databricks_ai_gateway_url(base_url):
         gateway_env["CLAUDE_CODE_USE_GATEWAY"] = "1"
         gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
-            gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV],
+            gateway_env.get(_ANTHROPIC_CUSTOM_HEADERS_ENV),
             CLAUDE_CODE_AGENT,
             via_ug=is_ug_route(base_url),
+            client_surface=harness_client_surface(),
         )
     else:
         gateway_env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
@@ -1546,21 +1933,20 @@ def prepare_claude_cli_path(
     return PreparedClaudeCli(
         cli_path=create_exec_launcher(real_cli_path, sandbox),
         enable_native_tools=True,
+        sandbox=sandbox,
     )
 
 
-def prepare_tight_cli_process_path(
+def prepare_tight_cli_process(
     real_cli_path: str | None,
     *,
     cwd: str | None = None,
-) -> str | None:
+) -> PreparedClaudeCli:
     """Wrap the Claude CLI in a tight default sandbox without enabling tools."""
 
-    if real_cli_path is None:
-        return None
-
-    if _sandbox_disabled_by_env():
-        return real_cli_path
+    unwrapped = PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
+    if real_cli_path is None or _sandbox_disabled_by_env():
+        return unwrapped
 
     # Skip silently on non-Linux: the implicit default sandbox here is
     # ``linux_bwrap`` and ``resolve_sandbox`` would raise
@@ -1571,7 +1957,7 @@ def prepare_tight_cli_process_path(
     # logging a warning every run is just noise (and breaks
     # tests that assert ``stderr_is_clean``).
     if sys.platform != "linux":
-        return real_cli_path
+        return unwrapped
 
     spec = OSEnvSpec(
         type="caller_process",
@@ -1590,13 +1976,50 @@ def prepare_tight_cli_process_path(
             "Could not apply default local CLI sandbox; continuing without it: %s",
             exc,
         )
-        return real_cli_path
+        return unwrapped
     else:
         if not sandbox.active:
-            return real_cli_path
+            return unwrapped
         sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
         sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
-        return create_exec_launcher(real_cli_path, sandbox)
+        return PreparedClaudeCli(
+            cli_path=create_exec_launcher(real_cli_path, sandbox),
+            enable_native_tools=False,
+            sandbox=sandbox,
+        )
+
+
+def _claude_managed_config_dirs() -> list[pathlib.Path]:
+    """Directories holding the enterprise ``managed-mcp.json`` Claude Code reads.
+
+    Claude Code reads its managed settings, drop-ins and MCP config from that one
+    directory, so a sandboxed CLI needs all of it to honour the relay entry's policy.
+    """
+    from omnigent.onboarding.ambient import claude_code_managed_mcp_paths
+
+    return [path.parent for path in claude_code_managed_mcp_paths() if os.path.exists(path)]
+
+
+def _client_cli_sandbox(
+    base: SandboxPolicy,
+    *,
+    managed_config_dirs: Sequence[pathlib.Path],
+    bridge_dir: pathlib.Path | None,
+    socket_dir: pathlib.Path | None = None,
+) -> SandboxPolicy:
+    """The CLI sandbox for one client under an enterprise MCP config.
+
+    Bubblewrap gives the CLI a private ``/tmp`` and a fixed set of ``/etc`` paths, and
+    Seatbelt denies writes outside its grants, so the managed config is granted
+    read-only and this client's relay bridge and control-socket directory read-write.
+    Neither shared root is granted: they hold every other session's relay token and
+    socket. A bwrap bind keeps the socket on the host, where it can be reached.
+    """
+    policy = with_additional_read_roots(base, managed_config_dirs)
+    relay_dirs = [path for path in (bridge_dir, socket_dir) if path is not None]
+    if relay_dirs:
+        policy = with_additional_write_roots(policy, relay_dirs)
+    return policy
 
 
 @dataclass(frozen=True)
@@ -1704,6 +2127,7 @@ class ClaudeSDKExecutor(Executor):
         self,
         *,
         cwd: str | None = None,
+        active_harnesses: Collection[str] | None = None,
         os_env: OSEnvSpec | None = None,
         model: str | None = None,
         permission_mode: str = "auto",
@@ -1719,6 +2143,7 @@ class ClaudeSDKExecutor(Executor):
         skills_filter: str | list[str] = "all",
         api_key_helper: str | None = None,
         system_prompt_preset: str | None = None,
+        context_window: int | None = None,
     ) -> None:
         """Create a ClaudeSDKExecutor.
 
@@ -1733,6 +2158,9 @@ class ClaudeSDKExecutor(Executor):
             model: Override the model name.
             system_prompt_preset: Set to ``claude_code`` to append agent
                 instructions to Claude Code's prompt. Unset preserves the custom prompt.
+            context_window: The spec's declared context window in tokens,
+                e.g. ``1000000``. Sizes the history a fresh client replays;
+                ``None`` resolves the window from the model.
             permission_mode: SDK permission mode (default: auto
                 so the agent runs autonomously with background safety checks).
             gateway: If True, route through a vendor-neutral gateway
@@ -1811,6 +2239,7 @@ class ClaudeSDKExecutor(Executor):
         self._os_env_spec = os_env
         self._os_env = os_env is not None
         self._model_override = model
+        self._context_window = context_window
         self._permission_mode = permission_mode
         self._gateway = gateway
         self._databricks_profile = databricks_profile
@@ -1859,6 +2288,9 @@ class ClaudeSDKExecutor(Executor):
         # Databricks gateway doesn't support.
         self._cli_wrapper_path: str | None = None
         self._cli_path: str | None = _find_system_claude()
+        # The unwrapped CLI and the sandbox its wrapper applies, for per-client launchers.
+        self._real_cli_path = self._cli_path
+        self._cli_sandbox: SandboxPolicy | None = None
         if self._cli_path:
             if self._os_env_spec is not None:
                 prepared = prepare_claude_cli_path(
@@ -1866,17 +2298,12 @@ class ClaudeSDKExecutor(Executor):
                     self._os_env_spec,
                 )
                 self._os_env = prepared.enable_native_tools
-                if prepared.cli_path != self._cli_path:
-                    self._cli_wrapper_path = prepared.cli_path
-                    self._cli_path = prepared.cli_path
             else:
-                wrapped_cli = prepare_tight_cli_process_path(
-                    self._cli_path,
-                    cwd=self._cwd,
-                )
-                if wrapped_cli != self._cli_path:
-                    self._cli_wrapper_path = wrapped_cli
-                    self._cli_path = wrapped_cli
+                prepared = prepare_tight_cli_process(self._cli_path, cwd=self._cwd)
+            if prepared.cli_path != self._cli_path:
+                self._cli_wrapper_path = prepared.cli_path
+                self._cli_path = prepared.cli_path
+                self._cli_sandbox = prepared.sandbox
             if self._os_env_spec is not None and self._cwd is None:
                 self._cwd = self._os_env_spec.cwd
             logger.info("Using system claude CLI: %s", self._cli_path)
@@ -1904,6 +2331,8 @@ class ClaudeSDKExecutor(Executor):
         # :meth:`_apply_gateway_model_vocabulary`). ``None`` until resolved;
         # the resolved value may be empty (discovery found nothing).
         self._gateway_vocabulary: _GatewayModelVocabulary | None = None
+
+        self._mcp_active_harnesses = active_harnesses
 
         # Eagerly resolve the gateway transport env so errors surface at
         # construction time.
@@ -1987,6 +2416,7 @@ class ClaudeSDKExecutor(Executor):
     ) -> _ClaudeClient:
         state = self._clients.get(session_key)
         if state is None:
+            mcp_auth = _claude_mcp_auth_statuses()
             await self._route_options_through_gateway_shim(options)
             # Tee CLI stderr so the connect timeout error carries the
             # tail; ``_on_stderr`` alone only logs at DEBUG.
@@ -2016,9 +2446,8 @@ class ClaudeSDKExecutor(Executor):
                 # DATABRICKS-PATCH(claude-sdk-gateway-betas): on the Databricks
                 # gateway we negotiate betas rather than disabling them, but
                 # *omitting* CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS from
-                # ``options.env`` does not beat an INHERITED one — Databricks
-                # runners export it (devtools/ai/databricks_auth/gateway_env.py
-                # and the arca/isaac runners), and the merge puts os.environ
+                # ``options.env`` does not beat an INHERITED one — a parent launcher
+                # may export it (the arca/isaac runners do), and the merge puts os.environ
                 # under options.env. Without this the child still strips
                 # interleaved-thinking and the gateway still answers 400. Scoped
                 # to launches that negotiate (CLAUDE_CODE_USE_GATEWAY): the
@@ -2079,6 +2508,7 @@ class ClaudeSDKExecutor(Executor):
                 loop=asyncio.get_running_loop(),
                 task=current_task,
                 effort=getattr(options, "effort", None),
+                mcp_auth=mcp_auth,
             )
             self._clients[session_key] = state
             return client
@@ -2088,6 +2518,112 @@ class ClaudeSDKExecutor(Executor):
             state.model = model
         return state.client
 
+    def _consented_relay_executor(
+        self, tool_executor: ToolExecutor, consents: _RelayConsents
+    ) -> ToolExecutor:
+        """The executor a managed relay dispatches through, asking consent as the CLI would.
+
+        Outside a pre-approving permission mode a call runs only if the CLI's gate
+        approved it (see :class:`_RelayConsents`) or the same gate approves it now, so a
+        process that reads the relay's token cannot skip the consent the CLI asks for.
+        """
+        from claude_agent_sdk import PermissionResultAllow
+
+        async def dispatch(name: str, arguments: ToolArgs) -> ToolResult:
+            if self._permission_mode not in _OMNIGENT_TOOLS_PREAPPROVED_MODES and not (
+                consents.consume(name, arguments)
+            ):
+                verdict = await self._can_use_tool_gate(
+                    f"{_OMNIGENT_MCP_PREFIX}{name}", arguments, None
+                )
+                if not isinstance(verdict, PermissionResultAllow):
+                    return {"error": f"Omnigent tool {name!r} was not approved", "blocked": True}
+            return await tool_executor(name, arguments)
+
+        return dispatch
+
+    def _prepare_managed_cli(
+        self, options: SdkOptions, relay_tools: list[ToolSpec] | None
+    ) -> tuple[_ManagedMcpRelay | None, str | None]:
+        """Point a new CLI's managed relay entry at its own relay, or at nothing.
+
+        The SDK merges this process's environment into the CLI's, so relay variables
+        inherited from an enclosing session are blanked rather than left out. Under a
+        sandbox the CLI also gets its own launcher, which exposes the managed config
+        and only this client's bridge.
+
+        :returns: The started relay and launcher, each ``None`` when not needed.
+        """
+        from omnigent.harnesses.claude_native.bridge import MANAGED_MCP_RELAY_ENV_NAMES
+
+        relay = None
+        if relay_tools is not None and self._tool_executor is not None:
+            consents = _RelayConsents()
+            relay = _ManagedMcpRelay(
+                relay_tools,
+                self._consented_relay_executor(self._tool_executor, consents),
+                asyncio.get_running_loop(),
+            )
+            options.env.update(relay.env)
+            gate = getattr(options, "can_use_tool", None)
+            if gate is not None:
+                options.can_use_tool = _recording_consents(gate, consents)
+        else:
+            # Empty values make the entry's command fail instead of reaching a bridge.
+            options.env.update(dict.fromkeys(MANAGED_MCP_RELAY_ENV_NAMES, ""))
+        if self._cli_sandbox is None or self._real_cli_path is None:
+            return relay, None
+        try:
+            launcher = create_exec_launcher(
+                self._real_cli_path,
+                _client_cli_sandbox(
+                    self._cli_sandbox,
+                    managed_config_dirs=_claude_managed_config_dirs(),
+                    bridge_dir=relay.bridge_dir if relay is not None else None,
+                    socket_dir=relay.socket_dir if relay is not None else None,
+                ),
+            )
+        except BaseException:
+            _release_client_cli(relay, None)
+            raise
+        options.cli_path = launcher
+        return relay, launcher
+
+    async def _reconnect_signed_in_mcp_servers(self, state: _ClaudeClientState) -> bool:
+        """Reconnect servers the host reports signed in since this client last checked.
+
+        The CLI connects MCP servers only at startup, so one that failed while its
+        sign-in was pending stays failed for the life of the client.
+
+        :returns: ``False`` when the CLI is still busy with a timed-out request and
+            would hold the next prompt, so the client must be replaced.
+        """
+        current = _claude_mcp_auth_statuses()
+        signed_in = {
+            name
+            for name, status in current.items()
+            if status == "connected" and state.mcp_auth.get(name) != "connected"
+        }
+        try:
+            # Wait out a panel request in flight: if it times out, that CLI holds the prompt.
+            async with state.mcp_control_lock:
+                if state.mcp_control_timed_out:
+                    return False
+                retry = (
+                    await _reconnect_failed_mcp_servers(state.client, signed_in)
+                    if signed_in
+                    else set()
+                )
+        except TimeoutError:
+            logger.warning(
+                "Reconnecting MCP servers timed out; restarting the Claude CLI, "
+                "which connects them as it starts"
+            )
+            return False
+        # A server left out of the snapshot is checked again next turn.
+        state.mcp_auth = {name: status for name, status in current.items() if name not in retry}
+        return True
+
     async def close_session(self, session_key: str) -> None:
         self._crashed_sessions.pop(session_key, None)
         await self._close_live_client(session_key)
@@ -2096,6 +2632,12 @@ class ClaudeSDKExecutor(Executor):
         state = self._clients.pop(session_key, None)
         if state is None:
             return
+        try:
+            await self._disconnect_client_state(session_key, state)
+        finally:
+            await _close_managed_mcp_relay(state)
+
+    async def _disconnect_client_state(self, session_key: str, state: _ClaudeClientState) -> None:
         try:
             current_loop = asyncio.get_running_loop()
             current_task = asyncio.current_task()
@@ -2136,9 +2678,15 @@ class ClaudeSDKExecutor(Executor):
             return
         # Close in the background: an await here runs under an in-flight
         # cancellation and could itself be cancelled, leaking the CLI process.
-        task = asyncio.create_task(self._force_close_client(state.client))
+        task = asyncio.create_task(self._force_close_evicted_client(state))
         self._cancel_close_tasks.add(task)
         task.add_done_callback(self._cancel_close_tasks.discard)
+
+    async def _force_close_evicted_client(self, state: _ClaudeClientState) -> None:
+        try:
+            await self._force_close_client(state.client)
+        finally:
+            await _close_managed_mcp_relay(state)
 
     async def _evict_terminated_client(self, session_key: str) -> None:
         """Discard a cached client after its CLI child exits."""
@@ -2301,6 +2849,67 @@ class ClaudeSDKExecutor(Executor):
         # The SDK has no API to inject into an active turn; claiming this
         # capability caused the one-turn-behind desync described in #3472.
         return False
+
+    def supports_live_mcp_control(self) -> bool:
+        return True
+
+    async def _mcp_control[T](
+        self, state: _ClaudeClientState, request: Callable[[], Awaitable[T]], timeout: float
+    ) -> T:
+        """Send one MCP control request, marking the client for replacement if it times out.
+
+        Waiting for another control request to finish counts toward *timeout*
+        but leaves the client in place: that CLI is busy, not stuck.
+        """
+        deadline = asyncio.get_running_loop().time() + timeout
+        async with asyncio.timeout_at(deadline):
+            await state.mcp_control_lock.acquire()
+        try:
+            # A CLI still busy with a timed-out request would hold this one too.
+            if state.mcp_control_timed_out:
+                raise TimeoutError
+            async with asyncio.timeout_at(deadline):
+                return await request()
+        except TimeoutError:
+            state.mcp_control_timed_out = True
+            raise
+        finally:
+            state.mcp_control_lock.release()
+
+    async def live_mcp_statuses(self, session_key: str) -> list[LiveMcpServerStatus] | None:
+        state = self._clients.get(session_key)
+        if state is None:
+            return None
+        response = await self._mcp_control(
+            state, state.client.get_mcp_status, _MCP_STATUS_TIMEOUT_SECONDS
+        )
+        return _live_mcp_statuses(response)
+
+    async def reconnect_live_mcp_server(self, session_key: str, name: str) -> None:
+        state = self._clients.get(session_key)
+        if state is None:
+            raise LiveMcpHarnessNotRunning(session_key)
+
+        # Check and reconnect in one lock hold, so both reach the same CLI.
+        async def check_and_reconnect() -> None:
+            if self._clients.get(session_key) is not state:
+                raise LiveMcpHarnessNotRunning(session_key)
+            response = await state.client.get_mcp_status()
+            if name not in {status.name for status in _live_mcp_statuses(response)}:
+                raise LiveMcpServerUnknown(name)
+            try:
+                await state.client.reconnect_mcp_server(name)
+            except Exception as exc:
+                # The SDK raises a bare Exception carrying the CLI's own error reply.
+                if type(exc) is Exception and exc.__cause__ is None:
+                    raise LiveMcpReconnectRefused(str(exc)) from exc
+                raise
+
+        await self._mcp_control(
+            state,
+            check_and_reconnect,
+            _MCP_STATUS_TIMEOUT_SECONDS + _MCP_RECONNECT_TIMEOUT_SECONDS,
+        )
 
     def supports_tool_boundary_interrupt(self) -> bool:
         return True
@@ -2780,9 +3389,10 @@ class ClaudeSDKExecutor(Executor):
             return
         await self._evict_terminated_client(session_key)
         resume_session = session_key in self._clients
-        prompt = self._build_prompt(
-            messages,
-            resume_session=resume_session,
+        prompt = (
+            self._build_prompt(messages, resume_session=True)
+            if resume_session
+            else await self._fresh_session_prompt(messages, cfg)
         )
         if not prompt:
             # Resumed sessions can have nothing new to say; signal turn
@@ -2791,29 +3401,59 @@ class ClaudeSDKExecutor(Executor):
             return
 
         state = self._clients.get(session_key)
-        if state is not None and state.effort != reasoning_effort and prompt != "/compact":
-            # Effort is a launch option. Rebuild with history for conversational
-            # turns, but let /compact operate on the existing client's context.
-            await self._close_live_client(session_key)
-            resume_session = False
-            prompt = self._build_prompt(messages, resume_session=False)
+        if state is not None and prompt == "/compact" and state.mcp_control_timed_out:
+            # The busy CLI would hold the command, and a new one has nothing to compact.
+            yield ExecutorError(message=_MCP_BUSY_COMPACT_MESSAGE)
+            return
+        if state is not None and prompt != "/compact":
+            # Effort is a launch option, and a CLI busy with a timed-out MCP reconnect
+            # holds the prompt. Rebuild with history for conversational turns, but let
+            # /compact operate on the existing client's context.
+            rebuild = state.effort != reasoning_effort or state.mcp_control_timed_out
+            if not rebuild:
+                try:
+                    rebuild = not await self._reconnect_signed_in_mcp_servers(state)
+                except asyncio.CancelledError:
+                    self._evict_client_on_cancel(session_key)
+                    raise
+            if rebuild:
+                await self._close_live_client(session_key)
+                resume_session = False
+                prompt = await self._fresh_session_prompt(messages, cfg)
 
-        # Build MCP tools from Omnigent tool schemas
-        mcp_tools = _build_mcp_tools(tools, self._tool_executor) if tools else []
+        from omnigent.harnesses.claude_native.bridge import (
+            MANAGED_MCP_RELAY_MISSING_WARNING,
+            managed_mcp_relay_configured,
+        )
+        from omnigent.onboarding.ambient import claude_code_managed_mcp_present
 
         # Create MCP server config for Omnigent tools. The SDK's
         # ``McpServerConfig`` union is opaque to us — we pass through
         # whatever ``create_sdk_mcp_server`` returns.
         mcp_servers: dict[str, Any] = {}  # type: ignore[explicit-any]
-        if mcp_tools:
-            mcp_servers["omnigent"] = sdk.create_sdk_mcp_server(
-                name="omnigent",
+        # Tools a new client's CLI reaches through the managed relay entry instead.
+        managed_relay_tools: list[ToolSpec] | None = None
+        omnigent_tools_reachable = bool(tools)
+        managed_mcp = claude_code_managed_mcp_present()
+        if tools and managed_mcp:
+            # Claude Code refuses --mcp-config while an enterprise MCP config exists.
+            if not managed_mcp_relay_configured():
+                if session_key not in self._clients:
+                    logger.warning(MANAGED_MCP_RELAY_MISSING_WARNING)
+            elif self._tool_executor is not None:
+                managed_relay_tools = tools
+            omnigent_tools_reachable = managed_relay_tools is not None
+        elif tools:
+            mcp_servers[_OMNIGENT_MCP_SERVER_NAME] = sdk.create_sdk_mcp_server(
+                name=_OMNIGENT_MCP_SERVER_NAME,
                 version="1.0.0",
-                tools=mcp_tools,
+                tools=_build_mcp_tools(tools, self._tool_executor),
             )
+        if omnigent_tools_reachable:
             system_prompt = _augment_system_prompt_for_omnigent_mcp_tools(
                 system_prompt,
                 tools,
+                managed_entry=managed_relay_tools is not None,
             )
 
         # Build allowed_tools list.  OS-environment operations route
@@ -2833,7 +3473,7 @@ class ClaudeSDKExecutor(Executor):
         # When ``allowed_tools`` is empty the SDK omits ``--allowedTools``
         # entirely, letting Claude's normal permission flow apply.
         allowed_tools: list[str] = []
-        if self._permission_mode in ("auto", "bypassPermissions"):
+        if self._permission_mode in _OMNIGENT_TOOLS_PREAPPROVED_MODES:
             # Allow all Omnigent MCP tools (no per-call human gate needed)
             for schema in tools:
                 raw_tname = schema.get("name")
@@ -2852,26 +3492,27 @@ class ClaudeSDKExecutor(Executor):
         # to a ``databricks-*`` model: the Omnigent producer always resolves a
         # concrete model (spec > provider default > catalog default) before
         # spawning, so no ``databricks-*`` default is injected there.
-        model = cfg.model or self._model_override
-        if model is None and self._gateway_uses_databricks_profile:
-            if self._resolved_default_model is None:
-                self._resolved_default_model = await run_sync_on_thread(
-                    _resolve_databricks_claude_model, self._databricks_profile
-                )
-            model = self._resolved_default_model
+        model = cfg.model or await self._spec_or_default_model()
 
         # Build env: Databricks gateway settings derived from profile-backed
         # creds. CLAUDECODE removal happens around the subprocess spawn in
         # ``_get_or_create_client`` via ``_unset_env_var`` — setting it to
         # ``""`` here would still leave an empty key in the child env.
         env = dict(self._extra_env)
+        env["CLAUDE_AGENT_SDK_CLIENT_APP"] = "omnigent"
         api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
         # Teach Claude Code this gateway's spellings so no model surface routes
         # to an id the gateway rejects: pins for the family aliases, rewrites
         # for the canonical ids the CLI names itself (the refusal-fallback).
         # No-op off the gateway transport.
         model_overrides = await self._apply_gateway_model_vocabulary(env, api_key_helper)
-        settings_payload = _claude_settings_payload(api_key_helper, model_overrides)
+        from omnigent.mcp_disabled_servers import apply_claude_settings
+
+        settings_payload = apply_claude_settings(
+            _claude_settings_payload(api_key_helper, model_overrides),
+            executor="claude-sdk",
+            active_harnesses=self._mcp_active_harnesses,
+        )
 
         # Capture stderr from the CLI subprocess for diagnostics
         stderr_lines: list[str] = []
@@ -3180,12 +3821,24 @@ class ClaudeSDKExecutor(Executor):
                 compacted_messages=compacted_messages,
             )
 
-        client = await self._get_or_create_client(
-            sdk,
-            session_key=session_key,
-            options=options,
-            model=model,
-        )
+        mcp_relay = None
+        cli_launcher = None
+        # Only a new CLI reads the relay environment; a live one keeps its relay.
+        if managed_mcp and session_key not in self._clients:
+            mcp_relay, cli_launcher = self._prepare_managed_cli(options, managed_relay_tools)
+        try:
+            client = await self._get_or_create_client(
+                sdk,
+                session_key=session_key,
+                options=options,
+                model=model,
+            )
+        except BaseException:
+            await asyncio.to_thread(_release_client_cli, mcp_relay, cli_launcher)
+            raise
+        if mcp_relay is not None or cli_launcher is not None:
+            state = self._clients[session_key]
+            state.mcp_relay, state.cli_launcher = mcp_relay, cli_launcher
 
         # ── LLM_REQUEST policy evaluation ────────────────────────
         # If the executor adapter installed a ``_policy_evaluator``
@@ -3529,6 +4182,15 @@ class ClaudeSDKExecutor(Executor):
                         subtype = system_msg.subtype
                         data = system_msg.data
 
+                        if subtype == "init":
+                            from omnigent.mcp_disabled_servers import claude_loaded_anyway
+
+                            for name in claude_loaded_anyway(
+                                _init_mcp_server_names(data),
+                                active_harnesses=self._mcp_active_harnesses,
+                            ):
+                                logger.warning("mcp_disabled_server_not_applied server=%s", name)
+
                         if subtype == "api_retry":
                             error_status = data.get("error_status")
                             retry_error = data.get("error", "unknown_error")
@@ -3707,11 +4369,53 @@ class ClaudeSDKExecutor(Executor):
         logger.info("ClaudeSDKExecutor: turn complete")
         yield TurnComplete(response=response_text, usage=turn_usage)
 
+    async def _spec_or_default_model(self) -> str | None:
+        """
+        Return the spec model, or the workspace default for an unpinned
+        Databricks-profile session, resolved once per executor.
+
+        :returns: The model id, or ``None`` to let the SDK pick its default.
+        """
+        if self._model_override is None and self._gateway_uses_databricks_profile:
+            if self._resolved_default_model is None:
+                self._resolved_default_model = await run_sync_on_thread(
+                    _resolve_databricks_claude_model, self._databricks_profile
+                )
+            return self._resolved_default_model
+        return self._model_override
+
+    async def _fresh_session_prompt(
+        self, messages: list[Message], cfg: ExecutorConfig
+    ) -> str | list[_JsonObject]:
+        """
+        Build the first prompt for a newly launched client.
+
+        Prior history is replayed within a share of the turn model's context
+        window, so a long session still fits after its client restarts.
+
+        :param messages: Conversation history as inner :class:`Message` dicts.
+        :param cfg: The turn's executor config, carrying any model override.
+        :returns: The prompt from :meth:`_build_prompt`.
+        """
+        budget = None
+        if _has_replayable_history(messages):
+            base_model = self._model_override if cfg.model else await self._spec_or_default_model()
+            # Off-loop: the window lookup may fetch the model catalog.
+            window = await run_sync_on_thread(
+                _resolve_replay_context_window,
+                self._context_window,
+                base_model,
+                cfg.model,
+            )
+            budget = int(window * _REPLAYED_HISTORY_WINDOW_SHARE)
+        return self._build_prompt(messages, resume_session=False, history_token_budget=budget)
+
     @staticmethod
     def _build_prompt(
         messages: list[Message],
         *,
         resume_session: bool,
+        history_token_budget: int | None = None,
     ) -> str | list[_JsonObject]:
         """
         Build the prompt for the SDK.
@@ -3732,6 +4436,10 @@ class ClaudeSDKExecutor(Executor):
         :param resume_session: ``True`` when the SDK session
             already has prior turns cached (no need to replay
             history).
+        :param history_token_budget: Estimated tokens the replayed
+            history may use, e.g. ``100000``. The newest prior messages
+            that fit are kept behind a marker counting the omitted ones;
+            ``None`` replays every prior message.
         :returns: A plain string prompt, or a list of Anthropic
             API content block dicts when multimodal blocks are
             present in the latest user message.
@@ -3740,8 +4448,7 @@ class ClaudeSDKExecutor(Executor):
             # The live session already holds its tool items; only a fresh one replays them.
             return ClaudeSDKExecutor._extract_trailing_user_content(without_tool_history(messages))
 
-        user_messages = [msg for msg in messages if msg.get("role") == "user"]
-        if len(messages) <= 1 or len(user_messages) <= 1:
+        if not _has_replayable_history(messages):
             return ClaudeSDKExecutor._extract_latest_user_content(messages)
 
         # Check if the latest user message is multimodal — if so,
@@ -3752,19 +4459,31 @@ class ClaudeSDKExecutor(Executor):
         latest_index = max(i for i, msg in enumerate(messages) if msg.get("role") == "user")
         prior = messages[:latest_index] + messages[latest_index + 1 :]
 
+        kept: list[list[_JsonObject]] = []
+        remaining_tokens = history_token_budget
+        for msg in reversed(prior):
+            rendered = _render_prior_message(msg)
+            if remaining_tokens is not None:
+                remaining_tokens -= _estimated_replay_tokens(rendered)
+                if remaining_tokens < 0:
+                    break
+            kept.append(rendered)
+
         prior_blocks: list[_JsonObject] = [_text_block("Conversation so far:")]
-        for msg in prior:
-            role = str(msg.get("role", "user")).replace("_", " ")
-            raw_content = msg.get("content")
-            rendered = [] if raw_content is None else _render_prior_content_blocks(raw_content)
-            if not rendered:
-                rendered = [_text_block("")]
-            # Label the message inline when it opens with text; an attachment
-            # that leads the message gets the label on its own line instead.
-            if rendered[0].get("type") == "text":
-                rendered[0] = _text_block(f"{role}: {rendered[0]['text']}")
-            else:
-                rendered.insert(0, _text_block(f"{role}:"))
+        omitted = len(prior) - len(kept)
+        if omitted:
+            logger.info(
+                "ClaudeSDKExecutor: replaying %d of %d prior messages within %d tokens",
+                len(kept),
+                len(prior),
+                history_token_budget,
+            )
+            prior_blocks.append(
+                _text_block(
+                    f"[Earlier messages omitted to fit the model's context window: {omitted}.]"
+                )
+            )
+        for rendered in reversed(kept):
             prior_blocks.extend(rendered)
         prior_blocks.append(_text_block(""))
         prior_blocks.append(

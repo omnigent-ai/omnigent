@@ -47,8 +47,8 @@ DetectedKind = Literal["key", "subscription", "local", "cli-config"]
 # ``subscription`` is a logged-in CLI; ``local`` is a self-hosted endpoint;
 # ``cli-config`` is a custom model provider a harness CLI's own config file
 # defines (today: a ``[model_providers.X]`` table in ``~/.codex/config.toml``
-# that carries its own auth, e.g. the Databricks Unity Gateway written by
-# ``isaac configure codex``).
+# that carries its own auth, e.g. the Databricks Unity Gateway set up by a
+# wrapper's Codex setup).
 KEY_KIND: DetectedKind = "key"
 SUBSCRIPTION_KIND: DetectedKind = "subscription"
 LOCAL_KIND: DetectedKind = "local"
@@ -64,16 +64,17 @@ _OLLAMA_URL = f"http://{_OLLAMA_HOST}:{_OLLAMA_PORT}"
 _OLLAMA_PROBE_TIMEOUT = 0.25
 
 # Claude Code's enterprise "managed settings" chain, highest precedence first.
-# An enterprise install (the shape ``isaac configure claude`` writes) configures
-# Claude Code here and nowhere else: an ``env`` block pinning
-# ``ANTHROPIC_BASE_URL`` at a gateway plus a top-level ``apiKeyHelper`` that
-# prints the bearer token. Managed settings win at Claude Code's own launch, so
-# this file alone is a complete, working credential — but it belongs to Claude
-# Code, not omnigent: we reflect it (readiness + label), we never adopt it into
-# a ``providers:`` shape (see ``claude_managed_gateway``).
+# An enterprise install configures Claude Code here and nowhere else: an
+# ``env`` block pinning ``ANTHROPIC_BASE_URL`` at a gateway plus a top-level
+# ``apiKeyHelper`` that prints the bearer token. Managed settings win at Claude
+# Code's own launch, so this file alone is a complete, working credential — but
+# it belongs to Claude Code, not omnigent: we reflect it (readiness + label), we
+# never adopt it into a ``providers:`` shape (see ``claude_managed_gateway``).
+_CLAUDE_CODE_MACOS_MANAGED_DIR = Path("/Library/Application Support/ClaudeCode")
+_CLAUDE_CODE_LINUX_MANAGED_DIR = Path("/etc/claude-code")
 CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] = (
-    Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
-    Path("/etc/claude-code/managed-settings.json"),
+    _CLAUDE_CODE_MACOS_MANAGED_DIR / "managed-settings.json",
+    _CLAUDE_CODE_LINUX_MANAGED_DIR / "managed-settings.json",
     Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "ClaudeCode" / "managed-settings.json",
 )
 
@@ -263,7 +264,7 @@ class CodexConfigProvider:
 def codex_config_custom_provider(config_path: Path) -> CodexConfigProvider | None:
     """Detect a custom, auth-carrying default model provider in a Codex config.
 
-    ``isaac configure codex`` (and similar enterprise tooling) configures
+    Enterprise setup tooling configures
     Codex by writing ``~/.codex/config.toml`` only: a custom
     ``[model_providers.X]`` table whose ``[X.auth]`` command prints a
     bearer token, selected via a top-level ``model_provider = "X"``. No
@@ -326,8 +327,8 @@ class CodexConfigTransport:
 
     The runtime-routing counterpart of :class:`CodexConfigProvider` (which
     only carries the id / display name for the setup menu). This reads the
-    fields a harness needs to actually talk to the provider — the ones
-    ``isaac configure codex`` writes for the Databricks Unity Gateway.
+    fields a harness needs to actually talk to the provider, the ones a
+    Codex setup writes for the Databricks Unity Gateway.
 
     :param base_url: The provider table's ``base_url``, e.g.
         ``"https://<workspace>.ai-gateway.cloud.databricks.com/codex/v1"``.
@@ -531,25 +532,65 @@ def claude_managed_gateway(
         credentials api.anthropic.com); ``has_credential`` is whether Claude
         Code has a usable credential to apply at launch.
     """
+    payload = read_claude_managed_settings(paths)
+    if payload is None:
+        return None, False
+    raw_env = payload.get("env")
+    env = raw_env if isinstance(raw_env, dict) else {}
+    raw_base_url = env.get("ANTHROPIC_BASE_URL")
+    base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
+    has_helper = bool(payload.get("apiKeyHelper"))
+    use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
+        "",
+        "0",
+        "false",
+    )
+    return base_url or None, has_helper or use_gateway
+
+
+def read_claude_managed_settings(
+    paths: tuple[Path, ...] | None = None,
+) -> dict[str, object] | None:
+    """Return the managed settings file Claude Code applies, parsed.
+
+    The first readable, object-shaped file decides, matching Claude Code's own
+    precedence.
+
+    :param paths: Settings files to read, highest precedence first; defaults to
+        :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
+    :returns: The parsed settings object, or ``None`` when no file is readable.
+    """
     for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS if paths is None else paths:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if not isinstance(payload, dict):
-            continue
-        raw_env = payload.get("env")
-        env = raw_env if isinstance(raw_env, dict) else {}
-        raw_base_url = env.get("ANTHROPIC_BASE_URL")
-        base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
-        has_helper = bool(payload.get("apiKeyHelper"))
-        use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
-            "",
-            "0",
-            "false",
-        )
-        return base_url or None, has_helper or use_gateway
-    return None, False
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def read_claude_user_settings(cwd: str | None = None) -> dict[str, object] | None:
+    """Return Claude Code's user ``settings.json``, parsed.
+
+    Uses ``$CLAUDE_CONFIG_DIR/settings.json`` when set, else
+    ``~/.claude/settings.json``, matching Claude Code's user settings scope.
+    As in Claude Code, ``~`` in ``CLAUDE_CONFIG_DIR`` is not expanded and a
+    relative value is relative to the CLI's working directory.
+
+    :param cwd: The CLI's working directory, e.g. ``"/home/user/repo"``;
+        ``None`` means this process's working directory.
+    :returns: The settings object, or ``None`` when the file is missing,
+        unreadable, or not an object.
+    """
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    config_dir = Path(configured) if configured else Path.home() / ".claude"
+    settings_path = Path(cwd or "") / config_dir / "settings.json"
+    try:
+        payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def claude_managed_gateway_routes(paths: tuple[Path, ...] | None = None) -> str | None:
@@ -629,6 +670,33 @@ def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -
     if is_databricks_ai_gateway_url(base_url):
         return "Databricks Unity Gateway"
     return urlsplit(base_url).hostname or "Claude Code gateway"
+
+
+def claude_code_managed_mcp_paths() -> tuple[Path, ...]:
+    """Claude Code's enterprise MCP config, which sits beside its managed settings.
+
+    Claude Code reads only its own platform's directory, so this skips the other POSIX
+    one, and Windows paths on POSIX, which would resolve against the working directory.
+    """
+    other_platform_dir = (
+        _CLAUDE_CODE_LINUX_MANAGED_DIR
+        if sys.platform == "darwin"
+        else _CLAUDE_CODE_MACOS_MANAGED_DIR
+    )
+    return tuple(
+        path.with_name("managed-mcp.json")
+        for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+        if path.is_absolute() and path.parent != other_platform_dir
+    )
+
+
+def claude_code_managed_mcp_present() -> bool:
+    """Whether an enterprise MCP config is deployed, so Claude Code refuses ``--mcp-config``.
+
+    Like Claude Code, an unreadable file still counts but an inaccessible directory
+    does not, which is why this uses ``os.path.exists`` rather than ``Path.exists``.
+    """
+    return any(os.path.exists(path) for path in claude_code_managed_mcp_paths())
 
 
 def _claude_login_detected() -> bool:
@@ -746,7 +814,7 @@ def detect_providers() -> list[DetectedProvider]:
        a login (see :func:`_claude_login_detected`).
     3. A custom, auth-carrying model provider in ``~/.codex/config.toml``
        (see :func:`codex_config_custom_provider`) — e.g. the Databricks AI
-       Gateway provider that ``isaac configure codex`` writes. Ordered
+       Gateway provider that a Codex setup writes. Ordered
        before the codex login check so the auto-default matches Codex's own
        resolution (config.toml's default provider beats auth.json).
     4. A logged-in Codex CLI (``~/.codex/auth.json`` exists *and* carries a
@@ -847,12 +915,11 @@ def _detect_providers_now() -> list[DetectedProvider]:
         )
 
     # 3. A custom model provider in ~/.codex/config.toml (e.g. the
-    #    Databricks Unity Gateway written by ``isaac configure codex``, which
-    #    writes config.toml only — never auth.json — so the login check
-    #    below cannot see it). Ordered BEFORE the codex login check so that
-    #    on a machine with both, the auto-default matches what a plain
-    #    ``codex`` invocation does: config.toml's default model_provider
-    #    wins over auth.json.
+    #    Databricks Unity Gateway, whose setup writes config.toml only, never
+    #    auth.json, so the login check below cannot see it). Ordered BEFORE the
+    #    codex login check so that on a machine with both, the auto-default
+    #    matches what a plain ``codex`` invocation does: config.toml's default
+    #    model_provider wins over auth.json.
     codex_config_det = codex_config_detection()
     if codex_config_det is not None:
         detected.append(codex_config_det)

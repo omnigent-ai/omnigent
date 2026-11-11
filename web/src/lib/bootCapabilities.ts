@@ -19,9 +19,18 @@ export const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
+  scheduled_task_worktrees: false,
   archive_worktree_cleanup: false,
   branding: null,
 };
+
+/**
+ * Whether *info* is a stalled probe's offline stand-in, not the server's answer.
+ * It carries no picker curation, so New Chat treats it like a pending probe.
+ */
+export function isBootFallbackInfo(info: ServerInfo | "loading"): boolean {
+  return info === SERVER_INFO_OFFLINE_FALLBACK;
+}
 
 /** How long a boot probe may stall before its fallback stands in. */
 export const BOOT_PROBE_TIMEOUT_MS = 1500;

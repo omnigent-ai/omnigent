@@ -57,6 +57,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  OMNIGENT_CI_PIPELINE: draft-release-notes
   SOURCE_REPO: omnigent-ai/omnigent
   OMNIGENT_SKIP_WEB_UI: "true"
   UV_INDEX_URL: https://pypi.org/simple
@@ -238,6 +239,7 @@ jobs:
         if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
         uses: ./.github/actions/run-omnigent-agent
         with:
+          pipeline: draft-release-notes
           agent: release-notes-drafter
           prompt-file: /tmp/draft_prompt.txt
           output-file: /tmp/draft_out.txt
