@@ -475,15 +475,25 @@ def test_host_enable_does_not_wait_on_a_dead_daemon(
     assert terminated == [target]
 
 
+@pytest.mark.parametrize(
+    "args",
+    [pytest.param([], id="waits-for-turns"), pytest.param(["--force"], id="force")],
+)
 def test_host_enable_keeps_running_host_when_wrapper_is_missing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    args: list[str],
 ) -> None:
     """An uninstallable service must not replace the host that is already running."""
     target = "https://server.example.com"
     monkeypatch.setattr("omnigent.cli._resolve_host_server", lambda server: target)
     monkeypatch.setattr("omnigent.cli._ensure_databricks_server_auth", lambda *a, **k: None)
     monkeypatch.setattr("omnigent.cli._find_daemon_record", _record_for)
+    monkeypatch.setattr("omnigent.cli._daemon_owner_is_live", lambda record: True)
+    monkeypatch.setattr(
+        "omnigent.cli._wait_for_running_sessions",
+        lambda *a, **k: pytest.fail("waited for running sessions"),
+    )
     monkeypatch.setattr(
         "omnigent.cli._terminate_daemon",
         lambda record, *, force: pytest.fail("stopped the running host"),
@@ -497,7 +507,7 @@ def test_host_enable_keeps_running_host_when_wrapper_is_missing(
         lambda server_url, *, environment: pytest.fail("installed the service"),
     )
 
-    result = CliRunner().invoke(cli, ["host", "enable", "--server", target, "--force"])
+    result = CliRunner().invoke(cli, ["host", "enable", "--server", target, *args])
 
     assert result.exit_code == 1, result.output
     assert "Cannot find 'wrapper'" in result.output
