@@ -341,6 +341,7 @@ import {
   prefetchAvailableAgentDetails,
   type AvailableAgent,
 } from "@/hooks/useAvailableAgents";
+import { harnessPickerChoices } from "@/components/composer/harnessPickerChoices";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
@@ -1159,15 +1160,6 @@ function visibleModelLabel(label: string): string {
 const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
 type ModelCatalogAvailability = "available" | "unavailable" | "unknown";
 
-// Harness icon kinds preferred for the picker's inline list, in display order.
-// A deployment that seeds none of these (OMNIGENT_SEEDED_AGENTS) backfills the
-// list from whatever is launchable rather than showing an empty group.
-const PRIMARY_HARNESS_ORDER: readonly string[] = ["claude", "cursor", "codex"];
-// Preferred order within the "Other..." submenu.
-const SECONDARY_HARNESS_ORDER: readonly string[] = ["opencode", "pi"];
-// How many rows the backfill promotes — matches the inline list's usual size.
-const INLINE_HARNESS_FALLBACK = PRIMARY_HARNESS_ORDER.length;
-
 function agentHasAdvancedSettings(
   agent: AvailableAgent | undefined,
   brainHarnessLabels: Readonly<Record<string, string>>,
@@ -1589,71 +1581,32 @@ export function AgentHarnessPicker({
     (agent: AvailableAgent) => agent.id !== effectiveAgentId && hiddenAgents.has(agent.name),
     [hiddenAgents, effectiveAgentId],
   );
-  const { readyHarnessEntries, moreHarnessEntries, hidOfferedHarness } = useMemo(() => {
-    const ready: AvailableAgent[] = [];
-    let more: AvailableAgent[] = [];
-    let hidOffered = false;
-    // Recorded during the split so the backfill below asks the same question
-    // rather than restating it inverted.
-    const unavailableIds = new Set<string>();
-    for (const agent of harnessEntries) {
-      const selected = agent.id === effectiveAgentId;
-      const readiness = harnessReadinessOnHost(agent.harness, host);
-      const unavailable = !readiness.selectable && readiness.fallbackRelevant;
-      if (!selected && hideUnconfigured && unavailable) continue;
-      // Readiness runs first, so this records only hides that removed an offered row.
-      if (isHiddenEntry(agent)) {
-        hidOffered = true;
-        continue;
-      }
-      if (unavailable) unavailableIds.add(agent.id);
-      const key = nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "";
-      const primary = PRIMARY_HARNESS_ORDER.includes(key) || agent.id === promotedHarnessId;
-      // Unavailable primaries demote to "Other..." — the main list stays
-      // launch-ready; the selected harness always keeps its slot.
-      if (primary && (selected || !unavailable)) {
-        ready.push(agent);
-      } else more.push(agent);
-    }
-    const rank = (agent: AvailableAgent, order: readonly string[]) => {
-      const index = order.indexOf(nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "");
-      return index < 0 ? order.length : index;
-    };
-    ready.sort(
-      (first, second) => rank(first, PRIMARY_HARNESS_ORDER) - rank(second, PRIMARY_HARNESS_ORDER),
-    );
-    more.sort(
-      (first, second) =>
-        rank(first, SECONDARY_HARNESS_ORDER) - rank(second, SECONDARY_HARNESS_ORDER),
-    );
-    // No preferred harness survived: promote the best launchable ones inline.
-    if (ready.length === 0) {
-      const promoted = more
-        .filter((agent) => !unavailableIds.has(agent.id))
-        .slice(0, INLINE_HARNESS_FALLBACK);
-      if (promoted.length > 0) {
-        ready.push(...promoted);
-        const promotedIds = new Set(promoted.map((agent) => agent.id));
-        more = more.filter((agent) => !promotedIds.has(agent.id));
-      }
-    }
-    return { readyHarnessEntries: ready, moreHarnessEntries: more, hidOfferedHarness: hidOffered };
-  }, [harnessEntries, host, hideUnconfigured, isHiddenEntry, effectiveAgentId, promotedHarnessId]);
-  // A curated list keeps the deployment's order but honours the same per-entry
-  // hides and "hide unconfigured harnesses" preference as the grouped menu, with
-  // the selected row always kept so the trigger's choice stays in the list.
-  const visibleCuratedEntries = useMemo(() => {
-    if (curatedEntries === undefined) return undefined;
-    const harnessIds = new Set(harnessEntries.map((agent) => agent.id));
-    return curatedEntries.filter((agent) => {
-      if (isHiddenEntry(agent)) return false;
-      if (agent.id === effectiveAgentId || !hideUnconfigured || !harnessIds.has(agent.id)) {
-        return true;
-      }
-      const readiness = harnessReadinessOnHost(agent.harness, host);
-      return readiness.selectable || !readiness.fallbackRelevant;
-    });
-  }, [curatedEntries, harnessEntries, hideUnconfigured, isHiddenEntry, effectiveAgentId, host]);
+  const {
+    readyHarnesses: readyHarnessEntries,
+    moreHarnesses: moreHarnessEntries,
+    hidOfferedHarness,
+    curated: visibleCuratedEntries,
+  } = useMemo(
+    () =>
+      harnessPickerChoices({
+        harnessEntries,
+        curatedEntries,
+        effectiveAgentId,
+        host,
+        hideUnconfigured,
+        hiddenAgentNames: hiddenAgents,
+        promotedHarnessId,
+      }),
+    [
+      harnessEntries,
+      curatedEntries,
+      effectiveAgentId,
+      host,
+      hideUnconfigured,
+      hiddenAgents,
+      promotedHarnessId,
+    ],
+  );
   // Why a curated list is empty, which is not always the deployment's doing:
   // a failed roster fetch and a harness this host lacks read differently.
   const curatedEmptyState = entriesFailed
