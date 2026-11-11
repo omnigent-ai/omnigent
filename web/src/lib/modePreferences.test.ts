@@ -1,8 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readHarnessOptions, writeHarnessOption } from "./modePreferences";
+import { beginHarnessModeChange, readHarnessOptions, writeHarnessOption } from "./modePreferences";
 
 const KEY = "omnigent:last-mode-by-harness";
-const CODEX_DEFAULT_MIGRATION_KEY = "omnigent:codex-default-mode-migrated";
 
 afterEach(() => {
   localStorage.clear();
@@ -79,33 +78,42 @@ describe("modePreferences (per-harness options)", () => {
     expect(readHarnessOptions("claude-native")).toEqual({ mode: "plan" });
   });
 
-  it.each([
-    ["an options object", { mode: "default", model: "gpt-5.6", effort: "high" }],
-    ["a bare mode string", "default"],
-  ])("preserves the automatic meaning of legacy Codex Default from %s", (_label, stored) => {
-    localStorage.setItem(
-      KEY,
-      JSON.stringify({
-        "claude-native": { mode: "plan" },
-        "codex-native": stored,
-      }),
-    );
+  it.each(["default", "ask-for-approval", "approve-for-me", "full-access", "read-only", "bypass"])(
+    "keeps the saved Codex %s mode unchanged",
+    (mode) => {
+      localStorage.setItem(KEY, JSON.stringify({ "codex-native": { mode } }));
+      expect(readHarnessOptions("codex-native")).toEqual({ mode });
+    },
+  );
 
+  it("remembers only a confirmed mode and preserves model and effort", () => {
+    writeHarnessOption("codex-native", { mode: "read-only", model: "coding-model" });
+    const confirm = beginHarnessModeChange("codex-native");
+    expect(readHarnessOptions("codex-native").mode).toBe("read-only");
+    writeHarnessOption("codex-native", { effort: "high" });
+
+    expect(confirm("approve-for-me")).toBe(true);
     expect(readHarnessOptions("codex-native")).toEqual({
-      ...(typeof stored === "string" ? {} : stored),
       mode: "approve-for-me",
+      model: "coding-model",
+      effort: "high",
     });
-    expect(readHarnessOptions("claude-native")).toEqual({ mode: "plan" });
-    expect(JSON.parse(localStorage.getItem(KEY)!)["codex-native"].mode).toBe("approve-for-me");
-    expect(localStorage.getItem(CODEX_DEFAULT_MIGRATION_KEY)).toBe("1");
   });
 
-  it("keeps a new explicit Codex Default after the one-time migration", () => {
-    writeHarnessOption("codex-native", { mode: "default" });
-
-    expect(readHarnessOptions("codex-native")).toEqual({ mode: "default" });
-    expect(localStorage.getItem(CODEX_DEFAULT_MIGRATION_KEY)).toBe("1");
-  });
+  it.each(["running-session", "new-chat"])(
+    "keeps a newer %s mode when an older switch finishes later",
+    (surface) => {
+      const confirmOld = beginHarnessModeChange("codex-native");
+      if (surface === "running-session") {
+        expect(beginHarnessModeChange("codex-native")("ask-for-approval")).toBe(true);
+      } else {
+        writeHarnessOption("codex-native", { mode: "default" });
+      }
+      const saved = readHarnessOptions("codex-native");
+      expect(confirmOld("full-access")).toBe(false);
+      expect(readHarnessOptions("codex-native")).toEqual(saved);
+    },
+  );
 
   it("drops non-string fields and structurally-corrupt entries", () => {
     localStorage.setItem(

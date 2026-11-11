@@ -7169,20 +7169,6 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  it("restores a remembered legacy Codex Default as Approve for me", () => {
-    localStorage.setItem(
-      HARNESS_OPTIONS_KEY,
-      JSON.stringify({ "codex-native": { mode: "default" } }),
-    );
-    renderLanding();
-    selectAgent("a2");
-
-    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
-      "Permission mode: Approve for me",
-    );
-    expect(readHarnessOptions("codex-native").mode).toBe("approve-for-me");
-  });
-
   it.each([
     ["default", "Default"],
     ["ask-for-approval", "Ask for approval"],

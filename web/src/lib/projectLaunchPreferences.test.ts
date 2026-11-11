@@ -6,13 +6,13 @@ import {
   onProjectLaunchDefaultsCleared,
   projectConfigWithLaunch,
   readProjectLaunchDefaults,
+  rememberProjectHarnessMode,
   writeProjectLaunchDefaults,
   type ProjectLaunchDefaults,
 } from "./projectLaunchPreferences";
 import type { ProjectConfig } from "./projectsApi";
 
 const STORAGE_KEY = "omnigent:project-launch-defaults";
-const CODEX_DEFAULT_MIGRATION_KEY = "omnigent:project-codex-default-mode-migrated";
 const START = {
   agentId: "ag_codex",
   pickedHarness: null,
@@ -42,41 +42,6 @@ describe("projectLaunchPreferences", () => {
     });
   });
 
-  it("migrates legacy Codex Default starts without changing other projects", () => {
-    const legacyCodex = {
-      ...START,
-      harnessOptions: { ...START.harnessOptions, mode: "default" },
-    };
-    writeProjectLaunchDefaults("proj_codex", legacyCodex, {});
-    writeProjectLaunchDefaults(
-      "proj_claude",
-      { harness: "claude-native", harnessOptions: { mode: "default" } },
-      {},
-    );
-    localStorage.removeItem(CODEX_DEFAULT_MIGRATION_KEY);
-
-    expect(readProjectLaunchDefaults("proj_codex", {})).toEqual({
-      ...legacyCodex,
-      harnessOptions: { ...legacyCodex.harnessOptions, mode: "approve-for-me" },
-    });
-    expect(readProjectLaunchDefaults("proj_claude", {})).toEqual({
-      harness: "claude-native",
-      harnessOptions: { mode: "default" },
-    });
-    expect(localStorage.getItem(CODEX_DEFAULT_MIGRATION_KEY)).toBe("1");
-  });
-
-  it("keeps a new explicit Codex Default after the one-time migration", () => {
-    const explicitDefault = {
-      harness: "codex-native",
-      harnessOptions: { mode: "default" },
-    };
-    writeProjectLaunchDefaults("proj_codex", explicitDefault, {});
-
-    expect(readProjectLaunchDefaults("proj_codex", {})).toEqual(explicitDefault);
-    expect(localStorage.getItem(CODEX_DEFAULT_MIGRATION_KEY)).toBe("1");
-  });
-
   it("drops a start once the project's stored defaults change", () => {
     writeProjectLaunchDefaults("proj_a", START, { agent_id: "ag_claude" });
     expect(readProjectLaunchDefaults("proj_a", { agent_id: "ag_claude" })).toEqual(START);
@@ -89,6 +54,29 @@ describe("projectLaunchPreferences", () => {
     expect(
       readProjectLaunchDefaults("proj_a", { model: "opus", agent_id: "ag_claude", icon: "🔥" }),
     ).toEqual(START);
+  });
+
+  it("keeps a live permission choice for the same project without changing its launch settings", () => {
+    const config = { agent_id: "ag_codex" };
+    writeProjectLaunchDefaults("proj_a", START, config);
+    writeProjectLaunchDefaults("proj_b", START, {});
+
+    rememberProjectHarnessMode("proj_a", "codex-native", "approve-for-me");
+
+    expect(readProjectLaunchDefaults("proj_a", config)).toEqual({
+      ...START,
+      harnessOptions: { ...START.harnessOptions, mode: "approve-for-me" },
+    });
+    expect(readProjectLaunchDefaults("proj_b", {})).toEqual(START);
+    expect(readProjectLaunchDefaults("proj_a", {})).toBeNull();
+  });
+
+  it("leaves absent projects and a different harness's settings alone", () => {
+    writeProjectLaunchDefaults("proj_a", START, {});
+    const saved = localStorage.getItem(STORAGE_KEY);
+    rememberProjectHarnessMode("proj_missing", "codex-native", "full-access");
+    rememberProjectHarnessMode("proj_a", "claude-native", "plan");
+    expect(localStorage.getItem(STORAGE_KEY)).toBe(saved);
   });
 
   it("ignores a malformed entry and overwrites a corrupt store", () => {
@@ -125,6 +113,7 @@ describe("projectLaunchPreferences", () => {
       throw new Error("access denied");
     });
     expect(() => writeProjectLaunchDefaults("proj_a", START, {})).not.toThrow();
+    expect(() => rememberProjectHarnessMode("proj_a", "codex-native", "full-access")).not.toThrow();
     expect(readProjectLaunchDefaults("proj_a", {})).toBeNull();
   });
 });

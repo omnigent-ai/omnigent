@@ -165,6 +165,8 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
+import { beginHarnessModeChange } from "@/lib/modePreferences";
+import { rememberProjectHarnessMode } from "@/lib/projectLaunchPreferences";
 import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
 import {
   getCurrentAuthorId,
@@ -3885,6 +3887,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   setCodexApprovalMode: async (mode) => {
     const { conversationId } = get();
     if (!conversationId) return;
+    const rememberMode = beginHarnessModeChange("codex-native");
     const previous = get().codexApprovalMode;
     // Pinned for the same reason as `setCostControlMode` — see there.
     const patchSet = setterFor(conversationId);
@@ -3893,7 +3896,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     patchSet({ codexApprovalMode: mode });
     try {
       const session = await updateSession(conversationId, { codexApprovalMode: mode });
-      patchSet({ codexApprovalMode: codexApprovalModeFromSession(session) ?? "" });
+      const confirmed = codexApprovalModeFromSession(session) ?? "";
+      patchSet({ codexApprovalMode: confirmed });
+      if (confirmed === mode && rememberMode(mode) && session.projectId) {
+        rememberProjectHarnessMode(session.projectId, "codex-native", mode);
+      }
     } catch (err) {
       patchSet({ codexApprovalMode: previous });
       throw err;
