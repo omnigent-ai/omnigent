@@ -1050,7 +1050,9 @@ class _ReusedDatabricksTokenSource:
         cached = self._cached
         if cached is not None and _databrickscfg_fingerprint() == cached[1]:
             try:
-                return cached[0].current_token()
+                token = cached[0].current_token()
+                if token:
+                    return token
             except DatabricksAuthError:
                 pass
         resolved = self._resolve()

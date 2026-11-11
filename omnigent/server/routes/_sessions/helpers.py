@@ -180,6 +180,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CLAUDE_NATIVE_UI_LABEL_KEY,
     _CLAUDE_NATIVE_UI_LABEL_VALUE,
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+    _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
     _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODES,
@@ -325,6 +326,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
+    FORK_SOURCE_LABEL_KEY,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
@@ -3094,6 +3096,68 @@ def _merge_claude_permission_launch_args(
     if not had_flag and not add_if_missing:
         return existing_args
     return [*stripped, "--permission-mode", mode]
+
+
+def _claude_args_without_permission_mode(args: list[str] | None) -> list[str]:
+    """
+    Claude launch args with permission-mode selectors removed, for comparing two sets.
+
+    Everything from an ``--`` option terminator on is positional text, so it
+    is kept exactly as stored.
+
+    :param args: Stored launch args, e.g. ``["--permission-mode", "plan", "--", "hi"]``.
+    :returns: The args without selectors, e.g. ``["--", "hi"]``.
+    """
+    stored = list(args or ())
+    end = stored.index("--") if "--" in stored else len(stored)
+    options, _ = _strip_claude_permission_launch_arg(stored[:end])
+    return [*options, *stored[end:]]
+
+
+def _drop_claude_launch_args_from_another_host(
+    conversation_store: ConversationStore, conv: Conversation
+) -> Conversation:
+    """
+    Drop launch args a Claude Code fork still carries from its source when bound elsewhere.
+
+    Stored launch args can name files on the machine that started the session
+    (an ``--mcp-config`` path, say), and Claude exits at startup when one is
+    missing. A fork's args are still its source's when they match the source's
+    apart from the permission mode; on any other host they are dropped. Args
+    that differ are the fork's own and are kept. The permission mode is rebuilt
+    from the session's label, never read out of the args.
+
+    :param conversation_store: Store holding the session and its source.
+    :param conv: The session row as just bound, with its stored ``host_id``.
+    :returns: The session row, updated when its args were dropped.
+    """
+    from omnigent.runner.routing import routing_host_id  # noqa: FlagLocalImports
+
+    source_id = conv.labels.get(FORK_SOURCE_LABEL_KEY)
+    if (
+        not source_id
+        or conv.host_id is None
+        or conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
+    ):
+        return conv
+    copied = _claude_args_without_permission_mode(conv.terminal_launch_args)
+    if not copied:
+        return conv
+    source = conversation_store.get_conversation(source_id)
+    if source is None:
+        return conv
+    source_args = _claude_args_without_permission_mode(source.terminal_launch_args)
+    # A side chat shares its source's runner without a host binding of its own.
+    source_host_id = routing_host_id(source, conversation_store)
+    if copied != source_args or source_host_id is None or source_host_id == conv.host_id:
+        return conv
+    mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+    kept: list[str] = (
+        ["--permission-mode", mode]
+        if mode is not None and mode in _CLAUDE_NATIVE_PERMISSION_MODES
+        else []
+    )
+    return conversation_store.update_conversation(conv.id, terminal_launch_args=kept) or conv
 
 
 def _pin_claude_permission_launch_args(
@@ -12592,6 +12656,7 @@ __all__ = [
     "_devin_subagent_labels_from_body",
     "_discovery_key",
     "_dispatch_skill_slash_command_to_runner",
+    "_drop_claude_launch_args_from_another_host",
     "_emit_server_routing_decision",
     "_error_item_from_sse",
     "_evaluate_output_policy",
