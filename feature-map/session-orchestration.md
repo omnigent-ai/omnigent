@@ -77,22 +77,41 @@ MCP independent creation.
   kept session starts one worker per match (`docs/AUTOMATIONS.md`).
 - `projects`: `sys_project_list` pages the owner's projects oldest first and
   their own sessions with each one's project, marking the calling session; a
-  legacy label folder shows only as a session's project.
+  legacy label folder shows only as a session's project. It also forwards the
+  sidebar's search (titles and transcripts), its pinned filter and its
+  include-archived toggle, and marks pinned and archived rows.
   `sys_session_update` files one of those sessions into a project by name,
   creating a missing project only once the session can move, or unfiles it
-  with `""`, through the sidebar's move request; agents call it once per
-  session, and `project` is its only field. An open sidebar regroups without a
-  reload; a collapsed folder stays collapsed. Changing the project changes only
-  folder membership, so running sessions, including the caller, keep their
-  turn. Sub-agents follow their parent and a family follows its
-  representative; each refusal names the session to update instead. An
-  edit-shared caller cannot change a project or create one through the update,
-  while listing stays an ordinary owner read. A session shared with the caller
+  with `""`, through the sidebar's move request; it also renames, pins or
+  unpins, and archives or restores the session, all in one PATCH; agents call
+  it once per session. An open sidebar regroups without a
+  reload; a collapsed folder stays collapsed. Filing, renaming and pinning
+  change only how the session is listed, so running sessions, including the
+  caller, keep their turn. Archiving stops the target and its running
+  sub-agents, as the sidebar's Archive does, so the server refuses an
+  agent-tool archive of the caller or any session it runs under (its parent
+  chain or a side chat's source), and the tool also refuses a session on the
+  caller's runner. An archive cannot also file the session into a project that
+  does not exist yet, so a refused archive never leaves a new empty project. `sys_project_update` renames a project or sets or clears
+  its emoji icon, keeping its other stored defaults; like the sidebar's
+  rename it re-files sessions that still belong through the legacy label,
+  promotes a label-only folder to a project row, and reports any session it
+  could not move. Agents cannot delete projects: the sessions list hides side
+  chats, so only the server could tell that a project is empty, and it has no
+  check for that yet. Sub-agents follow their parent and a
+  family follows its representative for filing; each refusal names the
+  session to update instead. An edit-shared caller cannot change a project or
+  create or rename one, or rename, pin or archive a session, while
+  listing stays an ordinary owner read. A session shared with the caller
   but owned by someone else is refused, even when it is already in the target
-  project. Updates refuse to run against a server that does not advertise
-  `session_move_source_checks` in `/v1/info`. `tool_groups.projects: false`
-  drops both tools. Covered by
-  `tests/server/integration/test_session_orchestration_projects.py::test_project_tools_list_and_file_running_sessions`
+  project. Project-only updates refuse to run against a server that does not
+  advertise `session_move_source_checks` in `/v1/info`; every other write
+  needs `session_organize_source_checks`. `tool_groups.projects: false`
+  drops all three tools. Covered by
+  `tests/server/integration/test_session_orchestration_projects.py::test_project_tools_list_and_file_running_sessions`,
+  `::test_organizing_tools_rename_pin_archive_and_manage_projects`,
+  `::test_organizing_tools_refuse_a_source_shared_with_edit_access`,
+  `::test_a_child_cannot_archive_its_rebound_parent`
   and the browser journeys in
   `tests/e2e_ui/sessions/test_agent_files_sessions_into_projects.py`.
 - `refusal`: disabled orchestration, another owner, edit-shared sender or wrong runner binding
@@ -118,10 +137,16 @@ MCP independent creation.
 - In a session's Chat, ask the agent to list your projects and file some
   sessions, including itself, into an existing or new project. The sidebar folders
   update while the agent keeps running.
+- Ask the same agent to rename, pin or archive a session, find sessions by a
+  word in their title or transcript, or rename a project or give it an emoji;
+  the sidebar reflects each change live.
 - In a native Claude Code session's Chat or agent terminal, ask the same; the
-  relay exposes `mcp__omnigent__sys_project_list` and
-  `mcp__omnigent__sys_session_update`, and the session lands in its folder
-  mid-turn (`test_native_claude_files_itself_into_a_project`, nightly).
+  relay exposes `mcp__omnigent__sys_project_list`,
+  `mcp__omnigent__sys_session_update` and `mcp__omnigent__sys_project_update`,
+  and the session lands in its folder
+  mid-turn (`test_native_claude_files_itself_into_a_project`, nightly). Cursor
+  and Antigravity sessions reach the same three tools through their relay
+  allowlists, which approve them without an in-terminal prompt.
 - Use the existing Share dialog to share the sender or receiver, then repeat.
   A read-only share of the sender keeps both tools working; an edit share
   refuses them.

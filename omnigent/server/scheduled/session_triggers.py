@@ -50,7 +50,7 @@ SessionEventType = Literal[
 ]
 SESSION_EVENT_TYPES: tuple[str, ...] = get_args(SessionEventType)
 
-# A loop between automations, or a burst of turns, stops at this many runs a minute.
+# A loop between automations, or a burst of turns, stops at this many accepted events a minute.
 MAX_EVENT_RUNS_PER_MINUTE = 10
 # Tasks read per query while listing a workspace's session-triggered tasks.
 _TASK_PAGE_SIZE = 500
@@ -323,13 +323,9 @@ def _session_triggered_tasks(wiring: _Wiring) -> list[ScheduledTask]:
     after: str | None = None
     while True:
         page = wiring.scheduled_task_store.list_event_triggered_tasks(
-            after=after, limit=_TASK_PAGE_SIZE
+            provider=SESSION_TRIGGER_PROVIDER, after=after, limit=_TASK_PAGE_SIZE
         )
-        tasks.extend(
-            task
-            for task in page
-            if (task.trigger_config or {}).get("provider") == SESSION_TRIGGER_PROVIDER
-        )
+        tasks.extend(page)
         if len(page) < _TASK_PAGE_SIZE:
             break
         after = page[-1].id

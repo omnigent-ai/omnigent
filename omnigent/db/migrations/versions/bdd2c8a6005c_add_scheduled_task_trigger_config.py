@@ -10,15 +10,18 @@ adds a ``provider`` value and its JSON shapes, not columns:
 * ``scheduled_tasks.trigger_config``: nullable JSON naming the provider and its
   condition. A task with one runs on events instead of a schedule.
 * ``scheduled_tasks.rrule`` becomes nullable, since an event-triggered task has
-  no recurrence rule. ``rrule IS NULL`` is what identifies one in SQL.
+  no recurrence rule.
+* ``scheduled_tasks.trigger_provider``: the provider named in ``trigger_config``,
+  or NULL for a scheduled task. It is the scalar that SQL filters on, through
+  ``ix_scheduled_tasks_trigger`` on ``(state, trigger_provider, next_run_at,
+  workspace_id, id)``: an equality seek finds a workspace's active tasks for one
+  provider, and the search for scheduled tasks without a next run time skips
+  event-triggered ones.
 * ``scheduled_task_runs.event``: nullable JSON describing the event(s) a run was
   recorded for.
 * ``scheduled_task_event_receipts``: one row per event occurrence a task
   accepted, unique per task, so an occurrence that joined another occurrence's
   run is still recognized when it is delivered again.
-* ``ix_scheduled_task_runs_task_status`` finds a task's runs by status and key
-  prefix, such as its unclaimed pending event run, without scanning its history
-  or its pending Run now requests.
 
 The JSON columns are read and written whole and never filtered in SQL, so they
 are stored compressed, at most 16,383 bytes each.
@@ -55,6 +58,7 @@ _GUARD_BATCH = 500
 # Dialects that ignore VARCHAR lengths and store a value of any size.
 _SQLITE_FAMILY = frozenset({"sqlite", "cloudflare_d1"})
 _RECEIPT_KEY_CHECK = "ck_scheduled_task_event_receipts_key_bytes"
+_PROVIDER_CHECK = "ck_scheduled_tasks_trigger_provider_bytes"
 
 
 def upgrade() -> None:
@@ -68,6 +72,17 @@ def upgrade() -> None:
             )
         )
         batch_op.alter_column("rrule", existing_type=sa.String(512), nullable=True)
+        batch_op.add_column(sa.Column("trigger_provider", sa.String(32), nullable=True))
+        if op.get_bind().dialect.name in _SQLITE_FAMILY:
+            # SQLite ignores VARCHAR lengths: 32 characters at up to four bytes each.
+            batch_op.create_check_constraint(
+                _PROVIDER_CHECK,
+                "trigger_provider IS NULL OR length(CAST(trigger_provider AS BLOB)) <= 128",
+            )
+        batch_op.create_index(
+            "ix_scheduled_tasks_trigger",
+            ["state", "trigger_provider", "next_run_at", "workspace_id", "id"],
+        )
     with op.batch_alter_table("scheduled_task_runs") as batch_op:
         batch_op.add_column(
             sa.Column(
@@ -75,10 +90,6 @@ def upgrade() -> None:
                 CompressedText(max_stored_bytes=_JSON_MAX_STORED_BYTES),
                 nullable=True,
             )
-        )
-        batch_op.create_index(
-            "ix_scheduled_task_runs_task_status",
-            ["workspace_id", "scheduled_task_id", "status", "trigger_key", "id"],
         )
     # SQLite ignores VARCHAR lengths: 256 characters at up to four bytes each.
     key_check = (
@@ -126,9 +137,13 @@ def downgrade() -> None:
     )
     op.drop_table("scheduled_task_event_receipts")
     with op.batch_alter_table("scheduled_task_runs") as batch_op:
-        batch_op.drop_index("ix_scheduled_task_runs_task_status")
         batch_op.drop_column("event")
     with op.batch_alter_table("scheduled_tasks") as batch_op:
+        batch_op.drop_index("ix_scheduled_tasks_trigger")
+        if op.get_bind().dialect.name in _SQLITE_FAMILY:
+            # The rebuilt table would otherwise keep a CHECK on the dropped column.
+            batch_op.drop_constraint(_PROVIDER_CHECK, type_="check")
+        batch_op.drop_column("trigger_provider")
         batch_op.alter_column("rrule", existing_type=sa.String(512), nullable=False)
         batch_op.drop_column("trigger_config")
 
@@ -138,19 +153,10 @@ def _refuse_while_a_task_has_no_rule() -> None:
     tasks = sa.table(
         "scheduled_tasks", sa.column("workspace_id"), sa.column("id"), sa.column("rrule")
     )
-    columns = (tasks.c.workspace_id, tasks.c.id)
     bind = op.get_bind()
     after: tuple[object, object] | None = None
     while True:
-        page = sa.select(*columns, tasks.c.rrule).order_by(*columns).limit(_GUARD_BATCH)
-        if after is not None:
-            page = page.where(
-                sa.or_(
-                    tasks.c.workspace_id > after[0],
-                    sa.and_(tasks.c.workspace_id == after[0], tasks.c.id > after[1]),
-                )
-            )
-        rows = bind.execute(page).all()
+        rows = bind.execute(_guard_page(tasks, after, bind.dialect.name)).all()
         if any(row.rrule is None for row in rows):
             raise RuntimeError(
                 "Delete the event-triggered scheduled tasks, which have no rrule, "
@@ -159,3 +165,22 @@ def _refuse_while_a_task_has_no_rule() -> None:
         if len(rows) < _GUARD_BATCH:
             return
         after = (rows[-1].workspace_id, rows[-1].id)
+
+
+def _guard_page(
+    tasks: sa.TableClause, after: tuple[object, object] | None, dialect: str
+) -> sa.Select:
+    """One primary-key page of tasks after *after*, as a seek to the cursor."""
+    columns = (tasks.c.workspace_id, tasks.c.id)
+    page = sa.select(*columns, tasks.c.rrule).order_by(*columns).limit(_GUARD_BATCH)
+    if after is None:
+        return page
+    if dialect == "mysql":
+        # MySQL treats tuple inequalities as filters over a full index scan.
+        return page.where(
+            sa.or_(
+                tasks.c.workspace_id > after[0],
+                sa.and_(tasks.c.workspace_id == after[0], tasks.c.id > after[1]),
+            )
+        )
+    return page.where(sa.tuple_(*columns) > after)

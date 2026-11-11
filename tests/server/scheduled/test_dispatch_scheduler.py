@@ -2740,7 +2740,7 @@ async def test_an_event_run_waits_while_its_continued_session_is_busy(store) -> 
     assert fire.await_count == 2
 
 
-async def test_an_event_task_cleared_by_legacy_timers_gets_its_marker_back(store) -> None:
+async def test_the_scheduler_neither_initializes_nor_pauses_an_event_task(store) -> None:
     task = store.create(
         uuid.uuid4().hex,
         "watcher",
@@ -2751,14 +2751,14 @@ async def test_an_event_task_cleared_by_legacy_timers_gets_its_marker_back(store
         "UTC",
         trigger_config={"provider": "omnigent", "events": ["turn.completed"]},
     )
-    assert store.list_event_triggered_tasks() == [store.get(task.id)]
-    # Switching to legacy timers clears every saved next run time.
+    # Switching to legacy timers and back leaves its next run time NULL as before.
     store.reset_dispatch_cursors()
-    assert store.list_event_triggered_tasks() == []
+    assert store.list_uninitialized_tasks() == []
     fire = AsyncMock()
     scheduler = PersistentTaskScheduler(store, fire, AsyncMock())
     await scheduler.poll_once()
     await _drain(scheduler)
-    assert [t.id for t in store.list_event_triggered_tasks()] == [task.id]
-    assert store.list_uninitialized_tasks() == []
+    stored = store.get(task.id)
+    assert (stored.state, stored.next_run_at) == ("active", None)
+    assert [t.id for t in store.list_event_triggered_tasks(provider="omnigent")] == [task.id]
     fire.assert_not_awaited()

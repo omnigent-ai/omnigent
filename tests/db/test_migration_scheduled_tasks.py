@@ -100,6 +100,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     assert columns["source_session_id"]["nullable"] is True
     assert columns["mcp_services"]["nullable"] is True
     assert columns["trigger_config"]["nullable"] is True
+    assert columns["trigger_provider"]["nullable"] is True
     assert columns["rrule"]["nullable"] is True
     cols = set(columns)
     assert cols == {
@@ -133,6 +134,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "session_id",
         "source_session_id",
         "trigger_config",
+        "trigger_provider",
     }
 
 
@@ -211,6 +213,13 @@ def test_expected_indexes(db_engine: Engine) -> None:
         "workspace_id",
         "id",
     ]
+    assert scheduled_tasks_idx_cols["ix_scheduled_tasks_trigger"] == [
+        "state",
+        "trigger_provider",
+        "next_run_at",
+        "workspace_id",
+        "id",
+    ]
     assert "ix_scheduled_tasks_agent_id" not in scheduled_tasks_idx
     # The separate created_at + user_id listing indexes were folded into the
     # single user-scope index above: with the user_id filter pushed into SQL the
@@ -245,13 +254,6 @@ def test_expected_indexes(db_engine: Engine) -> None:
         "workspace_id",
         "conversation_id",
         "status",
-        "id",
-    ]
-    assert runs_idx_cols["ix_scheduled_task_runs_task_status"] == [
-        "workspace_id",
-        "scheduled_task_id",
-        "status",
-        "trigger_key",
         "id",
     ]
     unique_keys = {
@@ -1071,6 +1073,53 @@ def test_receipt_keys_are_bounded_on_sqlite(db_engine: Engine) -> None:
             )
 
 
+def test_downgrade_guard_seeks_to_its_cursor_on_sqlite(db_engine: Engine) -> None:
+    """Each later page of the guard is a seek, so the whole check reads each task once."""
+    import importlib.util
+
+    path = next(
+        Path(__file__).parents[2].glob("omnigent/db/migrations/versions/bdd2c8a6005c_*.py")
+    )
+    spec = importlib.util.spec_from_file_location("trigger_migration", path)
+    assert spec is not None and spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    tasks = sa.table(
+        "scheduled_tasks", sa.column("workspace_id"), sa.column("id"), sa.column("rrule")
+    )
+    page = migration._guard_page(tasks, (0, b"a" * 16), "sqlite")
+    compiled = page.compile(dialect=db_engine.dialect, compile_kwargs={"literal_binds": False})
+    with db_engine.connect() as conn:
+        plan = conn.exec_driver_sql(
+            f"EXPLAIN QUERY PLAN {compiled}", tuple(compiled.params.values())
+        ).all()
+    detail = " ".join(str(row[-1]) for row in plan)
+    assert "SEARCH" in detail and "SCAN" not in detail, detail
+    # MySQL keeps scalar ranges, which it can seek with.
+    assert "OR" in str(migration._guard_page(tasks, (0, b"a" * 16), "mysql"))
+
+
+@pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
+def test_trigger_provider_is_bounded_on_sqlite(db_engine: Engine) -> None:
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
+    values = {
+        "name": "n",
+        "prompt": b"p",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    with db_engine.begin() as conn:
+        conn.execute(
+            tasks.insert().values(id=b"a" * 16, trigger_provider="\U0001f600" * 32, **values)
+        )
+    with pytest.raises(IntegrityError):
+        with db_engine.begin() as conn:
+            conn.execute(
+                tasks.insert().values(id=b"b" * 16, trigger_provider="\U0001f600" * 33, **values)
+            )
+
+
 @pytest.mark.parametrize("dialect", ["sqlite", "postgresql", "mysql"])
 def test_trigger_config_downgrade_requires_live_connection(dialect: str) -> None:
     config = _build_alembic_config(f"{dialect}://")
@@ -1149,14 +1198,28 @@ def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
         command.downgrade(config, _MCP_SERVICES_MERGE_REVISION)
     with engine.begin() as conn:
         conn.execute(tasks.delete().where(tasks.c.id == b"b" * 16))
+        # A task with no rule beyond the guard's first page of 500 is still found.
+        conn.execute(
+            tasks.insert(),
+            [
+                {"id": index.to_bytes(16, "big"), "rrule": "FREQ=DAILY", **values}
+                for index in range(1, 501)
+            ]
+            + [{"id": (10**6).to_bytes(16, "big"), "rrule": None, **values}],
+        )
+    with pytest.raises(RuntimeError, match="no rrule"):
+        command.downgrade(config, _MCP_SERVICES_MERGE_REVISION)
+    with engine.begin() as conn:
+        conn.execute(tasks.delete().where(tasks.c.id != b"a" * 16))
     command.downgrade(config, _MCP_SERVICES_MERGE_REVISION)
     inspector = sa.inspect(engine)
     task_columns = {c["name"]: c for c in inspector.get_columns("scheduled_tasks")}
     assert "trigger_config" not in task_columns
     assert task_columns["rrule"]["nullable"] is False
     assert "event" not in {c["name"] for c in inspector.get_columns("scheduled_task_runs")}
-    assert "ix_scheduled_task_runs_task_status" not in {
-        i["name"] for i in inspector.get_indexes("scheduled_task_runs")
+    assert "trigger_provider" not in task_columns
+    assert "ix_scheduled_tasks_trigger" not in {
+        i["name"] for i in inspector.get_indexes("scheduled_tasks")
     }
     assert "scheduled_task_event_receipts" not in inspector.get_table_names()
     # The rebuilt tables keep the scheduled task and its run.
