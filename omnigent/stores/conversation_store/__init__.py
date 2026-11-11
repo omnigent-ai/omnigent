@@ -17,6 +17,7 @@ from omnigent.entities import (
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 from omnigent.util.cost_plan import COST_CONTROL_LABEL_NAMESPACE
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY
 
 # Pending inputs share the item store, but are not harness transcript history yet.
 PENDING_INPUT_RESPONSE_ID = "pending_input"
@@ -265,6 +266,9 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     ARCHIVED_AT_LABEL_KEY,
     # A fork of an automation's copy isn't what the automation runs from.
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
+    # Closing seals only that child (a stopped side chat, a closed sub-agent);
+    # forking it is how the user continues it as a session of its own.
+    CLOSED_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     _SANDBOX_REPO_LABEL_KEY,

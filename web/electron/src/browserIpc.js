@@ -550,6 +550,14 @@ function registerBrowserIpc({
     return g.registry.setRecentSessionSwitchSupported(!!args?.supported);
   });
 
+  // Turn Cmd/Ctrl-clicked page links into new tabs only while a compatible
+  // renderer handles `browser-open-tab`; older server UIs keep in-place loads.
+  ipcMain.handle("omnigent:browser-set-open-tab-supported", (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    return g.registry.setOpenTabSupported(!!args?.supported);
+  });
+
   // A supported renderer can still decline the gesture when no sessions exist.
   ipcMain.handle("omnigent:browser-cancel-recent-session-switch", (event) => {
     const g = gateRegistry(event);

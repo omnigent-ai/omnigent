@@ -1228,10 +1228,12 @@ def register_core_routes(
                         "Sender host/workspace is invalid for independent creation",
                         code=ErrorCode.INVALID_INPUT,
                     ) from exc
+        agent_sibling = False
         if source is not None and request.app.state.feature_flags.enabled(
             Feature.SIBLING_SESSIONS
         ):
             body.sibling_source_id = source.root_conversation_id
+            agent_sibling = True
         if body.sibling_source_id is not None:
             from omnigent.server.session_families import authorize_sibling_source
 
@@ -1254,12 +1256,17 @@ def register_core_routes(
                 "project_id" in body.model_fields_set
                 and body.project_id != sibling_source.project_id
             ):
-                raise OmnigentError(
-                    "Nested agents stay in their source session's project",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            body.sibling_source_id = sibling_source.id
-            body.project_id = sibling_source.project_id
+                if not agent_sibling:
+                    raise OmnigentError(
+                        "Nested agents stay in their source session's project",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                # An agent that names another project gets a standalone session there;
+                # the source and destination checks above still apply.
+                body.sibling_source_id = None
+            else:
+                body.sibling_source_id = sibling_source.id
+                body.project_id = sibling_source.project_id
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp, conv = await _create_session_from_existing_agent(
             conversation_store,
@@ -4622,6 +4629,15 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             extra_labels[_CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
+        # The dialog's Claude mode pick becomes the fork's recorded mode, so a
+        # later bind to another host, which keeps only that mode, keeps the pick.
+        if (
+            override_launch_args is not None
+            and len(override_launch_args) == 2
+            and override_launch_args[0] == "--permission-mode"
+            and override_launch_args[1] in _CLAUDE_NATIVE_PERMISSION_MODES
+        ):
+            extra_labels[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = override_launch_args[1]
 
         # Side chats use the source for shared-runner routing and stay hidden
         # from the sidebar while appearing in the Workspace rail.
