@@ -3452,12 +3452,8 @@ async def _add_named_project(
                 "does not accept project_name; omit it. No session was created."
             }
         )
-    from omnigent.runner.session_projects import resolve_project_id
-
     try:
-        project_id, _created = await resolve_project_id(
-            server_client, str(project_name), headers=headers
-        )
+        project_id = await _project_id_for_name(server_client, str(project_name), headers=headers)
     except (httpx.HTTPError, ValueError) as exc:
         return json.dumps(
             {"error": f"Could not resolve project_name: {type(exc).__name__}: {exc}"}
@@ -5012,18 +5008,21 @@ def _scheduled_task_url(task_id: object) -> str | None:
     return f"/v1/scheduled-tasks/{task_id.lower()}"
 
 
-async def _project_id_for_name(server_client: httpx.AsyncClient, name: str) -> str:
+async def _project_id_for_name(
+    server_client: httpx.AsyncClient, name: str, *, headers: dict[str, str] | None = None
+) -> str:
     """
     Return the id of the caller's project named *name*, creating it if missing.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param name: The project name, e.g. ``"nightly triage"``.
+    :param headers: Extra headers for the create request, e.g. the orchestration source.
     :returns: The project id.
     :raises ValueError: If the name is blank or the project can't be resolved.
     """
     from omnigent.runner.session_projects import resolve_project_id
 
-    project_id, _created = await resolve_project_id(server_client, name)
+    project_id, _created = await resolve_project_id(server_client, name, headers=headers)
     return project_id
 
 
