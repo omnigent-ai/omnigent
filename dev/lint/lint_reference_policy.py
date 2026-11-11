@@ -88,7 +88,139 @@ def git(root: Path, *args: str) -> bytes:
     return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True).stdout
 
 
-def check(root: Path, base: str | None = None, head: str | None = None) -> list[str]:
+def _is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
+    try:
+        git(root, "merge-base", "--is-ancestor", ancestor, descendant)
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 1:
+            return False
+        raise
+    return True
+
+
+def _default_upstream(root: Path) -> tuple[str, str] | None:
+    try:
+        reference = (
+            git(root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD").decode().strip()
+        )
+    except subprocess.CalledProcessError as error:
+        if error.returncode != 1:
+            raise
+        try:
+            git(root, "show-ref", "--verify", "--quiet", "refs/remotes/origin/HEAD")
+        except subprocess.CalledProcessError as missing:
+            if missing.returncode != 1:
+                raise
+        else:
+            return None
+        reference = "refs/remotes/origin/main"
+    prefix = "refs/remotes/origin/"
+    if not reference.startswith(prefix) or reference == prefix:
+        return None
+    branch = "refs/heads/" + reference.removeprefix(prefix)
+    try:
+        tip = git(root, "rev-parse", "--verify", reference + "^{commit}").decode().strip()
+    except subprocess.CalledProcessError:
+        return None
+    return branch, tip
+
+
+def _has_unique_merge_base(root: Path, first: str, second: str) -> bool:
+    try:
+        ancestors = git(root, "merge-base", "--all", first, second).splitlines()
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 1:
+            return False
+        raise
+    return len(ancestors) == 1
+
+
+def _staged_upstream_update(root: Path) -> str | None:
+    """Recognize a current upstream-tip merge into a named feature branch."""
+    merge_path = Path(git(root, "rev-parse", "--git-path", "MERGE_HEAD").decode().strip())
+    if not merge_path.is_absolute():
+        merge_path = root / merge_path
+    if not merge_path.exists():
+        return None
+    incoming = merge_path.read_text().splitlines()
+    if len(incoming) != 1 or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", incoming[0]):
+        return None
+    try:
+        branch = git(root, "symbolic-ref", "--quiet", "HEAD").decode().strip()
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 1:
+            return None
+        raise
+    default = _default_upstream(root)
+    if default is None:
+        return None
+    default_branch, upstream = default
+    if branch == default_branch:
+        return None
+    if incoming[0] != upstream:
+        return None
+    if _is_ancestor(root, upstream, "HEAD") or not _has_unique_merge_base(root, "HEAD", upstream):
+        return None
+    return upstream
+
+
+def _pushed_upstream_update(
+    root: Path, base: str, head: str, destination: str | None
+) -> str | None:
+    """Recognize a verified upstream update published to a feature branch."""
+    if destination is None or not destination.startswith("refs/heads/"):
+        return None
+    try:
+        git(root, "check-ref-format", destination)
+    except subprocess.CalledProcessError:
+        return None
+    if not _is_ancestor(root, base, head):
+        return None
+    merges = git(root, "rev-list", "--ancestry-path", "--merges", "--parents", f"{base}..{head}")
+    if not merges.strip():
+        return None
+    try:
+        branch = git(root, "symbolic-ref", "--quiet", "HEAD").decode().strip()
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 1:
+            return None
+        raise
+    default = _default_upstream(root)
+    if default is None:
+        return None
+    default_branch, upstream = default
+    if branch == default_branch or destination == default_branch:
+        return None
+    if git(root, "rev-parse", head).strip() != git(root, "rev-parse", "HEAD").strip():
+        return None
+    if _is_ancestor(root, upstream, base):
+        return None
+    candidates = []
+    for merge in merges.decode().splitlines():
+        parents = merge.split()[1:]
+        if len(parents) != 2:
+            return None
+        if parents[1] == upstream and _is_ancestor(root, base, parents[0]):
+            candidates.append(parents[0])
+    if not candidates:
+        return None
+    if (
+        len(candidates) != 1
+        or not _is_ancestor(root, upstream, head)
+        or not _has_unique_merge_base(root, candidates[0], upstream)
+    ):
+        return None
+    return upstream
+
+
+def check(
+    root: Path,
+    base: str | None = None,
+    head: str | None = None,
+    *,
+    pre_push: bool = False,
+    destination: str | None = None,
+) -> list[str]:
     """Check staged changes, or the branch diff from a merge base."""
     if head and not base:
         raise ValueError("--head requires --base")
@@ -96,7 +228,13 @@ def check(root: Path, base: str | None = None, head: str | None = None) -> list[
     if base:
         target = head or "HEAD"
         ancestor = git(root, "merge-base", base, target).decode().strip()
+        if pre_push:
+            ancestor = _pushed_upstream_update(root, base, target, destination) or ancestor
         revisions = [ancestor, target]
+    else:
+        upstream = _staged_upstream_update(root)
+        if upstream is not None:
+            revisions.append(upstream)
     options = ["--no-ext-diff", "--no-textconv", "--no-color"]
     entries = iter(
         git(
@@ -169,6 +307,11 @@ def main() -> int:
     parser.add_argument("--base", default=os.environ.get("PRE_COMMIT_FROM_REF"))
     parser.add_argument("--head", default=os.environ.get("PRE_COMMIT_TO_REF"))
     parser.add_argument(
+        "--destination",
+        default=os.environ.get("PRE_COMMIT_REMOTE_BRANCH"),
+        help="Full destination branch ref for a pre-push check.",
+    )
+    parser.add_argument(
         "--pre-push",
         action="store_true",
         default="PRE_COMMIT_REMOTE_NAME" in os.environ,
@@ -178,7 +321,13 @@ def main() -> int:
     try:
         if args.pre_push and not (args.base and args.head):
             raise ValueError("--pre-push requires both --base and --head")
-        findings = check(Path.cwd(), args.base, args.head)
+        findings = check(
+            Path.cwd(),
+            args.base,
+            args.head,
+            pre_push=args.pre_push,
+            destination=args.destination,
+        )
     except (subprocess.CalledProcessError, ValueError):
         print(
             "reference-policy: cannot determine changes; check the base/head revisions",

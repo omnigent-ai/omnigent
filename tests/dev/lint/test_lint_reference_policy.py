@@ -298,6 +298,380 @@ def test_missing_base_fails_closed(repository: Path) -> None:
         check(repository, "missing-ref", "HEAD")
 
 
+@pytest.fixture
+def upstream_update(repository: Path, prohibited_name: str) -> tuple[str, str]:
+    """A feature and upstream each add a file after their shared initial commit."""
+    git(repository, "branch", "-M", "main")
+    git(repository, "switch", "-qc", "feature")
+    (repository / "feature.txt").write_text("safe\n")
+    git(repository, "add", ".")
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "feature")
+    feature = git(repository, "rev-parse", "HEAD").decode().strip()
+    git(repository, "switch", "-q", "main")
+    (repository / "upstream.txt").write_text(f"{prohibited_name}\n")
+    git(repository, "add", ".")
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "upstream")
+    upstream = git(repository, "rev-parse", "HEAD").decode().strip()
+    git(repository, "update-ref", "refs/remotes/origin/main", upstream)
+    git(repository, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    git(repository, "switch", "-q", "feature")
+    return feature, upstream
+
+
+@pytest.mark.parametrize("addition", ["none", "staged", "committed"])
+@pytest.mark.parametrize("default_symbolic_ref", [False, True])
+def test_staged_upstream_update_checks_the_full_feature_index(
+    repository: Path,
+    upstream_update: tuple[str, str],
+    prohibited_name: str,
+    addition: str,
+    default_symbolic_ref: bool,
+) -> None:
+    if not default_symbolic_ref:
+        git(repository, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+    if addition == "committed":
+        (repository / "feature.txt").write_text(f"safe\n{prohibited_name}\n")
+        git(repository, "add", ".")
+        git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "earlier feature")
+    git(repository, "merge", "--no-ff", "--no-commit", upstream_update[1])
+    if addition == "staged":
+        (repository / "feature.txt").write_text(f"safe\n{prohibited_name}\n")
+        git(repository, "add", ".")
+    (repository / "unstaged.txt").write_text(f"{prohibited_name}\n")
+    assert check(repository) == (
+        [] if addition == "none" else ["feature.txt:2: prohibited reference in added text"]
+    )
+
+
+@pytest.mark.parametrize("origin_metadata", [False, True])
+@pytest.mark.parametrize("unsafe", [False, True])
+@pytest.mark.parametrize("destination", ["main", "integration"])
+def test_feature_merge_into_main_uses_the_ordinary_staged_check(
+    repository: Path,
+    upstream_update: tuple[str, str],
+    prohibited_name: str,
+    origin_metadata: bool,
+    unsafe: bool,
+    destination: str,
+) -> None:
+    if unsafe:
+        (repository / "feature.txt").write_text(f"safe\n{prohibited_name}\n")
+        git(repository, "add", ".")
+        git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "feature addition")
+    if not origin_metadata:
+        git(repository, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+        git(repository, "update-ref", "-d", "refs/remotes/origin/main")
+    if destination != "main":
+        git(repository, "branch", destination, "main")
+    git(repository, "switch", "-q", destination)
+    old = git(repository, "rev-parse", "HEAD").decode().strip()
+    git(repository, "merge", "--no-ff", "--no-commit", "feature")
+    expected = ["feature.txt:2: prohibited reference in added text"] if unsafe else []
+    assert check(repository) == expected
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "feature merge")
+    assert (
+        check(repository, old, "HEAD", pre_push=True, destination=f"refs/heads/{destination}")
+        == expected
+    )
+
+
+@pytest.mark.parametrize("earlier_unsafe", [False, True])
+@pytest.mark.parametrize("later_unsafe", [False, True])
+def test_push_upstream_update_checks_old_and_new_feature_additions(
+    repository: Path,
+    upstream_update: tuple[str, str],
+    prohibited_name: str,
+    earlier_unsafe: bool,
+    later_unsafe: bool,
+) -> None:
+    if earlier_unsafe:
+        (repository / "feature.txt").write_text(f"safe\n{prohibited_name}\n")
+        git(repository, "add", ".")
+        git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "earlier feature")
+    old = git(repository, "rev-parse", "HEAD").decode().strip()
+    git(repository, "-c", "core.hooksPath=/dev/null", "merge", "--no-ff", "-qm", "update", "main")
+    if later_unsafe:
+        (repository / "later.txt").write_text(f"{prohibited_name}\n")
+        git(repository, "add", ".")
+        git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "later feature")
+    expected = []
+    if earlier_unsafe:
+        expected.append("feature.txt:2: prohibited reference in added text")
+    if later_unsafe:
+        expected.append("later.txt:1: prohibited reference in added text")
+    assert (
+        check(repository, old, "HEAD", pre_push=True, destination="refs/heads/feature") == expected
+    )
+    assert "upstream.txt:1: prohibited reference in added text" in check(repository, old, "HEAD")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(policy.__file__).resolve()),
+            "--pre-push",
+            "--base",
+            old,
+            "--head",
+            "HEAD",
+            "--destination",
+            "refs/heads/feature",
+        ],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == int(bool(expected))
+    assert result.stdout.splitlines()[: len(expected)] == expected
+    assert "upstream.txt" not in result.stdout
+
+
+@pytest.mark.parametrize("context", ["missing", "dangling", "direct", "stale", "octopus"])
+def test_unverified_update_keeps_the_conservative_scan(
+    repository: Path,
+    upstream_update: tuple[str, str],
+    prohibited_name: str,
+    context: str,
+) -> None:
+    old, upstream = upstream_update
+    if context == "missing":
+        git(repository, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+        git(repository, "update-ref", "-d", "refs/remotes/origin/main")
+    elif context == "dangling":
+        git(repository, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/missing")
+    elif context == "direct":
+        git(repository, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+        git(repository, "update-ref", "refs/remotes/origin/HEAD", upstream)
+    elif context == "stale":
+        git(repository, "switch", "-q", "main")
+        (repository / "newer.txt").write_text("safe\n")
+        git(repository, "add", ".")
+        git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "newer upstream")
+        git(repository, "update-ref", "refs/remotes/origin/main", "HEAD")
+        git(repository, "switch", "-q", "feature")
+    if context == "octopus":
+        ancestor = git(repository, "merge-base", old, upstream).decode().strip()
+        git(repository, "switch", "-qc", "secondary", ancestor)
+        (repository / "secondary.txt").write_text("safe\n")
+        git(repository, "add", ".")
+        git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "secondary")
+        git(repository, "switch", "-q", "feature")
+    git(
+        repository,
+        "merge",
+        "--no-ff",
+        "--no-commit",
+        upstream,
+        *(["secondary"] if context == "octopus" else []),
+    )
+    assert check(repository) == ["upstream.txt:1: prohibited reference in added text"]
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "update")
+    assert check(repository, old, "HEAD", pre_push=True, destination="refs/heads/feature") == [
+        "upstream.txt:1: prohibited reference in added text"
+    ]
+
+
+@pytest.mark.parametrize("unsafe", [False, True])
+def test_stale_upstream_merge_without_new_references_remains_allowed(
+    repository: Path, upstream_update: tuple[str, str], prohibited_name: str, unsafe: bool
+) -> None:
+    old, _ = upstream_update
+    git(repository, "switch", "-q", "main")
+    (repository / "upstream.txt").write_text("safe\n")
+    git(repository, "add", ".")
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "safe upstream")
+    incoming = git(repository, "rev-parse", "HEAD").decode().strip()
+    (repository / "newer.txt").write_text("safe\n")
+    git(repository, "add", ".")
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "newer upstream")
+    git(repository, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(repository, "switch", "-q", "feature")
+    git(repository, "merge", "--no-ff", "--no-commit", incoming)
+    if unsafe:
+        (repository / "feature.txt").write_text(f"safe\n{prohibited_name}\n")
+        git(repository, "add", ".")
+    expected = ["feature.txt:2: prohibited reference in added text"] if unsafe else []
+    assert check(repository) == expected
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "stale update")
+    assert (
+        check(repository, old, "HEAD", pre_push=True, destination="refs/heads/feature") == expected
+    )
+
+
+def test_symbolic_upstream_default_takes_precedence_over_main(
+    repository: Path, upstream_update: tuple[str, str]
+) -> None:
+    old, upstream = upstream_update
+    ancestor = git(repository, "merge-base", old, upstream).decode().strip()
+    git(repository, "branch", "-m", "main", "trunk")
+    git(repository, "update-ref", "refs/remotes/origin/main", ancestor)
+    git(repository, "update-ref", "refs/remotes/origin/trunk", upstream)
+    git(repository, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+    git(repository, "merge", "--no-ff", "--no-commit", "trunk")
+    assert check(repository) == []
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "update from default")
+    assert check(repository, old, "HEAD", pre_push=True, destination="refs/heads/feature") == []
+
+
+def test_push_can_include_an_older_update_before_the_current_upstream_tip(
+    repository: Path, upstream_update: tuple[str, str]
+) -> None:
+    old, _ = upstream_update
+    git(
+        repository,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "merge",
+        "--no-ff",
+        "-qm",
+        "first update",
+        "main",
+    )
+    git(repository, "switch", "-q", "main")
+    (repository / "newer.txt").write_text("safe\n")
+    git(repository, "add", ".")
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "newer upstream")
+    git(repository, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(repository, "switch", "-q", "feature")
+    git(
+        repository,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "merge",
+        "--no-ff",
+        "-qm",
+        "second update",
+        "main",
+    )
+    assert check(repository, old, "HEAD", pre_push=True, destination="refs/heads/feature") == []
+
+
+@pytest.mark.parametrize(
+    "destination", [None, "refs/heads/main", "refs/tags/release", "refs/heads/invalid..name"]
+)
+def test_push_to_older_default_or_without_branch_metadata_keeps_all_additions(
+    repository: Path, upstream_update: tuple[str, str], destination: str | None
+) -> None:
+    feature, upstream = upstream_update
+    remote_old = git(repository, "merge-base", feature, upstream).decode().strip()
+    git(repository, "-c", "core.hooksPath=/dev/null", "merge", "--no-ff", "-qm", "update", "main")
+    expected = ["upstream.txt:1: prohibited reference in added text"]
+    assert (
+        check(repository, remote_old, "HEAD", pre_push=True, destination=destination) == expected
+    )
+    environment = {
+        **os.environ,
+        "PRE_COMMIT_REMOTE_NAME": "fork",
+        "PRE_COMMIT_LOCAL_BRANCH": "refs/heads/feature",
+    }
+    environment.pop("PRE_COMMIT_REMOTE_BRANCH", None)
+    if destination is not None:
+        environment["PRE_COMMIT_REMOTE_BRANCH"] = destination
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(policy.__file__).resolve()),
+            "--pre-push",
+            "--base",
+            remote_old,
+            "--head",
+            "HEAD",
+        ],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert expected[0] in result.stdout
+
+
+def test_multiple_merge_bases_do_not_authorize_the_upstream_baseline(
+    repository: Path, upstream_update: tuple[str, str]
+) -> None:
+    feature, upstream = upstream_update
+    feature_tree = git(repository, "rev-parse", feature + "^{tree}").decode().strip()
+    upstream_tree = git(repository, "rev-parse", upstream + "^{tree}").decode().strip()
+    first = (
+        git(
+            repository,
+            "commit-tree",
+            feature_tree,
+            "-p",
+            feature,
+            "-p",
+            upstream,
+            "-m",
+            "first merge",
+        )
+        .decode()
+        .strip()
+    )
+    second = (
+        git(
+            repository,
+            "commit-tree",
+            upstream_tree,
+            "-p",
+            upstream,
+            "-p",
+            feature,
+            "-m",
+            "second merge",
+        )
+        .decode()
+        .strip()
+    )
+    git(repository, "update-ref", "refs/heads/feature", first)
+    git(repository, "update-ref", "refs/heads/main", second)
+    git(repository, "update-ref", "refs/remotes/origin/main", second)
+    git(repository, "reset", "--hard", first)
+    # Prepare one valid resolution of the two competing merge bases.
+    git(repository, "read-tree", "--reset", "-u", second)
+    merge_path = (
+        repository / git(repository, "rev-parse", "--git-path", "MERGE_HEAD").decode().strip()
+    )
+    merge_path.write_text(second + "\n")
+    expected = ["upstream.txt:1: prohibited reference in added text"]
+    assert check(repository) == expected
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "resolve merge")
+    assert (
+        check(repository, first, "HEAD", pre_push=True, destination="refs/heads/feature")
+        == expected
+    )
+
+
+@pytest.mark.parametrize("unsafe", [False, True])
+def test_pre_push_hook_metadata_checks_the_full_updated_feature(
+    repository: Path, upstream_update: tuple[str, str], prohibited_name: str, unsafe: bool
+) -> None:
+    if unsafe:
+        (repository / "feature.txt").write_text(f"safe\n{prohibited_name}\n")
+        git(repository, "add", ".")
+        git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "earlier feature")
+    old = git(repository, "rev-parse", "HEAD").decode().strip()
+    git(repository, "-c", "core.hooksPath=/dev/null", "merge", "--no-ff", "-qm", "update", "main")
+    result = subprocess.run(
+        [sys.executable, str(Path(policy.__file__).resolve())],
+        cwd=repository,
+        env={
+            **os.environ,
+            "PRE_COMMIT_FROM_REF": old,
+            "PRE_COMMIT_TO_REF": "HEAD",
+            "PRE_COMMIT_REMOTE_NAME": "fork",
+            "PRE_COMMIT_REMOTE_BRANCH": "refs/heads/feature",
+            "PRE_COMMIT_LOCAL_BRANCH": "refs/heads/feature",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == int(unsafe)
+    assert "upstream.txt" not in result.stdout
+    if unsafe:
+        assert "feature.txt:2: prohibited reference in added text" in result.stdout
+
+
 @pytest.mark.parametrize("push_context", ["flag", "hook"])
 def test_cli_uses_push_range_and_does_not_echo_values(
     repository: Path, prohibited_name: str, push_context: str
