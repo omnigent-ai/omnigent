@@ -79,13 +79,18 @@ describe("runScheduledTaskNow", () => {
 });
 
 describe("listScheduledTasks", () => {
-  // Servers that predate task projects omit the key.
+  // Servers that predate task projects or sharing omit the keys.
   it.each([
-    ["absent", {}, null],
-    ["present", { project_id: "proj_1" }, "proj_1"],
+    ["absent", {}, null, []],
+    [
+      "present",
+      { project_id: "proj_1", share_with: [{ user_id: "team.engineering", level: 1 }] },
+      "proj_1",
+      [{ userId: "team.engineering", level: 1 }],
+    ],
   ])(
-    "GETs /v1/scheduled-tasks and camelCases the rows (project %s)",
-    async (_, extra, projectId) => {
+    "GETs /v1/scheduled-tasks and camelCases the rows (project and shares %s)",
+    async (_, extra, projectId, shareWith) => {
       fetchMock.mockResolvedValueOnce(
         mockResponse({ scheduled_tasks: [{ ...TASK_WIRE, ...extra }] }),
       );
@@ -102,6 +107,7 @@ describe("listScheduledTasks", () => {
         hostId: null,
         workspace: null,
         projectId,
+        shareWith,
       });
     },
   );
@@ -276,6 +282,16 @@ describe("createScheduledTask", () => {
     expect(bodies[0].project_id).toBe("proj_1");
     expect(bodies[1]).not.toHaveProperty("project_id");
   });
+
+  it("sends shares and omits an empty list, which older servers would reject", async () => {
+    fetchMock.mockResolvedValue(mockResponse(TASK_WIRE));
+    const base = { name: "n", prompt: "p", rrule: "FREQ=DAILY", agentId: "ag_1" };
+    await createScheduledTask({ ...base, shareWith: [{ userId: "team.engineering", level: 2 }] });
+    await createScheduledTask({ ...base, shareWith: [] });
+    const bodies = fetchMock.mock.calls.map(([, init]) => JSON.parse(init.body));
+    expect(bodies[0].share_with).toEqual([{ user_id: "team.engineering", level: 2 }]);
+    expect(bodies[1]).not.toHaveProperty("share_with");
+  });
 });
 
 describe("updateScheduledTask", () => {
@@ -296,6 +312,12 @@ describe("updateScheduledTask", () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, project_id: projectId }));
     await updateScheduledTask("st_1", { projectId });
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ project_id: projectId });
+  });
+
+  it("sends an empty share list to stop sharing later runs", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+    await updateScheduledTask("st_1", { shareWith: [] });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ share_with: [] });
   });
 });
 

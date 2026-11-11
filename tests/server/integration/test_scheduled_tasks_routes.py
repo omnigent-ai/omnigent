@@ -3108,6 +3108,8 @@ async def test_create_can_continue_a_session_the_owner_picked(
 async def test_share_with_round_trips_and_rejects_shares_the_owner_could_not_add(
     auth_app: FastAPI, auth_client: httpx.AsyncClient
 ) -> None:
+    info = (await auth_client.get("/v1/info", headers=_headers())).json()
+    assert info["scheduled_task_sharing"] is True
     team = {"user_id": "team.engineering", "level": 1}
     bob = {"user_id": "bob@example.com", "level": 2}
     created = await auth_client.post(

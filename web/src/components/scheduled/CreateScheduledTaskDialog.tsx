@@ -72,6 +72,12 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
+import {
+  AutomationShareFields,
+  sameShares,
+  useAutomationSharingAvailable,
+} from "@/components/scheduled/AutomationShareFields";
+import { getCurrentUserId } from "@/lib/identity";
 import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
 import {
   APPROVAL_SKIPPING_PERMISSION_MODES,
@@ -96,6 +102,7 @@ import {
   type AutomationTemplateId,
   type ScheduledTaskExecutionTarget,
   type ScheduledTaskSessionMode,
+  type ScheduledTaskShare,
 } from "@/lib/scheduledTasksApi";
 import {
   isValidSandboxRepoUrl,
@@ -285,6 +292,9 @@ export function CreateScheduledTaskDialog({
   const createMutation = useCreateScheduledTask();
   const updateMutation = useUpdateScheduledTask();
   const isEdit = editingTask !== null;
+  const sharingAvailable = useAutomationSharingAvailable();
+  const savedShares = editingTask?.shareWith ?? [];
+  const [shares, setShares] = useState<ScheduledTaskShare[]>(savedShares);
   // Runs start from a copy of a session: the one being copied on create, or the
   // saved session copy on edit. They use a schedule and start each run in a new
   // session.
@@ -558,6 +568,7 @@ export function CreateScheduledTaskDialog({
       setPrompt(parts.userPrompt);
       setSystemPrompt(parts.systemPrompt);
       setTimezone(editingTask?.timezone ?? localTimezone());
+      setShares(editingTask?.shareWith ?? []);
       if (editingTask) {
         const parsedSchedule = savedSchedule;
         setName(editingTask.name);
@@ -1206,6 +1217,7 @@ export function CreateScheduledTaskDialog({
             // Only on a real switch: sending the unchanged agent is a server-side
             // no-op, but omitting it keeps the PATCH honest about what changed.
             ...(agentChanged && effectiveAgentId !== null ? { agentId: effectiveAgentId } : {}),
+            ...(!sameShares(shares, savedShares) ? { shareWith: shares } : {}),
           },
         });
       } else {
@@ -1226,6 +1238,7 @@ export function CreateScheduledTaskDialog({
           ...(supportsPermission && effectivePermission !== ""
             ? { permissionMode: effectivePermission }
             : {}),
+          ...(sharingAvailable && shares.length > 0 ? { shareWith: shares } : {}),
         });
         onCreated?.(created);
       }
@@ -2030,6 +2043,18 @@ export function CreateScheduledTaskDialog({
               </>
             )}
           </ScheduleFields>
+          {(sharingAvailable || savedShares.length > 0) && (
+            <div className="flex flex-col gap-1.5" data-testid="task-share-field">
+              <Label>Share runs with (optional)</Label>
+              <AutomationShareFields
+                idPrefix="task-share"
+                value={shares}
+                onChange={setShares}
+                ownerId={editingTask ? editingTask.ownerUserId : getCurrentUserId()}
+                disabled={submitting}
+              />
+            </div>
+          )}
           {error && (
             <div
               role="alert"

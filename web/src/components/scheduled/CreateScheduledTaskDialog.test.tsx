@@ -252,7 +252,13 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } = {}) {
+function render(
+  ui: Parameters<typeof renderBase>[0],
+  {
+    expandAdvanced = true,
+    info = {},
+  }: { expandAdvanced?: boolean; info?: Partial<ServerInfo> } = {},
+) {
   const view = renderBase(ui, {
     wrapper: ({ children }) => (
       <CapabilitiesProvider
@@ -262,6 +268,7 @@ function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } 
           scheduled_task_harness_settings: true,
           scheduled_task_approval_skipping_modes: true,
           scheduled_task_worktrees: true,
+          ...info,
         }}
       >
         {children}
@@ -401,6 +408,61 @@ describe("onCreated", () => {
 
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     expect(onCreated).not.toHaveBeenCalled();
+  });
+});
+
+describe("sharing runs", () => {
+  const SHARING = { scheduled_task_sharing: true, sharing_mode: "on" } as const;
+  const team = { userId: "team.engineering", level: 1 };
+
+  function shareWith(userId: string) {
+    const field = screen.getByTestId("task-share-field");
+    fireEvent.change(within(field).getByLabelText("User or group"), { target: { value: userId } });
+    fireEvent.click(within(field).getByRole("button", { name: "Add" }));
+  }
+
+  it("is hidden on servers that cannot share automation runs", () => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    expect(screen.queryByTestId("task-share-field")).toBeNull();
+  });
+
+  it("creates the automation with the people or groups its runs are shared with", async () => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, { info: SHARING });
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Morning review" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), {
+      target: { value: "Review pull requests" },
+    });
+    shareWith("team.engineering");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({ shareWith: [team] });
+  });
+
+  it("sends shares on edit only when they change", async () => {
+    const edit = () =>
+      render(
+        <CreateScheduledTaskDialog
+          open
+          onOpenChange={vi.fn()}
+          editingTask={scheduledTask({ shareWith: [team] })}
+        />,
+        { info: SHARING },
+      );
+    edit();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("shareWith");
+    cleanup();
+
+    edit();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Stop sharing runs with team.engineering" }),
+    );
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(2));
+    expect(updateMutateAsync.mock.calls[1][0].input).toMatchObject({ shareWith: [] });
   });
 });
 

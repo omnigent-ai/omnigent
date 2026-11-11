@@ -44,6 +44,9 @@ export function isOwnerLevel(level: number | null): boolean {
   return level == null || level >= LEVEL_OWNER;
 }
 
+/** Numeric view-only permission level. Mirrors ``LEVEL_READ`` in ``omnigent/server/auth.py``. */
+export const LEVEL_READ = 1;
+
 /**
  * Numeric permission level required to mutate the session's shared
  * workspace. Mirrors ``LEVEL_EDIT`` in ``omnigent/server/auth.py``.

@@ -22,6 +22,7 @@ import {
   PlayIcon,
   Trash2Icon,
   TriangleAlertIcon,
+  UsersIcon,
 } from "lucide-react";
 import { Link, useNavigate, useParams, useRebasePath } from "@/lib/routing";
 import { getShareableSessionLink } from "@/lib/shareLink";
@@ -32,6 +33,8 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
+import { AutomationShareDialog } from "@/components/scheduled/AutomationShareDialog";
+import { useAutomationSharingAvailable } from "@/components/scheduled/AutomationShareFields";
 import {
   isTriggerPrompt,
   SESSION_LINK_ID_PLACEHOLDER,
@@ -55,6 +58,7 @@ import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
 import { useProjects } from "@/hooks/useConversations";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
+import { LEVEL_EDIT } from "@/lib/permissionsApi";
 import { nativeCodingAgentForAvailableAgent } from "@/lib/nativeCodingAgents";
 import { canonicalNativeHarness, nativePermissionOptions } from "@/lib/nativeHarnessModes";
 import { formatStatusEffortLabel, formatStatusModelLabel } from "@/lib/composerModelLabel";
@@ -115,6 +119,8 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const runNowMutation = useRunScheduledTaskNow();
 
   const [editOpen, setEditOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
+  const sharingAvailable = useAutomationSharingAvailable();
 
   // Clear the awaiting flag and its safety timer (shared by the effect and
   // the timer callback so neither leaks).
@@ -301,6 +307,9 @@ function TaskDetail({ taskId }: { taskId: string }) {
   // A single per-task busy flag: the header actions disable while any of this
   // task's mutations are in flight.
   const busy = updateMutation.isPending || deleteMutation.isPending || runNowMutation.isPending;
+  const shares = task.shareWith ?? [];
+  // Saved shares stay visible and removable even where new sharing is off.
+  const showSharing = sharingAvailable || shares.length > 0;
 
   function handlePauseToggle() {
     updateMutation.mutate({
@@ -363,6 +372,18 @@ function TaskDetail({ taskId }: { taskId: string }) {
           {task.name}
         </h1>
         <div className="flex shrink-0 items-center gap-2">
+          {showSharing && (
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Share automation runs"
+              data-testid="task-detail-share"
+              disabled={busy}
+              onClick={() => setShareOpen(true)}
+            >
+              <UsersIcon className="size-4" />
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="icon-sm"
@@ -546,6 +567,22 @@ function TaskDetail({ taskId }: { taskId: string }) {
                 testId="task-detail-project"
               />
             )}
+            {showSharing && (
+              <ConfigField
+                label="Shared with"
+                value={
+                  shares.length === 0
+                    ? "Only you"
+                    : shares
+                        .map(
+                          (share) =>
+                            `${share.userId} (${share.level >= LEVEL_EDIT ? "Edit" : "Read"})`,
+                        )
+                        .join(", ")
+                }
+                testId="task-detail-shared-with"
+              />
+            )}
             <ConfigField label="Timezone" value={task.timezone} testId="task-detail-timezone" />
           </dl>
           {task.sessionMode === "continue" && task.sessionId && (
@@ -594,6 +631,9 @@ function TaskDetail({ taskId }: { taskId: string }) {
         editingTask={task}
         sessionLink={sessionLink}
       />
+      {showSharing && (
+        <AutomationShareDialog task={task} open={shareOpen} onOpenChange={setShareOpen} />
+      )}
     </PageScroll>
   );
 }

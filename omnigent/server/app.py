@@ -342,6 +342,8 @@ class ServerInfoResponse(BaseModel):
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     # Scheduled tasks accept ``project_id``; older servers reject it.
     scheduled_task_projects: bool = False
+    # Scheduled tasks accept ``share_with``; older servers reject it.
+    scheduled_task_sharing: bool = False
     # Bounded latest-failure feed for the Inbox.
     scheduled_task_inbox: bool = False
     # Session PATCH and project create check the agent tool's calling session;
@@ -3741,6 +3743,7 @@ def create_app(
                     "all_types": filesystem_attachment_policy.all_types,
                 },
                 "scheduled_task_projects": project_store is not None,
+                "scheduled_task_sharing": permission_store is not None,
                 "scheduled_task_inbox": automations_enabled,
                 "session_move_source_checks": True,
                 "automations_enabled": automations_enabled,

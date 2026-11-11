@@ -497,6 +497,55 @@ describe("loading / not-found states", () => {
   });
 });
 
+describe("sharing runs", () => {
+  function renderWithSharing() {
+    return render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, sharing_mode: "on", scheduled_task_sharing: true }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>,
+    );
+  }
+
+  it("hides sharing on servers without it, but keeps saved shares removable", () => {
+    setTask(task());
+    renderPage();
+    expect(screen.queryByTestId("task-detail-share")).toBeNull();
+    cleanup();
+
+    setTask(task({ shareWith: [{ userId: "team.engineering", level: 1 }] }));
+    renderPage();
+    expect(screen.getByTestId("task-detail-share")).toBeTruthy();
+    openConfiguration();
+    expect(screen.getByTestId("task-detail-shared-with")).toHaveTextContent(
+      "team.engineering (Read)",
+    );
+  });
+
+  it("saves who later runs are shared with from the Share dialog", () => {
+    setTask(task());
+    renderWithSharing();
+    openConfiguration();
+    expect(screen.getByTestId("task-detail-shared-with")).toHaveTextContent("Only you");
+
+    fireEvent.click(screen.getByTestId("task-detail-share"));
+    const dialog = screen.getByTestId("automation-share-dialog");
+    const save = screen.getByTestId("automation-share-save");
+    expect(save).toBeDisabled();
+    fireEvent.change(within(dialog).getByLabelText("User or group"), {
+      target: { value: "team.engineering" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add" }));
+    fireEvent.click(save);
+
+    expect(updateMutate).toHaveBeenCalledWith(
+      { id: "st_1", input: { shareWith: [{ userId: "team.engineering", level: 1 }] } },
+      expect.anything(),
+    );
+  });
+});
+
 describe("header actions", () => {
   it.each([{ isLoading: true }, { cached: true }, { isError: true }])(
     "can trigger before history is ready without highlighting old history: %j",

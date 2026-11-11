@@ -36,6 +36,14 @@ export type ScheduledTaskRunStatus =
  * server preserves the JSON key `owner_user_id` for the owning user even though
  * the DB column is `user_id`; it's surfaced here as `ownerUserId`.
  */
+/** A user or group every session an automation's runs create is shared with. */
+export interface ScheduledTaskShare {
+  /** Email, group name, or `__public__`, e.g. `team.engineering`. */
+  userId: string;
+  /** Session permission level, e.g. `1` for read. */
+  level: number;
+}
+
 export interface ScheduledTask {
   id: string;
   name: string;
@@ -57,6 +65,8 @@ export interface ScheduledTask {
    * `--permission-mode` launch arg from it at fire time.
    */
   permissionMode: string | null;
+  /** Who each run's session is shared with, after the owner; empty/absent when private. */
+  shareWith?: ScheduledTaskShare[];
   /** `"continue"` sends every run's prompt into `sessionId` instead of a new session. */
   sessionMode: ScheduledTaskSessionMode;
   /** The session a `"continue"` task sends to; `null` until its first run creates one. */
@@ -159,6 +169,8 @@ export interface CreateScheduledTaskInput {
   reasoningEffort?: string | null;
   /** Harness-specific permission or execution mode; omit for the agent default. */
   permissionMode?: string | null;
+  /** Users or groups every run's session is shared with; empty keeps runs private. */
+  shareWith?: ScheduledTaskShare[];
   /** `"continue"` keeps one session across runs; omit for a new session per run. */
   sessionMode?: ScheduledTaskSessionMode;
   /** Host directory (requires hostId), or a repository URL for a sandbox. */
@@ -203,6 +215,8 @@ export interface UpdateScheduledTaskInput {
   modelOverride?: string | null;
   reasoningEffort?: string | null;
   permissionMode?: string | null;
+  /** Replaces who later runs' sessions are shared with; `[]` stops sharing. */
+  shareWith?: ScheduledTaskShare[];
   sessionMode?: ScheduledTaskSessionMode;
   /** `null` makes a `"continue"` task's next run start the session later runs continue. */
   sessionId?: string | null;
@@ -235,6 +249,8 @@ interface ScheduledTaskWire {
   model_override: string | null;
   reasoning_effort: string | null;
   permission_mode: string | null;
+  // Absent on servers that predate automation sharing.
+  share_with?: { user_id: string; level: number }[];
   session_mode?: ScheduledTaskSessionMode;
   session_id?: string | null;
   workspace: string | null;
@@ -309,6 +325,10 @@ async function readJsonOrThrow<T>(res: Response): Promise<T> {
   return (await res.json()) as T;
 }
 
+function shareWithWire(shares: ScheduledTaskShare[]): { user_id: string; level: number }[] {
+  return shares.map((share) => ({ user_id: share.userId, level: share.level }));
+}
+
 function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
   return {
     id: wire.id,
@@ -323,6 +343,10 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     modelOverride: wire.model_override,
     reasoningEffort: wire.reasoning_effort,
     permissionMode: wire.permission_mode,
+    shareWith: (wire.share_with ?? []).map((share) => ({
+      userId: share.user_id,
+      level: share.level,
+    })),
     sessionMode: wire.session_mode ?? "new",
     sessionId: wire.session_id ?? null,
     workspace: wire.workspace,
@@ -395,6 +419,8 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.modelOverride != null) body.model_override = input.modelOverride;
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
+  // Servers without sharing reject the field, so a private automation omits it.
+  if (input.shareWith?.length) body.share_with = shareWithWire(input.shareWith);
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
   if (input.workspace != null) body.workspace = input.workspace;
@@ -441,6 +467,7 @@ export async function updateScheduledTask(
   if (input.modelOverride !== undefined) body.model_override = input.modelOverride;
   if (input.reasoningEffort !== undefined) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
+  if (input.shareWith !== undefined) body.share_with = shareWithWire(input.shareWith);
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
   if (input.sessionId !== undefined) body.session_id = input.sessionId;
