@@ -3321,6 +3321,53 @@ async def test_a_sandbox_task_whose_session_was_deleted_starts_a_new_one_on_its_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("startup", "launch", "change", "released"),
+    [
+        ("failed", None, None, True),
+        ("failed", "failed", None, True),
+        # Its sandbox is still being torn down after the registration timeout.
+        ("failed", "running", None, False),
+        ("pending", None, None, False),
+        ("failed", None, "archived", False),
+        ("failed", None, "bound", False),
+        ("failed", None, "connected_host", False),
+    ],
+)
+async def test_only_a_sandbox_session_whose_launch_failed_unbound_is_replaced(
+    startup: str, launch: str | None, change: str | None, released: bool
+) -> None:
+    """Nothing ran in it; a session that started, or that the owner changed, is kept."""
+    from omnigent.server.managed_hosts import ManagedLaunchTracker
+    from omnigent.server.startup_inputs import STARTUP_LABEL
+
+    task = _sandbox_continue_task(session_id="conv_prev")
+    if change == "connected_host":
+        task = replace(task, execution_target="connected_host")
+    own = continued_sandbox_host_id(task.id, task.workspace_id)
+    session = _continued_session(
+        host_id=own if change == "bound" else None,
+        workspace=None,
+        archived=change == "archived",
+        labels={fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id, STARTUP_LABEL: startup},
+    )
+    tracker = ManagedLaunchTracker()
+    if launch is not None:
+        tracker.begin(session.id)
+        if launch == "failed":
+            tracker.fail(session.id, "The sandbox didn't connect in time.")
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    deps = _deps(
+        store, conversation_store=_ExistingConversationStore(session), managed_launches=tracker
+    )
+
+    continued = await fire_mod._release_replaceable_session(deps, task)
+
+    assert store.released == ([(task.id, "conv_prev")] if released else [])
+    assert continued.session_id == (None if released else "conv_prev")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("repository", [None, "https://github.com/example/runtime"])
 async def test_a_new_session_joins_the_tasks_sandbox_in_an_earlier_sessions_workspace(
     monkeypatch: pytest.MonkeyPatch,
