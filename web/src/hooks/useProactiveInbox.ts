@@ -144,11 +144,16 @@ export function useProactiveInbox(
     };
   }, [state]);
 
+  /**
+   * Apply *change* to one suggestion. Resolves to whether the server accepted
+   * it, once its PATCH has settled, so a caller can keep its own view of the
+   * item until then.
+   */
   const update = useCallback(
-    (id: string, change: SuggestionUpdate) => {
+    (id: string, change: SuggestionUpdate): Promise<boolean> => {
       const scope = scopeState(queryClient, scopeKeyText);
       const notify = () => scope.listeners.forEach((listener) => listener());
-      if ("status" in change && scope.resolved.has(id)) return;
+      if ("status" in change && scope.resolved.has(id)) return Promise.resolve(false);
       if ("resolution" in change) {
         if (change.resolution === "none") scope.resolved.delete(id);
         else scope.resolved.add(id);
@@ -166,7 +171,7 @@ export function useProactiveInbox(
       notify();
       void queryClient.cancelQueries({ queryKey: key });
       const previous = scope.chains.get(id) ?? Promise.resolve();
-      const request = previous
+      const request: Promise<boolean> = previous
         .then(async () => {
           let saved: SuggestionUpdateResult | null = null;
           try {
@@ -187,6 +192,7 @@ export function useProactiveInbox(
             );
             scope.confirmed.set(id, reply.item.status);
           }
+          return saved !== null;
         })
         .finally(() => {
           if (scope.pending.get(id) === change) {
@@ -200,6 +206,7 @@ export function useProactiveInbox(
           if (scope.inFlight === 0) void queryClient.invalidateQueries({ queryKey: key });
         });
       scope.chains.set(id, request);
+      return request;
     },
     [queryClient, scopeKeyText],
   );

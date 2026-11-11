@@ -136,6 +136,7 @@ import {
   suggestionPreview,
   unreadCountText,
   type Suggestion,
+  type SuggestionUpdate,
 } from "@/lib/proactiveInbox";
 import { relativeTime } from "@/lib/relativeTime";
 import { Link, useNavigate } from "@/lib/routing";
@@ -581,6 +582,14 @@ export function InboxPage() {
     if (entry.kind === "suggestion") {
       const { item } = entry;
       const unpin = () => setPinnedSuggestions(({ [item.id]: _pinned, ...rest }) => rest);
+      // The pin keeps an expanded, read suggestion on the Unread tab. A
+      // dismissal or action hides the card at once through the hook; the pin
+      // goes only once the server accepts, so a failed PATCH brings the card
+      // back where it was.
+      const resolve = (change: SuggestionUpdate) =>
+        void proactiveInbox.update(item.id, change).then((accepted) => {
+          if (accepted) unpin();
+        });
       const onToggleSuggestion = () => {
         if (!expanded && item.status === "unread") {
           setPinnedSuggestions((prev) => ({ ...prev, [item.id]: { ...item, status: "read" } }));
@@ -592,8 +601,7 @@ export function InboxPage() {
       const takeAction = (index: number) => {
         const action = item.actions[index];
         if (!action) return;
-        unpin();
-        proactiveInbox.update(item.id, { resolution: "action_taken", resolutionAction: index });
+        resolve({ resolution: "action_taken", resolutionAction: index });
         // The user reviews and sends the prompt from the composer.
         navigate(newSessionLocation(action.prompt, []));
       };
@@ -636,8 +644,7 @@ export function InboxPage() {
                     key={reason.resolution}
                     onSelect={() => {
                       trackClick(`inbox.suggestion.dismiss.${reason.resolution}`, "button");
-                      unpin();
-                      proactiveInbox.update(item.id, { resolution: reason.resolution });
+                      resolve({ resolution: reason.resolution });
                     }}
                   >
                     {reason.label}
