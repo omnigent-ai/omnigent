@@ -2038,11 +2038,15 @@ async def test_flag_off_init_rollback_keeps_legacy_store_calls(
     replace = env.conversations.replace_runner_id
     clear = env.conversations.clear_runner_id
 
-    def legacy_replace(session_id, runner_id):
-        return replace(session_id, runner_id)
+    # A runner write requires the runner the request read (so a move's claim
+    # taken meanwhile survives); nothing profile-specific is passed.
+    def legacy_replace(session_id, runner_id, **kwargs):
+        assert set(kwargs) <= {"expected_runner"}
+        return replace(session_id, runner_id, **kwargs)
 
-    def legacy_clear(session_id):
-        return clear(session_id)
+    def legacy_clear(session_id, **kwargs):
+        assert set(kwargs) <= {"expected_runner"}
+        return clear(session_id, **kwargs)
 
     monkeypatch.setattr(env.conversations, "replace_runner_id", legacy_replace)
     monkeypatch.setattr(env.conversations, "clear_runner_id", legacy_clear)

@@ -6817,41 +6817,68 @@ def _start_managed_launch_task(
         "before the sandbox was ready. Send it again."
     )
 
-    async def release_claim() -> bool:
+    async def hold_to_settle(*, unbound_only: bool = False) -> str:
         """
-        Drop a move's claim on the runner, keeping any host its sandbox bound.
+        Hold the session under the move's claim while this launch settles it.
 
-        A claim left behind would refuse every later launch, including the
-        one another replica makes to finish a committed binding.
+        Only the move releases its claim, so until it does nothing else can bind
+        the session: a host that takes it afterwards isn't settled with this
+        launch's outcome. A claim handed over to the sandbox's replica, or one
+        its runner replaced, is taken back first, from the binding just read.
 
-        :returns: Whether the session is still this launch's to settle;
-            ``False`` when another host took it after the claim was released.
+        :param unbound_only: Leave a session bound to this launch's sandbox to
+            that sandbox's replica, which finishes the launch.
+        :returns: ``"held"``; ``"bound"`` when left to the sandbox's replica; or
+            ``"taken"`` when another host has the session.
         """
         if held_runner_id is None:
-            return True
+            return "held"
         for _ in range(3):
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if current is None:
-                return True
-            if current.runner_id != held_runner_id:
-                # Unbound, or bound to this launch's own sandbox (whose runner
-                # replaced the claim), the session is still this launch's; any
-                # other host won it.
-                return current.host_id is None or (
-                    entry is not None and entry.host_id == current.host_id
+            if current is None or current.runner_id == held_runner_id:
+                return "held"
+            on_sandbox = (
+                current.host_id is not None
+                and entry is not None
+                and entry.host_id == current.host_id
+            )
+            if not on_sandbox and (current.host_id is not None or current.runner_id is not None):
+                return "taken"
+            if on_sandbox and unbound_only:
+                return "bound"
+            try:
+                await asyncio.to_thread(
+                    conversation_store.replace_runner_id,
+                    session_id,
+                    held_runner_id,
+                    expected_binding=current,
                 )
+            except ConversationNotFoundError:
+                return "held"
+            except ValueError:
+                continue  # Changed since the read; classify it again.
+            return "held"
+        # Still contended after repeated reads: don't settle the session.
+        return "taken"
+
+    async def release_claim() -> None:
+        """Drop the move's claim, keeping any host its sandbox bound."""
+        if held_runner_id is None:
+            return
+        for _ in range(3):
+            current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if current is None or current.runner_id != held_runner_id:
+                return
             # Compare-and-clear on the exact binding read, so the host stays.
             try:
                 await asyncio.to_thread(
                     conversation_store.clear_runner_id, session_id, expected_binding=current
                 )
             except ConversationNotFoundError:
-                return True
+                return
             except ValueError:
-                continue  # Changed since the read; classify it again.
-            return True
-        # Still contended after repeated reads: don't claim the session.
-        return False
+                continue
+            return
 
     async def settle_superseded() -> None:
         # Another host runs the session: nothing failed there, but what was
@@ -6863,6 +6890,25 @@ def _start_managed_launch_task(
                 session_id, superseded_note, move_claim=held_runner_id
             )
 
+    async def settle(held: str, record: Callable[[], Awaitable[object]] | None) -> None:
+        """Record the launch's outcome while the session is held, then release the claim."""
+        if held == "taken":
+            await settle_superseded()
+            return
+        try:
+            if held == "held" and record is not None:
+                await record()
+        finally:
+            await release_claim()
+
+    # A create's launch records its failure as it always has.
+    move_kwargs = {"move_claim": held_runner_id} if held_runner_id is not None else {}
+
+    def record_failure(reason: str) -> Callable[[], Awaitable[object]] | None:
+        if startup is None:
+            return None
+        return lambda: startup.record_launch_failure(session_id, reason, **move_kwargs)
+
     async def record_unbound_launch_failure() -> None:
         # Shutdown gave up on the launch. Bound, the host's replica finishes
         # it; unbound, no replica can, so fail the saved inputs rather than
@@ -6871,14 +6917,16 @@ def _start_managed_launch_task(
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is not None and conv.host_id is None:
             await startup.record_launch_failure(
-                session_id, "the server shut down before the sandbox finished launching"
+                session_id,
+                "the server shut down before the sandbox finished launching",
+                **move_kwargs,
             )
 
     async def settle_cancelled() -> None:
-        if not await release_claim():
-            await settle_superseded()
-        elif startup is not None:
-            await record_unbound_launch_failure()
+        await settle(
+            await hold_to_settle(unbound_only=True),
+            record_unbound_launch_failure if startup is not None else None,
+        )
 
     async def launch_and_record_failure() -> None:
         try:
@@ -6890,12 +6938,10 @@ def _start_managed_launch_task(
                 )
             raise
         except Exception as exc:
-            if not await release_claim():
-                await settle_superseded()
-            elif startup is not None:
-                await startup.record_launch_failure(
-                    session_id, f"managed sandbox failed to launch: {exc}"
-                )
+            await settle(
+                await hold_to_settle(),
+                record_failure(f"managed sandbox failed to launch: {exc}"),
+            )
             raise
         if entry is not None and entry.superseded:
             if startup is not None:
@@ -6905,10 +6951,7 @@ def _start_managed_launch_task(
             return
         failed = tracker.get(session_id)
         if failed is not None and failed.error is not None:
-            if not await release_claim():
-                await settle_superseded()
-            elif startup is not None:
-                await startup.record_launch_failure(session_id, failed.error)
+            await settle(await hold_to_settle(), record_failure(failed.error))
 
     launch_task = asyncio.create_task(launch_and_record_failure())
     _managed_launch_tasks.add(launch_task)

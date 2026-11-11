@@ -940,6 +940,8 @@ def register_core_routes(
         caller re-raises the refusal, which is the error to report. Whether this
         attempt holds the session is read from the store, after the writes it
         started have landed, so a cancelled claim that still committed counts.
+        Only the move releases its claim, so holding it, nothing else can take
+        the session until step 3.
 
         1. Holding the claim, the old host, directory and branch come back,
            with the sandbox labels this attempt removed (*labels*, ``None``
@@ -966,14 +968,22 @@ def register_core_routes(
         holds_claim = current is not None and current.runner_id == claim
         if holds_claim:
             try:
-                await asyncio.to_thread(
-                    conversation_store.set_host_id,
-                    session_id,
-                    host_id,
-                    workspace,
-                    git_branch,
-                    expected_runner_id=claim,
-                )
+                try:
+                    await asyncio.to_thread(
+                        conversation_store.set_host_id,
+                        session_id,
+                        host_id,
+                        workspace,
+                        git_branch,
+                        expected_runner_id=claim,
+                    )
+                except ValueError:
+                    now = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                    if now is None or now.runner_id != claim:
+                        # The claim is gone, which only an expired lease allows:
+                        # the session is another host's, and nothing here is this move's.
+                        holds_claim = False
+                    raise
                 if labels is not None:
                     # A launch refused after writing its own sandbox labels leaves them.
                     restored = await asyncio.to_thread(
@@ -993,6 +1003,7 @@ def register_core_routes(
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
+        if holds_claim:
             await _withdraw_managed_launch(request, session_id, claim)
         try:
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -3676,8 +3687,19 @@ def register_core_routes(
                 else None,
                 binding_action="clear" if body.runner_id == "" else "bind",
             )
+            from omnigent.server.managed_hosts import move_claim_is_live
+
+            if move_claim_is_live(conv.runner_id):
+                # Only the move releases its claim, so its cleanup can't land on
+                # a host that took the session meanwhile.
+                raise OmnigentError(
+                    "The session is moving to a new sandbox. Try again once the move finishes.",
+                    code=ErrorCode.CONFLICT,
+                )
             # Empty string is the clear sentinel (None = leave unchanged);
             # used by /clear and /switch to move the runner between sessions.
+            # Each write below requires the runner read above, so a move that
+            # claims the session meanwhile keeps its claim.
             if body.runner_id == "":
                 try:
                     if profile_catalog is not None:
@@ -3690,9 +3712,16 @@ def register_core_routes(
                             user_id=user_id,
                         )
                     else:
-                        await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
+                        await asyncio.to_thread(
+                            conversation_store.clear_runner_id, session_id, expected_runner=conv
+                        )
                 except ConversationNotFoundError as exc:
                     raise _session_not_found() from exc
+                except ValueError as exc:
+                    raise OmnigentError(
+                        "The session's runner changed. Reload and try again.",
+                        code=ErrorCode.CONFLICT,
+                    ) from exc
                 _logger.info(
                     "Session unbound from runner",
                     extra=debug_event(
@@ -3761,7 +3790,10 @@ def register_core_routes(
                     if not handled:
                         if profile_catalog is None:
                             await asyncio.to_thread(
-                                conversation_store.replace_runner_id, session_id, runner_id
+                                conversation_store.replace_runner_id,
+                                session_id,
+                                runner_id,
+                                expected_runner=conv,
                             )
                         else:
                             await asyncio.to_thread(

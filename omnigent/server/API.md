@@ -954,6 +954,9 @@ Request body:
 is used on a non-Codex-native session; or `external_session_id` would
 overwrite a different existing value
 404 Not Found - no session with that id
+409 Conflict - `runner_id` was sent while a move onto a new sandbox holds
+the session (see "Move Session to a New Sandbox"), or the session's
+runner changed while the request was being handled
 
 This is the mutable affinity primitive for Alpha. The same endpoint
 serves create-bind, resume-bind, and recover-bind: the client starts a
@@ -1435,20 +1438,24 @@ session's runner first with `PATCH /v1/sessions/{id}` and
 `{"runner_id": ""}`. The call then claims the session against the
 binding it checked, so a runner bound or a host changed in the
 meantime, or a concurrent move, makes it fail with 409. The claim stays
-on the session until the sandbox binds; meanwhile a host launch is
-refused and a message is held for the sandbox, on every replica. The
-call clears the session's host, workspace and branch, drops any
-earlier sandbox's `omnigent.sandbox.repo*` and
-`omnigent.sandbox.requested_host_id` labels, and registers the sandbox
-to the caller. Like a managed fork, the request should be routed by the
-new sandbox's `host_id`, where the launch connects. A failed launch
-releases the claim and leaves the session unbound with the reason in
-`sandbox_status`; held messages are reported as not delivered. If the
-claim is released while the sandbox provisions and another host binds
-the session, that binding wins: the sandbox is torn down without
-failing the session, and held messages are marked not sent. A request
-the server refuses restores the previous binding and labels, unless
-another host took the session meanwhile, and releases the claim. Files
+on the session until the sandbox's runner replaces it; meanwhile a host
+launch is refused, a message is held for the sandbox, and
+`PATCH /v1/sessions/{id}` with a `runner_id` returns 409, on every
+replica. Only the move releases its claim, after it has settled the
+session; a claim over an hour old is left by a server that stopped
+mid-move, and `PATCH` may clear it. The call clears the session's host,
+workspace and branch, drops any earlier sandbox's
+`omnigent.sandbox.repo*` and `omnigent.sandbox.requested_host_id`
+labels, and registers the sandbox to the caller. Like a managed fork,
+the request should be routed by the new sandbox's `host_id`, where the
+launch connects. A failed launch leaves the session unbound with the
+reason in `sandbox_status`, and held messages are reported as not
+delivered, before the claim is released. When the sandbox's host
+connects to another replica, the claim is handed over for that replica
+to start the runner; if another host binds the session then, that
+binding wins: the sandbox is torn down without failing the session, and
+held messages are marked not sent. A request the server refuses
+restores the previous binding and labels, and releases the claim. Files
 don't move with the session; the transcript does.
 
 ### Read Fork Repository Branch Suggestions

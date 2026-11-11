@@ -1855,7 +1855,11 @@ class ConversationStore(ABC):
 
     @abstractmethod
     def clear_runner_id(
-        self, conversation_id: str, *, expected_binding: Conversation | None = None
+        self,
+        conversation_id: str,
+        *,
+        expected_binding: Conversation | None = None,
+        expected_runner: Conversation | None = None,
     ) -> Conversation:
         """
         Null out ``conversations.runner_id``.
@@ -1870,6 +1874,9 @@ class ConversationStore(ABC):
             e.g. ``"conv_abc123"``.
         :param expected_binding: Require its runner and host to match the current binding.
             A mismatch raises ValueError before any write.
+        :param expected_runner: Require its runner (``None`` included) to still be
+            the current one, whatever the host is now. A mismatch raises
+            ValueError before any write.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.

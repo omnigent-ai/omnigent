@@ -4878,13 +4878,20 @@ class SqlAlchemyConversationStore(ConversationStore):
         return _to_conversation(ap_row, meta, labels)
 
     def clear_runner_id(
-        self, conversation_id: str, *, expected_binding: Conversation | None = None
+        self,
+        conversation_id: str,
+        *,
+        expected_binding: Conversation | None = None,
+        expected_runner: Conversation | None = None,
     ) -> Conversation:
         """
         Null out ``conversations.runner_id``. Atomic last-write-wins.
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
+        :param expected_binding: Require its runner and host to still be current.
+        :param expected_runner: Require its runner (``None`` included) to still be
+            the current one, whatever the host is now.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
@@ -4894,7 +4901,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta = session.get(
                 SqlConversationMetadata,
                 (current_workspace_id(), conversation_id),
-                with_for_update=expected_binding is not None,
+                with_for_update=expected_binding is not None or expected_runner is not None,
             )
             if meta is None:
                 raise ConversationNotFoundError(
@@ -4904,6 +4911,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta.runner_id != expected_binding.runner_id
                 or meta.host_id != expected_binding.host_id
             ):
+                raise ValueError("The session binding changed; retry the request")
+            if expected_runner is not None and meta.runner_id != expected_runner.runner_id:
                 raise ValueError("The session binding changed; retry the request")
             _bind_runner(meta, None)
             return meta

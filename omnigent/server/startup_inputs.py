@@ -49,23 +49,34 @@ STARTUP_LABEL = "omnigent.startup"
 # superseded move). Nothing queues behind it, and an input admitted just before
 # it was set settles itself when it sees it.
 STARTUP_WITHDRAWN = "withdrawn"
-# The move claim a startup was withdrawn under, so a later move's claim, held
+# The move claim a startup was withdrawn or failed under. A move settles while
+# it still holds the session, so a message held for it can be saved after; this
+# tells that message the startup is settled, while a later move's claim, held
 # before that move marks its own startup pending, isn't taken for it.
-STARTUP_WITHDRAWN_BY_LABEL = "omnigent.startup.withdrawn_by"
+STARTUP_SETTLED_BY_LABEL = "omnigent.startup.settled_by"
 _WITHDRAWN_INPUT_NOTE = (
     "The message wasn't sent: the sandbox launch it was waiting for was withdrawn. Send it again."
 )
+_FAILED_INPUT_NOTE = (
+    "The message could not be delivered: the sandbox it was waiting for failed to launch."
+)
 
 
-def _startup_withdrawn(conv: Conversation) -> bool:
-    """Whether *conv*'s startup is withdrawn, and no later move has taken it since."""
+def _settled_startup(conv: Conversation) -> str | None:
+    """
+    The terminal state a message saved now must settle with, if any.
+
+    A withdrawn startup, or one a move failed, unless a later move has taken the
+    session since. A create's failed launch is left to its own handling.
+    """
     from omnigent.server.managed_hosts import is_move_claim
 
-    if conv.labels.get(STARTUP_LABEL) != STARTUP_WITHDRAWN:
-        return False
-    return not is_move_claim(conv.runner_id) or conv.runner_id == conv.labels.get(
-        STARTUP_WITHDRAWN_BY_LABEL
-    )
+    state = conv.labels.get(STARTUP_LABEL)
+    settled_by = conv.labels.get(STARTUP_SETTLED_BY_LABEL)
+    if state == STARTUP_WITHDRAWN or (state == "failed" and settled_by is not None):
+        if not is_move_claim(conv.runner_id) or conv.runner_id == settled_by:
+            return state
+    return None
 
 
 def initial_input_id(session_id: str) -> str:
@@ -223,9 +234,10 @@ class ManagedStartupInputs:
             )
         else:
             conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
-            if conv is not None and _startup_withdrawn(conv):
-                # Withdrawn after this was admitted, possibly after the withdrawal
-                # settled what it saw: settle this input the same way.
+            settled = _settled_startup(conv) if conv is not None else None
+            if settled is not None:
+                # Settled after this was admitted, possibly after the settlement
+                # failed what it saw: settle this input the same way.
                 if await asyncio.to_thread(
                     self.conversations.transition_pending_input,
                     session_id,
@@ -233,10 +245,11 @@ class ManagedStartupInputs:
                     expected="in_progress",
                     status="failed",
                 ):
+                    withdrawn = settled == STARTUP_WITHDRAWN
                     await self._report_failure(
                         session_id,
-                        "launch_withdrawn",
-                        _WITHDRAWN_INPUT_NOTE,
+                        "launch_withdrawn" if withdrawn else "launch_failed",
+                        _WITHDRAWN_INPUT_NOTE if withdrawn else _FAILED_INPUT_NOTE,
                         publish_status=False,
                     )
             elif conv is not None and STARTUP_LABEL not in conv.labels:
@@ -247,22 +260,30 @@ class ManagedStartupInputs:
         return saved[0]
 
     async def record_launch_failure(
-        self, session_id: str, reason: str | Callable[[], Awaitable[str]]
+        self,
+        session_id: str,
+        reason: str | Callable[[], Awaitable[str]],
+        *,
+        move_claim: str | None = None,
     ) -> str:
         """
-        Mark a failed create launch on the session, for replicas without its tracker.
+        Mark a failed launch on the session, for replicas without its tracker.
 
         No sandbox is left to deliver the saved inputs, so they are failed and
         the transcript says why. A deferred reason is resolved only after queued
         inputs are failed, so diagnostic I/O cannot race their delivery. Returns
         the resolved reason for callers recording the same failure elsewhere.
+
+        :param move_claim: The claim of the move whose launch failed, which it
+            still holds, or ``None`` for a create's launch.
         """
         undelivered = False
+        labels = {STARTUP_LABEL: "failed"}
+        if move_claim is not None:
+            labels[STARTUP_SETTLED_BY_LABEL] = move_claim
         if await asyncio.to_thread(self.conversations.get_conversation, session_id) is not None:
             with contextlib.suppress(ConversationNotFoundError):
-                await asyncio.to_thread(
-                    self.conversations.set_labels, session_id, {STARTUP_LABEL: "failed"}
-                )
+                await asyncio.to_thread(self.conversations.set_labels, session_id, labels)
             for item in await asyncio.to_thread(
                 self.conversations.list_pending_inputs, session_id
             ):
@@ -303,7 +324,7 @@ class ManagedStartupInputs:
         """
         labels = {STARTUP_LABEL: STARTUP_WITHDRAWN}
         if move_claim is not None:
-            labels[STARTUP_WITHDRAWN_BY_LABEL] = move_claim
+            labels[STARTUP_SETTLED_BY_LABEL] = move_claim
         with contextlib.suppress(ConversationNotFoundError):
             await asyncio.to_thread(self.conversations.set_labels, session_id, labels)
         undelivered = False

@@ -398,16 +398,37 @@ REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
 # require a runner's tunnel token stay strict, but no real token-bound id (hex
 # after the prefix) can equal it, so every replica can tell a move is underway.
 MOVE_CLAIM_RUNNER_ID_PREFIX = "runner_token_move_"
+# Only the move releases its claim, so nothing else can take the session while
+# it settles. A claim older than this was left by a server that stopped
+# mid-move, and may be cleared: longer than any provider's provisioning plus
+# the host-registration wait and the runner's start.
+MOVE_CLAIM_LEASE_S = MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S + 3600
+# Hex digits of the claim's creation time (seconds), after the prefix.
+_MOVE_CLAIM_TIME_DIGITS = 12
 
 
 def new_move_claim() -> str:
     """Return a fresh runner id for a move to claim a session with."""
-    return MOVE_CLAIM_RUNNER_ID_PREFIX + secrets.token_hex(16)
+    created = f"{int(time.time()):0{_MOVE_CLAIM_TIME_DIGITS}x}"
+    return MOVE_CLAIM_RUNNER_ID_PREFIX + created + secrets.token_hex(16)
 
 
 def is_move_claim(runner_id: str | None) -> bool:
     """Whether *runner_id* is a move's claim rather than a real runner."""
     return runner_id is not None and runner_id.startswith(MOVE_CLAIM_RUNNER_ID_PREFIX)
+
+
+def move_claim_is_live(runner_id: str | None) -> bool:
+    """Whether *runner_id* is a move's claim still within its lease."""
+    if not is_move_claim(runner_id):
+        return False
+    assert runner_id is not None
+    start = len(MOVE_CLAIM_RUNNER_ID_PREFIX)
+    try:
+        created = int(runner_id[start : start + _MOVE_CLAIM_TIME_DIGITS], 16)
+    except ValueError:
+        return False
+    return time.time() - created < MOVE_CLAIM_LEASE_S
 
 
 def managed_host_name(host_id: str) -> str:
