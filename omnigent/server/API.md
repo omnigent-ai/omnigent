@@ -1414,8 +1414,10 @@ it does on a `host_type: "managed"` fork:
 
 400 Bad Request — the session is a sub-agent or side chat, has no
   agent binding, already runs in a sandbox, or asks for a sandbox
-  this server has not configured
-403 / 404 — the caller does not own the session
+  this server has not configured or whose provider manages sandbox
+  profiles
+403 / 404 — the caller does not own the session, or (403) the server's
+  nested-agent destination policy keeps this session off new sandboxes
 409 Conflict — a runner is still bound, the session has no host to
   move from (it may already be moving), its host or runner changed
   while the move ran, or host_id names a host already in use
@@ -1442,9 +1444,11 @@ routed by the new sandbox's `host_id`, where the launch connects.
 Until the sandbox host binds, the session behaves like an in-flight
 managed create: a message posted meanwhile is held for the launch, and
 a failed launch leaves the session unbound with the reason in
-`sandbox_status`. A request the server refuses restores the previous
-binding and labels unless the session was rebound meanwhile. Files
-don't move with the session; the transcript does.
+`sandbox_status`. A host that binds the session while the sandbox
+provisions keeps it: the sandbox binds only if the session is still
+unbound, and is torn down otherwise. A request the server refuses
+restores the previous binding and labels unless the session was rebound
+meanwhile. Files don't move with the session; the transcript does.
 
 ### Read Fork Repository Branch Suggestions
 

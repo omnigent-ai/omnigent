@@ -123,13 +123,13 @@ const launchRunnerMock = vi.mocked(launchRunner);
 const launchManagedHostMock = vi.mocked(launchManagedHost);
 const updateSessionMock = vi.mocked(updateSession);
 
-// A server that provisions Arclet sandboxes, moves sessions onto them, and lets
+// A server that provisions Modal sandboxes, moves sessions onto them, and lets
 // the caller name the new host.
-const ARCLET_SERVER: Partial<ServerInfo> = {
+const SANDBOX_SERVER: Partial<ServerInfo> = {
   managed_sandboxes_enabled: true,
   move_to_managed_sandbox: true,
-  sandbox_provider: "arclet",
-  sandbox_providers: ["arclet"],
+  sandbox_provider: "modal",
+  sandbox_providers: ["modal"],
   request_managed_sandbox_host_id: true,
 };
 
@@ -431,21 +431,21 @@ describe("SwitchHostDialog", () => {
 
   describe("new sandbox target", () => {
     it("lists a sandbox per provider only on a server that can move a session onto one", () => {
-      renderDialog({ ...ARCLET_SERVER, managed_sandboxes_enabled: false });
-      expect(screen.queryByTestId("switch-host-sandbox-option-arclet")).toBeNull();
+      renderDialog({ ...SANDBOX_SERVER, managed_sandboxes_enabled: false });
+      expect(screen.queryByTestId("switch-host-sandbox-option-modal")).toBeNull();
       cleanup();
 
       // An older server launches sandboxes but lacks the move, which would
       // fail only after the switch has released the runner.
-      renderDialog({ ...ARCLET_SERVER, move_to_managed_sandbox: false });
-      expect(screen.queryByTestId("switch-host-sandbox-option-arclet")).toBeNull();
+      renderDialog({ ...SANDBOX_SERVER, move_to_managed_sandbox: false });
+      expect(screen.queryByTestId("switch-host-sandbox-option-modal")).toBeNull();
       cleanup();
 
-      renderDialog({ ...ARCLET_SERVER, sandbox_providers: ["arclet", "modal"] });
-      expect(screen.getByTestId("switch-host-sandbox-option-arclet")).toHaveTextContent(
-        "Arclet Sandbox",
+      renderDialog({ ...SANDBOX_SERVER, sandbox_providers: ["modal", "e2b"] });
+      expect(screen.getByTestId("switch-host-sandbox-option-modal")).toHaveTextContent(
+        "Modal Sandbox",
       );
-      expect(screen.getByTestId("switch-host-sandbox-option-modal")).toBeInTheDocument();
+      expect(screen.getByTestId("switch-host-sandbox-option-e2b")).toBeInTheDocument();
       // A fresh provision is never the default while another host is online.
       expect(screen.getByTestId("mock-host-select")).toHaveValue("host_new");
     });
@@ -472,8 +472,8 @@ describe("SwitchHostDialog", () => {
         isLoading: false,
         error: null,
       });
-      renderDialog(ARCLET_SERVER);
-      expect(screen.queryByTestId("switch-host-sandbox-option-arclet")).toBeNull();
+      renderDialog(SANDBOX_SERVER);
+      expect(screen.queryByTestId("switch-host-sandbox-option-modal")).toBeNull();
       expect(screen.getByTestId("mock-host-select")).toHaveValue("host_new");
     });
 
@@ -485,27 +485,43 @@ describe("SwitchHostDialog", () => {
         next_cursor: null,
       });
       renderDialog({
-        ...ARCLET_SERVER,
-        sandbox_providers: ["arclet", "profiled"],
+        ...SANDBOX_SERVER,
+        sandbox_providers: ["modal", "profiled"],
         features: { sandbox_profiles: true },
       });
-      expect(await screen.findByTestId("switch-host-sandbox-option-arclet")).toBeInTheDocument();
+      expect(await screen.findByTestId("switch-host-sandbox-option-modal")).toBeInTheDocument();
       expect(screen.queryByTestId("switch-host-sandbox-option-profiled")).toBeNull();
     });
 
+    it("offers no sandbox while it can't tell which providers use profiles", async () => {
+      vi.mocked(fetchSandboxProfiles).mockRejectedValue(new Error("profiles unavailable"));
+      onlyOriginHostOnline();
+      renderDialog({
+        ...SANDBOX_SERVER,
+        sandbox_providers: ["modal", "profiled"],
+        features: { sandbox_profiles: true },
+      });
+      await waitFor(() => expect(fetchSandboxProfiles).toHaveBeenCalled());
+      // Nothing to pick, so nothing can release the runner.
+      expect(await screen.findByTestId("switch-host-no-targets")).toBeVisible();
+      expect(screen.queryByTestId("switch-host-sandbox-option-modal")).toBeNull();
+      expect(screen.queryByTestId("switch-host-button")).toBeNull();
+      expect(updateSessionMock).not.toHaveBeenCalled();
+    });
+
     it("moves the session onto a new sandbox after releasing its runner", async () => {
-      const client = renderDialog(ARCLET_SERVER);
+      const client = renderDialog(SANDBOX_SERVER);
       client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_1"), [
         { id: "terminal_shellA_s1", name: "shellA", session: "s1", running: true },
       ]);
 
       fireEvent.change(screen.getByTestId("mock-host-select"), {
-        target: { value: "__sandbox__:arclet" },
+        target: { value: "__sandbox__:modal" },
       });
       // A sandbox doesn't exist yet, so a repository replaces the directory.
       expect(screen.queryByTestId("mock-workspace-input")).toBeNull();
       fireEvent.change(screen.getByTestId("switch-host-sandbox-repo-input"), {
-        target: { value: "https://github.com/databricks-eng/universe" },
+        target: { value: "https://github.com/example/repo" },
       });
       fireEvent.change(screen.getByTestId("switch-host-sandbox-branch-input"), {
         target: { value: "feature/login" },
@@ -525,8 +541,8 @@ describe("SwitchHostDialog", () => {
       const [sessionId, sandbox] = launchManagedHostMock.mock.calls[0];
       expect(sessionId).toBe("conv_1");
       expect(sandbox).toMatchObject({
-        provider: "arclet",
-        workspace: "https://github.com/databricks-eng/universe#feature/login",
+        provider: "modal",
+        workspace: "https://github.com/example/repo#feature/login",
       });
       expect(sandbox.hostId).toMatch(/^[0-9a-f]{32}$/);
       expect(launchRunnerMock).not.toHaveBeenCalled();
@@ -537,24 +553,24 @@ describe("SwitchHostDialog", () => {
 
     it("defaults to an empty sandbox when no other host is online", async () => {
       onlyOriginHostOnline();
-      renderDialog({ ...ARCLET_SERVER, request_managed_sandbox_host_id: false });
+      renderDialog({ ...SANDBOX_SERVER, request_managed_sandbox_host_id: false });
 
       expect(screen.queryByTestId("switch-host-no-targets")).toBeNull();
       await waitFor(() =>
-        expect(screen.getByTestId("mock-host-select")).toHaveValue("__sandbox__:arclet"),
+        expect(screen.getByTestId("mock-host-select")).toHaveValue("__sandbox__:modal"),
       );
       fireEvent.click(screen.getByTestId("switch-host-button"));
 
       await waitFor(() => expect(launchManagedHostMock).toHaveBeenCalledTimes(1));
       expect(launchManagedHostMock).toHaveBeenCalledWith("conv_1", {
-        provider: "arclet",
+        provider: "modal",
         workspace: null,
       });
     });
 
     it("blocks a branch without a repository, a malformed repository URL and an invalid branch", () => {
       onlyOriginHostOnline();
-      renderDialog(ARCLET_SERVER);
+      renderDialog(SANDBOX_SERVER);
       const button = screen.getByTestId("switch-host-button");
       const repo = screen.getByTestId("switch-host-sandbox-repo-input");
 
@@ -589,10 +605,10 @@ describe("SwitchHostDialog", () => {
 
     it("offers the origin host again when the sandbox launch is refused", async () => {
       launchManagedHostMock.mockRejectedValue(
-        new Error("sandbox provider 'arclet' is not configured on this server"),
+        new Error("sandbox provider 'modal' is not configured on this server"),
       );
       onlyOriginHostOnline();
-      renderDialog(ARCLET_SERVER);
+      renderDialog(SANDBOX_SERVER);
 
       fireEvent.click(screen.getByTestId("switch-host-button"));
 

@@ -1287,7 +1287,7 @@ def test_session_fork_external_rejects_any_workspace(workspace: str) -> None:
         ({}, None),
         (
             {
-                "sandbox_provider": "arclet",
+                "sandbox_provider": "modal",
                 "host_id": "0123456789abcdef0123456789abcdef",
                 "workspace": "https://github.com/org/repo#main",
             },

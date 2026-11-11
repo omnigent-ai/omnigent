@@ -809,23 +809,24 @@ async def test_move_to_managed_sandbox_requires_owner_access(
     auth_client: httpx.AsyncClient,
 ) -> None:
     """Moving a session onto a new sandbox is owner-only, like binding a
-    runner: an editor gets 403 and a user without access 404, and neither
-    changes the session.
+    runner: an editor or a manager gets 403 and a user without access 404,
+    and none of them changes the session.
     """
     agent = await create_test_agent(auth_client, user="bryan")
     session_id = (await _create_session_as(auth_client, agent["id"], "user-a"))["id"]
-    resp = await _grant_permission(
-        auth_client,
-        session_id,
-        granter="user-a",
-        target_user="user-b",
-        level=LEVEL_EDIT,
-    )
-    assert resp.status_code == 200
+    for target_user, level in (("user-b", LEVEL_EDIT), ("user-d", LEVEL_MANAGE)):
+        resp = await _grant_permission(
+            auth_client,
+            session_id,
+            granter="user-a",
+            target_user=target_user,
+            level=level,
+        )
+        assert resp.status_code == 200
     owner = {"X-Forwarded-Email": "user-a"}
     before = (await auth_client.get(f"/v1/sessions/{session_id}", headers=owner)).json()
 
-    for caller, expected_status in (("user-b", 403), ("user-c", 404)):
+    for caller, expected_status in (("user-b", 403), ("user-d", 403), ("user-c", 404)):
         resp = await auth_client.post(
             f"/v1/sessions/{session_id}/managed-host",
             json={},

@@ -138,7 +138,11 @@ the header menu), and each place is a separate entry point.
   on a session running on a connected machine also lists a new sandbox per
   provider. Picking one asks for an optional repository and branch, then moves
   the session there with the same launch progress a new sandbox session shows.
-  A refused launch keeps the dialog open, with the old host offered again.
+  A refused launch keeps the dialog open, with the old host offered again. The
+  reconnect dialog's Switch host opens the same picker, so a session whose
+  machine is offline can recover onto a new sandbox too. Providers that manage
+  sandbox profiles aren't offered, nor is any sandbox while that's unknown or
+  once the session has no host.
 
 - `clone`: copy a session into a new workspace, including a typed `~` path.
   Participating sandbox providers require a [profile selection](sandbox-profiles.md)

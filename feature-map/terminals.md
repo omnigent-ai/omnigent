@@ -83,8 +83,9 @@ with their own terminal retain the switcher.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host or a new sandbox, then look at both the terminal strip and the
-agent terminal. Sandbox-backed sessions, including Databricks Sandbox and Arclet,
-cannot switch hosts. Their "Switch host…" item is disabled; hover or focus it for the
+agent terminal.
+Sandbox-backed sessions, including Databricks Sandbox and Arclet, cannot switch
+hosts. Their "Switch host…" item is disabled; hover or focus it for the
 unsupported explanation.
 
 **Local terminal:** a native harness launched from the CLI runs in the user's

@@ -1879,6 +1879,7 @@ class ConversationStore(ABC):
         *,
         expected_host_id: str | None = None,
         expected_sandbox_id: str | None = None,
+        expected_runner_id: str | None = None,
         clear_profile: bool = False,
     ) -> Conversation:
         """
@@ -1904,6 +1905,8 @@ class ConversationStore(ABC):
             e.g. ``"conv_abc123"``.
         :param expected_host_id: When supplied, clear only if the current host
             still matches this identity; otherwise leave every binding field unchanged.
+        :param expected_runner_id: When supplied, clear only if the current
+            runner is still this one; otherwise leave every binding field unchanged.
         :param clear_profile: Allow detaching a profiled session from a live host.
             When false, that binding is left unchanged. Accepted profile labels are retained.
         :returns: The current :class:`Conversation` after the conditional clear.
@@ -2061,13 +2064,15 @@ class ConversationStore(ABC):
         host_id: str,
         workspace: str | None = None,
         git_branch: str | None = None,
+        *,
+        require_unbound: bool = False,
     ) -> Conversation:
         """
         Set the host that launched (or should launch) the runner.
 
         Used when the server asks a host to spawn a runner for
         an existing session. Last-write-wins semantics (like
-        :meth:`replace_runner_id`).
+        :meth:`replace_runner_id`) unless *require_unbound* is set.
 
         Runner/host binding is live state, not conversation activity, so
         this must NOT bump ``updated_at`` (it drives sidebar ordering
@@ -2089,9 +2094,14 @@ class ConversationStore(ABC):
             worktree (the fork resume path). ``None`` preserves the
             branch on the same host/workspace, but clears it when
             the host or an explicitly supplied workspace changes.
+        :param require_unbound: Bind only while the session has no runner
+            and no other host, checked atomically with the write, so a
+            binding made concurrently wins.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
+        :raises ValueError: If *require_unbound* is set and the session
+            has a runner or another host.
         """
         ...
 

@@ -44,6 +44,7 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
+from omnigent.server.sharing_settings import SiblingSessionDestinations
 from omnigent.server.startup_inputs import STARTUP_LABEL
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -1346,6 +1347,159 @@ async def test_runner_bound_during_a_sandbox_move_keeps_the_session(
     assert env.app.state.managed_launches.get(session_id) is None
 
 
+async def test_host_bound_while_the_sandbox_provisions_keeps_the_session(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A connected host that takes the session while its new sandbox provisions,
+    such as another tab resuming it, keeps it: the sandbox doesn't overwrite the
+    binding or supersede that runner when it comes up, and is torn down.
+    """
+    import threading
+
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    loop = asyncio.get_running_loop()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+        """Connect the fake sandbox host from the launcher's worker thread."""
+        future = asyncio.run_coroutine_threadsafe(
+            _fake_sandbox_host(
+                env.app, invocation.host_id, invocation.host_name, invocation.token
+            ),
+            loop,
+        )
+        host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+    provisioned = threading.Event()
+    fake = FakeSandboxLauncher(on_host_start=_start_fake_sandbox_host, provision_gate=provisioned)
+    install_fake_modal_launcher(monkeypatch, fake)
+    session_id = await _session_released_from_laptop(env, agent_name="move-rebound-agent")
+
+    resp = await env.client.post(f"/v1/sessions/{session_id}/managed-host", json={})
+    assert resp.status_code == 202, resp.text
+    # The same two writes a connected-host launch makes.
+    assert env.conv_store.set_runner_id(session_id, "runner_other_tab")
+    env.conv_store.set_host_id(session_id, _LAPTOP_HOST_ID, "/Users/alice/repo")
+    provisioned.set()
+
+    tracker = env.app.state.managed_launches
+    await poll_until_async(
+        lambda: (launch := tracker.get(session_id)) is not None and launch.settled.is_set()
+    )
+    launch = tracker.get(session_id)
+    assert launch is not None
+    assert launch.error is not None and "bound to another host" in launch.error
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert (conv.host_id, conv.workspace, conv.runner_id) == (
+        _LAPTOP_HOST_ID,
+        "/Users/alice/repo",
+        "runner_other_tab",
+    )
+    await poll_until_async(lambda: fake.terminated == ["sb-fake-1"])
+    # The sandbox host did come up; only its bind was refused.
+    assert len(host_futures) == 1
+
+
+async def test_rebind_as_a_refused_sandbox_move_rolls_back_keeps_the_winner(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A refused move puts the old host back only while the session is still
+    unbound, checked with the write. A host that binds it just as the rollback
+    writes keeps its binding and runner.
+    """
+    env = managed_session_env
+    session_id = await _session_released_from_laptop(env, agent_name="move-rollback-race-agent")
+    other_host_id = "99999999999999999999999999999999"
+    env.host_store.upsert_on_connect(other_host_id, "desktop", RESERVED_USER_LOCAL)
+    set_host_id = env.conv_store.set_host_id
+    rebound = False
+
+    def set_host_id_after_a_rebind(
+        conversation_id: str, *args: object, **kwargs: object
+    ) -> object:
+        nonlocal rebound
+        if not rebound:
+            rebound = True
+            assert env.conv_store.set_runner_id(conversation_id, "runner_desktop")
+            set_host_id(conversation_id, other_host_id, "/Users/alice/desktop")
+        return set_host_id(conversation_id, *args, **kwargs)
+
+    monkeypatch.setattr(env.conv_store, "set_host_id", set_host_id_after_a_rebind)
+
+    resp = await env.client.post(
+        f"/v1/sessions/{session_id}/managed-host", json={"sandbox_provider": "e2b"}
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert rebound
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert (conv.host_id, conv.workspace, conv.runner_id) == (
+        other_host_id,
+        "/Users/alice/desktop",
+        "runner_desktop",
+    )
+    assert env.app.state.managed_launches.get(session_id) is None
+
+
+@pytest.mark.parametrize("failing_step", ["re-read", "host clear"])
+async def test_sandbox_move_failing_right_after_its_claim_releases_it(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_step: str,
+) -> None:
+    """
+    A store error between claiming the session and clearing its host releases
+    the claim, so the session stays on its host and a later move or launch
+    isn't refused for a runner nothing holds.
+    """
+    env = managed_session_env
+    session_id = await _session_released_from_laptop(env, agent_name="move-claim-leak-agent")
+    claimed = False
+    set_runner_id = env.conv_store.set_runner_id
+    get_conversation = env.conv_store.get_conversation
+    clear_host_binding = env.conv_store.clear_host_binding
+
+    def claim(conversation_id: str, runner_id: str) -> bool:
+        nonlocal claimed
+        claimed = set_runner_id(conversation_id, runner_id)
+        return claimed
+
+    def reread(conversation_id: str) -> Conversation | None:
+        nonlocal claimed
+        if failing_step == "re-read" and claimed:
+            claimed = False
+            raise RuntimeError("store unavailable")
+        return get_conversation(conversation_id)
+
+    def clear(conversation_id: str, **kwargs: object) -> Conversation:
+        if failing_step == "host clear":
+            raise RuntimeError("store unavailable")
+        return clear_host_binding(conversation_id, **kwargs)
+
+    monkeypatch.setattr(env.conv_store, "set_runner_id", claim)
+    monkeypatch.setattr(env.conv_store, "get_conversation", reread)
+    monkeypatch.setattr(env.conv_store, "clear_host_binding", clear)
+
+    with pytest.raises(RuntimeError, match="store unavailable"):
+        await env.client.post(f"/v1/sessions/{session_id}/managed-host", json={})
+
+    conv = get_conversation(session_id)
+    assert conv is not None
+    assert (conv.host_id, conv.workspace, conv.runner_id) == (
+        _LAPTOP_HOST_ID,
+        "/Users/alice/repo",
+        None,
+    )
+    assert env.app.state.managed_launches.get(session_id) is None
+
+
 async def test_refused_sandbox_move_restores_the_session_binding(
     managed_session_env: ManagedSessionEnv,
 ) -> None:
@@ -1359,7 +1513,7 @@ async def test_refused_sandbox_move_restores_the_session_binding(
     env.conv_store.set_labels(session_id, _STALE_SANDBOX_LABELS)
 
     resp = await env.client.post(
-        f"/v1/sessions/{session_id}/managed-host", json={"sandbox_provider": "lakebox"}
+        f"/v1/sessions/{session_id}/managed-host", json={"sandbox_provider": "e2b"}
     )
 
     assert resp.status_code == 400, resp.text
@@ -1422,6 +1576,7 @@ async def test_sandbox_move_failing_partway_restores_the_session_binding(
         ("side chat", 400),
         ("already in a sandbox", 400),
         ("provider manages sandbox profiles", 400),
+        ("nested agent limited to its host", 403),
     ],
 )
 async def test_sandbox_move_refuses_without_touching_the_session(
@@ -1431,7 +1586,8 @@ async def test_sandbox_move_refuses_without_touching_the_session(
     A session whose runner was never released, that has no host to leave, or
     that is a side chat, or a move naming a taken host id, is refused without
     touching the session. So is one already in a sandbox nothing would tear
-    down, and a move onto a provider that binds a sandbox profile at create.
+    down, a move onto a provider that binds a sandbox profile at create, and a
+    nested agent the server limits to its current host.
     """
     env = managed_session_env
     session_id = await _session_released_from_laptop(env, agent_name="move-guard-agent")
@@ -1453,6 +1609,16 @@ async def test_sandbox_move_refuses_without_touching_the_session(
             token_expires_at=9_999_999_999,
         )
         request = {"host_id": _MOVED_SANDBOX_HOST_ID}
+    elif reason == "nested agent limited to its host":
+        source = env.conv_store.create_conversation(agent_id=None)
+        env.conv_store.add_new_sibling(source.id, session_id, user_id=None)
+        env.app.state.feature_flags = FeatureFlags(
+            enabled_features=env.app.state.feature_flags.enabled_features
+            | {Feature.SIBLING_SESSIONS}
+        )
+        env.app.state.sibling_session_destinations = lambda: (
+            SiblingSessionDestinations.CURRENT_HOST
+        )
     elif reason == "provider manages sandbox profiles":
         deployment = env.app.state.sandbox_config
         env.app.state.sandbox_config = replace(

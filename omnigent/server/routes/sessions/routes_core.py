@@ -655,6 +655,7 @@ def register_core_routes(
         sandbox_provider: str | None,
         workspaces: list[str],
         requested_host_id: str | None = None,
+        require_unbound: bool = False,
     ) -> None:
         """
         Provision a managed sandbox host for a session that has no host.
@@ -692,6 +693,8 @@ def register_core_routes(
         :param requested_host_id: Host id the caller chose for the sandbox
             host (already checked against existing hosts),
             or ``None`` to let the launch mint one.
+        :param require_unbound: Bind the sandbox only if the session is still
+            unbound once it is ready (a move onto a new sandbox).
         :raises OmnigentError: If managed hosts aren't configured or the
             provider isn't offered.
         """
@@ -791,6 +794,7 @@ def register_core_routes(
             agent_id=agent_id,
             host_id=requested_host_id,
             sandbox_profiles=profile_catalog,
+            require_unbound=require_unbound,
         )
         _start_managed_launch_task(
             session_id,
@@ -833,6 +837,22 @@ def register_core_routes(
                 code=ErrorCode.ALREADY_EXISTS,
             )
 
+    def _is_sandbox_launch_label(key: str) -> bool:
+        """
+        Whether *key* steers a managed launch's relaunches and routing.
+
+        :param key: Session label key, e.g. ``"omnigent.sandbox.repo.1"``.
+        :returns: True for the repository and requested-host-id labels.
+        """
+        from omnigent.server.managed_hosts import (
+            MANAGED_REPO_LABEL_KEY,
+            REQUESTED_HOST_ID_LABEL_KEY,
+        )
+
+        return key in (MANAGED_REPO_LABEL_KEY, REQUESTED_HOST_ID_LABEL_KEY) or key.startswith(
+            f"{MANAGED_REPO_LABEL_KEY}."
+        )
+
     async def _restore_host_binding(
         session_id: str,
         *,
@@ -853,12 +873,22 @@ def register_core_routes(
         :param labels: The sandbox labels the move removed.
         """
         try:
+            try:
+                await asyncio.to_thread(
+                    conversation_store.set_host_id,
+                    session_id,
+                    host_id,
+                    workspace,
+                    git_branch,
+                    require_unbound=True,
+                )
+            except ValueError:
+                return  # Rebound meanwhile; that binding wins.
+            # A launch refused after writing its own sandbox labels leaves them behind.
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if current is None or current.host_id is not None or current.runner_id is not None:
-                return
-            await asyncio.to_thread(
-                conversation_store.set_host_id, session_id, host_id, workspace, git_branch
-            )
+            for key in [] if current is None else list(current.labels):
+                if _is_sandbox_launch_label(key) and key not in labels:
+                    await asyncio.to_thread(conversation_store.delete_label, session_id, key)
             if labels:
                 await asyncio.to_thread(conversation_store.set_labels, session_id, labels)
         except Exception:  # Must not replace the refusal being raised.
@@ -5079,11 +5109,6 @@ def register_core_routes(
             one already moving), if the binding changed during the move, or
             if ``body.host_id`` is taken.
         """
-        from omnigent.server.managed_hosts import (
-            MANAGED_REPO_LABEL_KEY,
-            REQUESTED_HOST_ID_LABEL_KEY,
-        )
-
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
             user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
@@ -5139,6 +5164,18 @@ def register_core_routes(
                 "moved onto it. Fork the session onto it instead.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        if conv.family_id is not None and request.app.state.feature_flags.enabled(
+            Feature.SIBLING_SESSIONS
+        ):
+            from omnigent.server.session_families import require_sibling_destination
+
+            await asyncio.to_thread(
+                require_sibling_destination,
+                request,
+                conv.host_id,
+                host_id=body.host_id,
+                host_type="managed",
+            )
         if body.host_id is not None:
             await _check_requested_host_id(request, body.host_id, user_id)
 
@@ -5146,32 +5183,52 @@ def register_core_routes(
         # ``WHERE runner_id IS NULL`` bind a host launch uses. A runner bound
         # since the checks above, or a concurrent move, makes the claim fail.
         claim = token_bound_runner_id(secrets.token_urlsafe(32))
-        held: Conversation | None = None
-        if await asyncio.to_thread(conversation_store.set_runner_id, session_id, claim):
-            held = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        if held is None or held.runner_id != claim or held.host_id != previous_host_id:
-            # Another move unbound the session first; drop a claim that still stands.
-            if held is not None and held.runner_id == claim:
-                await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
+        if not await asyncio.to_thread(conversation_store.set_runner_id, session_id, claim):
             raise OmnigentError(
                 "The session's host or runner changed while moving it. Reload and try again.",
                 code=ErrorCode.CONFLICT,
             )
-
-        # An earlier sandbox's repositories and host id would steer this
-        # launch's relaunches and routing, so they leave with the old binding.
-        stale_labels = {
-            key: value
-            for key, value in held.labels.items()
-            if key in (MANAGED_REPO_LABEL_KEY, REQUESTED_HOST_ID_LABEL_KEY)
-            or key.startswith(f"{MANAGED_REPO_LABEL_KEY}.")
-        }
-        # Hostless until the sandbox binds, so nothing relaunches on the old host;
-        # clearing the binding also releases the claim.
+        held: Conversation | None = None
         try:
-            await asyncio.to_thread(conversation_store.clear_host_binding, session_id)
-        except ConversationNotFoundError as exc:
-            raise _session_not_found() from exc
+            held = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if held is None:
+                raise _session_not_found()
+            if held.runner_id != claim or held.host_id != previous_host_id:
+                raise OmnigentError(
+                    "The session's host or runner changed while moving it. Reload and try again.",
+                    code=ErrorCode.CONFLICT,
+                )
+            # An earlier sandbox's repositories and host id would steer this
+            # launch's relaunches and routing, so they leave with the old binding.
+            stale_labels = {
+                key: value for key, value in held.labels.items() if _is_sandbox_launch_label(key)
+            }
+            # Hostless until the sandbox binds, so nothing relaunches on the old
+            # host. Clearing only while the claim stands also releases it.
+            cleared = await asyncio.to_thread(
+                conversation_store.clear_host_binding,
+                session_id,
+                expected_host_id=previous_host_id,
+                expected_runner_id=claim,
+            )
+            if cleared.host_id is not None or cleared.runner_id is not None:
+                raise OmnigentError(
+                    "The session's host or runner changed while moving it. Reload and try again.",
+                    code=ErrorCode.CONFLICT,
+                )
+        except BaseException as exc:
+            # Nothing else holds this runner id, so a claim left behind would
+            # refuse every later move and launch.
+            standing = held if held is not None and held.runner_id == claim else None
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(
+                    conversation_store.clear_runner_id,
+                    session_id,
+                    expected_binding=standing or dataclasses.replace(conv, runner_id=claim),
+                )
+            if isinstance(exc, ConversationNotFoundError):
+                raise _session_not_found() from exc
+            raise
         try:
             for key in stale_labels:
                 await asyncio.to_thread(conversation_store.delete_label, session_id, key)
@@ -5183,6 +5240,7 @@ def register_core_routes(
                 sandbox_provider=body.sandbox_provider,
                 workspaces=[body.workspace] if body.workspace is not None else [],
                 requested_host_id=body.host_id,
+                require_unbound=True,
             )
         except Exception as exc:
             await _restore_host_binding(

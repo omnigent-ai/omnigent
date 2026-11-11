@@ -745,14 +745,14 @@ describe("launchManagedHost", () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse(moved));
 
     await launchManagedHost("conv_1", {
-      provider: "arclet",
+      provider: "modal",
       workspace: "https://github.com/org/repo#main",
       hostId: "0123456789abcdef0123456789abcdef",
     });
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({
-      sandbox_provider: "arclet",
+      sandbox_provider: "modal",
       workspace: "https://github.com/org/repo#main",
       host_id: "0123456789abcdef0123456789abcdef",
     });
@@ -768,7 +768,11 @@ describe("launchManagedHost", () => {
 
     await expect(
       launchManagedHost("conv_1", { provider: null, workspace: null }),
-    ).rejects.toMatchObject({ status: 409, code: "conflict" });
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "conflict",
+      message: "This session has no host to move from",
+    });
   });
 });
 

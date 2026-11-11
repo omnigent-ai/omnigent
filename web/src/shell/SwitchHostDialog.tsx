@@ -157,7 +157,7 @@ function SupportedSwitchHostDialog({
   // A provider that manages sandbox profiles binds one at session create, so
   // the server refuses to move a session onto it.
   const profilesEnabled = moveSupported && sandboxProfilesEnabled(info);
-  const { data: profileCatalog, isError: profileCatalogFailed } = useQuery({
+  const { data: profileCatalog } = useQuery({
     queryKey: [...SANDBOX_PROFILES_QUERY_KEY, null],
     queryFn: ({ signal }) => fetchSandboxProfiles(undefined, { signal }),
     enabled: profilesEnabled,
@@ -170,13 +170,15 @@ function SupportedSwitchHostDialog({
   const sessionHostless = session != null && session.hostId === null;
   const sandboxProviderRows = useMemo(() => {
     if (info === "loading" || !moveSupported || sessionHostless) return [];
-    if (!profilesEnabled || profileCatalogFailed) return sandboxProviderOptions(info);
+    if (!profilesEnabled) return sandboxProviderOptions(info);
+    // Until it is known which providers use profiles, offering none keeps a
+    // pick from releasing the runner for a move the server would refuse.
     if (profileCatalog === undefined) return [];
     const profiled = new Set(profileCatalog.managed_providers);
     return sandboxProviderOptions(info).filter(
       (provider) => !profiled.has(provider ?? info.sandbox_provider ?? ""),
     );
-  }, [info, moveSupported, sessionHostless, profilesEnabled, profileCatalog, profileCatalogFailed]);
+  }, [info, moveSupported, sessionHostless, profilesEnabled, profileCatalog]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 

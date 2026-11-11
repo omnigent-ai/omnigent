@@ -4609,6 +4609,7 @@ async def _run_managed_launch(
     agent_id: str | None = None,
     host_id: str | None = None,
     sandbox_profiles: Any = None,
+    require_unbound: bool = False,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -4674,6 +4675,9 @@ async def _run_managed_launch(
         classifier, or ``None`` to leave it unstamped.
     :param host_id: Host id a managed create asked for, or
         ``None`` to mint one. Ignored on a relaunch.
+    :param require_unbound: Bind the sandbox only if the session is still
+        unbound when it is ready; a move sets this so a host bound while it
+        provisioned keeps the session.
     """
     from omnigent.server.managed_hosts import (
         deployment_with_inference_snapshot,
@@ -4779,7 +4783,15 @@ async def _run_managed_launch(
             relaunch_host=relaunch_host,
             sandbox_profiles=sandbox_profiles,
             sandbox_profile=profile,
+            require_unbound=require_unbound,
         )
+
+
+class _SessionReboundDuringProvision(Exception):
+    """The session gained a host or runner while its sandbox provisioned."""
+
+
+_SESSION_REBOUND_REASON = "session was bound to another host while its sandbox was provisioning"
 
 
 async def _bind_and_launch_managed_runner(
@@ -4795,6 +4807,7 @@ async def _bind_and_launch_managed_runner(
     relaunch_host: Host | None = None,
     sandbox_profiles: Any = None,
     sandbox_profile: dict[str, Any] | None = None,
+    require_unbound: bool = False,
 ) -> None:
     """
     Bind a provisioned managed host to its session and launch a runner.
@@ -4827,6 +4840,9 @@ async def _bind_and_launch_managed_runner(
     :param relaunch_host: Existing managed host row being relaunched, or
         ``None`` for a first launch (a fresh host identity was just
         minted for ``managed.host_id``).
+    :param require_unbound: Bind only if the session has no runner and no
+        other host; otherwise the binding made meanwhile wins and the fresh
+        sandbox is torn down.
     """
     from omnigent.server.managed_hosts import terminate_managed_host
 
@@ -4836,7 +4852,14 @@ async def _bind_and_launch_managed_runner(
             if sandbox_profiles is not None
             else None
         )
-        if snapshot is None:
+        if snapshot is None and require_unbound:
+            try:
+                conv = conversation_store.set_host_id(
+                    session_id, managed.host_id, managed.workspace, require_unbound=True
+                )
+            except ValueError as exc:
+                raise _SessionReboundDuringProvision from exc
+        elif snapshot is None:
             conv = conversation_store.set_host_id(session_id, managed.host_id, managed.workspace)
         else:
             conversation_store.bind_profiled_host(
@@ -4877,6 +4900,9 @@ async def _bind_and_launch_managed_runner(
             conv = await asyncio.shield(bind)
         except ConversationNotFoundError:
             reason = "session was deleted while its sandbox was provisioning"
+            return
+        except _SessionReboundDuringProvision:
+            reason = _SESSION_REBOUND_REASON
             return
         except Exception:  # noqa: BLE001 — settle the tracker and release the fresh sandbox
             _logger.exception("Failed to bind managed host", extra={"session_id": session_id})
@@ -4948,6 +4974,8 @@ async def _bind_and_launch_managed_runner(
                     await bind
                 except ConversationNotFoundError:
                     reason = "session was deleted while its sandbox was provisioning"
+                except _SessionReboundDuringProvision:
+                    reason = _SESSION_REBOUND_REASON
                 except Exception:  # noqa: BLE001 — drain the transaction before compensating
                     reason = "failed to bind managed host"
                 if reason is None:
