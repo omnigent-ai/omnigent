@@ -292,9 +292,12 @@ def register_agent_routes(
             selection_headers[AUTOMATIONS_HEADER] = "1" if automations_available() else "0"
         inbox_enabled_for = getattr(request.app.state, "proactive_agent_enabled_for", None)
         if inbox_enabled_for is not None:
-            # For the session's owner, whoever downloads the bundle for it.
+            # For the session's owner, whoever downloads the bundle for it. A
+            # child session belongs to its root's owner.
             owner = (
-                await asyncio.to_thread(get_session_owner_id, session_id, permission_store)
+                await asyncio.to_thread(
+                    get_session_owner_id, conv.root_conversation_id, permission_store
+                )
                 if permission_store is not None
                 else RESERVED_USER_LOCAL
             )
