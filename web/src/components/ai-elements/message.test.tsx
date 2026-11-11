@@ -15,6 +15,7 @@ import type { AnyBlock } from "@/lib/blocks";
 import { setEmbedRoot } from "@/lib/host";
 import { useChatStore } from "@/store/chatStore";
 import { MermaidPreview } from "@/shell/MermaidPreview";
+import { ShellCommandContext } from "@/shell/ShellCommandContext";
 import { Reasoning, ReasoningContent } from "./reasoning";
 import {
   hasOpenCodeFence,
@@ -572,6 +573,57 @@ describe("MessageResponse code-block copy", () => {
       expect(copiedText).toEqual(["const value = 1;\nconsole.log(value);\n"]);
     });
     expect(screen.getByRole("button", { name: "Download file" })).toBeInTheDocument();
+  });
+});
+
+describe("MessageResponse shell drafts", () => {
+  it("requires chat opt-in and opens the exact shell code through an icon-only control", async () => {
+    const open = vi.fn();
+    const command = "printf 'hello\\n'\npwd\n";
+    const response = (allowShellCommands: boolean, language = "bash") => (
+      <ShellCommandContext.Provider value={{ open, disabled: false }}>
+        <MessageResponse allowShellCommands={allowShellCommands}>
+          {`\`\`\`${language}\n${command}\`\`\``}
+        </MessageResponse>
+      </ShellCommandContext.Provider>
+    );
+    const { rerender } = render(response(false));
+    expect(screen.queryByRole("button", { name: "Open in a new shell" })).toBeNull();
+
+    rerender(response(true));
+    const button = await screen.findByRole("button", { name: "Open in a new shell" });
+    expect(button.textContent).toBe("");
+    expect(button).toHaveAttribute("title", "Open in a new shell");
+    fireEvent.click(button);
+    expect(open).toHaveBeenCalledExactlyOnceWith(command, "bash");
+    expect(screen.getByRole("button", { name: "Copy Code" })).toBeInTheDocument();
+
+    rerender(response(true, "python"));
+    expect(screen.queryByRole("button", { name: "Open in a new shell" })).toBeNull();
+  });
+
+  it("disables the action for streaming, incomplete, empty, or unavailable shell drafts", async () => {
+    const open = vi.fn();
+    const complete = "```sh\nprintf hello\n```";
+    const { rerender } = render(<></>);
+    for (const [source, isStreaming, disabled] of [
+      [complete, true, false],
+      ["```sh\nprintf hello", false, false],
+      ["```sh\n  \n```", false, false],
+      [complete, false, true],
+    ] as const) {
+      rerender(
+        <ShellCommandContext.Provider value={{ open, disabled }}>
+          <MessageResponse allowShellCommands isStreaming={isStreaming} mode="static">
+            {source}
+          </MessageResponse>
+        </ShellCommandContext.Provider>,
+      );
+      const button = await screen.findByRole("button", { name: "Open in a new shell" });
+      expect(button).toBeDisabled();
+      fireEvent.click(button);
+    }
+    expect(open).not.toHaveBeenCalled();
   });
 });
 

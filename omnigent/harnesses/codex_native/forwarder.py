@@ -3484,6 +3484,7 @@ async def _replay_resume_response(
             thread_id=thread_id,
             turns=turns,
             forwarder_state=forwarder_state,
+            replay_from_turn_id=replay_from_turn_id,
         )
 
 
@@ -3509,6 +3510,7 @@ async def _post_resume_turn_status(
     thread_id: str | None,
     turns: list[object],
     forwarder_state: _CodexForwarderState | None = None,
+    replay_from_turn_id: str | None = None,
 ) -> None:
     """
     Publish a missed lifecycle edge from explicit ``thread/resume`` turn state.
@@ -3526,11 +3528,14 @@ async def _post_resume_turn_status(
     :param turns: Raw Codex resume turn list.
     :param forwarder_state: Mutable forwarder state holding the turns whose
         failure was already posted, or ``None``.
+    :param replay_from_turn_id: Persisted turn this subscription is recovering.
     :returns: None.
     """
     if thread_id is None:
         return
-    edge = _resume_turn_status_edge_for_latest_turn(bridge_dir, thread_id, turns)
+    edge = _resume_turn_status_edge_for_latest_turn(
+        bridge_dir, thread_id, turns, replay_from_turn_id=replay_from_turn_id
+    )
     if (
         edge is not None
         and _turn_failure_already_posted(forwarder_state, edge.turn_id)
@@ -3548,6 +3553,8 @@ def _resume_turn_status_edge_for_latest_turn(
     bridge_dir: Path,
     thread_id: str,
     turns: list[object],
+    *,
+    replay_from_turn_id: str | None = None,
 ) -> _CodexTurnStatusEdge | None:
     """
     Return the Omnigent status represented by the latest resume turn.
@@ -3556,6 +3563,7 @@ def _resume_turn_status_edge_for_latest_turn(
     :param thread_id: Codex thread id from the resume payload, e.g.
         ``"thread_123"``.
     :param turns: Raw Codex resume turn list.
+    :param replay_from_turn_id: Persisted turn eligible for terminal idle backfill.
     :returns: Status edge when the latest turn has explicit lifecycle state and
         belongs to the bridge's current thread; otherwise ``None``.
     """
@@ -3572,6 +3580,10 @@ def _resume_turn_status_edge_for_latest_turn(
             return None
         status = _omnigent_status_from_resume_turn(turn)
         if status is None:
+            return None
+        # Fresh resume snapshots can report a just-started turn as terminal.
+        # Only the matching recovery turn can settle through idle backfill.
+        if status == "idle" and turn_id != replay_from_turn_id:
             return None
         update_active_turn_id(bridge_dir, turn_id if status == "running" else None)
         # Parity with the live path — surface ``turn.error`` (if any) that
