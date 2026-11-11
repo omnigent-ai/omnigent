@@ -492,6 +492,55 @@ async def test_release_terminates_subprocess(
         await manager.shutdown()
 
 
+@pytest.mark.parametrize(
+    "change", ["replacement", "late_registration", "ownership", "activity", None]
+)
+async def test_conditional_release_rechecks_ownership_after_spawn_lock(
+    manager: HarnessProcessManager, change: str | None
+) -> None:
+    """A delayed release retires only its original registration and ownership."""
+    await manager.start()
+    try:
+        session_id = "conditional-release"
+        assert manager.registered_client(session_id) is None
+        original = await manager.get_client(session_id, _TEST_HARNESS_NAME)
+        assert manager.registered_client(session_id) is original
+        original_epoch = 1
+        current_epoch = original_epoch
+        spawn_lock = await manager._get_spawn_lock(session_id)
+        async with spawn_lock:
+            closing = asyncio.create_task(
+                manager.release(
+                    session_id,
+                    expected_client=None if change == "late_registration" else original,
+                    can_release=lambda: current_epoch == original_epoch,
+                )
+            )
+            await asyncio.sleep(0)
+            assert not closing.done()
+            if change == "replacement":
+                replacement = httpx.AsyncClient()
+                manager._entries[session_id].client = replacement
+            elif change == "ownership":
+                current_epoch += 1
+            elif change == "activity":
+                manager.note_activity(session_id)
+            manager.mark_in_flight(session_id, "live-response")
+        await closing
+        if change in {"replacement", "late_registration", "ownership"}:
+            assert manager.has_session(session_id)
+            assert manager.has_active_turn(session_id)
+            assert not original.is_closed
+            assert session_id not in manager._release_generations
+        else:
+            assert not manager.has_session(session_id)
+            assert not manager.has_active_turn(session_id)
+            assert original.is_closed
+        await original.aclose()
+    finally:
+        await manager.shutdown()
+
+
 async def test_close_entry_kills_process_when_aclose_raises(
     manager: HarnessProcessManager,
     monkeypatch: pytest.MonkeyPatch,

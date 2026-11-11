@@ -110,12 +110,15 @@ class PermissionStore(ABC):
         ...
 
     @abstractmethod
-    def list_for_sessions(self, conversation_ids: list[str]) -> dict[str, list[SessionPermission]]:
+    def list_for_sessions(
+        self, conversation_ids: list[str], *, user_id: str | None = None
+    ) -> dict[str, list[SessionPermission]]:
         """Return all grants for multiple sessions in one batched query.
 
         Issues a single ``WHERE conversation_id IN (…)`` query and
-        returns ALL grants for those sessions (all users, including
-        the ``"__public__"`` sentinel).  Callers filter in memory
+        returns all grants unless ``user_id`` restricts it to one caller.
+        Without that filter, it includes all users, including
+        the ``"__public__"`` sentinel. Callers filter in memory
         for the specific user or owner they care about.
 
         :param conversation_ids: List of conversation IDs to fetch,
