@@ -10933,14 +10933,7 @@ def configure_subagent_block_notifier(
 
     def _observe(conversation_id: str, event: dict[str, Any]) -> None:
         notifier.observe(conversation_id, event)
-        elicitation_id = event.get("elicitation_id")
-        if event.get("type") == "response.elicitation_request" and isinstance(elicitation_id, str):
-            session_triggers.notify(
-                "input.requested",
-                conversation_id,
-                occurrence=elicitation_id,
-                elicitation_id=elicitation_id,
-            )
+        session_triggers.observe_elicitation(conversation_id, event)
 
     _pending_elicitations.set_elicitation_observer(_observe)
 

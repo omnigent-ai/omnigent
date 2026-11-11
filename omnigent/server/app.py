@@ -2295,6 +2295,8 @@ def create_app(
                 yield
         finally:
             session_pull_requests.install_refresher(None)
+            # Another app in this process must not record into this one's stores.
+            session_triggers.configure(None)
             await pull_request_refresher.aclose()
             if scheduler_start_retry is not None:
                 scheduler_start_retry.cancel()
