@@ -167,27 +167,47 @@ export function statusAfterUpdate(update: SuggestionUpdate): SuggestionStatus {
     : "dismissed";
 }
 
-/** Apply an update to cached pages, adjusting the unread count to match. */
+/** How the unread total moves when one item goes from one status to another. */
+export function unreadDelta(from: SuggestionStatus | undefined, to: SuggestionStatus): number {
+  if (from === undefined) return 0;
+  return Number(to === "unread") - Number(from === "unread");
+}
+
+/** Move every page's unread total; a capped total stays as the server sent it. */
+export function adjustUnreadCount(pages: SuggestionPage[], delta: number): SuggestionPage[] {
+  if (delta === 0) return pages;
+  return pages.map((page) =>
+    page.unreadCountCapped ? page : { ...page, unreadCount: Math.max(0, page.unreadCount + delta) },
+  );
+}
+
+/**
+ * Apply an update to cached pages, adjusting the unread count to match.
+ *
+ * Pages that hold the item say how its status changes. Pages that do not,
+ * such as another tab's list whose loaded pages stop before the item, move
+ * their total from `from`, the status the item had before this update.
+ */
 export function applySuggestionUpdate(
   pages: SuggestionPage[],
   id: string,
   update: SuggestionUpdate,
+  from?: SuggestionStatus,
 ): SuggestionPage[] {
   const nextStatus = statusAfterUpdate(update);
   let delta = 0;
+  let seen = false;
   const updated = pages.map((page) => ({
     ...page,
     data: page.data.flatMap((item) => {
       if (item.id !== id) return [item];
-      if (item.status === "unread" && nextStatus !== "unread") delta -= 1;
-      if (item.status !== "unread" && nextStatus === "unread") delta += 1;
+      seen = true;
+      delta += unreadDelta(item.status, nextStatus);
       return OPEN_SUGGESTION_STATUSES.includes(nextStatus) ? [{ ...item, status: nextStatus }] : [];
     }),
   }));
-  // Every page carries the same total; a capped total stays as the server sent it.
-  return updated.map((page) =>
-    page.unreadCountCapped ? page : { ...page, unreadCount: Math.max(0, page.unreadCount + delta) },
-  );
+  // Every page carries the same total.
+  return adjustUnreadCount(updated, seen ? delta : unreadDelta(from, nextStatus));
 }
 
 /**
@@ -196,20 +216,24 @@ export function applySuggestionUpdate(
  * by the difference from the cached copy. An item the cache no longer holds is
  * left for the next fetch to place.
  */
-export function reconcileSuggestion(pages: SuggestionPage[], saved: Suggestion): SuggestionPage[] {
+export function reconcileSuggestion(
+  pages: SuggestionPage[],
+  saved: Suggestion,
+  from?: SuggestionStatus,
+): SuggestionPage[] {
   const isOpen = OPEN_SUGGESTION_STATUSES.includes(saved.status);
   let delta = 0;
+  let seen = false;
   const updated = pages.map((page) => ({
     ...page,
     data: page.data.flatMap((item) => {
       if (item.id !== saved.id) return [item];
-      delta += Number(saved.status === "unread") - Number(item.status === "unread");
+      seen = true;
+      delta += unreadDelta(item.status, saved.status);
       return isOpen ? [saved] : [];
     }),
   }));
-  return updated.map((page) =>
-    page.unreadCountCapped ? page : { ...page, unreadCount: Math.max(0, page.unreadCount + delta) },
-  );
+  return adjustUnreadCount(updated, seen ? delta : unreadDelta(from, saved.status));
 }
 
 /** Where a suggestion sits in cached pages, so a failed update can put it back. */
