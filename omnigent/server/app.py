@@ -1782,7 +1782,8 @@ def create_app(
         settings. Where the deployment offers the agent, a user gets it only when
         both are on, evaluated in the user's request when ``POST /v1/sessions``
         creates their proactive task and as the task owner when a run starts.
-        ``None`` treats both as on and leaves the settings routes unmounted.
+        ``None`` leaves the settings routes unmounted and turns the agent off,
+        whatever ``proactive_agent`` says.
     :param scheduled_task_dispatch: Overrides for automations_v2: host ownership,
         the owner identity fires act under, or a replacement executor. ``None``
         uses the built-in executor with every host owned by this replica.
@@ -2510,9 +2511,16 @@ def create_app(
     )
 
     def proactive_agent_available() -> bool:
-        """Whether the deployment offers the proactive agent to this request's caller."""
-        return inbox_item_store is not None and deployment_gate_enabled(
-            proactive_agent_gate, "proactive_agent"
+        """Whether the deployment offers the proactive agent to this request's caller.
+
+        Both stores are needed: the web client reads the settings before it
+        shows any Inbox item, so an offer without settings routes would never
+        be used.
+        """
+        return (
+            inbox_item_store is not None
+            and proactive_agent_settings_store is not None
+            and deployment_gate_enabled(proactive_agent_gate, "proactive_agent")
         )
 
     def proactive_agent_enabled_for(user_id: str) -> bool:
@@ -2521,10 +2529,8 @@ def create_app(
         Evaluated in that user's request or identity scope, since the
         deployment gate may read the current user.
         """
-        if not proactive_agent_available():
+        if not proactive_agent_available() or proactive_agent_settings_store is None:
             return False
-        if proactive_agent_settings_store is None:
-            return True
         return all(proactive_agent_settings_store.read(user_id))
 
     app.state.proactive_agent_available = proactive_agent_available
