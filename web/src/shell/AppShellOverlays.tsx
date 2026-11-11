@@ -8,6 +8,7 @@ import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
 import { CommandPalette } from "./CommandPalette";
+import { NewSessionProjectSheet } from "./NewSessionProjectSheet";
 import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
 
 // Dev-only preview; lazy so the sample data never ships in production bundles.
@@ -22,6 +23,9 @@ export interface AppShellOverlaysProps {
   /** Open the palette on its "which project?" step for a new session. */
   projectStep: boolean;
   onNewSession: () => void;
+  /** The phone's bottom-sheet form of the project step. */
+  projectSheetOpen: boolean;
+  setProjectSheetOpen: (open: boolean) => void;
   commandPaletteOpen: boolean;
   setCommandPaletteOpen: (open: boolean) => void;
   toggleLeftSidebar: () => void;
@@ -43,6 +47,8 @@ export function AppShellOverlays({
   sessionSearch,
   projectStep,
   onNewSession,
+  projectSheetOpen,
+  setProjectSheetOpen,
   commandPaletteOpen,
   setCommandPaletteOpen,
   toggleLeftSidebar,
@@ -82,6 +88,7 @@ export function AppShellOverlays({
         onToggleRightSidebar={toggleRightPanel}
         rightSidebarShortcutEnabled={!gridRoute}
       />
+      <NewSessionProjectSheet open={projectSheetOpen} onOpenChange={setProjectSheetOpen} />
       <RecentSessionsSwitcher
         conversations={allConversations}
         activeSessionId={serverConversationId ?? null}

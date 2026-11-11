@@ -28,6 +28,10 @@ import {
   useSessionSearch,
 } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import {
+  newSessionPath,
+  useLeaveProjectPickerWithoutProjects,
+} from "@/hooks/useNewChatProjectPrompt";
 import { rememberOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -273,7 +277,7 @@ export function CommandPalette({
     );
   }, [actions, query, sessionsOnly, projectStep]);
 
-  const { data: projects = [], isSuccess: projectsLoaded, isError: projectsFailed } = useProjects();
+  const { data: projects = [] } = useProjects();
   // Every typed word must appear in the row label or the group heading, so
   // "new omni", "omni" and "project" all reach "New chat in omnigent". The
   // project step lists every project until the user types, and matches names only.
@@ -285,14 +289,8 @@ export function CommandPalette({
     );
   }, [projects, query, sessionsOnly, projectStep]);
   const showNoProject = projectStep && matchesEveryWord("no project", query);
-  // The project step may open before the list resolves. Nothing to choose
-  // from means the plain composer, as if the prompt had never been offered.
-  const noProjectToOffer = projectsFailed || (projectsLoaded && projects.length === 0);
-  useEffect(() => {
-    if (!open || !projectStep || !noProjectToOffer) return;
-    onOpenChange(false);
-    navigate("/");
-  }, [open, projectStep, noProjectToOffer, onOpenChange, navigate]);
+  // The project step may open before the list resolves.
+  useLeaveProjectPickerWithoutProjects(open && projectStep, onOpenChange);
 
   const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
     useConversations("", false, { enabled: open && !projectStep });
@@ -438,7 +436,7 @@ export function CommandPalette({
 
   const newChatInProject = (name: string): void => {
     close();
-    navigate(name ? `/?project=${encodeURIComponent(name)}` : "/");
+    navigate(newSessionPath(name));
   };
 
   const queryClient = useQueryClient();

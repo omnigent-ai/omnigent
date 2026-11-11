@@ -1892,6 +1892,7 @@ function AppShellImpl() {
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [sessionSearch, setSessionSearch] = useState(false);
   const [projectStep, setProjectStep] = useState(false);
+  const [projectSheetOpen, setProjectSheetOpen] = useState(false);
   // Stable handlers so the memoized Sidebar doesn't re-render on AppShell's
   // frequent re-renders (chatStore status churn during a bind). Inline
   // callbacks would give it fresh props each time and defeat the memo.
@@ -1912,7 +1913,8 @@ function AppShellImpl() {
     setCommandPaletteOpen(true);
   }, []);
   // Every "new session" entry point lands here: with projects to choose from,
-  // the palette asks which one first; otherwise the plain composer opens.
+  // the palette (a bottom sheet on phones) asks which one first; otherwise
+  // the plain composer opens.
   const shouldPromptForProject = useShouldPromptForProject();
   const navigate = useNavigate();
   const handleNewSession = useCallback(() => {
@@ -1920,10 +1922,15 @@ function AppShellImpl() {
       navigate("/");
       return;
     }
+    if (mobileViewport) {
+      setCommandPaletteOpen(false);
+      setProjectSheetOpen(true);
+      return;
+    }
     setSessionSearch(false);
     setProjectStep(true);
     setCommandPaletteOpen(true);
-  }, [navigate, shouldPromptForProject]);
+  }, [mobileViewport, navigate, shouldPromptForProject]);
   const isEmbedded = useIsEmbedded();
   useCommandPaletteHotkey(
     () => {
@@ -3124,6 +3131,8 @@ function AppShellImpl() {
             sessionSearch={sessionSearch}
             projectStep={projectStep}
             onNewSession={handleNewSession}
+            projectSheetOpen={projectSheetOpen}
+            setProjectSheetOpen={setProjectSheetOpen}
             commandPaletteOpen={commandPaletteOpen}
             setCommandPaletteOpen={setCommandPaletteOpen}
             toggleLeftSidebar={toggleLeftSidebar}

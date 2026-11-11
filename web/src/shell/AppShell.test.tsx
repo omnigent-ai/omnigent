@@ -6328,7 +6328,15 @@ describe("new-session browser shortcut", () => {
         client,
         "/c/conv_abc",
         <>
-          <Route index element={<p>New session route</p>} />
+          <Route
+            index
+            element={
+              <>
+                <p>New session route</p>
+                <LocationDisplay />
+              </>
+            }
+          />
           <Route path="c/:conversationId" element={<p>Session route</p>} />
         </>,
         <AppShell />,
@@ -6336,6 +6344,17 @@ describe("new-session browser shortcut", () => {
     );
     fireEvent.keyDown(document, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
   }
+
+  function onPhone() {
+    const baseMatchMedia = window.matchMedia;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      ...baseMatchMedia(query),
+      matches: query === "(max-width: 767.98px)",
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
+  }
+
+  const projectSheet = () => screen.queryByRole("dialog", { name: "Start a new session in" });
 
   function restoreNoProjects() {
     vi.mocked(useProjects).mockReturnValue({ data: [] } as unknown as ReturnType<
@@ -6355,6 +6374,7 @@ describe("new-session browser shortcut", () => {
     it("asks for a project before opening the composer", () => {
       pressNewSession();
       expect(screen.getByPlaceholderText("Start a new session in…")).toBeInTheDocument();
+      expect(projectSheet()).toBeNull();
       expect(screen.queryByText("New session route")).toBeNull();
 
       fireEvent.click(screen.getByText("No project"));
@@ -6367,12 +6387,66 @@ describe("new-session browser shortcut", () => {
       expect(screen.queryByPlaceholderText("Start a new session in…")).toBeNull();
       expect(screen.getByText("New session route")).toBeInTheDocument();
     });
+
+    describe("on a phone", () => {
+      beforeEach(onPhone);
+
+      it("asks in a bottom sheet instead of the palette", () => {
+        pressNewSession();
+        const sheet = projectSheet();
+        expect(sheet).toBeInTheDocument();
+        expect(screen.queryByPlaceholderText("Start a new session in…")).toBeNull();
+        expect(within(sheet!).queryByRole("textbox")).toBeNull();
+        const rows = within(sheet!).getAllByRole("button");
+        expect(rows.map((row) => row.textContent)).toEqual(["No project", "omnigent"]);
+        expect(screen.queryByText("New session route")).toBeNull();
+      });
+
+      it("opens the project's composer when a project is picked", () => {
+        pressNewSession();
+        fireEvent.click(within(projectSheet()!).getByRole("button", { name: "omnigent" }));
+        expect(projectSheet()).toBeNull();
+        expect(screen.getByText("New session route")).toBeInTheDocument();
+        expect(screen.getByTestId("url-params")).toHaveTextContent("project=omnigent");
+      });
+
+      it("opens the plain composer for No project", () => {
+        pressNewSession();
+        fireEvent.click(within(projectSheet()!).getByRole("button", { name: "No project" }));
+        expect(projectSheet()).toBeNull();
+        expect(screen.getByText("New session route")).toBeInTheDocument();
+        expect(screen.getByTestId("url-params")).toBeEmptyDOMElement();
+      });
+
+      it("stays on the current session when dismissed", () => {
+        pressNewSession();
+        fireEvent.keyDown(projectSheet()!, { key: "Escape" });
+        expect(projectSheet()).toBeNull();
+        expect(screen.getByText("Session route")).toBeInTheDocument();
+      });
+
+      it("opens the sheet from the palette's New chat", () => {
+        pressNewSession();
+        fireEvent.keyDown(projectSheet()!, { key: "Escape" });
+        fireEvent.keyDown(document, { key: "k", code: "KeyK", ctrlKey: true });
+        fireEvent.click(screen.getByText("New chat"));
+        expect(projectSheet()).toBeInTheDocument();
+      });
+
+      it("opens the composer directly when the prompt is turned off", () => {
+        writeNewChatProjectPromptEnabled(false);
+        pressNewSession();
+        expect(projectSheet()).toBeNull();
+        expect(screen.getByText("New session route")).toBeInTheDocument();
+      });
+    });
   });
 
   describe("while the project list is still loading", () => {
     interface ProjectsQuery {
       data?: { id: string; name: string }[];
       isSuccess?: boolean;
+      isError?: boolean;
     }
     let projectsQuery: ProjectsQuery = {};
     const subscribers = new Set<() => void>();
@@ -6406,6 +6480,17 @@ describe("new-session browser shortcut", () => {
 
       resolveProjects({ data: [], isSuccess: true });
       expect(screen.queryByPlaceholderText("Start a new session in…")).toBeNull();
+      expect(screen.getByText("New session route")).toBeInTheDocument();
+    });
+
+    it("steps aside on a phone when the list fails", () => {
+      onPhone();
+      pressNewSession();
+      expect(projectSheet()).toBeInTheDocument();
+      expect(screen.getByRole("status")).toHaveTextContent("Loading projects…");
+
+      resolveProjects({ isError: true });
+      expect(projectSheet()).toBeNull();
       expect(screen.getByText("New session route")).toBeInTheDocument();
     });
 

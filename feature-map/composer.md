@@ -227,6 +227,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   New session links, and the palette's New chat first ask for a project (or No
   project), then open the composer with its defaults. Settings › General ›
   Sessions turns it off. Modified clicks on the links still open a new tab.
+  Phones (below the `md` breakpoint) ask in a bottom sheet instead of the
+  palette: No project, then every project, with no search field.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn. Side-chat composers queue and steer the
   same way, with their own queue strip.
@@ -389,12 +391,16 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - Press ⌘/Ctrl+K, type part of a project's name (or `project`), and pick
   **New chat in <project>** to open the new-session composer with that
   project's host, workspace and agent prefilled.
-- With at least one project, press the hotkey or click New session (also from
-  the mobile drawer): a "Start a new session in…" picker opens. Type part of a
+- With at least one project, press the hotkey or click New session on a
+  desktop-width window: a "Start a new session in…" picker opens. Type part of a
   project name and press Enter to land on `/?project=<name>` with its defaults;
   choose No project for a plain composer. Turn off **Ask for a project when
   starting a session** in Settings and the same actions open the composer
   directly.
+- On a phone with at least one project, tap New session in the drawer: a
+  "Start a new session in" sheet slides up with No project and each project,
+  and the keyboard stays down. Tap a project to land on `/?project=<name>`, or
+  tap outside it, press Escape or drag its handle down to stay where you were.
 - Hover the model/effort pill to see the tooltip.
 - Hover the host chip to see the selected host or sandbox and its connection.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
