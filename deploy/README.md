@@ -407,8 +407,9 @@ leaked copy of that token. This setting does not change sandbox lifetime or
 Mac/Arca user-login credentials.
 
 **Stopping archived sessions' sandboxes.** Set `sandbox.stop_on_archive: true`
-(deployment-wide, next to `provider` or `providers`; off by default) to stop a
-session's sandbox when the session is archived, after its runner is stopped.
+(off by default) to stop a session's sandbox when the session is archived, after
+its runner is stopped. It is a per-provider setting: in a `providers:` list, a
+value next to `providers` is every entry's default, and an entry can override it.
 The sandbox is stopped, not deleted, so unarchiving the session and sending a
 message resumes the same sandbox. It applies only to providers that can resume
 a stopped sandbox (`capabilities.resume_stopped`). A sandbox that another

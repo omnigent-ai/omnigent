@@ -44,9 +44,10 @@ stores into ``create_app``):
                                   # shutting-down server waits for in-flight
                                   # launches to bind their host; needs another
                                   # replica to take the host (default: 0)
-         stop_on_archive: false   # optional; deployment-wide. Stop (not
-                                  # delete) a session's sandbox when the
-                                  # session is archived and no unarchived
+         stop_on_archive: false   # optional; per provider (a top-level value
+                                  # is every `providers:` entry's default).
+                                  # Stop (not delete) a session's sandbox when
+                                  # the session is archived and no unarchived
                                   # session still uses it; the next message
                                   # resumes it. Only for providers that can
                                   # resume a stopped sandbox (default: false)
@@ -762,6 +763,11 @@ class ManagedSandboxConfig:
     :param default_profile_id: Profile a new managed session takes when its caller
         names none, from ``sandbox.default_profile_id``. Authorized and saved like an
         explicit selection. ``None`` keeps a selection mandatory.
+    :param stop_on_archive: Stop an archived session's sandbox, keeping it
+        resumable, once no unarchived session is bound to its host. The
+        provider's launcher makes the final call through
+        :meth:`~omnigent.onboarding.sandboxes.base.SandboxLifecycle.stop_when_archived`
+        (see :func:`stop_archived_session_sandbox`).
     """
 
     server_url: str
@@ -781,6 +787,7 @@ class ManagedSandboxConfig:
     unprofiled_host_id: str | None = None
     manages_profiles: bool = False
     default_profile_id: str | None = None
+    stop_on_archive: bool = False
 
 
 class NoReachableModels(Exception):
@@ -853,9 +860,6 @@ class ManagedSandboxDeployment:
         (this one has stopped accepting connections), so ``0`` (no wait)
         suits a single replica. A multi-replica deployment sizes it, plus
         uvicorn's graceful shutdown, inside its termination grace period.
-    :param stop_on_archive: Stop an archived session's sandbox, keeping it
-        resumable, once no unarchived session is bound to its host (see
-        :func:`stop_archived_session_sandbox`).
     """
 
     configs: tuple[ManagedSandboxConfig, ...]
@@ -866,7 +870,6 @@ class ManagedSandboxDeployment:
         dataclass_field(default_factory=dict)
     )
     shutdown_drain_s: float = 0.0
-    stop_on_archive: bool = False
 
     def __post_init__(self) -> None:
         # Enforce the "never empty" invariant the accessors rely on
@@ -886,7 +889,6 @@ class ManagedSandboxDeployment:
         *,
         reaper: ManagedSandboxReaperConfig | None = None,
         shutdown_drain_s: float = 0.0,
-        stop_on_archive: bool = False,
     ) -> ManagedSandboxDeployment:
         """
         Wrap one provider config as a one-provider deployment.
@@ -898,14 +900,12 @@ class ManagedSandboxDeployment:
         :param config: The single provider's config.
         :param reaper: Optional deployment-wide reaper policy.
         :param shutdown_drain_s: See :attr:`shutdown_drain_s`.
-        :param stop_on_archive: See :attr:`stop_on_archive`.
         :returns: A deployment offering exactly *config*.
         """
         return cls(
             configs=(config,),
             reaper=reaper or ManagedSandboxReaperConfig(),
             shutdown_drain_s=shutdown_drain_s,
-            stop_on_archive=stop_on_archive,
         )
 
     @property
@@ -1571,20 +1571,15 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxDeployment | None:
         shutdown_drain_s = float(raw_drain)
     except OverflowError:
         raise ValueError(_SHUTDOWN_DRAIN_ERROR) from None
-    stop_on_archive = raw.get("stop_on_archive", False)
-    if not isinstance(stop_on_archive, bool):
-        raise ValueError("server config 'sandbox.stop_on_archive' must be a boolean")
     if "providers" in raw:
         return replace(
             _parse_multi_provider_sandbox_config(raw, reaper=reaper),
             shutdown_drain_s=shutdown_drain_s,
-            stop_on_archive=stop_on_archive,
         )
     return ManagedSandboxDeployment.single(
         _parse_single_provider_sandbox_config(raw),
         reaper=reaper,
         shutdown_drain_s=shutdown_drain_s,
-        stop_on_archive=stop_on_archive,
     )
 
 
@@ -1668,7 +1663,7 @@ def _parse_multi_provider_sandbox_config(
     shared = {
         key: value
         for key, value in raw.items()
-        if key not in {"providers", "provider", "reaper", "shutdown_drain_s", "stop_on_archive"}
+        if key not in {"providers", "provider", "reaper", "shutdown_drain_s"}
     }
     parsed: list[ManagedSandboxConfig] = []
     seen: set[str] = set()
@@ -1682,7 +1677,7 @@ def _parse_multi_provider_sandbox_config(
             raise ValueError(
                 f"server config 'sandbox.providers[{index}]' must not nest 'providers'"
             )
-        for key in ("reaper", "shutdown_drain_s", "stop_on_archive"):
+        for key in ("reaper", "shutdown_drain_s"):
             if key in entry:
                 raise ValueError(
                     f"server config 'sandbox.{key}' is deployment-wide and must be set "
@@ -1736,6 +1731,9 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     # Validated regardless of provider (like server_url): a malformed
     # host_config should stop startup even for staged/unsupported providers.
     host_config = _parse_host_config(raw)
+    stop_on_archive = raw.get("stop_on_archive", False)
+    if not isinstance(stop_on_archive, bool):
+        raise ValueError("server config 'sandbox.stop_on_archive' must be a boolean")
     model_discovery = raw.get("model_discovery", {})
     if not isinstance(model_discovery, dict):
         raise ValueError("sandbox.model_discovery must be a mapping")
@@ -2103,6 +2101,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         git_clone=git_clone,
         manages_profiles=manages_profiles,
         default_profile_id=default_profile_id,
+        stop_on_archive=stop_on_archive,
     )
 
 
@@ -5146,10 +5145,12 @@ async def stop_archived_session_sandbox(
     """
     Stop an archived session's managed sandbox, keeping it resumable.
 
-    Runs after the archive teardown when :attr:`ManagedSandboxDeployment.
-    stop_on_archive` is set. The sandbox is only stopped, never deleted, and only
-    when its provider can resume it, so an unarchived session's next message
-    wakes it through :func:`resume_managed_host`. A sandbox another unarchived
+    Runs after the archive teardown. The host's provider decides: its
+    :attr:`ManagedSandboxConfig.stop_on_archive` setting is passed to the
+    launcher's ``stop_when_archived`` hook, which returns it unless the provider
+    overrides it. The sandbox is only stopped, never deleted, and only when its
+    provider can resume it, so an unarchived session's next message wakes it
+    through :func:`resume_managed_host`. A sandbox another unarchived
     session is bound to (a ``/clear`` continuation, for example) keeps running,
     as does a scheduled task run's, whose sandbox the task's own lifecycle
     manages. Best-effort: a failure leaves the sandbox running.
@@ -5163,7 +5164,7 @@ async def stop_archived_session_sandbox(
     """
     from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
 
-    if config is None or not config.stop_on_archive or conv.host_id is None:
+    if config is None or conv.host_id is None:
         return False
     if conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY):
         return False
@@ -5173,6 +5174,16 @@ async def stop_archived_session_sandbox(
             return False
         launcher = _launcher_for_teardown(host, config)
         if launcher is None or not launcher.capabilities.resume_stopped:
+            return False
+        configured = config.recorded(host.sandbox_provider).stop_on_archive
+        # getattr: embedding deployments may inject duck-typed launchers.
+        decide = getattr(launcher, "stop_when_archived", None)
+        wanted = (
+            configured
+            if decide is None
+            else await asyncio.to_thread(decide, owner=host.user_id, configured=configured)
+        )
+        if not wanted:
             return False
         if await _host_has_other_unarchived_session(host.host_id, conv.id, conversation_store):
             return False

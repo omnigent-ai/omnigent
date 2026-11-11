@@ -991,8 +991,9 @@ async def _archive_stop(
         server-created worktree directory (the branch is kept).
     :param host_store: Persistent host registrations, or ``None`` when host
         support is not wired.
-    :param sandbox_config: The deployment's managed-sandbox config; with
-        ``stop_on_archive`` set, the session's sandbox is stopped last.
+    :param sandbox_config: The deployment's managed-sandbox config; when the
+        host's provider opts in (``stop_on_archive``), the session's sandbox is
+        stopped last.
     """
     # Resolve through the facade so a test's monkeypatch is honored here.
     from omnigent.server.routes import sessions as _facade

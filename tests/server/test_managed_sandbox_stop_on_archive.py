@@ -1,4 +1,4 @@
-"""An archived session's managed sandbox is stopped, resumably, when the deployment opts in."""
+"""An archived session's managed sandbox is stopped, resumably, when its provider opts in."""
 
 from __future__ import annotations
 
@@ -27,9 +27,11 @@ _OWNER = "alice@example.com"
 def _deployment(fake: FakeSandboxLauncher, *, stop_on_archive: bool = True):
     return ManagedSandboxDeployment.single(
         ManagedSandboxConfig(
-            server_url="https://srv.example.com", launcher_factory=lambda: fake, token_ttl_s=3600
-        ),
-        stop_on_archive=stop_on_archive,
+            server_url="https://srv.example.com",
+            launcher_factory=lambda: fake,
+            token_ttl_s=3600,
+            stop_on_archive=stop_on_archive,
+        )
     )
 
 
@@ -74,6 +76,35 @@ async def test_stops_the_sandbox_of_its_only_session_and_the_next_message_resume
 async def test_leaves_the_sandbox_running_when_not_enabled(db_uri):
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
     assert await _stop(fake, host_store, conversations, conv, stop_on_archive=False) is False
+    assert fake.stopped == []
+
+
+@pytest.mark.parametrize(
+    "configured", [False, True], ids=["provider-enables", "provider-declines"]
+)
+async def test_the_providers_launcher_makes_the_final_call(db_uri, monkeypatch, configured):
+    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
+    asked: list[tuple[str, bool]] = []
+
+    def stop_when_archived(*, owner: str, configured: bool) -> bool:
+        asked.append((owner, configured))
+        return not configured
+
+    monkeypatch.setattr(fake, "stop_when_archived", stop_when_archived)
+    stopped = await _stop(fake, host_store, conversations, conv, stop_on_archive=configured)
+    assert asked == [(_OWNER, configured)]
+    assert stopped is (not configured)
+    assert len(fake.stopped) == (0 if configured else 1)
+
+
+async def test_a_failing_launcher_decision_leaves_the_sandbox_running(db_uri, monkeypatch):
+    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
+
+    def stop_when_archived(**_kwargs: object) -> bool:
+        raise RuntimeError("flag service unavailable")
+
+    monkeypatch.setattr(fake, "stop_when_archived", stop_when_archived)
+    assert await _stop(fake, host_store, conversations, conv) is False
     assert fake.stopped == []
 
 
@@ -137,18 +168,20 @@ async def test_the_archive_teardown_stops_the_sandbox_last(db_uri):
     assert fake.stopped == [host_store.get_host(conv.host_id).sandbox_id]
 
 
-def test_parses_stop_on_archive_as_a_deployment_wide_boolean():
+def _stop_settings(raw: dict) -> dict[str | None, bool]:
+    return {entry.provider: entry.stop_on_archive for entry in parse_sandbox_config(raw).configs}
+
+
+def test_parses_stop_on_archive_per_provider():
     base = {"provider": "modal", "server_url": "https://srv.example.com"}
-    assert parse_sandbox_config(base).stop_on_archive is False
-    assert parse_sandbox_config({**base, "stop_on_archive": True}).stop_on_archive is True
+    assert _stop_settings(base) == {"modal": False}
+    assert _stop_settings({**base, "stop_on_archive": True}) == {"modal": True}
+    with pytest.raises(ValueError, match="must be a boolean"):
+        parse_sandbox_config({**base, "stop_on_archive": "yes"})
+    # A top-level value is each entry's default; an entry can override it.
     multi = {
         "server_url": "https://srv.example.com",
         "stop_on_archive": True,
-        "providers": [{"provider": "modal"}, {"provider": "e2b"}],
+        "providers": [{"provider": "modal"}, {"provider": "e2b", "stop_on_archive": False}],
     }
-    assert parse_sandbox_config(multi).stop_on_archive is True
-    with pytest.raises(ValueError, match="must be a boolean"):
-        parse_sandbox_config({**base, "stop_on_archive": "yes"})
-    nested = {**multi, "providers": [{"provider": "modal", "stop_on_archive": True}]}
-    with pytest.raises(ValueError, match="deployment-wide"):
-        parse_sandbox_config(nested)
+    assert _stop_settings(multi) == {"modal": True, "e2b": False}

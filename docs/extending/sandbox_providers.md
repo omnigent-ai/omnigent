@@ -274,12 +274,16 @@ it atomically detaches the stale sandbox id from the active host generation.
 Failed terminations stay pending and are retried by later sweeps; providers must
 therefore make `terminate()` succeed when the sandbox is already absent.
 
-With `sandbox.stop_on_archive: true`, archiving a session calls `stop()` on
-its sandbox once no unarchived session is bound to the host, and the next
-message after an unarchive wakes it through `resume()`. Only providers whose
-capabilities declare `resume_stopped` are stopped. `stop()` must treat an
+When a provider's `stop_on_archive` setting is true, archiving a session calls
+`stop()` on its sandbox once no unarchived session is bound to the host, and
+the next message after an unarchive wakes it through `resume()`. Only providers
+whose capabilities declare `resume_stopped` are stopped. `stop()` must treat an
 already stopped sandbox as success; raising `SandboxCapabilityError` leaves the
-sandbox running.
+sandbox running. Before stopping, the server calls
+`stop_when_archived(owner=..., configured=...)`, which returns the setting by
+default. Override it to decide per owner when the session is archived, for
+example from a feature flag, so turning the behavior on or off needs no server
+restart.
 
 The reaper reuses one launcher per workspace and provider. Override
 `reaper_identity(workspace_id)` when background termination needs a scoped
