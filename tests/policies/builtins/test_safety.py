@@ -710,7 +710,7 @@ def test_ask_on_scheduled_task_change_asks_for_create_with_preview(data_name: st
 @pytest.mark.parametrize(
     "timing,shown",
     [
-        ({"delay_seconds": 2700}, "in 2700 seconds"),
+        ({"delay_seconds": 2700}, "2700 seconds after approval"),
         ({"at": "2026-11-12T15:00:00-08:00"}, "at 2026-11-12T15:00:00-08:00"),
     ],
 )

@@ -455,6 +455,10 @@ def resolve_reminder_time(args: dict[str, Any], now: datetime) -> datetime | str
         when = now + timedelta(seconds=delay)
     try:
         when = when.astimezone(UTC)
+        # The upper limit applies before rounding, so the largest delay is accepted;
+        # the extra seconds still leave the time well under a year away.
+        if when > now + MAX_REMINDER_DELAY:
+            return f"A reminder can be at most {MAX_REMINDER_DELAY.days} days away."
         if when.second or when.microsecond:
             when = when.replace(second=0, microsecond=0) + timedelta(minutes=1)
     except OverflowError:
@@ -462,8 +466,6 @@ def resolve_reminder_time(args: dict[str, Any], now: datetime) -> datetime | str
         return "'at' is outside the supported date range."
     if when < now + MIN_REMINDER_DELAY:
         return "A reminder must be at least one minute in the future."
-    if when > now + MAX_REMINDER_DELAY:
-        return f"A reminder can be at most {MAX_REMINDER_DELAY.days} days away."
     return when
 
 
@@ -512,8 +514,9 @@ class SysReminderSetTool(Tool):
             "Set a one-time reminder: at the given time, the message is sent into "
             "this session as a new turn, even if the session has gone idle, the "
             "runner has stopped, or the server restarted in between. The session's "
-            "host must be online then; a reminder that can't be delivered is "
-            "recorded as a failed run and not retried. Give either "
+            "host must be online then; a reminder that can't be delivered, "
+            "including one whose session was deleted, is recorded as a failed run "
+            "and not retried. Give either "
             "'at' (an ISO-8601 time with a UTC offset) or 'delay_seconds'; the "
             "time is rounded up to the next minute, must be at least a minute "
             "away, and at most 364 days. Write the message for your future self: "
@@ -553,8 +556,9 @@ class SysReminderSetTool(Tool):
                         "delay_seconds": {
                             "type": "number",
                             "description": (
-                                "When to fire, as seconds from now, e.g. 2700 for 45 "
-                                "minutes. Do not set at with it."
+                                "When to fire, as seconds from when the call runs (after "
+                                "its approval), e.g. 2700 for 45 minutes. Do not set at "
+                                "with it."
                             ),
                         },
                     },

@@ -23,12 +23,30 @@ from omnigent.tools.builtins.scheduled_tasks import (
 
 _NOW = datetime(2026, 11, 10, 22, 15, 30, tzinfo=UTC)
 _JUNE_2027 = datetime(2027, 6, 1, tzinfo=UTC)
+_WHOLE_MINUTE = datetime(2026, 11, 10, 22, 15, tzinfo=UTC)
 
 
 def test_delay_rounds_up_to_the_next_minute() -> None:
     assert resolve_reminder_time({"delay_seconds": 2700}, _NOW) == datetime(
         2026, 11, 10, 23, 1, tzinfo=UTC
     )
+
+
+@pytest.mark.parametrize(
+    "now,args,expected",
+    [
+        # Exactly one minute from a whole minute.
+        (_WHOLE_MINUTE, {"delay_seconds": 60}, _WHOLE_MINUTE + timedelta(minutes=1)),
+        # Exactly the largest delay from a whole minute.
+        (_WHOLE_MINUTE, {"delay_seconds": 364 * 86400}, _WHOLE_MINUTE + timedelta(days=364)),
+        # The largest delay from mid-minute rounds up past the limit and is still
+        # accepted; the limit applies before rounding.
+        (_NOW, {"delay_seconds": 364 * 86400}, datetime(2027, 11, 9, 22, 16, tzinfo=UTC)),
+        (_WHOLE_MINUTE, {"at": "2026-11-10T22:16:00Z"}, _WHOLE_MINUTE + timedelta(minutes=1)),
+    ],
+)
+def test_exact_limits_are_accepted(now: datetime, args: dict[str, object], expected: datetime):
+    assert resolve_reminder_time(args, now) == expected
 
 
 def test_at_is_converted_to_utc() -> None:
@@ -49,6 +67,7 @@ def test_at_is_converted_to_utc() -> None:
         ({"delay_seconds": "60"}, "must be a number"),
         ({"delay_seconds": float("nan")}, "finite"),
         ({"delay_seconds": 10}, "at least one minute"),
+        ({"delay_seconds": 364 * 86400 + 1}, "at most 364 days"),
         ({"at": "2026-11-10T22:00:00Z"}, "at least one minute"),
         ({"delay_seconds": MAX_REMINDER_DELAY.total_seconds() + 1}, "at most 364 days"),
         ({"at": "2027-11-10T22:15:00Z"}, "at most 364 days"),
@@ -59,8 +78,8 @@ def test_at_is_converted_to_utc() -> None:
         ({"delay_seconds": 1e300}, "at most 364 days"),
         ({"at": "0001-01-01T00:00:00+05:00"}, "outside the supported date range"),
         ({"at": "9999-12-31T23:59:59-05:00"}, "outside the supported date range"),
-        # Rounding up to the next minute is what overflows here.
-        ({"at": "9999-12-31T23:59:59Z"}, "outside the supported date range"),
+        # Rounding up would overflow here, but the limit is checked first.
+        ({"at": "9999-12-31T23:59:59Z"}, "at most 364 days"),
     ],
 )
 def test_invalid_times_are_rejected(args: dict[str, object], error: str) -> None:

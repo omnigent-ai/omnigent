@@ -113,6 +113,7 @@ from omnigent.server.scheduled.harness_settings import (
     scheduled_agent_harness,
     validate_scheduled_permission_mode,
 )
+from omnigent.server.scheduled.rrule import is_one_time_rule
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id, is_trigger_automation
 from omnigent.server.scheduled.source_session import (
     SourceCopyIncompleteError,
@@ -695,7 +696,9 @@ async def _run_fire_for_task(
         )
         return
 
-    if task.continues_session:
+    if task.continues_session and not is_one_time_rule(task.rrule):
+        # A one-time task, such as a reminder, belongs to its session: with the
+        # session gone it fails instead of running in a new one without its context.
         task = await _release_deleted_session(deps, task)
     if task.continues_session:
         await _continue_session(
@@ -924,7 +927,8 @@ async def _source_session_problem(deps: FireDeps, task: ScheduledTask) -> tuple[
 async def _release_deleted_session(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
     """Drop a continued session that was deleted, so this run starts a new one.
 
-    Only a session that no longer exists is replaced: one the owner archived or
+    Not called for one-time (``COUNT=1``) tasks, which fail instead. Only a
+    session that no longer exists is replaced: one the owner archived or
     that no longer fits the task still fails the run, so a change they made is
     never undone silently. The new session is recorded like a first run's, and a
     managed sandbox is provisioned again when the deleted session's workspace is

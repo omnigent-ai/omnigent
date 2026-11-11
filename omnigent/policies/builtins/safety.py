@@ -540,7 +540,7 @@ def _reminder_review(args: dict[str, object]) -> PolicyResponse:
     if args.get("at") is not None:
         when = f"at {_clip(str(args['at']))}"
     elif args.get("delay_seconds") is not None:
-        when = f"in {_clip(str(args['delay_seconds']))} seconds"
+        when = f"{_clip(str(args['delay_seconds']))} seconds after approval"
     else:
         when = "(no time given)"
     return {
