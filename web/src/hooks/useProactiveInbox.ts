@@ -4,14 +4,14 @@ import { showToast } from "@/components/ui/toast";
 import { withBasePath } from "@/lib/basePath";
 import { getOmnigentHostGeneration, getOmnigentServerIdentity } from "@/lib/host";
 import {
-  OPEN_SUGGESTION_STATES,
+  OPEN_SUGGESTION_STATUSES,
   applySuggestionUpdate,
   listSuggestions,
   reconcileSuggestion,
   updateSuggestion,
   type Suggestion,
   type SuggestionPage,
-  type SuggestionState,
+  type SuggestionStatus,
   type SuggestionUpdate,
 } from "@/lib/proactiveInbox";
 import { useRebasePath } from "@/lib/routing";
@@ -31,11 +31,11 @@ type Pages = InfiniteData<SuggestionPage, string | null>;
  * even when the refetch fails.
  *
  * :param identityReady: Whether the viewer is known yet.
- * :param states: Which states to list, e.g. only `"unread"` for the Unread tab.
+ * :param statuses: Which statuses to list, e.g. only `"unread"` for the Unread tab.
  */
 export function useProactiveInbox(
   identityReady: boolean,
-  states: readonly SuggestionState[] = OPEN_SUGGESTION_STATES,
+  statuses: readonly SuggestionStatus[] = OPEN_SUGGESTION_STATUSES,
 ) {
   const { settings } = useProactiveAgentSettings();
   const viewerId = useViewerId();
@@ -50,8 +50,8 @@ export function useProactiveInbox(
   const scopeKeyText = JSON.stringify(scopeKey);
   const enabled = identityReady && settings?.enabled === true;
   const query = useInfiniteQuery({
-    queryKey: [...scopeKey, [...states]],
-    queryFn: ({ pageParam }) => listSuggestions(pageParam, states),
+    queryKey: [...scopeKey, [...statuses]],
+    queryFn: ({ pageParam }) => listSuggestions(pageParam, statuses),
     initialPageParam: null as string | null,
     getNextPageParam: (page) => page.nextCursor ?? undefined,
     enabled,
@@ -71,7 +71,7 @@ export function useProactiveInbox(
 
   const update = useCallback(
     (id: string, change: SuggestionUpdate) => {
-      if ("state" in change && resolved.current.has(id)) return;
+      if ("status" in change && resolved.current.has(id)) return;
       if ("resolution" in change) {
         if (change.resolution === "none") resolved.current.delete(id);
         else resolved.current.add(id);
@@ -97,7 +97,7 @@ export function useProactiveInbox(
             showToast("Couldn’t save your response to this suggestion. Try again.");
           }
           // A fetch that started while the PATCH was in flight may carry the old
-          // state; drop it, then write the server's copy before releasing the overlay.
+          // status; drop it, then write the server's copy before releasing the overlay.
           await queryClient.cancelQueries({ queryKey: key });
           if (saved) {
             const copy = saved;
@@ -121,11 +121,11 @@ export function useProactiveInbox(
   let pages = query.data?.pages ?? [];
   for (const [id, change] of pending.current) pages = applySuggestionUpdate(pages, id, change);
   const first = pages[0];
-  const listedStates = new Set(states);
+  const listedStatuses = new Set(statuses);
   return {
-    // A read mark keeps an item in the cache; only list the states asked for.
+    // A read mark keeps an item in the cache; only list the statuses asked for.
     items: enabled
-      ? pages.flatMap((page) => page.data).filter((item) => listedStates.has(item.state))
+      ? pages.flatMap((page) => page.data).filter((item) => listedStatuses.has(item.status))
       : [],
     unreadCount: enabled ? (first?.unreadCount ?? 0) : 0,
     unreadCountCapped: enabled && first?.unreadCountCapped === true,

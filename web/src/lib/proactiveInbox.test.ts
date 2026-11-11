@@ -4,7 +4,7 @@ import {
   applySuggestionUpdate,
   listSuggestions,
   reconcileSuggestion,
-  stateAfterUpdate,
+  statusAfterUpdate,
   suggestionLinkTarget,
   suggestionPreview,
   unreadCountText,
@@ -35,7 +35,7 @@ const wire = {
   actions: [{ label: "Ramp up", prompt: "Ramp it" }, { label: 3 }],
   media: [{ type: "chart", chart: { version: 1 } }, { type: 3 }, "x"],
   source_session_id: "sess",
-  state: "unread",
+  status: "unread",
   resolution: "none",
   created_at: 10,
 };
@@ -50,7 +50,7 @@ function item(overrides: Partial<Suggestion> = {}): Suggestion {
     actions: [],
     media: [],
     sourceSessionId: "s",
-    state: "unread",
+    status: "unread",
     resolution: "none",
     createdAt: 1,
     ...overrides,
@@ -76,7 +76,7 @@ describe("API calls", () => {
 
     const result = await listSuggestions(null);
 
-    expect(mockFetch.mock.calls[0][0]).toBe("/v1/inbox/items?limit=50&state=unread&state=read");
+    expect(mockFetch.mock.calls[0][0]).toBe("/v1/inbox/items?limit=50&status=unread&status=read");
     expect(result).toMatchObject({
       nextCursor: "10:abc",
       unreadCount: 100,
@@ -88,24 +88,26 @@ describe("API calls", () => {
     expect(result.data[0].media).toEqual([{ type: "chart", chart: { version: 1 } }]);
   });
 
-  it("asks for the next page of one state", async () => {
+  it("asks for the next page of one status", async () => {
     mockFetch.mockResolvedValue(response({ data: [], next_cursor: null, unread_count: 0 }));
 
     const result = await listSuggestions("10:abc", ["unread"]);
 
-    expect(mockFetch.mock.calls[0][0]).toBe("/v1/inbox/items?limit=50&state=unread&after=10%3Aabc");
+    expect(mockFetch.mock.calls[0][0]).toBe(
+      "/v1/inbox/items?limit=50&status=unread&after=10%3Aabc",
+    );
     expect(result.unreadCountCapped).toBe(false);
   });
 
   it.each([
-    [{ state: "read" as const }, { state: "read" }],
+    [{ status: "read" as const }, { status: "read" }],
     [
       { resolution: "action_taken" as const, resolutionAction: 1 },
       { resolution: "action_taken", resolution_action: 1 },
     ],
     [{ resolution: "not_now" as const }, { resolution: "not_now" }],
   ])("patches %j as %j", async (update, body) => {
-    mockFetch.mockResolvedValue(response({ ...wire, state: "done" }));
+    mockFetch.mockResolvedValue(response({ ...wire, status: "done" }));
 
     await updateSuggestion("sug_1", update);
 
@@ -116,12 +118,12 @@ describe("API calls", () => {
 });
 
 describe("applySuggestionUpdate", () => {
-  const pages = [page([item({ id: "a" })]), page([item({ id: "b", state: "read" })])];
+  const pages = [page([item({ id: "a" })]), page([item({ id: "b", status: "read" })])];
 
   it("counts a read on every page and keeps the item listed", () => {
-    const next = applySuggestionUpdate(pages, "a", { state: "read" });
+    const next = applySuggestionUpdate(pages, "a", { status: "read" });
     expect(next.map((p) => p.unreadCount)).toEqual([0, 0]);
-    expect(next[0].data[0].state).toBe("read");
+    expect(next[0].data[0].status).toBe("read");
   });
 
   it("drops resolved items", () => {
@@ -135,40 +137,40 @@ describe("applySuggestionUpdate", () => {
   });
 
   it("is idempotent, so re-applying a pending update over fresh pages is safe", () => {
-    const once = applySuggestionUpdate(pages, "a", { state: "read" });
-    expect(applySuggestionUpdate(once, "a", { state: "read" })).toEqual(once);
+    const once = applySuggestionUpdate(pages, "a", { status: "read" });
+    expect(applySuggestionUpdate(once, "a", { status: "read" })).toEqual(once);
   });
 
   it("leaves a capped count as the server sent it", () => {
     const capped = [page([item()], { unreadCount: 100, unreadCountCapped: true })];
-    expect(applySuggestionUpdate(capped, "a", { state: "read" })[0].unreadCount).toBe(100);
+    expect(applySuggestionUpdate(capped, "a", { status: "read" })[0].unreadCount).toBe(100);
   });
 });
 
 describe("reconcileSuggestion", () => {
   it("replaces an open item and moves the unread count", () => {
     const pages = [page([item({ id: "a" })])];
-    const next = reconcileSuggestion(pages, item({ id: "a", state: "read", title: "new" }));
-    expect(next[0].data[0]).toMatchObject({ state: "read", title: "new" });
+    const next = reconcileSuggestion(pages, item({ id: "a", status: "read", title: "new" }));
+    expect(next[0].data[0]).toMatchObject({ status: "read", title: "new" });
     expect(next[0].unreadCount).toBe(0);
   });
 
   it("drops a resolved item and ignores one the cache no longer holds", () => {
     const pages = [page([item({ id: "a" })])];
-    expect(reconcileSuggestion(pages, item({ id: "a", state: "dismissed" }))[0]).toMatchObject({
+    expect(reconcileSuggestion(pages, item({ id: "a", status: "dismissed" }))[0]).toMatchObject({
       data: [],
       unreadCount: 0,
     });
-    expect(reconcileSuggestion(pages, item({ id: "z", state: "read" }))).toEqual(pages);
+    expect(reconcileSuggestion(pages, item({ id: "z", status: "read" }))).toEqual(pages);
   });
 });
 
-it("maps resolutions to states like the server", () => {
-  expect(stateAfterUpdate({ resolution: "none" })).toBe("read");
-  expect(stateAfterUpdate({ resolution: "already_done" })).toBe("done");
-  expect(stateAfterUpdate({ resolution: "action_taken", resolutionAction: 0 })).toBe("done");
-  expect(stateAfterUpdate({ resolution: "useful" })).toBe("dismissed");
-  expect(stateAfterUpdate({ state: "unread" })).toBe("unread");
+it("maps resolutions to statuses like the server", () => {
+  expect(statusAfterUpdate({ resolution: "none" })).toBe("read");
+  expect(statusAfterUpdate({ resolution: "already_done" })).toBe("done");
+  expect(statusAfterUpdate({ resolution: "action_taken", resolutionAction: 0 })).toBe("done");
+  expect(statusAfterUpdate({ resolution: "useful" })).toBe("dismissed");
+  expect(statusAfterUpdate({ status: "unread" })).toBe("unread");
 });
 
 it("shows a capped count with a plus", () => {

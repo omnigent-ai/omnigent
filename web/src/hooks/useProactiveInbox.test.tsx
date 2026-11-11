@@ -46,7 +46,7 @@ const item: Suggestion = {
   actions: [],
   media: [],
   sourceSessionId: "s",
-  state: "unread",
+  status: "unread",
   resolution: "none",
   createdAt: 1,
 };
@@ -107,7 +107,7 @@ it("does not let a poll that lands mid-update restore the old state", async () =
   expect(result.current.items).toEqual([]);
 
   vi.mocked(listSuggestions).mockResolvedValue(page([], 0));
-  await act(async () => patch.resolve({ ...item, state: "dismissed", resolution: "not_now" }));
+  await act(async () => patch.resolve({ ...item, status: "dismissed", resolution: "not_now" }));
   await waitFor(() => expect(listSuggestions).toHaveBeenLastCalledWith(null, ["unread", "read"]));
   expect(result.current.items).toEqual([]);
 });
@@ -135,7 +135,7 @@ it("keeps a suggestion resolved when an earlier read and a dismissal overlap", a
     .mockReturnValueOnce(dismiss.promise);
 
   // Expanding marks the item read; the viewer dismisses it before that settles.
-  act(() => result.current.update("sug", { state: "read" }));
+  act(() => result.current.update("sug", { status: "read" }));
   act(() => result.current.update("sug", { resolution: "not_relevant" }));
   expect(result.current.items).toEqual([]);
   // The dismissal waits for the read, so the server sees them in order.
@@ -144,7 +144,7 @@ it("keeps a suggestion resolved when an earlier read and a dismissal overlap", a
   expect(updateSuggestion).toHaveBeenCalledTimes(1);
 
   // The read's response says the item is open; it must not bring it back.
-  await act(async () => read.resolve({ ...item, state: "read" }));
+  await act(async () => read.resolve({ ...item, status: "read" }));
   await waitFor(() => expect(updateSuggestion).toHaveBeenCalledTimes(2));
   expect(vi.mocked(updateSuggestion).mock.calls[1]).toEqual([
     "sug",
@@ -154,7 +154,7 @@ it("keeps a suggestion resolved when an earlier read and a dismissal overlap", a
 
   vi.mocked(listSuggestions).mockResolvedValue(page([], 0));
   await act(async () =>
-    dismiss.resolve({ ...item, state: "dismissed", resolution: "not_relevant" }),
+    dismiss.resolve({ ...item, status: "dismissed", resolution: "not_relevant" }),
   );
   await waitFor(() => expect(listSuggestions).toHaveBeenCalledTimes(2));
   expect(result.current.items).toEqual([]);
@@ -168,9 +168,9 @@ it("ignores a read mark on a suggestion the viewer already resolved", async () =
   vi.mocked(updateSuggestion).mockReturnValueOnce(dismiss.promise);
 
   act(() => result.current.update("sug", { resolution: "already_done" }));
-  act(() => result.current.update("sug", { state: "read" }));
+  act(() => result.current.update("sug", { status: "read" }));
   vi.mocked(listSuggestions).mockResolvedValue(page([], 0));
-  await act(async () => dismiss.resolve({ ...item, state: "done", resolution: "already_done" }));
+  await act(async () => dismiss.resolve({ ...item, status: "done", resolution: "already_done" }));
 
   await waitFor(() => expect(listSuggestions).toHaveBeenCalledTimes(2));
   expect(updateSuggestion).toHaveBeenCalledTimes(1);
@@ -196,7 +196,7 @@ it("lists only the requested states after a read mark", async () => {
   const { result } = renderHook(() => useProactiveInbox(true, ["unread"]), { wrapper });
   await waitFor(() => expect(result.current.items).toEqual([item]));
 
-  act(() => result.current.update("sug", { state: "read" }));
+  act(() => result.current.update("sug", { status: "read" }));
 
   expect(result.current.items).toEqual([]);
 });
@@ -222,7 +222,7 @@ it.each(["fails", "hangs"])(
     } else {
       vi.mocked(listSuggestions).mockReturnValue(new Promise(() => {}));
     }
-    await act(async () => patch.resolve({ ...item, state: "dismissed", resolution: "not_now" }));
+    await act(async () => patch.resolve({ ...item, status: "dismissed", resolution: "not_now" }));
     await waitFor(() => expect(listSuggestions).toHaveBeenCalledTimes(3));
 
     expect(result.current.items).toEqual([]);
@@ -242,7 +242,7 @@ it("drops a poll still in flight when the PATCH settles", async () => {
   void act(() => void result.current.refetch());
 
   vi.mocked(listSuggestions).mockReturnValue(new Promise(() => {}));
-  await act(async () => patch.resolve({ ...item, state: "dismissed", resolution: "not_now" }));
+  await act(async () => patch.resolve({ ...item, status: "dismissed", resolution: "not_now" }));
   await act(async () => stalePoll.resolve(page([item], 1)));
 
   expect(result.current.items).toEqual([]);

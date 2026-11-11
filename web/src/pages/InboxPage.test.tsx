@@ -1732,7 +1732,7 @@ describe("agent suggestions", () => {
       ],
       media: [],
       sourceSessionId: "sess_src",
-      state: "unread",
+      status: "unread",
       resolution: "none",
       createdAt: 1_700_000_000,
       ...overrides,
@@ -1752,7 +1752,7 @@ describe("agent suggestions", () => {
       screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
     );
 
-    expect(update).toHaveBeenCalledWith("sug_1", { state: "read" });
+    expect(update).toHaveBeenCalledWith("sug_1", { status: "read" });
     expect(screen.getByRole("link", { name: "PR 7" })).toHaveAttribute(
       "href",
       "https://github.com/acme/app/pull/7",
@@ -1842,7 +1842,7 @@ describe("agent suggestions", () => {
 
   it("takes an agent action and opens the composer with its prompt", () => {
     const update = vi.fn();
-    stub({ items: [suggestion({ state: "read" })], update });
+    stub({ items: [suggestion({ status: "read" })], update });
     renderPage();
 
     fireEvent.click(
@@ -1861,7 +1861,7 @@ describe("agent suggestions", () => {
 
   it("dismisses with a reason from the menu", async () => {
     const update = vi.fn();
-    stub({ items: [suggestion({ state: "read" })], update });
+    stub({ items: [suggestion({ status: "read" })], update });
     renderPage();
 
     fireEvent.click(
@@ -1878,7 +1878,7 @@ describe("agent suggestions", () => {
 
   it("offers the next page of suggestions", () => {
     const fetchNextPage = vi.fn();
-    stub({ items: [suggestion({ state: "read" })], hasNextPage: true, fetchNextPage });
+    stub({ items: [suggestion({ status: "read" })], hasNextPage: true, fetchNextPage });
     renderPage();
 
     fireEvent.click(screen.getByRole("button", { name: "Load more suggestions" }));

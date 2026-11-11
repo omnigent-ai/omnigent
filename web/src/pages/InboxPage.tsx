@@ -129,7 +129,7 @@ import {
 import { newSessionLocation } from "@/lib/newSessionHandoff";
 import {
   DISMISS_REASONS,
-  OPEN_SUGGESTION_STATES,
+  OPEN_SUGGESTION_STATUSES,
   PROACTIVE_AGENT_DISPLAY_NAME,
   suggestionKindLabel,
   suggestionLinkTarget,
@@ -261,7 +261,7 @@ export function InboxPage() {
   // one is reachable behind newer read ones.
   const proactiveInbox = useProactiveInbox(
     identityReady,
-    filter === "unread" ? UNREAD_ONLY : OPEN_SUGGESTION_STATES,
+    filter === "unread" ? UNREAD_ONLY : OPEN_SUGGESTION_STATUSES,
   );
   // Suggestions expanded while unread, kept on screen until collapsed even
   // though marking them read takes them out of the Unread list.
@@ -561,9 +561,9 @@ export function InboxPage() {
       const { item } = entry;
       const unpin = () => setPinnedSuggestions(({ [item.id]: _pinned, ...rest }) => rest);
       const onToggleSuggestion = () => {
-        if (!expanded && item.state === "unread") {
-          setPinnedSuggestions((prev) => ({ ...prev, [item.id]: { ...item, state: "read" } }));
-          proactiveInbox.update(item.id, { state: "read" });
+        if (!expanded && item.status === "unread") {
+          setPinnedSuggestions((prev) => ({ ...prev, [item.id]: { ...item, status: "read" } }));
+          proactiveInbox.update(item.id, { status: "read" });
         }
         if (expanded) unpin();
         onToggle();
@@ -586,7 +586,7 @@ export function InboxPage() {
           title={item.title}
           preview={suggestionPreview(item.bodyMd)}
           at={entry.at}
-          unread={item.state === "unread"}
+          unread={item.status === "unread"}
           expanded={expanded}
           onToggle={onToggleSuggestion}
         >
