@@ -251,6 +251,36 @@ class TestCodexCommandApprovalPersistence:
         with pytest.raises(OmnigentError, match="did not offer a persistent rule"):
             _codex_command_approval_response(result, _COMMAND_METHOD, params)
 
+    @pytest.mark.parametrize(
+        "available_decisions",
+        [
+            "acceptWithExecpolicyAmendment",
+            {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": _OFFERED_RULE}},
+            [],
+            [None],
+            ["acceptWithExecpolicyAmendment"],
+            [{"acceptWithExecpolicyAmendment": "python -m pytest"}],
+            [{"acceptWithExecpolicyAmendment": {"execpolicy_amendment": "python -m pytest"}}],
+            [{"acceptWithExecpolicyAmendment": {"execpolicy_amendment": {}}}],
+            [{"acceptWithExecpolicyAmendment": {"execpolicy_amendment": []}}],
+            [{"acceptWithExecpolicyAmendment": {"execpolicy_amendment": [None]}}],
+            [{"acceptWithExecpolicyAmendment": {"execpolicy_amendment": [".venv/bin/python", 3]}}],
+            [{"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["python", ""]}}],
+        ],
+    )
+    def test_remember_rejects_malformed_offered_rule(self, available_decisions: object) -> None:
+        params: dict[str, object] = {
+            "command": "pytest -q",
+            "availableDecisions": available_decisions,
+        }
+        result = ElicitationResult(
+            action="accept",
+            content={"remember": True, "request_fingerprint": _fingerprint_of(params)},
+        )
+
+        with pytest.raises(OmnigentError, match="did not offer a persistent rule"):
+            _codex_command_approval_response(result, _COMMAND_METHOD, params)
+
     def test_remember_requires_displayed_fingerprint(self) -> None:
         params = _command_params("pytest -q", _OFFERED_RULE)
         result = ElicitationResult(action="accept", content={"remember": True})
