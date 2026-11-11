@@ -100,6 +100,11 @@ preparatory flushes; `status_post` covers the status-post operation. Exceptions
 after that operation returns do not emit this warning. Existing HTTP rejection
 diagnostics remain separate.
 
+If a preparatory flush raises, the forwarder still attempts the known terminal
+status in the same handler before re-raising the original error. Cancellation
+skips that attempt. A `before_status` warning alone therefore does not establish
+that the terminal status was lost; check the following status-post observations.
+
 These events add metadata, without terminal text or exception messages, and do
 not require stderr capture. A local terminal completion does not establish that
 its status reached the server. Conversely, a failed post may have reached the

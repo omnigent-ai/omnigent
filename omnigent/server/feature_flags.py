@@ -44,6 +44,7 @@ class Feature(StrEnum):
     AUTOMATIONS_V2 = "automations_v2"
     ONE_TIME_AUTOMATIONS = "one_time_automations"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
+    SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
 
 
 @dataclass(frozen=True)
@@ -209,6 +210,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Search workspace file contents through the session runner",
         owner="web",
         review_by_release="0.20.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.SIDEBAR_WINDOWED_ROWS,
+        description="Mount only the sidebar session rows near the viewport",
+        owner="web",
+        review_by_release="0.24.0",
     ),
 )
 
