@@ -5563,7 +5563,7 @@ def test_fork_marks_source_workspace_failures_as_notices(
     }
     assert LATEST_ACTIVITY_ERROR_LABEL_KEY not in fork.labels
     assert LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY not in fork.labels
-    _grant_search_access(db_uri, fork.id)
+    _grant_search_access(db_uri, fork.id, source.id)
     assert (
         len(
             conversation_store.search(
@@ -5572,6 +5572,7 @@ def test_fork_marks_source_workspace_failures_as_notices(
         )
         == 2
     )
+    assert conversation_store.search("Workspace", conversation_id=source.id, accessible_by=_SEARCHER)
     assert (
         conversation_store.search(
             "source_workspace_missing", conversation_id=source.id, accessible_by=_SEARCHER
