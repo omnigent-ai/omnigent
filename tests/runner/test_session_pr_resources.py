@@ -587,11 +587,11 @@ async def test_commits_route_pins_head_and_diff_route_reads_one_commit(
             return 0, json.dumps(pr), ""
         if args[-1] == "repos/example/two/pulls/42/commits?per_page=100":
             return 0, json.dumps(listing), ""
-        if args[-1] == f"repos/example/two/compare/{commit}...{head}":
-            if "Accept: application/vnd.github.diff" in args:
-                return 0, "compare-patch", ""
-            return 0, json.dumps({"files": [{"filename": "a.py", "status": "added"}]}), ""
+        if args[-1] == f"repos/example/two/compare/{'9' * 40}...{head}":
+            return 0, "compare-patch", ""
         assert args[-1] == f"repos/example/two/commits/{commit}"
+        if "Accept: application/vnd.github.diff" not in args:
+            return 0, json.dumps({"sha": commit, "parents": [{"sha": "9" * 40}]}), ""
         return 0, "commit-patch", ""
 
     monkeypatch.setattr(github, "_gh", gh)
@@ -651,8 +651,7 @@ async def test_commits_route_pins_head_and_diff_route_reads_one_commit(
     assert patch.status_code == 200, patch.text
     assert patch.json() == {"object": "session.github.pr_diff", "patch": "commit-patch"}
     assert compared.status_code == 200, compared.text
-    assert compared.json()["patch"] == "compare-patch"
-    assert [file["path"] for file in compared.json()["files"]] == ["a.py"]
+    assert compared.json() == {"object": "session.github.pr_diff", "patch": "compare-patch"}
     assert any("Accept: application/vnd.github.diff" in args for args in gh_args)
     assert malformed.status_code == 400
     assert foreign.status_code == 400

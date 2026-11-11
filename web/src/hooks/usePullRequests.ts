@@ -743,7 +743,7 @@ export interface PullRequestDiffResponse {
 /** GET one patch resource of the session's GitHub panel: the whole PR, or one commit. */
 async function fetchPullRequestPatch(
   conversationId: string,
-  resource: "diff" | "commit-diff",
+  resource: "diff" | "commit-diff" | "compare-diff",
   query: string,
 ): Promise<PullRequestDiffResponse> {
   const res = await authenticatedFetch(
@@ -906,20 +906,43 @@ async function fetchPullRequestCommitDiff(
   );
 }
 
+async function fetchPullRequestThroughHead(
+  conversationId: string,
+  prUrl: string,
+  commitSha: string,
+  headSha: string,
+): Promise<PullRequestDiffResponse> {
+  const query = new URLSearchParams({ pr_url: prUrl, head_sha: headSha, from_sha: commitSha });
+  return fetchPullRequestPatch(conversationId, "compare-diff", `?${query}`).catch(
+    (error: unknown) => {
+      // A server without the route still serves single commits, so only this view is unavailable.
+      if (error instanceof PullRequestApiError && error.status === 404) {
+        throw new Error("Showing changes through the head needs an updated Omnigent server.");
+      }
+      throw error;
+    },
+  );
+}
+
 /**
- * One commit's patch, read by its full id. Enabled only while a commit is open.
- * A commit's patch never changes, so it stays fresh for the whole cache lifetime.
+ * One commit's patch, read by its full id, or with `throughHeadSha` the patch from that
+ * commit through the PR's head. Enabled only while a commit is open. Both ends are fixed
+ * commits, so the patch never changes and stays fresh for the whole cache lifetime.
  */
 export function usePullRequestCommitDiff(
   conversationId: string | undefined,
   prUrl: string | undefined,
   commitSha: string | null,
+  throughHeadSha: string | null = null,
 ) {
   const serveable = useWorkspaceServeable(conversationId);
   const retry = useRunnerOfflineRetry(serveable !== false);
   return useQuery({
-    queryKey: ["github-pr-commit-diff", conversationId, prUrl, commitSha],
-    queryFn: () => fetchPullRequestCommitDiff(conversationId!, prUrl!, commitSha!),
+    queryKey: ["github-pr-commit-diff", conversationId, prUrl, commitSha, throughHeadSha],
+    queryFn: () =>
+      throughHeadSha
+        ? fetchPullRequestThroughHead(conversationId!, prUrl!, commitSha!, throughHeadSha)
+        : fetchPullRequestCommitDiff(conversationId!, prUrl!, commitSha!),
     enabled: !!conversationId && !!prUrl && !!commitSha && serveable !== false,
     retry,
     retryDelay: runnerOfflineRetryDelay,

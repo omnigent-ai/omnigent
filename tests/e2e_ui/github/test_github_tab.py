@@ -1564,7 +1564,9 @@ def test_changes_commits_view_lists_and_opens_a_commit(
     """Switch the Changes tab to Commits, open one commit, and step between commits.
 
     Only the commit's own files are listed, the viewed controls are absent there, and
-    Back returns to the commit list. The commit list and patches are stubbed routes.
+    Back returns to the commit list. Through head widens the open commit to every change
+    from it to the head, and turning it off narrows it again. The commit list and patches
+    are stubbed routes.
     """
     base_url, session_id = seeded_session
     pr_url = _INFO["pr"]["url"]
@@ -1616,6 +1618,13 @@ def test_changes_commits_view_lists_and_opens_a_commit(
         lambda route: route.fulfill(json={**_PR_DIFF, "head_sha": "head", "base_sha": "base"}),
     )
     page.route(re.compile(r"/resources/github/commit-diff\?"), commit_patch)
+    compare_urls: list[str] = []
+
+    def through_head_patch(route: Route) -> None:
+        compare_urls.append(route.request.url)
+        route.fulfill(json={"object": "session.github.pr_diff", "patch": _PR_DIFF["patch"]})
+
+    page.route(re.compile(r"/resources/github/compare-diff\?"), through_head_patch)
     page.goto(f"{base_url}/c/{session_id}")
     open_right_rail(page)
     panel = page.get_by_role("complementary", name="Workspace")
@@ -1650,5 +1659,22 @@ def test_changes_commits_view_lists_and_opens_a_commit(
 
     panel.get_by_role("button", name="Next commit").click()
     expect(files).to_have_attribute("data-github-file", "README.md")
+
+    through_head = panel.get_by_role("button", name="Through head")
+    expect(through_head).to_have_attribute("aria-pressed", "false")
+    through_head.click()
+    expect(through_head).to_have_attribute("aria-pressed", "true")
+    expect(files).to_have_count(2)
+    # The widened patch is pinned to the head the Changes list shows, from the open commit.
+    assert "head_sha=head" in compare_urls[-1], compare_urls
+    assert f"from_sha={_COMMIT_TWO}" in compare_urls[-1], compare_urls
+    expect(panel.get_by_role("checkbox", name="Hide viewed")).to_have_count(0)
+    page.screenshot(
+        path=str(tmp_path / f"commits-{entry}-through-head.png"), animations="disabled"
+    )
+    through_head.click()
+    expect(files).to_have_count(1)
+    expect(files).to_have_attribute("data-github-file", "README.md")
+
     panel.get_by_role("button", name="Back to commits").click()
     expect(panel.get_by_text("2 commits", exact=True)).to_be_visible()

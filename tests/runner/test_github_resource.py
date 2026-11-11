@@ -1123,15 +1123,17 @@ def test_github_commit_patch_failure_is_not_an_empty_success(
         github_resource._pr_commit_patch("/root", _PR, commit_sha=_COMMIT_ONE)
 
 
+_PARENT = "9" * 40
+
+
 def _stub_compare(
     monkeypatch: pytest.MonkeyPatch,
     *,
     heads: Sequence[str] = (_HEAD,),
     listed: Sequence[str] = (_COMMIT_ONE, _HEAD),
-    files: object = None,
     compare_rc: int = 0,
 ) -> list[list[str]]:
-    """Answer the PR, its commit listing, and the compare files and diff reads."""
+    """Answer the PR, its commit listing, the picked commit and the compare diff."""
     calls: list[list[str]] = []
     head_answers = iter(heads)
     last_head = heads[-1]
@@ -1147,15 +1149,10 @@ def _stub_compare(
             return 0, json.dumps({"head": {"sha": last_head}, "base": {"sha": _BASE}}), ""
         if endpoint.endswith("/commits?per_page=100"):
             return 0, json.dumps([[_commit_entry(sha, "Commit") for sha in listed]]), ""
+        if endpoint == f"repos/example/two/commits/{_COMMIT_ONE}":
+            return 0, json.dumps({"sha": _COMMIT_ONE, "parents": [{"sha": _PARENT}]}), ""
         if "/compare/" in endpoint:
-            if compare_rc:
-                return compare_rc, "", "not found"
-            if "Accept: application/vnd.github.diff" in argv:
-                return 0, "diff --git a/src/x.py b/src/x.py\n", ""
-            entries = files if files is not None else [
-                {"filename": "src/x.py", "status": "modified", "additions": 2, "deletions": 1}
-            ]
-            return 0, json.dumps({"files": entries}), ""
+            return compare_rc, "" if compare_rc else "diff --git a/x b/x\n", ""
         raise AssertionError(f"unexpected gh call: {argv}")
 
     monkeypatch.setattr(github_resource, "_gh", fake_gh)
@@ -1163,24 +1160,25 @@ def _stub_compare(
     return calls
 
 
-def test_github_compare_reads_the_changes_since_a_pr_commit(
+def test_github_compare_reads_from_a_commit_through_the_head(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = _stub_compare(monkeypatch)
 
     result = github_resource._pr_compare("/root", _PR, head_sha=_HEAD, from_sha=_COMMIT_ONE)
 
-    assert result["object"] == "session.github.pr_compare"
-    assert result["patch"] == "diff --git a/src/x.py b/src/x.py\n"
-    assert [file["path"] for file in result["files"]] == ["src/x.py"]
-    assert result["files"][0]["lines_added"] == 2
-    assert (result["head_sha"], result["from_sha"]) == (_HEAD, _COMMIT_ONE)
-    assert result["has_more"] is False
-    compare_calls = [call for call in calls if "/compare/" in call[-1]]
-    assert {call[-1] for call in compare_calls} == {
-        f"repos/example/two/compare/{_COMMIT_ONE}...{_HEAD}"
-    }
-    assert len(compare_calls) == 2
+    assert result == {"object": "session.github.pr_diff", "patch": "diff --git a/x b/x\n"}
+    # The comparison starts at the picked commit's parent, so the commit itself is included.
+    assert [call for call in calls if "/compare/" in call[-1]] == [
+        [
+            "api",
+            "--hostname",
+            "github.com",
+            "-H",
+            "Accept: application/vnd.github.diff",
+            f"repos/example/two/compare/{_PARENT}...{_HEAD}",
+        ]
+    ]
 
 
 def test_github_compare_refuses_a_commit_outside_the_pull_request(
@@ -1191,14 +1189,6 @@ def test_github_compare_refuses_a_commit_outside_the_pull_request(
     with pytest.raises(ValueError, match="not part of the selected pull request"):
         github_resource._pr_compare("/root", _PR, head_sha=_HEAD, from_sha=_COMMIT_ONE)
     assert not any("/compare/" in call[-1] for call in calls)
-
-
-def test_github_compare_refuses_the_head_itself(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _stub_compare(monkeypatch)
-
-    with pytest.raises(ValueError, match="before the pull request's head"):
-        github_resource._pr_compare("/root", _PR, head_sha=_HEAD, from_sha=_HEAD)
-    assert calls == []
 
 
 @pytest.mark.parametrize("heads", [("c" * 40,), (_HEAD, "c" * 40)])
@@ -1214,18 +1204,8 @@ def test_github_compare_refuses_a_moved_head(
 def test_github_compare_failure_is_not_an_empty_success(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_compare(monkeypatch, compare_rc=1)
 
-    with pytest.raises(ValueError, match="could not load the changes since that commit"):
+    with pytest.raises(ValueError, match="could not load the changes from that commit"):
         github_resource._pr_compare("/root", _PR, head_sha=_HEAD, from_sha=_COMMIT_ONE)
-
-
-def test_github_compare_flags_a_file_list_github_capped(monkeypatch: pytest.MonkeyPatch) -> None:
-    capped = [{"filename": f"f{index}.py", "status": "added"} for index in range(300)]
-    _stub_compare(monkeypatch, files=capped)
-
-    result = github_resource._pr_compare("/root", _PR, head_sha=_HEAD, from_sha=_COMMIT_ONE)
-
-    assert result["has_more"] is True
-    assert "at most 300 files" in result["warning"]
 
 
 # ── Account selection ────────────────────────────────────────────────────────

@@ -34,6 +34,10 @@ const mocks = vi.hoisted(() => ({
   commitList: { object: "list", has_more: false, data: [] as unknown[] },
   /** Each commit's patch by sha, as the commit-diff query returns it. */
   commitPatches: new Map<string, string>(),
+  /** The patch from each commit through the head, by sha. */
+  throughHeadPatches: new Map<string, string>(),
+  /** Each commit-diff read's commit and through-head sha, in order. */
+  commitDiffReads: [] as [string | null, string | null][],
   /** The commit-diff query's error, when a test wants a failed read. */
   commitDiffError: null as Error | null,
   /** The commit list's query cannot run here, so it has no data. */
@@ -83,13 +87,20 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
     error: null,
   }),
   usePullRequestCommitsUnsupported: () => mocks.commitsUnsupported,
-  usePullRequestCommitDiff: (_conversationId: string, _prUrl: string, sha: string | null) => ({
-    data: sha
-      ? { object: "session.github.pr_diff", patch: mocks.commitPatches.get(sha) }
-      : undefined,
-    isLoading: false,
-    error: mocks.commitDiffError,
-  }),
+  usePullRequestCommitDiff: (
+    _conversationId: string,
+    _prUrl: string,
+    sha: string | null,
+    throughHeadSha: string | null = null,
+  ) => {
+    mocks.commitDiffReads.push([sha, throughHeadSha]);
+    const patches = throughHeadSha ? mocks.throughHeadPatches : mocks.commitPatches;
+    return {
+      data: sha ? { object: "session.github.pr_diff", patch: patches.get(sha) } : undefined,
+      isLoading: false,
+      error: mocks.commitDiffError,
+    };
+  },
 }));
 vi.mock("@/components/theme/useResolvedThemeMode", () => ({
   useResolvedThemeMode: () => "light",
@@ -1553,6 +1564,8 @@ describe("PullRequestChangesTab commits", () => {
     mocks.commitPatches.clear();
     mocks.commitPatches.set(SHA_A, A);
     mocks.commitPatches.set(SHA_B, B);
+    mocks.throughHeadPatches.clear();
+    mocks.commitDiffReads = [];
     mocks.commitDiffError = null;
     mocks.draftAnchor = null;
     mocks.commitsUnsupported = false;
@@ -1578,6 +1591,36 @@ describe("PullRequestChangesTab commits", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Back to commits" }));
     expect(screen.getByRole("button", { name: /Add a\.ts/ })).toBeInTheDocument();
+  });
+
+  it("widens an open commit through the head, keeps it while stepping, and narrows it again", () => {
+    mocks.throughHeadPatches.set(SHA_A, A + B);
+    mocks.throughHeadPatches.set(SHA_B, B);
+    renderTab({
+      conversationId: "commits-through-head",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Add a\.ts/ }));
+    const toggle = () => screen.getByRole("button", { name: "Through head" });
+    expect(toggle()).toHaveAttribute("aria-pressed", "false");
+    expect(isListed("b.ts")).toBe(false);
+
+    fireEvent.click(toggle());
+    expect(toggle()).toHaveAttribute("aria-pressed", "true");
+    expect(isListed("a.ts")).toBe(true);
+    expect(isListed("b.ts")).toBe(true);
+    expect(mocks.commitDiffReads).toContainEqual([SHA_A, "head"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Next commit" }));
+    expect(toggle()).toHaveAttribute("aria-pressed", "true");
+    expect(mocks.commitDiffReads.at(-1)).toEqual([SHA_B, "head"]);
+
+    fireEvent.click(toggle());
+    expect(mocks.commitDiffReads.at(-1)).toEqual([SHA_B, null]);
+    expect(isListed("b.ts")).toBe(true);
+    expect(isListed("a.ts")).toBe(false);
   });
 
   it("hides the viewed controls and marks in a commit view, and keeps the marks for Changes", () => {

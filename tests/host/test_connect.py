@@ -11434,9 +11434,9 @@ def test_github_commit_ops_are_served_on_host(
             entries = [{"sha": commit, "commit": {"message": "Fix", "author": author}}]
             return 0, json.dumps([entries]), ""
         if "/compare/" in argv[-1]:
-            if "Accept: application/vnd.github.diff" in argv:
-                return 0, "compare-patch", ""
-            return 0, json.dumps({"files": []}), ""
+            return 0, "compare-patch", ""
+        if "Accept: application/vnd.github.diff" not in argv:
+            return 0, json.dumps({"sha": commit, "parents": [{"sha": "9" * 40}]}), ""
         return 0, "commit-patch", ""
 
     monkeypatch.setattr(github_resource, "_gh", gh)

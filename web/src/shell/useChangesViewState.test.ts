@@ -76,4 +76,17 @@ describe("useChangesViewState commit mode", () => {
       renderHook(() => useChangesViewState("view-commits", prUrl)).result.current,
     ).toMatchObject({ mode: "commits", commitSha: null });
   });
+
+  it("keeps Through head while stepping between commits and drops it on leaving the commit", () => {
+    const prUrl = "https://github.com/o/r/pull/10";
+    const { result } = renderHook(() => useChangesViewState("view-through-head", prUrl));
+
+    act(() => result.current.openCommit("c".repeat(40)));
+    act(() => result.current.setThroughHead(true));
+    act(() => result.current.openCommit("d".repeat(40)));
+    expect(result.current).toMatchObject({ commitSha: "d".repeat(40), throughHead: true });
+
+    act(() => result.current.setMode("commits"));
+    expect(result.current.throughHead).toBe(false);
+  });
 });

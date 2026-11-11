@@ -46,8 +46,12 @@ and a changed file is flagged.
   sha, author and date; **Search commits** matches sha, title or author, ignoring case.
   More than 250 commits shows `History limited to 250 commits`. Selecting a commit
   shows its patch with the same file list, diff and find bar, plus **Back to commits**,
-  **Previous commit** and **Next commit**. A commit view has no viewed controls, review
-  conversations or drafts, or context expansion, and **Open in** uses the commit's sha.
+  **Previous commit** and **Next commit**. **Through head** widens the open commit to
+  every change from it up to the head (one of the PR's commits through its head), so a
+  stacked PR's own changes are its first commit through head; it stays on while stepping
+  between commits. A commit view has no viewed controls, review conversations or drafts,
+  or context expansion, and **Open in** uses the commit's sha, or the head's with
+  **Through head**.
 
 ## How to get to it (user POV)
 
@@ -128,13 +132,17 @@ new head where only `main.py` changes. `README.md` keeps its mark, `main.py` sho
 `tests/e2e_ui/github/test_github_tab.py::test_changes_commits_view_lists_and_opens_a_commit`
 covers `rail`. It checks the viewed controls in Changes, switches to Commits, searches
 the list, opens a commit and checks that only its file is listed and the viewed
-controls are gone, steps with **Next commit**, and returns with **Back to commits**.
+controls are gone, steps with **Next commit**, turns **Through head** on and checks
+the widened patch is read from that commit through the head, turns it off, and returns
+with **Back to commits**.
 
 - `composer-desktop`, `composer-mobile` and `canvas`: Open Changes on a GitHub pull
   request with several commits and choose **Commits**. Search by an author's name and
   confirm the list narrows. Open a commit: only its files should be listed, with no
   **Viewed** checkbox or **Hide viewed**. Use **Next commit**, then **Back to commits**,
-  then **Changes**, and confirm your viewed marks are unchanged.
+  then **Changes**, and confirm your viewed marks are unchanged. On a stacked PR, open
+  its first own commit and turn on **Through head**: only that PR's changes should show,
+  not its parent's.
 
 Component coverage for these helpers and views lives in
 `web/src/shell/PullRequestChangesTab.test.tsx`,

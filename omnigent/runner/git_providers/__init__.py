@@ -47,9 +47,8 @@ Payload contract:
   ``session.github.file_diff`` with ``path``, ``before``, and ``after``.
 - With ``commit_history``, the commits are a ``list`` of ``session.github.commit``
   objects: ``sha``, ``title``, ``author``, and ``date``, with ``has_more``. One
-  commit's patch is a ``session.github.pr_diff``. The changes from one of the PR's
-  commits to its head are a ``session.github.pr_compare`` with ``patch``, ``files``
-  (changed files), ``has_more``, ``head_sha``, and ``from_sha``.
+  commit's patch, and the patch from one commit through the PR's head, are each a
+  ``session.github.pr_diff``.
 
 Additive fields:
 
@@ -98,7 +97,6 @@ CHANGED_FILE_OBJECT = "session.github.changed_file"
 FILE_DIFF_OBJECT = "session.github.file_diff"
 PR_DIFF_OBJECT = "session.github.pr_diff"
 COMMIT_OBJECT = "session.github.commit"
-PR_COMPARE_OBJECT = "session.github.pr_compare"
 PR_LABELS_OBJECT = "session.github.pr_labels"
 MERGE_OPTIONS_OBJECT = "session.github.merge_options"
 PR_MERGE_OBJECT = "session.github.pr_merge"
@@ -143,7 +141,8 @@ class ProviderCapabilities:
     :ivar attachment_uploads: The user can upload images and videos to embed in
         the description through :meth:`PullRequestFacet.upload_attachment`.
     :ivar commit_history: The PR's commits can be listed, and each one's patch or the
-        changes since one of them read, through the optional :class:`CommitsFacet`.
+        changes from one of them through the head read, through the optional
+        :class:`CommitsFacet`.
     """
 
     account_switching: bool
@@ -257,10 +256,11 @@ class CommitsFacet(Protocol):
     def compare_diff(
         self, root: str, reference: PullRequestRef, *, head_sha: str, from_sha: str
     ) -> dict[str, Any]:
-        """Return the changes from ``from_sha``, one of the PR's commits, to ``head_sha``.
+        """Return the patch from ``from_sha``, one of the PR's commits, through ``head_sha``.
 
-        The result is a ``session.github.pr_compare``. Raise ``ValueError`` when the PR's
-        head is no longer ``head_sha`` or ``from_sha`` is not one of its commits.
+        The patch includes ``from_sha`` itself, as a ``session.github.pr_diff``. Raise
+        ``ValueError`` when the PR's head is no longer ``head_sha`` or ``from_sha`` is not
+        one of its commits.
         """
         ...
 

@@ -75,8 +75,8 @@ async def read_workspace_from_host(
         ``"github_diff"`` / ``"github_pr_diff"`` / ``"github_labels"`` /
         ``"github_merge_options"`` / ``"github_reviewers"`` /
         ``"github_review_threads"`` / ``"github_review_thread_comments"`` /
-        ``"github_commits"`` / ``"github_commit_diff"`` / ``"github_compare_diff"``. The ``github_*`` ops
-        serve every git provider; their names are stable wire ids.
+        ``"github_commits"`` / ``"github_commit_diff"`` / ``"github_compare_diff"``.
+        The ``github_*`` ops serve every git provider; their names are stable wire ids.
     :param workspace: Absolute workspace path on the host.
     :param session_id: Session id, forwarded to the change registry.
     :param params: Operation-specific arguments.

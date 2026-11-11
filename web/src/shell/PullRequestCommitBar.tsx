@@ -1,4 +1,5 @@
-// The header of one commit's patch: back to the commit list, and step to the older or newer commit.
+// The header of one commit's patch: back to the commit list, step to the older or newer commit,
+// and widen the patch to run through the PR's head.
 
 import { ChevronDownIcon, ChevronUpIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -12,6 +13,8 @@ export function PullRequestCommitBar({
   next,
   onBack,
   onOpen,
+  throughHead,
+  onThroughHeadChange,
 }: {
   sha: string;
   /** The commit's title when the loaded list has it. */
@@ -22,6 +25,9 @@ export function PullRequestCommitBar({
   next: PullRequestCommit | null;
   onBack: () => void;
   onOpen: (sha: string) => void;
+  /** Whether the patch runs from this commit through the head; undefined hides the toggle. */
+  throughHead?: boolean;
+  onThroughHeadChange?: (throughHead: boolean) => void;
 }) {
   return (
     <div className="flex shrink-0 items-center gap-2 border-b border-border px-2 py-1">
@@ -32,6 +38,17 @@ export function PullRequestCommitBar({
         {title ?? "Commit"}
       </span>
       <span className="shrink-0 font-mono text-xs text-muted-foreground">{sha.slice(0, 7)}</span>
+      {throughHead !== undefined && onThroughHeadChange && (
+        <Button
+          variant={throughHead ? "secondary" : "ghost"}
+          size="sm"
+          aria-pressed={throughHead}
+          title="Show this commit and every later one, up to the pull request's head"
+          onClick={() => onThroughHeadChange(!throughHead)}
+        >
+          Through head
+        </Button>
+      )}
       <IconButton
         label="Previous commit"
         disabled={!previous}

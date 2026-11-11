@@ -432,8 +432,13 @@ function readErrorText(error: Error): string {
 }
 
 /** What an empty file list says: an unreadable commit, a commit without changes, or a PR without any. */
-function emptyChangesText(commitView: boolean, commitUnavailable: boolean): string {
+function emptyChangesText(
+  commitView: boolean,
+  throughHead: boolean,
+  commitUnavailable: boolean,
+): string {
   if (commitUnavailable) return "This commit's diff can't be read here.";
+  if (throughHead) return "No file changes from this commit through the head.";
   if (commitView) return "This commit has no file changes.";
   return "No changes vs base.";
 }
@@ -507,6 +512,8 @@ export function PullRequestChangesTab({
   const mode = commitsSupported ? view.mode : "changes";
   const commitsView = mode === "commits";
   const commitView = mode === "commit";
+  // The open commit's patch widened to run through the rendered head.
+  const throughHead = commitView && view.throughHead;
   const commits = usePullRequestCommits(
     conversationId,
     prUrl,
@@ -518,6 +525,7 @@ export function PullRequestChangesTab({
     conversationId,
     prUrl,
     commitView ? view.commitSha : null,
+    throughHead ? renderedHeadSha : null,
   );
   const shownDiff = commitView ? commitDiff : prDiff;
   // The list is oldest first, so the previous commit is the older one and the next is newer.
@@ -549,7 +557,7 @@ export function PullRequestChangesTab({
   useEffect(() => {
     setFindTarget(null);
     setPendingReveal(null);
-  }, [mode, view.commitSha]);
+  }, [mode, view.commitSha, throughHead]);
   // The head the shown patch was fetched for. Viewed state needs both the list and the diff
   // pinned to the same head; unpinned providers (GitLab, Azure) can't prove it, so marks are withheld.
   const pinnedHead = changes.data?.head_sha ?? null;
@@ -1053,7 +1061,7 @@ export function PullRequestChangesTab({
   // A disabled commit query has no data, which is not a commit without changes.
   const commitUnavailable =
     commitView && !commitDiff.data && !commitDiff.isLoading && !commitDiff.error;
-  const emptyChangesMessage = emptyChangesText(commitView, commitUnavailable);
+  const emptyChangesMessage = emptyChangesText(commitView, throughHead, commitUnavailable);
   const coverageNote =
     findOpen && patchReady && (listing.data?.has_more || withoutText > 0)
       ? `Search covers the fetched patch: ${patchFileCount} of ${listing.data?.total_count ?? files.length} files${withoutText > 0 ? `, ${withoutText} without text` : ""}`
@@ -1061,7 +1069,8 @@ export function PullRequestChangesTab({
 
   // Header actions for one file. Deleted files open at the base revision; others
   // at the rendered head, so a newer polled head never changes the link. A commit's
-  // files open at that commit, and a file the commit deletes has no page to open.
+  // files open at that commit, or at the head when it runs through the head, and a file
+  // the shown patch deletes has no page to open.
   const fileActions = (file: PullRequestChangedFile) => {
     const previous = file.previous_path ?? filesByPath.get(file.path)?.prevName ?? null;
     const renamedFrom = previous && previous !== file.path ? previous : null;
@@ -1070,7 +1079,7 @@ export function PullRequestChangesTab({
       provider: data.provider,
       headRepoUrl: pr.head_repository_url,
       baseRepoUrl,
-      headSha: commitView ? view.commitSha : renderedHeadSha,
+      headSha: commitView && !throughHead ? view.commitSha : renderedHeadSha,
       baseSha: commitView ? null : renderedBaseSha,
       path: file.path,
       previousPath: renamedFrom,
@@ -1084,7 +1093,9 @@ export function PullRequestChangesTab({
         openUrl={openUrl}
         openUnavailableReason={
           commitView && file.status === "deleted"
-            ? "Deleted in this commit"
+            ? throughHead
+              ? "Deleted by the head"
+              : "Deleted in this commit"
             : openUnavailableReason(providerLabel, !!baseRepoUrl, sourceRepoUrl)
         }
       />
@@ -1319,6 +1330,8 @@ export function PullRequestChangesTab({
           next={nextCommit}
           onBack={() => view.setMode("commits")}
           onOpen={view.openCommit}
+          throughHead={renderedHeadSha ? view.throughHead : undefined}
+          onThroughHeadChange={view.setThroughHead}
         />
       )}
       <div ref={bodyRef as React.RefObject<HTMLDivElement>} className="flex min-h-0 flex-1">

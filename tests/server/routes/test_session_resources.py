@@ -3916,7 +3916,7 @@ async def test_github_compare_diff_forwards_both_commits_to_the_runner(
 ) -> None:
     """GET /resources/github/compare-diff proxies the head and the picked commit."""
     path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/compare-diff"
-    payload = {"object": "session.github.pr_compare", "patch": "since\n", "files": []}
+    payload = {"object": "session.github.pr_diff", "patch": "through head\n"}
     fake_runner = _FakeRunnerClient(payload=payload)
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
     head, start = "a" * 40, "c" * 40

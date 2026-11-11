@@ -77,7 +77,6 @@ from omnigent.runner.git_providers import (
     COMMIT_OBJECT,
     MERGE_OPTIONS_OBJECT,
     PR_ATTACHMENT_OBJECT,
-    PR_COMPARE_OBJECT,
     PR_DETAILS_OBJECT,
     PR_DIFF_OBJECT,
     PR_LABELS_OBJECT,
@@ -1402,11 +1401,6 @@ def _pr_changed_files(root: str, reference: PullRequestRef | None) -> dict[str, 
         entries = [
             entry for page in entries for entry in (page if isinstance(page, list) else [page])
         ]
-    return {"object": "list", "data": _changed_file_payloads(entries), "has_more": False}
-
-
-def _changed_file_payloads(entries: Sequence[object]) -> list[dict[str, Any]]:
-    """Shape GitHub's PR or compare file entries as ``session.github.changed_file``."""
     data: list[dict[str, Any]] = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -1427,7 +1421,7 @@ def _changed_file_payloads(entries: Sequence[object]) -> list[dict[str, Any]]:
                 "previous_path": entry.get("previous_filename"),
             }
         )
-    return data
+    return {"object": "list", "data": data, "has_more": False}
 
 
 def _pr_changed_files_at_revision(
@@ -1669,60 +1663,44 @@ def _pr_commit_patch(root: str, reference: PullRequestRef, *, commit_sha: str) -
     return {"object": PR_DIFF_OBJECT, "patch": out}
 
 
-# GitHub's compare API lists at most this many changed files.
-_MAX_COMPARE_FILES = 300
-_COMPARE_FAILED = "GitHub could not load the changes since that commit. Refresh to retry."
+_COMPARE_FAILED = "GitHub could not load the changes from that commit. Refresh to retry."
 
 
 def _pr_compare(
     root: str, reference: PullRequestRef, *, head_sha: str, from_sha: str
 ) -> dict[str, Any]:
-    """Return the changed files and patch from ``from_sha`` to the PR's head.
+    """Return the patch from ``from_sha`` through the PR's head, including ``from_sha``.
 
     ``from_sha`` must be one of the PR's own commits, so only the PR's history is
-    served, and the head is checked before and after the reads so the result
-    describes the revision the panel shows.
+    served. The comparison starts at its first parent, and the head is checked before
+    and after the reads so the patch describes the revision the panel shows.
     """
-    if from_sha == head_sha:
-        raise ValueError("Pick a commit before the pull request's head.")
     host = _host_args(root, reference)
     token = _pr_token(root, reference)
-    endpoint = f"repos/{reference.repository}/compare/{from_sha}...{head_sha}"
     with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
         _check_pr_revision(root, reference, head_sha=head_sha)
         if from_sha not in {entry["sha"] for entry in _pr_commit_entries(root, reference)}:
             raise ValueError("That commit is not part of the selected pull request.")
-        rc, out, _ = _gh(["api", *host, endpoint], cwd=root, token=token)
-        if rc != 0:
+        commit = _pr_api(root, reference, f"repos/{reference.repository}/commits/{from_sha}")
+        parents = commit.get("parents")
+        parent = parents[0].get("sha") if isinstance(parents, list) and parents else None
+        if not isinstance(parent, str) or not parent:
             raise ValueError(_COMPARE_FAILED)
-        try:
-            comparison = json.loads(out)
-        except ValueError:
-            raise ValueError(_COMPARE_FAILED) from None
-        entries = comparison.get("files") if isinstance(comparison, dict) else None
-        if not isinstance(entries, list):
-            raise ValueError(_COMPARE_FAILED)
-        rc, patch, _ = _gh(
-            ["api", *host, "-H", "Accept: application/vnd.github.diff", endpoint],
+        rc, out, _ = _gh(
+            [
+                "api",
+                *host,
+                "-H",
+                "Accept: application/vnd.github.diff",
+                f"repos/{reference.repository}/compare/{parent}...{head_sha}",
+            ],
             cwd=root,
             token=token,
         )
         if rc != 0:
             raise ValueError(_COMPARE_FAILED)
         _check_pr_revision(root, reference, head_sha=head_sha)
-    result: dict[str, Any] = {
-        "object": PR_COMPARE_OBJECT,
-        "patch": patch,
-        "files": _changed_file_payloads(entries),
-        "has_more": len(entries) >= _MAX_COMPARE_FILES,
-        "head_sha": head_sha,
-        "from_sha": from_sha,
-    }
-    if result["has_more"]:
-        result["warning"] = (
-            f"The provider lists at most {_MAX_COMPARE_FILES} files; some files may not be shown."
-        )
-    return result
+    return {"object": PR_DIFF_OBJECT, "patch": out}
 
 
 def _host_args(root: str, reference: PullRequestRef) -> list[str]:

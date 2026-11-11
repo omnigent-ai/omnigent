@@ -218,12 +218,10 @@ class GitHubPullRequests:
     def compare_diff(
         self, root: str, reference: PullRequestRef, *, head_sha: str, from_sha: str
     ) -> dict[str, Any]:
-        """Compare one of the PR's commits with its head."""
+        """Read the patch from one of the PR's commits through its head."""
         from omnigent.runner import github_resource
 
-        return github_resource._pr_compare(
-            root, reference, head_sha=head_sha, from_sha=from_sha
-        )
+        return github_resource._pr_compare(root, reference, head_sha=head_sha, from_sha=from_sha)
 
     def set_preference(
         self,

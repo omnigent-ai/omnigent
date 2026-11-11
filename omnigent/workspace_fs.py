@@ -782,7 +782,7 @@ class WorkspaceReader:
         head_sha: str | None = None,
         from_sha: str | None = None,
     ) -> _WorkspacePayload:
-        """The selected PR's changes since one of its commits."""
+        """The selected PR's patch from one of its commits through its head."""
         return cast(
             "_WorkspacePayload",
             pr_resource.pr_compare_diff(

@@ -1287,7 +1287,7 @@ def pr_compare_diff(
     head_sha: object = None,
     from_sha: object = None,
 ) -> dict[str, Any]:
-    """Return the selected PR's changes since one of its commits.
+    """Return the selected PR's patch from one of its commits through its head.
 
     :raises ValueError: Without a selected tracked PR, when its provider cannot list
         commits, or when either commit is not a full commit id.

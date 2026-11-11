@@ -3004,7 +3004,7 @@ def register_resources_routes(
 
     @file_read_router.get(
         "/sessions/{session_id}/resources/github/compare-diff",
-        # Internal (UI PR "Compare from" view) — hidden from the public API reference.
+        # Internal (UI "Through head" commit view) — hidden from the public API reference.
         include_in_schema=False,
         response_model=None,
     )
@@ -3016,7 +3016,7 @@ def register_resources_routes(
         from_sha: str | None = None,
     ) -> Any:
         """
-        Return the selected PR's changed files and patch since one of its commits.
+        Return the selected PR's patch from one of its commits through its head.
 
         Falls back to the host tunnel when the runner is offline.
 
@@ -3024,8 +3024,7 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :param head_sha: The PR head the panel shows, a full commit id.
         :param from_sha: One of the PR's commits, a full commit id.
-        :returns: JSON with ``patch``, ``files``, ``has_more``, ``head_sha`` and
-            ``from_sha``.
+        :returns: JSON with the ``patch`` text.
         """
         conv = await _authorize_browse_read(session_id, request)
         params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
