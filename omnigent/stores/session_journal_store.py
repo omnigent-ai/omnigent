@@ -536,8 +536,9 @@ def copy_journal_for_fork(
     """Copy a session's journal into its new fork, in order, in the fork's transaction.
 
     The fork's entries get their own IDs and positions from 0, keep their times,
-    steps and contents, and drop their automation run, so a run's history lists
-    each entry once. Dispatches and their results stay with the parent.
+    steps and contents, and drop their automation run and workflow, so a run's or
+    a workflow's history lists each entry once. Dispatches and their results stay
+    with the parent.
 
     :param source_id: The session being forked.
     :param fork_id: The new fork, which has no journal yet.
@@ -575,6 +576,7 @@ def copy_journal_for_fork(
             id=uuid.uuid4().hex,
             kind=row.kind,
             scheduled_task_run_id=None,
+            workflow_id=None,
             step=row.step,
             idempotency_key=row.idempotency_key,
             # The sealed bytes as stored: the fork shares the parent's workspace key.
