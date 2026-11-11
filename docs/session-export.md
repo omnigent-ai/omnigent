@@ -1,17 +1,22 @@
 # Session export: the `omnigent.transcript/1` format
 
-`omnigent session export`, the chat header's **Export** action, and
-`GET /v1/sessions/{id}/export` all write the same file: a portable,
-versioned record of one session that a reviewer can read without an Omnigent
-server, and that `omnigent session import` reads back into any server.
+`omnigent.transcript/1` is a portable, versioned record of one session that a
+reviewer can read without an Omnigent server, and that `omnigent session
+import` reads back into any server. It is opt-in for now:
+`omnigent session export --format transcript` and
+`GET /v1/sessions/{id}/export` write it.
 
 ```bash
-omnigent session export --id conv_abc123                 # → conv_abc123.jsonl
-omnigent session export --id conv_abc123 -o churn.jsonl
+omnigent session export --id conv_abc123 --format transcript -o churn.jsonl
 curl -H "Authorization: Bearer $TOKEN" \
   "$SERVER/v1/sessions/conv_abc123/export" > churn.jsonl
 omnigent session import -i churn.jsonl --server https://other-server
 ```
+
+By default, `omnigent session export` and the chat header's **Export** action
+still write the older `record_type` JSONL (see [Reading it back](#reading-it-back)),
+because `omnigent session import` before 0.22 cannot read a transcript. A
+transcript needs an importing CLI from 0.22 or newer.
 
 ## Shape
 
@@ -45,8 +50,9 @@ entry. Fields that do not apply are omitted, never written as `null`.
 Every entry has `turn`, `seq`, `role` and `kind`. `turn` counts user requests:
 a new turn starts at each user message a person typed (injected `meta` context
 does not open one), so a resource event or a compaction stays in the turn it
-interrupted. `seq` is the line's position. `time` is the item's recorded time
-and `id` its id on the exporting server.
+interrupted. `seq` is the line's position. `time` is the item's recorded time,
+`id` its id on the exporting server, and `created_by` who wrote it there, so a
+shared session's file tells collaborators apart.
 
 `role` is one of `user`, `assistant`, `tool`, `system`. `kind` is deliberately
 small and does not grow a case per harness:
@@ -76,9 +82,13 @@ restores fields the summary leaves out: a message's `user_authored` flag, an
 error's `title` / `cause` / `remediation`, a compaction's `compacted_messages`,
 a reasoning item's `encrypted_content`.
 
-`raw` is authoritative: an import rebuilds the item from `raw` alone. So the
-readable fields cannot hide what gets imported, import refuses an entry whose
-`raw` would rebuild as a different `kind` or `role` than the entry says.
+`raw` is authoritative: an import rebuilds the item from `raw` alone. So that
+reviewing a file and importing it give the same conversation, import refuses an
+entry whose readable fields disagree with `raw`: a different `kind` or `role`,
+or any reading it states (`text`, `tool_input`, `tool_output`, ...) that differs
+from the one `raw` gives. A reading the entry omits is allowed, since it hides
+nothing; the `sealed`, `meta` and `interrupted` flags are always compared,
+because an omitted flag reads as false.
 
 Nothing is stored twice. A readable field only ever holds a *reading* of the
 payload (joined text, a parsed tool input, a one-line note), never a copy of a
@@ -120,7 +130,8 @@ replaced item id) and carries the summary it continued from.
   a store error mid-page) is still a valid file; check that the last `seq`
   matches the item count you expect before trusting it as complete.
 - The file is the session as of `exported`: items appended while the export
-  runs (a turn still in progress) are left out.
+  runs (a turn still in progress) are left out. The CLI (in either format) and
+  the server route both stop at the item that was newest when they started.
 - `omnigent session import` can rebuild only item types the CLI running the
   import knows, since it validates every item before sending it. A `note` for
   a type that version does not know is kept in the file but refused on import.
@@ -134,7 +145,8 @@ built-in agent for the header's harness; `settings` are reapplied, except
 runs the header's harness. Each item is
 rebuilt from `raw`, so the imported session carries every field the exporting
 server stored. Per-turn grouping is seeded afresh (`turn` is informational),
-and item authorship is re-attributed to the importing user. Items get new ids,
+and item authorship is re-attributed to the importing user (`created_by` stays
+in the file as a record of who wrote what). Items get new ids,
 so a compaction's `covers_through` still names the source session's item; the
 importing server treats that boundary as stale and compacts afresh when needed.
 
@@ -143,10 +155,10 @@ from the readable fields instead: a message's `content` blocks are used when
 present, else its `text` becomes one block; sealed reasoning comes back as
 summary only; terminal output is kept as stdout.
 
-Files written before this schema (`record_type: "session_meta"` / `"item"`
-lines) are still accepted by `session import`. Scripts that parsed those
-`record_type` lines from `omnigent session export` must switch to the schema
-above; the CLI no longer writes them.
+The default `record_type` export is a `record_type: "session_meta"` line (the
+`GET /v1/sessions/{id}` snapshot), then one `record_type: "item"` line per item
+in the flat API shape. `session import` reads both formats, telling them apart
+by the first line.
 
 ## Python
 
@@ -165,6 +177,5 @@ for entry in transcript.entries:
 uses it directly, and the server route streams the same header and numbering
 (`header_from_session`, `EntryNumbering`) one page of items at a time.
 
-The web Export action calls the route. Against a server that predates it, the
-web client falls back to building the older `record_type` export from the
-session and items endpoints, which `session import` still reads.
+The web Export action builds the `record_type` export from the session and
+items endpoints, so its download imports with any released CLI.

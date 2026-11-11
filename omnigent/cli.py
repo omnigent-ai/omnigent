@@ -7559,21 +7559,42 @@ def session(ctx: click.Context) -> None:
         "Defaults to the configured server, or a local server already running."
     ),
 )
-def session_export(session_id: str, output: str | None, server: str | None) -> None:
+@click.option(
+    "--format",
+    "export_format",
+    type=click.Choice(["records", "transcript"]),
+    default="records",
+    show_default=True,
+    help=(
+        "records: the record_type JSONL every omnigent release can import. "
+        "transcript: the documented omnigent.transcript/1 file "
+        "(docs/session-export.md); importing it needs omnigent 0.22 or newer."
+    ),
+)
+def session_export(
+    session_id: str, output: str | None, server: str | None, export_format: str
+) -> None:
     """Export a session transcript to a portable JSONL file.
 
-    Writes an ``omnigent.transcript/1`` file (see ``docs/session-export.md``):
-    the first line is a header naming the schema and the session; every
-    following line is one entry — ``message``, ``reasoning``, ``tool_call``,
-    ``tool_result``, ``error``, ``compaction`` or ``note`` — in turn order.
-    Content the provider withheld (encrypted reasoning, provider-hosted tool
-    results) is marked ``sealed`` rather than silently dropped. Independent of
+    By default each line is a JSON object: the first carries the session
+    metadata (``"record_type": "session_meta"``) and every following line is
+    one conversation item (``"record_type": "item"``) in turn order.
+
+    ``--format transcript`` writes an ``omnigent.transcript/1`` file instead
+    (see ``docs/session-export.md``): a header naming the schema and the
+    session, then one readable entry per item, with content the provider
+    withheld marked ``sealed``. Older ``omnigent session import`` versions
+    cannot read it.
+
+    Either way the file is the session as of the start of the export: items
+    appended meanwhile (a turn still running) are left out. Independent of
     ``omnigent import``, which reads native harness history.
 
     \b
     Examples:
       omnigent session export --id conv_abc123
       omnigent session export --id conv_abc123 --output my_session.jsonl
+      omnigent session export --id conv_abc123 --format transcript
       omnigent session export --id conv_abc123 --server https://myserver.com
     """
     import httpx
@@ -7610,11 +7631,22 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
         resp.raise_for_status()
         session_data = resp.json()
 
+        # The file is the session as of now: stop at the item that is newest
+        # now, as GET /v1/sessions/{id}/export does.
+        newest_resp = client.get(
+            f"/v1/sessions/{session_id}/items", params={"limit": 1, "order": "desc"}
+        )
+        newest_resp.raise_for_status()
+        newest = newest_resp.json()["data"]
+        stop_after_id = newest[0]["id"] if newest else None
+
         n_items = 0
 
         def _items() -> Iterator[dict[str, Any]]:
-            """Page through the session's items in ascending order."""
+            """Page through the session's items in ascending order, up to the boundary."""
             nonlocal n_items
+            if stop_after_id is None:
+                return
             after: str | None = None
             while True:
                 params: dict[str, str | int] = {"limit": 500, "order": "asc"}
@@ -7626,6 +7658,8 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
                 for item in page["data"]:
                     n_items += 1
                     yield item
+                    if item.get("id") == stop_after_id:
+                        return
                 if not page.get("has_more"):
                     break
                 after = page.get("last_id")
@@ -7640,7 +7674,12 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
         tmp_path = out_path.with_name(f".{out_path.name}.partial")
         try:
             with tmp_path.open("w", encoding="utf-8") as fh:
-                fh.writelines(iter_transcript_lines(session_data, _items()))
+                if export_format == "transcript":
+                    fh.writelines(iter_transcript_lines(session_data, _items()))
+                else:
+                    fh.write(json.dumps({"record_type": "session_meta", **session_data}) + "\n")
+                    for item in _items():
+                        fh.write(json.dumps({"record_type": "item", **item}) + "\n")
             tmp_path.replace(out_path)
         finally:
             tmp_path.unlink(missing_ok=True)

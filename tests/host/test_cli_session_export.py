@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import patch
 
 import httpx
+import pytest
 import respx
 from click.testing import CliRunner
 
@@ -55,6 +56,27 @@ _ITEMS_PAGE = {
 }
 
 
+def _mock_items(pages: list[dict[str, Any]], newest_id: str | None = "msg_2") -> respx.Route:
+    """Serve *pages* in order, and *newest_id* to the export's newest-item probe."""
+    remaining = list(pages)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("order") == "desc":
+            newest = [{"id": newest_id}] if newest_id else []
+            return httpx.Response(200, json={"data": newest, "has_more": bool(newest)})
+        return httpx.Response(200, json=remaining.pop(0))
+
+    return respx.get(f"{_BASE}/v1/sessions/conv_abc123/items").mock(side_effect=respond)
+
+
+def _export(out_file: Path, *args: str) -> Any:
+    with _patch_server():
+        return CliRunner().invoke(
+            cli,
+            ["session", "export", "--id", "conv_abc123", "--output", str(out_file), *args],
+        )
+
+
 def _patch_server(base_url: str = _BASE) -> Any:
     """Patch the CLI so it uses *base_url* without spawning a real server."""
     return patch(
@@ -64,26 +86,34 @@ def _patch_server(base_url: str = _BASE) -> Any:
 
 
 @respx.mock
-def test_session_export_writes_jsonl(tmp_path: Path) -> None:
-    """Export writes the schema header, then one transcript entry per item."""
+def test_session_export_writes_records_by_default(tmp_path: Path) -> None:
+    """By default the file is the record_type JSONL every released importer reads."""
     respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
         return_value=httpx.Response(200, json=_SESSION_META)
     )
-    respx.get(f"{_BASE}/v1/sessions/conv_abc123/items").mock(
-        return_value=httpx.Response(200, json=_ITEMS_PAGE)
-    )
+    _mock_items([_ITEMS_PAGE])
 
     out_file = tmp_path / "out.jsonl"
-    runner = CliRunner()
-    with _patch_server():
-        result = runner.invoke(
-            cli,
-            ["session", "export", "--id", "conv_abc123", "--output", str(out_file)],
-        )
+    result = _export(out_file)
 
     assert result.exit_code == 0, result.output
-    assert out_file.exists()
+    lines = [json.loads(line) for line in out_file.read_text().splitlines() if line]
+    assert lines[0] == {"record_type": "session_meta", **_SESSION_META}
+    assert lines[1:] == [{"record_type": "item", **item} for item in _ITEMS_PAGE["data"]]
 
+
+@respx.mock
+def test_session_export_writes_a_transcript_on_request(tmp_path: Path) -> None:
+    """--format transcript writes the schema header, then one entry per item."""
+    respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
+        return_value=httpx.Response(200, json=_SESSION_META)
+    )
+    _mock_items([_ITEMS_PAGE])
+
+    out_file = tmp_path / "out.jsonl"
+    result = _export(out_file, "--format", "transcript")
+
+    assert result.exit_code == 0, result.output
     lines = [json.loads(line) for line in out_file.read_text().splitlines() if line]
     assert len(lines) == 3  # 1 header + 2 entries
 
@@ -102,6 +132,30 @@ def test_session_export_writes_jsonl(tmp_path: Path) -> None:
     assert "content" not in entries[1]
     assert entries[1]["raw"]["content"] == [{"type": "output_text", "text": "hi there"}]
     assert entries[1]["agent"] == "my-agent"
+
+
+@pytest.mark.parametrize("export_format", ["records", "transcript"])
+@respx.mock
+def test_session_export_leaves_out_items_appended_while_it_runs(
+    tmp_path: Path, export_format: str
+) -> None:
+    """The file stops at the item that was newest when the export started."""
+    respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
+        return_value=httpx.Response(200, json=_SESSION_META)
+    )
+    appended = {**_ITEMS_PAGE["data"][1], "id": "msg_3"}
+    _mock_items(
+        [{**_ITEMS_PAGE, "data": [*_ITEMS_PAGE["data"], appended], "last_id": "msg_3"}],
+        newest_id="msg_2",
+    )
+
+    out_file = tmp_path / "out.jsonl"
+    result = _export(out_file, "--format", export_format)
+
+    assert result.exit_code == 0, result.output
+    assert "Exported 2 item(s)" in result.output
+    records = [json.loads(line) for line in out_file.read_text().splitlines() if line][1:]
+    assert [r["id"] for r in records] == ["msg_1", "msg_2"]
 
 
 @respx.mock
@@ -144,9 +198,7 @@ def test_session_export_default_filename(tmp_path: Path) -> None:
     respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
         return_value=httpx.Response(200, json=_SESSION_META)
     )
-    respx.get(f"{_BASE}/v1/sessions/conv_abc123/items").mock(
-        return_value=httpx.Response(200, json={**_ITEMS_PAGE, "data": [], "has_more": False})
-    )
+    _mock_items([], newest_id=None)
 
     runner = CliRunner()
     with runner.isolated_filesystem(temp_dir=tmp_path), _patch_server():
@@ -156,9 +208,7 @@ def test_session_export_default_filename(tmp_path: Path) -> None:
         assert default_path.exists()
         lines = [json.loads(line) for line in default_path.read_text().splitlines() if line]
 
-    assert len(lines) == 1
-    assert lines[0]["schema"] == "omnigent.transcript/1"
-    assert lines[0]["session"] == "conv_abc123"
+    assert lines == [{"record_type": "session_meta", **_SESSION_META}]
 
 
 @respx.mock
@@ -192,24 +242,15 @@ def test_session_export_items_ordered_ascending(tmp_path: Path) -> None:
     respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
         return_value=httpx.Response(200, json=_SESSION_META)
     )
-    respx.get(f"{_BASE}/v1/sessions/conv_abc123/items").mock(
-        return_value=httpx.Response(200, json=_ITEMS_PAGE)
-    )
+    _mock_items([_ITEMS_PAGE])
 
     out_file = tmp_path / "ordered.jsonl"
-    runner = CliRunner()
-    with _patch_server():
-        result = runner.invoke(
-            cli,
-            ["session", "export", "--id", "conv_abc123", "--output", str(out_file)],
-        )
+    result = _export(out_file)
     assert result.exit_code == 0, result.output
 
     records = [json.loads(line) for line in out_file.read_text().splitlines() if line]
-    entries = [r for r in records if "kind" in r]
-    assert len(entries) == 2
-    assert entries[0]["role"] == "user"
-    assert entries[1]["role"] == "assistant"
+    items = [r for r in records if r["record_type"] == "item"]
+    assert [r["role"] for r in items] == ["user", "assistant"]
 
 
 @respx.mock
@@ -249,20 +290,11 @@ def test_session_export_pagination(tmp_path: Path) -> None:
     respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
         return_value=httpx.Response(200, json=_SESSION_META)
     )
-    # First call (no after param) → page1; second call (after=msg_1) → page2.
-    items_route = respx.get(f"{_BASE}/v1/sessions/conv_abc123/items")
-    items_route.side_effect = [
-        httpx.Response(200, json=page1),
-        httpx.Response(200, json=page2),
-    ]
+    # First page call (no after param) → page1; second call (after=msg_1) → page2.
+    _mock_items([page1, page2])
 
     out_file = tmp_path / "paged.jsonl"
-    runner = CliRunner()
-    with _patch_server():
-        result = runner.invoke(
-            cli,
-            ["session", "export", "--id", "conv_abc123", "--output", str(out_file)],
-        )
+    result = _export(out_file, "--format", "transcript")
     assert result.exit_code == 0, result.output
 
     records = [json.loads(line) for line in out_file.read_text().splitlines() if line]
@@ -278,17 +310,10 @@ def test_session_export_refuses_a_page_without_a_cursor(tmp_path: Path) -> None:
     respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
         return_value=httpx.Response(200, json=_SESSION_META)
     )
-    respx.get(f"{_BASE}/v1/sessions/conv_abc123/items").mock(
-        return_value=httpx.Response(200, json={**_ITEMS_PAGE, "has_more": True, "last_id": None})
-    )
+    _mock_items([{**_ITEMS_PAGE, "has_more": True, "last_id": None}], newest_id="msg_9")
 
     out_file = tmp_path / "stuck.jsonl"
-    runner = CliRunner()
-    with _patch_server():
-        result = runner.invoke(
-            cli,
-            ["session", "export", "--id", "conv_abc123", "--output", str(out_file)],
-        )
+    result = _export(out_file)
 
     assert result.exit_code != 0
     assert "without a cursor" in result.output

@@ -83,10 +83,11 @@ the header menu), and each place is a separate entry point.
   you own it. A shared session opened by direct link gets no row unless you
   have owner-level access, because the session response carries no owner.
 - `delete`: confirmed, then removed from the list and the server.
-- `export`: Export in the header menu downloads the session as an
-  `omnigent.transcript/1` file from `GET /v1/sessions/{id}/export`; the CLI
-  writes the same file with `omnigent session export` and reads it back with
-  `omnigent session import` (`docs/session-export.md`).
+- `export`: Export in the header menu saves the session as a local
+  `record_type` JSONL file, the same one `omnigent session export` writes by
+  default and every `omnigent session import` reads. The opt-in
+  `omnigent.transcript/1` file comes from `omnigent session export --format
+  transcript` or `GET /v1/sessions/{id}/export` (`docs/session-export.md`).
 - `unread`: Mark as unread flags a session to revisit and survives a reload,
   including for the session being viewed. Its dot appears once the turn is
   idle; approval and error indicators can take precedence. A row showing the
