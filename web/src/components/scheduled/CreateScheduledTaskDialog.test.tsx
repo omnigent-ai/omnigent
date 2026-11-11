@@ -201,6 +201,20 @@ vi.mock("@/shell/NewChatDialog", () => ({
       </button>
     </fieldset>
   ),
+  ConnectHostInstructions: ({
+    label,
+    onSshConnected,
+  }: {
+    label?: string;
+    onSshConnected?: (hostId: string) => void;
+  }) => (
+    <div data-testid="connect-host-instructions">
+      {label}
+      <button type="button" onClick={() => onSshConnected?.("host_ssh")}>
+        ssh-connect
+      </button>
+    </div>
+  ),
 }));
 
 const AGENTS: AvailableAgent[] = [
@@ -1451,6 +1465,84 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(browse).toHaveAccessibleDescription("Connect your host to select a workspace.");
     fireEvent.click(browse);
     expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
+  });
+
+  it("shows the connect-host instructions inline when no host is online", () => {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "offline" }],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    renderDialog();
+
+    expect(screen.getByTestId("connect-host-instructions")).toHaveTextContent("No hosts online.");
+    expect(screen.queryByTestId("task-connect-host-toggle")).not.toBeInTheDocument();
+  });
+
+  it("says no host is connected when the host list is empty", () => {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    renderDialog();
+
+    expect(screen.getByTestId("connect-host-instructions")).toHaveTextContent(
+      "No hosts connected yet.",
+    );
+  });
+
+  it("picks a host that comes online while the dialog is open", () => {
+    const offline = [{ host_id: "host_1", name: "laptop", owner: "me", status: "offline" }];
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: offline,
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    const view = renderDialog();
+    expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Pick a host");
+
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ ...offline[0], status: "online" }],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    view.rerender(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+
+    expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("laptop");
+    expect(screen.queryByTestId("connect-host-instructions")).not.toBeInTheDocument();
+  });
+
+  it("offers connecting another host as a collapsed step when a host is online", () => {
+    renderDialog();
+
+    expect(screen.queryByTestId("connect-host-instructions")).not.toBeInTheDocument();
+    const toggle = screen.getByTestId("task-connect-host-toggle");
+    expect(toggle).toHaveTextContent("Connect another host from your terminal");
+    fireEvent.click(toggle);
+    expect(screen.getByTestId("connect-host-instructions")).toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(screen.queryByTestId("connect-host-instructions")).not.toBeInTheDocument();
+  });
+
+  it("selects a host connected over SSH from the inline instructions", () => {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [
+        { host_id: "host_1", name: "laptop", owner: "me", status: "online" },
+        { host_id: "host_ssh", name: "devbox", owner: "me", status: "online" },
+      ],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    renderDialog();
+    expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("laptop");
+
+    fireEvent.click(screen.getByTestId("task-connect-host-toggle"));
+    fireEvent.click(screen.getByRole("button", { name: "ssh-connect" }));
+
+    expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("devbox");
+    expect(screen.queryByTestId("connect-host-instructions")).not.toBeInTheDocument();
+  });
+
+  it("hides the connect-host instructions while a sandbox is the target", () => {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "offline" }],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    renderWithSandboxes();
+
+    expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Sandbox");
+    expect(screen.queryByTestId("connect-host-instructions")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-connect-host-toggle")).not.toBeInTheDocument();
   });
 
   it("preserves a saved workspace when switching to an offline host, but disables browsing", async () => {
