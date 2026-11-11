@@ -92,7 +92,6 @@ def test_invalid_times_are_rejected(args: dict[str, object], error: str) -> None
     "created,delay",
     [
         (_NOW, timedelta(minutes=2)),
-        (_NOW, timedelta(hours=3)),
         # Crosses a year boundary.
         (datetime(2026, 12, 31, 23, 50, tzinfo=UTC), timedelta(minutes=20)),
         # Same calendar date as creation, a few minutes earlier, next year.

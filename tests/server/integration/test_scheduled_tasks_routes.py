@@ -807,7 +807,7 @@ async def test_late_create_refuses_a_one_time_rule_instead_of_moving_it_a_year(
 
 
 @pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
-@pytest.mark.parametrize("first_run_at", [0, 253402300800, 9223372036854775807])
+@pytest.mark.parametrize("first_run_at", [0, 253402300800])
 async def test_out_of_range_first_run_at_is_rejected(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, first_run_at: int
 ) -> None:

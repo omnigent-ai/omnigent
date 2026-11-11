@@ -546,7 +546,8 @@ def _reminder_review(args: dict[str, object]) -> PolicyResponse:
     return {
         "result": "ASK",
         "reason": (
-            f"Agent wants to set a reminder for this session {when}.\n"
+            f"Agent wants to set a reminder for this session {when}, "
+            "rounded up to the next minute.\n"
             "When it fires, this message is sent into the session as a new turn, "
             "even if nobody is watching:\n"
             f"{message}\n"
