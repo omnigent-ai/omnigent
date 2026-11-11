@@ -20,6 +20,8 @@ type ProjectPrefillPhase = "location" | "settled";
 export interface ProjectPrefillConfig {
   hostId?: string;
   workspace?: string;
+  /** Repositories a sandbox default clones (`<url>[#<branch>]` each). */
+  sandboxWorkspaces?: string[];
   agentId?: string;
   /** Opt-in worktree default; only `true` is meaningful (absent = no worktree). */
   useWorktree?: boolean;
@@ -111,6 +113,8 @@ interface ProjectPrefillWrites {
   /** Select the managed sandbox as the target (config.hostId was the sandbox
    *  sentinel). Distinct from `hostId` — the sandbox is not a real host id. */
   selectSandbox?: boolean;
+  /** Repositories the selected sandbox clones; only written with `selectSandbox`. */
+  sandboxWorkspaces?: string[];
 }
 
 /**
@@ -189,6 +193,9 @@ function locationStep(
   if (config?.hostId === SANDBOX_HOST_CHOICE) {
     if (inputs.managedSandboxesEnabled && !inputs.sandboxSelected && selectedHostId === null) {
       writes.selectSandbox = true;
+      if (config.sandboxWorkspaces !== undefined && config.sandboxWorkspaces.length > 0) {
+        writes.sandboxWorkspaces = config.sandboxWorkspaces;
+      }
     }
     return settled(state);
   }

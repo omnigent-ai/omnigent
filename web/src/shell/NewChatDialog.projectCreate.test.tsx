@@ -606,6 +606,25 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     });
   });
 
+  it("clones a sandbox default's stored repositories over the last-used ones", async () => {
+    const projectRepo = "https://github.com/example/project-repo#main";
+    localStorage.setItem(
+      "omnigent:last-sandbox-repos",
+      JSON.stringify([{ url: "https://github.com/example/other-repo", branch: "" }]),
+    );
+    setProjectConfig({
+      host_id: SANDBOX_HOST_CHOICE,
+      sandbox_workspaces: [projectRepo],
+      agent_id: "ag_other",
+    });
+    renderLanding({ managed_sandboxes_enabled: true });
+
+    const body = await submitAndReadBody();
+    expect(body.project_id).toBe("proj_alpha");
+    expect(body.host_type).toBe("managed");
+    expect(body.workspaces).toEqual([projectRepo]);
+  });
+
   it("carries project_id and the omission rules through the multipart (bundled) path", async () => {
     const config = { host_id: "host_1", workspace: REPO, agent_id: "ag_other" };
     setProjectConfig(config);
