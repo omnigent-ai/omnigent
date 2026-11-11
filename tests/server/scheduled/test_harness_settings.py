@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import io
-import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +24,7 @@ from omnigent.server.scheduled.harness_settings import (
 )
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
+from tests._helpers.session import bundle_files
 
 _NULL_HINT = "JSON null (not the string 'null') for the agent default"
 
@@ -333,13 +332,7 @@ _CUSTOM_HANDLER_CONFIG = yaml.dump(
 
 
 def _store_custom_handler_bundle(store: LocalArtifactStore, location: str) -> None:
-    buffer = io.BytesIO()
-    data = _CUSTOM_HANDLER_CONFIG.encode()
-    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-        info = tarfile.TarInfo(name="config.yaml")
-        info.size = len(data)
-        archive.addfile(info, io.BytesIO(data))
-    store.put(location, buffer.getvalue())
+    store.put(location, bundle_files({"config.yaml": _CUSTOM_HANDLER_CONFIG.encode()}))
 
 
 @pytest.fixture()
