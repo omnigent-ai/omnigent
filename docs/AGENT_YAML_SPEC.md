@@ -745,6 +745,12 @@ credential storage outside sandbox write grants. Locked Codex profiles must set
 operations use Omnigent tools and policies. Missing or unsafe settings prevent
 launch.
 
+The runner now honors `web_search` and `disable_native_tools` for ordinary
+Codex profiles too; previously these options were ignored during spawn.
+Use YAML `true` or `false`; quoted strings and numbers reject launch. Omitting
+either option or setting it to `null` preserves the ordinary defaults: web
+search enabled and native tools available.
+
 ### Git over SSH from a sandbox
 
 `sandbox.git_ssh` grants one Git repository and one SSH operation at a time.

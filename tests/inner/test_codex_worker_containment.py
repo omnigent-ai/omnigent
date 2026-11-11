@@ -555,11 +555,6 @@ def test_non_signer_egress_setup_rolls_back_before_return(
 def test_brokered_gateway_command_source_is_rejected_before_worker_start(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    codex = tmp_path / "codex"
-    codex.touch()
-    codex_home = tmp_path / "codex-home"
-    codex_home.mkdir()
-    egress_tmpdir = tmp_path / "egress"
     marker = tmp_path / "command-ran"
     binding = CredentialProxyEntry(
         host="model.example.com",
@@ -568,29 +563,23 @@ def test_brokered_gateway_command_source_is_rejected_before_worker_start(
         inject_env=[CODEX_GATEWAY_TOKEN_ENV],
     )
     credentials = CredentialProxySpec(entries=[binding])
-    policy = _active_policy(tmp_path)
-    policy.credential_proxy = credentials
-    backend = Mock()
-    backend.wrap_launcher_argv.return_value = ["/usr/bin/sandbox-exec", str(codex)]
     start_proxy = Mock()
     create_launcher = Mock()
+    create_tmpdir = Mock()
 
-    def _create_tmpdir() -> Path:
-        egress_tmpdir.mkdir()
-        return egress_tmpdir
-
-    monkeypatch.setattr("omnigent.inner.codex_worker.resolve_sandbox", lambda *_: policy)
-    monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", lambda *_: backend)
-    monkeypatch.setattr("omnigent.inner.codex_worker.create_private_tmpdir", _create_tmpdir)
+    monkeypatch.setattr(
+        "omnigent.inner.codex_worker.resolve_sandbox", lambda *_: _active_policy(tmp_path)
+    )
+    monkeypatch.setattr("omnigent.inner.codex_worker.create_private_tmpdir", create_tmpdir)
     monkeypatch.setattr("omnigent.inner.codex_worker.start_egress_proxy", start_proxy)
     monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", create_launcher)
     worker_env = {"PATH": os.environ["PATH"], BROKERED_CODEX_ENV: "1"}
 
     with pytest.raises(ValueError, match="renewable file/socket source"):
         prepare_codex_worker(
-            codex_path=str(codex),
+            codex_path=str(tmp_path / "codex"),
             cwd=tmp_path,
-            codex_home=codex_home,
+            codex_home=tmp_path / "codex-home",
             os_env=OSEnvSpec(
                 sandbox=OSEnvSandboxSpec(
                     type="darwin_seatbelt",
@@ -605,7 +594,7 @@ def test_brokered_gateway_command_source_is_rejected_before_worker_start(
     assert worker_env == {"PATH": os.environ["PATH"], BROKERED_CODEX_ENV: "1"}
     start_proxy.assert_not_called()
     create_launcher.assert_not_called()
-    assert not egress_tmpdir.exists()
+    create_tmpdir.assert_not_called()
     assert not marker.exists()
 
 

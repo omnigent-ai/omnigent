@@ -55,8 +55,10 @@ def test_create_app_returns_fastapi_with_required_routes() -> None:
     assert "/v1/sessions/{conversation_id}/events" in paths
 
 
+@pytest.mark.parametrize("brokered_gateway", [False, True])
 def test_executor_factory_reads_env_vars(
     monkeypatch: pytest.MonkeyPatch,
+    brokered_gateway: bool,
 ) -> None:
     """Factory passes env-var values through to CodexExecutor.
 
@@ -64,7 +66,7 @@ def test_executor_factory_reads_env_vars(
     process before spawning the subprocess (which inherits
     them) are how the wrap learns its config. Verifies model,
     databricks, profile, cwd, codex_path, web_search,
-    disable_native_tools all thread through.
+    disable_native_tools, and brokered_gateway all thread through.
     """
     monkeypatch.setenv("HARNESS_CODEX_MODEL", "test-model-id")
     monkeypatch.setenv("HARNESS_CODEX_GATEWAY", "true")
@@ -81,6 +83,10 @@ def test_executor_factory_reads_env_vars(
     monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
     monkeypatch.setenv("HARNESS_CODEX_ENABLE_WEB_SEARCH", "false")
     monkeypatch.setenv("HARNESS_CODEX_DISABLE_NATIVE_TOOLS", "true")
+    if brokered_gateway:
+        monkeypatch.setenv("HARNESS_CODEX_BROKERED_GATEWAY", "true")
+    else:
+        monkeypatch.delenv("HARNESS_CODEX_BROKERED_GATEWAY", raising=False)
 
     captured: dict[str, Any] = {}
 
@@ -99,6 +105,7 @@ def test_executor_factory_reads_env_vars(
         gateway_auth_refresh_interval_ms: str | None,
         enable_web_search: bool,
         disable_native_tools: bool,
+        brokered_gateway: bool,
         **_kwargs: Any,
     ) -> None:
         captured["cwd"] = cwd
@@ -113,6 +120,7 @@ def test_executor_factory_reads_env_vars(
         captured["gateway_auth_refresh_interval_ms"] = gateway_auth_refresh_interval_ms
         captured["enable_web_search"] = enable_web_search
         captured["disable_native_tools"] = disable_native_tools
+        captured["brokered_gateway"] = brokered_gateway
 
     with patch(
         "omnigent.inner.codex_harness.CodexExecutor.__init__",
@@ -137,6 +145,7 @@ def test_executor_factory_reads_env_vars(
     # default is False, we set "true" → expect True.
     assert captured["enable_web_search"] is False
     assert captured["disable_native_tools"] is True
+    assert captured["brokered_gateway"] is brokered_gateway
     # Default os_env when no HARNESS_CODEX_OS_ENV is set: the
     # parity-preserving caller_process + sandbox=none.
     os_env_value = captured["os_env"]
