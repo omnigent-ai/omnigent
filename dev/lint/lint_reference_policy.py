@@ -1,4 +1,8 @@
-"""Check added text and paths against the repository reference policy."""
+"""Check added text and paths against the repository reference policy.
+
+Inside EXISTING_REFERENCE_SCOPE, added text and paths may reuse a reference that the
+scope already contains at the base revision; new references are still reported.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +15,8 @@ from bisect import bisect_right
 from pathlib import Path
 
 POLICY_FILES = frozenset({"dev/lint/lint_reference_policy.py"})
+# Desktop shell paths; entries ending in "/" are directories.
+EXISTING_REFERENCE_SCOPE = ("web/electron/", "web/src/lib/nativeBridge.ts")
 PROHIBITED_NAMES = frozenset(
     {
         "arca",
@@ -56,36 +62,88 @@ def host_pattern(suffixes: tuple[str, ...]) -> re.Pattern[str]:
 HOST = host_pattern(HOST_SUFFIXES)
 
 
-def _violation_lines(text: str) -> set[int]:
-    """Return LF-based locations, including phrases that wrap across lines."""
+def _line_references(text: str) -> dict[int, set[tuple[str, str]]]:
+    """Map LF-based line numbers, including wrapped phrases, to normalized references."""
     words = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
     words = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", words)
-    lines = set()
+    references: dict[int, set[tuple[str, str]]] = {}
     original_lines = text.split("\n")
     for line_number, normalized in enumerate(words.split("\n"), 1):
-        if PROHIBITED_NAMES.intersection(re.findall(r"[a-z]+", normalized.lower())) or any(
-            match.group().lower() not in PUBLIC_HOSTS
-            for match in HOST.finditer(original_lines[line_number - 1])
-        ):
-            lines.add(line_number)
+        line_references = {
+            ("name", name)
+            for name in PROHIBITED_NAMES.intersection(re.findall(r"[a-z]+", normalized.lower()))
+        }
+        for match in HOST.finditer(original_lines[line_number - 1]):
+            host = match.group().lower()
+            if host not in PUBLIC_HOSTS:
+                line_references.add(("host", host))
+        if line_references:
+            references[line_number] = line_references
     line_starts = [0, *(match.end() for match in re.finditer("\n", words))]
     position = 0
     while match := PHRASES.search(words, position):
+        # PHRASES treats case and space, underscore, and hyphen separators alike.
+        phrase = ("phrase", re.sub(r"[\s_-]+", "", match.group().lower()))
         first_line = bisect_right(line_starts, match.start())
         for offset, segment in enumerate(match.group().split("\n")):
             if segment.strip():
-                lines.add(first_line + offset)
+                references.setdefault(first_line + offset, set()).add(phrase)
         position = match.start() + 1
-    return lines
+    return references
 
 
 def violates(text: str) -> bool:
     """Match names in prose, snake_case, camelCase, and filenames."""
-    return bool(_violation_lines(text))
+    return bool(_line_references(text))
+
+
+def in_existing_reference_scope(path: str) -> bool:
+    return any(
+        path.startswith(entry) if entry.endswith("/") else path == entry
+        for entry in EXISTING_REFERENCE_SCOPE
+    )
 
 
 def git(root: Path, *args: str) -> bytes:
     return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True).stdout
+
+
+def existing_scope_references(root: Path, revision: str) -> set[tuple[str, str]]:
+    """Return references in scope paths and text blobs at a revision."""
+    entries = git(root, "ls-tree", "-r", "-z", revision, "--", *EXISTING_REFERENCE_SCOPE)
+    references: set[tuple[str, str]] = set()
+    object_ids = []
+    for entry in entries.split(b"\0"):
+        if not entry:
+            continue
+        metadata, path = entry.split(b"\t", 1)
+        for line_references in _line_references(os.fsdecode(path)).values():
+            references |= line_references
+        _mode, object_type, object_id = metadata.split()
+        if object_type == b"blob":
+            object_ids.append(object_id)
+    if not object_ids:
+        return references
+    output = subprocess.run(
+        ["git", "cat-file", "--batch"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        input=b"".join(object_id + b"\n" for object_id in object_ids),
+    ).stdout
+    position = 0
+    while position < len(output):
+        header_end = output.index(b"\n", position)
+        size = int(output[position:header_end].split()[2])
+        contents = output[header_end + 1 : header_end + 1 + size]
+        position = header_end + 2 + size
+        if b"\0" in contents[:8000]:
+            continue
+        for line_references in _line_references(
+            contents.decode("utf-8", errors="replace")
+        ).values():
+            references |= line_references
+    return references
 
 
 def check(root: Path, base: str | None = None, head: str | None = None) -> list[str]:
@@ -93,10 +151,11 @@ def check(root: Path, base: str | None = None, head: str | None = None) -> list[
     if head and not base:
         raise ValueError("--head requires --base")
     revisions = ["--cached"]
+    base_revision = "HEAD"
     if base:
         target = head or "HEAD"
-        ancestor = git(root, "merge-base", base, target).decode().strip()
-        revisions = [ancestor, target]
+        base_revision = git(root, "merge-base", base, target).decode().strip()
+        revisions = [base_revision, target]
     options = ["--no-ext-diff", "--no-textconv", "--no-color"]
     entries = iter(
         git(
@@ -113,6 +172,14 @@ def check(root: Path, base: str | None = None, head: str | None = None) -> list[
         ).split(b"\0")
     )
     findings = []
+    scope_references: set[tuple[str, str]] | None = None
+
+    def new_to_scope(references: set[tuple[str, str]]) -> bool:
+        nonlocal scope_references
+        if scope_references is None:
+            scope_references = existing_scope_references(root, base_revision)
+        return not references <= scope_references
+
     for metadata in entries:
         if not metadata:
             break
@@ -122,16 +189,21 @@ def check(root: Path, base: str | None = None, head: str | None = None) -> list[
         path = os.fsdecode(next(entries)) if renamed else old_path
         if path in POLICY_FILES:
             continue
-        if (status == b"A" or renamed) and violates(path):
-            findings.append(f"{path}:1: prohibited reference in new path")
+        in_scope = in_existing_reference_scope(path)
+        scope_note = " (new to the existing-reference scope)" if in_scope else ""
+        if status == b"A" or renamed:
+            path_references = set().union(*_line_references(path).values())
+            if path_references and (not in_scope or new_to_scope(path_references)):
+                findings.append(f"{path}:1: prohibited reference in new path{scope_note}")
         if mode == b"160000":
             continue
         contents = git(root, "cat-file", "blob", object_id.decode())
         if b"\0" in contents[:8000]:
             continue
-        violation_lines = _violation_lines(contents.decode("utf-8", errors="replace"))
-        if not violation_lines:
+        line_references = _line_references(contents.decode("utf-8", errors="replace"))
+        if not line_references:
             continue
+        violation_lines = set(line_references)
         if status == b"A" or old_mode == b"160000" or old_path in POLICY_FILES:
             added_lines = violation_lines
         else:
@@ -158,8 +230,9 @@ def check(root: Path, base: str | None = None, head: str | None = None) -> list[
                 elif line_number is not None and line.startswith(" "):
                     line_number += 1
         findings.extend(
-            f"{path}:{line_number}: prohibited reference in added text"
+            f"{path}:{line_number}: prohibited reference in added text{scope_note}"
             for line_number in sorted(violation_lines & added_lines)
+            if not in_scope or new_to_scope(line_references[line_number])
         )
     return findings
 

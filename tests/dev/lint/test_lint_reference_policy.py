@@ -406,3 +406,146 @@ def test_hook_and_ci_enforce_policy(repository: Path, prohibited_name: str, base
         assert result.returncode == 1
         assert "notes.txt:1: prohibited reference" in result.stdout
         assert "upstream.txt" not in result.stdout
+
+
+def _write(repository: Path, files: dict[str, str | bytes]) -> None:
+    for name, contents in files.items():
+        path = repository / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(contents, bytes):
+            path.write_bytes(contents)
+        else:
+            path.write_text(contents, encoding="utf-8")
+    git(repository, "add", ".")
+
+
+SCOPE_MODULE_TEXT = (
+    "const sampletool = require('./sampletool_auth');\n"
+    "const url = 'https://tenant.service.example.test/';\n"
+    "// exampleRestricted\n"
+    "keep\n"
+)
+
+
+@pytest.fixture
+def desktop_repository(repository: Path) -> Path:
+    # Scope text: sampletool, one host, one phrase. Outside or binary only: sampletools, demotool.
+    _write(
+        repository,
+        {
+            "web/electron/src/sampletool_auth.js": SCOPE_MODULE_TEXT,
+            "web/electron/assets/icon.bin": b"\x00demotool\n",
+            "web/src/lib/nativeBridge.ts": "export const bridge = {};\n",
+            "docs/notes.md": "sampletools\n",
+        },
+    )
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "desktop")
+    return repository
+
+
+def _check_staged_or_range(repository: Path, mode: str) -> list[str]:
+    if mode == "staged":
+        return check(repository)
+    base = git(repository, "rev-parse", "HEAD").decode().strip()
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "change")
+    return check(repository, base, "HEAD")
+
+
+@pytest.mark.parametrize("mode", ["staged", "range"])
+@pytest.mark.usefixtures("sample_policy")
+def test_existing_reference_scope_allows_references_already_in_scope(
+    desktop_repository: Path, mode: str
+) -> None:
+    git(
+        desktop_repository,
+        "mv",
+        "web/electron/src/sampletool_auth.js",
+        "web/electron/src/sampletool_auth.ts",
+    )
+    _write(
+        desktop_repository,
+        {
+            "web/electron/src/sampletool_auth.ts": (
+                f"{SCOPE_MODULE_TEXT}export const useSampletoolHost = sampletool;\n"
+                "const again = 'https://TENANT.service.example.test/';\n"
+                "// example_restricted\n"
+            ),
+            "web/electron/src/sampletool/new_module.ts": "// Example restricted sampletool\n",
+            "web/src/lib/nativeBridge.ts": "export const bridge = { sampletool: true };\n",
+        },
+    )
+    renames = git(desktop_repository, "diff", "--cached", "--find-renames", "--name-status")
+    assert re.search(rb"^R\d+\tweb/electron/src/sampletool_auth\.js\t", renames, re.MULTILINE)
+    assert _check_staged_or_range(desktop_repository, mode) == []
+
+
+@pytest.mark.parametrize("mode", ["staged", "range"])
+@pytest.mark.usefixtures("sample_policy")
+def test_existing_reference_scope_reports_references_new_to_scope(
+    desktop_repository: Path, mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        policy,
+        "PHRASES",
+        re.compile(r"example[\s_-]*restricted|restricted[\s_-]*example", re.IGNORECASE),
+    )
+    _write(
+        desktop_repository,
+        {
+            "web/electron/src/sampletool_auth.js": (
+                f"{SCOPE_MODULE_TEXT}const demotool = sampletool;\n"
+                "const sampletools = [];\n"
+                "const other = 'https://other.service.example.test/';\n"
+                "sampletool();\n"
+                "// restricted example\n"
+            ),
+            "web/electron/src/demotool.ts": "safe\n",
+            "web/src/lib/nativeBridge.ts": "export const bridge = { sampletools: true };\n",
+            "web/src/lib/otherBridge.ts": "export const sampletool = true;\n",
+            "web/electron-extra/sampletool.ts": "safe\n",
+        },
+    )
+    scope_note = " (new to the existing-reference scope)"
+    module = "web/electron/src/sampletool_auth.js"
+    assert sorted(_check_staged_or_range(desktop_repository, mode)) == sorted(
+        [
+            f"{module}:5: prohibited reference in added text{scope_note}",
+            f"{module}:6: prohibited reference in added text{scope_note}",
+            f"{module}:7: prohibited reference in added text{scope_note}",
+            f"{module}:9: prohibited reference in added text{scope_note}",
+            f"web/electron/src/demotool.ts:1: prohibited reference in new path{scope_note}",
+            f"web/src/lib/nativeBridge.ts:1: prohibited reference in added text{scope_note}",
+            "web/src/lib/otherBridge.ts:1: prohibited reference in added text",
+            "web/electron-extra/sampletool.ts:1: prohibited reference in new path",
+        ]
+    )
+
+
+@pytest.mark.usefixtures("sample_policy")
+def test_file_moved_out_of_existing_reference_scope_is_checked_strictly(
+    desktop_repository: Path,
+) -> None:
+    (desktop_repository / "lib").mkdir()
+    git(desktop_repository, "mv", "web/electron/src/sampletool_auth.js", "lib/sampletool_auth.js")
+    _write(desktop_repository, {"lib/sampletool_auth.js": f"{SCOPE_MODULE_TEXT}sampletool();\n"})
+    renames = git(desktop_repository, "diff", "--cached", "--find-renames", "--name-status")
+    assert renames.startswith(b"R")
+    assert check(desktop_repository) == [
+        "lib/sampletool_auth.js:1: prohibited reference in new path",
+        "lib/sampletool_auth.js:5: prohibited reference in added text",
+    ]
+
+
+@pytest.mark.usefixtures("sample_policy")
+def test_existing_reference_scope_is_read_lazily(
+    desktop_repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected_read(root: Path, revision: str) -> set[tuple[str, str]]:
+        raise AssertionError("scope references read without an in-scope finding")
+
+    monkeypatch.setattr(policy, "existing_scope_references", unexpected_read)
+    _write(
+        desktop_repository,
+        {"web/electron/src/clean.ts": "safe\n", "docs/notes.md": "sampletools\nsampletool\n"},
+    )
+    assert check(desktop_repository) == ["docs/notes.md:2: prohibited reference in added text"]
