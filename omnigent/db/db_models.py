@@ -1524,6 +1524,10 @@ class SqlScheduledTask(OmnigentBase):
         that support one (Claude Code), e.g. ``"acceptEdits"``. The fire path
         turns it into the runner's ``--permission-mode`` launch arg. ``None``
         means use the agent default.
+    :param share_with: JSON list of ``{"user_id", "level"}`` grants written on
+        every session a run creates, e.g.
+        ``[{"user_id": "team.engineering", "level": 1}]``. ``None`` keeps runs
+        private to the owner.
     :param workspace: Absolute path on disk where a fired session's runner
         should start (the source repo / working dir). ``None`` when unset.
     :param base_branch: Git base ref a firing branches FROM when it creates a
@@ -1609,6 +1613,9 @@ class SqlScheduledTask(OmnigentBase):
     permission_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # JSON list of MCP service names every fired session starts with. NULL = none.
     mcp_services: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    # JSON list of {"user_id", "level"} grants added to every session a run
+    # creates. NULL = runs stay private to the owner. The store caps it in bytes.
+    share_with: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     # Per-firing cost budget in USD. When set, the fire path attaches a
     # cost_budget policy to each spawned session. NULL = no per-firing cap.
     max_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)

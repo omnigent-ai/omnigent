@@ -40,6 +40,7 @@ _MCP_SERVICES_PREVIOUS = "1ad1db53f99d"
 _MCP_SERVICES_REVISION = "f2c6a9d1b3e8"
 _COMMENT_ANCHOR_REVISION = "f9b3e6c2a401"
 _MCP_SERVICES_MERGE_REVISION = "a7d4c2e9f610"
+_SHARE_WITH_REVISION = "57d10bb63551"
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -93,6 +94,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     assert columns["session_id"]["nullable"] is True
     assert columns["source_session_id"]["nullable"] is True
     assert columns["mcp_services"]["nullable"] is True
+    assert columns["share_with"]["nullable"] is True
     cols = set(columns)
     assert cols == {
         "workspace_id",
@@ -107,6 +109,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "reasoning_effort",
         "permission_mode",
         "mcp_services",
+        "share_with",
         "max_cost_usd",
         "workspace",
         "base_branch",
@@ -935,14 +938,23 @@ def test_session_mode_migration_defaults_existing_tasks_and_round_trips(
     }
 
 
-def test_mcp_services_migration_keeps_existing_tasks_and_round_trips(
-    dispatch_migration_engine: Engine,
+@pytest.mark.parametrize(
+    ("previous", "revision", "column"),
+    [
+        (_MCP_SERVICES_PREVIOUS, _MCP_SERVICES_REVISION, "mcp_services"),
+        (_MCP_SERVICES_MERGE_REVISION, _SHARE_WITH_REVISION, "share_with"),
+    ],
+    ids=["mcp_services", "share_with"],
+)
+def test_json_list_migration_keeps_existing_tasks_and_round_trips(
+    dispatch_migration_engine: Engine, previous: str, revision: str, column: str
 ) -> None:
+    """A nullable JSON-list column leaves existing tasks NULL and holds its widest value."""
     engine = dispatch_migration_engine
     config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
     # Later migrations open their own autocommit blocks on PostgreSQL, so this
     # upgrade cannot run inside an outer transaction.
-    command.upgrade(config, _MCP_SERVICES_PREVIOUS)
+    command.upgrade(config, previous)
     values = {
         "name": "nightly",
         "prompt": b"p",
@@ -956,28 +968,28 @@ def test_mcp_services_migration_keeps_existing_tasks_and_round_trips(
         conn.execute(before.insert().values(id=b"a" * 16, **values))
     with engine.begin() as conn:
         config.attributes["connection"] = conn
-        command.upgrade(config, _MCP_SERVICES_REVISION)
+        command.upgrade(config, revision)
     tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
     widest = '["' + "x" * 4092 + '"]'
     with engine.begin() as conn:
-        # A task saved before the migration starts its runs with no MCP selection.
-        assert conn.execute(sa.select(tasks.c.mcp_services)).scalar_one() is None
-        conn.execute(tasks.insert().values(id=b"b" * 16, mcp_services=widest, **values))
+        # A task saved before the migration keeps the column NULL (no selection, no shares).
+        assert conn.execute(sa.select(tasks.c[column])).scalar_one() is None
+        conn.execute(tasks.insert().values(id=b"b" * 16, **{column: widest}, **values))
         stored = conn.execute(
-            sa.select(tasks.c.mcp_services).where(tasks.c.id == b"b" * 16)
+            sa.select(tasks.c[column]).where(tasks.c.id == b"b" * 16)
         ).scalar_one()
     assert stored == widest
     with engine.begin() as conn:
         config.attributes["connection"] = conn
-        command.downgrade(config, _MCP_SERVICES_PREVIOUS)
+        command.downgrade(config, previous)
     columns = {c["name"] for c in sa.inspect(engine).get_columns("scheduled_tasks")}
-    assert "mcp_services" not in columns
+    assert column not in columns
     with engine.begin() as conn:
         assert conn.execute(sa.select(sa.func.count()).select_from(before)).scalar_one() == 2
         config.attributes["connection"] = conn
-        command.upgrade(config, _MCP_SERVICES_REVISION)
+        command.upgrade(config, revision)
     with engine.begin() as conn:
-        assert conn.execute(sa.select(tasks.c.mcp_services)).scalars().all() == [None, None]
+        assert conn.execute(sa.select(tasks.c[column])).scalars().all() == [None, None]
 
 
 @pytest.mark.parametrize(
