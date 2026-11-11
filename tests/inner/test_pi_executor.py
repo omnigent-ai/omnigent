@@ -1,6 +1,7 @@
 """Tests for PiExecutor."""
 
 import asyncio
+import base64
 import contextlib
 import itertools
 import json
@@ -12,6 +13,7 @@ import socket
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
@@ -53,7 +55,6 @@ from omnigent.models.model_catalog import ModelEntry
 from omnigent.models.model_metadata import ModelCapability, ModelMetadata, ModelWireAPI
 from omnigent.onboarding.providers import ModelInfo
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
-from tests._helpers.polling import poll_until_async
 
 
 def _cancel_all_tasks(loop):
@@ -1861,10 +1862,11 @@ class TestPiExecutorConstructor(unittest.TestCase):
             _run(executor._get_gateway_token())
 
         read_cfg.assert_not_called()
-        from omnigent.inner.pi_executor import _GATEWAY_AUTH_TIMEOUT_S
+        from omnigent.inner.pi_executor import _GATEWAY_TURN_AUTH_TIMEOUT_S
 
+        # The refresh owns its task, so a bridge request's short wait does not bound the helper.
         fetch_command_token.assert_awaited_once_with(
-            "printf token", timeout_s=_GATEWAY_AUTH_TIMEOUT_S
+            "printf token", timeout_s=_GATEWAY_TURN_AUTH_TIMEOUT_S
         )
         self.assertEqual(executor._databricks_host, "https://example.databricks.com")
         self.assertEqual(executor._databricks_token, "command-token")
@@ -2468,83 +2470,80 @@ async def test_gateway_refresh_before_turn_outlasts_the_bridge_deadline(monkeypa
     assert await executor._get_gateway_token(before_turn=True) == "slow-token"
 
 
-@pytest.mark.parametrize("renewal", ["slow", "failing", "hanging", "late"])
-async def test_gateway_renews_aging_token_outside_the_bridge_deadline(
-    tmp_path, monkeypatch, renewal
+def _jwt_expiring_in(seconds: float) -> str:
+    claims = base64.urlsafe_b64encode(json.dumps({"exp": time.time() + seconds}).encode())
+    return f"unsigned.{claims.rstrip(b'=').decode()}.not-verified"
+
+
+@pytest.mark.parametrize(("old_lifetime_s", "reused"), [(600, True), (10, False), (None, False)])
+async def test_gateway_slow_refresh_reuses_only_an_unexpired_token(
+    tmp_path, monkeypatch, old_lifetime_s, reused
 ):
-    # A renewal slower than Pi's bridge budget (a slow workspace) must still reach Pi,
-    # while a failed one leaves the cached token usable only until its lifetime ends.
-    # A renewal must also end before expiry so the bridge can then refresh on its own.
+    # A workspace too slow to renew the token within Pi's command deadline must not fail
+    # the request while the cached token's exp claim leaves it valid.
     from omnigent.inner import pi_executor
 
-    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.1)
-    monkeypatch.setattr(pi_executor, "_GATEWAY_BRIDGE_TIMEOUT_S", 3)
+    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.2)
     monkeypatch.setattr(pi_executor, "_GATEWAY_TURN_AUTH_TIMEOUT_S", 5)
-    runs = shlex.quote(str(tmp_path / "helper runs"))
-    pid_file = tmp_path / "renewal pid"
-    hang = f"echo $$ > {shlex.quote(str(pid_file))}; sleep 30 & wait"
-    renewal_command = {
-        "slow": "sleep 0.5; printf renewed",
-        "failing": "exit 1",
-        "hanging": hang,
-        "late": f"if [ $(wc -l < {runs}) -eq 2 ]; then {hang}; else printf renewed; fi",
-    }[renewal]
+    old = "opaque-token" if old_lifetime_s is None else _jwt_expiring_in(old_lifetime_s)
+    new = _jwt_expiring_in(3600)
+    token_file, delay_file, runs_file = tmp_path / "token", tmp_path / "delay", tmp_path / "runs"
+    token_file.write_text(old)
+    delay_file.write_text("0")
+    files = {
+        name: shlex.quote(str(path))
+        for name, path in [("token", token_file), ("delay", delay_file), ("runs", runs_file)]
+    }
     executor = PiExecutor(
         pi_path="/usr/bin/pi",
         gateway=True,
         gateway_host="https://example.test",
         gateway_auth_command=(
-            f"echo >> {runs}; if [ $(wc -l < {runs}) -eq 1 ]; then printf first; "
-            f"else {renewal_command}; fi"
+            f"echo run >> {files['runs']}; sleep $(cat {files['delay']}); cat {files['token']}"
         ),
+        gateway_auth_refresh_interval_ms="0",
     )
-    now = 100.0
-    monkeypatch.setattr(pi_executor, "time", SimpleNamespace(monotonic=lambda: now))
-    port = await executor._ensure_tool_server([])
-
-    async def request_credential() -> dict[str, str]:
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        request = {"kind": "gateway_auth", "token": executor._tool_server.token}
-        writer.write(json.dumps(request).encode() + b"\n")
-        await writer.drain()
-        response = json.loads(await reader.readline())
-        writer.close()
-        await writer.wait_closed()
-        return response
-
-    def renewal_helper_exited() -> bool:
-        try:
-            os.kill(int(pid_file.read_text()), 0)
-        except ProcessLookupError:
-            return True
-        return False
-
     try:
-        assert await executor._get_gateway_token(before_turn=True) == "first"
-        # Both ages are past half of the default 15-minute cache lifetime.
-        age = 897 if renewal == "late" else 451
-        now += age
-        assert await request_credential() == {"token": "first"}
-        if renewal in ("hanging", "late"):
-            await poll_until_async(lambda: pid_file.exists() and pid_file.read_text(), timeout_s=3)
-        if renewal == "hanging":
-            await asyncio.wait_for(executor.close(), 3)
-            assert renewal_helper_exited()
-            return
-        if renewal == "late":
-            await poll_until_async(renewal_helper_exited, timeout_s=900 - age)
-        now += 900 - age  # the first token's cache lifetime has ended
-        expected = (
-            {"token": "renewed"}
-            if renewal in ("slow", "late")
-            else {"error": "Pi gateway auth command failed"}
-        )
-        assert await request_credential() == expected
-        assert len((tmp_path / "helper runs").read_text().splitlines()) == (
-            2 if renewal == "slow" else 3
-        )
+        assert await executor._get_gateway_token(before_turn=True) == old
+        token_file.write_text(new)
+        delay_file.write_text("1")
+        if reused:
+            assert await executor._get_gateway_token() == old
+        else:
+            with pytest.raises(OSError, match="timed out"):
+                await executor._get_gateway_token()
+        # The slow helper was not killed: its token answers the next request.
+        assert await executor._get_gateway_token(before_turn=True) == new
+        assert runs_file.read_text().count("run") == 2
     finally:
         await executor.close()
+
+
+@pytest.mark.parametrize(("lifetime_s", "renew_after_s"), [(600, 300), (120, 30), (7200, 900)])
+async def test_gateway_renews_a_token_before_it_expires(monkeypatch, lifetime_s, renew_after_s):
+    # The Databricks CLI renews a token only near its expiry, so a fixed cache interval
+    # could outlive the token and leave a slow renewal nothing valid to reuse.
+    from omnigent.inner import pi_executor
+
+    fetch = AsyncMock(return_value=_jwt_expiring_in(lifetime_s))
+    monkeypatch.setattr(pi_executor, "_fetch_shell_command_token", fetch)
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command="get-token",
+    )
+    monkeypatch.setattr(
+        pi_executor, "time", SimpleNamespace(monotonic=lambda: now, time=time.time)
+    )
+    now = 100.0
+    await executor._get_gateway_token()
+    now += renew_after_s - 1
+    await executor._get_gateway_token()
+    assert fetch.await_count == 1
+    now += 2
+    await executor._get_gateway_token()
+    assert fetch.await_count == 2
 
 
 async def test_gateway_bridge_authenticates_and_cancels_helper_on_shutdown(tmp_path):
