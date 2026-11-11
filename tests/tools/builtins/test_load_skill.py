@@ -399,21 +399,18 @@ def test_load_skill_tool_accepts_namespaced_alias(tmp_path: Path, tool_ctx: Tool
     assert result == "Review the brand."
 
 
-def test_skill_paste_omits_resource_listing_but_tool_keeps_it(
-    skill_with_resources: SkillSpec,
-    tool_ctx: ToolContext,
-) -> None:
-    from omnigent.tools.builtins.load_skill import format_skill_meta_text
+def test_skill_context_reuse_covers_resource_listing(skill_with_resources: SkillSpec) -> None:
+    from omnigent.tools.builtins.load_skill import format_skill_meta_text, reuse_skill_context
 
-    pasted = format_skill_meta_text(skill_with_resources, "review this change")
-    assert pasted == (
-        "<skill>\n<name>code-review</name>\n"
-        f"<path>{skill_with_resources.skill_dir / 'SKILL.md'}</path>\n"
-        "Review the code.\n</skill>\n\n<user_request>\nreview this change\n</user_request>"
-    )
-    loaded = LoadSkillTool([skill_with_resources]).invoke('{"name":"code-review"}', tool_ctx)
-    assert "Review the code." in loaded
-    assert "references/style-guide.md" in loaded
+    first = format_skill_meta_text(skill_with_resources, "first request")
+    assert "references/style-guide.md" in first
+    messages = [
+        {"type": "message", "role": "user", "skill_expansion": True, "content": text}
+        for text in (first, format_skill_meta_text(skill_with_resources, "second request"))
+    ]
+    repeat = reuse_skill_context(messages)[1]["content"]
+    assert "references/style-guide.md" not in repeat
+    assert repeat.endswith("<user_request>\nsecond request\n</user_request>")
 
 
 @pytest.mark.parametrize(

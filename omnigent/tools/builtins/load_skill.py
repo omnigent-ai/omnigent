@@ -293,15 +293,32 @@ def find_skill_by_name(skills: list[SkillSpec], name: str) -> SkillSpec | None:
 
 
 def format_skill_meta_text(skill: SkillSpec, arguments: str) -> str:
-    """Build a full skill expansion using paths on the runner filesystem.
-
-    Auxiliary files remain available through ``load_skill`` and ``read_skill_file``.
-    Every invocation retains its arguments, independently of instruction reuse.
     """
+    Build the hidden user-message text injected for a skill invocation.
+
+    The format follows Codex's durable skill wrapper: the complete
+    skill content is enclosed in ``<skill>`` so clients can identify
+    it later, and slash-command arguments are appended in a separate
+    ``<user_request>`` block so the agent sees the actual request.
+
+    The embedded ``<path>`` and the resource listing are resolved
+    against ``skill.skill_dir``, so this MUST run on the host where the
+    harness executes (the runner) — the paths are read at runtime by
+    the ``read_skill_file`` tool, which resolves relative to the same
+    ``skill_dir``.
+
+    :param skill: Skill being invoked, e.g. ``SkillSpec(name="grill-me",
+        ...)``.
+    :param arguments: Raw arguments typed after the slash command,
+        e.g. ``"review this plan"``. Empty string when none.
+    :returns: Hidden message text for a single ``input_text`` block.
+    """
+    resource_files = list_skill_resources(skill)
+    content = format_skill_content(skill, resource_files)
     lines = ["<skill>", f"<name>{skill.name}</name>"]
     if skill.skill_dir is not None:
         lines.append(f"<path>{skill.skill_dir / 'SKILL.md'}</path>")
-    lines.extend([skill.content, "</skill>"])
+    lines.extend([content, "</skill>"])
     if arguments:
         lines.extend(["", "<user_request>", arguments, "</user_request>"])
     return "\n".join(lines)
