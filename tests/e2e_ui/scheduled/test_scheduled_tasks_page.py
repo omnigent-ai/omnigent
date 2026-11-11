@@ -18,6 +18,7 @@ never exercised.
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
@@ -399,7 +400,7 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     agent_trigger = page.get_by_test_id("task-agent-picker").get_by_test_id(
         "new-chat-landing-agent-select"
     )
-    expect(agent_trigger).to_contain_text("Claude Code", timeout=30_000)
+    expect(agent_trigger).to_have_accessible_name(_agent_name("Claude Code"), timeout=30_000)
     agent_trigger.click()
     page.get_by_role("menuitem").filter(has_text="Claude Code").click()
     expect(page.get_by_test_id("schedule-preset-trigger")).to_contain_text("Every day")
@@ -551,7 +552,7 @@ def _open_create_dialog(page: Page) -> None:
     agent_trigger = page.get_by_test_id("task-agent-picker").get_by_test_id(
         "new-chat-landing-agent-select"
     )
-    expect(agent_trigger).to_contain_text("Claude Code", timeout=30_000)
+    expect(agent_trigger).to_have_accessible_name(_agent_name("Claude Code"), timeout=30_000)
 
 
 def _pick_select_option(page: Page, trigger_test_id: str, option_label: str) -> None:
@@ -568,6 +569,17 @@ def _pick_select_option(page: Page, trigger_test_id: str, option_label: str) -> 
     """
     page.get_by_test_id(trigger_test_id).click()
     page.get_by_role("option", name=option_label, exact=True).click()
+
+
+def _agent_name(agent_label: str) -> re.Pattern[str]:
+    """Match the agent picker trigger's accessible name, which starts with the agent.
+
+    Its visible text shows the model and effort once the catalog has a default, as
+    in the composer, so tests identify the agent by the accessible name instead.
+
+    :param agent_label: The agent's display name, e.g. ``"Claude Code"``.
+    """
+    return re.compile(rf"^{re.escape(agent_label)}(,|$)")
 
 
 def _agent_trigger(page: Page) -> Locator:
@@ -592,10 +604,13 @@ def _open_agent_settings(page: Page) -> None:
 
 
 def _close_agent_settings(page: Page) -> None:
-    """Close the flyout and the picker menu with Escape, keeping the dialog open."""
-    page.keyboard.press("Escape")
+    """Close the flyout and the picker menu with one Escape, keeping the dialog open.
+
+    The dialog's capture-phase Escape handler closes the whole agent menu at once.
+    """
     page.keyboard.press("Escape")
     expect(page.get_by_role("menu")).to_have_count(0)
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible()
 
 
 def _pick_agent_setting(page: Page, section_test_id: str, option_label: str) -> None:
@@ -696,28 +711,6 @@ def test_scheduled_task_custom_schedule_round_trip(page: Page, automations_v2_se
     assert response.json()["timezone"] == "Asia/Singapore"
 
 
-def test_scheduled_task_model_effort_controls_visible_for_capable_agent(
-    page: Page,
-    live_server: str,
-) -> None:
-    """Claude Code offers model, effort, and permission settings; a new task starts on Auto."""
-    _open_automations_page(page, live_server)
-    _open_create_dialog(page)
-
-    expect(_agent_trigger(page)).to_contain_text("Claude Code", timeout=30_000)
-    permission_trigger = page.get_by_test_id("task-permission-trigger")
-    expect(permission_trigger).to_be_visible()
-    expect(permission_trigger).to_have_text("Auto")
-    _open_agent_settings(page)
-    expect(page.get_by_test_id("task-agent-model-default")).to_have_attribute(
-        "aria-checked", "true"
-    )
-    expect(page.get_by_test_id("task-agent-effort-default")).to_have_attribute(
-        "aria-checked", "true"
-    )
-    _close_agent_settings(page)
-
-
 @pytest.mark.parametrize(
     ("agent_name", "has_settings"),
     [("codex-native-ui", True), ("hello_world", False)],
@@ -801,6 +794,27 @@ def test_scheduled_task_create_persists_model_and_effort(
     assert created["host_id"] == claude_ready_host.host_id, created
     assert created["model_override"] == selected_model["id"], created
     assert created["reasoning_effort"] == "high", created
+
+
+def test_scheduled_task_model_effort_controls_visible_for_capable_agent(
+    page: Page,
+    live_server: str,
+) -> None:
+    """Claude Code offers model, effort, and permission settings; a new task starts on Auto."""
+    _open_automations_page(page, live_server)
+    _open_create_dialog(page)
+
+    permission_trigger = page.get_by_test_id("task-permission-trigger")
+    expect(permission_trigger).to_be_visible()
+    expect(permission_trigger).to_have_text("Auto")
+    _open_agent_settings(page)
+    expect(page.get_by_test_id("task-agent-model-default")).to_have_attribute(
+        "aria-checked", "true"
+    )
+    expect(page.get_by_test_id("task-agent-effort-default")).to_have_attribute(
+        "aria-checked", "true"
+    )
+    _close_agent_settings(page)
 
 
 @pytest.mark.usefixtures("online_host")
@@ -907,12 +921,12 @@ def test_scheduled_task_edit_switches_the_harness(
         "new-chat-landing-agent-select"
     )
     # Seeded from the task's own agent, not the first listed one.
-    expect(agent_trigger).to_contain_text("Codex", timeout=30_000)
+    expect(agent_trigger).to_have_accessible_name(_agent_name("Codex"), timeout=30_000)
     agent_trigger.click()
     expect(agent_trigger).to_have_attribute("aria-expanded", "true")
     expect(page.get_by_role("menuitem", name="Codex", exact=True)).to_be_focused()
     page.get_by_role("menuitem").filter(has_text="Claude Code").click()
-    expect(agent_trigger).to_contain_text("Claude Code")
+    expect(agent_trigger).to_have_accessible_name(_agent_name("Claude Code"))
     page.get_by_test_id("create-scheduled-task-submit").click()
 
     expect(dialog).to_be_hidden(timeout=30_000)

@@ -347,7 +347,7 @@ def test_reused_automation_settings(
         ).click()
         expect(page.get_by_test_id("task-picker-session-locked")).to_be_visible()
         expect(page.get_by_test_id("task-agent-model-default")).to_be_disabled()
-        page.keyboard.press("Escape")
+        # One Escape closes the whole agent menu, flyout included.
         page.keyboard.press("Escape")
         expect(page.get_by_role("menu")).to_have_count(0)
         expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible()

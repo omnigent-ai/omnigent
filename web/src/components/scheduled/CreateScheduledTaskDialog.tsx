@@ -372,6 +372,12 @@ export function CreateScheduledTaskDialog({
   const sourcePrefilledRef = useRef(false);
 
   function handleSelectAgent(agent: AvailableAgent) {
+    // The picker's Edit row re-selects the current agent before opening its settings,
+    // so picking the agent already in use must keep the unsaved model, effort and permission.
+    if (agent.id === effectiveAgentId) {
+      setPickedAgentId(agent.id);
+      return;
+    }
     sourcePrefilledRef.current = true;
     setPickedAgentId(agent.id);
     // Settings belong to their harness. Returning to the edited task's agent

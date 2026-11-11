@@ -119,11 +119,31 @@ vi.mock("@/shell/NewChatDialog", async () => {
   const { useState } = await import("react");
   const { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } =
     await import("@/components/ui/dropdown-menu");
-  // The real picker shows the selected entry's model/effort flyout from its Edit row.
-  function ConfigMenu({ content }: { content: React.ReactNode }) {
-    const [menuOpen, setMenuOpen] = useState(false);
+  // The real picker shows the selected entry's model/effort flyout from its Edit row. Like
+  // it, opening re-selects that entry and reports the menu state to the dialog, which
+  // controls `open`.
+  function ConfigMenu({
+    content,
+    open,
+    onOpenChange,
+    onEdit,
+  }: {
+    content: React.ReactNode;
+    open?: boolean;
+    onOpenChange?: (open: boolean) => void;
+    onEdit: () => void;
+  }) {
+    const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
     return (
-      <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen} modal={false}>
+      <DropdownMenu
+        open={open ?? uncontrolledOpen}
+        onOpenChange={(next) => {
+          if (next) onEdit();
+          setUncontrolledOpen(next);
+          onOpenChange?.(next);
+        }}
+        modal={false}
+      >
         <DropdownMenuTrigger asChild>
           <button type="button" data-testid="picker-config-open">
             edit
@@ -151,7 +171,9 @@ vi.mock("@/shell/NewChatDialog", async () => {
       triggerDetails,
       selectedConfigContent,
       isEntryConfigurable,
+      open,
     }: {
+      open?: boolean;
       onSelectAgent: (a: AvailableAgent) => void;
       onOpenChange?: (open: boolean) => void;
       effectiveAgentId: string | null;
@@ -193,7 +215,19 @@ vi.mock("@/shell/NewChatDialog", async () => {
         )}
       >
         <span>{hasAgents ? agentLabel : "No agents"}</span>
-        {selectedConfigContent != null && <ConfigMenu content={selectedConfigContent} />}
+        {selectedConfigContent != null && (
+          <ConfigMenu
+            content={selectedConfigContent}
+            open={open}
+            onOpenChange={onOpenChange}
+            onEdit={() => {
+              const selected = [...harnessEntries, ...agentEntries].find(
+                (agent) => agent.id === effectiveAgentId,
+              );
+              if (selected) onSelectAgent(selected);
+            }}
+          />
+        )}
         {harnessEntries
           .filter((agent) => agent.name !== "claude-native-ui")
           .map((agent) => (
@@ -602,7 +636,7 @@ describe("prompt-first automation setup", () => {
     );
     const advanced = screen.getByRole("button", { name: "Advanced" });
     expect(advanced).toHaveAttribute("aria-expanded", "false");
-    // The agent picker shows model and effort; Advanced no longer repeats them.
+    // Model and effort appear on the agent picker, not under Advanced.
     expect(pickerDetails()).toBe("Model: Opus, Effort: High");
     expect(advanced).not.toHaveTextContent("Opus");
     fireEvent.change(screen.getByLabelText("Instructions"), {
@@ -2793,8 +2827,9 @@ describe("nested dropdowns do not dismiss the Dialog (isInsidePopper guard)", ()
     renderDialog(onOpenChange);
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Unsaved draft" } });
     for (let attempt = 0; attempt < 2; attempt++) {
-      fireEvent.click(screen.getByTestId("picker-open"));
+      openPickerConfig();
       fireEvent.keyDown(window, { key: "Escape" });
+      expect(screen.queryByTestId("picker-config")).not.toBeInTheDocument();
       expect(screen.getByLabelText("Name")).toHaveValue("Unsaved draft");
       expect(onOpenChange).not.toHaveBeenCalled();
     }

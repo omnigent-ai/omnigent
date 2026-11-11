@@ -151,8 +151,9 @@ to customize.
   mode precede Repeat and Time because both determine the minimum interval. Time
   and timezone are separate controls in the same row. Type a 12-hour or 24-hour time directly; the timezone
   opens its searchable dropdown. Custom schedules use the same typed time input.
-  Advanced starts collapsed and contains Workspace or
-  Repository, Project, model/effort/permission settings, and Ends. Name remains
+  The Agent picker's **Edit** flyout holds Models and Effort, as in the composer,
+  and its trigger shows the picked model and effort. Advanced starts collapsed and
+  contains Workspace or Repository, Project, permission settings, and Ends. Name remains
   required and editable without opening Advanced; changing instructions preserves
   it. Configured overrides are summarized beside Advanced, and invalid
   settings reveal their controls. Escape closes the active selector or folder browser
@@ -168,8 +169,9 @@ to customize.
 - **Creation modal:** click New automation on either tab. Schedule is selected
   by default; use Trigger type to select an integration and reveal its conditions
   and session instructions. Returning to Schedule restores the schedule draft.
-  Choose Run on, Agent, and session mode above Repeat. Expand Advanced to change
-  model, effort, permissions, or an ending; for an integration trigger it also has
+  Choose Run on, Agent, and session mode above Repeat; use the Agent picker's Edit
+  flyout to change model and effort. Expand Advanced to change permissions or an
+  ending; for an integration trigger it also has
   **Start a new session for each match**. With `automations_v2` on a server
   supporting sub-hour schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
@@ -243,9 +245,10 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   that no content overflows, switching tabs keeps the heading aligned, and the
   gallery remains directly clickable.
 - In create and edit setup, select Claude Code, Codex, Pi, and a permission-only
-  harness such as Cursor below Run on. Selecting an agent keeps Advanced collapsed;
-  expand it to check that only supported settings appear, model changes
-  clear unsupported effort choices, and saved selections survive reopening. A new
+  harness such as Cursor below Run on. Selecting an agent keeps Advanced collapsed.
+  Open the agent's Edit flyout and expand Advanced to check that only supported
+  settings appear, model changes clear unsupported effort choices, and saved
+  selections survive closing and reopening the flyout and the dialog. A new
   automation starts Claude on Auto and Codex on Approve for me, because nobody
   approves an unattended run; choosing Default saves no override. Codex also
   offers Full Access and Bypass approvals & sandbox, and Antigravity offers Skip
