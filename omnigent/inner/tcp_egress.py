@@ -11,6 +11,7 @@ import logging
 import os
 import secrets
 import select
+import shlex
 import socket
 import socketserver
 import struct
@@ -24,6 +25,9 @@ from typing import Any, cast
 from . import tcp_egress_wire
 from .datamodel import TcpEgressRoute
 from .tcp_egress_policy import is_blocked_tcp_address, normalize_tcp_egress
+from .tcp_egress_wire import read_exact as _read_exact
+from .tcp_egress_wire import read_frame as _read_frame
+from .tcp_egress_wire import write_frame as _write_frame
 
 logger = logging.getLogger(__name__)
 
@@ -73,39 +77,18 @@ def resolve_pinned_address(route: TcpEgressRoute) -> str:
     return chosen
 
 
-def _read_exact(sock: socket.socket, length: int) -> bytes:
-    data = bytearray()
-    while len(data) < length:
-        chunk = sock.recv(length - len(data))
-        if not chunk:
-            raise TcpEgressDenied("TCP egress request ended early")
-        data.extend(chunk)
-    return bytes(data)
-
-
-def _read_frame(sock: socket.socket) -> tuple[bytes, bytes]:
-    header = _read_exact(sock, 5)
-    length = struct.unpack("!I", header[1:])[0]
-    if length > _MAX_FRAME:
-        raise TcpEgressDenied("TCP egress frame exceeds size limit")
-    return header[:1], _read_exact(sock, length)
-
-
-def _write_frame(sock: socket.socket, kind: bytes, data: bytes) -> None:
-    sock.sendall(kind + struct.pack("!I", len(data)) + data)
-
-
 class _BoundedTcpServer(socketserver.ThreadingMixIn):
     daemon_threads = True
     broker: TcpEgressBroker
 
     def process_request(self, request: Any, client_address: Any) -> None:
         if not self.broker._slots.acquire(blocking=False):
-            request.settimeout(0.25)
+            deadline = time.monotonic() + 0.25
             with contextlib.suppress(OSError, TcpEgressDenied, ValueError):
-                length = struct.unpack("!I", _read_exact(request, 4))[0]
+                length = struct.unpack("!I", _read_exact(request, 4, deadline=deadline))[0]
                 if 1 <= length <= _MAX_REQUEST:
-                    _read_exact(request, length)
+                    _read_exact(request, length, deadline=deadline)
+            request.settimeout(0.25)
             with contextlib.suppress(OSError):
                 request.sendall(b"\x01TCP egress connection limit reached")
             with contextlib.suppress(OSError):
@@ -212,9 +195,14 @@ class TcpEgressBroker:
         self._closed = False
         self._server = _TcpServer(str(socket_path), _TcpHandler)
         self._server.broker = self
-        os.chmod(socket_path, 0o600)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
+        try:
+            os.chmod(socket_path, 0o600)
+            self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+            self._thread.start()
+        except BaseException:
+            self._server.server_close()
+            socket_path.unlink(missing_ok=True)
+            raise
 
     def _dial_pinned(self, pinned_ip: str, port: int) -> socket.socket:
         family = (
@@ -350,8 +338,9 @@ def start_tcp_egress_broker(routes: Sequence[TcpEgressRoute], tmpdir: Path) -> T
 def apply_tcp_egress_env(env: dict[str, str], broker: TcpEgressBroker) -> None:
     """Install a standalone connector in the sandbox scratch directory."""
     helper_path = broker.socket_path.parent / "omnigent-egress-connect"
-    source = Path(tcp_egress_wire.__file__).read_bytes()
-    helper_path.write_bytes(f"#!{sys.executable} -I\n".encode() + source)
+    source = Path(tcp_egress_wire.__file__).read_text()
+    command = shlex.join([sys.executable, "-I", "-c", source])
+    helper_path.write_text(f'#!/bin/sh\nexec {command} "$@"\n')
     os.chmod(helper_path, 0o700)
     env[tcp_egress_wire.SOCKET_ENV] = str(broker.socket_path)
     env[tcp_egress_wire.TOKEN_ENV] = broker.token

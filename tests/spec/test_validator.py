@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TcpEgressRoute
 from omnigent.spec.types import (
     AgentSpec,
     CompactionConfig,
@@ -668,6 +668,23 @@ def test_os_env_egress_rules_accepted_for_seatbelt() -> None:
     egress_errors = [e for e in result.errors if "egress" in e.path]
     assert egress_errors == [], (
         f"egress_rules on seatbelt should pass validation, got: {result.errors}"
+    )
+
+
+@pytest.mark.parametrize("backend", ["linux_bwrap", "darwin_seatbelt"])
+def test_os_env_tcp_egress_cannot_coexist_with_http_rules(backend: str) -> None:
+    spec = _minimal_spec(
+        os_env=_os_env(
+            type=backend,
+            egress_rules=["GET api.example.test/**"],
+            tcp_egress=[TcpEgressRoute("api", "alias.example.test", 8443)],
+        ),
+    )
+    result = validate(spec)
+    assert not result.valid
+    assert any(
+        error.path == "os_env.sandbox.tcp_egress" and "cannot coexist" in error.message
+        for error in result.errors
     )
 
 

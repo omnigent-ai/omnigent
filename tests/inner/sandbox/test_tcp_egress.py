@@ -6,16 +6,19 @@ import ipaddress
 import json
 import logging
 import os
+import select
 import shlex
 import socket
 import socketserver
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,6 +38,7 @@ from omnigent.inner.os_env import create_os_environment
 from omnigent.inner.sandbox import (
     SandboxPolicy,
     _restore_broker_socket_roots,
+    create_exec_launcher,
     get_backend,
     resolve_sandbox,
 )
@@ -45,7 +49,7 @@ from omnigent.inner.tcp_egress import (
     start_tcp_egress_broker,
 )
 from omnigent.inner.tcp_egress_policy import parse_tcp_egress
-from omnigent.inner.tcp_egress_wire import _read_frame
+from omnigent.inner.tcp_egress_wire import read_frame as _read_frame
 from omnigent.inner.terminal import (
     build_terminal_os_env_spec,
     create_terminal_instance,
@@ -118,6 +122,8 @@ def broker_dir() -> Iterator[Path]:
         ("allowed_cidrs", ["10.1.0.0/16;id"]),
         ("allowed_cidrs", ["224.0.0.0/4"]),
         ("allowed_cidrs", ["100.100.100.200/32"]),
+        ("allowed_cidrs", ["100.100.0.0/16"]),
+        ("allowed_cidrs", ["fd00::/16"]),
         ("allowed_cidrs", ["fd00:ec2::/32"]),
     ],
 )
@@ -281,16 +287,16 @@ def test_tcp_broker_rejects_mixed_public_and_private_dns_without_dial(
 def test_tcp_connector_wire_rejects_oversized_and_truncated_frames() -> None:
     sender, receiver = socket.socketpair()
     with sender, receiver:
-        tcp_egress_wire._write_frame(sender, b"O", b"response")
-        assert tcp_egress_wire._read_frame(receiver) == (b"O", b"response")
+        tcp_egress_wire.write_frame(sender, b"O", b"response")
+        assert tcp_egress_wire.read_frame(receiver) == (b"O", b"response")
         with pytest.raises(OSError, match="size limit"):
-            tcp_egress_wire._write_frame(sender, b"I", b"x" * (tcp_egress_wire.MAX_FRAME + 1))
+            tcp_egress_wire.write_frame(sender, b"I", b"x" * (tcp_egress_wire.MAX_FRAME + 1))
         sender.sendall(b"O" + struct.pack("!I", tcp_egress_wire.MAX_FRAME + 1))
         with pytest.raises(OSError, match="size limit"):
-            tcp_egress_wire._read_frame(receiver)
+            tcp_egress_wire.read_frame(receiver)
         sender.shutdown(socket.SHUT_WR)
         with pytest.raises(OSError, match="disconnected"):
-            tcp_egress_wire._read_frame(receiver)
+            tcp_egress_wire.read_frame(receiver)
 
 
 def test_tcp_connector_reports_missing_and_denied_routes(
@@ -355,8 +361,11 @@ def test_tcp_broker_socket_is_not_masked_after_policy_round_trip(tmp_path: Path)
 
 
 def test_tcp_connector_round_trip_and_revocation(
-    tcp_route: TcpEgressRoute, broker_dir: Path
+    tcp_route: TcpEgressRoute, broker_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    interpreter = broker_dir / "python with spaces"
+    interpreter.symlink_to(sys.executable)
+    monkeypatch.setattr(sys, "executable", str(interpreter))
     broker = start_tcp_egress_broker([tcp_route], broker_dir)
     env = os.environ.copy()
     apply_tcp_egress_env(env, broker)
@@ -433,6 +442,78 @@ def test_tcp_upstream_half_close_preserves_pending_input(
             thread.join(timeout=2)
 
 
+@pytest.mark.parametrize("limit", ["_SESSION_SECONDS", "_IDLE_SECONDS"])
+@pytest.mark.parametrize("half_close", [False, True])
+def test_tcp_connector_timeouts_release_stream(
+    echo_server: tuple[str, int],
+    broker_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit: str,
+    half_close: bool,
+) -> None:
+    import omnigent.inner.tcp_egress as tcp_module
+
+    host, _ = echo_server
+    clock = [time.monotonic()]
+    monkeypatch.setattr(tcp_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(tcp_module, limit, 1)
+
+    class ReadyHandler(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            self.request.sendall(b"ready")
+            if half_close:
+                self.request.shutdown(socket.SHUT_WR)
+            while data := self.request.recv(65536):
+                if not half_close:
+                    self.request.sendall(data)
+
+    with _EchoServer((host, 0), ReadyHandler) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        route = TcpEgressRoute("ready", host, server.server_address[1], (f"{host}/32",))
+        broker = start_tcp_egress_broker([route], broker_dir)
+        env = os.environ.copy()
+        apply_tcp_egress_env(env, broker)
+        try:
+            with subprocess.Popen(
+                ["omnigent-egress-connect", "ready"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            ) as process:
+                try:
+                    assert process.stdin is not None and process.stdout is not None
+                    assert process.stderr is not None
+                    assert select.select([process.stdout], [], [], 5)[0]
+                    assert os.read(process.stdout.fileno(), 5) == b"ready"
+                    if half_close:
+                        assert select.select([process.stdout], [], [], 3)[0], "missing EOF"
+                        assert os.read(process.stdout.fileno(), 1) == b""
+                    clock[0] += 2
+                    if not half_close:
+                        # Wake the upstream read without refreshing the idle clock.
+                        server_request = next(
+                            sock for sock in broker._connections if sock.family == socket.AF_INET
+                        )
+                        server_request.shutdown(socket.SHUT_RD)
+                    assert process.wait(timeout=5) != 0
+                    assert b"timed out" in process.stderr.read()
+                    with broker._condition:
+                        assert broker._condition.wait_for(
+                            lambda: not broker._connections, timeout=3
+                        )
+                    assert broker._slots.acquire(blocking=False)
+                    broker._slots.release()
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+        finally:
+            broker.stop()
+            server.shutdown()
+            thread.join(timeout=2)
+
+
 def test_tcp_broker_pins_dns_answer_before_dialing(
     tcp_route: TcpEgressRoute,
     broker_dir: Path,
@@ -464,6 +545,24 @@ def test_tcp_broker_pins_dns_answer_before_dialing(
         )
         assert result.returncode == 0 and result.stdout == b"pinned", result.stderr
         assert looked_up.count(route.host) == 1
+        monkeypatch.setattr(
+            socket,
+            "getaddrinfo",
+            lambda *_args, **_kwargs: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", route.port)),
+            ],
+        )
+        dials: list[object] = []
+        monkeypatch.setattr(broker, "_dial_pinned", lambda *args: dials.append(args))
+        denied = subprocess.run(
+            ["omnigent-egress-connect", "echo"],
+            input=b"rebound",
+            capture_output=True,
+            env=env,
+            timeout=10,
+        )
+        assert denied.returncode != 0 and b"blocked address" in denied.stderr
+        assert not dials
     finally:
         broker.stop()
 
@@ -707,6 +806,73 @@ def test_tcp_broker_busy_has_a_useful_error(
         broker.stop()
 
 
+def test_tcp_revocation_during_slow_quota_denial(
+    tcp_route: TcpEgressRoute, broker_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("omnigent.inner.tcp_egress._MAX_CONNECTIONS", 1)
+    broker = start_tcp_egress_broker([tcp_route], broker_dir)
+    stop_finished = threading.Event()
+    trickling = threading.Event()
+    finish_trickle = threading.Event()
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as active:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as slow:
+            try:
+                active.settimeout(3)
+                active.connect(str(broker.socket_path))
+                request = json.dumps({"token": broker.token, "route": "echo"}).encode()
+                active.sendall(struct.pack("!I", len(request)) + request)
+                assert active.recv(1) == b"\x00"
+                slow.connect(str(broker.socket_path))
+                slow.sendall(struct.pack("!I", 2048))
+
+                def trickle() -> None:
+                    try:
+                        while not finish_trickle.wait(0.05):
+                            slow.sendall(b"x")
+                            trickling.set()
+                    except OSError:
+                        pass
+
+                def stop() -> None:
+                    broker.stop()
+                    stop_finished.set()
+
+                writer = threading.Thread(target=trickle, daemon=True)
+                writer.start()
+                assert trickling.wait(timeout=2)
+                stopper = threading.Thread(target=stop, daemon=True)
+                stopper.start()
+                assert stop_finished.wait(timeout=2), "quota denial blocked revocation"
+            finally:
+                finish_trickle.set()
+                slow.close()
+                broker.stop()
+                if "writer" in locals():
+                    writer.join(timeout=2)
+                if "stopper" in locals():
+                    stopper.join(timeout=2)
+
+
+@pytest.mark.parametrize("failure", ["chmod", "thread"])
+def test_tcp_broker_initialization_failure_removes_socket(
+    tcp_route: TcpEgressRoute,
+    broker_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    def fail(*_args: object) -> None:
+        raise OSError("injected initialization failure")
+
+    if failure == "chmod":
+        monkeypatch.setattr(os, "chmod", fail)
+    else:
+        monkeypatch.setattr(threading.Thread, "start", fail)
+    with pytest.raises(OSError, match="injected initialization failure"):
+        start_tcp_egress_broker([tcp_route], broker_dir)
+    assert not (broker_dir / ".tcp-egress.sock").exists()
+
+
 def test_tcp_revocation_prevents_dial_after_stalled_dns(
     tcp_route: TcpEgressRoute,
     broker_dir: Path,
@@ -814,6 +980,8 @@ def test_tcp_native_launcher_rejects_missing_broker(
         OSEnvSpec(sandbox=active_sandbox_spec_factory(tcp_egress=[route])), tmp_path
     )
     assert policy.allow_network is False
+    with pytest.raises(ValueError, match="requires its parent broker"):
+        create_exec_launcher("/bin/true", policy)
     with pytest.raises(ValueError, match="requires its parent broker"):
         get_backend(policy.backend_type).wrap_launcher_argv(["/bin/true"], policy, tmp_path)
 

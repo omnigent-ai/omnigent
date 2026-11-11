@@ -1385,6 +1385,8 @@ def create_exec_launcher(
         launcher, which would produce an unrunnable script.
     :raises ValueError: If a write grant includes the launcher directory.
     """
+    if sandbox.tcp_egress and sandbox.tcp_egress_socket_path is None:
+        raise ValueError("tcp_egress requires its parent broker before creating a launcher")
     launcher_dir = Path(tempfile.gettempdir()).resolve(strict=False)
     if sandbox.active:
         for root in [*sandbox.write_roots, *sandbox.write_files]:

@@ -590,6 +590,11 @@ def _validate_os_env(spec: AgentSpec, result: ValidationResult) -> None:
             "os_env.sandbox.tcp_egress",
             "tcp_egress requires linux_bwrap or darwin_seatbelt for hard network enforcement",
         )
+    if tcp_egress and egress_rules:
+        result.add(
+            "os_env.sandbox.tcp_egress",
+            "tcp_egress cannot coexist with HTTP egress_rules",
+        )
 
 
 def _validate_agent_names(

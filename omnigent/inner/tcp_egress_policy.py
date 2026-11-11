@@ -102,10 +102,7 @@ def parse_tcp_egress(
                 or network.is_reserved
                 or network.overlaps(_BLOCKED_ZERO_NETWORK)
                 or any(
-                    network.version == blocked.version
-                    and network.prefixlen >= blocked.prefixlen
-                    and (int(network.network_address) & int(blocked.netmask))
-                    == int(blocked.network_address)
+                    network.version == blocked.version and network.overlaps(blocked)
                     for blocked in (
                         *_CLOUD_TRAP_NETWORKS,
                         _BLOCKED_CONTROL,
@@ -147,6 +144,5 @@ def normalize_tcp_egress(
         ],
         egress_rules=egress_rules,
     )
-    if result is None:
-        raise ValueError("TCP egress requires at least one route")
+    assert result is not None
     return result
