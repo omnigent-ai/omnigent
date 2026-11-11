@@ -833,3 +833,36 @@ async def test_reminder_reports_a_wrong_schedule_it_could_not_delete(
     assert "was deleted" not in out["error"]
     assert out["scheduled_task_id"] == _TASK_ID
     assert client.calls[-1] == ("DELETE", f"/v1/scheduled-tasks/{_TASK_ID}", None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+async def test_reminder_is_refused_when_server_info_is_unreadable() -> None:
+    client = _ReminderClient()
+    client._info = _Resp(status_code=503, body={"error": "unavailable"})
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_set",
+            json.dumps({"message": "ping", "delay_seconds": 600}),
+            server_client=client,
+            conversation_id="conv_1",
+        )
+    )
+    assert "does not support one-time reminders" in out["error"]
+    assert not [call for call in client.calls if call[0] == "POST"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+async def test_reminder_needs_the_sessions_agent() -> None:
+    client = _ReminderClient(session=_Resp(body={"id": "conv_1"}))
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_set",
+            json.dumps({"message": "ping", "delay_seconds": 600}),
+            server_client=client,
+            conversation_id="conv_1",
+        )
+    )
+    assert out["error"] == "sys_reminder_set: this session has no agent to remind"
+    assert not [call for call in client.calls if call[0] == "POST"]

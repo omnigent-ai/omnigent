@@ -206,6 +206,13 @@ interface creating the fork. Gateway requests carry `Databricks-Custom-Coding-Ag
 creating interface use `omnigent` as a fallback.
 Routes configured by ug retain the additional `ug` surface.
 
+**Reminders:** on a server with `automations_v2` and `one_time_automations`,
+ask a native session to remind it later ("remind me in 45 minutes to check CI").
+The agent calls `sys_reminder_set`, an approval card shows the resolved time and
+the full message, and after approval the message arrives in the same session at
+that time. See the reminder recipe under "Driving it with the repro
+environment".
+
 **Agent instructions:** supported native startup paths add Omnigent's guidance
 to embed existing workspace screenshots in replies using their real file paths.
 After upgrading, start a new session or restart/cold-resume an existing one to

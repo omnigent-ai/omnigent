@@ -717,19 +717,27 @@ def _reminder_review(arguments: dict[str, object]):
     )
 
 
-def _tomorrow_at_nine_pacific() -> tuple[datetime, str]:
-    """A whole-minute time a day out, and the UTC minute the prompt must show."""
+def _resolved_minute(local: datetime) -> str:
+    return f"at {local.astimezone(UTC):%Y-%m-%d %H:%M} UTC"
+
+
+def _nine_am_pacific_two_days_out() -> tuple[datetime, str]:
+    """A whole-minute time at least two days out, and the minute the prompt must show.
+
+    Two days keeps it in the future even when its offset is swapped for one 17
+    hours ahead, so a changed offset still asks rather than being denied.
+    """
     pacific = timezone(timedelta(hours=-8))
-    local = (datetime.now(pacific) + timedelta(days=1)).replace(
+    local = (datetime.now(pacific) + timedelta(days=2)).replace(
         hour=9, minute=0, second=0, microsecond=0
     )
-    return local, f"at {local.astimezone(UTC):%Y-%m-%d %H:%M} UTC"
+    return local, _resolved_minute(local)
 
 
 def test_ask_on_scheduled_task_change_asks_for_a_reminder() -> None:
     """A reminder ASKs with its time and full message, which runs unattended later."""
     message = "Check CI on PR #12, then " + "summarize the failures. " * 10
-    local, shown = _tomorrow_at_nine_pacific()
+    local, shown = _nine_am_pacific_two_days_out()
     for timing, expected in (
         ({"delay_seconds": 2700}, "2700 seconds after approval, rounded up to the next minute"),
         ({"at": local.isoformat()}, shown),
@@ -742,7 +750,7 @@ def test_ask_on_scheduled_task_change_asks_for_a_reminder() -> None:
 
 def test_reminder_approval_shows_the_resolved_time_whatever_the_raw_text() -> None:
     """Padding or a long fraction can't push the time or its offset out of view."""
-    local, shown = _tomorrow_at_nine_pacific()
+    local, shown = _nine_am_pacific_two_days_out()
     stamp = local.isoformat()
     date_part, offset = stamp[:19], stamp[19:]
     for raw in (" " * 2048 + stamp, f"{date_part}.{'0' * 80}{offset}"):
@@ -750,8 +758,11 @@ def test_reminder_approval_shows_the_resolved_time_whatever_the_raw_text() -> No
         assert result["result"] == "ASK", result
         assert f"set a reminder for this session {shown}." in result["reason"]
     # The same digits with another offset name another moment, and the prompt says so.
+    tokyo = local.replace(tzinfo=timezone(timedelta(hours=9)))
     other = _reminder_review({"message": "ping", "at": f"{date_part}.{'0' * 80}+09:00"})
-    assert shown not in other.get("reason", "")
+    assert other["result"] == "ASK", other
+    assert f"set a reminder for this session {_resolved_minute(tokyo)}." in other["reason"]
+    assert shown not in other["reason"]
 
 
 def test_reminder_approval_denies_a_time_the_tool_would_reject() -> None:
