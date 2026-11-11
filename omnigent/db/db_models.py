@@ -1506,11 +1506,9 @@ class SqlScheduledTask(OmnigentBase):
         surfaced as a bare 32-char hex string (no dashes).
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
-    :param rrule: The RFC 5545 recurrence rule for the recurring trigger,
-        e.g. ``"FREQ=DAILY;BYHOUR=9;BYMINUTE=0"``, evaluated in ``timezone``.
-        ``None`` for an event-triggered task.
-    :param trigger_config: JSON event-trigger definition, or ``None`` for a
-        scheduled task.
+    :param rrule: The required RFC 5545 recurrence rule for the recurring
+        trigger, e.g. ``"FREQ=DAILY;BYHOUR=9;BYMINUTE=0"``. Evaluated in
+        ``timezone``.
     :param user_id: User the spawned session's ``LEVEL_OWNER`` grant is
         written for — who the run belongs to, e.g. ``"alice@example.com"``.
         ``None`` in single-user / OSS mode; the fire path resolves it to the
@@ -1591,14 +1589,14 @@ class SqlScheduledTask(OmnigentBase):
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     # Opaque free text, never SQL-queried — stored compressed (CompressedText).
     prompt: Mapped[str] = mapped_column(CompressedText, nullable=False)
-    # RFC 5545 recurrence rule, e.g. "FREQ=DAILY;BYHOUR=9;BYMINUTE=0". NULL for a
+    # RFC 5545 recurrence rule, e.g. "FREQ=DAILY;BYHOUR=9;BYMINUTE=0". NULL marks a
     # task that runs on events (``trigger_config``) instead of a schedule.
     rrule: Mapped[str | None] = mapped_column(String(512), nullable=True)
     # JSON naming an event trigger's provider and its condition, shared by every
     # provider, e.g. {"provider": "omnigent", "events": ["turn.completed"]}.
-    # NULL for a scheduled task. Read and written whole; SQL only tests IS NULL.
+    # NULL for a scheduled task. Read and written whole, never filtered in SQL.
     trigger_config: Mapped[str | None] = mapped_column(
-        CompressedText(max_stored_bytes=65_535), nullable=True
+        CompressedText(max_stored_bytes=16_383), nullable=True
     )
     # Session-owner identity: the spawned run's LEVEL_OWNER grant is written
     # for this user. Nullable — None in single-user/OSS mode (the fire path
@@ -1748,7 +1746,7 @@ class SqlScheduledTaskRun(OmnigentBase):
     # e.g. {"events": [{"type": "turn.completed", "session_id": "..."}]}. NULL for
     # scheduled and Run now runs. Read and written whole, never filtered in SQL.
     event: Mapped[str | None] = mapped_column(
-        CompressedText(max_stored_bytes=65_535), nullable=True
+        CompressedText(max_stored_bytes=16_383), nullable=True
     )
 
     __table_args__ = (
@@ -1776,6 +1774,15 @@ class SqlScheduledTaskRun(OmnigentBase):
             "scheduled_at",
             "id",
         ),
+        # A task's runs in one status, e.g. its unclaimed pending event run.
+        Index(
+            "ix_scheduled_task_runs_task_status",
+            "workspace_id",
+            "scheduled_task_id",
+            "status",
+            "scheduled_at",
+            "id",
+        ),
         # Reverse lookup conversation_id -> run for the event-driven completion
         # hook (get_running_run_by_conversation), which fires on every turn's
         # terminal edge; without this the lookup is a full-table scan.
@@ -1793,6 +1800,63 @@ class SqlScheduledTaskRun(OmnigentBase):
             "workspace_id",
             "conversation_id",
             "status",
+            "id",
+        ),
+    )
+
+
+class SqlScheduledTaskEventReceipt(OmnigentBase):
+    """
+    SQLAlchemy model for the ``scheduled_task_event_receipts`` table.
+
+    One row per provider event occurrence an event-triggered task accepted, so a
+    repeated delivery records nothing, including an occurrence that joined another
+    occurrence's pending run rather than getting a run of its own.
+
+    :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`).
+    :param scheduled_task_id: The task that accepted the occurrence (relates to
+        ``scheduled_tasks.id``; no DB foreign key, Rule R032).
+    :param trigger_key: The occurrence key, e.g.
+        ``"event:omnigent:<session>:turn.completed:<response>"``. Unique per task.
+    :param run_id: The run the occurrence was delivered in (relates to
+        ``scheduled_task_runs.id``), or ``None`` if it was not given one.
+    :param created_at: Unix epoch seconds the occurrence was accepted; old
+        receipts are removed in bounded batches.
+    """
+
+    __tablename__ = "scheduled_task_event_receipts"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    scheduled_task_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
+    trigger_key: Mapped[str] = mapped_column(
+        String(256).with_variant(
+            MySQLVarchar(256, charset="utf8mb4", collation="utf8mb4_bin"), "mysql"
+        ),
+        nullable=False,
+    )
+    run_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "scheduled_task_id",
+            "trigger_key",
+            name="uq_scheduled_task_event_receipts_occurrence",
+        ),
+        Index(
+            "ix_scheduled_task_event_receipts_age",
+            "workspace_id",
+            "scheduled_task_id",
+            "created_at",
             "id",
         ),
     )
