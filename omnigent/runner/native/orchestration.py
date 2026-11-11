@@ -10616,7 +10616,6 @@ async def _auto_create_grok_terminal(
         inherited by the terminal.
     :returns: Created terminal resource view.
     """
-    del ensure_comment_relay  # signature parity; the relay is not wired yet.
     from omnigent.harnesses.grok_native.bridge import (
         GROK_NATIVE_BRIDGE_DIR_ENV_VAR,
         GrokBridgeState,
@@ -10674,6 +10673,17 @@ async def _auto_create_grok_terminal(
             *tuple(launch_config.terminal_launch_args or []),
         ),
     )
+    # Start the Omnigent builtin-tool relay BEFORE the vendor session exists so
+    # ``tool_relay.json`` is present when grok's serve-mcp stdio MCP server is
+    # handed to ``session/new`` — the sys_* / load_skill / web_fetch surface,
+    # with policy enforced server-side on each call.
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
+
     agent_os_env = _agent_os_env_from_spec(agent_spec)
     terminal_view = await resource_registry.launch_required_terminal(
         session_id=session_id,
@@ -10719,7 +10729,24 @@ async def _auto_create_grok_terminal(
                 external_id,
             )
     if grok_session_id is None:
-        grok_session_id = await client.session_new(cwd=workspace)
+        grok_session_id = await client.session_new(
+            cwd=workspace,
+            mcp_servers=[
+                {
+                    "name": "omnigent",
+                    "command": sys.executable,
+                    "args": [
+                        "-I",
+                        "-m",
+                        "omnigent.harnesses.claude_native.bridge",
+                        "serve-mcp",
+                        "--bridge-dir",
+                        str(bridge_dir),
+                    ],
+                    "env": {"PYTHONUNBUFFERED": "1"},
+                }
+            ],
+        )
         if server_client is not None and grok_session_id:
             with contextlib.suppress(Exception):
                 await server_client.patch(
