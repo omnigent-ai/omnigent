@@ -1015,6 +1015,139 @@
         "title": "CancelledEvent",
         "type": "object"
       },
+      "ChartBlock": {
+        "additionalProperties": false,
+        "description": "A chart drawn on the card; see `InboxChartV1`.",
+        "properties": {
+          "chart": {
+            "$ref": "#/components/schemas/InboxChartV1"
+          },
+          "type": {
+            "const": "chart",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "chart"
+        ],
+        "title": "ChartBlock",
+        "type": "object"
+      },
+      "ChartHighlight": {
+        "additionalProperties": false,
+        "description": "A shaded range between two x labels.",
+        "properties": {
+          "from": {
+            "maxLength": 40,
+            "title": "From",
+            "type": "string"
+          },
+          "to": {
+            "maxLength": 40,
+            "title": "To",
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "to"
+        ],
+        "title": "ChartHighlight",
+        "type": "object"
+      },
+      "ChartMarker": {
+        "additionalProperties": false,
+        "description": "A labeled vertical line at one x label, e.g. when a change merged.",
+        "properties": {
+          "label": {
+            "maxLength": 60,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "x": {
+            "maxLength": 40,
+            "title": "X",
+            "type": "string"
+          }
+        },
+        "required": [
+          "x",
+          "label"
+        ],
+        "title": "ChartMarker",
+        "type": "object"
+      },
+      "ChartSeries": {
+        "additionalProperties": false,
+        "description": "One line or set of bars; `None` values leave gaps.",
+        "properties": {
+          "emphasis": {
+            "default": false,
+            "title": "Emphasis",
+            "type": "boolean"
+          },
+          "name": {
+            "maxLength": 60,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "values": {
+            "items": {
+              "anyOf": [
+                {
+                  "format": "double",
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": "Values",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "values"
+        ],
+        "title": "ChartSeries",
+        "type": "object"
+      },
+      "ChartSource": {
+        "additionalProperties": false,
+        "description": "Where the numbers came from, shown under the chart.",
+        "properties": {
+          "href": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "pattern": "^https?://",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Href"
+          },
+          "label": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "label"
+        ],
+        "title": "ChartSource",
+        "type": "object"
+      },
       "ChildSessionList": {
         "description": "Paginated list of child sessions; `data` is a page of `ChildSessionSummary`.",
         "properties": {
@@ -1932,6 +2065,85 @@
           "path"
         ],
         "title": "CreateDirectoryRequest",
+        "type": "object"
+      },
+      "CreateInboxItemRequest": {
+        "additionalProperties": false,
+        "description": "Body for `POST /v1/inbox/items`.",
+        "properties": {
+          "actions": {
+            "items": {
+              "$ref": "#/components/schemas/InboxItemAction"
+            },
+            "maxItems": 3,
+            "title": "Actions",
+            "type": "array"
+          },
+          "body_md": {
+            "maxLength": 8000,
+            "minLength": 1,
+            "title": "Body Md",
+            "type": "string"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "format": "int64",
+                "maximum": 9.223372036854776e+18,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "kind": {
+            "enum": [
+              "followup",
+              "info",
+              "reminder"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "links": {
+            "items": {
+              "$ref": "#/components/schemas/InboxItemLink"
+            },
+            "maxItems": 10,
+            "title": "Links",
+            "type": "array"
+          },
+          "media": {
+            "items": {
+              "$ref": "#/components/schemas/ChartBlock"
+            },
+            "maxItems": 3,
+            "title": "Media",
+            "type": "array"
+          },
+          "title": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          },
+          "topic": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Topic",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "title",
+          "body_md",
+          "topic"
+        ],
+        "title": "CreateInboxItemRequest",
         "type": "object"
       },
       "CreateProjectRequest": {
@@ -3822,6 +4034,162 @@
         "title": "InProgressEvent",
         "type": "object"
       },
+      "InboxChartV1": {
+        "additionalProperties": false,
+        "description": "Version 1 of the chart an Inbox item can carry.",
+        "properties": {
+          "highlight": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChartHighlight"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "markers": {
+            "items": {
+              "$ref": "#/components/schemas/ChartMarker"
+            },
+            "maxItems": 3,
+            "title": "Markers",
+            "type": "array"
+          },
+          "series": {
+            "items": {
+              "$ref": "#/components/schemas/ChartSeries"
+            },
+            "maxItems": 4,
+            "minItems": 1,
+            "title": "Series",
+            "type": "array"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChartSource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "line",
+              "bar"
+            ],
+            "title": "Type",
+            "type": "string"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "maxLength": 16,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          },
+          "version": {
+            "const": 1,
+            "format": "int64",
+            "title": "Version",
+            "type": "integer"
+          },
+          "x": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 60,
+            "minItems": 1,
+            "title": "X",
+            "type": "array"
+          }
+        },
+        "required": [
+          "version",
+          "type",
+          "title",
+          "x",
+          "series"
+        ],
+        "title": "InboxChartV1",
+        "type": "object"
+      },
+      "InboxItemAction": {
+        "additionalProperties": false,
+        "description": "An agent-defined action: a button that opens a session prefilled with `prompt`.",
+        "properties": {
+          "label": {
+            "maxLength": 60,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "prompt": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Prompt",
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "prompt"
+        ],
+        "title": "InboxItemAction",
+        "type": "object"
+      },
+      "InboxItemLink": {
+        "additionalProperties": false,
+        "description": "One evidence link on an item.",
+        "properties": {
+          "label": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "ref": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Ref",
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "session",
+              "pr",
+              "url"
+            ],
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "ref"
+        ],
+        "title": "InboxItemLink",
+        "type": "object"
+      },
       "IncompleteDetails": {
         "description": "Details explaining why a response is incomplete.",
         "properties": {
@@ -5475,6 +5843,54 @@
           "joined_at"
         ],
         "title": "PresenceViewer",
+        "type": "object"
+      },
+      "ProactiveAgentSettings": {
+        "description": "The caller's view of the settings.",
+        "properties": {
+          "can_manage_workspace": {
+            "description": "Whether the caller may change the workspace setting.",
+            "title": "Can Manage Workspace",
+            "type": "boolean"
+          },
+          "enabled": {
+            "description": "Whether the agent runs for the caller: both settings on.",
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "user_enabled": {
+            "description": "The caller's own setting.",
+            "title": "User Enabled",
+            "type": "boolean"
+          },
+          "workspace_enabled": {
+            "description": "The admin's workspace-wide setting.",
+            "title": "Workspace Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "workspace_enabled",
+          "user_enabled",
+          "enabled",
+          "can_manage_workspace"
+        ],
+        "title": "ProactiveAgentSettings",
+        "type": "object"
+      },
+      "ProactiveAgentToggle": {
+        "additionalProperties": false,
+        "description": "Body of a settings change.",
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "ProactiveAgentToggle",
         "type": "object"
       },
       "ProjectOrderRequest": {
@@ -12636,6 +13052,75 @@
         "title": "UpdateDefaultPolicyRequest",
         "type": "object"
       },
+      "UpdateInboxItemRequest": {
+        "additionalProperties": false,
+        "description": "Body for `PATCH /v1/inbox/items/{item_id}`.\n\n`status` marks an open item read or unread. `resolution` closes an item\n(or reopens it with `\"none\"`) and moves its status to match;\n`\"action_taken\"` also needs `resolution_action`, the action's index.",
+        "properties": {
+          "feedback_text": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Feedback Text"
+          },
+          "resolution": {
+            "anyOf": [
+              {
+                "enum": [
+                  "none",
+                  "action_taken",
+                  "already_done",
+                  "useful",
+                  "not_relevant",
+                  "incorrect",
+                  "not_now"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolution"
+          },
+          "resolution_action": {
+            "anyOf": [
+              {
+                "exclusiveMaximum": 3.0,
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolution Action"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "unread",
+                  "read"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          }
+        },
+        "title": "UpdateInboxItemRequest",
+        "type": "object"
+      },
       "UpdateProjectRequest": {
         "additionalProperties": false,
         "description": "Request body for `PATCH /v1/projects/{project_id}`.\n\nAll fields optional; `None` leaves a field unchanged.",
@@ -15746,6 +16231,211 @@
         ]
       }
     },
+    "/v1/inbox/items": {
+      "get": {
+        "description": "List the caller's items, newest first, with a bounded unread count.",
+        "operationId": "list_inbox_items_v1_inbox_items_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "enum": [
+                      "unread",
+                      "read",
+                      "done",
+                      "dismissed"
+                    ],
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Inbox Items V1 Inbox Items Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Inbox Items",
+        "tags": [
+          "inbox_items"
+        ]
+      },
+      "post": {
+        "description": "Post an item to the caller's Inbox, or return the item it repeats.",
+        "operationId": "create_inbox_item_v1_inbox_items_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateInboxItemRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Inbox Item V1 Inbox Items Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Inbox Item",
+        "tags": [
+          "inbox_items"
+        ]
+      }
+    },
+    "/v1/inbox/items/{item_id}": {
+      "patch": {
+        "description": "Record the caller's response to one of their items.",
+        "operationId": "update_inbox_item_v1_inbox_items__item_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "title": "Item Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateInboxItemRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Inbox Item V1 Inbox Items  Item Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Inbox Item",
+        "tags": [
+          "inbox_items"
+        ]
+      }
+    },
     "/v1/info": {
       "get": {
         "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a build without accounts for header / OIDC\ndeploys (in particular, hosted deployments).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`, `dictation_available`,\n`single_user`), the short sandbox provider name\n(`sandbox_provider`) the web UI labels the new-session\nsandbox option with, and the installed\n`server_version` (already public via `/api/version`).",
@@ -16070,6 +16760,109 @@
         "summary": "List Registry",
         "tags": [
           "policy_registry"
+        ]
+      }
+    },
+    "/v1/proactive-agent/settings": {
+      "get": {
+        "operationId": "read_settings_v1_proactive_agent_settings_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProactiveAgentSettings"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Settings",
+        "tags": [
+          "proactive_agent"
+        ]
+      }
+    },
+    "/v1/proactive-agent/settings/me": {
+      "put": {
+        "operationId": "set_user_setting_v1_proactive_agent_settings_me_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProactiveAgentToggle"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProactiveAgentSettings"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set User Setting",
+        "tags": [
+          "proactive_agent"
+        ]
+      }
+    },
+    "/v1/proactive-agent/settings/workspace": {
+      "put": {
+        "operationId": "set_workspace_setting_v1_proactive_agent_settings_workspace_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProactiveAgentToggle"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProactiveAgentSettings"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Workspace Setting",
+        "tags": [
+          "proactive_agent"
         ]
       }
     },
