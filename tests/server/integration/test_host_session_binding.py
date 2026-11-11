@@ -45,7 +45,7 @@ from omnigent.server.managed_hosts import (
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
 from omnigent.server.sharing_settings import SiblingSessionDestinations
-from omnigent.server.startup_inputs import STARTUP_LABEL
+from omnigent.server.startup_inputs import STARTUP_LABEL, STARTUP_WITHDRAWN
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -1485,7 +1485,7 @@ async def test_released_claim_lets_another_host_keep_the_session(
 
     def handed_off() -> bool:
         current = env.conv_store.get_conversation(session_id)
-        return current is not None and STARTUP_LABEL not in current.labels
+        return current is not None and current.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN
 
     await poll_until_async(lambda: fake.terminated == ["sb-fake-1"])
     await poll_until_async(handed_off)
@@ -1504,15 +1504,18 @@ async def test_released_claim_lets_another_host_keep_the_session(
     assert len(host_futures) == 1
 
 
+@pytest.mark.parametrize("rebind", ["before_cleanup", "during_cleanup"])
 async def test_released_claim_keeps_the_winner_when_the_old_sandbox_fails_to_start(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,
+    rebind: str,
 ) -> None:
     """
     A move whose sandbox fails before it reaches its bind, after the claim was
     released and another host took the session, doesn't fail that host's
     session: its startup isn't marked failed, its launch state is cleared, and
-    a message held for the sandbox is marked not sent.
+    a message held for the sandbox is marked not sent. That holds even when the
+    takeover lands between the cleanup reading the claim and clearing it.
     """
     import threading
 
@@ -1526,16 +1529,32 @@ async def test_released_claim_keeps_the_winner_when_the_old_sandbox_fails_to_sta
     assert resp.status_code == 202, resp.text
     held = await _post_user_message(env, session_id)
     assert held["queued"] is True
-    env.conv_store.clear_runner_id(session_id)
-    assert env.conv_store.set_runner_id(session_id, "runner_other_tab")
-    env.conv_store.set_host_id(session_id, _LAPTOP_HOST_ID, "/Users/alice/repo")
+
+    def take_over() -> None:
+        env.conv_store.clear_runner_id(session_id)
+        assert env.conv_store.set_runner_id(session_id, "runner_other_tab")
+        env.conv_store.set_host_id(session_id, _LAPTOP_HOST_ID, "/Users/alice/repo")
+
+    if rebind == "before_cleanup":
+        take_over()
+    else:
+        clear_runner_id = env.conv_store.clear_runner_id
+
+        def take_over_then_clear(conversation_id: str, **kwargs: Any) -> Conversation:
+            if kwargs.get("expected_binding") is not None and not took_over:
+                took_over.append(True)
+                take_over()
+            return clear_runner_id(conversation_id, **kwargs)
+
+        took_over: list[bool] = []
+        monkeypatch.setattr(env.conv_store, "clear_runner_id", take_over_then_clear)
     provisioned.set()
 
     def settled() -> bool:
         current = env.conv_store.get_conversation(session_id)
         return (
             current is not None
-            and STARTUP_LABEL not in current.labels
+            and current.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN
             and env.app.state.managed_launches.get(session_id) is None
         )
 
@@ -1554,13 +1573,13 @@ async def test_released_claim_keeps_the_winner_when_the_old_sandbox_fails_to_sta
     assert [item.status for item in env.conv_store.list_pending_inputs(session_id)] == ["failed"]
 
 
-async def test_relaunch_admitted_before_a_move_detaches_keeps_the_claim(
+async def test_relaunch_admitted_before_a_move_claims_keeps_the_claim(
     managed_session_env: ManagedSessionEnv,
 ) -> None:
     """
-    A relaunch on the old host that was admitted just before the move detached
-    the session can't overwrite the move's claim: its runner replacement is
-    checked against the binding it read, so it is refused instead.
+    A relaunch on the old host that read the session before the move claimed it,
+    and was admitted while the move claimed and detached it, can't overwrite the
+    claim: its runner replacement is checked against the runner it read.
     """
     from typing import cast
 
@@ -1568,13 +1587,13 @@ async def test_relaunch_admitted_before_a_move_detaches_keeps_the_claim(
 
     env = managed_session_env
     session_id = await _session_released_from_laptop(env, agent_name="move-relaunch-race-agent")
-    claim = "runner_token_move_claim"
-    assert env.conv_store.set_runner_id(session_id, claim)
     seen = env.conv_store.get_conversation(session_id)
-    assert seen is not None
+    assert seen is not None and seen.runner_id is None
+    claim = "runner_token_move_claim"
 
-    class _AdmitThenDetach:
+    class _AdmitWhileTheMoveClaims:
         async def admit_launch(self, conn: object, conversation_id: str, **_: object) -> None:
+            assert env.conv_store.set_runner_id(conversation_id, claim)
             env.conv_store.clear_host_binding(
                 conversation_id, expected_runner_id=claim, keep_runner=True
             )
@@ -1582,7 +1601,7 @@ async def test_relaunch_admitted_before_a_move_detaches_keeps_the_claim(
     attempt = await _launch_runner_on_host_locked(
         seen,
         env.conv_store,
-        cast(Any, _AdmitThenDetach()),
+        cast(Any, _AdmitWhileTheMoveClaims()),
         cast(Any, SimpleNamespace(host_id=_LAPTOP_HOST_ID)),
     )
 
@@ -1590,6 +1609,135 @@ async def test_relaunch_admitted_before_a_move_detaches_keeps_the_claim(
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None
     assert (conv.host_id, conv.runner_id) == (None, claim)
+
+
+async def test_message_after_the_move_claims_waits_for_the_sandbox(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The pending startup is written before the claim, so a message that sees the
+    claim, with the old host still bound and offline, is held for the sandbox
+    instead of relaunching on the old host.
+    """
+    env = managed_session_env
+    install_fake_modal_launcher(monkeypatch, FakeSandboxLauncher(fail_on_host_start=True))
+    session_id = await _session_released_from_laptop(env, agent_name="move-claim-message-agent")
+    env.host_store.set_offline(_LAPTOP_HOST_ID)
+    loop = asyncio.get_running_loop()
+    set_runner_id = env.conv_store.set_runner_id
+    responses: list[dict[str, Any]] = []
+
+    def claim_then_message(conversation_id: str, runner_id: str) -> bool:
+        claimed = set_runner_id(conversation_id, runner_id)
+        if claimed and not responses:
+            responses.append(
+                asyncio.run_coroutine_threadsafe(
+                    _post_user_message(env, conversation_id), loop
+                ).result(timeout=10)
+            )
+        return claimed
+
+    monkeypatch.setattr(env.conv_store, "set_runner_id", claim_then_message)
+
+    resp = await env.client.post(f"/v1/sessions/{session_id}/managed-host", json={})
+
+    assert resp.status_code == 202, resp.text
+    assert len(responses) == 1 and responses[0]["queued"] is True
+    assert responses[0].get("pending_id")
+
+
+async def test_move_cancelled_during_its_startup_write_leaves_nothing_held(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A move cancelled while its pending-startup write is in flight waits for the
+    write and then withdraws it, so the restored session, even with its host
+    offline, doesn't go on holding messages that nothing would deliver.
+    """
+    import threading
+
+    env = managed_session_env
+    session_id = await _session_released_from_laptop(env, agent_name="move-cancel-startup-agent")
+    env.host_store.set_offline(_LAPTOP_HOST_ID)
+    writing, release = threading.Event(), threading.Event()
+    set_labels = env.conv_store.set_labels
+
+    def slow_startup_write(conversation_id: str, labels: dict[str, str]) -> object:
+        if labels.get(STARTUP_LABEL) == "pending":
+            writing.set()
+            release.wait(timeout=10)
+        return set_labels(conversation_id, labels)
+
+    monkeypatch.setattr(env.conv_store, "set_labels", slow_startup_write)
+
+    move = asyncio.create_task(env.client.post(f"/v1/sessions/{session_id}/managed-host", json={}))
+    assert await asyncio.to_thread(writing.wait, 10)
+    move.cancel()
+    release.set()
+    await asyncio.gather(move, return_exceptions=True)
+
+    # The rollback finishes after the cancelled request.
+    await poll_until_async(
+        lambda: (current := env.conv_store.get_conversation(session_id)) is not None
+        and current.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN
+    )
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN
+    assert (conv.host_id, conv.runner_id) == (_LAPTOP_HOST_ID, None)
+    assert env.conv_store.list_pending_inputs(session_id) == []
+    startup = env.app.state.startup_inputs
+    assert not await startup.accepts(conv, env.app)
+
+
+async def test_message_admitted_while_a_launch_is_withdrawn_is_settled(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A message admitted behind a pending startup that lands after the withdrawal
+    took its snapshot settles itself on seeing the withdrawn startup, through the
+    real enqueue path, instead of staying queued with nothing to deliver it.
+    """
+    from starlette.datastructures import Headers
+
+    from omnigent.server.schemas import SessionEventInput
+
+    env = managed_session_env
+    session_id = await _session_released_from_laptop(env, agent_name="move-withdraw-race-agent")
+    env.conv_store.set_labels(session_id, {STARTUP_LABEL: "pending"})
+    startup = env.app.state.startup_inputs
+    loop = asyncio.get_running_loop()
+    list_pending_inputs = env.conv_store.list_pending_inputs
+    raced: list[object] = []
+
+    def snapshot_then_message(conversation_id: str) -> Any:
+        snapshot = list_pending_inputs(conversation_id)
+        if not raced:
+            event = SessionEventInput(
+                type="message",
+                data={"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            )
+            raced.append(
+                asyncio.run_coroutine_threadsafe(
+                    startup.enqueue(
+                        conversation_id, event, user_id=None, headers=Headers({}), first=False
+                    ),
+                    loop,
+                ).result(timeout=10)
+            )
+        return snapshot
+
+    monkeypatch.setattr(env.conv_store, "list_pending_inputs", snapshot_then_message)
+
+    await startup.release_held_inputs(session_id, "The message wasn't sent.")
+
+    assert len(raced) == 1
+    assert [item.status for item in list_pending_inputs(session_id)] == ["failed"]
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None and conv.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN
 
 
 async def test_shutdown_after_the_sandbox_runner_starts_keeps_held_messages(

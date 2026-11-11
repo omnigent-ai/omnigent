@@ -698,8 +698,8 @@ def register_core_routes(
             until the sandbox binds; see :func:`_run_managed_launch`.
         :param before_start: Run once the launch is visible to message
             handling (startup label and tracker entry) and before it starts,
-            e.g. a move detaching the old host. If it raises, the launch is
-            withdrawn and the error propagates.
+            e.g. a move detaching the old host. If it raises, the launch never
+            starts and the error propagates; the caller withdraws it.
         :raises OmnigentError: If managed hosts aren't configured or the
             provider isn't offered.
         """
@@ -761,16 +761,14 @@ def register_core_routes(
             # silently truncate the list and drop repos on relaunch.
             managed_labels.update(managed_repo_labels(workspaces))
         if managed_labels:
-            await asyncio.to_thread(
-                conversation_store.set_labels,
-                session_id,
-                managed_labels,
+            await _settled_write(
+                session_id, conversation_store.set_labels, session_id, managed_labels
             )
         if getattr(request.app.state, "startup_inputs", None) is not None:
             from omnigent.server.startup_inputs import STARTUP_LABEL
 
-            await asyncio.to_thread(
-                conversation_store.set_labels, session_id, {STARTUP_LABEL: "pending"}
+            await _settled_write(
+                session_id, conversation_store.set_labels, session_id, {STARTUP_LABEL: "pending"}
             )
         managed_launches.begin(session_id)
         # Seed the launch-progress indicator before the background task
@@ -783,11 +781,7 @@ def register_core_routes(
             provider=sandbox_provider or sandbox_config.default.provider,
         )
         if before_start is not None:
-            try:
-                await before_start()
-            except BaseException:
-                await _withdraw_managed_launch(request, session_id)
-                raise
+            await before_start()
         launch = _run_managed_launch(
             session_id=session_id,
             # On auth-disabled servers user_id is None; the sandbox
@@ -828,9 +822,9 @@ def register_core_routes(
         :param session_id: The session it was registered for.
         """
         managed_launches = getattr(request.app.state, "managed_launches", None)
-        if managed_launches is not None:
+        if managed_launches is not None and managed_launches.get(session_id) is not None:
             managed_launches.finish(session_id)
-        _publish_sandbox_status(session_id, "ready")
+            _publish_sandbox_status(session_id, "ready")
         startup = getattr(request.app.state, "startup_inputs", None)
         if startup is None:
             return
@@ -897,7 +891,39 @@ def register_core_routes(
             f"{MANAGED_REPO_LABEL_KEY}."
         )
 
-    async def _restore_host_binding(
+    # Store writes a move started, per session, until they land; a rollback
+    # waits for them so a write that outlives its cancelled request isn't missed.
+    _move_writes: dict[str, set[asyncio.Future[Any]]] = {}
+    # Rollbacks finishing after their request was cancelled.
+    _detached_rollbacks: set[asyncio.Task[None]] = set()
+
+    async def _settled_write(
+        session_id: str, call: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        """
+        Run a store write for a move in a thread that survives the request's cancellation.
+
+        A cancelled ``asyncio.to_thread`` await still lets the thread commit, so
+        the write is tracked until it lands for the rollback to wait on.
+
+        :param session_id: The session being moved.
+        :param call: The store method, e.g. ``conversation_store.set_labels``.
+        :returns: What *call* returned.
+        """
+        write = asyncio.ensure_future(asyncio.to_thread(call, *args, **kwargs))
+        writes = _move_writes.setdefault(session_id, set())
+        writes.add(write)
+
+        def forget(done: asyncio.Future[Any]) -> None:
+            writes.discard(done)
+            if not writes:
+                _move_writes.pop(session_id, None)
+
+        write.add_done_callback(forget)
+        return await asyncio.shield(write)
+
+    async def _roll_back_sandbox_move(
+        request: Request,
         session_id: str,
         *,
         host_id: str,
@@ -907,12 +933,20 @@ def register_core_routes(
         claim: str,
     ) -> None:
         """
-        Put back the binding a refused sandbox move cleared, then release its claim.
+        Undo a refused sandbox move: old binding, then launch, then claim.
 
-        Restores only while the move's claim still holds the session, so a host
-        that took it after the claim was released keeps it. Best effort: the
+        Each step is best effort and runs even if an earlier one fails; the
         caller re-raises the refusal, which is the error to report.
 
+        1. The old host, directory, branch and sandbox labels come back, but only
+           while the move's claim still holds the session, so a host that took
+           it after the claim was released keeps it.
+        2. The launch registration is withdrawn, so a message held for it is
+           marked not sent and later ones reach the restored host.
+        3. The claim is released. It is no runner's; left in place it would
+           refuse every later move and launch.
+
+        :param request: The request whose move is being rolled back.
         :param session_id: The session the move unbound, e.g. ``"conv_abc123"``.
         :param host_id: The host it was bound to before the move.
         :param workspace: Its working directory on that host.
@@ -931,7 +965,7 @@ def register_core_routes(
                     expected_runner_id=claim,
                 )
             except ValueError:
-                pass  # Taken by another host meanwhile; that binding wins.
+                pass  # Never claimed, or taken by another host; that binding wins.
             else:
                 # A launch refused after writing its own sandbox labels leaves them behind.
                 current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -947,8 +981,7 @@ def register_core_routes(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
-        # Released even when restoring failed: the claim is no runner's, and
-        # left in place it would refuse every later move and launch.
+        await _withdraw_managed_launch(request, session_id)
         try:
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if current is not None and current.runner_id == claim:
@@ -5248,34 +5281,6 @@ def register_core_routes(
         # ``WHERE runner_id IS NULL`` bind a host launch uses. A runner bound
         # since the checks above, or a concurrent move, makes the claim fail.
         claim = token_bound_runner_id(secrets.token_urlsafe(32))
-        claiming = asyncio.ensure_future(
-            asyncio.to_thread(conversation_store.set_runner_id, session_id, claim)
-        )
-        try:
-            claimed = await asyncio.shield(claiming)
-        except asyncio.CancelledError:
-            # The worker can still commit the claim after the request is gone;
-            # wait for it and take the claim back off.
-            with contextlib.suppress(Exception):
-                if await claiming:
-                    current = await asyncio.to_thread(
-                        conversation_store.get_conversation, session_id
-                    )
-                    if current is not None and current.runner_id == claim:
-                        await asyncio.to_thread(
-                            conversation_store.clear_runner_id,
-                            session_id,
-                            expected_binding=current,
-                        )
-            raise
-        if not claimed:
-            raise OmnigentError(
-                "The session's host or runner changed while moving it. Reload and try again.",
-                code=ErrorCode.CONFLICT,
-            )
-        # From here the claim stays on the session until the sandbox binds, so no
-        # host launch can take it on any replica; every refusal below puts the
-        # old binding back and releases the claim.
         stale_labels: dict[str, str] = {}
 
         async def detach_old_host() -> None:
@@ -5295,6 +5300,30 @@ def register_core_routes(
                 )
 
         try:
+            if getattr(request.app.state, "startup_inputs", None) is not None:
+                from omnigent.server.startup_inputs import STARTUP_LABEL
+
+                # Before the claim: a message that can see the claim also sees
+                # the pending startup and waits for the sandbox, on any replica,
+                # rather than relaunching on the old host.
+                await _settled_write(
+                    session_id,
+                    conversation_store.set_labels,
+                    session_id,
+                    {STARTUP_LABEL: "pending"},
+                )
+            # Claim the session with a runner id no runner holds, through the
+            # same ``WHERE runner_id IS NULL`` bind a host launch uses. A runner
+            # bound since the checks above, or a concurrent move, makes it fail.
+            # The claim then stays until the sandbox binds, so no host launch
+            # can take the session on any replica.
+            if not await _settled_write(
+                session_id, conversation_store.set_runner_id, session_id, claim
+            ):
+                raise OmnigentError(
+                    "The session's host or runner changed while moving it. Reload and try again.",
+                    code=ErrorCode.CONFLICT,
+                )
             held = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if held is None:
                 raise _session_not_found()
@@ -5309,7 +5338,7 @@ def register_core_routes(
                 key: value for key, value in held.labels.items() if _is_sandbox_launch_label(key)
             }
             for key in stale_labels:
-                await asyncio.to_thread(conversation_store.delete_label, session_id, key)
+                await _settled_write(session_id, conversation_store.delete_label, session_id, key)
             await _schedule_managed_launch(
                 request,
                 session_id=session_id,
@@ -5322,14 +5351,27 @@ def register_core_routes(
                 before_start=detach_old_host,
             )
         except BaseException as exc:
-            await _restore_host_binding(
-                session_id,
-                host_id=previous_host_id,
-                workspace=previous_workspace,
-                git_branch=conv.git_branch,
-                labels=stale_labels,
-                claim=claim,
-            )
+
+            async def roll_back() -> None:
+                # Writes the cancelled request left running land before the undo.
+                await asyncio.gather(*_move_writes.get(session_id, ()), return_exceptions=True)
+                await _roll_back_sandbox_move(
+                    request,
+                    session_id,
+                    host_id=previous_host_id,
+                    workspace=previous_workspace,
+                    git_branch=conv.git_branch,
+                    labels=stale_labels,
+                    claim=claim,
+                )
+
+            if isinstance(exc, asyncio.CancelledError):
+                # A cancelled request can't await its own cleanup, so it runs on.
+                rollback = asyncio.ensure_future(roll_back())
+                _detached_rollbacks.add(rollback)
+                rollback.add_done_callback(_detached_rollbacks.discard)
+                raise
+            await roll_back()
             if isinstance(exc, ConversationNotFoundError):
                 raise _session_not_found() from exc
             raise

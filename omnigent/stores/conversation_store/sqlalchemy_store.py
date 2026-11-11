@@ -4808,6 +4808,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         *,
         expected_runner_id: str | None = None,
         expected_binding: Conversation | None = None,
+        expected_runner: Conversation | None = None,
     ) -> Conversation:
         """
         Atomically overwrite ``conversations.runner_id``.
@@ -4820,16 +4821,19 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param runner_id: New runner id, e.g. ``"runner_abc123"``.
+        :param expected_runner: Require its runner (``None`` included) to still be
+            the current one, whatever the host is now, checked under the row lock.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
+        :raises ValueError: If *expected_binding* or *expected_runner* no longer matches.
         """
 
         def write(session: Session) -> SqlConversationMetadata:
             meta = session.get(
                 SqlConversationMetadata,
                 (current_workspace_id(), conversation_id),
-                with_for_update=expected_binding is not None,
+                with_for_update=expected_binding is not None or expected_runner is not None,
             )
             if meta is None:
                 raise ConversationNotFoundError(
@@ -4839,6 +4843,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta.runner_id != expected_binding.runner_id
                 or meta.host_id != expected_binding.host_id
             ):
+                raise ValueError("The session binding changed; retry the request")
+            if expected_runner is not None and meta.runner_id != expected_runner.runner_id:
                 raise ValueError("The session binding changed; retry the request")
             if expected_runner_id is None:
                 _bind_runner(meta, runner_id)

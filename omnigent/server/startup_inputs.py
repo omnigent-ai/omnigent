@@ -45,6 +45,13 @@ from omnigent.stores.host_store import host_is_live
 
 _logger = logging.getLogger(__name__)
 STARTUP_LABEL = "omnigent.startup"
+# Terminal startup state of a launch withdrawn before it ran (a refused or
+# superseded move). Nothing queues behind it, and an input admitted just before
+# it was set settles itself when it sees it.
+STARTUP_WITHDRAWN = "withdrawn"
+_WITHDRAWN_INPUT_NOTE = (
+    "The message wasn't sent: the sandbox launch it was waiting for was withdrawn. Send it again."
+)
 
 
 def initial_input_id(session_id: str) -> str:
@@ -202,7 +209,23 @@ class ManagedStartupInputs:
             )
         else:
             conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
-            if conv is not None and STARTUP_LABEL not in conv.labels:
+            if conv is not None and conv.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN:
+                # Withdrawn after this was admitted, possibly after the withdrawal
+                # settled what it saw: settle this input the same way.
+                if await asyncio.to_thread(
+                    self.conversations.transition_pending_input,
+                    session_id,
+                    saved[0].id,
+                    expected="in_progress",
+                    status="failed",
+                ):
+                    await self._report_failure(
+                        session_id,
+                        "launch_withdrawn",
+                        _WITHDRAWN_INPUT_NOTE,
+                        publish_status=False,
+                    )
+            elif conv is not None and STARTUP_LABEL not in conv.labels:
                 # The startup finished as this was saved; keep later messages behind it.
                 await asyncio.to_thread(
                     self.conversations.set_labels, session_id, {STARTUP_LABEL: "ready"}
@@ -253,12 +276,17 @@ class ManagedStartupInputs:
         The session keeps running where it is (its old host, or one that took
         it before the sandbox was ready). Messages held for the sandbox were
         never sent: they are failed with *message* so the user can send them
-        again, and the startup label goes so later messages reach that host.
+        again. The startup becomes :data:`STARTUP_WITHDRAWN` first, so later
+        messages reach that host and one admitted meanwhile settles itself.
 
         :param session_id: The session the launch was for.
         :param message: Transcript note for the held messages, e.g. why they
             weren't sent.
         """
+        with contextlib.suppress(ConversationNotFoundError):
+            await asyncio.to_thread(
+                self.conversations.set_labels, session_id, {STARTUP_LABEL: STARTUP_WITHDRAWN}
+            )
         undelivered = False
         for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
             if item.status == "in_progress":
@@ -269,8 +297,6 @@ class ManagedStartupInputs:
                     expected="in_progress",
                     status="failed",
                 )
-        with contextlib.suppress(ConversationNotFoundError):
-            await asyncio.to_thread(self.conversations.delete_label, session_id, STARTUP_LABEL)
         if undelivered:
             await self._report_failure(
                 session_id, "launch_withdrawn", message, publish_status=False

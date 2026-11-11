@@ -1821,6 +1821,7 @@ class ConversationStore(ABC):
         *,
         expected_runner_id: str | None = None,
         expected_binding: Conversation | None = None,
+        expected_runner: Conversation | None = None,
     ) -> Conversation:
         """
         Replace ``conversations.runner_id`` for a conversation.
@@ -1843,6 +1844,9 @@ class ConversationStore(ABC):
             return the current conversation unchanged. None means unconditional.
         :param expected_binding: Require its runner and host to match the current binding.
             A mismatch raises ValueError before any write.
+        :param expected_runner: Require its runner (``None`` included) to still be the
+            current one, whatever the host is now. A mismatch raises ValueError
+            before any write.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.

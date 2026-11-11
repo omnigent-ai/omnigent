@@ -6582,13 +6582,14 @@ async def _launch_runner_on_host_locked(
     new_runner_id = token_bound_runner_id(binding_token)
 
     try:
-        # Against the binding this launch read, so a session that moved in the
-        # meantime (detached onto a new sandbox, say) keeps its new binding.
+        # Only while the runner is still the one this launch read, so a claim a
+        # move took meanwhile isn't overwritten. The host may have changed: an
+        # admitted launch still goes ahead after its host is revoked.
         bound_conv = await asyncio.to_thread(
             conversation_store.replace_runner_id,
             conv.id,
             new_runner_id,
-            expected_binding=conv,
+            expected_runner=conv,
         )
     except ValueError:
         return _HostLaunchAttempt(
@@ -6804,19 +6805,29 @@ def _start_managed_launch_task(
         """
         if held_runner_id is None:
             return True
-        current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        if current is None:
-            return True
-        if current.runner_id == held_runner_id:
+        for _ in range(3):
+            current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if current is None:
+                return True
+            if current.runner_id != held_runner_id:
+                # Unbound, or bound to this launch's own sandbox (whose runner
+                # replaced the claim), the session is still this launch's; any
+                # other host won it.
+                return current.host_id is None or (
+                    entry is not None and entry.host_id == current.host_id
+                )
             # Compare-and-clear on the exact binding read, so the host stays.
-            with contextlib.suppress(ConversationNotFoundError, ValueError):
+            try:
                 await asyncio.to_thread(
                     conversation_store.clear_runner_id, session_id, expected_binding=current
                 )
+            except ConversationNotFoundError:
+                return True
+            except ValueError:
+                continue  # Changed since the read; classify it again.
             return True
-        # Unbound, or bound to this launch's own sandbox (whose runner replaced
-        # the claim), the session is still this launch's; any other host won it.
-        return current.host_id is None or (entry is not None and entry.host_id == current.host_id)
+        # Still contended after repeated reads: don't claim the session.
+        return False
 
     async def settle_superseded() -> None:
         # Another host runs the session: nothing failed there, but what was
