@@ -7670,10 +7670,20 @@ def session_export(
                     )
 
         # Write beside the target and rename, so a failure while paging never
-        # leaves a partial file that reads as a complete transcript.
-        tmp_path = out_path.with_name(f".{out_path.name}.partial")
+        # leaves a partial file that reads as a complete transcript. The staging
+        # file is created exclusively under a fresh name, so no existing file
+        # (or symlink) is written through, and only that file is ever removed.
+        staging = tempfile.NamedTemporaryFile(  # noqa: SIM115 — closed by the with below
+            "w",
+            encoding="utf-8",
+            dir=out_path.parent,
+            prefix=f".{out_path.name}.",
+            suffix=".partial",
+            delete=False,
+        )
+        tmp_path = Path(staging.name)
         try:
-            with tmp_path.open("w", encoding="utf-8") as fh:
+            with staging as fh:
                 if export_format == "transcript":
                     fh.writelines(iter_transcript_lines(session_data, _items()))
                 else:

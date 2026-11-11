@@ -642,10 +642,15 @@ def item_from_entry(entry: TranscriptEntry) -> dict[str, Any]:
     :returns: A create payload in the ``SessionEventInput`` shape, with
         ``data`` keyed by the entity field names (``agent``, not ``model``).
     :raises TranscriptSchemaError: If ``raw`` describes a different kind or
-        role than the entry's readable fields.
+        role than the entry's readable fields, or comes without the
+        ``origin_type`` needed to rebuild it.
     """
     origin = entry.origin_type
     data: dict[str, Any]
+    if entry.raw is not None and not origin:
+        # Rebuilding from the readable fields would silently drop what only
+        # ``raw`` holds, such as encrypted reasoning.
+        raise TranscriptSchemaError(f"entry {entry.seq}: raw needs an origin_type to import")
     if entry.raw is not None and origin:
         _require_raw_matches_entry(entry, origin, entry.raw)
         data = dict(entry.raw)
@@ -753,13 +758,33 @@ def _require_raw_matches_entry(entry: TranscriptEntry, origin: str, raw: dict[st
         name
         for name in readings
         if (getattr(entry, name) is not None or name in _FLAG_FIELDS)
-        and getattr(entry, name) != getattr(expected, name)
+        and not _same_json(getattr(entry, name), getattr(expected, name))
     )
     if differing:
         raise TranscriptSchemaError(
             f"entry {entry.seq}: {', '.join(differing)} does not match its raw "
             f"{origin!r} payload, so the file reads differently from what it imports"
         )
+
+
+def _same_json(left: Any, right: Any) -> bool:
+    """Whether two JSON values are equal, keeping ``true`` apart from ``1``.
+
+    Python's ``==`` treats ``True == 1`` and ``False == 0``, at any depth.
+
+    :param left: A parsed JSON value, e.g. ``{"limit": True}``.
+    :param right: Another, e.g. ``{"limit": 1}``.
+    :returns: ``True`` only when both are the same JSON value.
+    """
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_same_json(left[k], right[k]) for k in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(map(_same_json, left, right))
+    if isinstance(left, dict | list) or isinstance(right, dict | list):
+        return False
+    return left == right
 
 
 def agent_serializes_as_model(item_type: str) -> bool:

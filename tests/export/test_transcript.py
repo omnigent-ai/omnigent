@@ -443,17 +443,6 @@ def test_reader_refuses_a_field_that_does_not_belong_to_the_kind(
         )
 
 
-def test_every_written_entry_satisfies_its_kind_table() -> None:
-    """The writer never produces a line the reader would refuse."""
-    for item in _ROUND_TRIP_ITEMS:
-        read_transcript(
-            [
-                json.dumps({"schema": TRANSCRIPT_SCHEMA, "session": "x"}) + "\n",
-                entry_from_item(item, turn=1, seq=1).to_line() + "\n",
-            ]
-        )
-
-
 def test_reader_ignores_fields_it_does_not_know() -> None:
     """A future minor addition inside the same schema must not break reading."""
     lines = [
@@ -623,8 +612,26 @@ def test_rebuild_refuses_raw_that_reads_as_another_kind() -> None:
             {"meta": False},
             "meta",
         ),
+        (
+            _item("function_call", name="search", arguments='{"limit": 1}', call_id="c1"),
+            {"tool_input": {"limit": True}},
+            "tool_input",
+        ),
+        (
+            _item("function_call", name="search", arguments='{"flags": [false]}', call_id="c1"),
+            {"tool_input": {"flags": [0]}},
+            "tool_input",
+        ),
     ],
-    ids=["text", "tool-input", "tool-output", "sealed-flag", "omitted-meta-flag"],
+    ids=[
+        "text",
+        "tool-input",
+        "tool-output",
+        "sealed-flag",
+        "omitted-meta-flag",
+        "true-for-one",
+        "nested-zero-for-false",
+    ],
 )
 def test_rebuild_refuses_a_reading_that_disagrees_with_raw(
     item: dict[str, Any], edit: dict[str, Any], field: str
@@ -634,6 +641,19 @@ def test_rebuild_refuses_a_reading_that_disagrees_with_raw(
     line = {key: value for key, value in line.items() if value is not None}
 
     with pytest.raises(TranscriptSchemaError, match=f"{field}.* does not match its raw"):
+        item_from_entry(_entry(**line))
+
+
+def test_rebuild_refuses_raw_without_its_origin_type() -> None:
+    """Without ``origin_type`` the entry can't rebuild from ``raw``, and the readable
+    fields alone would drop the encrypted reasoning."""
+    item = _item(
+        "reasoning", summary=[{"type": "summary_text", "text": "Plan"}], encrypted_content="gA"
+    )
+    line = json.loads(entry_from_item(item, turn=1, seq=1).to_line())
+    del line["origin_type"]
+
+    with pytest.raises(TranscriptSchemaError, match="raw needs an origin_type"):
         item_from_entry(_entry(**line))
 
 

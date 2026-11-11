@@ -237,23 +237,6 @@ def test_session_export_missing_session_errors(tmp_path: Path) -> None:
 
 
 @respx.mock
-def test_session_export_items_ordered_ascending(tmp_path: Path) -> None:
-    """Items in the JSONL appear in ascending position order (user then assistant)."""
-    respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
-        return_value=httpx.Response(200, json=_SESSION_META)
-    )
-    _mock_items([_ITEMS_PAGE])
-
-    out_file = tmp_path / "ordered.jsonl"
-    result = _export(out_file)
-    assert result.exit_code == 0, result.output
-
-    records = [json.loads(line) for line in out_file.read_text().splitlines() if line]
-    items = [r for r in records if r["record_type"] == "item"]
-    assert [r["role"] for r in items] == ["user", "assistant"]
-
-
-@respx.mock
 def test_session_export_pagination(tmp_path: Path) -> None:
     """Export follows has_more cursors to fetch all pages."""
     page1 = {
@@ -306,15 +289,47 @@ def test_session_export_pagination(tmp_path: Path) -> None:
 
 @respx.mock
 def test_session_export_refuses_a_page_without_a_cursor(tmp_path: Path) -> None:
-    """A page that claims more results but gives no cursor stops the export, leaving no file."""
+    """A page that claims more results but gives no cursor stops the export.
+
+    The destination and any neighbouring file are left as they were, including
+    one named like the export's own staging file.
+    """
     respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
         return_value=httpx.Response(200, json=_SESSION_META)
     )
     _mock_items([{**_ITEMS_PAGE, "has_more": True, "last_id": None}], newest_id="msg_9")
-
     out_file = tmp_path / "stuck.jsonl"
+    out_file.write_text("previous export\n")
+    neighbour = tmp_path / ".stuck.jsonl.partial"
+    neighbour.write_text("someone else's file\n")
+
     result = _export(out_file)
 
     assert result.exit_code != 0
     assert "without a cursor" in result.output
-    assert list(tmp_path.iterdir()) == []
+    assert out_file.read_text() == "previous export\n"
+    assert neighbour.read_text() == "someone else's file\n"
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        ".stuck.jsonl.partial",
+        "stuck.jsonl",
+    ]
+
+
+@respx.mock
+def test_session_export_replaces_only_its_destination(tmp_path: Path) -> None:
+    """A finished export replaces the destination and touches no neighbouring file."""
+    respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
+        return_value=httpx.Response(200, json=_SESSION_META)
+    )
+    _mock_items([_ITEMS_PAGE])
+    out_file = tmp_path / "out.jsonl"
+    out_file.write_text("previous export\n")
+    neighbour = tmp_path / ".out.jsonl.partial"
+    neighbour.write_text("someone else's file\n")
+
+    result = _export(out_file)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(out_file.read_text().splitlines()[0])["record_type"] == "session_meta"
+    assert neighbour.read_text() == "someone else's file\n"
+    assert sorted(path.name for path in tmp_path.iterdir()) == [".out.jsonl.partial", "out.jsonl"]

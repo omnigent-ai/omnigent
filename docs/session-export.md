@@ -150,8 +150,9 @@ in the file as a record of who wrote what). Items get new ids,
 so a compaction's `covers_through` still names the source session's item; the
 importing server treats that boundary as stale and compacts afresh when needed.
 
-A file whose entries lack `raw` (one written by hand, or trimmed) is rebuilt
-from the readable fields instead: a message's `content` blocks are used when
+An entry with `raw` must also carry `origin_type`, or import refuses it rather
+than drop what only `raw` holds. A file whose entries lack `raw` (one written by
+hand, or trimmed) is rebuilt from the readable fields instead: a message's `content` blocks are used when
 present, else its `text` becomes one block; sealed reasoning comes back as
 summary only; terminal output is kept as stdout.
 
