@@ -51,7 +51,7 @@ import contextlib
 import copy
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -2674,12 +2674,17 @@ async def _run_with_telemetry(
     monkeypatch: pytest.MonkeyPatch,
     iterations: int,
     catalog: dict[str, object] | None = None,
+    catalog_fetcher: Callable[[int], dict[str, object]] | None = None,
+    context_window_override: str | None = None,
 ) -> None:
     """Drive ``supervise_reader`` in STREAM mode with a fake model catalog."""
     from omnigent.onboarding import providers as providers_mod
 
     fake_catalog = catalog if catalog is not None else _FAKE_CATALOG
-    monkeypatch.delenv("AP_CONTEXT_WINDOW_OVERRIDE", raising=False)
+    if context_window_override is None:
+        monkeypatch.delenv("AP_CONTEXT_WINDOW_OVERRIDE", raising=False)
+    else:
+        monkeypatch.setenv("AP_CONTEXT_WINDOW_OVERRIDE", context_window_override)
     monkeypatch.setattr(
         providers_mod,
         "_fetch_provider_catalog",
@@ -2691,7 +2696,7 @@ async def _run_with_telemetry(
     monkeypatch.setattr(
         reader,
         "get_available_models",
-        lambda port: fake_catalog,
+        catalog_fetcher if catalog_fetcher is not None else (lambda port: fake_catalog),
     )
 
     async def _noop_sleep(_seconds: float) -> None:
@@ -3183,6 +3188,99 @@ async def test_usage_context_window_resolution_variants_and_unknown_omission(
     assert usage_events[3]["context_tokens"] == 1500
     assert usage_events[3]["model"] == "MODEL_PLACEHOLDER_UNKNOWN_999"
     assert "context_window" not in usage_events[3]
+
+
+@pytest.mark.asyncio
+async def test_usage_context_window_env_override_takes_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """AP_CONTEXT_WINDOW_OVERRIDE overrides explicit catalog limits and shared tables."""
+    catalog: dict[str, object] = {
+        "models": {
+            "m_custom": {
+                "model": "MODEL_PLACEHOLDER_CUSTOM",
+                "displayName": "Custom Workspace Model",
+                "maxContextTokens": 512_000,
+            }
+        }
+    }
+    step = _planner_with_model_usage(
+        step_index=2,
+        input_tokens="800",
+        cache_read_tokens="200",
+        model_enum="MODEL_PLACEHOLDER_CUSTOM",
+    )
+    sink = _PostSink()
+
+    await _run_with_telemetry(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript([_frame([step])]),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+        catalog=catalog,
+        context_window_override="64000",
+    )
+
+    usage_events = [d for et, d in sink.posts if et == "external_session_usage"]
+    assert len(usage_events) == 1
+    assert usage_events[0]["context_tokens"] == 1000
+    assert usage_events[0]["context_window"] == 64_000
+
+
+@pytest.mark.asyncio
+async def test_usage_catalog_retries_after_transient_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A transient GetAvailableModels error recovers on the next turn without cache poisoning."""
+    calls = 0
+
+    def _flaky_catalog(_port: int) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient rpc error")
+        return _FAKE_CATALOG
+
+    step1 = _planner_with_model_usage(
+        step_index=2,
+        input_tokens="1000",
+        cache_read_tokens="200",
+        model_enum="MODEL_PLACEHOLDER_M20",
+    )
+    step2 = _planner_with_model_usage(
+        step_index=5,
+        input_tokens="400",
+        cache_read_tokens="1200",
+        model_enum="MODEL_PLACEHOLDER_M20",
+    )
+    sink = _PostSink()
+
+    await _run_with_telemetry(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript([_frame([step1]), _frame([step1, step2])]),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+        catalog_fetcher=_flaky_catalog,
+    )
+
+    usage_events = [d for et, d in sink.posts if et == "external_session_usage"]
+    assert len(usage_events) == 2
+    assert calls == 2
+    assert usage_events[0]["model"] == "MODEL_PLACEHOLDER_M20"
+    assert usage_events[0]["context_tokens"] == 1200
+    assert "context_window" not in usage_events[0]
+
+    assert usage_events[1]["model"] == "Gemini 2.5 Flash"
+    assert usage_events[1]["context_tokens"] == 1600
+    assert usage_events[1]["context_window"] == 1_048_576
 
 
 # ---------------------------------------------------------------------------
@@ -4082,7 +4180,11 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
     snapshot: dict[str, object] = {
         "agent_id": "agent_xyz",
         "runner_id": "runner_abc",
-        "labels": {ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: "bridge-123"},
+        "labels": {
+            ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: "bridge-123",
+            "omnigent.last_context_tokens": "17298",
+            "omnigent.last_context_window": "1048576",
+        },
         "title": "Fix login flow",
         "project_id": "proj_alpha",
     }
@@ -4127,11 +4229,13 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
         f"rotation must not PATCH external_session_id (claude parity); calls={calls!r}"
     )
     # The create POST inherited the old agent_id, title, project + bridge-id label
-    # (so the new session resolves to the same bridge_dir).
+    # (so the new session resolves to the same bridge_dir), without stale context fill.
     create_body = calls[1][2]
     assert create_body["agent_id"] == "agent_xyz"
     assert isinstance(create_body["labels"], dict)
     assert create_body["labels"][ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY] == "bridge-123"
+    assert "omnigent.last_context_tokens" not in create_body["labels"]
+    assert "omnigent.last_context_window" not in create_body["labels"]
     assert create_body.get("title") == "Fix login flow"
     assert create_body.get("project_id") == "proj_alpha"
     assert create_body.get("workspace", "missing") is None
