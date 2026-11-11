@@ -101,6 +101,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     assert columns["mcp_services"]["nullable"] is True
     assert columns["trigger_config"]["nullable"] is True
     assert columns["trigger_provider"]["nullable"] is True
+    assert columns["pending_event_run_id"]["nullable"] is True
     assert columns["rrule"]["nullable"] is True
     cols = set(columns)
     assert cols == {
@@ -135,6 +136,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "source_session_id",
         "trigger_config",
         "trigger_provider",
+        "pending_event_run_id",
     }
 
 
@@ -1140,6 +1142,26 @@ def test_json_columns_cap_stored_bytes() -> None:
         assert column.type.max_stored_bytes == 16_383
 
 
+def test_json_columns_are_bounded_varbinary_on_mysql() -> None:
+    """MySQL declares both JSON columns VARBINARY(16383), through migration and metadata."""
+    from sqlalchemy.dialects import mysql
+    from sqlalchemy.schema import CreateTable
+
+    for table, column in (
+        (SqlScheduledTask.__table__, "trigger_config"),
+        (SqlScheduledTaskRun.__table__, "event"),
+    ):
+        ddl = str(CreateTable(table).compile(dialect=mysql.dialect()))
+        assert f"{column} VARBINARY(16383)" in ddl
+    config = _build_alembic_config("mysql://")
+    config.output_buffer = StringIO()
+    command.upgrade(config, f"{_MCP_SERVICES_MERGE_REVISION}:{_TRIGGER_CONFIG_REVISION}", sql=True)
+    sql = config.output_buffer.getvalue()
+    assert "ADD COLUMN trigger_config VARBINARY(16383)" in sql
+    assert "ADD COLUMN event VARBINARY(16383)" in sql
+    assert "BLOB" not in sql
+
+
 def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
     dispatch_migration_engine: Engine,
 ) -> None:
@@ -1194,6 +1216,12 @@ def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
     with pytest.raises(IntegrityError):
         with engine.begin() as conn:
             conn.execute(receipts.insert().values(id=b"d" * 16, **receipt))
+    with engine.begin() as conn:
+        # The same occurrence is its own receipt for another task or workspace.
+        conn.execute(
+            receipts.insert().values(id=b"e" * 16, **{**receipt, "scheduled_task_id": b"a" * 16})
+        )
+        conn.execute(receipts.insert().values(id=b"f" * 16, **{**receipt, "workspace_id": 7}))
     with pytest.raises(RuntimeError, match="no rrule"):
         command.downgrade(config, _MCP_SERVICES_MERGE_REVISION)
     with engine.begin() as conn:

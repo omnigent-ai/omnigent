@@ -1597,11 +1597,15 @@ class SqlScheduledTask(OmnigentBase):
     # provider, e.g. {"provider": "omnigent", "events": ["turn.completed"]}.
     # NULL for a scheduled task. Read and written whole, never filtered in SQL.
     trigger_config: Mapped[str | None] = mapped_column(
-        CompressedText(max_stored_bytes=16_383), nullable=True
+        CompressedText(max_stored_bytes=16_383, mysql_varbinary=True), nullable=True
     )
     # The provider named in trigger_config, e.g. "omnigent", or NULL for a scheduled
     # task: the scalar SQL filters event-triggered tasks on.
     trigger_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # The event run a task that continues one session adds new events to while it
+    # waits for a claim (relates to scheduled_task_runs.id; no DB foreign key, Rule
+    # R032). Stale once that run is claimed; NULL until the task's first event run.
+    pending_event_run_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     # Session-owner identity: the spawned run's LEVEL_OWNER grant is written
     # for this user. Nullable — None in single-user/OSS mode (the fire path
     # resolves null to the reserved "local" user). String(128) to match
@@ -1765,7 +1769,7 @@ class SqlScheduledTaskRun(OmnigentBase):
     # e.g. {"events": [{"type": "turn.completed", "session_id": "..."}]}. NULL for
     # scheduled and Run now runs. Read and written whole, never filtered in SQL.
     event: Mapped[str | None] = mapped_column(
-        CompressedText(max_stored_bytes=16_383), nullable=True
+        CompressedText(max_stored_bytes=16_383, mysql_varbinary=True), nullable=True
     )
 
     __table_args__ = (
