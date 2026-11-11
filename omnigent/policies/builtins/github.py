@@ -1163,6 +1163,12 @@ def _classify_gh(tokens: list[str]) -> _ShellOp | None:
             repo = _normalize_repo(rest[1]) or None
         elif group in {"pr", "issue"} and action not in {"", "create"}:
             repo = _repo_from_url(rest[1]) or None
+    if explicit_repo is not None and group in {"pr", "issue"} and action not in {"", "create"}:
+        # gh takes the target from a URL argument even when -R is also given, so any
+        # URL argument must name the explicit repo.
+        url_repos = {url_repo for token in rest if (url_repo := _repo_from_url(token))}
+        if any(url_repo != repo for url_repo in url_repos):
+            return _unparseable_op("gh URL argument names a different repo than -R")
     is_write = action in _GH_WRITE_ACTIONS.get(group, frozenset())
     detail = f"gh {group} {action}".strip()
     if is_write:
