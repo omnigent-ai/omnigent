@@ -98,6 +98,10 @@ the header menu), and each place is a separate entry point.
   [session orchestration](session-orchestration.md)).
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
+  Agents rename projects and set their emoji with `sys_project_update`, and
+  rename, pin or archive
+  sessions with `sys_session_update` (see
+  [session orchestration](session-orchestration.md)).
 - `project-show-more`: an expanded project folder lists its five newest
   sessions; each Show more slides five more in until none remain. Re-expanding
   starts at five again, the open session stays listed once the sidebar has
@@ -195,7 +199,9 @@ the header menu), and each place is a separate entry point.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
   (Default / Status / Harness / Created / Updated), Display (All / My / Shared with me / Archived), Ordering
   (Updated / Created / Custom) and Show (Updated / Environment / Repo / Branch) submenus,
-  saved per device. Created ordering keeps sessions newest-created first as messages
+  saved per device. On phone layouts a submenu replaces the menu's list under a
+  back row with its name, and reopening the menu starts at the main list.
+  Created ordering keeps sessions newest-created first as messages
   arrive;
   requests, pagination, and project folders use that order too. Switching order
   clears the cached rows and shows loading while session timestamps refresh,
@@ -1210,13 +1216,14 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_canvas_creation.py::test_stale_regular_creation_url_returns_to_new_session`.
 - **`view-options`:**
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_harness_grouping_persists_across_reload`
-  (desktop and narrow-browser navigation),
+  (desktop and narrow-browser navigation, with every Grouping option inside the viewport),
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_grouping_and_show_toggles_persist_across_reload`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_created_ordering_persists_and_flag_off_uses_updated`
   (the flag-off case disables it by patching `GET /v1/info`). Unit tests in
   `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
-  that the flag-off sidebar ignores stored view options.
+  that the flag-off sidebar ignores stored view options; "Sidebar view options"
+  covers the phone-layout submenus opening in place with their back row.
 - **`project-show-more`:** no browser test drives it. Component tests in
   `web/src/shell/Sidebar.test.tsx` ("Sidebar project Show more") cover paging,
   the next server page, the slide and its reduced-motion skip, the open-session
@@ -1272,8 +1279,8 @@ its discoverability.
   cannot create siblings. Shared viewers see flat rows.
 - Families are bounded to 100 retained members, including archived members.
   Use the row chevron to **Collapse session family** or **Expand session family**.
-- Nested creation and same-sandbox fork selection require the default-off
-  `OMNIGENT_FEATURES=sibling_sessions` flag. Reload the UI after enabling it.
+- Nested creation and same-sandbox fork selection are enabled by default.
+  Set `OMNIGENT_FEATURES=-sibling_sessions` to disable them and reload the UI.
   Opening a saved **Add nested agent** link while disabled or on an older server
   shows an unavailable message instead of a composer that cannot submit.
 - If the source disappears after a rejected create, **Continue in a new session**

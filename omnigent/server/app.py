@@ -347,6 +347,9 @@ class ServerInfoResponse(BaseModel):
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
+    # Every other agent-tool organizing write checks it too: session title, pin
+    # and archive, and project rename, icon and delete.
+    session_organize_source_checks: bool = False
     # An agent's create that names a project other than its source's project makes a
     # standalone session; older servers refuse it while sibling sessions are on.
     sibling_other_project_standalone: bool = False
@@ -3746,6 +3749,7 @@ def create_app(
                 "scheduled_task_projects": project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
                 "session_move_source_checks": True,
+                "session_organize_source_checks": True,
                 "sibling_other_project_standalone": True,
                 "automations_enabled": automations_enabled,
                 "automation_trigger_poll_minutes": trigger_poll_minutes,

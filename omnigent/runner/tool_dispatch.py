@@ -91,7 +91,11 @@ from omnigent.tools.builtins.session_message import (
     SysSessionMessageTool,
     peer_session_messaging_enabled,
 )
-from omnigent.tools.builtins.session_projects import SysProjectListTool, SysSessionUpdateTool
+from omnigent.tools.builtins.session_projects import (
+    SysProjectListTool,
+    SysProjectUpdateTool,
+    SysSessionUpdateTool,
+)
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -331,8 +335,14 @@ _SESSION_QUERY_TOOLS = frozenset(
 )
 
 _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
-# Project listing and moves proxy the sidebar's owner-gated REST endpoints.
-_PROJECT_TOOLS = frozenset({SysProjectListTool.name(), SysSessionUpdateTool.name()})
+# Project and session organizing proxy the sidebar's owner-gated REST endpoints.
+_PROJECT_TOOLS = frozenset(
+    {
+        SysProjectListTool.name(),
+        SysSessionUpdateTool.name(),
+        SysProjectUpdateTool.name(),
+    }
+)
 _UI_TOOLS = frozenset({UiOpenFileTool.name()})
 
 # The title bound the rename tool advertises to the LLM — read once from the
@@ -618,6 +628,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysSessionMessageTool,
             SysProjectListTool,
             SysSessionUpdateTool,
+            SysProjectUpdateTool,
             UiOpenFileTool,
             SysAgentGetTool,
             SysAgentListTool,
@@ -662,6 +673,8 @@ _RUNNER_STATUS_CONCURRENCY = 8
 # ``visibility``. The default matches the UI sidebar: an agent reasoning over
 # "its" sessions must not pick up sessions other users shared with the caller.
 _SESSION_LIST_DEFAULT_VISIBILITY = "mine"
+# Newest sessions ``sys_session_list`` returns when the agent passes no ``limit``.
+_SESSION_LIST_DEFAULT_LIMIT = 50
 _SESSION_LIST_VISIBILITIES = ("mine", "shared", "all")
 
 _DISCOVERY_LIST_MAX_LIMIT = 100
@@ -803,22 +816,27 @@ def _bounded_discovery_result(
     continued: bool,
     source_pages: dict[str, _DiscoveryPage],
     page_sections: tuple[str, ...] | None = None,
+    default_limit: int | None = None,
     tool_name: str,
     filters: _JsonObject,
 ) -> str:
-    """Keep a small legacy result intact, otherwise return a fitting page."""
+    """Keep a small legacy result intact, otherwise return a fitting page.
+
+    ``default_limit`` caps paged rows when the caller passes no ``limit``.
+    """
+    paged = page_sections or tuple(sections)
     complete = json.dumps(sections)
     if (
         limit is None
         and not continued
         and not any(page.failed for page in source_pages.values())
         and not any(page.has_more for page in source_pages.values())
+        and (default_limit is None or all(len(sections[name]) <= default_limit for name in paged))
         and len(complete) <= _DISCOVERY_LIST_OUTPUT_MAX_CHARS
     ):
         return complete
 
-    requested_limit = limit or _DISCOVERY_LIST_MAX_LIMIT
-    paged = page_sections or tuple(sections)
+    requested_limit = limit or default_limit or _DISCOVERY_LIST_MAX_LIMIT
 
     def _candidate(candidate_limit: int) -> str | None:
         page = dict(sections)
@@ -6381,11 +6399,12 @@ async def _session_list_via_rest(
     :param include_archived: Also list archived sessions in the global view.
     :param visibility: ``"mine"``, ``"shared"`` or ``"all"`` — the server's
         ownership filter for the global view.
-    :param limit: Optional maximum rows returned from the global sessions view. When
-        omitted, the complete legacy result is preserved while it fits.
+    :param limit: Optional maximum rows returned from the global sessions view;
+        :data:`_SESSION_LIST_DEFAULT_LIMIT` when omitted.
     :param cursor_state: Opaque continuation position for the global sessions view.
-    :returns: The legacy complete JSON result while it fits, otherwise a
-        bounded page with continuation metadata.
+    :returns: The complete JSON result when no ``limit`` was given and at most
+        :data:`_SESSION_LIST_DEFAULT_LIMIT` sessions exist, otherwise a bounded
+        page with continuation metadata.
     """
     sub_agents = await _collect_sub_agents(conversation_id, server_client)
     sessions_page = (
@@ -6397,7 +6416,7 @@ async def _session_list_via_rest(
             include_archived=include_archived,
             visibility=visibility,
             after=cursor_state["sessions"][1],
-            limit=limit or _AGENT_LIST_PAGE_LIMIT,
+            limit=limit or _SESSION_LIST_DEFAULT_LIMIT,
         )
     )
     result = _bounded_discovery_result(
@@ -6409,6 +6428,7 @@ async def _session_list_via_rest(
         filters=_session_list_filters(agent_name, include_archived, visibility),
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
+        default_limit=_SESSION_LIST_DEFAULT_LIMIT,
     )
     return await _fill_returned_runner_online(result, server_client)
 
@@ -6417,11 +6437,12 @@ async def _fill_returned_runner_online(result: str, server_client: httpx.AsyncCl
     """
     Resolve ``runner_online`` for the session rows the tool actually returns.
 
-    The global view fetches up to :data:`_AGENT_LIST_PAGE_LIMIT` sessions but
-    the output budget usually keeps far fewer, so resolving before paging
-    fired one status call per runner across the whole fetch. Rows are sized
-    with the :data:`_RUNNER_ONLINE_SIZING_PLACEHOLDER`, the widest value, so
-    the chosen page stays within the budget once real values replace it.
+    The global view can fetch more sessions than the output budget keeps
+    (an older server's archive fallback fetches :data:`_AGENT_LIST_PAGE_LIMIT`),
+    so resolving before paging fired one status call per runner across the
+    whole fetch. Rows are sized with the :data:`_RUNNER_ONLINE_SIZING_PLACEHOLDER`,
+    the widest value, so the chosen page stays within the budget once real
+    values replace it.
 
     :param result: Serialized ``sys_session_list`` result from
         :func:`_bounded_discovery_result`.
@@ -7365,14 +7386,15 @@ async def execute_tool(
         elif tool_name in _PROJECT_TOOLS:
             from omnigent.runner.session_projects import (
                 execute_project_list,
+                execute_project_update,
                 execute_session_update,
             )
 
-            execute = (
-                execute_project_list
-                if tool_name == SysProjectListTool.name()
-                else execute_session_update
-            )
+            execute = {
+                SysProjectListTool.name(): execute_project_list,
+                SysSessionUpdateTool.name(): execute_session_update,
+                SysProjectUpdateTool.name(): execute_project_update,
+            }[tool_name]
             output = await execute(args, server_client, conversation_id)
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(
