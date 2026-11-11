@@ -31,6 +31,7 @@ def persistent_configuration_command(command: Sequence[str]) -> list[str]:
         len(command) < 5
         or Path(command[0]).name.lower() not in {"uvx", "uvx.exe"}
         or command[1] != "--from"
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", command[3]) is None
     ):
         return list(command)
     from omnigent.process_logging import data_dir

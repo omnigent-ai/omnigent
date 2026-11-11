@@ -88,6 +88,8 @@ def test_saved_helper_survives_cache_replacement(
         ["sh", "-c", "custom-helper --selected-profile"],
         ["uvx", "--from", "package", "helper"],
         ["uvx", "--isolated", "helper", "configure", "--profile", "selected"],
+        ["uvx", "--from", "example-kit==1.0", "--python", "3.12", "helper", "configure"],
+        ["uvx", "--from", "example-kit==1.0", "--", "helper", "configure"],
     ],
 )
 def test_custom_command_is_not_replaced(command: list[str]) -> None:
