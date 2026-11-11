@@ -195,7 +195,7 @@ function loadNavigationHarness({
     dbcertPreflights: 0,
     arcaConsentRuns: [],
     cookiesSet: [],
-    oidc: { refresh: 0, signIn: 0, signOut: 0 },
+    oidc: { created: 0, refresh: 0, signIn: 0, signOut: 0 },
     arcaLogins: [],
     arcaLoginCancels: 0,
     arcaSetups: [],
@@ -562,26 +562,31 @@ function loadNavigationHarness({
       expireStoredAccessToken: () => false,
       removeStoredRefreshToken: () => false,
     },
-    "./oidc-credentials": {
-      ...require("../src/oidc-credentials"),
-      refreshSession: async (...args) => {
-        calls.oidc.refresh++;
-        if (!oidc.refresh) throw Object.assign(new Error("none"), { code: "NO_STORED_TOKEN" });
-        return oidc.refresh(...args);
+    "./oidc-credentials.ts": {
+      createOidcCredentials: (deps) => {
+        calls.oidc.created++;
+        return {
+          ...require("../src/oidc-credentials.ts").createOidcCredentials(deps),
+          refreshSession: async (...args) => {
+            calls.oidc.refresh++;
+            if (!oidc.refresh) throw Object.assign(new Error("none"), { code: "NO_STORED_TOKEN" });
+            return oidc.refresh(...args);
+          },
+          signInWithBrowser: async (...args) => {
+            calls.oidc.signIn++;
+            if (!oidc.signIn) throw new Error("unexpected browser sign-in");
+            return oidc.signIn(...args);
+          },
+          signOut: async () => {
+            calls.oidc.signOut++;
+          },
+          removeStoredGrant: () => false,
+        };
       },
-      signInWithBrowser: async (...args) => {
-        calls.oidc.signIn++;
-        if (!oidc.signIn) throw new Error("unexpected browser sign-in");
-        return oidc.signIn(...args);
-      },
-      signOut: async () => {
-        calls.oidc.signOut++;
-      },
-      removeStoredGrant: () => false,
     },
-    "./oidc-auth": {
+    "./oidc-auth.ts": {
       createOidcAuth: (options) =>
-        require("../src/oidc-auth").createOidcAuth({
+        require("../src/oidc-auth.ts").createOidcAuth({
           ...options,
           // /v1/me accepts exactly the session tokens the test allows.
           fetchFn: async (_url, init) => ({
@@ -589,8 +594,8 @@ function loadNavigationHarness({
           }),
         }),
     },
-    "./databricks-auth": {
-      ...require("../src/databricks-auth"),
+    "./databricks-auth.ts": {
+      ...require("../src/databricks-auth.ts"),
       readDatabricksAuthMode: () => databricksMode,
     },
     // The bounce's behavior is unit-tested in workspace-root-bounce.test.js;
@@ -655,10 +660,10 @@ function loadNavigationHarness({
       stripCrossOriginOpenerHeaders: () => {},
       WEB_SCHEMES: new Set(),
     },
-    "./hostIdentity": {
-      ...require("../src/hostIdentity"),
+    "./hostIdentity.ts": {
+      ...require("../src/hostIdentity.ts"),
       createHostThisMachineChecker: () =>
-        require("../src/hostIdentity").createHostThisMachineChecker({
+        require("../src/hostIdentity.ts").createHostThisMachineChecker({
           cli: localHostCli,
           now: localHostNow,
         }),
@@ -5324,6 +5329,20 @@ describe("OIDC system-browser sign-in wiring", () => {
     assert.equal(h.calls.oidc.refresh, 1);
     assert.equal(h.calls.oidc.signIn, 0);
     assert.deepEqual(h.calls.loadURL.at(-1), [server]);
+  });
+
+  it("creates one credentials instance when main loads, shared by every connect", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: oidcManifest,
+      oidc: { refresh: minted("renewed") },
+      acceptedSessions: new Set(["renewed"]),
+    });
+    t.after(h.cleanup);
+    assert.equal(h.calls.oidc.created, 1);
+    await h.api.loadServerUrl(h.win, server);
+    await h.api.loadServerUrl(h.win, server);
+    assert.equal(h.calls.oidc.created, 1);
   });
 
   it("returns a restore it can't renew to the connect screen, explaining why", async (t) => {

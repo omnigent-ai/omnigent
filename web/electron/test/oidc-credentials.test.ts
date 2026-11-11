@@ -1,39 +1,43 @@
-// Unit tests for OIDC sign-in credentials (src/oidc-credentials.js), run with
+// Unit tests for OIDC sign-in credentials (src/oidc-credentials.ts), run with
 // `node --test`. The loopback listener is real; the system browser is a
 // callback that follows the server's redirect to it, and the server's token
-// endpoints are a fetch stub. Electron is stubbed so the module loads outside
-// the app.
+// endpoints are a fetch stub.
 
-"use strict";
+import { describe, it, beforeEach, afterEach, mock } from "node:test";
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import http from "node:http";
+import os from "node:os";
+import path from "node:path";
 
-const { describe, it, beforeEach, afterEach, mock } = require("node:test");
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const http = require("node:http");
-const os = require("node:os");
-const path = require("node:path");
-const Module = require("node:module");
+import { createOidcCredentials, serverEndpoint } from "../src/oidc-credentials.ts";
 
-const electronStub = {
-  shell: { openExternal: async () => {} },
+/** A rejection from the credentials, with the fields they attach. */
+interface OidcError extends Error {
+  code?: string;
+  description?: string;
+}
+
+// One instance for the file, as main creates one per process.
+const oidc = createOidcCredentials({
   // Plaintext store so the round trip runs without an OS keychain.
-  safeStorage: { isEncryptionAvailable: () => false },
-};
-const origLoad = Module["_load"];
-Module["_load"] = function (request, ...rest) {
-  if (request === "electron") return electronStub;
-  return origLoad.call(this, request, ...rest);
-};
-
-const oidc = require("../src/oidc-credentials");
+  safeStorage: {
+    isEncryptionAvailable: () => false,
+    encryptString: () => assert.fail("unexpected encryption"),
+    decryptString: () => assert.fail("unexpected decryption"),
+  },
+  openExternal: async () => {},
+});
 
 const SERVER = "https://omni.example";
-let tmpHome;
+let tmpHome: string;
+let warn: ReturnType<typeof mock.method>;
 beforeEach(() => {
   tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "omni-oidc-"));
   mock.method(os, "homedir", () => tmpHome);
   mock.method(console, "log", () => {});
-  mock.method(console, "warn", () => {});
+  warn = mock.method(console, "warn", () => {});
 });
 afterEach(() => {
   mock.restoreAll();
@@ -41,27 +45,35 @@ afterEach(() => {
 });
 
 const storeFile = () => path.join(tmpHome, ".omnigent", "oidc_tokens.json");
-const readStore = () => JSON.parse(fs.readFileSync(storeFile(), "utf8"));
-const writeStore = (value) => {
+const readStore = () =>
+  JSON.parse(fs.readFileSync(storeFile(), "utf8")) as Record<string, { plain: unknown }>;
+const writeStore = (value: unknown) => {
   fs.mkdirSync(path.dirname(storeFile()), { recursive: true });
   fs.writeFileSync(storeFile(), JSON.stringify(value));
 };
 
-function json(status, body) {
-  return { status, json: async () => body };
+/** A fetch answer: only `status` and `json()` are read. */
+function json(status: number, body: unknown) {
+  return { status, json: async () => body } as unknown as Response;
+}
+
+interface FetchCall {
+  url: string;
+  init: RequestInit | undefined;
+  form: URLSearchParams;
 }
 
 /** Record fetch calls and answer them with `responder`. */
-function stubFetch(responder) {
-  const calls = [];
-  mock.method(globalThis, "fetch", async (url, init) => {
-    calls.push({ url: String(url), init, form: new URLSearchParams(init?.body ?? "") });
-    return responder(String(url), init, calls.length);
+function stubFetch(responder: (url: string) => Response) {
+  const calls: FetchCall[] = [];
+  mock.method(globalThis, "fetch", async (url: string | URL, init?: RequestInit) => {
+    calls.push({ url: String(url), init, form: new URLSearchParams(String(init?.body ?? "")) });
+    return responder(String(url));
   });
   return calls;
 }
 
-function get(url) {
+function get(url: URL): Promise<number | undefined> {
   return new Promise((resolve, reject) => {
     http
       .get(url, { agent: false }, (res) => {
@@ -73,13 +85,13 @@ function get(url) {
 }
 
 /** A system browser that completes sign-in by hitting the loopback with `params`. */
-function browserReturning(params) {
-  const opened = [];
-  const openExternal = async (raw) => {
+function browserReturning(params: Record<string, string>) {
+  const opened: URL[] = [];
+  const openExternal = async (raw: string) => {
     const url = new URL(raw);
     opened.push(url);
-    const callback = new URL(url.searchParams.get("native_redirect_uri"));
-    callback.searchParams.set("state", url.searchParams.get("native_state"));
+    const callback = new URL(String(url.searchParams.get("native_redirect_uri")));
+    callback.searchParams.set("state", String(url.searchParams.get("native_state")));
     for (const [key, value] of Object.entries(params)) callback.searchParams.set(key, value);
     setImmediate(() => void get(callback));
   };
@@ -88,12 +100,9 @@ function browserReturning(params) {
 
 describe("serverEndpoint", () => {
   it("joins routes under the server mount and drops query and hash", () => {
+    assert.equal(serverEndpoint("https://h.test/", "/auth/login"), "https://h.test/auth/login");
     assert.equal(
-      oidc.serverEndpoint("https://h.test/", "/auth/login"),
-      "https://h.test/auth/login",
-    );
-    assert.equal(
-      oidc.serverEndpoint("https://h.test/omnigent/?x=1#y", "/v1/me"),
+      serverEndpoint("https://h.test/omnigent/?x=1#y", "/v1/me"),
       "https://h.test/omnigent/v1/me",
     );
   });
@@ -114,26 +123,28 @@ describe("signInWithBrowser", () => {
 
     assert.deepEqual(minted, { token: "session-jwt", expiresIn: 28800 });
     const [login] = browser.opened;
+    assert.ok(login);
     assert.equal(`${login.origin}${login.pathname}`, `${SERVER}/auth/login`);
     assert.equal(login.searchParams.get("code_challenge_method"), "S256");
-    const redirect = new URL(login.searchParams.get("native_redirect_uri"));
+    const redirect = new URL(String(login.searchParams.get("native_redirect_uri")));
     assert.equal(redirect.hostname, "127.0.0.1");
     assert.equal(redirect.pathname, "/callback");
 
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].url, `${SERVER}/auth/native-token`);
-    assert.equal(calls[0].init.redirect, "manual");
-    assert.equal(calls[0].form.get("code"), "one-time");
-    assert.equal(calls[0].form.get("redirect_uri"), redirect.toString());
+    const [exchange] = calls;
+    assert.ok(exchange);
+    assert.equal(exchange.url, `${SERVER}/auth/native-token`);
+    assert.equal(exchange.init?.redirect, "manual");
+    assert.equal(exchange.form.get("code"), "one-time");
+    assert.equal(exchange.form.get("redirect_uri"), redirect.toString());
     // The verifier hashes to the challenge the browser carried.
-    const crypto = require("node:crypto");
     const digest = crypto
       .createHash("sha256")
-      .update(calls[0].form.get("code_verifier"))
+      .update(String(exchange.form.get("code_verifier")))
       .digest("base64url");
     assert.equal(digest, login.searchParams.get("code_challenge"));
 
-    assert.deepEqual(readStore()[SERVER].plain, {
+    assert.deepEqual(readStore()[SERVER]?.plain, {
       refresh_token: "refresh-1",
       user_id: "alice@example.com",
     });
@@ -156,7 +167,7 @@ describe("signInWithBrowser", () => {
     });
     await assert.rejects(
       oidc.signInWithBrowser(SERVER, { openExternal: browser.openExternal }),
-      (error) =>
+      (error: OidcError) =>
         error.code === "sign_in_failed" &&
         error.description === "Email domain 'x.test' is not permitted on this server",
     );
@@ -168,14 +179,14 @@ describe("signInWithBrowser", () => {
     const browser = browserReturning({ code: "c" });
     await assert.rejects(
       oidc.signInWithBrowser(SERVER, { openExternal: browser.openExternal }),
-      (error) => error.code === "sign_in_failed",
+      (error: OidcError) => error.code === "sign_in_failed",
     );
   });
 
   it("maps an unopenable browser", async () => {
     await assert.rejects(
       oidc.signInWithBrowser(SERVER, { openExternal: async () => Promise.reject(new Error("x")) }),
-      (error) => error.code === "browser_unavailable",
+      (error: OidcError) => error.code === "browser_unavailable",
     );
   });
 
@@ -184,7 +195,7 @@ describe("signInWithBrowser", () => {
     const openExternal = async () => controller.abort();
     await assert.rejects(
       oidc.signInWithBrowser(SERVER, { openExternal, signal: controller.signal }),
-      (error) => error.name === "AbortError",
+      (error: OidcError) => error.name === "AbortError",
     );
   });
 });
@@ -194,9 +205,9 @@ describe("refreshSession", () => {
     writeStore({ [SERVER]: { plain: { refresh_token: "refresh-1" } } });
     const calls = stubFetch(() => json(200, { access_token: "fresh", expires_in: 3600 }));
     assert.deepEqual(await oidc.refreshSession(`${SERVER}/`), { token: "fresh", expiresIn: 3600 });
-    assert.equal(calls[0].url, `${SERVER}/oauth/token`);
-    assert.equal(calls[0].form.get("grant_type"), "refresh_token");
-    assert.equal(calls[0].form.get("refresh_token"), "refresh-1");
+    assert.equal(calls[0]?.url, `${SERVER}/oauth/token`);
+    assert.equal(calls[0]?.form.get("grant_type"), "refresh_token");
+    assert.equal(calls[0]?.form.get("refresh_token"), "refresh-1");
   });
 
   it("shares one request between concurrent callers", async () => {
@@ -208,18 +219,21 @@ describe("refreshSession", () => {
 
   it("requires a stored grant", async () => {
     const calls = stubFetch(() => json(200, {}));
-    await assert.rejects(oidc.refreshSession(SERVER), (e) => e.code === "NO_STORED_TOKEN");
+    await assert.rejects(
+      oidc.refreshSession(SERVER),
+      (e: OidcError) => e.code === "NO_STORED_TOKEN",
+    );
     assert.equal(calls.length, 0);
   });
 
   for (const [status, error] of [
     [400, "invalid_grant"],
     [400, "expired_token"],
-  ]) {
+  ] as const) {
     it(`forgets a dead grant (${error})`, async () => {
       writeStore({ [SERVER]: { plain: { refresh_token: "r" } } });
       stubFetch(() => json(status, { error }));
-      await assert.rejects(oidc.refreshSession(SERVER), (e) => e.code === error);
+      await assert.rejects(oidc.refreshSession(SERVER), (e: OidcError) => e.code === error);
       assert.equal(oidc.hasStoredGrant(SERVER), false);
     });
   }
@@ -227,7 +241,10 @@ describe("refreshSession", () => {
   it("forgets the grant when the server has no token route", async () => {
     writeStore({ [SERVER]: { plain: { refresh_token: "r" } } });
     stubFetch(() => json(404, null));
-    await assert.rejects(oidc.refreshSession(SERVER), (e) => e.code === "NO_STORED_TOKEN");
+    await assert.rejects(
+      oidc.refreshSession(SERVER),
+      (e: OidcError) => e.code === "NO_STORED_TOKEN",
+    );
     assert.equal(oidc.hasStoredGrant(SERVER), false);
   });
 
@@ -236,7 +253,7 @@ describe("refreshSession", () => {
     mock.method(globalThis, "fetch", async () => {
       throw new Error("ECONNREFUSED");
     });
-    await assert.rejects(oidc.refreshSession(SERVER), (e) => e.code === "network");
+    await assert.rejects(oidc.refreshSession(SERVER), (e: OidcError) => e.code === "network");
     assert.equal(oidc.hasStoredGrant(SERVER), true);
   });
 });
@@ -253,8 +270,8 @@ describe("signOut", () => {
     writeStore({ [SERVER]: { plain: { refresh_token: "r" } } });
     const calls = stubFetch(() => json(200, { revoked: true }));
     await oidc.signOut(SERVER);
-    assert.equal(calls[0].url, `${SERVER}/oauth/revoke`);
-    assert.equal(calls[0].form.get("refresh_token"), "r");
+    assert.equal(calls[0]?.url, `${SERVER}/oauth/revoke`);
+    assert.equal(calls[0]?.form.get("refresh_token"), "r");
     assert.equal(oidc.hasStoredGrant(SERVER), false);
   });
 
@@ -272,17 +289,17 @@ describe("signOut", () => {
     stubFetch(() => json(503, null));
     await oidc.signOut(SERVER);
     assert.equal(oidc.hasStoredGrant(SERVER), false);
-    assert.ok(console.warn.mock.calls.some((call) => /HTTP 503/.test(call.arguments[0])));
+    assert.ok(warn.mock.calls.some((call) => /HTTP 503/.test(String(call.arguments[0]))));
   });
 
   it("forgets the grant before the revoke request returns", async () => {
     writeStore({ [SERVER]: { plain: { refresh_token: "r" } } });
-    let respond;
+    let respond = () => {};
     mock.method(
       globalThis,
       "fetch",
       () =>
-        new Promise((resolve) => {
+        new Promise<Response>((resolve) => {
           respond = () => resolve(json(200, {}));
         }),
     );

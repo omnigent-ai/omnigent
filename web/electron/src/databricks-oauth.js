@@ -27,9 +27,9 @@
 const { diagnostics } = require("./diagnostics.ts");
 
 const crypto = require("node:crypto");
-const { shell } = require("electron");
-const { base64url, makePkce, runLoopbackAuthorization } = require("./loopback-oauth");
-const { createTokenStore } = require("./token_store");
+const { safeStorage, shell } = require("electron");
+const { base64url, makePkce, runLoopbackAuthorization } = require("./loopback-oauth.ts");
+const { createTokenStore } = require("./token_store.ts");
 
 // The loopback redirect every published client registers. Not configurable: the
 // port is ephemeral per RFC 8252 (Databricks ignores it), and pinning a host,
@@ -86,6 +86,7 @@ function isTrustedDatabricksOrigin(url) {
 const tokenStore = createTokenStore({
   fileName: "databricks_oauth_tokens.json",
   label: "Databricks tokens",
+  safeStorage,
 });
 const saveTokens = tokenStore.save;
 const loadTokens = tokenStore.load;

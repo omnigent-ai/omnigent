@@ -28,7 +28,7 @@ const { lastLine, SAFE_URL_RE } = require("./arca");
 const { isDatabricksOAuthServerUrl } = require("./url.ts");
 const { readArcaIdentity, IDENTITY_START, IDENTITY_END } = require("./arcaIdentity");
 const { UV_INSTALLER } = require("./cli_install");
-const { createAskpass } = require("./ssh_askpass");
+const { createAskpass } = require("./ssh_askpass.ts");
 
 /** Includes time for the user to type a password or trust a new host. */
 const OPEN_TIMEOUT_MS = 5 * 60 * 1000;

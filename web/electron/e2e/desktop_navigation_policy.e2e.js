@@ -14,7 +14,7 @@ const {
   spawnServer,
 } = require("./desktopHarness");
 const { startDesignBackend, eventually } = require("./desktopDesignPromptHarness");
-const { escapeHtml } = require("../src/loopback-oauth");
+const { escapeHtml } = require("../src/loopback-oauth.ts");
 
 const deps = desktopDepsAvailable();
 

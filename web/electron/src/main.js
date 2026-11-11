@@ -27,6 +27,7 @@ const {
   nativeTheme,
   net,
   powerMonitor,
+  safeStorage,
   screen,
   session,
   shell,
@@ -89,7 +90,7 @@ const { createBrowserViewRegistry } = withTestOverrides(
 const { createBrowserViewBoundsController } = require("./browserViewBounds.ts");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
-const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
+const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity.ts");
 const { isDeveloperModeEnabled } = require("./developer_mode.ts");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences.ts");
 const {
@@ -114,8 +115,8 @@ const {
   removeStoredRefreshToken,
   whenRefreshSettled: whenDatabricksRefreshSettled,
 } = require("./databricks-oauth");
-const oidcCredentials = require("./oidc-credentials");
-const { createOidcAuth } = require("./oidc-auth");
+const { createOidcCredentials } = require("./oidc-credentials.ts");
+const { createOidcAuth } = require("./oidc-auth.ts");
 const {
   readDatabricksAuthMode,
   usesDatabricksBrowserAuth,
@@ -124,7 +125,7 @@ const {
   isTransientRenewalError,
   SESSION_REJECTED,
   IP_ACL_BLOCKED,
-} = require("./databricks-auth");
+} = require("./databricks-auth.ts");
 const {
   decideWindowOpen,
   stripCrossOriginOpenerHeaders,
@@ -148,7 +149,12 @@ const omnigentCli = withTestOverrides("omnigent_cli", require("./omnigent_cli"))
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics.ts");
 
-const isHostThisMachine = createHostThisMachineChecker();
+const isHostThisMachine = createHostThisMachineChecker({ cli: require("./omnigent_cli") });
+// One per process: it owns the stored OIDC grants and the in-flight refreshes.
+const oidcCredentials = createOidcCredentials({
+  safeStorage,
+  openExternal: (url) => shell.openExternal(url),
+});
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = pagePath("setup");
