@@ -3222,6 +3222,24 @@ async def test_shares_saved_while_an_agent_retargets_never_reach_its_new_session
     assert SqlAlchemyPermissionStore(db_uri).get("team.engineering", second) is None
     assert SqlAlchemyScheduledTaskStore(db_uri).get(task_id).session_id == first  # type: ignore[union-attr]
 
+    # The reverse order: a retarget commits while the owner's shares are being validated.
+    monkeypatch.setattr(fire_mod, "continued_session_problem", checking)
+
+    def retarget_during_validation(self: object, user_id: str) -> None:
+        SqlAlchemyScheduledTaskStore(db_uri).update(task_id, session_id=second)
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "validate_grantee", retarget_during_validation)
+    shared = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"share_with": [{"user_id": "bob@example.com", "level": 1}]},
+        headers=_headers(),
+    )
+    assert shared.status_code == 409, shared.text
+    stored = SqlAlchemyScheduledTaskStore(db_uri).get(task_id)
+    assert stored is not None
+    assert stored.share_with == (ScheduledTaskShare("team.engineering", 1),)
+    assert SqlAlchemyPermissionStore(db_uri).get("bob@example.com", second) is None
+
 
 async def test_shares_reach_a_continued_session_without_lowering_access(
     auth_client: httpx.AsyncClient, db_uri: str

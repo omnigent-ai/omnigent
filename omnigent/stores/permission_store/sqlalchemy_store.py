@@ -212,8 +212,14 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 return False
             # A grant inserted concurrently after the read is still never lowered.
             session.execute(self._upsert_grant(user_id, conversation_id, level, only_raise=True))
-            session.flush()
-            return True
+            stored = session.execute(
+                select(SqlSessionPermission.level).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == user_id,
+                    SqlSessionPermission.conversation_id == conversation_id,
+                )
+            ).scalar_one()
+            return stored == level
 
         if not run_write_transaction(self._session_immediate, "raise_permission_grant", write):
             return None

@@ -433,11 +433,15 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 return None
             if expected_schedule is not None:
                 current = _to_entity(row)
+                guarded = ["rrule", "session_mode", "execution_target", "share_with"]
+                if share_with is not None:
+                    # Saving shares grants the continued session, which must be the
+                    # one they were validated against; a retarget validated against
+                    # the old shares fails on the share_with comparison above.
+                    guarded.append("session_id")
                 if any(
                     getattr(current, field) != getattr(expected_schedule, field)
-                    # Shares too: a save validated against the old ones may not
-                    # retarget the session they apply to.
-                    for field in ("rrule", "session_mode", "execution_target", "share_with")
+                    for field in guarded
                 ):
                     raise OmnigentError(
                         "The automation's schedule, execution or sharing settings changed. "
