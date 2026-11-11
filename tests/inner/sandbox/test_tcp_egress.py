@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import json
 import logging
@@ -55,6 +56,7 @@ from omnigent.inner.terminal import (
     create_terminal_instance,
 )
 from omnigent.spec.parser import _parse_os_env_sandbox
+from tests._helpers.polling import poll_until
 from tests.inner.git_ssh_fixture import _nonloopback_ip
 from tests.inner.sandbox.conftest import run_async
 
@@ -72,12 +74,9 @@ class _EchoServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 @pytest.fixture
 def echo_server() -> Iterator[tuple[str, int]]:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-        try:
-            probe.connect(("192.0.2.1", 80))
-        except OSError:
-            pytest.skip("no non-loopback local address")
-        host = probe.getsockname()[0]
+    host = _nonloopback_ip()
+    if host is None:
+        pytest.skip("no non-loopback local address")
     with _EchoServer((host, 0), _EchoHandler) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -360,6 +359,119 @@ def test_tcp_broker_socket_is_not_masked_after_policy_round_trip(tmp_path: Path)
     assert str(socket_path) not in _dotfile_and_symlink_mask_args(workspace, [], restored)
 
 
+@pytest.fixture
+def high_descriptor_socket() -> Iterator[Callable[[socket.socket], socket.socket]]:
+    if sys.platform == "win32":
+        pytest.skip("high descriptor duplication requires POSIX")
+    import fcntl
+    import resource
+
+    limits = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if limits[1] != resource.RLIM_INFINITY and limits[1] <= 2048:
+        pytest.skip("descriptor hard limit is below the regression threshold")
+    if limits[0] != resource.RLIM_INFINITY and limits[0] <= 2048:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (2049, limits[1]))
+
+    def duplicate(original: socket.socket) -> socket.socket:
+        return socket.socket(fileno=fcntl.fcntl(original, fcntl.F_DUPFD_CLOEXEC, 2048))
+
+    try:
+        yield duplicate
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, limits)
+
+
+def test_tcp_dial_with_high_descriptor(
+    tcp_route: TcpEgressRoute,
+    broker_dir: Path,
+    high_descriptor_socket: Callable[[socket.socket], socket.socket],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.inner.tcp_egress as tcp_module
+
+    def create_high(*args: object, **kwargs: object) -> socket.socket:
+        with socket.socket(*args, **kwargs) as original:
+            return high_descriptor_socket(original)
+
+    socket_module = SimpleNamespace(**vars(socket))
+    socket_module.socket = create_high
+    monkeypatch.setattr(tcp_module, "socket", socket_module)
+    broker = start_tcp_egress_broker([tcp_route], broker_dir)
+    upstream = None
+    try:
+        upstream = broker._dial_pinned(tcp_route.host, tcp_route.port)
+        assert upstream.fileno() >= 2048
+        upstream.sendall(b"high fd")
+        assert upstream.recv(7) == b"high fd"
+    finally:
+        if upstream is not None:
+            upstream.close()
+            with broker._condition:
+                broker._connections.discard(upstream)
+        broker.stop()
+
+
+@pytest.mark.parametrize("selector_failure", [False, True])
+def test_tcp_relay_with_high_descriptor(
+    tcp_route: TcpEgressRoute,
+    broker_dir: Path,
+    high_descriptor_socket: Callable[[socket.socket], socket.socket],
+    monkeypatch: pytest.MonkeyPatch,
+    selector_failure: bool,
+) -> None:
+    import omnigent.inner.tcp_egress as tcp_module
+
+    if selector_failure:
+
+        def fail_selector() -> None:
+            raise ValueError("selector registration failed")
+
+        monkeypatch.setattr(tcp_module.selectors, "DefaultSelector", fail_selector)
+    broker = start_tcp_egress_broker([tcp_route], broker_dir)
+    errors: list[Exception] = []
+    transferred = [0]
+    completed = threading.Event()
+    client, peer = socket.socketpair()
+    upstream, remote = socket.socketpair()
+    with client, peer, upstream, remote, high_descriptor_socket(client) as high_client:
+        for connection in (high_client, peer, upstream, remote):
+            connection.settimeout(3)
+
+        def relay() -> None:
+            try:
+                broker._relay(high_client, upstream, transferred)
+            except (OSError, ValueError) as exc:
+                errors.append(exc)
+            finally:
+                completed.set()
+
+        worker = threading.Thread(target=relay, daemon=True)
+        try:
+            worker.start()
+            if selector_failure:
+                assert completed.wait(timeout=3)
+                assert len(errors) == 1 and "selector registration failed" in str(errors[0])
+            else:
+                assert high_client.fileno() >= 2048
+                tcp_egress_wire.write_frame(peer, b"I", b"wire")
+                tcp_egress_wire.write_frame(peer, b"Z", b"")
+                assert remote.recv(4) == b"wire"
+                assert remote.recv(1) == b""
+                remote.sendall(b"reply")
+                remote.shutdown(socket.SHUT_WR)
+                assert _read_frame(peer) == (b"O", b"reply")
+                assert _read_frame(peer) == (b"Z", b"")
+                assert completed.wait(timeout=3)
+                assert not errors
+                assert transferred == [9]
+        finally:
+            broker.stop()
+            for connection in (high_client, upstream):
+                with contextlib.suppress(OSError):
+                    connection.shutdown(socket.SHUT_RDWR)
+            worker.join(timeout=3)
+
+
 def test_tcp_connector_round_trip_and_revocation(
     tcp_route: TcpEgressRoute, broker_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -618,76 +730,50 @@ def test_tcp_connector_supports_real_ssh_proxy_command(
         broker.stop()
 
 
-def test_tcp_helper_reports_quota_denial(
-    tcp_route: TcpEgressRoute,
-    broker_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("omnigent.inner.tcp_egress._MAX_BYTES", 1)
-    broker = start_tcp_egress_broker([tcp_route], broker_dir)
-    env = os.environ.copy()
-    apply_tcp_egress_env(env, broker)
-    try:
-        result = subprocess.run(
-            ["omnigent-egress-connect", "echo"],
-            input=b"blocked",
-            capture_output=True,
-            env=env,
-            timeout=15,
-        )
-        assert result.returncode != 0
-        assert b"transfer limit exceeded" in result.stderr
-    finally:
-        broker.stop()
-
-
-def test_tcp_helper_reports_output_quota_denial(
-    tcp_route: TcpEgressRoute,
-    broker_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("omnigent.inner.tcp_egress._MAX_BYTES", 3)
-    broker = start_tcp_egress_broker([tcp_route], broker_dir)
-    env = os.environ.copy()
-    apply_tcp_egress_env(env, broker)
-    try:
-        result = subprocess.run(
-            ["omnigent-egress-connect", "echo"],
-            input=b"ab",
-            capture_output=True,
-            env=env,
-            timeout=15,
-        )
-        assert result.returncode != 0
-        assert b"transfer limit exceeded" in result.stderr
-    finally:
-        broker.stop()
-
-
-def test_tcp_broker_enforces_byte_quota(
+@pytest.mark.parametrize(
+    ("payload", "quota", "accounted"),
+    [(b"blocked", 1, 7), (b"ab", 3, 4)],
+    ids=["input", "output"],
+)
+def test_tcp_quota_denial_reports_frame_and_accounting(
     tcp_route: TcpEgressRoute,
     broker_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    payload: bytes,
+    quota: int,
+    accounted: int,
 ) -> None:
-    monkeypatch.setattr("omnigent.inner.tcp_egress._MAX_BYTES", 1)
+    monkeypatch.setattr("omnigent.inner.tcp_egress._MAX_BYTES", quota)
     broker = start_tcp_egress_broker([tcp_route], broker_dir)
+    env = os.environ.copy()
+    apply_tcp_egress_env(env, broker)
     caplog.set_level(logging.INFO, logger="omnigent.inner.tcp_egress")
     try:
+        result = subprocess.run(
+            ["omnigent-egress-connect", "echo"],
+            input=payload,
+            capture_output=True,
+            env=env,
+            timeout=15,
+        )
+        assert result.returncode != 0
+        assert b"transfer limit exceeded" in result.stderr
+        assert not result.stdout
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(3)
             client.connect(str(broker.socket_path))
             request = json.dumps({"token": broker.token, "route": "echo"}).encode()
             client.sendall(struct.pack("!I", len(request)) + request)
             assert client.recv(1) == b"\x00"
-            client.sendall(b"I" + struct.pack("!I", 7) + b"blocked")
+            tcp_egress_wire.write_frame(client, b"I", payload)
             kind, detail = _read_frame(client)
             if kind == b"Z":
                 kind, detail = _read_frame(client)
             assert kind == b"D" and b"transfer limit exceeded" in detail
         broker.stop()
         assert "transfer limit exceeded" in caplog.text
-        assert "closed after 7 bytes" in caplog.text
+        assert f"closed after {accounted} bytes" in caplog.text
     finally:
         broker.stop()
 
@@ -1097,8 +1183,10 @@ def test_tcp_terminal_start_failure_closes_broker(
         run_async(instance.close())
 
 
+@pytest.mark.parametrize("inherited", [False, True])
 def test_tcp_connector_inside_sandboxed_terminal(
     tcp_route: TcpEgressRoute,
+    inherited: bool,
     tmp_path: Path,
     active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
 ) -> None:
@@ -1115,23 +1203,31 @@ def test_tcp_connector_inside_sandboxed_terminal(
         ") > output 2>&1 "
         "&& printf success > marker || printf failure > marker"
     )
+    environment = OSEnvSpec(
+        type="caller_process",
+        cwd=str(workspace),
+        sandbox=active_sandbox_spec_factory(write_paths=["."], tcp_egress=[tcp_route]),
+    )
     spec = TerminalEnvSpec(
         command="/bin/bash",
         args=["-lc", command],
-        os_env=OSEnvSpec(
-            type="caller_process",
-            cwd=str(workspace),
-            sandbox=active_sandbox_spec_factory(write_paths=["."], tcp_egress=[tcp_route]),
-        ),
+        os_env="inherit" if inherited else environment,
     )
-    instance = create_terminal_instance(name="tcp", session_key="test", spec=spec).instance
+    instance = create_terminal_instance(
+        name="tcp",
+        session_key="test",
+        spec=spec,
+        parent_os_env_spec=environment if inherited else None,
+    ).instance
     try:
         run_async(instance.launch(cwd=workspace))
-        deadline = time.monotonic() + 20
-        while not (workspace / "marker").exists() and time.monotonic() < deadline:
-            time.sleep(0.1)
-        assert (workspace / "marker").exists(), run_async(instance.read()).get("screen")
-        assert (workspace / "marker").read_text() == "success", (workspace / "output").read_text()
+        marker = workspace / "marker"
+        poll_until(
+            lambda: marker.exists() and marker.read_text() in {"success", "failure"},
+            timeout_s=20,
+            interval_s=0.1,
+        )
+        assert marker.read_text() == "success", (workspace / "output").read_text()
         assert (workspace / "result").read_text() == "terminal"
     finally:
         run_async(instance.close())

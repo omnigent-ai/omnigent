@@ -761,6 +761,7 @@ os_env:
   cwd: .
   sandbox:
     type: auto # linux_bwrap or darwin_seatbelt
+    allow_network: false
     tcp_egress:
       - name: analytics_db
         host: db.internal.example
@@ -774,6 +775,13 @@ terminals:
     command: bash
     os_env: inherit
 ```
+
+Upgrade the server, host, and session runner to builds with TCP egress support
+before using this field. The server requires both connected runtimes to advertise
+the `tcp_egress` capability and rejects older builds before launch or initialization,
+including routes in sub-agents and terminal environments. Updating only the server
+is insufficient. Keep `allow_network: false` explicit so an older server and runner
+that ignore `tcp_egress` still deny direct networking.
 
 The parent resolves DNS on every connection. A public DNS name that resolves
 to a private address is **denied by default**; permit the smallest relevant

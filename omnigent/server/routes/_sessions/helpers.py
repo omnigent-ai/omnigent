@@ -5971,7 +5971,9 @@ async def _get_runner_client_impl(
                     conversation=conversation,
                 )
             return routed.client
-        except (LookupError, httpx.HTTPError, OmnigentError):
+        except (LookupError, httpx.HTTPError, OmnigentError) as exc:
+            if isinstance(exc, OmnigentError) and exc.code == ErrorCode.RUNNER_CAPABILITY_MISMATCH:
+                raise
             _logger.debug(
                 "No runner bound for session=%s",
                 session_id,

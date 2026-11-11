@@ -216,6 +216,7 @@ class RunnerRouter:
         if conv is None:
             raise OmnigentError("conversation not found", code=ErrorCode.NOT_FOUND)
         if conv.runner_id:
+            self.require_runtime_support(conv)
             return self._routed_pinned_runner(conv, conv.runner_id, harness=harness)
         raise OmnigentError(
             f"conversation {conversation_id!r} is not bound to a runner; "
@@ -262,6 +263,7 @@ class RunnerRouter:
                     conv.runner_id,
                     f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
                 )
+            self.require_runtime_support(conv)
             return RoutedRunner(
                 runner_id=conv.runner_id,
                 client=self._client_for_runner(conv.runner_id),
@@ -299,6 +301,7 @@ class RunnerRouter:
                 conv.runner_id,
                 f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
             )
+        self.require_runtime_support(conv)
         return RoutedRunner(
             runner_id=conv.runner_id,
             client=self._client_for_runner(conv.runner_id),
@@ -325,21 +328,14 @@ class RunnerRouter:
         connection = self._registry.get(runner_id)
         return connection is not None and capability in connection.hello.capabilities
 
-    def require_mcp_registry_support(self, conversation: Conversation) -> None:
-        """Validate the connected runner before sending it a registry-backed agent."""
-        from omnigent.host.frames import CAP_MCP_REGISTRY
-
+    def require_runtime_support(self, conversation: Conversation) -> None:
+        """Validate the connected runner before sending it a restricted agent."""
         connection = self._registry.get(conversation.runner_id) if conversation.runner_id else None
-        if (
-            connection is None
-            or CAP_MCP_REGISTRY in connection.hello.capabilities
-            or self._agent_store is None
-            or self._agent_cache is None
-        ):
+        if connection is None or self._agent_store is None or self._agent_cache is None:
             return
-        from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+        from omnigent.server.runtime_compatibility import require_session_runtime_support
 
-        require_session_registry_mcp_support(
+        require_session_runtime_support(
             conversation,
             connection.hello.capabilities,
             component="runner",

@@ -1636,7 +1636,7 @@ def register_resources_routes(
         path = f"/v1/sessions/{session_id}/resources/terminals"
         router = runner_router or get_server_runner_router()
         if router is not None:
-            await asyncio.to_thread(router.require_mcp_registry_support, conv)
+            await asyncio.to_thread(router.require_runtime_support, conv)
         status, payload = await _proxy_post_to_runner(
             session_id,
             path,

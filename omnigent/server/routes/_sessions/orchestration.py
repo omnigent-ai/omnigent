@@ -6416,7 +6416,7 @@ async def _ensure_native_terminal_ready(
 
     async def _post_ensure() -> httpx.Response:
         if runner_router is not None:
-            await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
+            await asyncio.to_thread(runner_router.require_runtime_support, conv)
         return await runner_client.post(
             f"/v1/sessions/{session_id}/resources/terminals",
             json={
@@ -8458,7 +8458,7 @@ async def _dispatch_session_event_to_runner_impl(
         (claude-native message bypass).
     """
     if runner_router is not None:
-        await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
+        await asyncio.to_thread(runner_router.require_runtime_support, conv)
     if body.type == "message":
         disconnect_outcome.note_user_turn(conv.id)
     if body.type == "message" and _codex_side_chat_thread_id(conv) is not None:
@@ -12174,9 +12174,14 @@ async def _create_session_from_existing_agent(
 
     inference_snapshot = None
     selection_spec = None
-    from omnigent.server.mcp_compatibility import registry_services, require_registry_mcp_runtime
+    from omnigent.server.runtime_compatibility import (
+        registry_services,
+        require_runtime_support,
+        uses_tcp_egress,
+    )
 
     selected_registry_services = set(body.mcp_registry_services or [])
+    tcp_egress_required = False
     if agent_cache is not None:
         from omnigent.harness_aliases import canonicalize_harness
         from omnigent.runtime.workflow import _find_spec_by_name
@@ -12207,6 +12212,7 @@ async def _create_session_from_existing_agent(
             )
             selection_spec = None
         selected_registry_services.update(registry_services(selection_spec))
+        tcp_egress_required = uses_tcp_egress(selection_spec)
         if selection_spec is not None and body.sub_agent_name:
             selection_spec = _find_spec_by_name(selection_spec, body.sub_agent_name)
         from omnigent.server.routes.sandbox_inference import (
@@ -12294,8 +12300,9 @@ async def _create_session_from_existing_agent(
         validate_create_harness_readiness,
     )
 
-    require_registry_mcp_runtime(
+    require_runtime_support(
         selected_registry_services,
+        tcp_egress_required=tcp_egress_required,
         host_id=body.host_id,
         runner_id=inherited_runner_id,
         host_registry=getattr(request.app.state, "host_registry", None),

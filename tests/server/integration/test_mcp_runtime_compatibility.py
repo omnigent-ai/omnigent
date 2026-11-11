@@ -12,7 +12,7 @@ from omnigent.host.frames import CAP_MCP_REGISTRY
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime import get_agent_store, get_conversation_store
 from omnigent.server.auth import RESERVED_USER_LOCAL
-from omnigent.server.mcp_compatibility import registry_services, require_registry_mcp_runtime
+from omnigent.server.runtime_compatibility import registry_services, require_runtime_support
 from omnigent.spec.types import AgentSpec, MCPServerConfig
 from tests.server.helpers import build_agent_bundle, create_test_session
 from tests.server.integration.test_mcp_registry import launch_registry as launch_registry
@@ -253,7 +253,7 @@ async def test_registry_checks_include_nested_agents_and_preserve_replica_routin
     router = Mock()
     router.host_is_on_another_replica.return_value = True
     with pytest.raises(OmnigentError) as error:
-        require_registry_mcp_runtime(
+        require_runtime_support(
             registry_services(spec),
             host_id="remote-host",
             runner_id="remote-runner",
@@ -334,13 +334,11 @@ async def test_guards_use_app_stores_without_runtime_globals(
             monkeypatch.setattr(_globals, "_agent_cache", None)
             host = app.state.host_registry.get(_HOST_ID)
             await app.state.host_registry.admit_launch(host, plain["id"])
-            app.state.runner_router.require_mcp_registry_support(
-                store.get_conversation(plain["id"])
-            )
+            app.state.runner_router.require_runtime_support(store.get_conversation(plain["id"]))
             with pytest.raises(OmnigentError, match="MCP registry support"):
                 await app.state.host_registry.admit_launch(host, sid)
             with pytest.raises(OmnigentError, match="MCP registry support"):
-                app.state.runner_router.require_mcp_registry_support(store.get_conversation(sid))
+                app.state.runner_router.require_runtime_support(store.get_conversation(sid))
     finally:
         app.state.tunnel_registry.deregister("old-runner", session=connection)
 

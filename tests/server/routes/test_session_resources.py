@@ -7675,7 +7675,7 @@ class _ReconnectWaitRouter:
         self._reconnects = reconnects
         self.waits: list[tuple[str, float]] = []
 
-    def require_mcp_registry_support(self, conversation: Conversation) -> None:
+    def require_runtime_support(self, conversation: Conversation) -> None:
         """These reconnect fixtures have no registry MCPs."""
 
     async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> bool:

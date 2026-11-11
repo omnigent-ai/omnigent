@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import secrets
-import select
+import selectors
 import shlex
 import socket
 import socketserver
@@ -220,16 +220,18 @@ class TcpEgressBroker:
             if error not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
                 raise OSError(error, "TCP egress dial failed")
             deadline = time.monotonic() + 10
-            while error:
-                if self._closed:
-                    raise TcpEgressDenied("TCP egress broker is closed")
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("TCP egress dial timed out")
-                if select.select([], [upstream], [], min(remaining, 0.2))[1]:
-                    error = upstream.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-                    if error:
-                        raise OSError(error, "TCP egress dial failed")
+            with selectors.DefaultSelector() as readiness:
+                readiness.register(upstream, selectors.EVENT_WRITE)
+                while error:
+                    if self._closed:
+                        raise TcpEgressDenied("TCP egress broker is closed")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("TCP egress dial timed out")
+                    if readiness.select(timeout=min(remaining, 0.2)):
+                        error = upstream.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                        if error:
+                            raise OSError(error, "TCP egress dial failed")
             upstream.settimeout(10)
             return upstream
         except BaseException:
@@ -257,20 +259,22 @@ class TcpEgressBroker:
 
         def pump_input() -> None:
             try:
-                while True:
-                    if self._closed:
-                        raise TcpEgressDenied("TCP egress broker is closed")
-                    if not select.select([client], [], [], 1)[0]:
-                        continue
-                    kind, data = _read_frame(client)
-                    if kind == b"Z" and not data:
-                        upstream.shutdown(socket.SHUT_WR)
-                        return
-                    if kind != b"I" or not data:
-                        raise TcpEgressDenied("TCP egress input frame is invalid")
-                    account(len(data))
-                    upstream.sendall(data)
-            except (OSError, TcpEgressDenied) as exc:
+                with selectors.DefaultSelector() as readiness:
+                    readiness.register(client, selectors.EVENT_READ)
+                    while True:
+                        if self._closed:
+                            raise TcpEgressDenied("TCP egress broker is closed")
+                        if not readiness.select(timeout=1):
+                            continue
+                        kind, data = _read_frame(client)
+                        if kind == b"Z" and not data:
+                            upstream.shutdown(socket.SHUT_WR)
+                            return
+                        if kind != b"I" or not data:
+                            raise TcpEgressDenied("TCP egress input frame is invalid")
+                        account(len(data))
+                        upstream.sendall(data)
+            except (OSError, ValueError) as exc:
                 failure[0] = str(exc)
                 with contextlib.suppress(OSError):
                     upstream.shutdown(socket.SHUT_RDWR)
