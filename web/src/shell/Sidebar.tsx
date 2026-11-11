@@ -1237,7 +1237,7 @@ function SidebarImpl({
           // conversations-sidebar only matters under the macOS Electron
           // shell, where it pushes the card below the traffic lights
           // (see the [data-electron-mac] rules in index.css).
-          "conversations-sidebar flex flex-col md:bg-card md:flex-row md:select-none",
+          "conversations-sidebar flex flex-col md:bg-card md:select-none",
           nativeSidebarSurface ? "omnigent-native-sidebar-surface" : "omnigent-sidebar-panel",
           !isElectronShell() && !nativeSidebarSurface && (open || peek) && "md:pl-1",
           // Mobile (default): a fixed drawer that slides in via translate-x

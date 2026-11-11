@@ -499,7 +499,9 @@ describe("Sidebar resize handle geometry", () => {
 
     expect(handle.parentElement).toBe(sidebar);
     expect(clippedContent.parentElement).toBe(sidebar);
-    expect(sidebar).toHaveClass("md:flex-row");
+    // A row would lay the profile footer beside the body instead of below it.
+    expect(sidebar).toHaveClass("flex-col");
+    expect(sidebar).not.toHaveClass("md:flex-row");
     expect(sidebar).not.toHaveClass("md:overflow-hidden");
     expect(clippedContent).toHaveClass("md:overflow-hidden");
     expect(handle).toHaveClass("md:absolute", "md:inset-y-0");
