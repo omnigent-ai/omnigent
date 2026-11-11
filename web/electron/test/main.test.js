@@ -3972,43 +3972,59 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.deepEqual(h.calls.loadFile, []);
   });
 
-  it("reopens the failed page after a Cancel, then Connect while offline", async (t) => {
-    let online = false;
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => {
-      if (!online) throw new TypeError("fetch failed");
-      return { headers: new Headers({ server: "databricks" }) };
-    };
-    t.after(() => {
-      globalThis.fetch = originalFetch;
-    });
-    const h = browserHarness(t, [], {
-      normalizeServer: urlHelpers.normalizeUrl,
-      expandWorkspace: urlHelpers.expandDatabricksWorkspaceUrl,
-      ensureSession: async (_ses, sessionOrigin) => {
+  // [the failed page's server, managed servers, Connect's URL (null: the setup page's
+  //  pre-filled server), whether Connect reaches the workspace]
+  for (const [server, managedServers, connectTo, connectsOnline] of [
+    [workspace, [], null, false],
+    [`${workspace}/`, [`${workspace}/`], origin, false],
+    [`${workspace}/`, [`${workspace}/`], origin, true],
+  ]) {
+    const how = connectsOnline ? "online" : "while offline";
+    it(`reopens the failed page on ${server} after a Cancel, then Connect ${how}`, async (t) => {
+      let online = false;
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async () => {
         if (!online) throw new TypeError("fetch failed");
-        return sessionOrigin;
-      },
+        return { headers: new Headers({ server: "databricks" }) };
+      };
+      t.after(() => {
+        globalThis.fetch = originalFetch;
+      });
+      const h = browserHarness(t, [], {
+        serverUrl: server,
+        managedServers,
+        normalizeServer: urlHelpers.normalizeUrl,
+        expandWorkspace: urlHelpers.expandDatabricksWorkspaceUrl,
+        ensureSession: async (_ses, sessionOrigin) => {
+          if (!online) throw new TypeError("fetch failed");
+          return sessionOrigin;
+        },
+      });
+      h.api.registerIpc();
+      failLoad(h);
+      await wait(1);
+      h.overlay.cancel();
+      await until(() => h.calls.loadFile.length === 1, "the setup page");
+      // The setup form keeps the mounted URL for the next Connect.
+      assert.equal(h.overlay.hint, null);
+      assert.equal(setupParams(h).url, server);
+      h.api.setReconnectDelaysMs([20]);
+      online = connectsOnline;
+      const result = await h.ipc.get("omnigent:set-server-url")(
+        setupEvent(h),
+        connectTo ?? setupParams(h).url,
+        { requestId: "connect" },
+      );
+      if (!connectsOnline) {
+        assert.equal(result.reconnecting, true);
+        assert.equal(h.overlay.hint, "Check your network connection.");
+        online = true;
+      }
+      await until(() => h.calls.loadURL.length === 1, "the failed page");
+      assert.deepEqual(h.calls.loadURL, [[page]]);
+      assert.equal(h.overlay.hint, null);
     });
-    h.api.registerIpc();
-    failLoad(h);
-    await wait(1);
-    h.overlay.cancel();
-    await until(() => h.calls.loadFile.length === 1, "the setup page");
-    // The setup form keeps the mounted URL for the next Connect.
-    assert.equal(h.overlay.hint, null);
-    assert.equal(setupParams(h).url, workspace);
-    h.api.setReconnectDelaysMs([20]);
-    const result = await h.ipc.get("omnigent:set-server-url")(setupEvent(h), setupParams(h).url, {
-      requestId: "connect",
-    });
-    assert.equal(result.reconnecting, true);
-    assert.equal(h.overlay.hint, "Check your network connection.");
-    online = true;
-    await until(() => h.calls.loadURL.length === 1, "the reconnect");
-    assert.deepEqual(h.calls.loadURL, [[page]]);
-    assert.equal(h.overlay.hint, null);
-  });
+  }
 
   it("waits while offline without using up retries", async (t) => {
     const h = browserHarness(t, [20], {

@@ -2301,8 +2301,12 @@ function serverRoutePath(serverUrl, url) {
  * @returns {{ serverUrl: string, loadUrl?: string }}
  */
 function connectResumeTarget(discovered, setupReturn) {
-  // A bare workspace root and its UI mount are one server.
-  const identity = (url) => databricksWorkspaceUiUrl(url) ?? url;
+  // A bare workspace root and its UI mount are one server, with or without a trailing slash.
+  const identity = (url) => {
+    const server = new URL(databricksWorkspaceUiUrl(url) ?? url);
+    server.pathname = server.pathname.replace(/\/+$/, "");
+    return server.toString();
+  };
   if (!setupReturn || identity(setupReturn.serverUrl) !== identity(discovered)) {
     return { serverUrl: discovered };
   }
