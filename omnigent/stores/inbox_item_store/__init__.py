@@ -111,7 +111,7 @@ class InboxItemStore(ABC):
         self,
         user_id: str,
         *,
-        states: frozenset[str] | None = None,
+        statuses: frozenset[str] | None = None,
         created_after: int | None = None,
         after: tuple[int, str] | None = None,
         limit: int = 50,
@@ -119,7 +119,7 @@ class InboxItemStore(ABC):
         """Return the owner's items, newest first.
 
         :param user_id: The owner.
-        :param states: Only items in these states; ``None`` for all.
+        :param statuses: Only items in these statuses; ``None`` for all.
         :param created_after: Only items posted at or after this epoch second.
         :param after: Cursor ``(created_at, id)`` from a previous page.
         :param limit: Page size.
@@ -140,7 +140,7 @@ class InboxItemStore(ABC):
         item_id: str,
         user_id: str,
         *,
-        state: str | None = None,
+        status: str | None = None,
         resolution: str | None = None,
         resolution_action: int | None = None,
         feedback_text: str | None = None,
@@ -149,12 +149,12 @@ class InboxItemStore(ABC):
         """Apply the owner's response to an item.
 
         Setting a resolution other than ``"none"`` stamps ``resolved_at``.
-        Without a resolution, *state* changes only an open (unread or read)
+        Without a resolution, *status* changes only an open (unread or read)
         item, so a late read mark cannot reopen a resolved one.
 
         :param item_id: Hex UUID of the item.
         :param user_id: The owner the item must belong to.
-        :param state: New state, or ``None`` to keep it.
+        :param status: New status, or ``None`` to keep it.
         :param resolution: New resolution, or ``None`` to keep it.
         :param resolution_action: Index of the action taken, stored with the resolution.
         :param feedback_text: New comment, or ``None`` to keep it.
