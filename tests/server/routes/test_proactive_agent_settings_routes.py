@@ -31,7 +31,12 @@ _ADMIN = {"X-Forwarded-Email": "admin@example.com"}
 
 @asynccontextmanager
 async def _client(
-    db_uri: str, tmp_path: Path, *, offered: bool = True, **extra: Any
+    db_uri: str,
+    tmp_path: Path,
+    *,
+    offered: bool = True,
+    settings_store: bool = True,
+    **extra: Any,
 ) -> AsyncIterator[httpx.AsyncClient]:
     conversations = SqlAlchemyConversationStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
@@ -44,7 +49,9 @@ async def _client(
         artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
         agent_cache=None,  # type: ignore[arg-type]
         inbox_item_store=SqlAlchemyInboxItemStore(db_uri),
-        proactive_agent_settings_store=ProactiveAgentSettingsStore(db_uri),
+        proactive_agent_settings_store=(
+            ProactiveAgentSettingsStore(db_uri) if settings_store else None
+        ),
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
         permission_store=permissions,
         feature_flags=resolve_feature_flags(
@@ -191,4 +198,28 @@ async def test_the_bundle_download_tells_the_runner_whether_to_offer_the_inbox_t
         child_url = f"/v1/sessions/{child.id}/agent/contents"
         assert (await client.get(child_url, headers=_ALICE)).headers[USER_INBOX_HEADER] == "0"
         await client.put("/v1/proactive-agent/settings/me", json={"enabled": True}, headers=_ALICE)
-        assert (await client.get(child_url, headers=_ALICE)).headers[USER_INBOX_HEADER] == "1"
+        good = await client.get(child_url, headers=_ALICE)
+        assert good.headers[USER_INBOX_HEADER] == "1"
+        # The Inbox is optional: a failing settings read turns its tools off
+        # without failing the download.
+        app = client._transport.app  # type: ignore[attr-defined]
+
+        def failing_settings_read(user_id: str) -> bool:
+            raise RuntimeError("settings store down")
+
+        app.state.proactive_agent_enabled_for = failing_settings_read
+        degraded = await client.get(child_url, headers=_ALICE)
+        assert (degraded.status_code, degraded.headers[USER_INBOX_HEADER]) == (200, "0")
+        assert degraded.content == good.content
+
+
+async def test_without_a_settings_store_the_agent_is_not_offered(
+    db_uri: str, tmp_path: Path
+) -> None:
+    """The web client reads the settings before it shows Inbox items, so the offer needs them."""
+    async with _client(db_uri, tmp_path, settings_store=False) as client:
+        info = await client.get("/v1/info", headers=_ALICE)
+        assert info.json()["proactive_agent_available"] is False
+        settings = await client.get("/v1/proactive-agent/settings", headers=_ALICE)
+        assert settings.status_code == 404
+        assert (await client.get("/v1/inbox/items", headers=_ALICE)).status_code == 404

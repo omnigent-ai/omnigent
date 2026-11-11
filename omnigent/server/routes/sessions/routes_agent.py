@@ -45,7 +45,6 @@ from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     can_mutate_session_agent as _can_mutate_session_agent,
 )
-from omnigent.server.routes._auth_helpers import get_session_owner_id
 from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
@@ -293,15 +292,27 @@ def register_agent_routes(
         inbox_enabled_for = getattr(request.app.state, "proactive_agent_enabled_for", None)
         if inbox_enabled_for is not None:
             # For the session's owner, whoever downloads the bundle for it. A
-            # child session belongs to its root's owner.
-            owner = (
-                await asyncio.to_thread(
-                    get_session_owner_id, conv.root_conversation_id, permission_store
+            # child session belongs to its root's owner. The Inbox is optional,
+            # so a failing settings read turns it off rather than failing the
+            # bundle download.
+            try:
+                owner = (
+                    await asyncio.to_thread(
+                        conversation_store.get_session_owner,
+                        conv.root_conversation_id,
+                        owner_only=True,
+                    )
+                    if permission_store is not None
+                    else RESERVED_USER_LOCAL
                 )
-                if permission_store is not None
-                else RESERVED_USER_LOCAL
-            )
-            inbox_on = owner is not None and await asyncio.to_thread(inbox_enabled_for, owner)
+                inbox_on = owner is not None and await asyncio.to_thread(inbox_enabled_for, owner)
+            except Exception:
+                _logger.warning(
+                    "Inbox settings check failed for session %s; offering no Inbox tools",
+                    session_id,
+                    exc_info=True,
+                )
+                inbox_on = False
             selection_headers[USER_INBOX_HEADER] = "1" if inbox_on else "0"
         return Response(
             content=bundle_bytes,

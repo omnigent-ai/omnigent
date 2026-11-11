@@ -30,6 +30,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
 
 _INBOX_AGENT = "1" * 32
 _PLAIN_AGENT = "2" * 32
@@ -40,12 +41,20 @@ _TOKEN = "runner-binding-token"
 class _AgentCacheStub:
     """Loads a spec whose ``user_inbox`` group is on only for the Inbox agent.
 
-    Each agent has one named sub-agent whose opt-in is the opposite of its own.
+    Each agent has a named sub-agent, and that one a nested sub-agent, whose
+    opt-ins are the opposite of the root's.
     """
 
     def load(self, agent_id: str, bundle_location: str, **_: Any) -> SimpleNamespace:
         posts = agent_id == _INBOX_AGENT
-        child = SimpleNamespace(name="child", tool_groups=ToolGroupsConfig(user_inbox=not posts))
+        grandchild = SimpleNamespace(
+            name="grandchild", tool_groups=ToolGroupsConfig(user_inbox=not posts), sub_agents=[]
+        )
+        child = SimpleNamespace(
+            name="child",
+            tool_groups=ToolGroupsConfig(user_inbox=not posts),
+            sub_agents=[grandchild],
+        )
         return SimpleNamespace(
             spec=SimpleNamespace(
                 tool_groups=ToolGroupsConfig(user_inbox=posts), sub_agents=[child]
@@ -84,6 +93,9 @@ def _app(
         artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
         agent_cache=_AgentCacheStub(),  # type: ignore[arg-type]
         inbox_item_store=stores.inbox,
+        proactive_agent_settings_store=ProactiveAgentSettingsStore(
+            stores.conversations.storage_location
+        ),
         feature_flags=resolve_feature_flags(
             {"OMNIGENT_FEATURES": "proactive_agent" if enabled else ""}
         ),
@@ -254,15 +266,36 @@ async def test_an_expired_item_is_replaced(
 
 
 @pytest.mark.parametrize(
-    ("agent_id", "expected"),
-    [(_PLAIN_AGENT, 200), (_INBOX_AGENT, 403)],
-    ids=["child-opts-in", "child-opts-out"],
+    ("agent_id", "sub_agent_name", "expected"),
+    [
+        (_PLAIN_AGENT, "child", 200),
+        (_INBOX_AGENT, "child", 403),
+        (_PLAIN_AGENT, "grandchild", 200),
+        (_INBOX_AGENT, "grandchild", 403),
+        (_PLAIN_AGENT, "stranger", 403),
+        (_INBOX_AGENT, "stranger", 403),
+    ],
+    ids=[
+        "child-opts-in",
+        "child-opts-out",
+        "grandchild-opts-in",
+        "grandchild-opts-out",
+        "unknown-name-under-opted-out-root",
+        "unknown-name-under-opted-in-root",
+    ],
 )
 async def test_post_checks_the_named_sub_agents_opt_in(
-    client: httpx.AsyncClient, stores: SimpleNamespace, agent_id: str, expected: int
+    client: httpx.AsyncClient,
+    stores: SimpleNamespace,
+    agent_id: str,
+    sub_agent_name: str,
+    expected: int,
 ) -> None:
-    """A named child session posts under its own spec's tool groups, not its root's."""
-    session_id = _session(stores, agent_id, sub_agent_name="child")
+    """A named session posts under its own spec's tool groups, wherever it sits in the tree.
+
+    A name the bundle does not define never falls back to the root's opt-in.
+    """
+    session_id = _session(stores, agent_id, sub_agent_name=sub_agent_name)
 
     resp = await client.post("/v1/inbox/items", json=_body(), headers=_from(session_id))
 

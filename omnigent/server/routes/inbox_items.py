@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.entities import InboxItem
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.inbox_dedupe import (
     DedupeInputs,
@@ -130,14 +131,6 @@ class UpdateInboxItemRequest(BaseModel):
         return self
 
 
-def _sub_agent_spec(spec: Any, name: str) -> Any | None:
-    """Return the sub-agent of *spec* called *name*, or ``None``."""
-    for sub_agent in getattr(spec, "sub_agents", None) or []:
-        if getattr(sub_agent, "name", None) == name:
-            return sub_agent
-    return None
-
-
 def _item_json(item: InboxItem) -> dict[str, Any]:
     return dataclasses.asdict(item)
 
@@ -200,10 +193,14 @@ def create_inbox_items_router(
             agent.id, agent.bundle_location, expand_env=agent.operator_authored
         ).spec
         # A named child session runs its sub-agent's spec, whose tool groups
-        # are the ones the runner registered.
+        # are the ones the runner registered; it may sit anywhere in the tree.
         sub_agent_name = conversation.sub_agent_name
         if sub_agent_name:
-            spec = _sub_agent_spec(spec, sub_agent_name) or spec
+            spec = _find_spec_by_name(spec, sub_agent_name)
+            if spec is None:
+                raise OmnigentError(
+                    "Inbox posts require the session's agent", code=ErrorCode.FORBIDDEN
+                )
         if not spec.tool_groups.user_inbox:
             raise OmnigentError(
                 "Inbox posts require an agent with the user_inbox tool group",
