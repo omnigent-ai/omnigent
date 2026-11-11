@@ -155,6 +155,18 @@ class PermissionStore(ABC):
         """
         ...
 
+    def validate_grantee(self, user_id: str) -> None:
+        """Raise if *user_id* can never receive a grant, before a share is saved.
+
+        Lets a store that resolves principals reject an unknown user or group
+        when an automation saves its shares, not on every run. The default
+        accepts any id, as :meth:`grant` creates users on demand.
+
+        :param user_id: The grantee, e.g. ``"team.engineering"``.
+        :raises OmnigentError: With ``INVALID_INPUT`` for an unknown grantee.
+        """
+        del user_id
+
     @abstractmethod
     def get_user(self, user_id: str) -> Account | None:
         """Read the target account and generation before an operation on another user."""

@@ -2084,6 +2084,20 @@
             "title": "Session Mode",
             "type": "string"
           },
+          "share_with": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/GrantPermissionRequest"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Share With"
+          },
           "source_session_id": {
             "anyOf": [
               {
@@ -12823,6 +12837,20 @@
               }
             ],
             "title": "Session Mode"
+          },
+          "share_with": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/GrantPermissionRequest"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Share With"
           },
           "state": {
             "anyOf": [

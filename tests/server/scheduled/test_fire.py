@@ -31,8 +31,21 @@ from starlette.datastructures import Headers
 
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id
-from omnigent.entities import ScheduledTask, ScheduledTaskRun, StoredFile
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+from omnigent.entities import (
+    ScheduledTask,
+    ScheduledTaskRun,
+    ScheduledTaskShare,
+    SessionPermission,
+    StoredFile,
+)
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
+    SharingMode,
+)
 from omnigent.server.bundles import bundle_location
 from omnigent.server.routes._host_worktree import (
     WORKTREE_ROOT_LABEL_KEY,
@@ -430,6 +443,10 @@ class FakePermissionStore:
 
     def check_access(self, user_id: str | None, conversation_id: str, required_level: int) -> bool:
         return conversation_id not in self.unowned
+
+    def get(self, user_id: str, conversation_id: str) -> SessionPermission | None:
+        levels = [lvl for uid, cid, lvl in self.grants if (uid, cid) == (user_id, conversation_id)]
+        return SessionPermission(user_id, conversation_id, levels[-1]) if levels else None
 
     def grant(self, user_id: str, conversation_id: str, level: int) -> Any:
         self.grant_workspace_ids.append(current_workspace_id())
@@ -2678,6 +2695,48 @@ async def test_public_grant_failure_does_not_cancel_run() -> None:
     assert len(launched) == 1
     assert store.runs and store.runs[0]["status"] == "running"
     assert not any(r.get("error_code") == "owner_grant_failed" for r in store.runs)
+
+
+class _SharingState:
+    """Minimal ``app.state`` carrying only the live sharing mode."""
+
+    def __init__(self, mode: SharingMode) -> None:
+        self.sharing_mode = lambda: mode
+
+
+@pytest.mark.asyncio
+async def test_fire_shares_the_run_with_the_tasks_grantees() -> None:
+    """A run's session is shared after its owner grant, re-checking the live policy.
+
+    The server became read-only after the task was saved, so the edit share is
+    skipped; a failing grantee is skipped too, and the run still dispatches.
+    """
+    perm = FakePermissionStore(fail_grant_users={"broken@example.com"})
+    task = _task(
+        share_with=(
+            ScheduledTaskShare("broken@example.com", LEVEL_READ),
+            ScheduledTaskShare("team.engineering", LEVEL_READ),
+            ScheduledTaskShare("alice@example.com", LEVEL_EDIT),
+        )
+    )
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    deps = _deps(store, permission_store=perm, host_registry=FakeHostRegistry(online={"host_1"}))
+    deps.app_state = _SharingState(SharingMode.READ_ONLY)
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    session_id = launched[0].id
+    assert perm.grants == [
+        (RESERVED_USER_LOCAL, session_id, LEVEL_OWNER),
+        ("team.engineering", session_id, LEVEL_READ),
+    ]
+    assert store.runs and store.runs[0]["status"] == "running"
 
 
 # ── Continuing one session ───────────────────────────────────────────────────

@@ -8,15 +8,48 @@ table and its ``scheduled_task_runs`` history table.
 from __future__ import annotations
 
 import builtins
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.entities import ScheduledTask, ScheduledTaskRun, ScheduledTaskShare
+from omnigent.errors import ErrorCode, OmnigentError
 
 # Sentinel meaning "caller did not supply this argument; leave the column unchanged."
 # Distinct from None, which means "set the column to NULL."
 _UNSET: Any = object()
+
+# Width of the ``scheduled_tasks.share_with`` column, in characters.
+SHARE_WITH_MAX_STORED_CHARS = 2048
+
+
+def encode_share_with(shares: tuple[ScheduledTaskShare, ...]) -> str | None:
+    """Serialize a task's run shares for its column; empty stores NULL.
+
+    SQLite does not enforce the column width, so the limit is checked here,
+    on every write path.
+    """
+    if not shares:
+        return None
+    encoded = json.dumps(
+        [{"user_id": share.user_id, "level": share.level} for share in shares],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if len(encoded) > SHARE_WITH_MAX_STORED_CHARS:
+        raise OmnigentError(
+            "Too many people or groups to share runs with", code=ErrorCode.INVALID_INPUT
+        )
+    return encoded
+
+
+def decode_share_with(raw: str | None) -> tuple[ScheduledTaskShare, ...]:
+    """Read a task's run shares back; NULL keeps runs private to the owner."""
+    if not raw:
+        return ()
+    return tuple(ScheduledTaskShare(entry["user_id"], entry["level"]) for entry in json.loads(raw))
+
 
 # How :meth:`ScheduledTaskStore.adopt_session` resolved: the task now continues
 # the session, another session got there first, or the task changed under the run.
@@ -68,6 +101,7 @@ class ScheduledTaskStore(ABC):
         model_override: str | None = None,
         reasoning_effort: str | None = None,
         permission_mode: str | None = None,
+        share_with: tuple[ScheduledTaskShare, ...] = (),
         max_cost_usd: float | None = None,
         session_mode: str = "new",
         session_id: str | None = None,
@@ -96,6 +130,7 @@ class ScheduledTaskStore(ABC):
         :param reasoning_effort: Optional reasoning-effort hint.
         :param permission_mode: Optional native-harness permission mode
             (Claude Code), e.g. ``"acceptEdits"``.
+        :param share_with: Grants added to every session a run creates.
         :param max_cost_usd: Optional per-firing cost budget in USD.
         :param session_mode: ``"new"`` (default) starts a new session per
             firing; ``"continue"`` sends each firing's prompt into one session.
@@ -192,6 +227,7 @@ class ScheduledTaskStore(ABC):
         model_override: str | None = _UNSET,
         reasoning_effort: str | None = _UNSET,
         permission_mode: str | None = _UNSET,
+        share_with: tuple[ScheduledTaskShare, ...] | None = None,
         max_cost_usd: float | None = _UNSET,
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
@@ -218,7 +254,9 @@ class ScheduledTaskStore(ABC):
         binding or nulling out a deleted last-run conversation.
 
         Passing ``rrule`` updates the recurring trigger; ``None``
-        leaves it unchanged.
+        leaves it unchanged. ``share_with`` replaces the grants added to the
+        sessions later runs create (an empty tuple clears them); ``None`` leaves
+        them unchanged.
 
         Passing ``agent_id`` rebinds the task to a different agent, which
         switches the harness its future firings run. The fire path reads

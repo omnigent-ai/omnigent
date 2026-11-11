@@ -37,6 +37,19 @@ class ScheduledRunLogContext(BaseModel):
     session_mode: str
 
 
+@dataclass(frozen=True)
+class ScheduledTaskShare:
+    """A grant written on every session a scheduled task's runs create.
+
+    :param user_id: The grantee: a user, a group the permission store resolves,
+        or ``"__public__"``, e.g. ``"team.engineering"``.
+    :param level: The session permission level granted, e.g. ``1`` for read.
+    """
+
+    user_id: str
+    level: int
+
+
 @dataclass
 class ScheduledTask:
     """
@@ -64,6 +77,9 @@ class ScheduledTask:
     :param permission_mode: Harness-specific permission or execution mode.
         The fire path translates it into that harness's launch options.
         ``None`` means use the agent's configured default.
+    :param share_with: Grants added to every session a run creates, after the
+        owner's. Each is checked against the server's sharing policy when it is
+        written; empty keeps runs private to the owner.
     :param max_cost_usd: Optional per-firing cost budget in USD. When set, the
         fire path attaches a ``cost_budget`` policy to each spawned session that
         blocks all models once cumulative spend reaches this limit. ``None``
@@ -108,6 +124,7 @@ class ScheduledTask:
     model_override: str | None = None
     reasoning_effort: str | None = None
     permission_mode: str | None = None
+    share_with: tuple[ScheduledTaskShare, ...] = ()
     max_cost_usd: float | None = None
     session_mode: str = "new"
     session_id: str | None = None

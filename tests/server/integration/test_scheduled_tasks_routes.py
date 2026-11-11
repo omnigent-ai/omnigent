@@ -32,6 +32,7 @@ from omnigent.runner.identity import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.auth import SharingMode
 from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
 from omnigent.server.routes import scheduled_tasks as scheduled_tasks_routes
@@ -367,6 +368,13 @@ async def test_agent_mutations_validate_origin_at_http_boundary(
         assert updated.status_code == expected_status, updated.text
         stored = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
         assert stored.json()["state"] == ("paused" if expected_status == 200 else "active")
+        if expected_status == 200:
+            # Even a verified agent cannot widen who sees every run.
+            shared = await client.patch(
+                f"/v1/scheduled-tasks/{task_id}", json={"share_with": []}, headers=headers
+            )
+            assert shared.status_code == 403, shared.text
+            assert "Agent tools cannot change" in shared.json()["error"]["message"]
 
 
 async def test_automations_gate_is_checked_per_request(
@@ -3080,6 +3088,85 @@ async def test_create_can_continue_a_session_the_owner_picked(
         assert picked.status_code == status, (permission_mode, picked.text)
         if status == 400:
             assert "which skips approval" in picked.json()["error"]["message"]
+
+
+async def test_share_with_round_trips_and_rejects_shares_the_owner_could_not_add(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient
+) -> None:
+    team = {"user_id": "team.engineering", "level": 1}
+    bob = {"user_id": "bob@example.com", "level": 2}
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(share_with=[team, bob]), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    task_url = f"/v1/scheduled-tasks/{created.json()['id']}"
+    assert created.json()["share_with"] == [team, bob]
+    renamed = await auth_client.patch(task_url, json={"name": "renamed"}, headers=_headers())
+    assert renamed.json()["share_with"] == [team, bob]
+
+    refused = [
+        ([{"user_id": "alice@example.com", "level": 1}], 400, "already owns every run"),
+        ([team, team], 400, "listed more than once"),
+        ([{"user_id": f"u{index}", "level": 1} for index in range(11)], 400, "at most 10"),
+        ([{"user_id": "g" * 129, "level": 1}], 400, "1-128 characters"),
+        ([{"user_id": "__public__", "level": 2}], 400, "Public access is limited"),
+    ]
+    for shares, status, message in refused:
+        resp = await auth_client.patch(task_url, json={"share_with": shares}, headers=_headers())
+        assert resp.status_code == status, (shares, resp.text)
+        assert message in resp.json()["error"]["message"]
+    owner_level = await auth_client.patch(
+        task_url,
+        json={"share_with": [{"user_id": "bob@example.com", "level": 4}]},
+        headers=_headers(),
+    )
+    assert owner_level.status_code == 422, owner_level.text
+
+    # The policy in force when the owner saves applies, as for a hand-made share.
+    auth_app.state.sharing_mode = lambda: SharingMode.READ_ONLY
+    edit = await auth_client.patch(task_url, json={"share_with": [bob]}, headers=_headers())
+    assert edit.status_code == 403, edit.text
+    assert "read-only" in edit.json()["error"]["message"]
+
+    cleared = await auth_client.patch(task_url, json={"share_with": None}, headers=_headers())
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["share_with"] == []
+    stored = await auth_client.get(task_url, headers=_headers())
+    assert stored.json()["share_with"] == []
+
+
+async def test_shares_reach_a_continued_session_without_lowering_access(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A continued session gets no new run session, so saving shares it directly."""
+    session_id = _owned_session(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.grant("bob@example.com", session_id, 2)
+
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            session_mode="continue",
+            session_id=session_id,
+            share_with=[{"user_id": "bob@example.com", "level": 1}],
+        ),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    bob = permissions.get("bob@example.com", session_id)
+    assert bob is not None and bob.level == 2
+
+    updated = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created.json()['id']}",
+        json={"share_with": [{"user_id": "team.engineering", "level": 1}]},
+        headers=_headers(),
+    )
+    assert updated.status_code == 200, updated.text
+    team = permissions.get("team.engineering", session_id)
+    assert team is not None and team.level == 1
+    # Removing a grantee from the automation leaves the session's grants alone.
+    bob = permissions.get("bob@example.com", session_id)
+    assert bob is not None and bob.level == 2
 
 
 async def test_a_picked_session_must_be_the_owners_and_fit_the_task(

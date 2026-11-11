@@ -13,6 +13,8 @@ from typing import Any
 import pytest
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
+from omnigent.entities import ScheduledTaskShare
+from omnigent.errors import OmnigentError
 from omnigent.server.scheduled.schedule import next_scheduled_time
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
@@ -833,26 +835,32 @@ def test_update_overrides_can_be_cleared_to_null(store: SqlAlchemyScheduledTaskS
         model_override="opus",
         reasoning_effort="high",
         permission_mode="bypassPermissions",
+        share_with=(ScheduledTaskShare("team.engineering", 1),),
     )
     updated = store.update(
         _uid("st_clear_ovr"),
         model_override=None,
         reasoning_effort=None,
         permission_mode=None,
+        share_with=(),
     )
     assert updated is not None
     assert updated.model_override is None
     assert updated.reasoning_effort is None
     assert updated.permission_mode is None
+    assert updated.share_with == ()
     fetched = store.get(_uid("st_clear_ovr"))
     assert fetched is not None
     assert fetched.permission_mode is None
+    assert fetched.share_with == ()
 
 
 def test_update_omitting_overrides_leaves_them_unchanged(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:
     """Omitting the override params does NOT clear them (sentinel = unchanged)."""
+    # A non-ASCII group name round-trips unescaped.
+    shares = (ScheduledTaskShare("équipe", 1), ScheduledTaskShare("alice@example.com", 2))
     store.create(
         scheduled_task_id=_uid("st_keep_ovr"),
         name="n",
@@ -864,6 +872,7 @@ def test_update_omitting_overrides_leaves_them_unchanged(
         model_override="opus",
         reasoning_effort="high",
         permission_mode="acceptEdits",
+        share_with=shares,
     )
     # Update name only — the overrides must be untouched.
     updated = store.update(_uid("st_keep_ovr"), name="renamed")
@@ -871,6 +880,41 @@ def test_update_omitting_overrides_leaves_them_unchanged(
     assert updated.model_override == "opus"
     assert updated.reasoning_effort == "high"
     assert updated.permission_mode == "acceptEdits"
+    fetched = store.get(_uid("st_keep_ovr"))
+    assert fetched is not None
+    assert fetched.share_with == shares
+
+
+def test_share_with_rejects_a_list_wider_than_its_column(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Every write path refuses shares that would not fit, even where SQLite would."""
+    too_many = tuple(ScheduledTaskShare(f"{'g' * 120}{index}", 1) for index in range(20))
+    with pytest.raises(OmnigentError, match="Too many people or groups"):
+        store.create(
+            scheduled_task_id=_uid("st_wide"),
+            name="n",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="u",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+            share_with=too_many,
+        )
+    store.create(
+        scheduled_task_id=_uid("st_wide"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+    )
+    with pytest.raises(OmnigentError, match="Too many people or groups"):
+        store.update(_uid("st_wide"), share_with=too_many)
+    fetched = store.get(_uid("st_wide"))
+    assert fetched is not None
+    assert fetched.share_with == ()
 
 
 def test_update_last_run_conversation_id_can_be_cleared_to_null(

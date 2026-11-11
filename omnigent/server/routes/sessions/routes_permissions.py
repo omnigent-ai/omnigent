@@ -12,7 +12,6 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
-from omnigent.db.account_authority import target_account_scope
 from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import (
     Agent,
@@ -33,10 +32,8 @@ from omnigent.server.auth import (
     LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
-    RESERVED_USER_PUBLIC,
     AuthProvider,
     SharingMode,
-    workspace_sharing_blocked,
 )
 from omnigent.server.routes._auth_helpers import (
     get_session_owner_id as _get_session_owner_id,
@@ -62,6 +59,11 @@ from omnigent.server.schemas import (
     PermissionObject,
     PolicySummary,
     SkillSummary,
+)
+from omnigent.server.session_sharing import (
+    require_new_grant_allowed,
+    sharing_mode,
+    write_session_grant,
 )
 from omnigent.spec.types import (
     FunctionPolicySpec,
@@ -115,36 +117,15 @@ def register_permissions_routes(
         await _require_access(
             user_id, session_id, LEVEL_MANAGE, permission_store, conversation_store
         )
-        # Server-wide sharing policy gate (see SharingMode). Applied only
-        # to *new* grants — revoke/list and owner grants are unaffected.
-        # ``getattr`` default keeps a hand-built app (a router mounted without
-        # create_app, e.g. in a focused test) from AttributeError-ing; every
-        # production path sets these via create_app.
-        _sharing_mode = getattr(request.app.state, "sharing_mode", lambda: SharingMode.ON)()
-        if _sharing_mode == SharingMode.OFF:
-            raise OmnigentError(
-                "Sharing has been disabled for this Omnigent server.",
-                code=ErrorCode.FORBIDDEN,
-            )
-        # RESTRICTED_READ_ONLY blocks sharing entirely (even read) for a session
-        # whose cwd is a home dir or the filesystem root — that workspace is too
-        # broad to expose. Other sessions fall through to the read-only cap.
-        if _sharing_mode == SharingMode.RESTRICTED_READ_ONLY:
-            _conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if _conv is not None and workspace_sharing_blocked(_conv.workspace):
-                raise OmnigentError(
-                    "This session's working directory (a home or root directory) "
-                    "cannot be shared on this Omnigent server.",
-                    code=ErrorCode.FORBIDDEN,
-                )
-        if (
-            _sharing_mode in (SharingMode.READ_ONLY, SharingMode.RESTRICTED_READ_ONLY)
-            and body.level > LEVEL_READ
-        ):
-            raise OmnigentError(
-                "Sharing is limited to read-only access on this Omnigent server.",
-                code=ErrorCode.FORBIDDEN,
-            )
+        # Server-wide sharing policy (see SharingMode), applied only to new grants.
+        # Only RESTRICTED_READ_ONLY depends on the session's working directory.
+        workspace = None
+        if sharing_mode(request.app.state) == SharingMode.RESTRICTED_READ_ONLY:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            workspace = conv.workspace if conv is not None else None
+        require_new_grant_allowed(
+            request.app.state, user_id=body.user_id, level=body.level, workspace=workspace
+        )
         if permission_store is None:
             raise OmnigentError(
                 "Permissions not enabled",
@@ -155,38 +136,10 @@ def register_permissions_routes(
                 "Cannot modify your own permissions",
                 code=ErrorCode.FORBIDDEN,
             )
-        if body.user_id == RESERVED_USER_PUBLIC:
-            # Public-access kill switch, independent of the sharing_mode gate
-            # above (see app.state.public_sharing). Blocks the anyone-with-the
-            # -link grant while leaving user-to-user sharing intact. ``getattr``
-            # default mirrors the sharing_mode read above (hand-built apps).
-            if not getattr(request.app.state, "public_sharing", lambda: True)():
-                raise OmnigentError(
-                    "Public access has been disabled for this Omnigent server.",
-                    code=ErrorCode.FORBIDDEN,
-                )
-            from omnigent.server.sharing_settings import PublicSharingMaxLevel
-
-            ceiling = getattr(
-                request.app.state, "public_sharing_max_level", lambda: PublicSharingMaxLevel.READ
-            )()
-            if body.level > ceiling.level:
-                raise OmnigentError(
-                    f"Public access is limited to {ceiling.value} (level {ceiling.level})",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-        target = await asyncio.to_thread(permission_store.get_user, body.user_id)
-        with target_account_scope(body.user_id, target.account_generation if target else None):
-            existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
-            if existing is not None and existing.level == LEVEL_OWNER:
-                raise OmnigentError(
-                    "Cannot modify owner permissions",
-                    code=ErrorCode.FORBIDDEN,
-                )
-            await asyncio.to_thread(permission_store.ensure_user, body.user_id)
-            perm = await asyncio.to_thread(
-                permission_store.grant, body.user_id, session_id, body.level
-            )
+        perm = await asyncio.to_thread(
+            write_session_grant, permission_store, body.user_id, session_id, body.level
+        )
+        assert perm is not None
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
         _announce_session_added(body.user_id, session_id)

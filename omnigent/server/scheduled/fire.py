@@ -851,6 +851,10 @@ async def _run_fire_for_task(
             task.id,
             conv.id,
         )
+    # Like default-public access, the task's shares never cancel a ready run.
+    await grant_task_shares(
+        deps.app_state, deps.permission_store, effective, conv.id, workspace=conv.workspace
+    )
 
     await recorder.check()
     try:
@@ -2070,6 +2074,61 @@ async def _grant_default_public(deps: FireDeps, task: ScheduledTask, conversatio
     await asyncio.to_thread(
         deps.permission_store.grant, RESERVED_USER_PUBLIC, conversation_id, LEVEL_READ
     )
+
+
+async def grant_task_shares(
+    state: Any | None,
+    permission_store: Any | None,
+    task: ScheduledTask,
+    session_id: str,
+    *,
+    workspace: str | None,
+) -> None:
+    """Add *task*'s shares to *session_id*, skipping any its owner could not add now.
+
+    Each grantee is independent: a share the sharing policy refuses, or one that
+    fails, is logged and the rest still apply, so sharing never fails a run. A
+    grantee who already holds the level or higher keeps their grant.
+
+    :param state: ``app.state``, for the live sharing policy; ``None`` shares nothing.
+    :param workspace: The session's working directory, for the restricted policy.
+    """
+    if not task.share_with or permission_store is None or state is None:
+        return
+    from omnigent.server.session_sharing import require_new_grant_allowed, write_session_grant
+
+    for share in task.share_with:
+        try:
+            require_new_grant_allowed(
+                state, user_id=share.user_id, level=share.level, workspace=workspace
+            )
+            granted = await asyncio.to_thread(
+                write_session_grant,
+                permission_store,
+                share.user_id,
+                session_id,
+                share.level,
+                keep_higher=True,
+            )
+        except OmnigentError as exc:
+            _logger.warning(
+                "scheduled task %s: not sharing session %s with %r: %s",
+                task.id,
+                session_id,
+                share.user_id,
+                exc,
+            )
+            continue
+        except Exception:
+            _logger.exception(
+                "scheduled task %s: sharing session %s with %r failed",
+                task.id,
+                session_id,
+                share.user_id,
+            )
+            continue
+        if granted is not None:
+            _announce_session_added(share.user_id, session_id)
 
 
 async def _record_run(

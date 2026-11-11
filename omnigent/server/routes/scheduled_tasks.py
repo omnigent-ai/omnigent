@@ -28,7 +28,13 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
-from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
+from omnigent.entities import (
+    Agent,
+    Conversation,
+    ScheduledTask,
+    ScheduledTaskRun,
+    ScheduledTaskShare,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
@@ -39,6 +45,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     AuthProvider,
+    SharingMode,
     bind_host_is_loopback,
 )
 from omnigent.server.bundles import agent_for_user
@@ -65,7 +72,9 @@ from omnigent.server.scheduled.harness_settings import (
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.telemetry import log_task_created
+from omnigent.server.schemas import GrantPermissionRequest
 from omnigent.server.session_orchestration import require_owned_session
+from omnigent.server.session_sharing import require_new_grant_allowed, sharing_mode
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.project_store import ProjectStore
@@ -85,6 +94,9 @@ _SOURCE_SESSION_CONTINUE_MSG = (
     "an automation with source_session_id starts each run in a new session; "
     "session_mode must be 'new'"
 )
+# Grantees per automation; an id must fit session_permissions.user_id.
+_MAX_TASK_SHARES = 10
+_MAX_SHARE_USER_ID_CHARS = 128
 # A continued session cannot follow a change to these, so the next run starts a new one.
 _SESSION_BOUND_FIELDS = frozenset(
     {"agent_id", "host_id", "workspace", "base_branch", "execution_target"}
@@ -130,6 +142,8 @@ class CreateScheduledTaskRequest(BaseModel):
     # A session the caller owns. Create copies it, and every run starts a new
     # session from that copy; responses carry the copy's id here.
     source_session_id: str | None = Field(default=None, min_length=1)
+    # Users or groups every session a run creates is shared with, at these levels.
+    share_with: list[GrantPermissionRequest] | None = None
 
     @model_validator(mode="after")
     def _validate_create(self) -> CreateScheduledTaskRequest:
@@ -173,6 +187,8 @@ class UpdateScheduledTaskRequest(BaseModel):
     execution_target: str | None = Field(default=None, min_length=1)
     state: str | None = None
     project_id: str | None = None  # null unfiles future runs
+    # Replaces who later runs' sessions are shared with; null or [] stops sharing.
+    share_with: list[GrantPermissionRequest] | None = None
 
     @model_validator(mode="after")
     def _validate_patch(self) -> UpdateScheduledTaskRequest:
@@ -244,6 +260,9 @@ def _to_response(
         "model_override": task.model_override,
         "reasoning_effort": task.reasoning_effort,
         "permission_mode": task.permission_mode,
+        "share_with": [
+            {"user_id": share.user_id, "level": share.level} for share in task.share_with
+        ],
         "max_cost_usd": task.max_cost_usd,
         "session_mode": task.session_mode,
         "session_id": task.session_id,
@@ -593,6 +612,89 @@ def create_scheduled_tasks_router(
             raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         return task
 
+    async def _validated_shares(
+        request: Request,
+        shares: list[GrantPermissionRequest] | None,
+        *,
+        owner: str,
+        execution_target: str,
+        workspace: str | None,
+    ) -> tuple[ScheduledTaskShare, ...]:
+        """The shares an owner saves, refused unless they could add each by hand.
+
+        Runs check the policy again when they write the grants, since it can
+        change after the automation is saved.
+        """
+        if any(
+            header in request.headers
+            for header in (ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER)
+        ):
+            # Agents act on untrusted input; widening who sees every run takes a person.
+            raise OmnigentError(
+                "Agent tools cannot change who an automation's runs are shared with",
+                code=ErrorCode.FORBIDDEN,
+            )
+        if not shares:
+            return ()
+        if permission_store is None:
+            raise OmnigentError(
+                "Sharing automation runs needs a server with permissions enabled",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if len(shares) > _MAX_TASK_SHARES:
+            raise OmnigentError(
+                f"An automation can share its runs with at most {_MAX_TASK_SHARES} "
+                "users or groups",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if (
+            sharing_mode(request.app.state) == SharingMode.RESTRICTED_READ_ONLY
+            and execution_target == "connected_host"
+            and workspace is None
+        ):
+            # Unpinned runs start in the host's home directory, which this policy never shares.
+            raise OmnigentError(
+                "Choose a workspace folder to share this automation's runs on this "
+                "Omnigent server.",
+                code=ErrorCode.FORBIDDEN,
+            )
+        seen: set[str] = set()
+        for share in shares:
+            if not share.user_id.strip() or len(share.user_id) > _MAX_SHARE_USER_ID_CHARS:
+                raise OmnigentError(
+                    f"Share with a user or group id of 1-{_MAX_SHARE_USER_ID_CHARS} characters",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if share.user_id == owner:
+                raise OmnigentError(
+                    "The automation's owner already owns every run",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if share.user_id in seen:
+                raise OmnigentError(
+                    f"{share.user_id!r} is listed more than once",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            seen.add(share.user_id)
+            require_new_grant_allowed(
+                request.app.state, user_id=share.user_id, level=share.level, workspace=workspace
+            )
+            await asyncio.to_thread(permission_store.validate_grantee, share.user_id)
+        return tuple(ScheduledTaskShare(share.user_id, share.level) for share in shares)
+
+    async def _share_continued_session(request: Request, task: ScheduledTask) -> None:
+        """Add *task*'s shares to the session it continues, which no run will create."""
+        if not task.share_with or not task.continues_session:
+            return
+        from omnigent.server.scheduled.fire import grant_task_shares
+
+        assert task.session_id is not None
+        conv = await asyncio.to_thread(conversation_store.get_conversation, task.session_id)
+        if conv is not None:
+            await grant_task_shares(
+                request.app.state, permission_store, task, conv.id, workspace=conv.workspace
+            )
+
     async def _require_continuable(request: Request, task: ScheduledTask) -> Conversation:
         """Return a picked session *task* can continue; reject it otherwise, hiding one
         the owner cannot see."""
@@ -862,6 +964,15 @@ def create_scheduled_tasks_router(
             execution_target=body.execution_target,
         )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        shares: tuple[ScheduledTaskShare, ...] = ()
+        if "share_with" in body.model_fields_set:
+            shares = await _validated_shares(
+                request,
+                body.share_with,
+                owner=owner,
+                execution_target=body.execution_target,
+                workspace=workspace,
+            )
         project_owner = _project_owner(owner)
         # Known before the task exists, since a sandbox session must run on the
         # sandbox host derived from it.
@@ -931,6 +1042,7 @@ def create_scheduled_tasks_router(
                 model_override=model_override,
                 reasoning_effort=reasoning_effort,
                 permission_mode=permission_mode,
+                share_with=shares,
                 max_cost_usd=body.max_cost_usd,
                 session_mode=body.session_mode,
                 session_id=body.session_id,
@@ -958,6 +1070,7 @@ def create_scheduled_tasks_router(
 
             # Surface the copy in the owner's open sidebars, keyed as they subscribe.
             _announce_session_added(require_user(request, auth_provider), source_copy.id)
+        await _share_continued_session(request, task)
         log_task_created(
             task,
             owner=owner,
@@ -1381,6 +1494,14 @@ def create_scheduled_tasks_router(
                 fields["host_id"] = picked.host_id
         elif "permission_mode" in fields and continuing.continues_session:
             await _require_mode_fits_session(request, continuing)
+        if "share_with" in fields:
+            fields["share_with"] = await _validated_shares(
+                request,
+                body.share_with,
+                owner=owner,
+                execution_target=target_execution,
+                workspace=fields.get("workspace", existing.workspace),
+            )
         project_owner = _project_owner(owner)
         try:
             if fields.get("project_id") is not None:
@@ -1404,6 +1525,8 @@ def create_scheduled_tasks_router(
             request.app.state, "scheduled_task_dispatch_enabled", False
         ):
             scheduler.update(updated)
+        if "share_with" in fields or updated.session_id != existing.session_id:
+            await _share_continued_session(request, updated)
         latest_status = store.list_latest_run_status_for_tasks([updated.id])
         return _to_response(
             updated,
