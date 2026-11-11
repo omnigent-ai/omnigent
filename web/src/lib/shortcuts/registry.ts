@@ -54,6 +54,9 @@ interface ShortcutBindingDefinition {
 /** Sidebar slots in order: ⌘1–⌘9 pick the first nine and ⌘0 the tenth, as browser tabs do. */
 export const SESSION_NUMBER_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"] as const;
 
+/** Workspace rail tabs ⌃1–⌃9, by position. */
+const WORKSPACE_TAB_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"] as const;
+
 const BINDINGS = {
   "palette.commands": {
     label: "Open command palette",
@@ -114,6 +117,41 @@ const BINDINGS = {
           ? { mod: true, key: digit, exactKey: true, matchesAltGraph: true }
           : { mod: true, alt: true, code: `Digit${digit}` },
       ),
+  },
+  "view.mode": {
+    label: "Toggle Chat / Terminal view",
+    chords: () => [{ mod: true, alt: true, code: "Backslash" }],
+  },
+  // The desktop app uses ⌘B / ⇧⌘B; a browser keeps those for bookmarks, so there
+  // ⌘⌥[ / ⌘⌥] by physical key, since Alt rewrites the brackets on macOS.
+  "sidebar.left": {
+    label: "Toggle conversations sidebar",
+    chords: (environment) =>
+      environment.native
+        ? [{ mod: true, key: "b" }]
+        : [{ mod: true, alt: true, code: "BracketLeft" }],
+  },
+  "sidebar.right": {
+    label: "Toggle workspace sidebar",
+    chords: (environment) =>
+      environment.native
+        ? [{ mod: true, shift: true, key: "b" }]
+        : [{ mod: true, alt: true, code: "BracketRight" }],
+  },
+  "workspace.tab": {
+    label: "Select a workspace tab",
+    // ⌃1–⌃9 on macOS; Alt elsewhere, where Ctrl+digit is a sidebar session.
+    chords: (environment) =>
+      WORKSPACE_TAB_DIGITS.map((digit) =>
+        environment.mac
+          ? { ctrl: true, code: `Digit${digit}` }
+          : { alt: true, code: `Digit${digit}` },
+      ),
+  },
+  "terminal.new": {
+    label: "Open a new shell",
+    // Literal Control on every platform, so it never meets macOS window cycling (⌘`).
+    chords: () => [{ ctrl: true, code: "Backquote", matchesAltGraph: true }],
   },
 } satisfies Record<string, ShortcutBindingDefinition>;
 
