@@ -1,13 +1,6 @@
-// Per-client slice key for host-less traffic.
-//
-// A sharded deployment routes a request that carries no slice key by its
-// workspace id, so every key-less request from one workspace lands on the same
-// replica. Host-less reads (session lists, `/health`, the
-// `WS /v1/sessions/updates` stream) serve from any replica, so when no modal
-// host is known they carry this random key instead. Each client generates its
-// own key once and keeps it in localStorage, so a workspace's clients spread
-// across replicas while one client stays on one replica across reloads and
-// WebSocket reconnects. When storage is unavailable the key lasts for the page.
+// Random per-client slice key for host-less requests when no modal host is known. Unkeyed
+// requests route by workspace id onto one replica; this spreads clients across replicas.
+// Stored in localStorage so a browser's tabs, reloads, and reconnects share one replica.
 
 import { randomUUID } from "@/lib/randomUUID";
 

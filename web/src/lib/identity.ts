@@ -75,7 +75,7 @@ type UrlHostScope = { scoped: true; hostId: string | null } | { scoped: false };
 
 // Routes under /v1/sessions/ whose next segment is not a session id. Read as a
 // session id, they would look up a host that can't exist and go out unkeyed.
-const SESSION_COLLECTION_ROUTES = new Set(["orchestrated", "projects", "updates"]);
+const SESSION_COLLECTION_ROUTES = new Set(["projects", "updates"]);
 
 function skillsParamsForUrl(url: string): URLSearchParams | null {
   const match = url.match(/\/v1\/skills(?:\?([^#]*))?(?:#.*)?$/);
