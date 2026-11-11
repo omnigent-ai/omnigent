@@ -393,6 +393,13 @@ class AuthProvider(ABC):
         """Return the authenticated user ID, or ``None``."""
         ...
 
+    def canonical_user_id(self, user_id: str) -> str:
+        """Return a caller-typed *user_id*, e.g. a sharing grantee, as :meth:`get_user_id` would.
+
+        Default: unchanged, since a provider's IDs may be case-sensitive.
+        """
+        return user_id
+
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:  # noqa: ARG002
         """
         Mint a short-lived bearer a managed-sandbox runner presents as *user_id*.
@@ -591,6 +598,15 @@ class UnifiedAuthProvider(AuthProvider):
         if self._source in ("oidc", "accounts"):
             return self._check_cookie(request)
         return self._check_header(request)
+
+    def canonical_user_id(self, user_id: str) -> str:
+        """Lowercase *user_id* in OIDC and accounts modes, whose sign-in lowercases it.
+
+        Header mode keeps the proxy's value verbatim.
+        """
+        if self._source in ("oidc", "accounts"):
+            return user_id.strip().lower()
+        return user_id
 
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:
         """
