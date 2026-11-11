@@ -62,6 +62,7 @@ from omnigent.inner.native_attachments import (
     framework_notices,
 )
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
+from omnigent.native.skill_invocation import ClaudeSkillInvocation, current_native_skill_invocation
 
 _logger = logging.getLogger(__name__)
 
@@ -350,12 +351,18 @@ class ClaudeNativeExecutor(Executor):
     async def _inject_prompt(self, text: str, notices: list[str]) -> None:
         """Inject user text with one-shot context while holding the injection lock."""
         self._require_active_session()
+        invocation = current_native_skill_invocation()
+        inject = partial(inject_user_message, self._bridge_dir, content=text)
+        if isinstance(invocation, ClaudeSkillInvocation):
+            if invocation.bridge_dir != str(self._bridge_dir) or invocation.command != text:
+                raise ClaudeMessageNotAccepted("Claude's skill delivery binding changed.")
+            inject = partial(inject, expected_skill_socket=invocation.socket_path)
         context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
         context_path.unlink(missing_ok=True)
         if notices:
             context_path.write_text("\n\n".join(notices), encoding="utf-8")
         try:
-            await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
+            await self._inject(inject)
         except BaseException:
             context_path.unlink(missing_ok=True)
             raise

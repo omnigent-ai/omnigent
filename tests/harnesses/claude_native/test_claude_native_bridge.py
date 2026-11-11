@@ -3294,6 +3294,101 @@ def test_read_hook_events_from_offset_preserves_partial_trailing_line(tmp_path: 
     assert [record.event_name for record in second.records] == ["Stop"]
 
 
+def test_claude_native_skill_expansion_stays_hidden_and_in_its_command_turn(
+    tmp_path: Path,
+) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    expansion = "Base directory for this skill: /bundle/skills/review\n\nCheck arg 42."
+    command_echo = "<command-name>/team:review</command-name>"
+    _write_transcript_jsonl(
+        transcript_path,
+        [
+            {
+                "type": "user",
+                "uuid": "skill-command",
+                "message": {
+                    "role": "user",
+                    "content": f"{command_echo}\n<command-args>42</command-args>",
+                },
+            },
+            {
+                "type": "user",
+                "uuid": "skill-expansion",
+                "isMeta": True,
+                "turnCompanion": True,
+                "message": {"role": "user", "content": [{"type": "text", "text": expansion}]},
+            },
+            {
+                "type": "user",
+                "uuid": "unrelated-cli-meta",
+                "isMeta": True,
+                "message": {"role": "user", "content": "An unrelated CLI note."},
+            },
+        ],
+    )
+    _, _, items = read_transcript_items_since(transcript_path, 0, agent_name="claude-native-ui")
+    command, context = items
+    assert command.item_type == "slash_command"
+    assert context.response_id == command.response_id
+    assert context.data == {
+        "role": "user",
+        "is_meta": True,
+        "content": [{"type": "input_text", "text": expansion}],
+    }
+
+
+@pytest.mark.parametrize("with_second_block", [False, True], ids=["single-block", "multi-block"])
+def test_rebuilt_claude_skill_expansion_stays_hidden_in_local_import(
+    tmp_path: Path, with_second_block: bool
+) -> None:
+    from omnigent.harnesses.claude_native.main import _claude_transcript_records_from_session_items
+    from omnigent.session_import.local import load_claude_session
+
+    external_id = "02857840-6362-408f-b41f-309e396ed7c6"
+    command = {
+        "type": "slash_command",
+        "kind": "skill",
+        "name": "team:review",
+        "arguments": "42",
+        "response_id": "resp_claude_review",
+    }
+    content = [
+        {
+            "type": "input_text",
+            "text": "Base directory for this skill: /bundle/skills/review\n\nCheck arg 42.",
+        },
+    ]
+    if with_second_block:
+        content.append({"type": "input_text", "text": "Second skill block."})
+    expansion = {
+        "type": "message",
+        "role": "user",
+        "is_meta": True,
+        "response_id": "resp_claude_review",
+        "content": content,
+    }
+    records = _claude_transcript_records_from_session_items(
+        [command, expansion],
+        session_id="conv_review",
+        external_session_id=external_id,
+        cwd=tmp_path,
+        bridge_dir=tmp_path,
+    )
+    transcript_path = tmp_path / "projects" / "review" / f"{external_id}.jsonl"
+    transcript_path.parent.mkdir(parents=True)
+    _write_transcript_jsonl(transcript_path, records)
+
+    imported = load_claude_session(external_id, claude_home=tmp_path)
+    assert [item.type for item in imported.items] == ["slash_command", "message"]
+    imported_command, imported_expansion = imported.items
+    assert imported_expansion.response_id == imported_command.response_id
+    assert imported_expansion.data.model_dump(include={"role", "is_meta", "content"}) == {
+        "role": "user",
+        "is_meta": True,
+        "content": content,
+    }
+
+
 def test_read_transcript_items_since_surfaces_skill_as_slash_command(
     tmp_path: Path,
 ) -> None:

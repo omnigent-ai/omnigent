@@ -824,7 +824,7 @@ class RoutingDecisionData(BaseModel):
 class SlashCommandData(BaseModel):
     """
     Data payload for a slash-command invocation observed in a
-    harness transcript (today: Claude Code's embedded TUI).
+    harness transcript.
 
     Listed in :data:`NON_CONTENT_ITEM_TYPES` so the agent loop's
     history filter skips it — a downstream LLM never sees this as a
@@ -842,6 +842,7 @@ class SlashCommandData(BaseModel):
     :param name: Command name with leading ``/`` stripped, e.g.
         ``"dev-productivity:simplify"``.
     :param arguments: Raw ``<command-args>`` text. Empty when none.
+    :param native_invocation: Original Codex input text for native history replay.
     :param output: ``<local-command-stdout>`` text when present,
         else ``None`` (the common case — Skills act via the next
         assistant turn, not stdout).
@@ -852,6 +853,7 @@ class SlashCommandData(BaseModel):
     name: str
     arguments: str
     output: str | None = None
+    native_invocation: str | None = Field(default=None, exclude_if=lambda value: value is None)
     startup_options: StartupInputOptions | None = Field(
         default=None, exclude_if=lambda value: value is None
     )

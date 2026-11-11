@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import math
 import re
@@ -95,6 +96,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_wrapper_label,
 )
 from omnigent.native.session_todos import validate_session_todos
+from omnigent.native.skill_invocation import NativeSkillInvocation, native_skill_invocation_adapter
 from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
     token_bound_runner_id,
@@ -7237,6 +7239,13 @@ def _native_coding_agent_for_session(conv: Conversation) -> NativeCodingAgent | 
     return native_coding_agent_for_harness(_resolve_harness(conv))
 
 
+def _native_skill_harness_for_session(conv: Conversation) -> str | None:
+    native_agent = _native_coding_agent_for_session(conv)
+    if native_agent is not None and native_agent.harness in {"claude-native", "codex-native"}:
+        return native_agent.harness
+    return None
+
+
 def _native_terminal_name_for_harness(harness: str) -> str:
     """
     Return the runner terminal resource name for a native harness.
@@ -8099,16 +8108,17 @@ def _build_skill_slash_command_policy_body(body: SessionEventInput) -> SessionEv
     )
 
 
-async def _resolve_skill_meta_text_via_runner(
+async def _resolve_skill_invocation_via_runner(
     session_id: str,
     skill_name: str,
     arguments: str,
     runner_client: httpx.AsyncClient,
     *,
     legacy_name: str | None = None,
-) -> str:
+    native_harness: str | None = None,
+) -> str | NativeSkillInvocation:
     """
-    Resolve a skill's hidden ``<skill>`` meta text on the bound runner.
+    Resolve a skill invocation on the bound runner.
 
     Skill content is runner-owned: the runner reads the ``SKILL.md``
     body and resource files from the skill's directory on its own
@@ -8127,16 +8137,18 @@ async def _resolve_skill_meta_text_via_runner(
         for directory ``review``. Retried once when the runner rejects
         ``skill_name`` but lists this name, as runners from before
         directory-name invocation do.
-    :returns: The hidden ``<skill>`` meta text for a single
-        ``input_text`` block.
+    :returns: A verified native invocation or hidden paste text.
     :raises OmnigentError: If the skill is not exposed for the session
         (the runner 404s with the available list), or the runner is
         unreachable / errors while resolving.
     """
+    request_data: dict[str, str | bool] = {"name": skill_name, "arguments": arguments}
+    if native_harness is not None:
+        request_data["allow_native"] = True
     try:
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/skills/resolve",
-            json={"name": skill_name, "arguments": arguments},
+            json=request_data,
             timeout=10.0,
         )
     except (httpx.HTTPError, ConnectionError) as exc:
@@ -8171,13 +8183,27 @@ async def _resolve_skill_meta_text_via_runner(
     if resp.status_code == 404:
         available = payload.get("available", [])
         if legacy_name is not None and isinstance(available, list) and legacy_name in available:
-            return await _resolve_skill_meta_text_via_runner(
-                session_id, legacy_name, arguments, runner_client
+            return await _resolve_skill_invocation_via_runner(
+                session_id, legacy_name, arguments, runner_client, native_harness=native_harness
             )
         raise OmnigentError(
             f"Skill {skill_name!r} not found. Available skills: {available}",
             code=ErrorCode.INVALID_INPUT,
         )
+    if (native := payload.get("native_invocation")) is not None:
+        try:
+            invocation = native_skill_invocation_adapter.validate_python(native)
+        except ValidationError as exc:
+            raise OmnigentError(
+                f"Runner returned a malformed native skill resolution for {skill_name!r}",
+                code=ErrorCode.INTERNAL_ERROR,
+            ) from exc
+        if invocation.harness != native_harness:
+            raise OmnigentError(
+                f"Runner returned an unauthorized native skill resolution for {skill_name!r}",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        return invocation
     meta_text = payload.get("meta_text")
     if not isinstance(meta_text, str):
         raise OmnigentError(
@@ -8185,6 +8211,84 @@ async def _resolve_skill_meta_text_via_runner(
             code=ErrorCode.INTERNAL_ERROR,
         )
     return meta_text
+
+
+_native_request_locks: WorkspaceScopedCache[tuple[str, str], asyncio.Lock] = WorkspaceScopedCache(
+    weakref.WeakValueDictionary
+)
+
+
+def _native_request_lock(session_id: str, stable_id: str) -> asyncio.Lock:
+    return _native_request_locks.setdefault((session_id, stable_id), asyncio.Lock())
+
+
+def _native_skill_claim_id(session_id: str, stable_id: str) -> str:
+    import uuid
+
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"omnigent:native-skill:{session_id}:{stable_id}").hex
+
+
+def _native_skill_submission_claim(
+    session_id: str, body: SessionEventInput, created_by: str | None
+) -> NewConversationItem | None:
+    stable_id = body.data.get("stable_id")
+    if not isinstance(stable_id, str) or not re.fullmatch(r"[0-9a-f]{32}", stable_id):
+        return None
+    name, arguments = _parse_skill_slash_command(body)
+    payload = json.dumps([name, arguments, body.model_override], ensure_ascii=True)
+    return NewConversationItem(
+        type="message",
+        response_id=f"native_skill_claim_{hashlib.sha256(payload.encode()).hexdigest()}",
+        data=MessageData(role="user", content=[], is_meta=True),
+        created_by=created_by,
+        status="incomplete",
+        stable_id=_native_skill_claim_id(session_id, stable_id),
+    )
+
+
+def _check_native_skill_submission_claim(
+    existing: ConversationItem, claim: NewConversationItem
+) -> None:
+    if existing.created_by != claim.created_by or existing.response_id != claim.response_id:
+        raise OmnigentError(
+            "stable_id already names a different native skill submission in this session",
+            code=ErrorCode.CONFLICT,
+        )
+
+
+async def _record_native_skill_claim(
+    conversation_store: ConversationStore,
+    session_id: str,
+    stable_id: str,
+    claim: NewConversationItem,
+) -> bool:
+    async def record() -> bool:
+        async with _native_request_lock(session_id, stable_id):
+            if pending_inputs.pending_id_for_stable_id(session_id, stable_id) is not None:
+                existing = await asyncio.to_thread(
+                    conversation_store.get_item,
+                    session_id,
+                    _native_skill_claim_id(session_id, stable_id),
+                )
+                if existing is None:
+                    raise OmnigentError(
+                        "stable_id already names a pending native message in this session",
+                        code=ErrorCode.CONFLICT,
+                    )
+                _check_native_skill_submission_claim(existing, claim)
+                return False
+            (recorded,) = await asyncio.to_thread(conversation_store.append, session_id, [claim])
+            if recorded.deduplicated:
+                _check_native_skill_submission_claim(recorded, claim)
+                return False
+            return True
+
+    task = asyncio.create_task(record())
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        raise
 
 
 async def _dispatch_skill_slash_command_to_runner(
@@ -8195,22 +8299,15 @@ async def _dispatch_skill_slash_command_to_runner(
     runner_client: httpx.AsyncClient,
     *,
     agent: Agent,
+    meta_text: str,
     has_mcp_servers: bool,
     created_by: str | None,
-    legacy_skill_names: Mapping[str, str] | None = None,
     startup_input: StartupInputContext | None = None,
 ) -> str:
     """
     Persist a skill slash command and forward hidden skill context.
 
-    Skill content is runner-owned: this asks the bound runner to
-    resolve the skill (``POST /v1/sessions/{id}/skills/resolve``) into
-    its ``<skill>`` meta text, reading the ``SKILL.md`` body and
-    resource files from the skill's directory *on the runner* — so the
-    embedded ``<path>`` and resource listing are valid where the harness
-    executes. The server then persists the result (runner-resolves,
-    server-persists). Appends two conversation items with the same
-    response id:
+    Appends two conversation items with the same response id:
 
     * a visible ``slash_command`` item for the UI transcript;
     * a hidden ``message`` item with ``is_meta=True`` and ``user_authored=True``
@@ -8232,23 +8329,11 @@ async def _dispatch_skill_slash_command_to_runner(
         servers; forwarded unchanged to the runner event.
     :param created_by: Authenticated actor id, e.g.
         ``"alice@example.com"``, or ``None`` in single-user mode.
-    :param legacy_skill_names: Frontmatter names of the agent's bundled
-        skills keyed by command, e.g. ``{"review": "code-review"}``, for
-        runners that predate directory-name invocation.
     :returns: The persisted visible ``slash_command`` item id.
-    :raises OmnigentError: If the skill is not exposed for the
-        session, or the runner is unreachable while resolving it.
     """
     import uuid
 
     skill_name, arguments = _parse_skill_slash_command(body)
-    meta_text = await _resolve_skill_meta_text_via_runner(
-        session_id,
-        skill_name,
-        arguments,
-        runner_client,
-        legacy_name=(legacy_skill_names or {}).get(skill_name),
-    )
     if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
         return startup_input.input_id
     startup_input_id = startup_input.input_id if startup_input is not None else None
@@ -12795,7 +12880,7 @@ __all__ = [
     "_require_permission_mode_forward",
     "_resolve_harness",
     "_resolve_llm_model",
-    "_resolve_skill_meta_text_via_runner",
+    "_resolve_skill_invocation_via_runner",
     "_resolve_subagent_spec",
     "_resource_event_item_from_sse",
     "_routing_decision_item_from_sse",

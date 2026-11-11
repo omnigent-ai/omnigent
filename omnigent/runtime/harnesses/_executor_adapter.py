@@ -54,6 +54,7 @@ from omnigent.native.input_diagnostics import (
     input_delivery_scope,
     log_input_event,
 )
+from omnigent.native.skill_invocation import native_skill_delivery
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
 from omnigent.runtime.prompt import dedupe_tool_output_images
@@ -362,6 +363,7 @@ class ExecutorAdapter(HarnessApp):
                 trace_cm,
                 input_delivery_scope(input_identity, response_id=ctx.response_id),
                 native_shell_authorization(request.authorized_native_shell_command),
+                native_skill_delivery(request.native_skill_invocation),
             ):
                 log_input_event(
                     _logger, "native_input_execution_started", session_id=turn_session_id
@@ -756,6 +758,7 @@ class ExecutorAdapter(HarnessApp):
                         response_id=ctx.response_id,
                     ),
                     native_shell_authorization(injection.authorized_native_shell_command),
+                    native_skill_delivery(injection.native_skill_invocation),
                 ):
                     log_input_event(
                         _logger, "native_input_steering_started", session_id=ctx.session_id

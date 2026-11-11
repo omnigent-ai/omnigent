@@ -43,6 +43,7 @@ class Feature(StrEnum):
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS_V2 = "automations_v2"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
+    NATIVE_SKILL_ROUTING = "native_skill_routing"
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,13 @@ class FeatureDefinition:
 
 
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
+    FeatureDefinition(
+        feature=Feature.NATIVE_SKILL_ROUTING,
+        description="Route verified structured skill commands to native CLI loaders",
+        owner="runtime",
+        review_by_release="0.24.0",
+        frontend_visible=False,
+    ),
     FeatureDefinition(
         feature=Feature.CODEX_PLAN_AT_LAUNCH,
         description="Start Codex in Plan mode with host compatibility checks",

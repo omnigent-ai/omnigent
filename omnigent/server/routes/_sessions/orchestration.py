@@ -88,6 +88,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.native.skill_invocation import NATIVE_SKILL_INVOCATION_HEADER, NativeSkillInvocation
 from omnigent.onboarding.provider_config import harness_owns_its_credential
 from omnigent.policies.types import (
     ElicitationRequest,
@@ -311,6 +312,9 @@ from omnigent.server.routes._sessions.helpers import (
     _message_text,
     _model_usage_bucket,
     _native_coding_agent_for_session,
+    _native_request_lock,
+    _native_skill_claim_id,
+    _native_skill_harness_for_session,
     _native_subagent_wrapper_labels_from_spec,
     _native_terminal_ensure_transport_error,
     _native_terminal_failure_from_runner_response,
@@ -3237,16 +3241,26 @@ async def _persist_external_conversation_item_unlocked(
         # A command typed in the web composer was queued as plain text but comes back
         # as a slash_command item; a plugin skill typed ``/simplify`` is recorded as
         # ``/<plugin>:simplify``. Drain its own entry so it is not mistaken for a lost message.
-        spellings = dict.fromkeys((item.data.name, item.data.name.rpartition(":")[2]))
-        for spelling in spellings:
-            command_line = f"/{spelling} {item.data.arguments}".strip()
-            matched = pending_inputs.resolve_matching_text(session_id, command_line, hold=True)
+        commands = (
+            (item.data.native_invocation,)
+            if item.data.native_invocation
+            else (
+                f"/{item.data.name} {item.data.arguments}",
+                f"/{item.data.name.rpartition(':')[2]} {item.data.arguments}",
+            )
+        )
+        for command_line in dict.fromkeys(commands):
+            matched = pending_inputs.resolve_matching_text(
+                session_id, command_line.strip(), hold=True
+            )
             if matched.matched is not None:
                 break
         drained = matched.matched
         match_method = matched.match_method
         if drained is not None:
             cleared_pending_id = drained.pending_id
+            if drained.created_by is not None and item.created_by is None:
+                item = item.model_copy(update={"created_by": drained.created_by})
         held_older = [*matched.skipped, *matched.uncertain]
     elif (shell_command := _shell_command_input(item)) is not None:
         drained = pending_inputs.resolve_shell_command(session_id, shell_command, hold=True)
@@ -6687,6 +6701,7 @@ async def _forward_native_terminal_message(
     input_delivery: Mapping[str, object] | None = None,
     agent_revision: str | None = None,
     native_shell_authorized: bool = False,
+    native_skill_invocation: NativeSkillInvocation | None = None,
 ) -> None:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -6772,6 +6787,11 @@ async def _forward_native_terminal_message(
         from omnigent.harnesses.codex_native.shell_input import CODEX_SHELL_AUTHORIZED_HEADER
 
         forward_options["headers"] = {CODEX_SHELL_AUTHORIZED_HEADER: "1"}
+    if native_skill_invocation is not None:
+        if native_skill_invocation.harness != harness:
+            raise OmnigentError("Native skill binding changed", code=ErrorCode.CONFLICT)
+        event["native_skill_invocation"] = native_skill_invocation.model_dump()
+        forward_options["headers"] = {NATIVE_SKILL_INVOCATION_HEADER: "1"}
     try:
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
@@ -8251,6 +8271,8 @@ async def _dispatch_session_event_to_runner_impl(
     background_titles_enabled: bool = True,
     agent_revision: str | None = None,
     startup_input: StartupInputContext | None = None,
+    native_skill_invocation: NativeSkillInvocation | None = None,
+    native_skill_routing: bool = False,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -8422,44 +8444,72 @@ async def _dispatch_session_event_to_runner_impl(
         queues_message = (
             isinstance(content, list) and bool(content) and not opens_side_chat and not is_btw
         )
-        if queues_message and web_stable_id is not None:
-            repeated_pending_id = pending_inputs.pending_id_for_stable_id(
-                session_id, web_stable_id
+        checked_stable_id = (
+            web_stable_id
+            if (
+                queues_message
+                and native_skill_routing
+                and web_stable_id is not None
+                and await asyncio.to_thread(_native_skill_harness_for_session, conv) is not None
             )
-            if repeated_pending_id is not None:
-                # A client retry of a send the runner already received (its
-                # response was lost in flight). Forwarding it again would run
-                # the prompt twice; answer with the queued entry it already has.
-                _logger.info(
-                    "Native message %s is already queued for session=%s; not forwarding again",
-                    repeated_pending_id,
-                    session_id,
-                    extra={"session_id": session_id},
-                )
-                log_input_event(
-                    _logger,
-                    "native_input_retry_deduplicated",
-                    session_id=session_id,
-                    attributes=pending_inputs.delivery_attributes_for(
-                        session_id, repeated_pending_id
-                    ),
-                )
-                return _SessionEventDispatchResult(item_id=None, pending_id=repeated_pending_id)
-        if startup_input is not None and not await startup_input.claim(
-            conversation_store, session_id
-        ):
-            return _SessionEventDispatchResult(item_id=None, pending_id=None, accepted=False)
-        pending_id: str | None = (
-            pending_inputs.record(
-                session_id,
-                content,
-                created_by=created_by,
-                stable_id=web_stable_id,
-                background_titles_enabled=background_titles_enabled,
-            )
-            if queues_message
             else None
         )
+        async with (
+            _native_request_lock(session_id, checked_stable_id)
+            if checked_stable_id is not None
+            else contextlib.nullcontext()
+        ):
+            if checked_stable_id is not None:
+                claim = await asyncio.to_thread(
+                    conversation_store.get_item,
+                    session_id,
+                    _native_skill_claim_id(session_id, checked_stable_id),
+                )
+                if claim is not None:
+                    raise OmnigentError(
+                        "stable_id already names a native skill submission in this session",
+                        code=ErrorCode.CONFLICT,
+                    )
+            if queues_message and web_stable_id is not None:
+                repeated_pending_id = pending_inputs.pending_id_for_stable_id(
+                    session_id, web_stable_id
+                )
+                if repeated_pending_id is not None:
+                    # A client retry of a send the runner already received (its
+                    # response was lost in flight). Forwarding it again would run
+                    # the prompt twice; answer with the queued entry it already has.
+                    _logger.info(
+                        "Native message %s is already queued for session=%s; not forwarding again",
+                        repeated_pending_id,
+                        session_id,
+                        extra={"session_id": session_id},
+                    )
+                    log_input_event(
+                        _logger,
+                        "native_input_retry_deduplicated",
+                        session_id=session_id,
+                        attributes=pending_inputs.delivery_attributes_for(
+                            session_id, repeated_pending_id
+                        ),
+                    )
+                    return _SessionEventDispatchResult(
+                        item_id=None, pending_id=repeated_pending_id
+                    )
+            if startup_input is not None and not await startup_input.claim(
+                conversation_store, session_id
+            ):
+                return _SessionEventDispatchResult(item_id=None, pending_id=None, accepted=False)
+            pending_id: str | None = (
+                pending_inputs.record(
+                    session_id,
+                    content,
+                    created_by=created_by,
+                    stable_id=web_stable_id,
+                    background_titles_enabled=background_titles_enabled,
+                )
+                if queues_message
+                else None
+            )
         input_delivery = (
             pending_inputs.delivery_attributes_for(session_id, pending_id)
             if pending_id is not None
@@ -8602,11 +8652,16 @@ async def _dispatch_session_event_to_runner_impl(
                 # The executor speaks the pane's own vocabulary, so it takes the
                 # routed id; ``None`` when the pane has no spelling for it.
                 model_override=(
-                    _native_routed_model if _native_applied_model is not None else None
+                    _native_routed_model
+                    if _native_applied_model is not None
+                    else body.model_override
+                    if native_skill_invocation is not None
+                    else None
                 ),
                 input_delivery=input_delivery,
                 agent_revision=agent_revision,
                 native_shell_authorized=native_shell_authorized,
+                native_skill_invocation=native_skill_invocation,
             )
             forwarded = True
             if pending_id is not None:

@@ -2914,6 +2914,162 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     assert session_resp.json()["title"] == "/grill-me review this rollout"
 
 
+@pytest.mark.parametrize(
+    ("harness", "wrapper", "command", "selection"),
+    [
+        (
+            "claude-native",
+            "claude-code-native-ui",
+            "/team:review a b",
+            {"bridge_dir": "/tmp/claude"},
+        ),
+        (
+            "codex-native",
+            "codex-native-ui",
+            "$review a b",
+            {"name": "review", "path": "/tmp/review/SKILL.md", "thread_id": "thread-a"},
+        ),
+    ],
+)
+@pytest.mark.parametrize("case", ["lost_ack", "occupied", "concurrent", "reverse"])
+async def test_structured_native_skill_preserves_stable_request_identity(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    wrapper: str,
+    command: str,
+    selection: dict[str, str],
+    case: str,
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+
+    feature_flags = app.state.feature_flags.__class__
+    original_enabled = feature_flags.enabled
+    monkeypatch.setattr(
+        feature_flags,
+        "enabled",
+        lambda self, feature: (
+            feature.value == "native_skill_routing" or original_enabled(self, feature)
+        ),
+    )
+    monkeypatch.setattr(
+        sessions_module,
+        "_ensure_native_terminal_ready",
+        AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None)),
+    )
+    forwarded: list[dict[str, Any]] = []
+    resolving = asyncio.Event()
+    release_resolution = asyncio.Event()
+
+    async def runner_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/skills/resolve"):
+            assert json.loads(request.content) == {
+                "name": "review",
+                "arguments": "a b",
+                "allow_native": True,
+            }
+            if case == "concurrent":
+                resolving.set()
+                await release_resolution.wait()
+            return httpx.Response(
+                200,
+                json={
+                    "native_invocation": {
+                        "harness": harness,
+                        "command": command,
+                        "socket_path": "/tmp/terminal.sock",
+                        **selection,
+                    }
+                },
+            )
+        if request.url.path.endswith("/events"):
+            forwarded.append(json.loads(request.content))
+            if case == "lost_ack":
+                raise httpx.ReadTimeout("runner accepted the request before the response was lost")
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_handler), base_url="http://runner"
+    ) as runner:
+        _route_to_runner(monkeypatch, runner)
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client, agent["id"], labels={"omnigent.ui": "terminal", "omnigent.wrapper": wrapper}
+        )
+        events = f"/v1/sessions/{session['id']}/events"
+        request_data = {
+            "kind": "skill",
+            "name": "review",
+            "arguments": "a b",
+            "stable_id": uuid.uuid4().hex,
+        }
+        skill_event = {"type": "slash_command", "data": request_data}
+        plain_event = {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": command}],
+                "stable_id": request_data["stable_id"],
+            },
+        }
+        if case in ("occupied", "concurrent"):
+            if case == "concurrent":
+                async with asyncio.TaskGroup() as requests:
+                    skill_post = requests.create_task(client.post(events, json=skill_event))
+                    try:
+                        await asyncio.wait_for(resolving.wait(), timeout=5)
+                        ordinary = await client.post(events, json=plain_event)
+                    finally:
+                        release_resolution.set()
+                original = skill_post.result()
+            else:
+                ordinary = await client.post(events, json=plain_event)
+                original = await client.post(events, json=skill_event)
+            assert ordinary.status_code == 202, ordinary.text
+            assert original.status_code == 409, original.text
+            ordinary_retry = await client.post(events, json=plain_event)
+            assert ordinary_retry.status_code == 202, ordinary_retry.text
+            assert ordinary_retry.json()["pending_id"] == ordinary.json()["pending_id"]
+            assert len(forwarded) == 1
+            assert "native_skill_invocation" not in forwarded[0]
+            items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+            assert not any(item["type"] in {"message", "slash_command"} for item in items)
+            fresh = await client.post(
+                events,
+                json={
+                    **skill_event,
+                    "data": {**request_data, "stable_id": uuid.uuid4().hex},
+                },
+            )
+            assert fresh.status_code == 202, fresh.text
+            assert len(forwarded) == 2
+            return
+        original = await client.post(events, json=skill_event)
+        if case == "reverse":
+            assert original.status_code == 202, original.text
+            ordinary = await client.post(events, json=plain_event)
+            assert ordinary.status_code == 409, ordinary.text
+            assert len(forwarded) == 1
+            return
+        assert original.status_code == 502, original.text
+        retry = await client.post(events, json={"type": "slash_command", "data": request_data})
+        assert retry.status_code == 202, retry.text
+        assert retry.json()["queued"] is False
+        assert retry.json()["delivery_unconfirmed"] is True
+        conflict = await client.post(
+            events,
+            json={"type": "slash_command", "data": {**request_data, "arguments": "changed"}},
+        )
+        assert conflict.status_code == 409, conflict.text
+
+    assert len(forwarded) == 1
+    assert forwarded[0]["native_skill_invocation"]["command"] == command
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    assert not any(item["type"] == "slash_command" for item in items)
+    assert not any(item.get("content") for item in items if item["type"] == "message")
+
+
 @pytest.mark.parametrize("in_sub_agent", [False, True])
 @pytest.mark.parametrize(
     ("available", "status", "expected_names"),

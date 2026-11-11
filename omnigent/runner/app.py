@@ -34,8 +34,9 @@ if TYPE_CHECKING:
     from omnigent.terminals.registry import TerminalRegistry
 
 import httpx
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import ValidationError
 
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import (
@@ -75,6 +76,11 @@ from omnigent.native.failure_telemetry import failure_log_attributes, normalize_
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
+)
+from omnigent.native.skill_invocation import (
+    NATIVE_SKILL_INVOCATION_HEADER,
+    NativeSkillInvocation,
+    native_skill_invocation_adapter,
 )
 from omnigent.runner import native as _native
 from omnigent.runner import pending_approvals, pr_reports
@@ -5917,6 +5923,8 @@ def create_runner_app(
         _authorized_shell = msg_body.get("authorized_native_shell_command")
         if isinstance(_authorized_shell, str):
             harness_body["authorized_native_shell_command"] = _authorized_shell
+        if "native_skill_invocation" in msg_body:
+            harness_body["native_skill_invocation"] = msg_body["native_skill_invocation"]
         # The routed model rides in-band on the forwarded message. This body is
         # built field by field (not copied), so it must be threaded explicitly:
         # the harness forwards it onto CreateResponseRequest.model_override and
@@ -7316,6 +7324,17 @@ def create_runner_app(
                 authorized_command = shell_command_from_input(body.get("content"))
                 if authorized_command is not None:
                     body["authorized_native_shell_command"] = authorized_command
+            raw_invocation = body.pop("native_skill_invocation", None)
+            if request.headers.get(NATIVE_SKILL_INVOCATION_HEADER) == "1":
+                try:
+                    invocation = native_skill_invocation_adapter.validate_python(raw_invocation)
+                except ValidationError:
+                    return JSONResponse(status_code=400, content={"error": "invalid_native_skill"})
+                if body.get("type") != "message" or body.get("content") != [
+                    {"type": "input_text", "text": invocation.command}
+                ]:
+                    return JSONResponse(status_code=400, content={"error": "invalid_native_skill"})
+                body["native_skill_invocation"] = invocation.model_dump()
         body_type = body.get("type") if isinstance(body, dict) else None
         _logger.info(
             "post_session_events: conv=%s type=%s active=%s buffer_len=%d content_types=%s "
@@ -8341,6 +8360,34 @@ def create_runner_app(
     _require_os_env = _resource_routes.require_os_env
     _resolve_conversation_id = _resource_routes.resolve_conversation_id
 
+    async def _select_native_skill(
+        session_id: str, skill: SkillSpec, arguments: str
+    ) -> NativeSkillInvocation | None:
+        harness = _session_harness_name(session_id)
+        if harness not in {"claude-native", "codex-native"} or skill.skill_dir is None:
+            return None
+        from omnigent.runner.native.skill_invocation import select_claude_skill, select_codex_skill
+
+        try:
+            await _ensure_native_terminal_for_turn(session_id, harness)
+            if harness == "claude-native":
+                registry = resource_registry.terminal_registry
+                terminal = registry.get(session_id, "claude", "main") if registry else None
+                if terminal is not None and await terminal.is_alive():
+                    bridge_dir = await _claude_prompt_bridge_dir(session_id)
+                    return await asyncio.to_thread(
+                        select_claude_skill, skill, arguments, terminal, bridge_dir
+                    )
+            else:
+                state = await _codex_native_bridge_state_for_session(
+                    session_id, action="skill selection", missing_state_log_level=logging.DEBUG
+                )
+                if state is not None:
+                    return await select_codex_skill(skill, arguments, state)
+        except (HTTPException, OmnigentError, OSError, RuntimeError, ValueError):
+            _logger.debug("Native skill selection unavailable for %s", session_id, exc_info=True)
+        return None
+
     async def _release_session_harness(session_id: str) -> None:
         if process_manager is not None:
             await process_manager.release(session_id)
@@ -8434,6 +8481,7 @@ def create_runner_app(
         _resolve_session_agent_spec=_resolve_session_agent_spec,
         _resolve_session_claude_launch_config=_resolve_session_claude_launch_config,
         _resolve_session_skills=_resolve_session_skills,
+        _select_native_skill=_select_native_skill,
         _session_cursor_model_names=_session_cursor_model_names,
         _session_harness_name=_session_harness_name,
         _session_spec_cache=_session_spec_cache,

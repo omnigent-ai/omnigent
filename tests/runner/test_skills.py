@@ -6,12 +6,14 @@ import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import ResolvedSpec
+from omnigent.runner.native import skill_invocation
 from omnigent.spec.types import SkillSpec
 
 
@@ -35,6 +37,105 @@ def _skill_md(name: str, description: str) -> str:
     :returns: SKILL.md file contents.
     """
     return f"---\nname: {name}\ndescription: {description}\n---\n\nbody for {name}\n"
+
+
+@pytest.mark.parametrize("case", ["enabled", "disabled", "duplicate", "old_cli", "secondary"])
+async def test_native_codex_skill_requires_exact_enabled_catalog_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
+
+    skill_dir = tmp_path / "review"
+    skill_dir.mkdir()
+    selected = skill_dir / "SKILL.md"
+    selected.write_text(_skill_md("review", "Review code."), encoding="utf-8")
+    rows = [{"name": "review", "path": str(selected), "enabled": case != "disabled"}]
+    if case == "duplicate":
+        rows.append({"name": "review", "path": str(tmp_path / "other"), "enabled": True})
+    client = AsyncMock()
+    client.connect.return_value = {
+        "result": {
+            "userAgent": f"Codex Desktop/{'0.166.0' if case == 'old_cli' else '0.167.0'} (test)"
+        }
+    }
+    client.request.return_value = {
+        "result": {"data": [{"cwd": str(tmp_path), "errors": [], "skills": rows}]}
+    }
+    monkeypatch.setattr(skill_invocation, "client_for_transport", lambda *_, **__: client)
+    state = CodexNativeBridgeState(
+        "conv", "ws://127.0.0.1:2222", "thread", str(tmp_path / "home"), cwd=str(tmp_path)
+    )
+    arguments = "ask $another" if case == "secondary" else "read résumé"
+    invocation = await skill_invocation.select_codex_skill(
+        SkillSpec("review", "Review code.", "", skill_dir=skill_dir), arguments, state
+    )
+    if case == "enabled":
+        assert invocation is not None
+        assert invocation.command == "$review read résumé"
+        assert invocation.path == str(selected)
+        client.request.assert_awaited_once_with(
+            "skills/list", {"cwds": [str(tmp_path)], "forceReload": True}
+        )
+    else:
+        assert invocation is None
+
+
+@pytest.mark.parametrize("case", ["enabled", "disabled", "duplicate", "unbound", "old_cli"])
+def test_native_claude_skill_requires_verified_plugin_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    from omnigent.inner.terminal import TerminalInstance
+
+    monkeypatch.setattr(skill_invocation, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    plugin = tmp_path / "plugin"
+    manifest_dir = plugin / ".claude-plugin"
+    manifest_dir.mkdir(parents=True)
+    (manifest_dir / "plugin.json").write_text('{"name":"team"}', encoding="utf-8")
+    skill_dir = plugin / "skills" / "review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(_skill_md("review", "Review code."), encoding="utf-8")
+    config = tmp_path / "config"
+    config.mkdir()
+    settings = {
+        "disabled": {"skillOverrides": {"team:review": "off"}},
+        "duplicate": {"enabledPlugins": {"team@marketplace": True}},
+    }.get(case, {})
+    (config / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    status = {
+        "context_window_size": 200000,
+        "claude_code_version": "2.1.317" if case == "old_cli" else "2.1.318",
+    }
+    (bridge / "context.json").write_text(json.dumps(status), encoding="utf-8")
+    terminal = TerminalInstance(
+        "claude",
+        "main",
+        tmp_path / "terminal.sock",
+        tmp_path,
+        command="claude",
+        args=[
+            "--settings",
+            str(bridge / "claude-settings.json"),
+            "--plugin-dir",
+            str(tmp_path / "other" if case == "unbound" else plugin),
+        ],
+        env={"CLAUDE_CONFIG_DIR": str(config)},
+        launch_cwd=str(tmp_path),
+        inherit_env=False,
+    )
+    invocation = skill_invocation.select_claude_skill(
+        SkillSpec("review", "Review code.", "", skill_dir=skill_dir),
+        "read résumé",
+        terminal,
+        bridge,
+    )
+    if case == "enabled":
+        assert invocation is not None
+        assert invocation.command == "/team:review read résumé"
+        assert invocation.socket_path == str(terminal.socket_path)
+    else:
+        assert invocation is None
 
 
 class _ExecutorStub:

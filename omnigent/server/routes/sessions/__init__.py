@@ -518,7 +518,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_host_conn_for_worktree as _require_host_conn_for_worktree,
     _require_permission_mode_forward as _require_permission_mode_forward,
     _resolve_llm_model as _resolve_llm_model,
-    _resolve_skill_meta_text_via_runner as _resolve_skill_meta_text_via_runner,
+    _resolve_skill_invocation_via_runner as _resolve_skill_invocation_via_runner,
     _resolve_subagent_spec as _resolve_subagent_spec,
     _resource_event_item_from_sse as _resource_event_item_from_sse,
     _routing_decision_item_from_sse as _routing_decision_item_from_sse,

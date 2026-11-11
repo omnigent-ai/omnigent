@@ -43,6 +43,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.conversation import StartupInputOptions
 from omnigent.inner.native_attachments import reject_authored_framework_notices
+from omnigent.native.skill_invocation import NativeSkillInvocation
 from omnigent.onboarding.sandboxes.profiles import SandboxProfileSummary
 
 # ── Shared ──────────────────────────────────────────────────────
@@ -1236,6 +1237,7 @@ class CreateResponseRequest(BaseModel):
     input_enqueued_at_ms: int | None = None
     # Runner-validated authorization for one delivery, separate from user content/history.
     authorized_native_shell_command: str | None = None
+    native_skill_invocation: SkipJsonSchema[NativeSkillInvocation | None] = None
     conversation: ConversationRef | None = None
     # Reasoning config, e.g. {"effort": "low"|"medium"|"high"}
     reasoning: dict[str, str] | None = None

@@ -999,6 +999,8 @@ Request body matches `SessionEventInput`:
   type (string, required)
     Event/input discriminator. Recognized values:
       - "message"               — a user message
+      - "slash_command"         — a skill invocation
+                                  Payload: `{kind: "skill", name, arguments?, stable_id?}`.
       - "function_call_output"  — a client-side tool result
       - "function_call"         — a queued tool call (rare; mostly
                                   emitted by the runtime, not clients)
@@ -1198,6 +1200,32 @@ FIFO matching), so adoption is optional, not required.
 A failed transcript append restores pending inputs with their prior delivery
 uncertainty, including entries that expired while persistence was in flight.
 A later mirror cannot report a possibly recorded input as definitely undelivered.
+
+**Structured skill invocations.** The server evaluates request policy against
+the command and its arguments before resolving the skill. By default, the
+runner supplies the skill instructions as hidden input.
+
+Set `OMNIGENT_FEATURES=native_skill_routing` on the server to opt in to native
+loading for Claude Code and Codex sessions. Keep any other enabled features in
+the comma-separated value. The runner must verify the exact skill before it
+sends the command. Claude Code 2.1.318 or later uses the qualified command for
+a skill in the active bundle plugin. Codex 0.167.0 or later uses the active
+app-server's enabled skill catalog and sends the selected file path. When verification fails, or a
+managed startup input is still waiting for its terminal, the server uses the
+hidden input path. Native loading applies vendor semantics such as Claude
+Code's argument substitution and dynamic context.
+
+A native submission returns `pending_id`. The native transcript supplies the
+visible command. When the forwarder can verify where the CLI expansion
+belongs, it records the expansion for resume and history forks. On an opted-in
+session, reuse the same 32-character lowercase hexadecimal `stable_id` when
+retrying a logical submission. A repeat returns
+`{"queued": false, "delivery_unconfirmed": true}` if the server already
+recorded the attempt. Check the transcript for delivery before creating a
+new submission. Reusing the ID with different arguments or a different skill
+returns 409. A skill submission also returns 409 if an ordinary native message
+is pending under the same ID. On an opted-in session, an ordinary message that
+uses the native pending queue cannot reuse a recorded skill submission's ID.
 
 **Interrupt is dual-path on purpose.** Posting `{"type": "interrupt"}`
 is exposed as an event for API uniformity, but it does NOT enter the

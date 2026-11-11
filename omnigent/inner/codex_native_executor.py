@@ -94,6 +94,11 @@ from omnigent.native.input_diagnostics import (
     log_input_event,
     with_input_attributes,
 )
+from omnigent.native.skill_invocation import (
+    SKILL_CLIENT_ID_PREFIX,
+    CodexSkillInvocation,
+    current_native_skill_invocation,
+)
 from omnigent.process_logging import log_once
 from omnigent.util.reasoning_effort import (
     CODEX_NATIVE_EFFORTS,
@@ -442,6 +447,32 @@ async def _native_delivery_request_once(
         if method in ("turn/start", "turn/steer")
         else None
     )
+    invocation = current_native_skill_invocation()
+    if isinstance(invocation, CodexSkillInvocation) and method in ("turn/start", "turn/steer"):
+        expected_input = [{"type": "text", "text": invocation.command}]
+        if (
+            state.thread_id != invocation.thread_id
+            or state.socket_path != invocation.socket_path
+            or params.get("input") != expected_input
+            or not isinstance(client_message_id, str)
+        ):
+            raise _CodexNativeInputUndelivered(
+                CodexStartupFailure(
+                    code="codex_skill_binding_changed",
+                    message="Codex's skill delivery binding changed before submission.",
+                    title="Skill was not sent",
+                    remediation="Check the active Codex session and submit the skill again.",
+                ),
+                preserve_session=True,
+            )
+        params = {
+            **params,
+            "input": [
+                *expected_input,
+                {"type": "skill", "name": invocation.name, "path": invocation.path},
+            ],
+        }
+        client_message_id = f"{SKILL_CLIENT_ID_PREFIX}{client_message_id}"
     if isinstance(client_message_id, str) and client_message_id and thread_id == state.thread_id:
         params = {**params, "clientUserMessageId": client_message_id}
     else:
