@@ -4940,6 +4940,8 @@ async def _bind_and_launch_managed_runner(
                         conversation_store,
                         host_registry,
                         host_conn,
+                        # Only a move's launch replaces its own claim.
+                        **({"replace_move_claim": True} if held_runner_id is not None else {}),
                     )
                     runner_id = launch_attempt.runner_id
                     reason = (

@@ -393,6 +393,22 @@ MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 # available before the host binds, and never copied from a fork's source.
 REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
 
+# A move onto a new sandbox holds the session's runner with an id of this shape
+# until the sandbox binds. It keeps the token-bound prefix, so checks that
+# require a runner's tunnel token stay strict, but no real token-bound id (hex
+# after the prefix) can equal it, so every replica can tell a move is underway.
+MOVE_CLAIM_RUNNER_ID_PREFIX = "runner_token_move_"
+
+
+def new_move_claim() -> str:
+    """Return a fresh runner id for a move to claim a session with."""
+    return MOVE_CLAIM_RUNNER_ID_PREFIX + secrets.token_hex(16)
+
+
+def is_move_claim(runner_id: str | None) -> bool:
+    """Whether *runner_id* is a move's claim rather than a real runner."""
+    return runner_id is not None and runner_id.startswith(MOVE_CLAIM_RUNNER_ID_PREFIX)
+
 
 def managed_host_name(host_id: str) -> str:
     """

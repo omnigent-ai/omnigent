@@ -1304,6 +1304,7 @@ async def test_message_sent_while_a_moved_session_provisions_waits_for_the_sandb
     assert snapshot.json()["runner_id"] is None
     assert snapshot.json()["sandbox_status"]["stage"] == "failed"
     assert fake.terminated == ["sb-fake-1"]
+    assert [item.status for item in env.conv_store.list_pending_inputs(session_id)] == ["failed"]
 
 
 async def test_concurrent_sandbox_moves_launch_one_sandbox(
@@ -1312,9 +1313,13 @@ async def test_concurrent_sandbox_moves_launch_one_sandbox(
 ) -> None:
     """
     Two moves racing for one session, such as from two tabs, launch a single
-    sandbox; the later one is told the session's binding changed.
+    sandbox; the later one is told the session's binding changed. The loser's
+    rollback leaves the winner's launch alone: its startup and a message held
+    for it stay, and when its sandbox then fails, it releases its claim.
     """
     import threading
+
+    from omnigent.server.managed_hosts import is_move_claim
 
     env = managed_session_env
     gate = threading.Event()
@@ -1327,14 +1332,28 @@ async def test_concurrent_sandbox_moves_launch_one_sandbox(
     )
 
     assert sorted(r.status_code for r in responses) == [202, 409], [r.text for r in responses]
-    gate.set()
     tracker = env.app.state.managed_launches
-    for _ in range(150):
-        launch = tracker.get(session_id)
-        if launch is not None and launch.settled.is_set():
-            break
-        await asyncio.sleep(0.1)
+    assert tracker.get(session_id) is not None
+    moving = env.conv_store.get_conversation(session_id)
+    assert moving is not None and is_move_claim(moving.runner_id)
+    assert moving.labels.get(STARTUP_LABEL) == "pending"
+    held = await _post_user_message(env, session_id)
+    assert held["queued"] is True
+    assert [item.status for item in env.conv_store.list_pending_inputs(session_id)] == [
+        "in_progress"
+    ]
+    gate.set()
+    await poll_until_async(
+        lambda: (launch := tracker.get(session_id)) is not None and launch.settled.is_set()
+    )
     assert len(fake.provisioned_names) == 1
+    await poll_until_async(
+        lambda: (
+            [item.status for item in env.conv_store.list_pending_inputs(session_id)] == ["failed"]
+        )
+    )
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None and conv.runner_id is None
 
 
 async def test_runner_bound_during_a_sandbox_move_keeps_the_session(
@@ -1571,6 +1590,87 @@ async def test_released_claim_keeps_the_winner_when_the_old_sandbox_fails_to_sta
     assert snapshot.json()["sandbox_status"] is None
     assert snapshot.json()["status"] != "failed"
     assert [item.status for item in env.conv_store.list_pending_inputs(session_id)] == ["failed"]
+
+
+async def test_relaunch_that_reads_a_move_claim_is_refused(
+    managed_session_env: ManagedSessionEnv,
+) -> None:
+    """
+    A relaunch that reads the session while a move holds it, from any caller,
+    refuses to replace the move's claim: only the move's own sandbox launch may.
+    """
+    from typing import cast
+
+    from omnigent.server.managed_hosts import new_move_claim
+    from omnigent.server.routes._sessions.helpers import _launch_runner_on_host_locked
+
+    env = managed_session_env
+    session_id = await _session_released_from_laptop(env, agent_name="move-claim-relaunch-agent")
+    claim = new_move_claim()
+    assert env.conv_store.set_runner_id(session_id, claim)
+    seen = env.conv_store.get_conversation(session_id)
+    assert seen is not None
+
+    class _NoAdmission:
+        async def admit_launch(self, conn: object, conversation_id: str, **_: object) -> None:
+            raise AssertionError("a refused relaunch must not reach admission")
+
+    attempt = await _launch_runner_on_host_locked(
+        seen,
+        env.conv_store,
+        cast(Any, _NoAdmission()),
+        cast(Any, SimpleNamespace(host_id=_LAPTOP_HOST_ID)),
+    )
+
+    assert attempt.error_code == "session_binding_changed"
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None and conv.runner_id == claim
+
+
+async def test_move_cancelled_during_its_detach_restores_the_whole_binding(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A move cancelled while detaching the old host waits for that write before
+    rolling back, so the old host, directory and branch all come back and the
+    claim is released, instead of the late detach clearing the restored host.
+    """
+    import threading
+
+    env = managed_session_env
+    session_id = await _session_released_from_laptop(env, agent_name="move-cancel-detach-agent")
+    detaching, release = threading.Event(), threading.Event()
+    clear_host_binding = env.conv_store.clear_host_binding
+
+    def slow_detach(conversation_id: str, **kwargs: Any) -> Conversation:
+        if kwargs.get("keep_runner"):
+            detaching.set()
+            release.wait(timeout=10)
+        return clear_host_binding(conversation_id, **kwargs)
+
+    monkeypatch.setattr(env.conv_store, "clear_host_binding", slow_detach)
+
+    move = asyncio.create_task(env.client.post(f"/v1/sessions/{session_id}/managed-host", json={}))
+    assert await asyncio.to_thread(detaching.wait, 10)
+    move.cancel()
+    release.set()
+    await asyncio.gather(move, return_exceptions=True)
+
+    def rolled_back() -> bool:
+        current = env.conv_store.get_conversation(session_id)
+        return current is not None and current.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN
+
+    await poll_until_async(rolled_back)
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert (conv.host_id, conv.workspace, conv.git_branch, conv.runner_id) == (
+        _LAPTOP_HOST_ID,
+        "/Users/alice/repo",
+        "feature/x",
+        None,
+    )
+    assert env.app.state.managed_launches.get(session_id) is None
 
 
 async def test_relaunch_admitted_before_a_move_claims_keeps_the_claim(
@@ -2039,6 +2139,7 @@ async def test_sandbox_move_failing_right_after_its_claim_releases_it(
     """
     env = managed_session_env
     session_id = await _session_released_from_laptop(env, agent_name="move-claim-leak-agent")
+    env.conv_store.set_labels(session_id, _STALE_SANDBOX_LABELS)
     claimed = False
     set_runner_id = env.conv_store.set_runner_id
     get_conversation = env.conv_store.get_conversation
@@ -2073,11 +2174,14 @@ async def test_sandbox_move_failing_right_after_its_claim_releases_it(
 
     conv = get_conversation(session_id)
     assert conv is not None
-    assert (conv.host_id, conv.workspace, conv.runner_id) == (
+    assert (conv.host_id, conv.workspace, conv.git_branch, conv.runner_id) == (
         _LAPTOP_HOST_ID,
         "/Users/alice/repo",
+        "feature/x",
         None,
     )
+    # Whether or not the move read them, the earlier sandbox's labels survive.
+    assert {key: conv.labels.get(key) for key in _STALE_SANDBOX_LABELS} == _STALE_SANDBOX_LABELS
     assert env.app.state.managed_launches.get(session_id) is None
 
 
@@ -2116,8 +2220,9 @@ async def test_sandbox_move_failing_partway_restores_the_session_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A store failure after the move cleared the binding, here while removing the
-    earlier sandbox's labels, still puts the old binding and labels back.
+    A store failure partway through the move, here while removing the earlier
+    sandbox's labels after the claim and before the old host is detached, still
+    puts the old binding and labels back.
     """
     env = managed_session_env
     session_id = await _session_released_from_laptop(env, agent_name="move-partway-agent")
