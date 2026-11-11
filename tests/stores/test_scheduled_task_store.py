@@ -2425,6 +2425,8 @@ def test_adopt_session_records_only_an_unchanged_continue_task_without_one(
         ("reasoning_effort", "high"),
         ("permission_mode", "acceptEdits"),
         ("project_id", _uid("proj")),
+        # A share saved before adoption found no session, so the run must not keep one.
+        ("share_with", (ScheduledTaskShare("team.engineering", 1),)),
     ):
         edited = _session_task(store, f"st_adopt_edit_{name}", session_mode="continue")
         store.update(edited.id, name="renamed")

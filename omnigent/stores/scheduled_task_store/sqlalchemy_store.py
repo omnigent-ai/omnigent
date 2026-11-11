@@ -168,6 +168,8 @@ _SESSION_CREATION_FIELDS = (
     "reasoning_effort",
     "permission_mode",
     "project_id",
+    # The first run grants these; a save that found no session to share is caught here.
+    "share_with",
     "updated_at",
 )
 
