@@ -1680,8 +1680,10 @@ async def test_move_cancelled_during_its_startup_write_leaves_nothing_held(
 
     # The rollback finishes after the cancelled request.
     await poll_until_async(
-        lambda: (current := env.conv_store.get_conversation(session_id)) is not None
-        and current.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN
+        lambda: (
+            (current := env.conv_store.get_conversation(session_id)) is not None
+            and current.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN
+        )
     )
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None
