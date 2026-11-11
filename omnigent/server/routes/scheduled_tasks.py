@@ -356,6 +356,14 @@ def _validate_timezone_or_400(timezone: str) -> None:
         ) from exc
 
 
+def _from_agent_tool(request: Request) -> bool:
+    """Whether a runner sent this request on behalf of an agent tool."""
+    return any(
+        header in request.headers
+        for header in (ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER)
+    )
+
+
 def require_scheduled_task_agent_origin(
     request: Request,
     *,
@@ -625,10 +633,7 @@ def create_scheduled_tasks_router(
         Runs check the policy again when they write the grants, since it can
         change after the automation is saved.
         """
-        if any(
-            header in request.headers
-            for header in (ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER)
-        ):
+        if _from_agent_tool(request):
             # Agents act on untrusted input; widening who sees every run takes a person.
             raise OmnigentError(
                 "Agent tools cannot change who an automation's runs are shared with",
@@ -683,17 +688,35 @@ def create_scheduled_tasks_router(
         return tuple(ScheduledTaskShare(share.user_id, share.level) for share in shares)
 
     async def _share_continued_session(request: Request, task: ScheduledTask) -> None:
-        """Add *task*'s shares to the session it continues, which no run will create."""
+        """Add *task*'s shares to the session it continues, which no run will create.
+
+        Runs after the task is saved, so a failure is logged rather than raised.
+        """
         if not task.share_with or not task.continues_session:
             return
         from omnigent.server.scheduled.fire import grant_task_shares
+        from omnigent.server.sharing_settings import host_is_managed_sandbox
 
         assert task.session_id is not None
-        conv = await asyncio.to_thread(conversation_store.get_conversation, task.session_id)
-        if conv is not None:
-            await grant_task_shares(
-                request.app.state, permission_store, task, conv.id, workspace=conv.workspace
+        try:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, task.session_id)
+        except Exception:
+            _logger.exception(
+                "scheduled task %s: could not load its continued session to share it", task.id
             )
+            return
+        if conv is None:
+            return
+        host_registry = getattr(request.app.state, "host_registry", None)
+        await grant_task_shares(
+            request.app.state,
+            permission_store,
+            task,
+            conv.id,
+            workspace=conv.workspace,
+            managed=task.execution_target == "managed_sandbox"
+            or host_is_managed_sandbox(host_registry, conv.host_id),
+        )
 
     async def _require_continuable(request: Request, task: ScheduledTask) -> Conversation:
         """Return a picked session *task* can continue; reject it otherwise, hiding one
@@ -1484,6 +1507,16 @@ def create_scheduled_tasks_router(
                 if name in fields
             },
         )
+        if (
+            existing.share_with
+            and fields.get("session_id") not in (None, existing.session_id)
+            and _from_agent_tool(request)
+        ):
+            # Saving shares the continued session, so retargeting widens who sees it.
+            raise OmnigentError(
+                "Agent tools cannot point a shared automation at another session",
+                code=ErrorCode.FORBIDDEN,
+            )
         if fields.get("session_id") is not None:
             picked = await _require_continuable(request, continuing)
             # The session cannot move, so the task routes every run to its host.

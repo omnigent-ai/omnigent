@@ -375,6 +375,21 @@ async def test_agent_mutations_validate_origin_at_http_boundary(
             )
             assert shared.status_code == 403, shared.text
             assert "Agent tools cannot change" in shared.json()["error"]["message"]
+            # Nor point a shared automation at another session, which saving would share.
+            owner_shares = await auth_client.patch(
+                f"/v1/scheduled-tasks/{task_id}",
+                json={
+                    "session_mode": "continue",
+                    "share_with": [{"user_id": "team.engineering", "level": 1}],
+                },
+                headers=_headers(),
+            )
+            assert owner_shares.status_code == 200, owner_shares.text
+            retarget = await client.patch(
+                f"/v1/scheduled-tasks/{task_id}", json={"session_id": source.id}, headers=headers
+            )
+            assert retarget.status_code == 403, retarget.text
+            assert "another session" in retarget.json()["error"]["message"]
 
 
 async def test_automations_gate_is_checked_per_request(

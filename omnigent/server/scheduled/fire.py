@@ -84,7 +84,13 @@ from omnigent.native.permission_modes import (
     APPROVAL_SKIPPING_PERMISSION_MODES,
     PERMISSION_LAUNCH_ARGS,
 )
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+from omnigent.server.auth import (
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
+    SharingMode,
+)
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
 from omnigent.server.managed_hosts import (
@@ -852,8 +858,15 @@ async def _run_fire_for_task(
             conv.id,
         )
     # Like default-public access, the task's shares never cancel a ready run.
+    from omnigent.server.sharing_settings import host_is_managed_sandbox
+
     await grant_task_shares(
-        deps.app_state, deps.permission_store, effective, conv.id, workspace=conv.workspace
+        deps.app_state,
+        deps.permission_store,
+        effective,
+        conv.id,
+        workspace=conv.workspace,
+        managed=managed or host_is_managed_sandbox(deps.host_registry, effective.host_id),
     )
 
     await recorder.check()
@@ -2083,6 +2096,7 @@ async def grant_task_shares(
     session_id: str,
     *,
     workspace: str | None,
+    managed: bool,
 ) -> None:
     """Add *task*'s shares to *session_id*, skipping any its owner could not add now.
 
@@ -2092,11 +2106,25 @@ async def grant_task_shares(
 
     :param state: ``app.state``, for the live sharing policy; ``None`` shares nothing.
     :param workspace: The session's working directory, for the restricted policy.
+    :param managed: Whether the session runs in a server-provisioned sandbox.
     """
     if not task.share_with or permission_store is None or state is None:
         return
-    from omnigent.server.session_sharing import require_new_grant_allowed, write_session_grant
+    from omnigent.server.session_sharing import (
+        require_new_grant_allowed,
+        sharing_mode,
+        write_session_grant,
+    )
 
+    if sharing_mode(state) == SharingMode.RESTRICTED_READ_ONLY and not workspace and not managed:
+        # Unknown cwd: nothing re-checks the grants once one binds, so fail closed, as
+        # the default-public grant does. Sandboxes pick theirs in a disposable container.
+        _logger.warning(
+            "scheduled task %s: not sharing session %s, whose working directory is unknown",
+            task.id,
+            session_id,
+        )
+        return
     for share in task.share_with:
         try:
             require_new_grant_allowed(

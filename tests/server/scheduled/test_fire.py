@@ -2705,23 +2705,46 @@ class _SharingState:
 
 
 @pytest.mark.asyncio
-async def test_fire_shares_the_run_with_the_tasks_grantees() -> None:
+@pytest.mark.parametrize(
+    "mode,workspace,read_shared",
+    [
+        (SharingMode.READ_ONLY, "/repo", True),
+        (SharingMode.RESTRICTED_READ_ONLY, "/repo", True),
+        # An unpinned workspace runs in the host's home, which restricted sharing excludes.
+        (SharingMode.RESTRICTED_READ_ONLY, None, False),
+    ],
+    ids=["read-only", "restricted-project", "restricted-home"],
+)
+async def test_fire_shares_the_run_with_the_tasks_grantees(
+    monkeypatch: pytest.MonkeyPatch, mode: SharingMode, workspace: str | None, read_shared: bool
+) -> None:
     """A run's session is shared after its owner grant, re-checking the live policy.
 
     The server became read-only after the task was saved, so the edit share is
     skipped; a failing grantee is skipped too, and the run still dispatches.
     """
+
+    async def _home(deps: Any, host_id: str) -> str:
+        return "/home/alice"
+
+    monkeypatch.setattr(fire_mod, "_resolve_default_workspace", _home)
     perm = FakePermissionStore(fail_grant_users={"broken@example.com"})
     task = _task(
+        workspace=workspace,
         share_with=(
             ScheduledTaskShare("broken@example.com", LEVEL_READ),
             ScheduledTaskShare("team.engineering", LEVEL_READ),
             ScheduledTaskShare("alice@example.com", LEVEL_EDIT),
-        )
+        ),
     )
     store = FakeScheduledTaskStore(rows={"task_1": task})
-    deps = _deps(store, permission_store=perm, host_registry=FakeHostRegistry(online={"host_1"}))
-    deps.app_state = _SharingState(SharingMode.READ_ONLY)
+    deps = _deps(
+        store,
+        permission_store=perm,
+        host_store=FakeHostStore({"host_1": _FakeHost("host_1", "local")}),
+        host_registry=FakeHostRegistry(online={"host_1"}),
+    )
+    deps.app_state = _SharingState(mode)
     launched: list[Any] = []
 
     async def _launch(conv: Any, task: Any) -> None:
@@ -2734,9 +2757,26 @@ async def test_fire_shares_the_run_with_the_tasks_grantees() -> None:
     session_id = launched[0].id
     assert perm.grants == [
         (RESERVED_USER_LOCAL, session_id, LEVEL_OWNER),
-        ("team.engineering", session_id, LEVEL_READ),
+        *([("team.engineering", session_id, LEVEL_READ)] if read_shared else []),
     ]
     assert store.runs and store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("managed", [False, True], ids=["connected-host", "sandbox"])
+async def test_restricted_sharing_needs_a_known_workspace_outside_sandboxes(managed: bool) -> None:
+    """With no recorded cwd, restricted sharing grants nothing unless a sandbox picks it."""
+    perm = FakePermissionStore()
+    task = _task(share_with=(ScheduledTaskShare("team.engineering", LEVEL_READ),))
+    await fire_mod.grant_task_shares(
+        _SharingState(SharingMode.RESTRICTED_READ_ONLY),
+        perm,
+        task,
+        "conv_1",
+        workspace=None,
+        managed=managed,
+    )
+    assert perm.grants == ([("team.engineering", "conv_1", LEVEL_READ)] if managed else [])
 
 
 # ── Continuing one session ───────────────────────────────────────────────────
