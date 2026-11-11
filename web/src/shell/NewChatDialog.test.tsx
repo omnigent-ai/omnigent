@@ -114,6 +114,7 @@ vi.mock("@/pages/settings/HarnessFixDialog", () => ({
   },
 }));
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { composerContextFromLabels } from "@/lib/composerContextAdapters";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
@@ -8362,6 +8363,91 @@ describe("NewChatLandingScreen", () => {
     };
     // The generated name rides through as a new-worktree create.
     expect(body.git?.branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
+  });
+
+  it("retries a colliding auto-seeded worktree branch with fresh metadata", async () => {
+    localStorage.setItem("omnigent:always-use-worktree", "true");
+    authenticatedFetchMock
+      .mockImplementationOnce(async (_input, init) => {
+        const body = JSON.parse((init as RequestInit).body as string) as {
+          git: { branch_name: string };
+        };
+        const branch = body.git.branch_name;
+        return {
+          ok: false,
+          status: 400,
+          json: async () => ({
+            error: {
+              message: `worktree creation failed: a branch named '${branch}' already exists; choose a different branch name`,
+            },
+          }),
+        } as unknown as Response;
+      })
+      .mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveTextContent(
+        /^worktree-[0-9a-f]{8}$/,
+      ),
+    );
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "start despite the stale generated name" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(2));
+    const bodies = authenticatedFetchMock.mock.calls.slice(0, 2).map(([, init]) => {
+      return JSON.parse((init as RequestInit).body as string) as {
+        git: { branch_name: string };
+        labels: Record<string, string>;
+      };
+    });
+    expect(bodies[0].git.branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
+    expect(bodies[1].git.branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
+    expect(bodies[1].git.branch_name).not.toBe(bodies[0].git.branch_name);
+    expect(composerContextFromLabels(bodies[1].labels).worktree).toEqual({
+      kind: "new",
+      branchName: bodies[1].git.branch_name,
+      baseBranch: null,
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("landing-location")).toHaveTextContent("/c/conv_new"),
+    );
+    expect(screen.queryByTestId("new-chat-landing-error")).toBeNull();
+  });
+
+  it("does not replace a hand-entered branch after a name collision", async () => {
+    const message =
+      "worktree creation failed: a branch named 'feature/mine' already exists; choose a different branch name";
+    authenticatedFetchMock.mockResolvedValue({
+      ok: false,
+      status: 400,
+      json: async () => ({ error: { message } }),
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+      target: { value: "feature/mine" },
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "keep my branch name" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    expect(await screen.findByTestId("new-chat-landing-error")).toHaveTextContent(message);
+    expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as {
+      git: { branch_name: string };
+    };
+    expect(body.git.branch_name).toBe("feature/mine");
   });
 
   it("shows no conflict banner when no live session shares the directory", async () => {

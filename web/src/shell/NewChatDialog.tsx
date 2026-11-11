@@ -121,7 +121,7 @@ import { MenuItem } from "@/components/ui/menu-item";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
-import { composerContextToLabels } from "@/lib/composerContextAdapters";
+import { COMPOSER_CONTEXT_LABEL_KEY, composerContextToLabels } from "@/lib/composerContextAdapters";
 import { randomUUID } from "@/lib/randomUUID";
 import { sessionRoutingHostId, setSessionHost } from "@/lib/sessionHost";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
@@ -867,6 +867,19 @@ export async function describeCreateError(res: Response): Promise<string> {
     // Non-JSON body — fall through to the generic message.
   }
   return `Couldn't create the session (HTTP ${res.status}).`;
+}
+
+function isAutoSeededWorktreeCollision(
+  message: string,
+  branchName: string,
+  autoSeededBranch: string,
+): boolean {
+  return (
+    branchName !== "" &&
+    branchName === autoSeededBranch.trim() &&
+    message ===
+      `worktree creation failed: a branch named '${branchName}' already exists; choose a different branch name`
+  );
 }
 
 /**
@@ -6375,25 +6388,27 @@ function NewChatLandingContent({
         });
         const createForm = serverOwnsInitialInput && files.length > 0 ? new FormData() : null;
         if (createForm !== null) {
-          createForm.append("metadata", createPayload);
           for (const file of files) createForm.append("initial_files", file, file.name);
         }
-        const createRequest = authenticatedFetch("/v1/sessions", {
-          method: "POST",
-          headers: {
-            ...(createForm === null ? { "Content-Type": "application/json" } : {}),
-            ...backgroundSessionTitlesRequestHeaders(),
-          },
-          body: createForm ?? createPayload,
-        });
         // Managed launch validation continues after the row is announced, so
         // only its HTTP response can resolve the temp chat.
         const abortPush = new AbortController();
         const pushedRow = sandboxSelected
           ? Promise.resolve(null)
           : nextPushedSession(matchOwnCreate, abortPush.signal);
-        const confirmed = (async (): Promise<{ id: string } | { error: string }> => {
-          const response = await createRequest;
+        const confirmCreate = async (
+          payload: string,
+          allowBranchRetry: boolean,
+        ): Promise<{ id: string } | { error: string }> => {
+          createForm?.set("metadata", payload);
+          const response = await authenticatedFetch("/v1/sessions", {
+            method: "POST",
+            headers: {
+              ...(createForm === null ? { "Content-Type": "application/json" } : {}),
+              ...backgroundSessionTitlesRequestHeaders(),
+            },
+            body: createForm ?? payload,
+          });
           if (!response.ok) {
             if (sandboxSelected) {
               void queryClient.invalidateQueries({ queryKey: SANDBOX_PROFILES_QUERY_KEY });
@@ -6408,7 +6423,45 @@ function NewChatLandingContent({
                 ),
               });
             }
-            return { error: await describeCreateError(response) };
+            const error = await describeCreateError(response);
+            if (
+              allowBranchRetry &&
+              shouldCreateWorktree &&
+              isAutoSeededWorktreeCollision(error, trimmedBranch, autoSeededBranch)
+            ) {
+              const replacementBranch = generateBranchName();
+              setAutoSeededBranch(replacementBranch);
+              draftRef.current = {
+                ...draftRef.current,
+                branchName: replacementBranch,
+                autoSeededBranch: replacementBranch,
+              };
+              const nextContext = {
+                ...composerContextState,
+                worktree: {
+                  kind: "new" as const,
+                  branchName: replacementBranch,
+                  baseBranch: baseBranch.trim() || null,
+                },
+              };
+              setComposerContextState(nextContext);
+              const retryPayload = JSON.parse(payload) as {
+                git: { branch_name: string };
+                labels?: Record<string, string>;
+              };
+              retryPayload.git.branch_name = replacementBranch;
+              const otherLabels = Object.fromEntries(
+                Object.entries(retryPayload.labels ?? {}).filter(
+                  ([key]) => !key.startsWith(`${COMPOSER_CONTEXT_LABEL_KEY}.`),
+                ),
+              );
+              retryPayload.labels = {
+                ...otherLabels,
+                ...composerContextToLabels(nextContext),
+              };
+              return confirmCreate(JSON.stringify(retryPayload), false);
+            }
+            return { error };
           }
           const created = (await response.json()) as {
             id: string;
@@ -6420,7 +6473,8 @@ function NewChatLandingContent({
           const requestedHostId = sessionRoutingHostId(null, created.labels);
           if (requestedHostId !== null) setSessionHost(created.id, requestedHostId);
           return { id: created.id };
-        })();
+        };
+        const confirmed = confirmCreate(createPayload, true);
         // Once the create answers, its id is authoritative — stop listening.
         void confirmed.finally(() => abortPush.abort()).catch(() => {});
         const created = await new Promise<{ id: string } | { error: string }>((resolve, reject) => {
