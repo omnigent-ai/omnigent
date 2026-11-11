@@ -2276,8 +2276,6 @@ class PiExecutor(Executor):
             raise ValueError("gateway_auth_refresh_interval_ms must be nonnegative")
         self._gateway_auth_refresh_interval_s = interval / 1000
         self._gateway_refresh_after = 0.0
-        # Monotonic time the cached token's ``exp`` claim runs out; ``None`` when unknown.
-        self._gateway_token_valid_until: float | None = None
         self._gateway_refresh_task: asyncio.Task[str] | None = None
         self._gateway_auth_lock = asyncio.Lock()
         # Retry policy → Pi's .pi/settings.json before subprocess spawn.
@@ -2625,11 +2623,10 @@ class PiExecutor(Executor):
                         self._gateway_refresh_task = refresh
                     return await asyncio.shield(refresh)
         except (TimeoutError, _GatewayAuthTimeout) as exc:
-            valid_until = self._gateway_token_valid_until
-            if (
-                valid_until is not None
-                and time.monotonic() + _GATEWAY_TOKEN_REUSE_MARGIN_S < valid_until
-            ):
+            # Read the expiry now against wall time: the monotonic clock stops while a
+            # host sleeps, so a deadline derived at fetch time could outlive the token.
+            lifetime_s = _seconds_until_token_expiry(self._databricks_token)
+            if lifetime_s is not None and lifetime_s > _GATEWAY_TOKEN_REUSE_MARGIN_S:
                 logger.warning("Pi gateway credential refresh is slow; reusing the current token")
                 return self._databricks_token
             if isinstance(exc, _GatewayAuthTimeout):
@@ -2667,7 +2664,6 @@ class PiExecutor(Executor):
             )
             cache_s = min(cache_s, renew_in_s)
         self._databricks_token = token
-        self._gateway_token_valid_until = None if lifetime_s is None else now + lifetime_s
         self._gateway_workspace_url = self._gateway_model_service_workspace_url()
         self._gateway_refresh_after = now + cache_s
         return token

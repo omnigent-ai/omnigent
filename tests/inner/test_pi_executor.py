@@ -2519,6 +2519,37 @@ async def test_gateway_slow_refresh_reuses_only_an_unexpired_token(
         await executor.close()
 
 
+async def test_gateway_slow_refresh_rechecks_expiry_after_the_host_sleeps(tmp_path, monkeypatch):
+    # The monotonic clock stops while a host sleeps, so only the token's exp claim, read
+    # against wall time, can tell that the cached token expired in the meantime.
+    from omnigent.inner import pi_executor
+
+    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(pi_executor, "_GATEWAY_TURN_AUTH_TIMEOUT_S", 5)
+    token = _jwt_expiring_in(600)
+    delay_file = tmp_path / "delay"
+    delay_file.write_text("0")
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command=f"sleep $(cat {shlex.quote(str(delay_file))}); printf %s {token}",
+        gateway_auth_refresh_interval_ms="0",
+    )
+    try:
+        assert await executor._get_gateway_token(before_turn=True) == token
+        delay_file.write_text("1")
+        monkeypatch.setattr(
+            pi_executor,
+            "time",
+            SimpleNamespace(monotonic=time.monotonic, time=lambda: time.time() + 1000),
+        )
+        with pytest.raises(OSError, match="timed out"):
+            await executor._get_gateway_token()
+    finally:
+        await executor.close()
+
+
 @pytest.mark.parametrize(
     ("broken_helper", "cached", "outcome"),
     [
