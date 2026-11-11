@@ -431,11 +431,22 @@ async def test_organizing_tools_refuse_a_source_shared_with_edit_access(
     ):
         refused = await _project_tool(auth_client, source, name, **arguments)
         assert "shared with edit access cannot" in refused["error"], (name, refused)
+    # The routes themselves refuse the shared source, not only the tools.
+    source_headers = {ORCHESTRATION_SOURCE_HEADER: source["id"]}
+    direct = [
+        await auth_client.patch(
+            f"/v1/projects/{project_id}",
+            headers=source_headers,
+            json={"config": {"icon": "🔥"}},
+        ),
+        await auth_client.delete(f"/v1/projects/{project_id}", headers=source_headers),
+    ]
+    assert [response.status_code for response in direct] == [403, 403], [r.text for r in direct]
     saved = SqlAlchemyConversationStore(db_uri).get_conversation(target["id"])
     assert saved.title != "Hijacked" and saved.archived is not True
     assert not any(key.startswith("omnigent.pinned") for key in saved.labels)
     (project,) = (await auth_client.get("/v1/projects")).json()["data"]
-    assert project == {**project, "id": project_id, "name": "Shared folder"}
+    assert project == {**project, "id": project_id, "name": "Shared folder", "config": {}}
 
 
 @_ONE_ENVIRONMENT
@@ -450,13 +461,25 @@ async def test_a_child_cannot_archive_its_rebound_parent(auth_client, peers, db_
     store.clear_runner_id(source["id"])
     assert store.set_runner_id(source["id"], "rebound-runner")
 
-    result = json.loads(
-        await execute_tool(
-            tool_name="sys_session_update",
-            arguments=json.dumps({"session_id": source["id"], "archived": True}),
-            server_client=auth_client,
-            conversation_id=child.id,
+    existing_id = await _project(auth_client, "Existing")
+
+    async def archive_parent(**fields) -> dict:
+        return json.loads(
+            await execute_tool(
+                tool_name="sys_session_update",
+                arguments=json.dumps({"session_id": source["id"], "archived": True, **fields}),
+                server_client=auth_client,
+                conversation_id=child.id,
+            )
         )
-    )
+
+    result = await archive_parent()
     assert "cannot archive its own session or a session it runs under" in result["error"], result
-    assert store.get_conversation(source["id"]).archived is not True
+    into_existing = await archive_parent(project="Existing")
+    assert "a session it runs under" in into_existing["error"], into_existing
+    into_new = await archive_parent(project="Brand new")
+    assert "in separate calls" in into_new["error"], into_new
+    parent = store.get_conversation(source["id"])
+    assert parent.archived is not True and parent.project_id is None
+    projects = (await auth_client.get("/v1/projects")).json()["data"]
+    assert [project["id"] for project in projects] == [existing_id]

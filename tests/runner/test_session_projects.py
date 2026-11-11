@@ -568,3 +568,61 @@ async def test_project_update_promotes_a_label_only_folder():
         f"/v1/projects/{PROJECT_ID}",
         f"/v1/sessions/{PARENT}",
     ]
+
+
+async def test_project_rename_reports_members_it_could_not_move_across_pages():
+    requests: list[httpx.Request] = []
+    pages = [
+        [],
+        [
+            {"id": PARENT, "labels": {"omni_project": "Q3"}},
+            {"id": FAILING, "labels": {"omni_project": "Q3"}},
+            {"id": READ_SHARED, "labels": {"omni_project": "Q3"}},
+        ],
+    ]
+    base = _paged_project_server(requests, pages)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH" and request.url.path.endswith(FAILING):
+            requests.append(request)
+            raise httpx.ConnectError("connection reset")
+        if request.method == "PATCH" and request.url.path.endswith(READ_SHARED):
+            requests.append(request)
+            return httpx.Response(403, json={"detail": "forbidden"})
+        return base(request)
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_project_update({"project": "Q3", "name": "Q4"}, client, SOURCE)
+        )
+    assert result == {
+        "project": "Q4",
+        "status": "partial",
+        "sessions_not_moved": [FAILING, READ_SHARED],
+        "previous_name": "Q3",
+    }
+    assert [r.url.params.get("after") for r in requests if r.url.path == "/v1/sessions"] == [
+        None,
+        "1",
+    ]
+    patched = [r.url.path for r in requests if r.method == "PATCH"]
+    assert patched == [
+        f"/v1/projects/{PROJECT_ID}",
+        f"/v1/sessions/{PARENT}",
+        f"/v1/sessions/{FAILING}",
+        f"/v1/sessions/{READ_SHARED}",
+    ]
+
+
+async def test_project_rename_warns_when_the_member_walk_hits_its_page_cap(monkeypatch):
+    from omnigent.runner import session_projects
+
+    monkeypatch.setattr(session_projects, "_MAX_LOOKUP_PAGES", 2)
+    requests: list[httpx.Request] = []
+    async with _client(_paged_project_server(requests, [[], [], [], []])) as client:
+        result = json.loads(
+            await execute_project_update({"project": "Q3", "icon": "📦"}, client, SOURCE)
+        )
+    assert result["status"] == "updated"
+    assert result["warning"] == "the project has too many sessions to check them all"
+    assert len([r for r in requests if r.url.path == "/v1/sessions"]) == 2

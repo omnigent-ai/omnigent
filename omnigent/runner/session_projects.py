@@ -562,6 +562,23 @@ async def execute_session_update(
     created = False
     if set_project:
         project_id = ""
+        if name and changes.get("archived") is True:
+            # The server can still refuse the archive (its lineage guard), and a
+            # project created before that refusal would be left behind empty.
+            try:
+                existing = await _find_project(client, name)
+            except (httpx.HTTPError, ValueError) as exc:
+                return json.dumps(
+                    {"session_id": session_id, "error": f"sys_session_update: {exc}"}
+                )
+            if existing is None:
+                return json.dumps(
+                    {
+                        "session_id": session_id,
+                        "error": f"no project named {name!r}; archive the session and "
+                        "file it into a new project in separate calls",
+                    }
+                )
         if name:
             try:
                 project_id, created = await resolve_project_id(client, name, headers=headers)

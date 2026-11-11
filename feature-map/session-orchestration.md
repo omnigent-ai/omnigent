@@ -85,7 +85,8 @@ MCP independent creation.
   sub-agents, as the sidebar's Archive does, so the server refuses an
   agent-tool archive of the caller or any session it runs under (its parent
   chain or a side chat's source), and the tool also refuses a session on the
-  caller's runner. `sys_project_update` renames a project or sets or clears
+  caller's runner. An archive cannot also file the session into a project that
+  does not exist yet, so a refused archive never leaves a new empty project. `sys_project_update` renames a project or sets or clears
   its emoji icon, keeping its other stored defaults; like the sidebar's
   rename it re-files sessions that still belong through the legacy label,
   promotes a label-only folder to a project row, and reports any session it
