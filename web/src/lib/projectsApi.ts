@@ -31,6 +31,12 @@ export interface ProjectConfig {
   repository?: { url: string; branch?: string };
   /** Sandbox provider a sandbox project runs on, e.g. "modal". */
   sandbox_provider?: string;
+  /**
+   * Repositories a sandbox default (`host_id` is the sandbox sentinel) clones,
+   * each a managed create `<url>[#<branch>]` string. A sandbox has no host
+   * path, so it keeps its repositories here rather than in `workspace`.
+   */
+  sandbox_workspaces?: string[];
   /** Default agent id for new sessions. */
   agent_id?: string;
   /** Chosen emoji icon (a unicode grapheme, e.g. "🔥"). Unset → default folder. */
