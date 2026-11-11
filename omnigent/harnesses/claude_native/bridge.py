@@ -6765,8 +6765,8 @@ def _user_prompt_visible(pane: str) -> bool:
     lines = [line for line in pane.splitlines() if line.strip()]
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
     region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
-    # Narrow panes wrap the decision footer across captured lines.
-    footer = " ".join(region.split())
+    # Narrow panes can wrap inside the decision footer's words.
+    footer = "".join(region.split())
     # A short pane can clip the plan decision's footer entirely.
     plan_region = "\n".join(lines[rules[-1] + 1 :]) if rules else ""
     plan_exit = re.search(
@@ -6782,8 +6782,8 @@ def _user_prompt_visible(pane: str) -> bool:
         or "Do you want to " in region
         or "Yes, and don't ask again" in region
         or (
-            any(hint in footer for hint in ("Enter to select", "Enter to submit"))
-            and "Esc to cancel" in footer
+            any(hint in footer for hint in ("Entertoselect", "Entertosubmit"))
+            and "Esctocancel" in footer
         )
     )
 

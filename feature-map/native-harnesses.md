@@ -591,6 +591,14 @@ Cross-harness journeys:
   and cleanup checks, including Codex-role and auxiliary-shell controls, are
   in [Terminals](./terminals.md); they do not establish full harness acceptance.
 
+- **`steer`, Claude questions in a narrow terminal:**
+  `tests/harnesses/claude_native/test_claude_native_copy_mode.py::test_question_with_a_footer_word_split_by_tmux_keeps_waiting`
+  uses real tmux and a stand-in question picker. Chat input and settings leave
+  the question open when wrapping splits a footer word; an explicit terminal
+  answer releases the composer for one message. Manually, narrow Claude's
+  terminal while a question is pending, send an unrelated Chat message, then
+  answer the question and verify that the held message arrives once.
+
 - **Antigravity permission choices (Chat and Inbox):**
   `tests/e2e_ui/approvals/test_agy_permission_full_prompt.py::test_agy_permission_persist_request_round_trip`
   uses a recorded permission prompt and the real server to check both choices
@@ -1173,6 +1181,10 @@ Cross-harness journeys:
   the session stays idle and the released reply never appears, then completes
   a follow-up. The harness bench does not register opencode-native, so its
   interrupt probe does not apply.
+- **opencode-native usage (component checks):**
+  `tests/test_opencode_native_forwarder.py::test_usage_dedupes_identical_posts`
+  checks that a rejected report can be retried at turn completion while
+  accepted totals remain deduplicated. It controls HTTP responses locally.
 - **opencode-native journeys (own environment, scripted model):** needs
   `@opencode/cli` 2.0.18–2.0.x and tmux on `PATH`, in e2e mock mode:
   `uv run --no-sync pytest tests/e2e/test_host_opencode_native_mock_e2e.py --reruns 0 -v`.
