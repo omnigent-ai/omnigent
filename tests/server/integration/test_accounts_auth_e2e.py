@@ -24,7 +24,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
-from omnigent.server.auth import LEVEL_READ, create_auth_provider
+from omnigent.server.auth import LEVEL_MANAGE, LEVEL_READ, create_auth_provider
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
@@ -629,8 +629,9 @@ async def _grantees(
 
 async def test_mixed_case_revoke_and_leave_remove_the_login_identity_grant(
     client: httpx.AsyncClient,
+    tmp_path: Path,
 ) -> None:
-    """Revoking or leaving by a differently cased email removes the canonical grant."""
+    """Revoking or leaving by another casing removes the canonical grant, never an owner's."""
     admin_headers = _cookie_header(await _login(client, _ADMIN_USERNAME, _ADMIN_PASSWORD))
     alice_headers = await _register_user(
         client, admin_headers, "alice@example.com", "alice-pw-123456"
@@ -659,6 +660,25 @@ async def test_mixed_case_revoke_and_leave_remove_the_login_identity_grant(
     )
     assert leave_resp.status_code == 204, leave_resp.text
     assert await _grantees(client, session_id, admin_headers) == {_ADMIN_USERNAME: 4}
+
+    grant_resp = await client.put(
+        f"/v1/sessions/{session_id}/permissions",
+        json={**grant, "level": LEVEL_MANAGE},
+        headers=admin_headers,
+    )
+    assert grant_resp.status_code == 200, grant_resp.text
+    permission_store = SqlAlchemyPermissionStore(f"sqlite:///{tmp_path}/test.db")
+    permission_store.ensure_user("Admin")
+    permission_store.grant("Admin", session_id, LEVEL_READ)
+    owner_alias_resp = await client.delete(
+        f"/v1/sessions/{session_id}/permissions/Admin", headers=alice_headers
+    )
+    assert owner_alias_resp.status_code == 403, owner_alias_resp.text
+    assert await _grantees(client, session_id, admin_headers) == {
+        _ADMIN_USERNAME: 4,
+        "Admin": LEVEL_READ,
+        "alice@example.com": LEVEL_MANAGE,
+    }
 
 
 async def test_revoke_by_typed_id_removes_both_spellings_idempotently(

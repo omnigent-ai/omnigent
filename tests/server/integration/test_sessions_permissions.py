@@ -1208,11 +1208,15 @@ async def test_header_identity_grant_keeps_its_case(
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["user_id"] == "Alice@Example.com"
-    resp = await auth_client.get(
-        f"/v1/sessions/{session_id}",
-        headers={"X-Forwarded-Email": "Alice@Example.com"},
-    )
-    assert resp.status_code == 200, resp.text
+    for header_identity, expected_status in (
+        ("Alice@Example.com", 200),
+        ("alice@example.com", 404),
+    ):
+        resp = await auth_client.get(
+            f"/v1/sessions/{session_id}",
+            headers={"X-Forwarded-Email": header_identity},
+        )
+        assert resp.status_code == expected_status, resp.text
 
 
 async def test_revoke_nonexistent_grant_returns_204(

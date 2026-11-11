@@ -371,7 +371,10 @@ async def test_machine_client_owns_and_operates_its_own_session(env: SimpleNames
 async def test_mixed_case_machine_principal_is_shared_and_leaves_by_its_exact_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A login user shares with the case-sensitive machine subject, which can read and leave."""
+    """A login user shares with the case-sensitive machine subject, which can read and leave.
+
+    The lowercase spelling is a separate human identity that the machine cannot remove.
+    """
     from omnigent.db.utils import clear_engine_cache
 
     machine_sub = "BuildBot@Example.com"
@@ -394,15 +397,24 @@ async def test_mixed_case_machine_principal_is_shared_and_leaves_by_its_exact_id
         )
         assert shared.status_code == 200, shared.text
         assert shared.json()["user_id"] == machine_sub
+        human_id = machine_sub.lower()
+        built.permission_store.ensure_user(human_id)
+        built.permission_store.grant(human_id, session_id, LEVEL_READ)
 
         machine_auth = {"Authorization": f"Bearer {await _mint_token(client)}"}
         session_url = f"/v1/sessions/{session_id}"
         assert (await client.get(session_url, headers=machine_auth)).status_code == 200
+        cross_leave = await client.delete(
+            f"{session_url}/permissions/{human_id}", headers=machine_auth
+        )
+        assert cross_leave.status_code == 403, cross_leave.text
         left = await client.delete(
             f"{session_url}/permissions/{machine_sub}", headers=machine_auth
         )
         assert left.status_code == 204, left.text
         assert built.permission_store.get(machine_sub, session_id) is None
+        human_grant = built.permission_store.get(human_id, session_id)
+        assert human_grant is not None and human_grant.level == LEVEL_READ
         assert (await client.get(session_url, headers=machine_auth)).status_code == 404
     clear_engine_cache()
 
