@@ -5,6 +5,7 @@ from __future__ import annotations
 import click
 import pytest
 
+from omnigent.server import managed_hosts
 from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
@@ -35,7 +36,9 @@ def _deployment(fake: FakeSandboxLauncher, *, stop_on_archive: bool = True):
     )
 
 
-async def _archived_session_on_a_sandbox(db_uri: str, *, can_resume: bool = True, labels=None):
+async def _archived_session_on_a_sandbox(
+    db_uri: str, *, can_resume: bool = True, labels=None, git_branch=None
+):
     host_store = HostStore(db_uri)
     conversations = SqlAlchemyConversationStore(db_uri)
 
@@ -49,7 +52,7 @@ async def _archived_session_on_a_sandbox(db_uri: str, *, can_resume: bool = True
         config=_deployment(fake), owner=_OWNER, host_store=host_store
     )
     conv = conversations.create_conversation(
-        host_id=launched.host_id, workspace="/workspace", labels=labels
+        host_id=launched.host_id, workspace="/workspace", labels=labels, git_branch=git_branch
     )
     conversations.update_conversation(conv.id, archived=True)
     return fake, host_store, conversations, conversations.get_conversation(conv.id)
@@ -95,6 +98,20 @@ async def test_the_providers_launcher_makes_the_final_call(db_uri, monkeypatch, 
     assert asked == [(_OWNER, configured)]
     assert stopped is (not configured)
     assert len(fake.stopped) == (0 if configured else 1)
+
+
+async def test_an_unarchive_while_the_launcher_decides_keeps_the_sandbox(db_uri, monkeypatch):
+    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
+
+    def stop_when_archived(**_kwargs: object) -> bool:
+        # The user unarchives (and may already be sending a message) while a
+        # slow decision, such as a flag lookup, is in flight.
+        conversations.update_conversation(conv.id, archived=False)
+        return True
+
+    monkeypatch.setattr(fake, "stop_when_archived", stop_when_archived)
+    assert await _stop(fake, host_store, conversations, conv) is False
+    assert fake.stopped == []
 
 
 async def test_a_failing_launcher_decision_leaves_the_sandbox_running(db_uri, monkeypatch):
@@ -145,6 +162,21 @@ async def test_keeps_the_sandbox_when_the_store_cannot_list_the_hosts_sessions(
     assert fake.stopped == []
 
 
+@pytest.mark.parametrize(("pages", "stops"), [(2, False), (3, True)], ids=["capped", "complete"])
+async def test_keeps_the_sandbox_when_the_hosts_sessions_exceed_the_page_cap(
+    db_uri, monkeypatch, pages, stops
+):
+    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
+    other = conversations.create_conversation(host_id=conv.host_id, workspace="/workspace")
+    conversations.update_conversation(other.id, archived=True)
+    # Two archived sessions at one per page: the listing only ends on a third,
+    # short page. A cap that cuts it off first counts the host as in use.
+    monkeypatch.setattr(managed_hosts, "_ARCHIVE_STOP_HOST_SESSION_PAGE_SIZE", 1)
+    monkeypatch.setattr(managed_hosts, "_ARCHIVE_STOP_HOST_SESSION_PAGES", pages)
+    assert await _stop(fake, host_store, conversations, conv) is stops
+    assert len(fake.stopped) == (1 if stops else 0)
+
+
 async def test_a_failed_stop_does_not_raise(db_uri, monkeypatch):
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
 
@@ -155,17 +187,33 @@ async def test_a_failed_stop_does_not_raise(db_uri, monkeypatch):
     assert await _stop(fake, host_store, conversations, conv) is False
 
 
-async def test_the_archive_teardown_stops_the_sandbox_last(db_uri):
-    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
+async def test_the_archive_teardown_stops_the_sandbox_last(db_uri, monkeypatch):
+    from omnigent.server.routes import sessions as sessions_facade
+
+    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(
+        db_uri, git_branch="topic"
+    )
+    calls: list[str] = []
+
+    async def stop_runner(*_args: object, **_kwargs: object) -> None:
+        calls.append("runner")
+
+    async def remove_worktree(*_args: object, **_kwargs: object) -> None:
+        calls.append("worktree")
+
+    monkeypatch.setattr(sessions_facade, "_best_effort_stop", stop_runner)
+    monkeypatch.setattr(sessions_facade, "_remove_session_worktree_best_effort", remove_worktree)
+    monkeypatch.setattr(fake, "stop", lambda sandbox_id: calls.append("sandbox"))
     await orchestration._archive_stop(
         conv.id,
         conversations,
         None,
         None,
+        delete_worktree=True,
         host_store=host_store,
         sandbox_config=_deployment(fake),
     )
-    assert fake.stopped == [host_store.get_host(conv.host_id).sandbox_id]
+    assert calls == ["runner", "worktree", "sandbox"]
 
 
 def _stop_settings(raw: dict) -> dict[str | None, bool]:

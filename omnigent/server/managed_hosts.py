@@ -5123,13 +5123,11 @@ async def _host_has_other_unarchived_session(
             after=after,
             limit=_ARCHIVE_STOP_HOST_SESSION_PAGE_SIZE,
         )
-        for other_id in ids:
-            if other_id == session_id:
-                seen_self = True
-                continue
-            other = await asyncio.to_thread(conversation_store.get_conversation, other_id)
-            if other is not None and not other.archived:
-                return True
+        others = [other_id for other_id in ids if other_id != session_id]
+        seen_self = seen_self or len(others) < len(ids)
+        found = await asyncio.to_thread(conversation_store.get_conversations, others)
+        if any(not other.archived for other in found.values()):
+            return True
         if len(ids) < _ARCHIVE_STOP_HOST_SESSION_PAGE_SIZE:
             return not seen_self
         after = ids[-1]
@@ -5175,6 +5173,8 @@ async def stop_archived_session_sandbox(
         launcher = _launcher_for_teardown(host, config)
         if launcher is None or not launcher.capabilities.resume_stopped:
             return False
+        if await _host_has_other_unarchived_session(host.host_id, conv.id, conversation_store):
+            return False
         configured = config.recorded(host.sandbox_provider).stop_on_archive
         # getattr: embedding deployments may inject duck-typed launchers.
         decide = getattr(launcher, "stop_when_archived", None)
@@ -5185,7 +5185,12 @@ async def stop_archived_session_sandbox(
         )
         if not wanted:
             return False
-        if await _host_has_other_unarchived_session(host.host_id, conv.id, conversation_store):
+        # An unarchive no longer cancels this teardown once it has started, and
+        # the checks above can take a while (the hook may call a flag service),
+        # so re-read the session just before stopping. A message sent in the
+        # remaining window finds the sandbox stopped and resumes it.
+        current = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        if current is None or not current.archived:
             return False
         await asyncio.to_thread(launcher.stop, host.sandbox_id)
     except SandboxCapabilityError:
