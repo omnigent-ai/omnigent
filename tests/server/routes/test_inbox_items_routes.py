@@ -401,8 +401,16 @@ async def test_list_and_resolve(client: httpx.AsyncClient, stores: SimpleNamespa
     taken = await client.patch(url, json={"resolution": "action_taken", "resolution_action": 0})
     assert taken.status_code == 200
     assert (taken.json()["status"], taken.json()["resolution_action"]) == ("done", 0)
+    # Each change reports the caller's unread total after it.
+    assert (taken.json()["unread_count"], taken.json()["unread_count_capped"]) == (0, False)
     reopened = (await client.patch(url, json={"resolution": "none"})).json()
     assert (reopened["status"], reopened["resolution"]) == ("read", "none")
+    back = (await client.patch(url, json={"status": "unread"})).json()
+    assert (back["status"], back["unread_count"], back["unread_count_capped"]) == (
+        "unread",
+        1,
+        False,
+    )
     # "Already done" closes the item as done, not as a dismissal.
     already = (await client.patch(url, json={"resolution": "already_done"})).json()
     assert (already["status"], already["resolution"]) == ("done", "already_done")

@@ -352,6 +352,16 @@ def create_inbox_items_router(
             ) from exc
         if item is None:
             raise OmnigentError("Inbox item not found", code=ErrorCode.NOT_FOUND)
-        return _item_json(item)
+        # The caller's unread total after this change, so a client can set its
+        # badge from the server's count instead of inferring the move from a
+        # page it fetched at some unknown point during the request.
+        unread = await asyncio.to_thread(
+            lambda: store.count_unread(owner, limit=UNREAD_COUNT_LIMIT)
+        )
+        return {
+            **_item_json(item),
+            "unread_count": unread,
+            "unread_count_capped": unread >= UNREAD_COUNT_LIMIT,
+        }
 
     return router
