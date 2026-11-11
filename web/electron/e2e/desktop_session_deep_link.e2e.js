@@ -1,10 +1,6 @@
-// A chat reply that links another session with `omnigent://<host>/c/<id>`
-// opens that chat in the same desktop window when clicked: no "[blocked]"
-// text, no external-protocol prompt, no second window.
-//
-// Run after building web, on Linux with an X display:
-//   OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_session_deep_link.e2e.js
-// OMNIGENT_PYTHON selects the backend; OMNIGENT_DESKTOP_RECORD_DIR keeps a paced recording.
+// Clicking an `omnigent://<host>/c/<id>` link in a reply opens that chat in the same window.
+// Run: OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_session_deep_link.e2e.js
+// Env: OMNIGENT_PYTHON (backend), OMNIGENT_DESKTOP_RECORD_DIR (paced recording).
 
 "use strict";
 
@@ -95,7 +91,11 @@ it(
       );
 
       recordingStart = Date.now();
-      app = await launchDesktop({ serverUrl, recordDir });
+      app = await launchDesktop({
+        serverUrl,
+        recordDir,
+        userDataDir: path.join(tmpDir, "profile"),
+      });
       const { window, electronApp } = app;
       await window.goto(`${serverUrl}/c/${sessionId}`);
       const composer = window.getByRole("textbox", { name: "Message the agent" });
@@ -129,6 +129,8 @@ it(
       );
       assert.deepEqual(windowsAfter, windowsBefore, "the link opened or closed a window");
       await pause(3_000);
+      // End the clip on this state rather than on the window closing.
+      await app.stopDisplayCapture();
     } finally {
       if (app) {
         await app.electronApp.close().catch(() => {});

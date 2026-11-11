@@ -157,17 +157,26 @@ describe("popupPolicy — everything else keeps leaving the shell", () => {
     assert.deepEqual(decision, { kind: "protocol-consent", scheme: "vscode:" });
   });
 
-  it("opens an Omnigent session link from the pinned server in the app", () => {
+  const LOCAL = "http://127.0.0.1:53694";
+  const localContext = (overrides = {}) =>
+    pinnedContext({ openerOrigin: LOCAL, pinnedOrigin: LOCAL, ...overrides });
+  const decide = (url, context) =>
+    decideWindowOpen({ url, disposition: "foreground-tab", features: "" }, context);
+  const consent = { kind: "protocol-consent", scheme: "omnigent:" };
+
+  it("opens a session link to the window's own server in the app", () => {
     for (const url of [
       "omnigent://127.0.0.1:53694/c/e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9",
-      "omnigent://omnigent.example.com/c/conv_abc/",
+      "omnigent://127.0.0.1:53694/c/conv_abc/",
     ]) {
-      const decision = decideWindowOpen(
-        { url, disposition: "foreground-tab", features: "" },
-        pinnedContext(),
-      );
-      assert.deepEqual(decision, { kind: "deep-link" }, `expected deep-link for ${url}`);
+      assert.deepEqual(decide(url, localContext()), { kind: "deep-link" }, url);
     }
+    const remote = "omnigent://omnigent.example.com/c/abc";
+    const remoteOrigin = "https://omnigent.example.com";
+    assert.deepEqual(
+      decide(remote, pinnedContext({ openerOrigin: remoteOrigin, pinnedOrigin: remoteOrigin })),
+      { kind: "deep-link" },
+    );
   });
 
   it("prompts for any other omnigent: link", () => {
@@ -178,30 +187,28 @@ describe("popupPolicy — everything else keeps leaving the shell", () => {
       "omnigent://127.0.0.1:53694/c/abc?",
       "omnigent://127.0.0.1:53694/c/abc#x",
       "omnigent://user:secret@127.0.0.1:53694/c/abc",
+      "omnigent://127.0.0.1:53694/inbox/../c/abc",
     ]) {
-      const decision = decideWindowOpen(
-        { url, disposition: "foreground-tab", features: "" },
-        pinnedContext(),
-      );
-      assert.deepEqual(
-        decision,
-        { kind: "protocol-consent", scheme: "omnigent:" },
-        `expected protocol-consent for ${url}`,
-      );
+      assert.deepEqual(decide(url, localContext()), consent, url);
+    }
+  });
+
+  it("prompts for a session link to a different server", () => {
+    for (const url of [
+      "omnigent://omnigent.example.com/c/abc",
+      "omnigent://127.0.0.1:53695/c/abc",
+    ]) {
+      assert.deepEqual(decide(url, localContext()), consent, url);
     }
   });
 
   it("prompts for a session link opened from a page off the pinned server", () => {
     const url = "omnigent://127.0.0.1:53694/c/abc";
     for (const context of [
-      pinnedContext({ openerOrigin: "https://sso.example.com" }),
+      localContext({ openerOrigin: "https://sso.example.com" }),
       { openerOrigin: null, pinnedOrigin: null },
     ]) {
-      const decision = decideWindowOpen(
-        { url, disposition: "foreground-tab", features: "" },
-        context,
-      );
-      assert.deepEqual(decision, { kind: "protocol-consent", scheme: "omnigent:" });
+      assert.deepEqual(decide(url, context), consent);
     }
   });
 

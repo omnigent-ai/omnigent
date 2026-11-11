@@ -105,30 +105,19 @@ export function shortFileCitationLabel(text: string): string | null {
   return text.slice(slash + 1);
 }
 
-// An Omnigent session deep link, `omnigent://<host[:port]>/c/<session_id>`,
-// which the desktop app registers. No credentials, query or fragment.
-const OMNIGENT_SESSION_PATH = /^\/c\/[A-Za-z0-9_-]+\/?$/;
+// An Omnigent session deep link, `omnigent://<host[:port]>/c/<session_id>`, which
+// the desktop app registers. Matched on the raw href: no credentials, query,
+// fragment, or dot segments.
+const OMNIGENT_SESSION_LINK = /^omnigent:\/\/[^/?#@\\\s]+\/c\/[A-Za-z0-9_-]+\/?$/;
 
 /** Whether `href` is exactly an Omnigent session deep link. */
 export function isOmnigentSessionLink(href: string): boolean {
-  if (!/^omnigent:\/\//i.test(href)) return false;
-  let url: URL;
+  if (!OMNIGENT_SESSION_LINK.test(href)) return false;
   try {
-    url = new URL(href);
+    return new URL(href).host !== "";
   } catch {
     return false;
   }
-  return (
-    url.protocol === "omnigent:" &&
-    url.host !== "" &&
-    url.username === "" &&
-    url.password === "" &&
-    url.search === "" &&
-    url.hash === "" &&
-    !href.includes("?") &&
-    !href.includes("#") &&
-    OMNIGENT_SESSION_PATH.test(url.pathname)
-  );
 }
 
 /**
@@ -361,7 +350,12 @@ function isStreamdownHardenPlugin(
 function isStreamdownSanitizePlugin(
   plugin: StreamdownRehypePlugin,
 ): plugin is StreamdownSanitizePlugin {
-  return Array.isArray(plugin) && plugin.length >= 2 && typeof plugin[1] === "object";
+  return (
+    Array.isArray(plugin) &&
+    plugin.length >= 2 &&
+    typeof plugin[1] === "object" &&
+    plugin[1] !== null
+  );
 }
 
 /** Sanitize with `omnigent:` hrefs admitted, narrowed to session links right after. */
@@ -370,7 +364,11 @@ function withOmnigentSessionLinks(plugin: StreamdownRehypePlugin): StreamdownReh
     throw new Error("Streamdown sanitize plugin must be a [plugin, schema] tuple");
   }
   const schema = plugin[1];
-  const hrefProtocols = schema.protocols?.href ?? [];
+  // A schema without an href allowlist allows every scheme; adding one would block web links.
+  const hrefProtocols = schema.protocols?.href;
+  if (!hrefProtocols) {
+    throw new Error("Streamdown sanitize schema must restrict href protocols");
+  }
   return [
     [
       plugin[0],
@@ -405,9 +403,6 @@ function createStreamdownRehypePlugins(
     if (key === "sanitize") {
       sawSanitize = true;
       if (markFileLinks) plugins.push(rewriteFileUriLinks);
-    }
-
-    if (key === "sanitize") {
       plugins.push(...withOmnigentSessionLinks(plugin));
       continue;
     }

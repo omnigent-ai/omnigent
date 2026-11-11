@@ -49,19 +49,18 @@ const OAUTH_POPUP_ORIGINS = new Set([
 /** Popup-shaped features: an explicit width or height entry. */
 const SIZE_FEATURE_RE = /(^|,)\s*(width|height)\s*=/i;
 
+/** A plain session link: no credentials, query, fragment (so no CLI `desktop_ack`), or dot segments. */
+const SESSION_DEEP_LINK_RE = /^omnigent:\/\/[^/?#@\\\s]+\/c\/[A-Za-z0-9_-]+\/?$/;
+
 /**
- * Whether `url` is a plain Omnigent session deep link
- * (`omnigent://<host[:port]>/c/<id>`): no credentials, query, or fragment, so
- * a page cannot pass a CLI `desktop_ack` or anything beyond the chat to open.
+ * Whether `raw` is a plain session deep link to the server at `origin`.
  *
- * @param {URL} parsed
  * @param {string} raw
+ * @param {string} origin
  * @returns {boolean}
  */
-function isPageSessionDeepLink(parsed, raw) {
-  if (parsed.protocol !== "omnigent:" || parsed.username || parsed.password) return false;
-  if (raw.includes("?") || raw.includes("#")) return false;
-  return parseOmnigentDeepLink(raw)?.path.startsWith("/c/") ?? false;
+function isSessionDeepLinkTo(raw, origin) {
+  return SESSION_DEEP_LINK_RE.test(raw) && parseOmnigentDeepLink(raw)?.origin === origin;
 }
 
 /**
@@ -88,11 +87,11 @@ function decideWindowOpen(details, context) {
     return { kind: "ignore" };
   }
   if (!WEB_SCHEMES.has(parsed.protocol)) {
-    // A chat link to another session, clicked on the window's own server, opens
-    // in this app directly; from any other page it gets the generic prompt.
+    // A chat link to another session on the window's own server opens in this
+    // app directly; other pages and other servers get the generic prompt.
     const { openerOrigin, pinnedOrigin } = context;
     const onPinnedServer = pinnedOrigin !== null && openerOrigin === pinnedOrigin;
-    if (onPinnedServer && isPageSessionDeepLink(parsed, details.url)) {
+    if (onPinnedServer && isSessionDeepLinkTo(details.url, pinnedOrigin)) {
       return { kind: "deep-link" };
     }
     return { kind: "protocol-consent", scheme: parsed.protocol };
