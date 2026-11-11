@@ -1858,28 +1858,34 @@ async def test_runner_change_waits_for_a_move_to_release_its_claim(
     assert not await startup.accepts(conv, env.app)
 
 
+@pytest.mark.parametrize("runner_id", ["", "runner_other_tab"])
 async def test_runner_release_racing_a_move_keeps_its_claim(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,
+    runner_id: str,
 ) -> None:
     """
-    A runner release that read the session just before a move claimed it is
-    refused rather than clearing the move's claim.
+    A runner release or rebind that read the session just before a move claimed
+    it is refused as a conflict rather than overwriting the move's claim.
     """
     from omnigent.server.managed_hosts import new_move_claim
+    from tests.server.helpers import register_test_runner
 
     env = managed_session_env
     session_id = await _session_released_from_laptop(env, agent_name="move-claim-race-agent")
     claim = new_move_claim()
-    clear_runner_id = env.conv_store.clear_runner_id
+    method = "clear_runner_id" if runner_id == "" else "replace_runner_id"
+    if runner_id:
+        register_test_runner(env.app, runner_id)
+    write = getattr(env.conv_store, method)
 
-    def claim_then_clear(conversation_id: str, **kwargs: Any) -> Conversation:
+    def claim_then_write(conversation_id: str, *args: Any, **kwargs: Any) -> Conversation:
         assert env.conv_store.set_runner_id(conversation_id, claim)
-        return clear_runner_id(conversation_id, **kwargs)
+        return write(conversation_id, *args, **kwargs)
 
-    monkeypatch.setattr(env.conv_store, "clear_runner_id", claim_then_clear)
+    monkeypatch.setattr(env.conv_store, method, claim_then_write)
 
-    resp = await env.client.patch(f"/v1/sessions/{session_id}", json={"runner_id": ""})
+    resp = await env.client.patch(f"/v1/sessions/{session_id}", json={"runner_id": runner_id})
 
     assert resp.status_code == 409, resp.text
     conv = env.conv_store.get_conversation(session_id)
@@ -2337,13 +2343,20 @@ async def test_shutdown_after_the_sandbox_runner_starts_keeps_held_messages(
 async def test_sandbox_bound_on_another_replica_hands_over_without_the_claim(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+    tmp_path: Path,
 ) -> None:
     """
     When the sandbox host is online in shared storage but its tunnel is on
     another replica, the launching replica binds the session and drops the
-    move's claim, so that replica's startup recovery can start the runner.
+    move's claim, so that replica's startup recovery can start the runner. A
+    recovery pass there between the bind and the handover waits for the claim
+    instead of finishing the startup, and the next one starts the runner with
+    no message needed.
     """
     import threading
+
+    from omnigent.server.managed_hosts import is_move_claim
 
     env = managed_session_env
     monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
@@ -2356,6 +2369,51 @@ async def test_sandbox_bound_on_another_replica_hands_over_without_the_claim(
         )
         started.append(invocation.host_id)
 
+    # The replica holding the sandbox's tunnel, where its startup recovery runs.
+    other_app, _, _ = _managed_app(db_uri, tmp_path / "sandbox-replica")
+    other_startup = other_app.state.startup_inputs
+    other_hosts = other_startup.hosts
+    admissions: list[str] = []
+
+    async def admit_launch(conn: object, conversation_id: str, **_: object) -> None:
+        admissions.append(conversation_id)
+
+    def host_gone(conn: object, text: str) -> None:
+        # The runner is bound by now; the host's answer isn't under test.
+        raise ConnectionError("host gone")
+
+    monkeypatch.setattr(other_hosts, "admit_launch", admit_launch)
+    monkeypatch.setattr(other_hosts, "send_text", host_gone)
+    monkeypatch.setattr(other_hosts, "get", lambda host_id: None)
+
+    def sandbox_connection(host_id: str) -> Any:
+        return SimpleNamespace(
+            host_id=host_id, owner=None, pending_launches={}, registered_with_managed_token=True
+        )
+
+    loop = asyncio.get_running_loop()
+    early_recovery: list[bool] = []
+    clear_runner_id = env.conv_store.clear_runner_id
+
+    def recover_there_then_hand_over(conversation_id: str, **kwargs: Any) -> Conversation:
+        expected = kwargs.get("expected_binding")
+        if (
+            expected is not None
+            and is_move_claim(expected.runner_id)
+            and expected.host_id is not None
+            and not early_recovery
+        ):
+            early_recovery.append(
+                asyncio.run_coroutine_threadsafe(
+                    other_startup._recover_session(
+                        other_app, conversation_id, sandbox_connection(expected.host_id)
+                    ),
+                    loop,
+                ).result(timeout=10)
+            )
+        return clear_runner_id(conversation_id, **kwargs)
+
+    monkeypatch.setattr(env.conv_store, "clear_runner_id", recover_there_then_hand_over)
     provisioned = threading.Event()
     fake = FakeSandboxLauncher(on_host_start=online_elsewhere, provision_gate=provisioned)
     install_fake_modal_launcher(monkeypatch, fake)
@@ -2371,6 +2429,17 @@ async def test_sandbox_bound_on_another_replica_hands_over_without_the_claim(
     assert conv is not None
     assert (conv.host_id, conv.runner_id) == (started[0], None)
     assert conv.labels.get(STARTUP_LABEL) == "pending"
+    # Still in flight, so the worker polls again soon.
+    assert early_recovery == [True]
+    assert admissions == []
+
+    assert await other_startup._recover_session(
+        other_app, session_id, sandbox_connection(started[0])
+    )
+    assert admissions == [session_id]
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None and conv.runner_id is not None
+    assert not is_move_claim(conv.runner_id)
 
 
 async def test_refused_sandbox_move_releases_its_claim_when_restoring_labels_fails(

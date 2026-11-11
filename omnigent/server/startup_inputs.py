@@ -461,6 +461,13 @@ class ManagedStartupInputs:
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
         if conv is None or conv.host_id != connection.host_id:
             return False
+        from omnigent.server.managed_hosts import is_move_claim, move_claim_is_live
+
+        if is_move_claim(conv.runner_id):
+            # A move holds the session until its sandbox's runner replaces the
+            # claim or the claim is handed over to this replica: nothing to deliver
+            # or finish yet, and soon a runner to start.
+            return move_claim_is_live(conv.runner_id)
         state = conv.labels.get(STARTUP_LABEL)
         if state == "failed":
             return False

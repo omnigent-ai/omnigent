@@ -3800,12 +3800,18 @@ def register_core_routes(
                     )
                     if not handled:
                         if profile_catalog is None:
-                            await asyncio.to_thread(
-                                conversation_store.replace_runner_id,
-                                session_id,
-                                runner_id,
-                                expected_runner=conv,
-                            )
+                            try:
+                                await asyncio.to_thread(
+                                    conversation_store.replace_runner_id,
+                                    session_id,
+                                    runner_id,
+                                    expected_runner=conv,
+                                )
+                            except ValueError as exc:
+                                raise OmnigentError(
+                                    "The session's runner changed. Reload and try again.",
+                                    code=ErrorCode.CONFLICT,
+                                ) from exc
                         else:
                             await asyncio.to_thread(
                                 conversation_store.replace_runner_id,

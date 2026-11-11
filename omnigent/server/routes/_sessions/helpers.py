@@ -6913,7 +6913,7 @@ def _start_managed_launch_task(
         finally:
             await release_claim()
 
-    # A create's launch records its failure as it always has.
+    # Only a move's failure carries its claim; a create's launch has none.
     move_kwargs = {"move_claim": held_runner_id} if held_runner_id is not None else {}
 
     def record_failure(reason: str) -> Callable[[], Awaitable[object]] | None:
