@@ -751,6 +751,10 @@ def harness_setup_hint(harness: str | None) -> str:
     SDK-based ``cursor`` harness (``cursor-sdk`` + ``CURSOR_API_KEY``). For
     those, name the vendor installer and the CLI's own login instead.
 
+    UI-installable harnesses also name Settings › Harnesses, which installs
+    through the host itself: ``omni setup`` run in a terminal can find a CLI
+    the host process can't, report it ready, and leave the host unfixed.
+
     :param harness: An executor harness identifier, e.g. ``"cursor-native"``,
         ``"claude-native"``, or ``"codex"``; ``None`` falls back to the
         ``omni setup`` hint.
@@ -781,11 +785,15 @@ def harness_setup_hint(harness: str | None) -> str:
             login = f", then run `{spec.binary} {' '.join(spec.login_args)}`"
         elif spec.auth_hint:
             login = f", then {spec.auth_hint}"
-        return f"install the {spec.binary} CLI on that machine with `{spec.install_hint}`{login}"
-    return (
-        f"run `{cli_invocation(name='omni')} setup` on that machine to install "
-        "the CLI and set a default credential"
-    )
+        hint = f"install the {spec.binary} CLI on that machine with `{spec.install_hint}`{login}"
+    else:
+        hint = (
+            f"run `{cli_invocation(name='omni')} setup` on that machine to install "
+            "the CLI and set a default credential"
+        )
+    if spec is not None and harness and ui_install_key(harness) is not None:
+        hint += f", or set up {spec.display} for that host in Settings › Harnesses"
+    return hint
 
 
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")
