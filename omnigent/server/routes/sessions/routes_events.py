@@ -545,8 +545,10 @@ async def _raise_if_runner_re_tunnelled_to_another_replica(
     :param session_id: Session/conversation identifier.
     :param runner_id: Runner id being classified (captured before the wait).
     :param conversation_store: Store used to re-read the fresh runner stamp.
-    :raises OmnigentError: ``WRONG_REPLICA`` when the bound runner's liveness
-        stamp is fresh evidence written by another replica.
+    :raises WrongReplicaError: When the bound runner's liveness stamp is fresh
+        evidence written by another replica, naming the session's routing host.
+    :raises OmnigentError: ``WRONG_REPLICA`` for the same miss when no host is
+        bound anywhere in the session's chain.
     """
     if runner_id is None:
         return
@@ -560,6 +562,11 @@ async def _raise_if_runner_re_tunnelled_to_another_replica(
     if _runner_live_on_another_replica_from_conversations(
         [fresh], runner_id, last_liveness_stamp(runner_id)
     ):
+        host_id = await asyncio.to_thread(routing_host_id, fresh, conversation_store)
+        if host_id is not None:
+            raise WrongReplicaError(
+                "session runner re-tunnelled to another replica", host_id=host_id
+            )
         raise OmnigentError(
             "session runner re-tunnelled to another replica; retry",
             code=ErrorCode.WRONG_REPLICA,

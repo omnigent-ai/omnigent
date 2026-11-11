@@ -709,10 +709,11 @@ def _wrong_replica_error_body(request: Request, exc: WrongReplicaError) -> dict[
 
     A request not keyed to the host must resend keyed to it. A request already
     keyed to it missed because the tunnel dialed the default route, so it must
-    resend without the key, as first-party clients do.
+    resend without the key in either form, as first-party clients do.
 
     :param request: The rejected request; its slice-key header, or the query
-        parameter ingress falls back to, is compared with the host.
+        parameter ingress falls back to when the header is empty, is compared
+        with the host.
     :param exc: The wrong-replica error naming the host.
     :returns: The ``error`` object: code, message ending in the remedy,
         ``slice_key_header``, and ``slice_key`` to resend with (``None`` to
@@ -723,7 +724,10 @@ def _wrong_replica_error_body(request: Request, exc: WrongReplicaError) -> dict[
     )
     if request_slice_key == exc.host_id:
         resend_slice_key = None
-        remedy = f"resend without the {OMNIGENT_SLICE_KEY_HEADER} header"
+        remedy = (
+            f"resend without the {OMNIGENT_SLICE_KEY_HEADER} header "
+            "or omnigent_slice_key query parameter"
+        )
     else:
         resend_slice_key = exc.host_id
         remedy = f"resend with header {OMNIGENT_SLICE_KEY_HEADER}: {exc.host_id}"

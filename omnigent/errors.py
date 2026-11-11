@@ -192,9 +192,10 @@ class ErrorCode:
         (the same bytes succeed on the right replica), so the fix is to
         re-address it: a request not keyed to the host resends keyed to it,
         and one already keyed to it resends WITHOUT the key to reach a tunnel
-        on the default route. :class:`WrongReplicaError` names that key.
-        Distinct from ``RUNNER_UNAVAILABLE`` (no runner bound anywhere),
-        which no re-addressing can fix.
+        on the default route. :class:`WrongReplicaError` names that key; an
+        error without one (a binding that changed mid-request) retries
+        unchanged. Distinct from ``RUNNER_UNAVAILABLE`` (no runner bound
+        anywhere), which no re-addressing can fix.
     :cvar UNAUTHORIZED: No valid authentication credentials (HTTP 401).
     :cvar FORBIDDEN: Authenticated but insufficient permissions (HTTP 403).
     :cvar RUNNER_CAPABILITY_MISMATCH: The selected runner cannot

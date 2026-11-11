@@ -1184,7 +1184,9 @@ async def test_host_route_for_live_host_on_another_replica(
 _LIVE_HOST_ID = "0123456789abcdef0123456789abcdef"
 _SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key"
 _RESEND_KEYED = f"resend with header {_SLICE_KEY_HEADER}: {_LIVE_HOST_ID}"
-_RESEND_KEYLESS = f"resend without the {_SLICE_KEY_HEADER} header"
+_RESEND_KEYLESS = (
+    f"resend without the {_SLICE_KEY_HEADER} header or omnigent_slice_key query parameter"
+)
 
 
 @pytest.mark.asyncio
@@ -1202,8 +1204,24 @@ _RESEND_KEYLESS = f"resend without the {_SLICE_KEY_HEADER} header"
         ({_SLICE_KEY_HEADER: f"host_{_LIVE_HOST_ID}"}, {}, _LIVE_HOST_ID, _RESEND_KEYED),
         ({_SLICE_KEY_HEADER: _LIVE_HOST_ID}, {}, None, _RESEND_KEYLESS),
         ({}, {"omnigent_slice_key": _LIVE_HOST_ID}, None, _RESEND_KEYLESS),
+        # Like ingress, a non-empty header wins over the query fallback.
+        (
+            {_SLICE_KEY_HEADER: "fedcba9876543210fedcba9876543210"},
+            {"omnigent_slice_key": _LIVE_HOST_ID},
+            _LIVE_HOST_ID,
+            _RESEND_KEYED,
+        ),
+        ({_SLICE_KEY_HEADER: ""}, {"omnigent_slice_key": _LIVE_HOST_ID}, None, _RESEND_KEYLESS),
     ],
-    ids=["keyless", "other_key", "legacy_prefixed_key", "host_key", "host_query_key"],
+    ids=[
+        "keyless",
+        "other_key",
+        "legacy_prefixed_key",
+        "host_key",
+        "host_query_key",
+        "other_header_over_host_query",
+        "empty_header_host_query",
+    ],
 )
 async def test_wrong_replica_names_the_slice_key_that_reaches_the_host(
     db_uri: str,
