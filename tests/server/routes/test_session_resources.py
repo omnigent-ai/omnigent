@@ -6377,6 +6377,7 @@ async def test_codex_text_upload_beside_a_spilled_paste_settles_with_the_whole_m
     conv.labels["omnigent.wrapper"] = "codex-native-ui"
     bridge = tmp_path / "bridge"
     monkeypatch.setattr(codex_native_executor, "_MAX_INLINE_TEXT_CHARS", 1_000)
+    monkeypatch.setattr(codex_native_executor, "_MAX_CODEX_TEXT_INPUT_CHARS", 1_000)
     csv = "id,value\n" + "1,2\n" * 100
     paste = "pasted log line\n" * 60
     filename = (
@@ -11999,6 +12000,7 @@ async def test_spilled_receipt_preserves_exact_queue_ownership(
     conv.labels["omnigent.wrapper"] = "codex-native-ui"
     monkeypatch.setattr(native_attachments, "data_dir", lambda: tmp_path / "data")
     monkeypatch.setattr(codex_native_executor, "_MAX_INLINE_TEXT_CHARS", 500)
+    monkeypatch.setattr(codex_native_executor, "_MAX_CODEX_TEXT_INPUT_CHARS", 500)
 
     older_content = [{"type": "input_text", "text": "earlier input still awaiting its echo"}]
     older_id = pending_inputs.record(session_id, older_content, created_by="older@example.test")
