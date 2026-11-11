@@ -140,10 +140,7 @@ class CreateScheduledTaskRequest(BaseModel):
     # A session the caller owns. Create copies it, and every run starts a new
     # session from that copy; responses carry the copy's id here.
     source_session_id: str | None = Field(default=None, min_length=1)
-    # Epoch seconds the first run must fall at, checked against the schedule the
-    # task gets from its recorded creation timestamp. A one-time reminder sends it
-    # so a request that arrives late is refused instead of moving to the rule's
-    # next match.
+    # Expected first-run epoch; reject the create if the schedule resolves differently.
     first_run_at: int | None = Field(default=None, gt=0, le=_MAX_FIRST_RUN_AT)
 
     @model_validator(mode="after")
@@ -994,9 +991,9 @@ def create_scheduled_tasks_router(
                 raise OmnigentError(
                     "The schedule's first run would be "
                     f"{actual}, not {datetime.fromtimestamp(exc.expected, UTC).isoformat()} "
-                    "as requested, because the server recorded the task after that time "
-                    "(a late request, or a client clock behind the server's). "
-                    "The task was not created.",
+                    "as requested: the request may have arrived after that time, the "
+                    "client's clock may be behind the server's, or the rule may not match "
+                    "it. The task was not created.",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
             if isinstance(exc, RRuleSearchError):

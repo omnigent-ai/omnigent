@@ -800,7 +800,7 @@ async def test_the_reminder_tools_request_continues_its_session(
     session_id = _owned_session(db_uri)
     rule, fire_at = _one_time_rule_in(hours=2)
     when = datetime.fromtimestamp(fire_at, UTC)
-    # Exactly what sys_reminder_set sends: no host or workspace, the session's own
+    # The request body sys_reminder_set sends: no host or workspace, the session's own
     # agent, no permission override, and the first run pinned to the reminder's minute.
     resp = await auth_client.post(
         "/v1/scheduled-tasks",
@@ -853,7 +853,7 @@ async def test_late_create_refuses_a_one_time_rule_instead_of_moving_it_a_year(
     )
     assert resp.status_code == 400, resp.text
     assert "The task was not created." in resp.text
-    assert "client clock behind the server's" in resp.text
+    assert "may have arrived after that time" in resp.text
     assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
 
 
