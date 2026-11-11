@@ -1275,11 +1275,25 @@ def test_changes_find_reveals_collapsed_and_filtered(
     page.screenshot(path=str(tmp_path / f"find-{entry}-reopened.png"))
 
 
+# README.md's hunk, so its viewed mark has a patch to be checked against.
+_README_PATCH = (
+    "diff --git a/README.md b/README.md\n"
+    "new file mode 100644\n"
+    "index 0000000..4c2d3e1\n"
+    "--- /dev/null\n"
+    "+++ b/README.md\n"
+    "@@ -0,0 +1,2 @@\n"
+    "+# Demo\n"
+    "+Adds the GitHub tab.\n"
+)
+
+
 @pytest.mark.parametrize("entry", ["rail", "composer-mobile"])
 def test_changes_viewed_progress_persists_and_resets(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
 ) -> None:
-    """Viewed marks collapse files, survive a reload, and reset when the PR gets a new head."""
+    """Viewed marks collapse files and survive a reload. A new head keeps the mark on an
+    unchanged file and flags a changed one as "Changed since viewed"."""
     base_url, session_id = seeded_session
     mobile = entry == "composer-mobile"
     page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
@@ -1287,6 +1301,11 @@ def test_changes_viewed_progress_persists_and_resets(
     pr_url = _INFO["pr"]["url"]
     # The PR's head moves mid-test, so every resource answers for the current head.
     head = {"sha": "head1"}
+    # head2 reworks main.py's hunk and leaves README.md's hunk as it was.
+    patches = {
+        "head1": _PR_DIFF["patch"] + _README_PATCH,
+        "head2": _PR_DIFF["patch"].replace("+added line", "+reworked line") + _README_PATCH,
+    }
 
     def info_at_head(route: Route) -> None:
         route.fulfill(
@@ -1314,7 +1333,14 @@ def test_changes_viewed_progress_persists_and_resets(
     )
     page.route(
         re.compile(r"/resources/github/diff(?:\?|$)"),
-        lambda r: r.fulfill(json={**_PR_DIFF, "head_sha": head["sha"], "base_sha": "base"}),
+        lambda r: r.fulfill(
+            json={
+                **_PR_DIFF,
+                "patch": patches[head["sha"]],
+                "head_sha": head["sha"],
+                "base_sha": "base",
+            }
+        ),
     )
 
     def open_changes() -> Locator:
@@ -1334,11 +1360,12 @@ def test_changes_viewed_progress_persists_and_resets(
     panel = open_changes()
     expect(panel.get_by_text("0 / 2 files viewed", exact=True)).to_be_visible(timeout=30_000)
     panel.get_by_role("checkbox", name="Viewed README.md").click()
+    panel.get_by_role("checkbox", name="Viewed src/app/main.py").click()
     expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked()
-    expect(panel.get_by_text("1 / 2 files viewed", exact=True)).to_be_visible()
+    expect(panel.get_by_text("2 / 2 files viewed", exact=True)).to_be_visible()
     if not mobile:  # Mobile shows the count without the bar.
         expect(panel.get_by_role("progressbar", name="Files viewed")).to_have_attribute(
-            "aria-valuenow", "50"
+            "aria-valuenow", "100"
         )
     # Marking collapses the file's diff.
     expect(
@@ -1350,22 +1377,26 @@ def test_changes_viewed_progress_persists_and_resets(
     page.reload()
     panel = open_changes()
     expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked(timeout=30_000)
-    expect(panel.get_by_text("1 / 2 files viewed", exact=True)).to_be_visible()
+    expect(panel.get_by_text("2 / 2 files viewed", exact=True)).to_be_visible()
 
-    # A new head starts with no marks and says so until the notice is dismissed.
+    # The new head changes main.py's hunk. README.md keeps its mark, and main.py loses its
+    # mark and is flagged until it is marked again.
     head["sha"] = "head2"
     page.reload()
     panel = open_changes()
-    expect(panel.get_by_text("0 / 2 files viewed", exact=True)).to_be_visible(timeout=30_000)
-    expect(panel.get_by_role("checkbox", name="Viewed README.md")).not_to_be_checked()
-    expect(panel.get_by_text(re.compile("viewed marks were reset"))).to_be_visible()
+    expect(panel.get_by_text("1 / 2 files viewed", exact=True)).to_be_visible(timeout=30_000)
+    expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked()
+    expect(panel.get_by_role("checkbox", name="Viewed src/app/main.py")).not_to_be_checked()
+    expect(panel.get_by_text("Changed since viewed", exact=True)).to_have_count(1)
+    expect(panel.get_by_text(re.compile("changed files lost their viewed marks"))).to_be_visible()
     page.screenshot(path=str(tmp_path / f"viewed-{entry}-reset.png"), animations="disabled")
     panel.get_by_role("button", name="Dismiss", exact=True).click()
-    expect(panel.get_by_text(re.compile("viewed marks were reset"))).to_have_count(0)
+    expect(panel.get_by_text(re.compile("changed files lost their viewed marks"))).to_have_count(0)
 
-    # Hiding viewed files, once every file is viewed, shows the all-viewed state.
-    panel.get_by_role("checkbox", name="Viewed README.md").click()
+    # Marking the changed file on the new head clears its badge. Then hiding viewed files,
+    # once every file is viewed, shows the all-viewed state.
     panel.get_by_role("checkbox", name="Viewed src/app/main.py").click()
+    expect(panel.get_by_text("Changed since viewed", exact=True)).to_have_count(0)
     panel.get_by_role("checkbox", name="Hide viewed").click()
     expect(panel.get_by_text("All 2 files viewed", exact=True)).to_be_visible()
     if not mobile:
@@ -1489,3 +1520,135 @@ def test_changes_filter_copy_open(page: Page, seeded_session: tuple[str, str], e
     expect(page.get_by_role("menuitem", name="Open in GitHub")).to_have_attribute(
         "href", "https://example.com/fork/app/blob/head/README.md"
     )
+
+
+_COMMIT_ONE, _COMMIT_TWO = "1" * 40, "2" * 40
+# GET /resources/github/commits — oldest first; each commit's patch is served by sha below.
+_COMMITS = {
+    "object": "list",
+    "has_more": False,
+    "data": [
+        {
+            "object": "session.github.commit",
+            "sha": _COMMIT_ONE,
+            "title": "Add the parser",
+            "author": "Ada",
+            "date": "2026-11-01T10:00:00Z",
+        },
+        {
+            "object": "session.github.commit",
+            "sha": _COMMIT_TWO,
+            "title": "Wire the README",
+            "author": "Grace",
+            "date": "2026-11-02T10:00:00Z",
+        },
+    ],
+}
+_COMMIT_PATCHES = {
+    _COMMIT_ONE: _PR_DIFF["patch"],
+    _COMMIT_TWO: (
+        "diff --git a/README.md b/README.md\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/README.md\n"
+        "@@ -0,0 +1 @@\n"
+        "+# Demo\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("entry", ["rail"])
+def test_changes_commits_view_lists_and_opens_a_commit(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
+) -> None:
+    """Switch the Changes tab to Commits, open one commit, and step between commits.
+
+    Only the commit's own files are listed, the viewed controls are absent there, and
+    Back returns to the commit list. The commit list and patches are stubbed routes.
+    """
+    base_url, session_id = seeded_session
+    pr_url = _INFO["pr"]["url"]
+    _stub_github(page)
+    # Commit history needs the Changes list pinned to a head, and the provider to support it.
+    page.route(
+        re.compile(r"/resources/github(?:\?|$)"),
+        lambda route: route.fulfill(
+            json={
+                **_INFO,
+                "tracking_available": True,
+                "selected_pr_url": pr_url,
+                "capabilities": {"commit_history": True},
+                "prs": [
+                    {
+                        "url": pr_url,
+                        "host": "example.com",
+                        "repository": "acme/app",
+                        "number": _PR_NUMBER,
+                        "relationship": "created",
+                    }
+                ],
+            }
+        ),
+    )
+    page.route(
+        re.compile(r"/resources/github/changes"),
+        lambda route: route.fulfill(json={**_CHANGES, "head_sha": "head", "base_sha": "base"}),
+    )
+    list_urls: list[str] = []
+    patch_urls: list[str] = []
+
+    def commit_list(route: Route) -> None:
+        list_urls.append(route.request.url)
+        route.fulfill(json=_COMMITS)
+
+    def commit_patch(route: Route) -> None:
+        patch_urls.append(route.request.url)
+        sha = re.search(r"commit_sha=([0-9a-f]+)", route.request.url)
+        assert sha is not None, route.request.url
+        route.fulfill(
+            json={"object": "session.github.pr_diff", "patch": _COMMIT_PATCHES[sha.group(1)]}
+        )
+
+    page.route(re.compile(r"/resources/github/commits"), commit_list)
+    # The whole-PR patch reports the head it describes, so viewed marks are available in Changes.
+    page.route(
+        re.compile(r"/resources/github/diff(?:\?|$)"),
+        lambda route: route.fulfill(json={**_PR_DIFF, "head_sha": "head", "base_sha": "base"}),
+    )
+    page.route(re.compile(r"/resources/github/commit-diff\?"), commit_patch)
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    panel = page.get_by_role("complementary", name="Workspace")
+    panel.get_by_role("tab", name="Pull Requests").click()
+    panel.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
+    files = panel.locator("[data-github-file]")
+    expect(files).to_have_count(2, timeout=30_000)
+    expect(panel.get_by_role("checkbox", name="Hide viewed")).to_be_visible()
+    expect(panel.get_by_role("checkbox", name="Viewed src/app/main.py")).to_be_visible()
+
+    panel.get_by_role("group", name="Show changes or commits").get_by_role(
+        "button", name="Commits", exact=True
+    ).click()
+    search = panel.get_by_role("searchbox", name="Search commits")
+    expect(panel.get_by_text("2 commits", exact=True)).to_be_visible()
+    search.fill("readme")
+    expect(panel.get_by_role("button", name=re.compile("Wire the README"))).to_be_visible()
+    expect(panel.get_by_role("button", name=re.compile("Add the parser"))).to_have_count(0)
+    search.fill("")
+    page.screenshot(path=str(tmp_path / f"commits-{entry}-list.png"), animations="disabled")
+
+    panel.get_by_role("button", name=re.compile("Add the parser")).click()
+    expect(files).to_have_count(1)
+    expect(files).to_have_attribute("data-github-file", "src/app/main.py")
+    expect(panel.get_by_role("checkbox", name="Hide viewed")).to_have_count(0)
+    expect(panel.get_by_role("checkbox", name="Viewed src/app/main.py")).to_have_count(0)
+    # The list is pinned to the head the Changes list shows; the patch names the selected commit.
+    assert "head_sha=head" in list_urls[0], list_urls
+    assert "/resources/github/commit-diff?" in patch_urls[-1], patch_urls
+    assert f"commit_sha={_COMMIT_ONE}" in patch_urls[-1], patch_urls
+    page.screenshot(path=str(tmp_path / f"commits-{entry}-diff.png"), animations="disabled")
+
+    panel.get_by_role("button", name="Next commit").click()
+    expect(files).to_have_attribute("data-github-file", "README.md")
+    panel.get_by_role("button", name="Back to commits").click()
+    expect(panel.get_by_text("2 commits", exact=True)).to_be_visible()

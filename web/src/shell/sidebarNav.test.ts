@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { orderSessionFamilies } from "@/lib/sessionFamilies";
 import {
   type ActiveChatOverride,
+  appendPinWrites,
   bareConversationId,
   computeNextActiveOverride,
   conversationDisplayLabel,
@@ -194,6 +196,19 @@ describe("orderByPinnedTimestamp", () => {
     ]);
   });
 
+  it("uses the family pin position for every member without pinning each member", () => {
+    const member = pinned("peer", undefined, new Date(2026, 4, 14, 9));
+    member.family = {
+      id: "family",
+      representative_id: "representative",
+      pinned: true,
+      pinned_at: "500",
+    };
+    const other = pinned("other", 1000, new Date(2026, 4, 14, 9));
+    expect(orderByPinnedTimestamp([other, member]).map((row) => row.id)).toEqual(["peer", "other"]);
+    expect(member.labels["omnigent.pinned"]).toBeUndefined();
+  });
+
   it("does not mutate the input array", () => {
     const convA = pinned("conv_a", 2000, new Date(2026, 4, 14, 9));
     const convB = pinned("conv_b", 1000, new Date(2026, 4, 14, 8));
@@ -275,9 +290,36 @@ describe("pinOrderWrites", () => {
     ]);
   });
 
+  it("inserts a not-yet-pinned session below the row with below", () => {
+    expect(pinOrderWrites(pins(1000, 2000), "new", "conv_1", true)).toEqual([
+      { id: "new", pinnedAt: 2001 },
+    ]);
+    expect(pinOrderWrites(pins(1000, 2000), "new", "conv_0", true)).toEqual([
+      { id: "new", pinnedAt: 1500 },
+    ]);
+    // An existing pin still moves into the row's slot.
+    expect(pinOrderWrites(pins(1000, 2000, 3000), "conv_0", "conv_1", true)).toEqual(
+      pinOrderWrites(pins(1000, 2000, 3000), "conv_0", "conv_1"),
+    );
+  });
+
   it("is a no-op for a drop on itself or an unknown row", () => {
     expect(pinOrderWrites(pins(1000, 2000), "conv_0", "conv_0")).toEqual([]);
     expect(pinOrderWrites(pins(1000, 2000), "conv_0", "missing")).toEqual([]);
+  });
+
+  it("reorders family representatives without pinning their context rows", () => {
+    const rows = pins(100, 200, undefined);
+    const family = { id: "family", representative_id: "conv_1", pinned: true, pinned_at: "200" };
+    rows[1].family = family;
+    rows[2].family = family;
+    expect(pinOrderWrites(rows, "conv_0", "conv_1")).toEqual([{ id: "conv_0", pinnedAt: 201 }]);
+    rows[0].labels = { "omnigent.pinned": "200" };
+    expect(pinOrderWrites(rows, "new", "conv_1")).toEqual([
+      { id: "new", pinnedAt: 201 },
+      { id: "conv_1", pinnedAt: 202 },
+    ]);
+    expect(pinOrderWrites(rows, "conv_0", "conv_2")).toEqual([]);
   });
 
   it("produces values that orderByPinnedTimestamp sorts into the dragged order", () => {
@@ -292,6 +334,65 @@ describe("pinOrderWrites", () => {
       "conv_1",
       "conv_2",
     ]);
+  });
+
+  it("appends a new pin past every shown row's value with appendPinWrites", () => {
+    const rows = pins(1000, 2000, undefined);
+    rows[2].family = { id: "family", representative_id: "parent", pinned: true, pinned_at: "3000" };
+    expect(appendPinWrites(rows, "new")).toEqual([{ id: "new", pinnedAt: 3001 }]);
+    // A pin without a value sorts last, so it's numbered first.
+    expect(appendPinWrites(pins(1000, undefined), "new")).toEqual([
+      { id: "conv_1", pinnedAt: 1001 },
+      { id: "new", pinnedAt: 1002 },
+    ]);
+    expect(appendPinWrites([], "new")).toEqual([]);
+  });
+
+  it("keeps a valueless pin below a family shown without its representative when appending", () => {
+    // Shown order: conv_0 (1000), conv_1 (a family member, family at 3000), conv_2 (no value).
+    const rows = pins(1000, undefined, undefined);
+    rows[1].family = { id: "family", representative_id: "parent", pinned: true, pinned_at: "3000" };
+    const writes = appendPinWrites(rows, "new");
+    expect(writes).toEqual([
+      { id: "conv_2", pinnedAt: 3001 },
+      { id: "new", pinnedAt: 3002 },
+    ]);
+    const byId = new Map(writes.map((w) => [w.id, w.pinnedAt]));
+    const next = [...rows, conversation("new", null, new Date(2026, 4, 14, 8))].map((c) =>
+      byId.has(c.id) ? { ...c, labels: { "omnigent.pinned": String(byId.get(c.id)) } } : c,
+    );
+    expect(orderByPinnedTimestamp(next).map((c) => c.id)).toEqual([
+      "conv_0",
+      "conv_1",
+      "conv_2",
+      "new",
+    ]);
+  });
+
+  it("doesn't give a valueless nested family row a value when appending", () => {
+    const rows = pins(1000, undefined, undefined);
+    rows[1].family = { id: "family", representative_id: "parent", pinned: true };
+    expect(appendPinWrites(rows, "new")).toEqual([{ id: "new", pinnedAt: 1001 }]);
+    rows[0].family = rows[1].family;
+    rows[0].labels = {};
+    expect(appendPinWrites(rows.slice(0, 2), "new")).toEqual([]);
+  });
+
+  it("numbers valueless pins just below now when no shown row has a value", () => {
+    vi.useFakeTimers({ now: 5000 });
+    try {
+      expect(appendPinWrites(pins(undefined, undefined), "new")).toEqual([
+        { id: "conv_0", pinnedAt: 4998 },
+        { id: "conv_1", pinnedAt: 4999 },
+        { id: "new", pinnedAt: 5000 },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("falls back to a plain pin when the values are too large to step past", () => {
+    expect(appendPinWrites(pins(Number.MAX_SAFE_INTEGER), "new")).toEqual([]);
   });
 });
 
@@ -854,6 +955,27 @@ describe("Custom order", () => {
       "history-active",
       "history-tie",
       "history",
+    ]);
+  });
+
+  it("keeps a family's custom slot through new members and representative promotion", () => {
+    const family = { id: "origin", representative_id: "a", pinned: false };
+    const a = { ...row("a", 1), family };
+    const b = { ...row("b", 200), family };
+    const x = row("x", 2);
+    const order = { base: "updated" as const, since: 100, ids: ["x", "origin"] };
+    const ordered = (rows: Conversation[]) =>
+      ids(
+        orderSessionFamilies(
+          sortConversations(rows, null, null, "updated_at", customSortOrder(order)),
+        ),
+      );
+    expect(ordered([a, b, x])).toEqual(["x", "a", "b"]);
+    const promoted = { ...b, family: { ...family, representative_id: "b" } };
+    expect(ordered([promoted, x])).toEqual(["x", "b"]);
+    expect(moveCustomOrder(order, [promoted, x], "b", "x", null, null)?.ids).toEqual([
+      "origin",
+      "x",
     ]);
   });
 
