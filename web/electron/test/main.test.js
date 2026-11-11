@@ -2222,6 +2222,7 @@ describe("Databricks auth mode wiring", () => {
 
     it("keeps the workspace URL for sign-in, and shows the pick", async (t) => {
       const h = await joinThroughAccount(t);
+      assert.deepEqual(h.calls.loadURL, [[workspace]]);
       assert.equal(saved(h).server_url, workspace);
       assert.deepEqual(saved(h).recent_servers, [workspace]);
       assert.deepEqual(saved(h).server_labels, { [workspaceOrigin]: picked });
@@ -4180,21 +4181,25 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     });
   }
 
-  it("does not retry credential failures", async (t) => {
+  it("does not retry credential failures, and Connect returns to the failed page", async (t) => {
     const h = browserHarness(t, [25], {
-      ensureSession: async () => {
+      ensureSession: async (_ses, sessionOrigin, { interactive }) => {
+        if (interactive) return sessionOrigin;
         throw Object.assign(new Error("expired with no refresh token"), {
           errorCode: "NO_REFRESH_TOKEN",
         });
       },
     });
-    await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+    h.api.registerIpc();
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace, "/c/conv_1"));
     await wait(50);
     assert.equal(h.calls.auth.length, 1);
     assert.deepEqual(setupParams(h), {
       error: "Session expired. Connect to sign in again.",
       url: workspace,
     });
+    await h.ipc.get("omnigent:set-server-url")(setupEvent(h), workspace);
+    assert.deepEqual(h.calls.loadURL, [[`${workspace}/c/conv_1`]]);
   });
 
   it("goes straight to setup for other windows and non-network errors", async (t) => {
@@ -4442,6 +4447,61 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
     assert.equal(h.overlay.hint, null);
     assert.equal(network.browserSignIns, 0);
   });
+
+  // [Connect target, its URL (null: the setup page's pre-filled server), page loaded]
+  for (const [label, connectTo, landing] of [
+    ["the linked account host", null, `${workspace}/c/conv_1`],
+    ["another server", "https://server.example/", "https://server.example/"],
+  ]) {
+    it(`opens Connect to ${label} after an account-host deep link needs sign-in`, async (t) => {
+      const accountOrigin = "https://accounts.cloud.databricks.com";
+      const network = createWorkspaceNetwork(origin, {
+        oauth: {
+          // Tokens are stored per workspace, never under the account origin.
+          getValidStoredToken: async () => {
+            throw Object.assign(new Error("no stored token"), { errorCode: "NO_STORED_TOKEN" });
+          },
+          runInteractiveLogin: async () => {
+            network.browserSignIns++;
+            return { tokens: { access_token: "token" }, issuerOrigin: accountOrigin };
+          },
+        },
+        account: {
+          parseAccountFromToken: () => ({ accountOrigin, accountId: "account" }),
+          listRunningWorkspaces: async () => [
+            { workspaceId: "123", fqdn: new URL(origin).hostname },
+          ],
+        },
+      });
+      const h = loadNavigationHarness({
+        serverUrl: workspace,
+        databricksMode: "browser",
+        network,
+        deepLinks: require("../src/deepLink"),
+        expandWorkspace: async (url) =>
+          new URL(url).origin === accountOrigin ? `${accountOrigin}/omnigent` : url,
+      });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      h.electron.dialog.showMessageBox = async () => ({ response: 1 }); // Open
+      await h.api.handleDeepLink("omnigent://accounts.cloud.databricks.com/c/conv_1");
+      await until(() => h.calls.loadFile.length === 1, "the sign-in fallback");
+      const { url } = shown(h);
+      assert.equal(url, `${accountOrigin}/omnigent`);
+      const connecting = h.ipc.get("omnigent:set-server-url")(
+        { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } },
+        connectTo ?? url,
+      );
+      if (!connectTo) {
+        await until(() => h.pickers.length === 1, "the workspace picker");
+        h.ipc.get("workspacePicker:choose")({ sender: h.pickers[0].webContents }, "123");
+      }
+      await connecting;
+      assert.deepEqual(h.calls.loadURL, [[landing]]);
+      assert.equal(h.api.windows.get(h.win).serverUrl, connectTo ?? workspace);
+      assert.equal(network.browserSignIns, connectTo ? 0 : 1);
+    });
+  }
 
   it("does not retry an account URL whose workspace listing failed", async (t) => {
     const accountUrl = "https://spog.cloud.databricks.com/";

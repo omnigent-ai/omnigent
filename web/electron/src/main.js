@@ -979,12 +979,19 @@ function cancelReconnect(win) {
   reconnectOverlay.hide(win);
 }
 
-/** Return to setup with a pre-filled server and an optional error message. */
-function showConnectFailure(win, url, message) {
+/**
+ * Return to setup with a pre-filled server and an optional error message.
+ * Connecting to that server again resumes `returnUrl`, such as a deep link.
+ */
+function showConnectFailure(win, url, message, returnUrl) {
   const params = new URLSearchParams({ url });
   if (message) params.set("error", message);
   else params.set("step", "server");
-  if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
+  const windowState = windows.get(win);
+  if (windowState?.ephemeral) params.set("ephemeral", "1");
+  if (windowState) {
+    windowState.setupReturn = returnUrl && returnUrl !== url ? { serverUrl: url, returnUrl } : null;
+  }
   pinWindow(win, null); // back on the setup page → no trusted origin
   void loadSetupPage(win, params.toString());
 }
@@ -1177,7 +1184,7 @@ function showDatabricksAuthRequired(
       blocked,
       interactive,
     });
-  if (!retrying) showConnectFailure(win, serverUrl, message);
+  if (!retrying) showConnectFailure(win, serverUrl, message, returnUrl);
 }
 
 function getDatabricksAuth() {
@@ -1377,6 +1384,8 @@ function applyDockIcon() {
  * @property {import("./desktopCommands").DesktopCommandState | null} [desktopCommands]
  *   Menu commands this window's SPA last reported it can act on (see
  *   desktopCommands.js); absent until a supporting web bundle reports.
+ * @property {{ serverUrl: string, returnUrl: string } | null} [setupReturn] The page
+ *   a failed load was opening, until this window loads a server (see showConnectFailure).
  *
  * @type {Map<BrowserWindow, WindowState>}
  */
@@ -2271,6 +2280,19 @@ function resolveServerPath(serverUrl, routePath) {
 }
 
 /**
+ * The in-app route `url` opens under `serverUrl` (the inverse of
+ * resolveServerPath), or null when `url` is the server root or outside it.
+ *
+ * @param {string} serverUrl
+ * @param {string} url
+ * @returns {string | null}
+ */
+function serverRoutePath(serverUrl, url) {
+  const base = serverUrl.replace(/\/+$/, "");
+  return url.startsWith(`${base}/`) ? url.slice(base.length) : null;
+}
+
+/**
  * Pin an existing window to a server origin and load a (optionally
  * path-suffixed) URL. Shared by the deep-link reuse/reload paths so the
  * pin + identity + load sequence isn't duplicated. ``serverUrl`` is stored as
@@ -2362,8 +2384,9 @@ async function loadServerUrl(
         }
         assertCurrent();
         if (resolvedOrigin !== entered.origin) {
+          const route = serverRoutePath(serverUrl, target);
           serverUrl = databricksWorkspaceUiUrl(resolvedOrigin);
-          target = serverUrl;
+          target = route ? resolveServerPath(serverUrl, route) : serverUrl;
           pinWindow(win, resolvedOrigin, attempt);
           setWindowServerUrl(win, serverUrl);
           const settings = loadSettings();
@@ -2446,6 +2469,7 @@ async function loadServerUrl(
     diagnostics.record("connection_result", { origin: originOf(serverUrl), outcome: "loaded" });
     // Loaded: any reconnect this window was waiting on is over.
     cancelReconnect(win);
+    if (windowState) windowState.setupReturn = null;
     // Only a manifest that was actually read can say the name went away.
     if (manifest?.manifestVersion >= 1 && !windowState?.ephemeral) {
       rememberServerName(serverUrl, manifest.serverName);
@@ -4493,9 +4517,11 @@ function registerIpc() {
         settings.server_url = target;
         saveSettings(settings);
       }
+      const setupReturn = windows.get(win)?.setupReturn;
       const resolvedServerUrl = await loadServerUrl(win, target, undefined, {
         interactive: true,
         attempt,
+        loadUrl: setupReturn?.serverUrl === target ? setupReturn.returnUrl : undefined,
       });
       // Only a server that actually responded earns a recents slot. Sign-in that
       // moved to another host keeps the pick's name for display.
