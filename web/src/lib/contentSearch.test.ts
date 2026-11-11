@@ -43,7 +43,16 @@ describe("contentSearchPattern", () => {
 describe("wholeWordRegexProblem", () => {
   it("finds a group closed before it is opened, which would escape the wrapper", () => {
     // `\b(?:foo)|(bar)\b` would match inside `foobar`, `xbar` and `foox`.
-    for (const query of ["foo)|(bar", "foo))|((bar", "(a)b)", "[ ])", "[^^])"]) {
+    for (const query of [
+      "foo)|(bar",
+      "foo))|((bar",
+      "(a)b)",
+      "[ ])",
+      "[^^])",
+      // A capture name may contain `[`, which does not open a class there.
+      "(?P<a[>foo))|((bar)",
+      "(?<a[>foo))|((bar)",
+    ]) {
       expect(wholeWordRegexProblem(query)).toBe("unopened-group");
     }
   });
@@ -55,6 +64,8 @@ describe("wholeWordRegexProblem", () => {
       "(?i:foo)|bar",
       "(?-x)foo",
       "(?P<x>foo)",
+      "(?<a[]>foo)|bar",
+      "(?P<a]>[)])",
       "(a|b)(c)",
       "a\\)b",
       "\\(?x\\)",
@@ -81,6 +92,7 @@ describe("wholeWordRegexProblem", () => {
       "(?x:foo)",
       "(?x-i)foo",
       "a(?x)b",
+      "(?P<a[>foo)(?x)[ ](]foo)|(bar",
     ]) {
       expect(wholeWordRegexProblem(query)).toBe("verbose");
     }

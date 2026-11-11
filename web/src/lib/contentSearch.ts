@@ -77,8 +77,9 @@ export type WholeWordRegexProblem = "unopened-group" | "verbose";
  *   and comments change how ripgrep reads brackets. Rather than model that,
  *   such an expression is refused.
  *
- * Escapes and (nested) character classes are skipped as ripgrep reads them,
- * which is exact up to the first flag group that could turn on verbose mode.
+ * Escapes, (nested) character classes and capture-group names, which may
+ * contain `[` and `]`, are skipped as ripgrep reads them. That is exact up to
+ * the first flag group that could turn on verbose mode.
  */
 export function wholeWordRegexProblem(query: string): WholeWordRegexProblem | null {
   let groups = 0;
@@ -97,8 +98,12 @@ export function wholeWordRegexProblem(query: string): WholeWordRegexProblem | nu
       if (character === "]" && !classStart) classes -= 1;
       classStart = classStart && character === "^" && query[index - 1] === "[";
     } else if (character === "(") {
+      const header = query.slice(index + 1);
+      // A named group, `(?P<name>…)` or `(?<name>…)`: the name is not regex syntax.
+      const name = header.match(/^\?P?<[^>]*>/);
+      if (name) index += name[0].length;
       // A flag group, `(?flags)` or `(?flags:…)`; the flags before any `-` are turned on.
-      const flags = query.slice(index + 1).match(/^\?([A-Za-z-]*)[):]/);
+      const flags = header.match(/^\?([A-Za-z-]*)[):]/);
       if (flags?.[1].split("-")[0].includes("x")) return "verbose";
       groups += 1;
     } else if (character === ")") {
