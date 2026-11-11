@@ -811,6 +811,50 @@ describe("agent picker readiness (needs-setup badges)", () => {
     expect(picker).toHaveAttribute("data-harness-entries", "claude-native-ui,codex-native-ui");
   });
 
+  it("keeps model and effort in Advanced for a saved agent that curation hides", async () => {
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_harness_settings: true,
+          picker: { restrictToAgentNames: new Set(["polly"]), defaultAgentName: "polly" },
+        }}
+      >
+        <CreateScheduledTaskDialog
+          open
+          onOpenChange={vi.fn()}
+          editingTask={scheduledTask({
+            agentId: "ag_claude_native",
+            modelOverride: "opus",
+            reasoningEffort: "high",
+          })}
+        />
+      </CapabilitiesProvider>,
+    );
+    // The saved agent stays selected but has no picker row, so no Edit flyout.
+    expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute(
+      "data-effective",
+      "ag_claude_native",
+    );
+    expect(screen.queryByTestId("picker-config-open")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Advanced" })).toHaveTextContent("Opus · High");
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Opus");
+    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("High");
+
+    // Clear both overrides from Advanced.
+    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+    fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    // The agent is kept, not rebound to a curated one.
+    expect(input.agentId).toBeUndefined();
+    expect(input).toMatchObject({ modelOverride: null, reasoningEffort: null });
+  });
+
   it.each([
     { editing: false, empty: false },
     { editing: true, empty: false },

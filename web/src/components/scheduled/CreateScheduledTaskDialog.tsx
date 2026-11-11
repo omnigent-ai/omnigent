@@ -794,8 +794,13 @@ export function CreateScheduledTaskDialog({
       ? sandboxMode
       : !sandboxMode && hostId === (editingTask?.hostId ?? "");
   // Model and effort live in the agent picker, as in the composer; Advanced keeps permissions.
-  const pickerHasLaunchSettings = supportsModel || harnessSettings.efforts.length > 0;
-  const showAdvanced = supportsPermission;
+  // A saved agent that curation hides has no picker row, so its model and effort stay in
+  // Advanced.
+  const hasLaunchSettings = supportsModel || harnessSettings.efforts.length > 0;
+  const selectedInPicker = agentList.some((agent) => agent.id === effectiveAgentId);
+  const pickerHasLaunchSettings = hasLaunchSettings && selectedInPicker;
+  const advancedHasLaunchSettings = hasLaunchSettings && !selectedInPicker;
+  const showAdvanced = supportsPermission || advancedHasLaunchSettings;
   // From a session: start from its model, effort and permission mode once its
   // snapshot and the harness options are known; unattended rules still apply.
   useEffect(() => {
@@ -985,12 +990,14 @@ export function CreateScheduledTaskDialog({
   const summaryModel = editingWorkerSettings ? (workerSettings?.model ?? "") : displayedModel;
   const summaryEffort = editingWorkerSettings ? (workerSettings?.effort ?? "") : displayedEffort;
   const summaryPermission = editingWorkerSettings ? "" : displayedPermission;
+  // Model and effort are summarized here only where Advanced holds them.
+  const summaryHasLaunchSettings = editingWorkerSettings || advancedHasLaunchSettings;
   const overrideSummary = [
-    editingWorkerSettings
+    summaryHasLaunchSettings
       ? (summarySettings.models.find((option) => option.id === summaryModel)?.displayName ??
         summaryModel)
       : null,
-    editingWorkerSettings
+    summaryHasLaunchSettings
       ? (summarySettings.efforts.find((option) => option.value === summaryEffort)?.label ??
         summaryEffort)
       : null,
@@ -2080,11 +2087,11 @@ export function CreateScheduledTaskDialog({
                             </p>
                           )}
                           {/* Each harness exposes only the launch settings it supports. */}
-                          {(showAdvanced || (reusesExistingSession && pickerHasLaunchSettings)) && (
+                          {(showAdvanced || (reusesExistingSession && hasLaunchSettings)) && (
                             <div data-testid="task-launch-settings-field">
                               {showAdvanced && (
                                 <ModelEffortFields
-                                  permissionOnly
+                                  permissionOnly={!advancedHasLaunchSettings}
                                   model={displayedModel}
                                   effort={displayedEffort}
                                   permissionMode={displayedPermission}

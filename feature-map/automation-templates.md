@@ -152,7 +152,8 @@ to customize.
   and timezone are separate controls in the same row. Type a 12-hour or 24-hour time directly; the timezone
   opens its searchable dropdown. Custom schedules use the same typed time input.
   The Agent picker's **Edit** flyout holds Models and Effort, as in the composer,
-  and its trigger shows the picked model and effort. Advanced starts collapsed and
+  and its trigger shows the picked model and effort; a saved agent that the
+  deployment's curated picker hides keeps them in Advanced. Advanced starts collapsed and
   contains Workspace or Repository, Project, permission settings, and Ends. Name remains
   required and editable without opening Advanced; changing instructions preserves
   it. Configured overrides are summarized beside Advanced, and invalid

@@ -422,6 +422,27 @@ describe("a curated New Chat picker", () => {
       await userEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${codex.id}`));
       expect(await screen.findByRole("button", { name: "Configured model" })).toBeVisible();
     });
+
+    it("opens an unavailable selected entry's settings from the keyboard without selecting it", async () => {
+      const onSelectAgent = vi.fn();
+      renderPicker({
+        harnessEntries: [claude, codex],
+        effectiveAgentId: codex.id,
+        host: codexMissing,
+        selectedConfigContent: config,
+        configurableWhenUnavailable: true,
+        onSelectAgent,
+      });
+      await openPicker();
+
+      screen.getByTestId(`new-chat-landing-agent-${codex.id}`).focus();
+      await userEvent.keyboard("{Enter}");
+      expect(onSelectAgent).not.toHaveBeenCalled();
+      expect(screen.queryByRole("button", { name: "Configured model" })).not.toBeInTheDocument();
+
+      await userEvent.keyboard("{ArrowRight}");
+      expect(await screen.findByRole("button", { name: "Configured model" })).toBeVisible();
+    });
   });
 
   describe("with unconfigured harnesses hidden", () => {

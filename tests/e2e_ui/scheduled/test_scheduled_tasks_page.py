@@ -716,7 +716,7 @@ def test_scheduled_task_create_persists_model_and_effort(
     live_server: str,
     claude_ready_host: Host,
 ) -> None:
-    """Persist a model from the host's actual catalog and an explicit effort."""
+    """Persist a model from the host's actual catalog and an explicit effort, then reopen it."""
     _open_automations_page(page, live_server)
     catalog_url = (
         f"{live_server}/v1/hosts/{claude_ready_host.host_id}/harnesses/claude-native/model-options"
@@ -751,6 +751,22 @@ def test_scheduled_task_create_persists_model_and_effort(
     assert created["model_override"] == selected_model["id"], created
     assert created["reasoning_effort"] == "high", created
 
+    # Reopening the automation shows the saved picks, not the "Default" sentinel.
+    row = _row_by_name(page, "Model effort create")
+    row.hover()
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
+    expect(_agent_trigger(page)).to_contain_text(model_label)
+    expect(_agent_trigger(page)).to_contain_text("High")
+    _open_agent_settings(page)
+    expect(
+        page.get_by_test_id("task-agent-models").get_by_role(
+            "menuitemcheckbox", name=model_label, exact=True
+        )
+    ).to_have_attribute("aria-checked", "true")
+    _close_agent_settings(page)
+
 
 @pytest.mark.usefixtures("online_host")
 def test_scheduled_task_create_default_omits_model_and_effort(
@@ -776,48 +792,6 @@ def test_scheduled_task_create_default_omits_model_and_effort(
     created = next(t for t in tasks if t["name"] == "Default model effort")
     assert created["model_override"] is None, created
     assert created["reasoning_effort"] is None, created
-
-
-def test_scheduled_task_edit_prefills_model_and_effort(
-    page: Page,
-    live_server: str,
-) -> None:
-    """The edit dialog prefills the model and effort from the loaded task.
-
-    Seeds a Claude Code task carrying ``model_override="opus"`` +
-    ``reasoning_effort="high"``, opens its Edit dialog, and asserts the agent
-    picker shows the stored picks ("Opus" / "High"), not the "Default" sentinel —
-    the round-trip the create test's persistence feeds into.
-    """
-    claude_agent_id = _builtin_agent_id(live_server, "claude-native-ui")
-    _create_task(
-        live_server,
-        claude_agent_id,
-        "Prefill target",
-        "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-        model_override="opus",
-        reasoning_effort="high",
-    )
-
-    _open_automations_page(page, live_server)
-    row = _row_by_name(page, "Prefill target")
-    expect(row).to_be_visible(timeout=30_000)
-    row.hover()
-    row.get_by_test_id("task-row-menu").click()
-    page.get_by_test_id("task-edit").click()
-    page.get_by_role("button", name="Advanced", exact=True).click()
-
-    dialog = page.get_by_test_id("create-scheduled-task-dialog")
-    expect(dialog).to_be_visible(timeout=30_000)
-    expect(_agent_trigger(page)).to_contain_text("Opus")
-    expect(_agent_trigger(page)).to_contain_text("High")
-    _open_agent_settings(page)
-    expect(
-        page.get_by_test_id("task-agent-models").get_by_role(
-            "menuitemcheckbox", name="Opus", exact=True
-        )
-    ).to_have_attribute("aria-checked", "true")
-    _close_agent_settings(page)
 
 
 def test_scheduled_task_edit_switches_the_harness(
