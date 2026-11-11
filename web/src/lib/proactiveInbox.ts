@@ -236,7 +236,7 @@ export function reconcileSuggestion(
   return adjustUnreadCount(updated, seen ? delta : unreadDelta(from, saved.status));
 }
 
-/** Where a suggestion sits in cached pages, so a failed update can put it back. */
+/** Where a suggestion sits in cached pages. */
 export interface SuggestionPlace {
   page: number;
   index: number;
@@ -249,28 +249,6 @@ export function locateSuggestion(pages: SuggestionPage[], id: string): Suggestio
     if (index !== -1) return { page, index, item: data[index] };
   }
   return null;
-}
-
-/**
- * Put a suggestion back the way it was before an update that then failed:
- * replace it where it still is, or reinsert it where it was, and move the unread
- * count back to match.
- */
-export function restoreSuggestion(
-  pages: SuggestionPage[],
-  place: SuggestionPlace,
-): SuggestionPage[] {
-  if (locateSuggestion(pages, place.item.id)) return reconcileSuggestion(pages, place.item);
-  const delta = Number(place.item.status === "unread");
-  const restored = pages.map((page, number) => {
-    if (number !== Math.min(place.page, pages.length - 1)) return page;
-    const data = [...page.data];
-    data.splice(Math.min(place.index, data.length), 0, place.item);
-    return { ...page, data };
-  });
-  return restored.map((page) =>
-    page.unreadCountCapped ? page : { ...page, unreadCount: page.unreadCount + delta },
-  );
 }
 
 /** The badge text for an unread count, e.g. `"100+"` once the server stops counting. */
