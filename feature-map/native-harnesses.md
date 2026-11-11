@@ -591,6 +591,14 @@ Cross-harness journeys:
   and cleanup checks, including Codex-role and auxiliary-shell controls, are
   in [Terminals](./terminals.md); they do not establish full harness acceptance.
 
+- **`steer`, Claude questions in a narrow terminal:**
+  `tests/harnesses/claude_native/test_claude_native_copy_mode.py::test_question_with_a_footer_word_split_by_tmux_keeps_waiting`
+  uses real tmux and a stand-in question picker. Chat input and settings leave
+  the question open when wrapping splits a footer word; an explicit terminal
+  answer releases the composer for one message. Manually, narrow Claude's
+  terminal while a question is pending, send an unrelated Chat message, then
+  answer the question and verify that the held message arrives once.
+
 - **Antigravity permission choices (Chat and Inbox):**
   `tests/e2e_ui/approvals/test_agy_permission_full_prompt.py::test_agy_permission_persist_request_round_trip`
   uses a recorded permission prompt and the real server to check both choices
