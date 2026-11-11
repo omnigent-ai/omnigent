@@ -42,6 +42,7 @@ const meta = {
   args: {
     now,
     onEdit: () => undefined,
+    onDuplicate: () => undefined,
     onPauseToggle: () => undefined,
     onRunNow: () => undefined,
     onDelete: () => undefined,

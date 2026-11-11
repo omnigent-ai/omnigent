@@ -11,6 +11,7 @@ import { LIST_ROW_QUERY_ROOTS } from "@/lib/sessionListCache";
 import {
   createScheduledTask,
   deleteScheduledTask,
+  duplicateScheduledTask,
   getScheduledTask,
   listScheduledTaskRuns,
   listScheduledTasks,
@@ -174,6 +175,19 @@ export function useCreateScheduledTask() {
     mutationFn: (input: CreateScheduledTaskInput) => createScheduledTask(input),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
+    },
+  });
+}
+
+/** Duplicate a task as a paused copy, then refresh the list. */
+export function useDuplicateScheduledTask() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (task: ScheduledTask) => duplicateScheduledTask(task),
+    onSuccess: (copy) => {
+      void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
+      // A task started from a session gets a new session copy in the sidebar.
+      if (copy.sourceSessionId) refreshAutomationSourceSession(queryClient, copy.sourceSessionId);
     },
   });
 }

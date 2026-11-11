@@ -50,6 +50,7 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useScheduledTaskRuns: vi.fn(),
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
+  useDuplicateScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
 }));
 
@@ -170,6 +171,7 @@ function run(overrides: Partial<ScheduledTaskRun> = {}): ScheduledTaskRun {
 const updateMutate = vi.fn();
 const deleteMutate = vi.fn();
 const runNowMutate = vi.fn();
+const duplicateMutate = vi.fn();
 
 const refetchTask = vi.fn();
 function setTask(
@@ -205,6 +207,7 @@ beforeEach(() => {
   updateMutate.mockReset();
   deleteMutate.mockReset();
   runNowMutate.mockReset();
+  duplicateMutate.mockReset();
   showToast.mockReset();
   resetReadStateForTests();
   seedRunUnreadBaseline.mockReset();
@@ -220,6 +223,10 @@ beforeEach(() => {
     mutate: runNowMutate,
     isPending: false,
   } as unknown as ReturnType<typeof hooks.useRunScheduledTaskNow>);
+  vi.mocked(hooks.useDuplicateScheduledTask).mockReturnValue({
+    mutate: duplicateMutate,
+    isPending: false,
+  } as unknown as ReturnType<typeof hooks.useDuplicateScheduledTask>);
   setRuns([]);
 });
 
@@ -788,6 +795,37 @@ describe("header actions", () => {
       expect(navigate).toHaveBeenCalledWith("/tasks");
     },
   );
+
+  it("duplicate creates a paused copy and opens it", () => {
+    setTask(task());
+    duplicateMutate.mockImplementation(
+      (_id: string, opts?: { onSuccess?: (copy: ScheduledTask) => void }) =>
+        opts?.onSuccess?.(task({ id: "st_2", name: "nightly (copy)", state: "paused" })),
+    );
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_duplicate: true }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>,
+    );
+    fireEvent.click(screen.getByTestId("task-detail-duplicate"));
+    expect(duplicateMutate).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "st_1" }),
+      expect.anything(),
+    );
+    expect(navigate).toHaveBeenCalledWith("/tasks/st_2");
+    expect(showToast).toHaveBeenCalledWith(expect.stringContaining("nightly (copy)"));
+  });
+
+  it("hides duplicate on a server that can't duplicate", () => {
+    setTask(task());
+    render(
+      <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>{pageTree()}</CapabilitiesProvider>,
+    );
+    expect(screen.getByTestId("task-detail-edit")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-detail-duplicate")).toBeNull();
+  });
 
   it("edit opens the reused create dialog in edit mode", () => {
     setTask(task());

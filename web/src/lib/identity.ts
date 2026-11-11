@@ -551,9 +551,16 @@ async function _isWrongReplica(res: Response): Promise<boolean> {
   }
 }
 
+/** Routing for a request whose target host only the caller knows. */
+export interface AuthenticatedFetchRouting {
+  /** Host whose replica must serve the request, keyed like a host-scoped URL. */
+  hostId?: string | null;
+}
+
 export async function authenticatedFetch(
   input: RequestInfo | URL,
   init?: RequestInit,
+  routing?: AuthenticatedFetchRouting,
 ): Promise<Response> {
   const headers = new Headers(init?.headers);
   if (currentUserId && currentUserId !== RESERVED_USER_LOCAL && !headers.has("X-Forwarded-Email")) {
@@ -589,7 +596,9 @@ export async function authenticatedFetch(
     // it is keyable ONLY by that body host_id (a managed create with none stays
     // unkeyed).
     const scope = hostScopeForUrl(url);
-    if (isManagedForkRequest(url, init?.body)) {
+    if (routing?.hostId) {
+      derivedHostId = routing.hostId;
+    } else if (isManagedForkRequest(url, init?.body)) {
       derivedHostId = hostIdFromBody(url, init?.body);
     } else if (scope.scoped) {
       derivedHostId = scope.hostId;

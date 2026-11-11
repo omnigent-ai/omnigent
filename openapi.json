@@ -6632,6 +6632,11 @@
             "title": "Scheduled Task Approval Skipping Modes",
             "type": "boolean"
           },
+          "scheduled_task_duplicate": {
+            "default": false,
+            "title": "Scheduled Task Duplicate",
+            "type": "boolean"
+          },
           "scheduled_task_harness_settings": {
             "default": true,
             "title": "Scheduled Task Harness Settings",
@@ -16976,6 +16981,51 @@
           }
         },
         "summary": "Update Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/{scheduled_task_id}/duplicate": {
+      "post": {
+        "description": "Create a paused copy of one of the caller's scheduled tasks.\n\nThe copy keeps the original's settings but not its run history. A\ncontinue-mode copy starts its own session on its first run, and a task\nstarted from a session gets its own copy of that session.",
+        "operationId": "duplicate_scheduled_task_v1_scheduled_tasks__scheduled_task_id__duplicate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Duplicate Scheduled Task V1 Scheduled Tasks  Scheduled Task Id  Duplicate Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Duplicate Scheduled Task",
         "tags": [
           "scheduled_tasks"
         ]

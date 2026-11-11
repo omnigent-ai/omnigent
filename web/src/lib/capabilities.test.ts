@@ -259,6 +259,7 @@ describe.each([
   "scheduled_task_subhour",
   "scheduled_task_sandbox_workspaces",
   "scheduled_task_inbox",
+  "scheduled_task_duplicate",
 ] as const)("resolveServerInfo %s", (capability) => {
   it.each([
     [true, true],

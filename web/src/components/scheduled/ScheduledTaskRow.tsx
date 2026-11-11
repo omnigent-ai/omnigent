@@ -12,12 +12,13 @@
 // client-recomputed instant can't match the server anchor for INTERVAL>1 rules)
 // is not violated. Paused rows are NOT dimmed — the title stays fully legible
 // and the pill is the sole paused signal. A hover-revealed ellipsis (⋯) action
-// menu (Run now / Pause / Resume / Edit / Delete) sits on the right; right-clicking
+// menu (Run now / Edit / Duplicate / Pause / Resume / Delete) sits on the right; right-clicking
 // the card opens the same actions as a context menu.
 
 import { useId, useMemo, useState, type ComponentType, type ReactNode } from "react";
 import {
   CirclePlayIcon,
+  CopyIcon,
   MoreHorizontalIcon,
   PauseIcon,
   PencilIcon,
@@ -51,6 +52,7 @@ export function ScheduledTaskRow({
   task,
   now,
   onEdit,
+  onDuplicate,
   onPauseToggle,
   onRunNow,
   onDelete,
@@ -63,6 +65,8 @@ export function ScheduledTaskRow({
   // props — one ticker for the whole list, and deterministic in tests.
   now: Date;
   onEdit: (task: ScheduledTask) => void;
+  // Omitted when the server can't duplicate, which hides the action.
+  onDuplicate?: (task: ScheduledTask) => void;
   onPauseToggle: (task: ScheduledTask) => void;
   onRunNow: (task: ScheduledTask) => void;
   onDelete: (task: ScheduledTask) => void;
@@ -129,7 +133,16 @@ export function ScheduledTaskRow({
     </>
   );
 
-  const menuItemProps = { task, paused, triggerMode, onEdit, onPauseToggle, onRunNow, onDelete };
+  const menuItemProps = {
+    task,
+    paused,
+    triggerMode,
+    onEdit,
+    onDuplicate,
+    onPauseToggle,
+    onRunNow,
+    onDelete,
+  };
 
   const card = (
     <div
@@ -238,6 +251,7 @@ function TaskMenuItems({
   paused,
   triggerMode,
   onEdit,
+  onDuplicate,
   onPauseToggle,
   onRunNow,
   onDelete,
@@ -247,6 +261,7 @@ function TaskMenuItems({
   paused: boolean;
   triggerMode: boolean;
   onEdit: (task: ScheduledTask) => void;
+  onDuplicate?: (task: ScheduledTask) => void;
   onPauseToggle: (task: ScheduledTask) => void;
   onRunNow: (task: ScheduledTask) => void;
   onDelete: (task: ScheduledTask) => void;
@@ -276,6 +291,18 @@ function TaskMenuItems({
         <PencilIcon className="size-4" />
         Edit
       </Item>
+      {onDuplicate && (
+        <Item
+          onSelect={() => {
+            trackClick("tasks.scheduled.duplicate", "button");
+            onDuplicate(task);
+          }}
+          data-testid="task-duplicate"
+        >
+          <CopyIcon className="size-4" />
+          Duplicate
+        </Item>
+      )}
       <Item
         onSelect={() => {
           trackClick("tasks.scheduled.pause_resume", "button");

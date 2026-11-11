@@ -17,6 +17,7 @@ import {
   CalendarOffIcon,
   ChevronDownIcon,
   ChevronLeftIcon,
+  CopyIcon,
   Loader2Icon,
   PencilIcon,
   PlayIcon,
@@ -39,6 +40,7 @@ import {
 } from "@/components/scheduled/triggerTemplates";
 import {
   useDeleteScheduledTask,
+  useDuplicateScheduledTask,
   useRunScheduledTaskNow,
   useScheduledTask,
   useScheduledTaskRuns,
@@ -112,6 +114,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
 
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
+  const duplicateMutation = useDuplicateScheduledTask();
   const runNowMutation = useRunScheduledTaskNow();
 
   const [editOpen, setEditOpen] = useState(false);
@@ -226,6 +229,8 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const info = useServerInfo();
   const { data: projects } = useProjects({ enabled: task?.projectId != null });
   const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
+  // Older servers lack the duplicate route, so the header leaves the button out.
+  const duplicateSupported = info !== "loading" && info.scheduled_task_duplicate === true;
   const agent = agents?.find((candidate) => candidate.id === task?.agentId);
   const agentLabel = agent?.display_name ?? task?.agentId ?? "";
   const agentHarness = nativeCodingAgentForAvailableAgent(agent)?.harness ?? agent?.harness;
@@ -300,7 +305,11 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const nextRun = formatNextRunAt(task.nextRunAt, now);
   // A single per-task busy flag: the header actions disable while any of this
   // task's mutations are in flight.
-  const busy = updateMutation.isPending || deleteMutation.isPending || runNowMutation.isPending;
+  const busy =
+    updateMutation.isPending ||
+    deleteMutation.isPending ||
+    runNowMutation.isPending ||
+    duplicateMutation.isPending;
 
   function handlePauseToggle() {
     updateMutation.mutate({
@@ -345,6 +354,20 @@ function TaskDetail({ taskId }: { taskId: string }) {
     });
   }
 
+  function handleDuplicate() {
+    duplicateMutation.mutate(task!, {
+      onSuccess: (copy) => {
+        showToast(`Created "${copy.name}". It's paused until you resume it.`);
+        navigate(`/tasks/${copy.id}`);
+      },
+      onError: (err) => {
+        showToast(
+          err instanceof Error ? `Couldn't duplicate: ${err.message}` : "Couldn't duplicate",
+        );
+      },
+    });
+  }
+
   function handleDelete() {
     // Optimistic navigation: on success return to the list (the row is already
     // gone from the invalidated list cache).
@@ -373,6 +396,18 @@ function TaskDetail({ taskId }: { taskId: string }) {
           >
             <PencilIcon className="size-4" />
           </Button>
+          {duplicateSupported && (
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Duplicate automation"
+              data-testid="task-detail-duplicate"
+              disabled={busy}
+              onClick={handleDuplicate}
+            >
+              <CopyIcon className="size-4" />
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="icon-sm"

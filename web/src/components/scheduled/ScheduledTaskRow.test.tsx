@@ -66,6 +66,7 @@ function renderRow(
     task: t,
     now: NOW,
     onEdit: vi.fn(),
+    onDuplicate: vi.fn(),
     onPauseToggle: vi.fn(),
     onRunNow: vi.fn(),
     onDelete: vi.fn(),
@@ -117,6 +118,15 @@ describe("⋯ menu actions", () => {
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
     fireEvent.click(screen.getByTestId("task-run-now"));
     expect(onRunNow).toHaveBeenCalledWith(t);
+  });
+
+  it("dispatches onDuplicate when 'Duplicate' is selected", () => {
+    const onDuplicate = vi.fn();
+    const t = task();
+    renderRow(t, { onDuplicate });
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByTestId("task-duplicate"));
+    expect(onDuplicate).toHaveBeenCalledWith(t);
   });
 
   it("offers Run now even for a paused task (manual override)", () => {
