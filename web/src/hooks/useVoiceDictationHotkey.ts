@@ -12,7 +12,8 @@
 import { useEffect, useRef } from "react";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 /** Glyphs for the chord `isVoiceDictationHotkey` matches; shown in control tooltips. */
 export const VOICE_DICTATION_KEYS = [MOD_KEY, ALT_KEY, "V"] as const;
@@ -26,16 +27,8 @@ export function isVoiceDictationHotkey(
   e: globalThis.KeyboardEvent,
   isMac: boolean = isMacPlatform(),
 ): boolean {
-  // Require the platform command modifier AND Alt (the browser-safe ⌘⌥ chord)
-  // and reject Shift, so ⌘⌥⇧ combos stay free for future bindings.
-  if (!hasCommandModifier(e, isMac) || !e.altKey || e.shiftKey) return false;
-  // AltGr often reports as Ctrl+Alt; ignore it so intl-layout typing doesn't
-  // trigger dictation. Guard the call: not every environment implements
-  // getModifierState, and an unguarded call there would throw.
-  if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return false;
-  // Match the physical key, not the character: ⌥ rewrites "v" → "√" on macOS,
-  // but e.code is stable across layouts and modifiers.
-  return e.code === "KeyV";
+  // The browser-safe ⌘⌥ chord by physical key, since ⌥ rewrites "v" → "√" on macOS.
+  return matchesShortcut(e, "dictation.toggle", { mac: isMac });
 }
 
 /** Does focus sit inside a surface that owns its keystrokes (xterm / Monaco)? */
