@@ -3972,7 +3972,7 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.deepEqual(h.calls.loadFile, []);
   });
 
-  it("reopens the mounted page after a Cancel, then Connect while offline", async (t) => {
+  it("reopens the failed page after a Cancel, then Connect while offline", async (t) => {
     let online = false;
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async () => {
@@ -4006,7 +4006,7 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.equal(h.overlay.hint, "Check your network connection.");
     online = true;
     await until(() => h.calls.loadURL.length === 1, "the reconnect");
-    assert.deepEqual(h.calls.loadURL, [[workspace]]);
+    assert.deepEqual(h.calls.loadURL, [[page]]);
     assert.equal(h.overlay.hint, null);
   });
 
@@ -4450,9 +4450,25 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
   });
 
   // [Connect target, its URL (null: the setup page's pre-filled server), page loaded,
-  //  window server, browser sign-ins]
-  for (const [label, connectTo, landing, windowServer, signIns] of [
+  //  window server, browser sign-ins, which probes find the account host's mount]
+  for (const [label, connectTo, landing, windowServer, signIns, mountProbes = "all"] of [
     ["the linked account host", null, `${workspace}/c/conv_1`, workspace, 1],
+    [
+      "the linked account host without mount discovery",
+      null,
+      `${workspace}/c/conv_1`,
+      workspace,
+      1,
+      "none",
+    ],
+    [
+      "the linked account host once Connect finds its mount",
+      null,
+      `${workspace}/c/conv_1`,
+      workspace,
+      1,
+      "Connect",
+    ],
     [
       "a workspace on the account host",
       "https://accounts.cloud.databricks.com/omnigent?o=123",
@@ -4488,15 +4504,20 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
           ],
         },
       });
+      let probes = 0;
       const h = loadNavigationHarness({
         serverUrl: workspace,
         databricksMode: "browser",
         network,
         deepLinks: require("../src/deepLink"),
-        expandWorkspace: async (url) =>
-          new URL(url).origin === accountOrigin
+        normalizeServer: urlHelpers.normalizeUrl,
+        expandWorkspace: async (url) => {
+          probes++;
+          const found = mountProbes === "all" || (mountProbes === "Connect" && probes > 1);
+          return found && new URL(url).origin === accountOrigin
             ? `${accountOrigin}/omnigent${new URL(url).search}`
-            : url,
+            : url;
+        },
       });
       t.after(h.cleanup);
       h.api.registerIpc();
@@ -4504,7 +4525,7 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       await h.api.handleDeepLink("omnigent://accounts.cloud.databricks.com/c/conv_1");
       await until(() => h.calls.loadFile.length === 1, "the sign-in fallback");
       const { url } = shown(h);
-      assert.equal(url, `${accountOrigin}/omnigent`);
+      assert.equal(url, mountProbes === "all" ? `${accountOrigin}/omnigent` : accountOrigin);
       const connecting = h.ipc.get("omnigent:set-server-url")(
         { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } },
         connectTo ?? url,

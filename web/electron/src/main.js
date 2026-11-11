@@ -2293,6 +2293,29 @@ function serverRoutePath(serverUrl, url) {
 }
 
 /**
+ * The server and page a Connect to `discovered` opens: the failed page saved in
+ * `setupReturn` when Connect names its server (see showConnectFailure).
+ *
+ * @param {string} discovered
+ * @param {{ serverUrl: string, returnUrl: string } | null | undefined} setupReturn
+ * @returns {{ serverUrl: string, loadUrl?: string }}
+ */
+function connectResumeTarget(discovered, setupReturn) {
+  // A bare workspace root and its UI mount are one server.
+  const identity = (url) => databricksWorkspaceUiUrl(url) ?? url;
+  if (!setupReturn || identity(setupReturn.serverUrl) !== identity(discovered)) {
+    return { serverUrl: discovered };
+  }
+  // A bare workspace root means discovery failed (e.g. offline): keep the failed page's server.
+  const serverUrl = databricksWorkspaceUiUrl(discovered) ? setupReturn.serverUrl : discovered;
+  const route = serverRoutePath(setupReturn.serverUrl, setupReturn.returnUrl);
+  return {
+    serverUrl,
+    loadUrl: route ? resolveServerPath(serverUrl, route) : setupReturn.returnUrl,
+  };
+}
+
+/**
  * Pin an existing window to a server origin and load a (optionally
  * path-suffixed) URL. Shared by the deep-link reuse/reload paths so the
  * pin + identity + load sequence isn't duplicated. ``serverUrl`` is stored as
@@ -4504,8 +4527,12 @@ function registerIpc() {
       // A managed choice is already validated and may name a workspace mount;
       // preserve it exactly. The shared expansion is a no-op for paths, while a
       // managed workspace root still gets the normal mount discovery.
-      const target = await resolveConnectTarget(url, { signal }); // throws → setup page shows error
+      const discovered = await resolveConnectTarget(url, { signal }); // throws → setup page shows error
       signal.throwIfAborted();
+      const { serverUrl: target, loadUrl } = connectResumeTarget(
+        discovered,
+        windows.get(win)?.setupReturn,
+      );
 
       // Multi-server windows connect without touching the saved server —
       // the connection lives and dies with the window.
@@ -4517,11 +4544,10 @@ function registerIpc() {
         settings.server_url = target;
         saveSettings(settings);
       }
-      const setupReturn = windows.get(win)?.setupReturn;
       const resolvedServerUrl = await loadServerUrl(win, target, undefined, {
         interactive: true,
         attempt,
-        loadUrl: setupReturn?.serverUrl === target ? setupReturn.returnUrl : undefined,
+        loadUrl,
       });
       // Only a server that actually responded earns a recents slot. Sign-in that
       // moved to another host keeps the pick's name for display.
