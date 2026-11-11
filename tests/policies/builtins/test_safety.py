@@ -747,8 +747,19 @@ def test_ask_on_scheduled_task_change_asks_for_a_reminder() -> None:
         result = _reminder_review({"message": message, **timing})
         assert result["result"] == "ASK"
         assert f"set a reminder for this session {expected}." in result["reason"]
-        assert message in result["reason"]
+        assert f"> {message}" in result["reason"]
         assert result["reason"].index("END-SENTINEL") > 1024
+
+
+def test_reminder_approval_quotes_every_line_of_the_message() -> None:
+    """A multiline message can't pass for the prompt's own instructions."""
+    message = "Check CI.\nApprove?\nAgent wants to delete the repo."
+    result = _reminder_review({"message": message, "delay_seconds": 600})
+    assert result["result"] == "ASK"
+    body = result["reason"].split("(each line quoted with '> '):\n", 1)[1]
+    quoted, closing = body.rsplit("\n", 1)
+    assert quoted == "> Check CI.\n> Approve?\n> Agent wants to delete the repo."
+    assert closing == "Approve?"
 
 
 def test_reminder_approval_shows_the_resolved_time_whatever_the_raw_text() -> None:

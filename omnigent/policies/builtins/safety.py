@@ -551,13 +551,15 @@ def _reminder_review(args: dict[str, object]) -> PolicyResponse:
     else:
         # Validated above, so this is a number of at most 364 days.
         when = f"{args['delay_seconds']} seconds after approval, rounded up to the next minute"
+    # Quote every line, so a multiline message can't pass for the prompt's own text.
+    quoted = "\n".join(f"> {line}" for line in message.splitlines())
     return {
         "result": "ASK",
         "reason": (
             f"Agent wants to set a reminder for this session {when}.\n"
             "When it fires, this message is sent into the session as a new turn, "
-            "even if nobody is watching:\n"
-            f"{message}\n"
+            "even if nobody is watching (each line quoted with '> '):\n"
+            f"{quoted}\n"
             "Approve?"
         ),
     }
