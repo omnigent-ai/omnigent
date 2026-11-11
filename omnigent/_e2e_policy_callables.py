@@ -80,3 +80,10 @@ def taint_on_banana(event: PolicyEvent) -> PolicyResult:
             set_labels={"tainted": "1"},
         )
     return PolicyResult(action=PolicyAction.ALLOW)
+
+
+POLICY_REGISTRY = [
+    {"handler": "omnigent._e2e_policy_callables.block_on_sentinel", "kind": "callable"},
+    {"handler": "omnigent._e2e_policy_callables.taint_on_banana", "kind": "callable"},
+    {"handler": "omnigent.policies.function.make_fixed_action_callable", "kind": "factory"},
+]
