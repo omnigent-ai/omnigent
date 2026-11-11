@@ -766,17 +766,25 @@ async def test_reminder_argument_errors_make_no_server_calls(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_frozen_now")
-async def test_reminder_reports_an_unreadable_session_without_creating_a_task() -> None:
-    client = _ReminderClient(session=_Resp(status_code=404, body={"error": "not found"}))
+@pytest.mark.parametrize(
+    "session,error",
+    [
+        (_Resp(status_code=404, body={"error": "not found"}), "could not read this session"),
+        (_Resp(body={"id": "conv_1"}), "this session has no agent to remind"),
+    ],
+    ids=["unreadable", "no_agent"],
+)
+async def test_reminder_needs_a_readable_session_with_an_agent(session: _Resp, error: str) -> None:
+    client = _ReminderClient(session=session)
     out = json.loads(
         await _execute_scheduled_task_tool(
             "sys_reminder_set",
-            json.dumps({"message": "ping", "at": "2026-11-11T09:00:00Z"}),
+            json.dumps({"message": "ping", "delay_seconds": 600}),
             server_client=client,
             conversation_id="conv_1",
         )
     )
-    assert "could not read this session" in out["error"]
+    assert error in out["error"]
     assert not [call for call in client.calls if call[0] == "POST"]
 
 
@@ -851,22 +859,6 @@ async def test_reminder_reports_a_wrong_schedule_it_could_not_delete(
     assert "was deleted" not in out["error"]
     assert out["scheduled_task_id"] == _TASK_ID
     assert client.calls[-1] == ("DELETE", f"/v1/scheduled-tasks/{_TASK_ID}", None)
-
-
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("_frozen_now")
-async def test_reminder_needs_the_sessions_agent() -> None:
-    client = _ReminderClient(session=_Resp(body={"id": "conv_1"}))
-    out = json.loads(
-        await _execute_scheduled_task_tool(
-            "sys_reminder_set",
-            json.dumps({"message": "ping", "delay_seconds": 600}),
-            server_client=client,
-            conversation_id="conv_1",
-        )
-    )
-    assert out["error"] == "sys_reminder_set: this session has no agent to remind"
-    assert not [call for call in client.calls if call[0] == "POST"]
 
 
 @pytest.mark.asyncio

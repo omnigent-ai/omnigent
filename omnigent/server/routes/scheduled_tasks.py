@@ -329,12 +329,10 @@ def _run_to_response(
 
 
 def one_time_schedules_supported(request: Request) -> bool:
-    """Whether this server creates ``COUNT=1`` schedules.
+    """Whether creation accepts single-fire rules; see :func:`validate_rrule`.
 
-    Only the database scheduler counts ``COUNT`` from the task's creation; the
-    legacy timer counts from midnight of each re-arm and would fire again. The
-    ``one_time_automations`` release feature also gates creation, because an
-    older database scheduler polling the same database would pause such a task.
+    Also gated by the ``one_time_automations`` release feature, because an older
+    database scheduler polling the same database would pause such a task.
     """
     return bool(getattr(request.app.state, "one_time_automations_enabled", False))
 

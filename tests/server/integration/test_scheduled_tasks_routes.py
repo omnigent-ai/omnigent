@@ -140,9 +140,15 @@ def auth_app(
     runtime_init: None, db_uri: str, tmp_path: Path, request: pytest.FixtureRequest
 ) -> FastAPI:
     # ``True`` turns on the database scheduler; ``"one_time"`` also enables
-    # one-time automations on it.
+    # one-time automations on it; ``"one_time_without_dispatch"`` enables only
+    # the release feature, which needs the database scheduler to take effect.
     param = getattr(request, "param", False)
-    app = _build_app(db_uri, tmp_path, persistent=bool(param), one_time=param == "one_time")
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        persistent=param in (True, "one_time"),
+        one_time=param in ("one_time", "one_time_without_dispatch"),
+    )
     _make_user(db_uri)
     _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
     return app
@@ -855,7 +861,10 @@ async def test_late_create_refuses_a_one_time_rule_instead_of_moving_it_a_year(
 # without one_time_automations, so a reminder can't reach an older scheduler that
 # would pause it.
 @pytest.mark.parametrize(
-    "auth_app", [False, True], indirect=True, ids=["legacy_timer", "no_release_feature"]
+    "auth_app",
+    [False, True, "one_time_without_dispatch"],
+    indirect=True,
+    ids=["legacy_timer", "no_release_feature", "release_feature_without_dispatch"],
 )
 async def test_servers_without_one_time_automations_refuse_them(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
@@ -875,6 +884,17 @@ async def test_servers_without_one_time_automations_refuse_them(
     assert guarded.status_code == 400, guarded.text
     assert "first_run_at needs one-time automations" in guarded.text
     assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
+    # An edit can't turn an existing task into a one-time one either.
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    edited = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created.json()['id']}", json={"rrule": rule}, headers=_headers()
+    )
+    assert edited.status_code == 400, edited.text
+    assert "fires only once" in edited.text
+    assert SqlAlchemyScheduledTaskStore(db_uri).get(created.json()["id"]).rrule == _VALID_RRULE
 
 
 async def test_create_rejects_unknown_agent(auth_client: httpx.AsyncClient, db_uri: str) -> None:
