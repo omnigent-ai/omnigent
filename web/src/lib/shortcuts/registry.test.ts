@@ -39,6 +39,17 @@ describe("shortcut registry", () => {
       "sidebar.right",
       "workspace.tab",
       "terminal.new",
+      "model.picker",
+      "model.cycle",
+      "effort.cycle",
+      "composer.focus",
+      "dictation.toggle",
+      "approval.accept",
+      "approval.decline",
+      "pane.previous",
+      "pane.next",
+      "terminal.splitRight",
+      "terminal.splitDown",
     ]);
     for (const binding of SHORTCUT_BINDINGS) expect(shortcutBinding(binding.id)).toBe(binding);
     expect(shortcutBinding("settings.open").label).toBe("Open Settings");
@@ -284,6 +295,115 @@ describe("View bindings", () => {
     expect(matchesShortcut({ ...shell, altGraph: true }, "terminal.new", other)).toBe(true);
     expect(
       matchesShortcut(press({ key: "`", code: "Backquote", metaKey: true }), "terminal.new", mac),
+    ).toBe(false);
+  });
+});
+
+describe("Chat and Pane bindings", () => {
+  it("keeps the composer chords on literal Control, even on macOS", () => {
+    for (const environment of [mac, other]) {
+      expect(
+        matchesShortcut(
+          press({ key: "M", code: "KeyM", ctrlKey: true, shiftKey: true }),
+          "model.picker",
+          environment,
+        ),
+      ).toBe(true);
+      expect(
+        matchesShortcut(
+          press({ key: "µ", code: "KeyM", ctrlKey: true, altKey: true }),
+          "model.cycle",
+          environment,
+        ),
+      ).toBe(true);
+      expect(
+        matchesShortcut(
+          press({ key: "e", code: "KeyE", ctrlKey: true, altKey: true }),
+          "effort.cycle",
+          environment,
+        ),
+      ).toBe(true);
+      expect(
+        matchesShortcut(
+          press({ key: "L", code: "KeyL", ctrlKey: true, shiftKey: true }),
+          "composer.focus",
+          environment,
+        ),
+      ).toBe(true);
+    }
+    expect(
+      matchesShortcut(
+        press({ key: "M", code: "KeyM", metaKey: true, shiftKey: true }),
+        "model.picker",
+        mac,
+      ),
+    ).toBe(false);
+  });
+
+  it("toggles dictation with ⌘⌥V by physical key", () => {
+    const dictation = press({ key: "√", code: "KeyV", metaKey: true, altKey: true });
+    expect(matchesShortcut(dictation, "dictation.toggle", mac)).toBe(true);
+    expect(matchesShortcut(dictation, "dictation.toggle", other)).toBe(false);
+  });
+
+  it("accepts with ⌘↵ and declines with a bare Esc, comparing the key exactly", () => {
+    expect(matchesShortcut(press({ key: "Enter", metaKey: true }), "approval.accept", mac)).toBe(
+      true,
+    );
+    expect(matchesShortcut(press({ key: "enter", metaKey: true }), "approval.accept", mac)).toBe(
+      false,
+    );
+    expect(
+      matchesShortcut(
+        press({ key: "Enter", ctrlKey: true, shiftKey: true }),
+        "approval.accept",
+        other,
+      ),
+    ).toBe(false);
+    expect(matchesShortcut(press({ key: "Escape" }), "approval.decline", mac)).toBe(true);
+    expect(matchesShortcut(press({ key: "Escape", shiftKey: true }), "approval.decline", mac)).toBe(
+      false,
+    );
+    expect(
+      matchesShortcut(press({ key: "Escape", altGraph: true }), "approval.decline", other),
+    ).toBe(true);
+  });
+
+  it("cycles panes with ⌘⌥⇧[ / ⌘⌥⇧] and splits with ⌘⌥⇧\\ and ⌘⌥-", () => {
+    expect(
+      matchesShortcut(
+        press({ key: "”", code: "BracketLeft", metaKey: true, altKey: true, shiftKey: true }),
+        "pane.previous",
+        mac,
+      ),
+    ).toBe(true);
+    expect(
+      matchesShortcut(
+        press({ key: "}", code: "BracketRight", ctrlKey: true, altKey: true, shiftKey: true }),
+        "pane.next",
+        other,
+      ),
+    ).toBe(true);
+    expect(
+      matchesShortcut(
+        press({ key: "|", code: "Backslash", metaKey: true, altKey: true, shiftKey: true }),
+        "terminal.splitRight",
+        mac,
+      ),
+    ).toBe(true);
+    expect(
+      matchesShortcut(
+        press({ key: "–", code: "Minus", metaKey: true, altKey: true }),
+        "terminal.splitDown",
+        mac,
+      ),
+    ).toBe(true);
+    expect(
+      matchesShortcut(
+        press({ key: "—", code: "Minus", metaKey: true, altKey: true, shiftKey: true }),
+        "terminal.splitDown",
+        mac,
+      ),
     ).toBe(false);
   });
 });

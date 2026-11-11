@@ -153,6 +153,53 @@ const BINDINGS = {
     // Literal Control on every platform, so it never meets macOS window cycling (⌘`).
     chords: () => [{ ctrl: true, code: "Backquote", matchesAltGraph: true }],
   },
+  // Literal Control on macOS too: ⌘⇧M is a browser's profile switcher and ⌘⌥M minimizes
+  // every window. Physical keys, since Shift and Alt change the character.
+  "model.picker": {
+    label: "Open model picker",
+    chords: () => [{ ctrl: true, shift: true, code: "KeyM" }],
+  },
+  "model.cycle": {
+    label: "Cycle model",
+    chords: () => [{ ctrl: true, alt: true, code: "KeyM" }],
+  },
+  "effort.cycle": {
+    label: "Cycle reasoning effort",
+    chords: () => [{ ctrl: true, alt: true, code: "KeyE" }],
+  },
+  "composer.focus": {
+    label: "Focus chat input",
+    chords: () => [{ ctrl: true, shift: true, code: "KeyL" }],
+  },
+  "dictation.toggle": {
+    label: "Toggle voice dictation",
+    chords: () => [{ mod: true, alt: true, code: "KeyV" }],
+  },
+  // These two never checked for AltGr and compared the key exactly.
+  "approval.accept": {
+    label: "Accept approval prompt",
+    chords: () => [{ mod: true, key: "Enter", exactKey: true, matchesAltGraph: true }],
+  },
+  "approval.decline": {
+    label: "Decline approval prompt",
+    chords: () => [{ key: "Escape", exactKey: true, matchesAltGraph: true }],
+  },
+  "pane.previous": {
+    label: "Focus previous pane",
+    chords: () => [{ mod: true, alt: true, shift: true, code: "BracketLeft" }],
+  },
+  "pane.next": {
+    label: "Focus next pane",
+    chords: () => [{ mod: true, alt: true, shift: true, code: "BracketRight" }],
+  },
+  "terminal.splitRight": {
+    label: "Split terminal right",
+    chords: () => [{ mod: true, alt: true, shift: true, code: "Backslash" }],
+  },
+  "terminal.splitDown": {
+    label: "Split terminal down",
+    chords: () => [{ mod: true, alt: true, code: "Minus" }],
+  },
 } satisfies Record<string, ShortcutBindingDefinition>;
 
 export type ShortcutId = keyof typeof BINDINGS;
