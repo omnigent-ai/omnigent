@@ -3441,7 +3441,7 @@ async def _add_named_project(
     project_name = args.get("project_name")
     if project_name is None:
         return None
-    # An older nested server refuses another project; refuse before creating one.
+    # An older nested server refuses another project; refuse before a project is created.
     if (
         server_info.get("sibling_sessions") is True
         and server_info.get("sibling_other_project_standalone") is not True
@@ -3709,7 +3709,7 @@ async def _execute_session_create(
         host_id = None
         info_data: _JsonObject = {}
         if placement == "managed" or args.get("project_name") is not None:
-            info = await server_client.get("/v1/info")
+            info = await server_client.get("/v1/info", timeout=30.0)
             info.raise_for_status()
             info_data = info.json()
         if placement == "managed":

@@ -50,17 +50,19 @@ MCP independent creation.
   Managed creation uses the server's configured default sandbox provider. A
   sibling stays in its creator's project, and an unavailable source project is
   rejected before creation; a different requested project makes a standalone
-  session in that project. A standalone session is filed in its creator's
-  project, if that project still exists. A `project_name` argument files the
-  session in the owner's project with that name instead, created if missing.
-  Project defaults do not override the worker's agent or placement.
+  session in that project. Without a requested project, a standalone session is
+  filed in its creator's project, if that project still exists. A `project_name`
+  argument files the session in the owner's project with that name instead,
+  created if missing. On an older server that has `sibling_sessions` on and no
+  `sibling_other_project_standalone` in `/v1/info`, the tool refuses
+  `project_name`. Project defaults do not override the worker's agent or placement.
 - `destinations`: Settings → Admin → General → **Nested agent destinations** limits new
   agents to the current host, the current host or a fresh managed sandbox, or
   any available host. The server enforces the same choice for the composer,
   uploaded custom agents, direct API calls, MCP, later host launches, and runner reassignment. Failed
   relaunches retain the prior host so restricted sessions can retry. Any available host is the
-  behavior-preserving default. A standalone session in another project is checked only at
-  creation.
+  behavior-preserving default. For a standalone session in another project, the policy
+  applies only at creation; later host launches and runner reassignment do not check it.
 - `sharing`: sharing the sender with edit (or higher) access, including public
   edit, blocks subsequent sends and independent creates. Read-only grants,
   including public read and default-public sessions, do not: viewers cannot add

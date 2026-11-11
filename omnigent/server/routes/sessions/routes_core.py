@@ -1260,7 +1260,8 @@ def register_core_routes(
                         "Nested agents stay in their source session's project",
                         code=ErrorCode.INVALID_INPUT,
                     )
-                # An agent that names another project gets a standalone session there.
+                # An agent that names another project gets a standalone session there;
+                # the source and destination checks above still apply.
                 body.sibling_source_id = None
             else:
                 body.sibling_source_id = sibling_source.id

@@ -347,7 +347,7 @@ class ServerInfoResponse(BaseModel):
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
-    # An agent's create that names another project than its source's makes a
+    # An agent's create that names a project other than its source's project makes a
     # standalone session; older servers refuse it while sibling sessions are on.
     sibling_other_project_standalone: bool = False
     branding: BrandingInfo

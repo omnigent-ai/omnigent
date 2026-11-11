@@ -883,9 +883,13 @@ async def test_a_refused_managed_create_resolves_no_project():
     ("info", "error"),
     [
         ({"sibling_sessions": True}, "does not accept project_name"),
+        (
+            {"sibling_sessions": True, "sibling_other_project_standalone": False},
+            "does not accept project_name",
+        ),
         (500, "sys_session_create failed"),
     ],
-    ids=["nested_agents", "unreadable_info"],
+    ids=["older_nested_server", "flag_false", "unreadable_info"],
 )
 async def test_project_name_needs_a_server_that_files_other_projects(placement, info, error):
     requests = []

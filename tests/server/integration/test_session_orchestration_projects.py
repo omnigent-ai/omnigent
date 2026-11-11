@@ -262,6 +262,8 @@ async def test_another_project_keeps_the_destination_policy(auth_client, auth_ap
     other = await _project(auth_client, "Elsewhere")
     auth_app.state.sibling_session_destinations = lambda: SiblingSessionDestinations.CURRENT_HOST
     auth_client.headers.update(_bind_runner(db_uri, source["id"]))
+    store = SqlAlchemyConversationStore(db_uri)
+    before = {session.id for session in store.list_conversations().data}
 
     response = await auth_client.post(
         "/v1/sessions/orchestrated",
@@ -271,6 +273,7 @@ async def test_another_project_keeps_the_destination_policy(auth_client, auth_ap
 
     assert response.status_code == 403, response.text
     assert "limited to the current host" in response.json()["error"]["message"]
+    assert {session.id for session in store.list_conversations().data} == before
 
 
 async def test_the_tool_files_a_worker_in_a_named_project_without_its_defaults(
@@ -383,54 +386,25 @@ async def test_same_host_worker_in_a_named_project_starts_no_worktree(
 
 
 @_NESTED_ONLY
-@pytest.mark.parametrize("named", ["Elsewhere", "Triage"])
-async def test_the_tool_nests_a_worker_only_in_its_source_project(
-    auth_client, auth_app, db_uri, monkeypatch, named
+async def test_the_tool_nests_a_worker_named_into_its_source_project(
+    auth_client, auth_app, db_uri, monkeypatch
 ):
     auth_client.headers["X-Forwarded-Email"] = "alice"
     source = await _create_session_as(auth_client, "", "alice")
-    await _file(auth_client, db_uri, source["id"], await _project(auth_client, "Triage"))
+    triage = await _project(auth_client, "Triage")
+    await _file(auth_client, db_uri, source["id"], triage)
 
     worker_id = await _start_worker(
-        auth_client, auth_app, db_uri, monkeypatch, source, tool_args={"project_name": named}
+        auth_client, auth_app, db_uri, monkeypatch, source, tool_args={"project_name": "Triage"}
     )
 
     worker = SqlAlchemyConversationStore(db_uri).get_conversation(worker_id)
-    projects = {p.id: p.name for p in SqlAlchemyProjectStore(db_uri).list(user_id="alice")}
-    assert projects[worker.project_id] == named
-    assert worker.family_id == (source["id"] if named == "Triage" else None)
-
-
-async def test_the_tool_creates_no_project_for_a_source_shared_with_edit_access(
-    auth_client, db_uri
-):
-    auth_client.headers["X-Forwarded-Email"] = "alice"
-    source = await _create_session_as(auth_client, "", "alice")
-    permissions = SqlAlchemyPermissionStore(db_uri)
-    permissions.ensure_user("bob")
-    permissions.grant("bob", source["id"], LEVEL_EDIT)
-    auth_client.headers.update(_bind_runner(db_uri, source["id"]))
-
-    result = json.loads(
-        await execute_tool(
-            tool_name="sys_session_create",
-            arguments=json.dumps(
-                {"agent_id": source["agent_id"], "placement": "managed", "project_name": "Shared"}
-            ),
-            server_client=auth_client,
-            conversation_id=source["id"],
-        )
-    )
-
-    assert "shared with edit access cannot" in result.get("error", ""), result
-    projects = SqlAlchemyProjectStore(db_uri).list(user_id="alice")
-    assert "Shared" not in [project.name for project in projects]
+    assert worker.project_id == triage
+    assert worker.family_id == source["id"]
 
 
 # The project tools do not depend on the sibling-sessions environment.
-_ONE_ENVIRONMENT = pytest.mark.parametrize(
-    "orchestration_environment", [True], indirect=True, ids=["nested"]
-)
+_ONE_ENVIRONMENT = _NESTED_ONLY
 
 
 @pytest.fixture
@@ -561,8 +535,17 @@ async def test_project_update_refuses_a_source_shared_with_edit_access(auth_clie
         auth_client, source, "sys_session_update", session_id=target["id"], project="Shared"
     )
     assert "shared with edit access cannot" in refused_create["error"], refused_create
+    refused_session = await _project_tool(
+        auth_client,
+        source,
+        "sys_session_create",
+        agent_id=source["agent_id"],
+        placement="managed",
+        project_name="Spawned",
+    )
+    assert "shared with edit access cannot" in refused_session["error"], refused_session
     projects = (await auth_client.get("/v1/projects")).json()["data"]
-    assert "Shared" not in {project["name"] for project in projects}
+    assert not {"Shared", "Spawned"} & {project["name"] for project in projects}
     existing = await auth_client.post("/v1/projects", json={"name": "Existing"})
     assert existing.status_code == 200, existing.text
     refused = await _project_tool(

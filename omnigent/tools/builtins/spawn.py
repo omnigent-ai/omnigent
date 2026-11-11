@@ -1055,7 +1055,7 @@ class SysSessionCreateTool(Tool):
                                 "the project id), to file an independent session "
                                 "(same_host or managed) in: your existing project "
                                 "with this name, or a new one if you have none. "
-                                "Another project than this session's makes a "
+                                "A project other than this session's project gives a "
                                 "standalone session, not a nested agent."
                             ),
                         },
