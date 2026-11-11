@@ -36,6 +36,11 @@ _DEFAULT_PORTS = {"http": 80, "https": 443}
 MAX_CANONICAL_LINK_CHARS = 2048
 
 _GITHUB_PULL_PATH = re.compile(r"^/([^/]+)/([^/]+)/pull/(\d+)(?:/.*)?$")
+# A session reference is a conversation id: 32 hex digits, also accepted in
+# the dashed UUID spelling. The Inbox renders it as an in-app link, never as a URL.
+_SESSION_ID = re.compile(
+    r"^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$"
+)
 _TOPIC_SEPARATORS = re.compile(r"[\s_]+")
 
 
@@ -78,22 +83,26 @@ class InvalidLinkError(ValueError):
 def canonical_link(link: Mapping[str, Any]) -> str | None:
     """Return one stable string for a link, so spellings of the same target match.
 
-    Sessions become ``session:<id>``. GitHub pull request URLs keep only
+    Sessions become ``session:<id>`` with the bare hex conversation id. GitHub
+    pull request URLs keep only
     ``github.com/<owner>/<repo>/pull/<n>``, dropping subpages such as
     ``/files``. Other URLs drop the scheme, fragment, trailing slash, and the
     scheme's default port, and lowercase the host.
 
     :param link: A link with ``type`` and ``ref``.
     :returns: The canonical form, or ``None`` when ``ref`` is empty.
-    :raises InvalidLinkError: If ``ref`` is not an http(s) URL with a host and
-        no user name or password, or its canonical form is longer than
+    :raises InvalidLinkError: If a session ``ref`` is not a conversation id, if
+        a web ``ref`` is not an http(s) URL with a host and no user name or
+        password, or if the canonical form is longer than
         :data:`MAX_CANONICAL_LINK_CHARS`.
     """
     ref = str(link.get("ref") or "").strip()
     if not ref:
         return None
     if link.get("type") == "session":
-        canonical = f"session:{ref}"
+        if _SESSION_ID.match(ref) is None:
+            raise InvalidLinkError("session links must name a conversation id")
+        canonical = f"session:{ref.replace('-', '').lower()}"
     else:
         try:
             parts = urlsplit(ref)
