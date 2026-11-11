@@ -2253,7 +2253,7 @@ function AppShellImpl() {
               if (railSelectionRef.current.conversationId !== conversationId) return;
               const key = terminalTabKey(info);
               if (isMobileViewport()) openTerminalsPanel(key);
-              else openTerminalTab(key, { focus: false });
+              else openTerminalTab(key);
             });
           },
           (error: unknown) =>

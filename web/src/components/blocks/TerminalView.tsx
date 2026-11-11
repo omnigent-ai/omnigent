@@ -6,7 +6,7 @@
 // layout effect disposes it on unmount (React 18 never calls a ref's
 // returned cleanup).
 
-import { ArrowUpIcon, Loader2Icon, XIcon } from "lucide-react";
+import { Loader2Icon } from "lucide-react";
 import {
   useCallback,
   useContext,
@@ -18,7 +18,6 @@ import {
 } from "react";
 import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
 import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
 import { toast } from "sonner";
 import {
   isTerminalClipboardWritePending,
@@ -214,11 +213,8 @@ export function TerminalView({
   const commandDrafts = useContext(ShellCommandDraftContext);
   const draftKey = `${sessionId}:${terminalId}`;
   const draft = commandDrafts?.drafts[draftKey];
-  const showDraft = draft !== undefined && active && !readOnly;
-  const draftInputRef = useRef<HTMLTextAreaElement>(null);
-  useEffect(() => {
-    if (showDraft) draftInputRef.current?.focus();
-  }, [showDraft, state.kind]);
+  const pastedCommandRef = useRef<string | null>(null);
+  const setDraft = commandDrafts?.setDraft;
   const [connectAttempt, setConnectAttempt] = useState(0);
   const [resumeError, setResumeError] = useState<string | null>(null);
   const clipboardServerIdentity = getOmnigentServerIdentity();
@@ -322,15 +318,22 @@ export function TerminalView({
   const activeRef = useRef(active);
   activeRef.current = active;
   const focusOnConnectRef = useRef(focusOnConnect);
-  focusOnConnectRef.current = focusOnConnect && !showDraft;
-  const discardDraft = () => {
-    commandDrafts?.setDraft(draftKey, null);
-    sessionRef.current?.focus();
-  };
-  const submitDraft = () => {
-    if (!showDraft || !draft.trim() || state.kind !== "connected") return;
-    if (sessionRef.current?.submitCommand(draft)) discardDraft();
-  };
+  focusOnConnectRef.current = focusOnConnect;
+  useEffect(() => {
+    if (draft === undefined || !setDraft || !active || readOnly) return;
+    if (state.kind === "closed" || state.kind === "error") {
+      setDraft(draftKey, null);
+      return;
+    }
+    const session = sessionRef.current;
+    if (state.kind !== "connected" || !session || pastedCommandRef.current === draftKey) return;
+    return session.pasteCommand(draft, (error) => {
+      pastedCommandRef.current = draftKey;
+      setDraft(draftKey, null);
+      if (error) toast.error(error);
+      else session.focus();
+    });
+  }, [draft, draftKey, setDraft, active, readOnly, state.kind]);
   // Track whether this terminal has already tried a keyless re-dial after a
   // 4400 wrong-replica close. If keyless still fails with 4400, the host is
   // genuinely unreachable — stop retrying.
@@ -741,8 +744,7 @@ export function TerminalView({
   const wasActiveRef = useRef(active);
   useEffect(() => {
     if (active && !wasActiveRef.current) {
-      if (draftInputRef.current) draftInputRef.current.focus();
-      else sessionRef.current?.focus();
+      sessionRef.current?.focus();
       const current = stateRef.current;
       if (current.kind === "closed" && isReconnectableTerminalClose(current.code)) {
         reconnectAttemptsRef.current = 0;
@@ -879,60 +881,6 @@ export function TerminalView({
           />
         )}
       </div>
-      {showDraft && (
-        <div
-          className="shrink-0 border-t border-border p-3"
-          ref={(node) => {
-            draftInputRef.current = node?.querySelector("textarea") ?? null;
-          }}
-        >
-          <Textarea
-            aria-label="Shell command"
-            value={draft}
-            onChange={(event) => commandDrafts?.setDraft(draftKey, event.target.value)}
-            onKeyDown={(event) => {
-              if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
-              if (event.key === "Escape" || (event.key === "Enter" && !event.shiftKey)) {
-                event.preventDefault();
-                event.stopPropagation();
-                if (event.key === "Escape") discardDraft();
-                else submitDraft();
-              }
-            }}
-            spellCheck={false}
-            autoCapitalize="off"
-            autoCorrect="off"
-            className="max-h-48 resize-y font-mono"
-          />
-          <div className="mt-2 flex items-center justify-between gap-2">
-            <span className="text-xs text-muted-foreground">
-              Enter to run · Shift+Enter for newline
-            </span>
-            <div className="flex gap-1">
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                aria-label="Discard command"
-                title="Discard command"
-                onClick={discardDraft}
-              >
-                <XIcon />
-              </Button>
-              <Button
-                type="button"
-                size="icon"
-                aria-label="Run command"
-                title="Run command"
-                disabled={state.kind !== "connected" || !draft.trim()}
-                onClick={submitDraft}
-              >
-                <ArrowUpIcon />
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

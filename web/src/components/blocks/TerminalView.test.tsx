@@ -84,7 +84,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
-    submitCommand: ReturnType<typeof vi.fn>;
+    pasteCommand: ReturnType<typeof vi.fn>;
   }[],
 }));
 
@@ -97,7 +97,10 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
     focus = vi.fn();
-    submitCommand = vi.fn(() => true);
+    pasteCommand = vi.fn((_text: string, onResult: (error: string | null) => void) => {
+      onResult(null);
+      return vi.fn();
+    });
 
     constructor(
       container: HTMLDivElement,
@@ -126,7 +129,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
         focus: this.focus,
-        submitCommand: this.submitCommand,
+        pasteCommand: this.pasteCommand,
       });
     }
   },
@@ -1288,7 +1291,7 @@ describe("terminal clipboard", () => {
   });
 });
 
-describe("shell command draft", () => {
+describe("shell command paste", () => {
   function DraftTerminal({
     active = true,
     readOnly = false,
@@ -1321,54 +1324,59 @@ describe("shell command draft", () => {
     );
   }
 
-  it("keeps the command editable until Enter explicitly submits the edited text", async () => {
+  it("pastes once into the connected shell without adding another editor", async () => {
     render(<DraftTerminal />);
-    const input = screen.getByRole("textbox", { name: "Shell command" });
-    expect(input).toHaveValue("printf hello\npwd");
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
     const terminal = terminalSessionMock.instances[0];
-    expect(terminal.focusOnConnect).toBe(false);
-    act(() => terminal.onState({ kind: "connected" }));
-    expect(input).toHaveFocus();
-    expect(terminal.submitCommand).not.toHaveBeenCalled();
-    expect(fireEvent.keyDown(input, { key: "Enter", shiftKey: true })).toBe(true);
-    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
-    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
-    expect(terminal.submitCommand).not.toHaveBeenCalled();
-    fireEvent.change(input, { target: { value: "printf edited\npwd" } });
-    fireEvent.keyDown(input, { key: "Enter" });
-    expect(terminal.submitCommand).toHaveBeenCalledExactlyOnceWith("printf edited\npwd");
+    expect(terminal.focusOnConnect).toBe(true);
+    expect(terminal.pasteCommand).not.toHaveBeenCalled();
     expect(screen.queryByRole("textbox", { name: "Shell command" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Run command" })).toBeNull();
+    act(() => terminal.onState({ kind: "connected" }));
+    expect(terminal.pasteCommand).toHaveBeenCalledExactlyOnceWith(
+      "printf hello\npwd",
+      expect.any(Function),
+    );
     expect(terminal.focus).toHaveBeenCalledOnce();
-    expect(terminalSessionMock.instances).toHaveLength(1);
+    act(() => terminal.onState({ kind: "closed", code: 4405, reason: "detached" }));
+    act(() => terminal.onState({ kind: "connected" }));
+    expect(terminal.pasteCommand).toHaveBeenCalledOnce();
   });
 
-  it("preserves disconnected or unsent edits and allows cancellation without sending", async () => {
+  it("reports an unsupported paste without retrying on reconnect", async () => {
     render(<DraftTerminal />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
     const terminal = terminalSessionMock.instances[0];
-    const input = screen.getByRole("textbox", { name: "Shell command" });
-    fireEvent.change(input, { target: { value: "printf edited" } });
-    fireEvent.keyDown(input, { key: "Enter" });
-    expect(screen.getByRole("button", { name: "Run command" })).toBeDisabled();
-    expect(terminal.submitCommand).not.toHaveBeenCalled();
+    terminal.pasteCommand.mockImplementation((_text, onResult) => {
+      onResult("This shell does not support multiline paste.");
+      return vi.fn();
+    });
     act(() => terminal.onState({ kind: "connected" }));
-    expect(terminal.submitCommand).not.toHaveBeenCalled();
-    terminal.submitCommand.mockReturnValue(false);
-    fireEvent.click(screen.getByRole("button", { name: "Run command" }));
-    expect(input).toHaveValue("printf edited");
+    expect(await screen.findByText("This shell does not support multiline paste.")).toBeVisible();
     act(() => terminal.onState({ kind: "closed", code: 4405, reason: "detached" }));
-    expect(input).toBeEnabled();
-    fireEvent.keyDown(input, { key: "Escape" });
-    expect(screen.queryByRole("textbox", { name: "Shell command" })).toBeNull();
-    expect(terminal.submitCommand).toHaveBeenCalledExactlyOnceWith("printf edited");
+    act(() => terminal.onState({ kind: "connected" }));
+    expect(terminal.pasteCommand).toHaveBeenCalledOnce();
+  });
+
+  it("cancels a paste waiting for shell readiness when the view closes", async () => {
+    const { unmount } = render(<DraftTerminal />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const terminal = terminalSessionMock.instances[0];
+    const cancel = vi.fn();
+    terminal.pasteCommand.mockReturnValue(cancel);
+    act(() => terminal.onState({ kind: "connected" }));
+    unmount();
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it.each([{ active: false }, { readOnly: true }, { terminalId: "terminal_bash_other" }])(
-    "does not expose the draft on an ineligible surface: %j",
-    (props) => {
+    "does not paste on an ineligible surface: %j",
+    async (props) => {
       render(<DraftTerminal {...props} />);
-      expect(screen.queryByRole("textbox", { name: "Shell command" })).toBeNull();
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      const terminal = terminalSessionMock.instances[0];
+      act(() => terminal.onState({ kind: "connected" }));
+      expect(terminal.pasteCommand).not.toHaveBeenCalled();
     },
   );
 });
