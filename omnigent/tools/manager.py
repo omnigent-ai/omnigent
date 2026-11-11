@@ -237,13 +237,7 @@ class ToolManager:
             self._tools[tool.name()] = tool
 
     def _register_user_inbox_tools(self) -> None:
-        """
-        Register ``sys_user_inbox_post`` and ``sys_user_inbox_list``.
-
-        Opt-in through ``tool_groups.user_inbox: true``, so only agents built
-        to post Inbox suggestions can write to their owner's Inbox. The runner
-        dispatches both via the server's ``/v1/inbox/items`` endpoints.
-        """
+        """Register the owner-Inbox tools for agents that opt in."""
         if not self._spec.tool_groups.user_inbox:
             return
         for tool in (SysUserInboxPostTool(), SysUserInboxListTool()):
