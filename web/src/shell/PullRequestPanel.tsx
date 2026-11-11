@@ -25,6 +25,11 @@
 // the header + stacked diff.
 
 import { createPortal } from "react-dom";
+import {
+  PULL_REQUESTS_PAGE_ENGINE,
+  useEngine,
+  type PullRequestsPageEngine,
+} from "@/lib/enginePreferences";
 import { useMobilePanelHeaderTarget } from "./MobilePanelDrawer";
 import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
 import { usePullRequestReviewThreads } from "@/hooks/usePullRequestReviewThreads";
@@ -989,6 +994,54 @@ interface PullRequestPanelView {
 
 const DEFAULT_PANEL_VIEW: PullRequestPanelView = { showingDetails: false, subtab: "summary" };
 
+interface PullRequestListProps {
+  conversationId: string;
+  active: boolean;
+  /** The session's pull requests, each with its provider filled in. */
+  associations: readonly PullRequestAssociation[];
+  hostOffline: boolean;
+  sandboxAsleep: boolean;
+  unlinkPending: boolean;
+  /** Absent where pull requests can't be unlinked from the session. */
+  onUnlink?: (prUrl: string) => void;
+  onSelect: (prUrl: string) => void;
+}
+
+/** The session's pull requests, one row each; picking one shows its details. */
+function PullRequestList({
+  conversationId,
+  active,
+  associations,
+  hostOffline,
+  sandboxAsleep,
+  unlinkPending,
+  onUnlink,
+  onSelect,
+}: PullRequestListProps) {
+  return (
+    <ul aria-label="Pull requests" className="h-full overflow-y-auto">
+      {associations.map((association) => (
+        <PullRequestListRow
+          key={association.url}
+          conversationId={conversationId}
+          active={active}
+          association={association}
+          hostOffline={hostOffline}
+          sandboxAsleep={sandboxAsleep}
+          unlinkPending={unlinkPending}
+          onUnlink={onUnlink ? () => onUnlink(association.url) : undefined}
+          onSelect={() => onSelect(association.url)}
+        />
+      ))}
+    </ul>
+  );
+}
+
+// The pieces each Pull Requests page engine renders.
+const PULL_REQUEST_PAGES = {
+  classic: { List: PullRequestList },
+} satisfies Record<PullRequestsPageEngine, unknown>;
+
 export function PullRequestPanel({
   conversationId,
   active = true,
@@ -999,6 +1052,7 @@ export function PullRequestPanel({
 }) {
   const mobileHeaderTarget = useMobilePanelHeaderTarget();
   const inMobileDrawer = mobileHeaderTarget !== undefined;
+  const page = PULL_REQUEST_PAGES[useEngine(PULL_REQUESTS_PAGE_ENGINE)];
   const queryClient = useQueryClient();
   const viewKey = ["pull-request-panel-view", conversationId];
   const { data: cachedView = DEFAULT_PANEL_VIEW } = useQuery<PullRequestPanelView>({
@@ -1331,28 +1385,22 @@ export function PullRequestPanel({
       ) : null}
       <div className="min-h-0 flex-1">
         {prs.length > 1 && !showingDetails ? (
-          <ul aria-label="Pull requests" className="h-full overflow-y-auto">
-            {prs.map((pr) => (
-              <PullRequestListRow
-                key={pr.url}
-                conversationId={conversationId}
-                active={active}
-                association={{
-                  ...pr,
-                  provider: pr.provider ?? associations?.provider ?? undefined,
-                  provider_display:
-                    pr.provider_display ?? associations?.provider_display ?? undefined,
-                }}
-                hostOffline={hostOffline}
-                sandboxAsleep={sandboxAsleep}
-                unlinkPending={unlink.isPending}
-                onUnlink={associations?.tracking_available ? () => unlinkPr(pr.url) : undefined}
-                onSelect={() => {
-                  updateView({ selected: pr.url, showingDetails: true, subtab: "summary" });
-                }}
-              />
-            ))}
-          </ul>
+          <page.List
+            conversationId={conversationId}
+            active={active}
+            associations={prs.map((pr) => ({
+              ...pr,
+              provider: pr.provider ?? associations?.provider ?? undefined,
+              provider_display: pr.provider_display ?? associations?.provider_display ?? undefined,
+            }))}
+            hostOffline={hostOffline}
+            sandboxAsleep={sandboxAsleep}
+            unlinkPending={unlink.isPending}
+            onUnlink={associations?.tracking_available ? unlinkPr : undefined}
+            onSelect={(prUrl) => {
+              updateView({ selected: prUrl, showingDetails: true, subtab: "summary" });
+            }}
+          />
         ) : (
           <PullRequestPanelDetails
             key={`${conversationId}:${selected ?? ""}`}

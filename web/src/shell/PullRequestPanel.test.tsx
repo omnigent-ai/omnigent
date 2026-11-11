@@ -4,6 +4,7 @@
 
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { PULL_REQUESTS_PAGE_ENGINE } from "@/lib/enginePreferences";
 import { parsePatchFiles } from "@pierre/diffs";
 import type * as DiffsModule from "@pierre/diffs";
 import userEvent from "@testing-library/user-event";
@@ -2981,6 +2982,42 @@ describe("session PR selection", () => {
     state.info = { isLoading: true, error: null, isFetching: true };
     rerender(<PullRequestPanel conversationId="conv_other" />);
     expect(screen.queryByRole("button", { name: /All pull requests/ })).toBeNull();
+  });
+
+  it("keeps the current list when this device has a pin for a page not offered yet", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(PULL_REQUESTS_PAGE_ENGINE.intent.storageKey, "page");
+    const one = "https://github.com/example/one/pull/42";
+    const two = "https://github.com/example/two/pull/42";
+    const association = (url: string, repository: string, title: string) => ({
+      url,
+      host: "github.com",
+      repository,
+      number: 42,
+      title,
+      relationship: "created" as const,
+    });
+    state.info = {
+      isLoading: false,
+      error: null,
+      isFetching: false,
+      data: {
+        ...state.info!.data!,
+        tracking_available: true,
+        selected_pr_url: one,
+        pr: { ...state.info!.data!.pr!, url: one, number: 42, title: "First repository" },
+        prs: [
+          association(one, "example/one", "First repository"),
+          association(two, "example/two", "Second repository"),
+        ],
+      },
+    };
+    renderPanel();
+
+    const list = screen.getByRole("list", { name: "Pull requests" });
+    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
+    await user.click(screen.getByRole("button", { name: "example/two #42 — Second repository" }));
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
   });
 
   it("shows the server's stored PRs and lets them be unlinked while the host is offline", async () => {
