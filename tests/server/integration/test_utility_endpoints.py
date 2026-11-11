@@ -102,9 +102,10 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
         "session_orchestration": True,
-        "sibling_sessions": False,
+        "sibling_sessions": True,
         "codex_plan_at_launch": True,
     }
+    assert data["sibling_sessions"] is True
     # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False
     # installable_harnesses is the allowlist the SPA offers setup for; blank
