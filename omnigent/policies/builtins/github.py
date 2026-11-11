@@ -972,21 +972,57 @@ def _unparsed_git_push(args: list[str]) -> _ShellOp:
     )
 
 
-def _flag_value(tokens: list[str], names: frozenset[str]) -> str | None:
+def _flag_values(tokens: list[str], names: frozenset[str]) -> list[str]:
     """
-    Return the value of the first matching ``--flag value`` / ``--flag=value``.
+    Return every value given for a flag, in command-line order.
+
+    Accepts ``--flag value``, ``--flag=value``, and the attached short form
+    ``-Rvalue``. gh (cobra/pflag) keeps the last occurrence, so callers must
+    check the whole list for conflicts instead of trusting the first match.
 
     :param tokens: Argument tokens.
     :param names: Flag spellings to match, e.g. ``{"--repo", "-R"}``.
-    :returns: The flag's value, or ``None`` when the flag is absent.
+    :returns: The values in order; empty when the flag is absent.
     """
+    values: list[str] = []
     for i, token in enumerate(tokens):
         for name in names:
-            if token == name and i + 1 < len(tokens):
-                return tokens[i + 1]
-            if token.startswith(name + "="):
-                return token[len(name) + 1 :]
-    return None
+            if token == name:
+                if i + 1 < len(tokens):
+                    values.append(tokens[i + 1])
+            elif token.startswith(name + "="):
+                values.append(token[len(name) + 1 :])
+            elif len(name) == 2 and token.startswith(name) and len(token) > 2:
+                values.append(token[2:])
+    return values
+
+
+def _conflicting_values(values: list[str], normalize: Callable[[str], str]) -> bool:
+    """
+    Return whether repeated flag values name different targets.
+
+    :param values: Values from :func:`_flag_values`, e.g. ``["example/a", "example/b"]``.
+    :param normalize: Reduces a value to its target, e.g. :func:`_normalize_repo`.
+        Values that normalize to nothing are compared as written.
+    :returns: ``True`` when two or more distinct targets are present.
+    """
+    return len({normalize(value) or value for value in values}) > 1
+
+
+def _unparseable_op(detail: str) -> _ShellOp:
+    """
+    Build the op for a git/gh command whose target cannot be determined.
+
+    :param detail: Short reason, e.g. ``"conflicting gh repo selectors"``.
+    :returns: An ``unparseable`` :class:`_ShellOp`, which the policy sends to approval.
+    """
+    return _ShellOp(
+        kind="unparseable",
+        repo=None,
+        branches=frozenset(),
+        branch_targeted=False,
+        detail=detail,
+    )
 
 
 def _classify_git(tokens: list[str]) -> _ShellOp | None:
@@ -1077,16 +1113,16 @@ def _classify_gh(tokens: list[str]) -> _ShellOp | None:
         config) and bare ``gh`` with no subcommand.
     """
     i = 1
-    global_repo = None
+    global_repos: list[str] = []
     while i < len(tokens) and tokens[i].startswith("-"):
         option = tokens[i]
         if option in {"--help", "-h", "--version"}:
             return None
         if option in {"-R", "--repo"} and i + 1 < len(tokens):
-            global_repo = tokens[i + 1]
+            global_repos.append(tokens[i + 1])
             i += 2
         elif option.startswith(("-R=", "--repo=")):
-            global_repo = option.split("=", 1)[1]
+            global_repos.append(option.split("=", 1)[1])
             i += 1
         else:
             return _ShellOp(
@@ -1103,14 +1139,21 @@ def _classify_gh(tokens: list[str]) -> _ShellOp | None:
         return None
     rest = tokens[i + 1 :]
 
-    explicit_repo = _flag_value(rest, frozenset({"--repo", "-R"})) or global_repo
-    repo = _normalize_repo(explicit_repo) if explicit_repo is not None else None
-    # Only ``--base`` is a write destination; ``--head`` is the PR's source branch.
-    base = _flag_value(rest, frozenset({"--base", "-B"}))
-    branches = _normalize_branches([base] if base else None)
-
     if group == "api":
         return _classify_gh_api(rest)
+
+    # The global -R and the subcommand -R both select the repo. Conflicting values
+    # cannot be resolved to one target, so they need approval.
+    repo_values = [*global_repos, *_flag_values(rest, frozenset({"--repo", "-R"}))]
+    if _conflicting_values(repo_values, _normalize_repo):
+        return _unparseable_op("conflicting gh repo selectors")
+    explicit_repo = repo_values[-1] if repo_values else None
+    repo = _normalize_repo(explicit_repo) if explicit_repo is not None else None
+    # Only ``--base`` is a write destination; ``--head`` is the PR's source branch.
+    base_values = _flag_values(rest, frozenset({"--base", "-B"}))
+    if _conflicting_values(base_values, _normalize_branch):
+        return _unparseable_op("conflicting gh base branches")
+    branches = _normalize_branches(base_values[-1:])
 
     action = rest[0] if rest and not rest[0].startswith("-") else ""
     if explicit_repo is None and len(rest) > 1 and not rest[1].startswith("-"):
@@ -1177,7 +1220,10 @@ def _classify_gh_api(rest: list[str]) -> _ShellOp:
     )
     write_methods = {"POST", "PUT", "PATCH", "DELETE"}
     is_write = any(method in write_methods for method in methods) or has_fields
-    hostname = _flag_value(rest, frozenset({"--hostname"}))
+    hostname_values = _flag_values(rest, frozenset({"--hostname"}))
+    if _conflicting_values(hostname_values, str.lower):
+        return _unparseable_op("conflicting gh api hostnames")
+    hostname = hostname_values[-1] if hostname_values else None
     api_repo = (
         _repo_from_gh_api_endpoint(_gh_api_endpoint(rest))
         if hostname is None or hostname.lower() in {"github.com", "api.github.com"}
