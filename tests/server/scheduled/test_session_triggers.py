@@ -169,6 +169,26 @@ def test_a_task_ignores_the_sessions_it_created_or_continues(stores: _Stores) ->
     }
 
 
+def test_a_cached_task_whose_continued_session_changed_records_nothing(stores: _Stores) -> None:
+    first, second = stores.session(), stores.session()
+    task = stores.task(session_mode="continue", session_id=first.id)
+    # Prime this replica's cache, then change the task's session as another replica
+    # would, without this replica's cache hearing of it.
+    _notify("turn.completed", second.id, occurrence="r0")
+    assert [e["session_id"] for e in stores.events(task)] == [second.id]
+    stores.tasks.update(task.id, session_id=second.id)
+    _notify("turn.completed", second.id, occurrence="r1")
+    assert [e["session_id"] for e in stores.events(task)] == [second.id]
+
+
+def test_admin_access_alone_does_not_fire(stores: _Stores) -> None:
+    stores.permissions.ensure_user("admin@example.com", is_admin=True)
+    task = stores.task(owner="admin@example.com")
+    conv = stores.session(owner=BOB)
+    _notify("turn.completed", conv.id, occurrence="r")
+    assert stores.events(task) == []
+
+
 def test_only_sessions_the_owner_holds_a_grant_on_fire(stores: _Stores) -> None:
     task = stores.task()
     bobs = stores.session(owner=BOB)

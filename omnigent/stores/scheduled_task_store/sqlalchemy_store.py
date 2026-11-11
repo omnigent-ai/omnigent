@@ -1628,9 +1628,10 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 row is None
                 or row.state != encode_scheduled_task_state("active")
                 or row.trigger_config is None
-                # The task was matched against a cached copy; a changed trigger
-                # decides again on the next event.
+                # The task was matched against a cached copy; a changed trigger or
+                # continued session decides again on the next event.
                 or _load_json(row.trigger_config) != task.trigger_config
+                or row.session_id != task.session_id
             ):
                 return "inactive"
             receipts = (

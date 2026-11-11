@@ -2877,7 +2877,6 @@ class ClaimedRunExecutor:
     async def fire(self, task: ScheduledTask, lease: StartupLease) -> None:
         """``on_fire``: start the claimed run and record its startup outcome."""
         if lease.run.event is not None:
-            # An event's run sends the task's prompt followed by the event's IDs.
             task = replace(task, prompt=render_event_prompt(task.prompt, lease.run.event))
         recorder = _ClaimedRunRecorder(
             self._deps, task, lease, registration_timeout_s=self._registration_timeout_s

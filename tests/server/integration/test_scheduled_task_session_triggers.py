@@ -195,3 +195,32 @@ async def test_a_sandbox_session_trigger_must_continue_one_session(
     )
     assert switched.status_code == 400, switched.text
     assert "must continue one session" in switched.text
+
+
+async def test_a_failed_reader_lookup_does_not_stop_a_session_delete(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created = await client.post(
+        "/v1/scheduled-tasks",
+        json=_trigger_body(trigger_config={"provider": "omnigent", "events": ["session.deleted"]}),
+        headers=_headers(),
+    )
+    task_id = created.json()["id"]
+    conv = SqlAlchemyConversationStore(db_uri).create_conversation(
+        agent_id=created.json()["agent_id"]
+    )
+    SqlAlchemyPermissionStore(db_uri).grant("alice@example.com", conv.id, LEVEL_OWNER)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("task store unavailable")
+
+    sent: list[str] = []
+    monkeypatch.setattr(session_triggers, "readers_of", fail)
+    monkeypatch.setattr(session_triggers, "notify", lambda kind, *a, **kw: sent.append(kind))
+    response = await client.delete(f"/v1/sessions/{conv.id}", headers=_headers())
+    assert response.status_code == 200, response.text
+    assert SqlAlchemyConversationStore(db_uri).get_conversation(conv.id) is None
+    # Without who could see it, the deletion is not reported.
+    assert sent == []
+    runs = (await client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())).json()
+    assert runs["runs"] == []
