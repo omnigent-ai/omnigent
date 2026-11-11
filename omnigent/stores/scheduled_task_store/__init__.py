@@ -337,8 +337,8 @@ class ScheduledTaskStore(ABC):
         instead. Once the task has accepted ``max_runs_per_minute`` events in the
         last minute, a further event that would start a run is dropped as
         ``"rate_limited"``, and one ``skipped`` run per minute records that. A task
-        no longer active, or whose trigger changed since *task* was read, records
-        nothing.
+        no longer active, or whose trigger or continued session changed since
+        *task* was read, records nothing.
 
         :param task: The matched task, as listed.
         :param now: Unix epoch seconds the event is recorded at.

@@ -4223,22 +4223,33 @@ def register_events_routes(
                 )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.pop(session_id, None)
-        # Grants go with the session, so read who could see it first.
-        readers = (
-            await asyncio.to_thread(session_triggers.readers_of, conv, "session.deleted")
-            if session_triggers.enabled()
-            else None
-        )
+        # Grants go with the session, so read who could see it first. A failed
+        # read must not stop the deletion; it only means no automation hears of it.
+        readers: frozenset[str] | None = None
+        reported = session_triggers.enabled()
+        if reported:
+            try:
+                readers = await asyncio.to_thread(
+                    session_triggers.readers_of, conv, "session.deleted"
+                )
+            except Exception:
+                _logger.warning(
+                    "Could not read who may hear that session %s was deleted",
+                    session_id,
+                    exc_info=True,
+                )
+                reported = False
         deleted = await conversation_store.delete_conversation(session_id)
         if not deleted:
             raise _session_not_found()
-        session_triggers.notify(
-            "session.deleted",
-            session_id,
-            occurrence="deleted",
-            conversation=conv,
-            readers=readers,
-        )
+        if reported:
+            session_triggers.notify(
+                "session.deleted",
+                session_id,
+                occurrence="deleted",
+                conversation=conv,
+                readers=readers,
+            )
         # A relay still inside an offline runner's reconnect grace must not
         # fail the deleted turns when that grace expires.
         _cancel_runner_relays([session_id, *descendant_ids])
