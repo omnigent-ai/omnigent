@@ -2,9 +2,9 @@
 
 An agent in a session that is private or shared read-only can send work to
 another session owned by the same user, then read its status/history. It can also create private sibling
-workers grouped in the left sidebar on its host or a new managed sandbox when
-`sibling_sessions` is enabled in `OMNIGENT_FEATURES`; otherwise workers appear
-as standalone sessions. Peer messaging is enabled
+workers grouped in the left sidebar on its host or a new managed sandbox by
+default. Set `OMNIGENT_FEATURES=-sibling_sessions` for standalone workers instead.
+Peer messaging is enabled
 by default; `-session_orchestration` is its server kill switch and also blocks
 MCP independent creation.
 
@@ -167,8 +167,8 @@ MCP independent creation.
 
 ## Driving it with the repro environment
 
-Preconditions: use an isolated test server with `OMNIGENT_FEATURES=sibling_sessions`
-for nested creation journeys; peer messaging and standalone creation use the default settings.
+Preconditions: use an isolated test server with default settings for nested
+creation and peer messaging; set `OMNIGENT_FEATURES=-sibling_sessions` for standalone creation.
 Own both sessions. Same-host creation requires a connected
 owned host/workspace. Managed creation requires a launch-capable provider in the
 server's sandbox configuration (for example, Modal or Daytona). Other deployments
