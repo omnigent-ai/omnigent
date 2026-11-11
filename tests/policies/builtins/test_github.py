@@ -1447,6 +1447,10 @@ def test_gh_write_uses_only_an_explicit_target() -> None:
         ("gh api repos/example/other/issues --input=body.json", "DENY"),
         ("gh api -X POST repos/example/allowed/../other/issues", "ASK"),
         ("gh api -X POST repos/example/allowed/issues --hostname other.example", "ASK"),
+        # --cache and --preview take values, so the endpoint is the next operand.
+        ("gh api --cache 1h repos/example/other/issues -X POST", "DENY"),
+        ("gh api -p example-preview --cache 1h repos/example/allowed/issues -X POST", "ALLOW"),
+        ("gh api --cache 1h repos/example/allowed/issues -f title=x", "ALLOW"),
         # An explicit read method overrides the POST implied by field flags.
         ("gh api -X GET repos/example/other/issues -f q=x", "ALLOW"),
         ("gh api -F q=x -X HEAD repos/example/other/issues", "ALLOW"),
