@@ -135,9 +135,9 @@ class UploadedBundleSandboxGrantValidationTest(unittest.TestCase):
                     assert spec.os_env is not None
                     (workspace / "linked").symlink_to(outside, target_is_directory=True)
                     with patch.dict(os.environ, {"OMNIGENT_RUNNER_WORKSPACE": str(workspace)}):
-                        with self.assertRaisesRegex(ValueError, "outside workspace"):
+                        with self.assertRaisesRegex(ValueError, "outside its working directory"):
                             resolve_sandbox(spec.os_env, workspace)
-                        with self.assertRaisesRegex(ValueError, "outside workspace"):
+                        with self.assertRaisesRegex(ValueError, "outside its working directory"):
                             _resolve_root(workspace, "linked/file")
                     (workspace / "linked").unlink()
 
