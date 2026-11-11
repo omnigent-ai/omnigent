@@ -149,6 +149,8 @@ export interface ServerInfo {
       multi_repo?: boolean;
       inference_models?: boolean;
       default_models?: boolean;
+      /** Nested composers keep the source sandbox's directory and hide worktree choices. */
+      reuse_source_workspace?: boolean;
       repo_catalog?: { name: string; url: string }[];
     }
   >;

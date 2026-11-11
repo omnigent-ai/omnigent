@@ -448,6 +448,76 @@ afterEach(() => {
 
 describe("NewChatLandingScreen create flow", () => {
   it.each([
+    { provider: undefined, newWorktree: false },
+    { provider: undefined, newWorktree: true },
+    { provider: "fixed-workspace", newWorktree: false },
+  ])(
+    "inherits the nested source checkout with provider=$provider, newWorktree=$newWorktree",
+    async ({ provider, newWorktree }) => {
+      searchParams = new URLSearchParams("sibling=source");
+      localStorage.setItem("omnigent:always-use-worktree", "true");
+      writeDefaultBaseBranch("main");
+      setHosts([host({ sandbox_provider: provider })]);
+      vi.mocked(authenticatedFetch).mockImplementation(
+        async (url) =>
+          new Response(
+            JSON.stringify(
+              String(url).startsWith("/v1/sessions/source?")
+                ? {
+                    id: "source",
+                    title: "Source",
+                    host_id: "host_1",
+                    workspace: SEEDED_WORKSPACE,
+                    agent_id: "ag_hello",
+                    permission_level: 4,
+                    labels: {},
+                    items: [],
+                  }
+                : { id: "conv_new" },
+            ),
+          ),
+      );
+      renderLanding([], {
+        sibling_sessions: true,
+        sandbox_provider_capabilities: { "fixed-workspace": { reuse_source_workspace: true } },
+      });
+      await screen.findByTestId("new-chat-landing-input");
+      if (provider === "fixed-workspace") {
+        expect(screen.getByTestId("composer-workspace-dir")).toHaveAccessibleName(
+          `Working directory: ${SEEDED_WORKSPACE}`,
+        );
+        expect(screen.queryByTestId("new-chat-landing-workspace-chip")).toBeNull();
+        expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
+      } else {
+        await waitForWorkspaceSeed();
+        expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveTextContent("None");
+        if (newWorktree) {
+          openWorktree();
+          fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+            target: { value: "feature/nested" },
+          });
+          fireEvent.keyDown(document, { key: "Escape" });
+        }
+      }
+      typeMessage("Research this change");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+      const create = vi
+        .mocked(authenticatedFetch)
+        .mock.calls.find(([url, init]) => url === "/v1/sessions" && init?.method === "POST")!;
+      const body = JSON.parse(create[1]!.body as string);
+      expect(body).toMatchObject({
+        sibling_source_id: "source",
+        host_id: "host_1",
+        workspace: SEEDED_WORKSPACE,
+      });
+      expect(body.git).toEqual(
+        newWorktree ? { branch_name: "feature/nested", base_branch: "main" } : undefined,
+      );
+    },
+  );
+
+  it.each([
     { query: "canvas=main", canvasId: "main", project: undefined },
     {
       query: "canvas=proj_alpha&project=Alpha",

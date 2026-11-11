@@ -33,6 +33,7 @@ import {
   ComposerMenuTooltip,
 } from "@/components/composer/ComposerControls";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { ComposerWorkspaceStatus } from "@/components/composer/ComposerWorkspaceStatus";
 import {
   COMPOSER_HARNESS_MENU_SIZE,
   HarnessMenuNavigationLabel,
@@ -2640,6 +2641,15 @@ function NewChatLandingContent({
   const [sandboxSelected, setSandboxSelected] = useState(
     () => restoredDraft?.sandboxSelected ?? false,
   );
+  const selectedHost = hosts?.find((host) => host.host_id === selectedHostId);
+  const reuseSourceWorkspace =
+    !!siblingSourceId &&
+    !sandboxSelected &&
+    selectedHostId === siblingSource?.hostId &&
+    info !== "loading" &&
+    selectedHost?.sandbox_provider != null &&
+    info.sandbox_provider_capabilities?.[selectedHost.sandbox_provider]?.reuse_source_workspace ===
+      true;
   // Provider the sandbox pick launches on. Seeded to the sticky last pick (or
   // the first offered row) once the picker rows load; null both before that
   // seed and for a single-provider server that names no provider.
@@ -2731,9 +2741,10 @@ function NewChatLandingContent({
   const [pendingRepoUrl, setPendingRepoUrl] = useState("");
   const [sandboxRepoPopoverOpen, setSandboxRepoPopoverOpen] = useState(false);
   const sandboxRepoPopoverRef = useRef<HTMLDivElement>(null);
-  const [workspace, setWorkspace] = useState<string>(
+  const [selectedWorkspace, setWorkspace] = useState<string>(
     () => restoredDraft?.workspace ?? siblingSource?.workspace ?? "",
   );
+  const workspace = reuseSourceWorkspace ? (siblingSource?.workspace ?? "") : selectedWorkspace;
   useEffect(() => {
     if (!siblingSourceId || !siblingSource || info === "loading") return;
     if (
@@ -3220,6 +3231,7 @@ function NewChatLandingContent({
   // armed until the host is seeded (the once-per-host guard), and skipped for
   // sandboxes (no host worktrees).
   const forkFreshArmed =
+    !siblingSourceId &&
     prefillSettled &&
     selectedHostId !== null &&
     !sandboxSelected &&
@@ -3326,7 +3338,6 @@ function NewChatLandingContent({
     pickedAgentId !== null &&
     pickedAgentId !== PENDING_AGENT_ID &&
     !agentList.some((a) => a.id === pickedAgentId);
-  const selectedHost = allHosts.find((host) => host.host_id === selectedHostId);
   // Readiness is meaningful only for a connected host; managed sandboxes
   // provision their own tooling and should not drive fallback warnings.
   const harnessWarningHost = !sandboxSelected ? selectedHost : undefined;
@@ -4886,7 +4897,8 @@ function NewChatLandingContent({
   // Existing git worktrees of the picked directory's repo, for the
   // worktree picker. Skipped for sandbox sessions (server-managed) and
   // when no directory is picked. A non-git path resolves to [].
-  const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceTrimmed !== "";
+  const worktreesEnabled =
+    !sandboxSelected && !reuseSourceWorkspace && selectedHostId !== null && workspaceTrimmed !== "";
   const {
     data: hostWorktrees,
     isLoading: hostWorktreesLoading,
@@ -5072,12 +5084,15 @@ function NewChatLandingContent({
     defaultSandboxProvider,
   ]);
 
+  // Nested agents reuse their source checkout unless a new worktree is explicitly chosen.
+  const defaultUseWorktree =
+    !siblingSourceId && (prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) === true;
   // Seed a fresh worktree branch once the workspace settles, from the effective
   // default (project `use_worktree` wins, else the user-global setting).
   // Ref-guarded to fire once per workspace and only into an empty branch.
   useEffect(() => {
     if (prefill.project !== projectParam || !prefillDone(prefill)) return;
-    if ((prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) !== true) return;
+    if (!defaultUseWorktree) return;
     if (sandboxSelected || selectedHostId === null || workspaceTrimmed === "") return;
     if (branchName !== "" || activeWorktree !== null) return;
     if (worktreeSeededForRef.current === workspaceTrimmed) return;
@@ -5088,7 +5103,7 @@ function NewChatLandingContent({
     worktreeSeededForRef.current = workspaceTrimmed;
     if (hostWorktrees.some((w) => w.is_main)) setAutoSeededBranch(generateBranchName());
   }, [
-    prefillConfig,
+    defaultUseWorktree,
     prefill,
     projectParam,
     sandboxSelected,
@@ -5107,12 +5122,12 @@ function NewChatLandingContent({
   // default off in Settings. Only clears while the field still holds OUR seed.
   useEffect(() => {
     if (autoSeededBranch === "" || branchName !== autoSeededBranch) return;
-    if ((prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) === true) return;
+    if (defaultUseWorktree) return;
     setBranchName("");
     setAutoSeededBranch("");
     // Re-arm the seed guard so flipping the default back on can seed again.
     worktreeSeededForRef.current = null;
-  }, [prefillConfig, branchName, autoSeededBranch]);
+  }, [defaultUseWorktree, branchName, autoSeededBranch]);
 
   // Keep provider changes and unfinished URL edits from silently dropping repositories.
   const sandboxRepoOverCap = sandboxRepoSelections.length > maxSandboxRepos;
@@ -5375,10 +5390,7 @@ function NewChatLandingContent({
   // A drafted branch needs the discovery result unless the repository is
   // already verified; the always-use-worktree default needs it to seed one.
   const worktreeRequestPending =
-    worktreeDiscoveryPending &&
-    (branchName.trim() !== ""
-      ? !workspaceIsGit
-      : (prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) === true);
+    worktreeDiscoveryPending && (branchName.trim() !== "" ? !workspaceIsGit : defaultUseWorktree);
   const worktreeHeader = composerWorktreeHeaderState({
     workspace: workspaceTrimmed,
     worktrees: hostWorktrees ?? [],
@@ -6851,15 +6863,29 @@ function NewChatLandingContent({
           data-testid="new-chat-landing-workspace-controls"
           trailingContent={mcpRegistryPicker}
         >
-          {workspaceLoading && cachedWorkspace === null && (
+          {reuseSourceWorkspace && (
+            <ComposerWorkspaceStatus
+              workspacePath={workspaceTrimmed}
+              worktreePath={null}
+              isWorktree={null}
+              branch={null}
+              branchState="unknown"
+              creationBranch={null}
+              showWorktree={false}
+            />
+          )}
+          {!reuseSourceWorkspace && workspaceLoading && cachedWorkspace === null && (
             <NewChatPickerLoading
               label="Loading working directory"
               testId="new-chat-landing-workspace-loading"
               className="h-6 md:h-6"
             />
           )}
-          <Popover open={workspacePopoverOpen} onOpenChange={setWorkspacePopoverOpen}>
-            {(!workspaceLoading || cachedWorkspace !== null) && (
+          <Popover
+            open={!reuseSourceWorkspace && workspacePopoverOpen}
+            onOpenChange={setWorkspacePopoverOpen}
+          >
+            {!reuseSourceWorkspace && (!workspaceLoading || cachedWorkspace !== null) && (
               <PopoverTrigger asChild>{workspaceChip}</PopoverTrigger>
             )}
             <PopoverContent
@@ -6920,7 +6946,8 @@ function NewChatLandingContent({
             </PopoverContent>
           </Popover>
           {/* Worktree selection stays a separate real action from the directory picker. */}
-          {(!workspaceLoading || cachedWorkspace !== null) &&
+          {!reuseSourceWorkspace &&
+            (!workspaceLoading || cachedWorkspace !== null) &&
             (noExecutionTargetSelected || workspaceIsGit) && (
               <Popover open={worktreePopoverOpen} onOpenChange={setWorktreePopoverOpen}>
                 <PopoverTrigger asChild>
@@ -7861,7 +7888,7 @@ function NewChatLandingContent({
             />
           </form>
           <WorkspacePickerDialog
-            open={workspacePickerOpen}
+            open={!reuseSourceWorkspace && workspacePickerOpen}
             onOpenChange={setWorkspacePickerOpen}
             hostId={selectedHostId}
             initialPath={workspacePickerInitialPath}
