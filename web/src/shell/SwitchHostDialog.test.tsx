@@ -16,6 +16,8 @@ import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
 import { launchManagedHost, launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import { handleSessionEvent } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 
 // Heavy children have their own suites; stub them so this one stays on the
 // dialog's two-call move and its recovery from a half-finished switch.
@@ -196,7 +198,10 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  conversationRegistry.clear();
+});
 
 describe("SwitchHostDialog", () => {
   it("shows a loading status before exposing a supported host-switch form", async () => {
@@ -549,6 +554,11 @@ describe("SwitchHostDialog", () => {
     });
 
     it("moves the session onto a new sandbox after releasing its runner", async () => {
+      conversationRegistry.acquire("conv_1");
+      // What the move returns; its launch events may reach another replica's stream.
+      launchManagedHostMock.mockResolvedValue({
+        sandboxStatus: { stage: "provisioning", error: null, provider: "modal" },
+      } as Awaited<ReturnType<typeof launchManagedHost>>);
       const client = renderDialog(SANDBOX_SERVER);
       client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_1"), [
         { id: "terminal_shellA_s1", name: "shellA", session: "s1", running: true },
@@ -588,6 +598,44 @@ describe("SwitchHostDialog", () => {
       await waitFor(() =>
         expect(client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_1"))).toEqual([]),
       );
+      expect(conversationRegistry.peek("conv_1")!.getState().sandboxStatus).toMatchObject({
+        stage: "provisioning",
+        provider: "modal",
+      });
+    });
+
+    it("keeps a launch event that lands before the move's response", async () => {
+      conversationRegistry.acquire("conv_1");
+      launchManagedHostMock.mockImplementation(async () => {
+        handleSessionEvent(
+          {
+            type: "session_sandbox_status",
+            conversationId: "conv_1",
+            stage: "failed",
+            error: "quota exceeded",
+            provider: "modal",
+            details: null,
+          },
+          "conv_1",
+        );
+        return {
+          sandboxStatus: { stage: "provisioning", error: null, provider: "modal" },
+        } as Awaited<ReturnType<typeof launchManagedHost>>;
+      });
+      const client = renderDialog(SANDBOX_SERVER);
+      fireEvent.change(screen.getByTestId("mock-host-select"), {
+        target: { value: "__sandbox__:modal" },
+      });
+      fireEvent.click(screen.getByTestId("switch-host-button"));
+
+      // The move is through once the old host's terminals are cleared.
+      await waitFor(() =>
+        expect(client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_1"))).toEqual([]),
+      );
+      expect(conversationRegistry.peek("conv_1")!.getState().sandboxStatus).toMatchObject({
+        stage: "failed",
+        error: "quota exceeded",
+      });
     });
 
     it("waits for the runner release, and doesn't move when it fails", async () => {

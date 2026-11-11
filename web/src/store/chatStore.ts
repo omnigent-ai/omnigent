@@ -5854,6 +5854,34 @@ async function reconcileLaunchStatus(id: string, set: Setter, get: Getter): Prom
   set((s) => (s.sandboxStatus === before ? launchSnapshotPatch(session, s) : {}));
 }
 
+/**
+ * Capture a conversation's launch stage before a request that starts a sandbox launch.
+ *
+ * Returns a function that shows the stage the request's response reports. A move
+ * runs on the replica its sandbox connects to, so the launch's early events may
+ * never reach this page's stream, which doesn't replay them. A launch event that
+ * lands after the capture is newer, and wins.
+ */
+export function captureLaunchStatus(conversationId: string): (session: Session) => void {
+  const before = setterForState(conversationId)?.sandboxStatus;
+  return (session) => {
+    const status = session.sandboxStatus;
+    const state = setterForState(conversationId);
+    if (status == null || state === null || state.sandboxStatus !== before) return;
+    handleSessionEvent(
+      {
+        type: "session_sandbox_status",
+        conversationId,
+        stage: status.stage,
+        error: status.error ?? null,
+        provider: status.provider ?? undefined,
+        details: status.details ?? null,
+      },
+      conversationId,
+    );
+  };
+}
+
 /** How a status reconcile hands a stream that missed events to the reconnect backfill. */
 interface MissedEventRecovery {
   /** Abort the connected stream attempt; false when none is connected. */

@@ -49,9 +49,23 @@ STARTUP_LABEL = "omnigent.startup"
 # superseded move). Nothing queues behind it, and an input admitted just before
 # it was set settles itself when it sees it.
 STARTUP_WITHDRAWN = "withdrawn"
+# The move claim a startup was withdrawn under, so a later move's claim, held
+# before that move marks its own startup pending, isn't taken for it.
+STARTUP_WITHDRAWN_BY_LABEL = "omnigent.startup.withdrawn_by"
 _WITHDRAWN_INPUT_NOTE = (
     "The message wasn't sent: the sandbox launch it was waiting for was withdrawn. Send it again."
 )
+
+
+def _startup_withdrawn(conv: Conversation) -> bool:
+    """Whether *conv*'s startup is withdrawn, and no later move has taken it since."""
+    from omnigent.server.managed_hosts import is_move_claim
+
+    if conv.labels.get(STARTUP_LABEL) != STARTUP_WITHDRAWN:
+        return False
+    return not is_move_claim(conv.runner_id) or conv.runner_id == conv.labels.get(
+        STARTUP_WITHDRAWN_BY_LABEL
+    )
 
 
 def initial_input_id(session_id: str) -> str:
@@ -209,7 +223,7 @@ class ManagedStartupInputs:
             )
         else:
             conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
-            if conv is not None and conv.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN:
+            if conv is not None and _startup_withdrawn(conv):
                 # Withdrawn after this was admitted, possibly after the withdrawal
                 # settled what it saw: settle this input the same way.
                 if await asyncio.to_thread(
@@ -269,7 +283,9 @@ class ManagedStartupInputs:
             )
         return reason
 
-    async def release_held_inputs(self, session_id: str, message: str) -> None:
+    async def release_held_inputs(
+        self, session_id: str, message: str, *, move_claim: str | None
+    ) -> None:
         """
         Settle a startup whose launch won't happen, without failing the session.
 
@@ -282,11 +298,14 @@ class ManagedStartupInputs:
         :param session_id: The session the launch was for.
         :param message: Transcript note for the held messages, e.g. why they
             weren't sent.
+        :param move_claim: The claim of the move whose launch this was, or
+            ``None`` for a create's launch.
         """
+        labels = {STARTUP_LABEL: STARTUP_WITHDRAWN}
+        if move_claim is not None:
+            labels[STARTUP_WITHDRAWN_BY_LABEL] = move_claim
         with contextlib.suppress(ConversationNotFoundError):
-            await asyncio.to_thread(
-                self.conversations.set_labels, session_id, {STARTUP_LABEL: STARTUP_WITHDRAWN}
-            )
+            await asyncio.to_thread(self.conversations.set_labels, session_id, labels)
         undelivered = False
         for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
             if item.status == "in_progress":
@@ -304,6 +323,14 @@ class ManagedStartupInputs:
 
     async def accepts(self, conv: Conversation, app: Any) -> bool:
         """Whether a new message must wait behind the session's startup."""
+        from omnigent.server.managed_hosts import is_move_claim
+
+        if is_move_claim(conv.runner_id):
+            # A move onto a new sandbox holds the session from its claim until
+            # the sandbox's runner replaces it: hold the message for the sandbox,
+            # on any replica. A move that gives up settles what it held, then
+            # releases the claim.
+            return True
         state = conv.labels.get(STARTUP_LABEL)
         if state not in ("pending", "ready"):
             return False
@@ -328,11 +355,6 @@ class ManagedStartupInputs:
             if host_store is not None
             else None
         )
-        if host is not None and host.sandbox_provider is None:
-            # Only a move onto a new sandbox leaves a user-connected host bound
-            # with a pending startup, and it detaches that host next; on every
-            # replica, hold the message for the sandbox even if the host is gone.
-            return True
         return host is not None and host_is_live(host)
 
     async def has_undelivered(self, session_id: str) -> bool:

@@ -1432,14 +1432,12 @@ move on a server that doesn't.
 Moves an existing session onto a new server-provisioned sandbox — the
 sandbox counterpart of `POST /v1/hosts/{host_id}/runners`. Release the
 session's runner first with `PATCH /v1/sessions/{id}` and
-`{"runner_id": ""}`. The call then claims the session through the
-same `runner_id IS NULL` transition a host launch binds with, so a
-runner bound in the meantime, or a concurrent move, makes it fail with
-409. The claim stays on the session until the sandbox binds, so a host
-launch meanwhile is refused on every replica. The call registers the
-launch (the session's startup label and launch tracker) before it
-clears the session's host, workspace and branch, so a message sent at
-any point during the move is held for the sandbox. It also drops any
+`{"runner_id": ""}`. The call then claims the session against the
+binding it checked, so a runner bound or a host changed in the
+meantime, or a concurrent move, makes it fail with 409. The claim stays
+on the session until the sandbox binds; meanwhile a host launch is
+refused and a message is held for the sandbox, on every replica. The
+call clears the session's host, workspace and branch, drops any
 earlier sandbox's `omnigent.sandbox.repo*` and
 `omnigent.sandbox.requested_host_id` labels, and registers the sandbox
 to the caller. Like a managed fork, the request should be routed by the

@@ -42,7 +42,7 @@ import { composeSandboxWorkspace, sandboxRepoProblem } from "@/lib/sandboxReposi
 import { SANDBOX_PROFILES_QUERY_KEY, fetchSandboxProfiles } from "@/lib/sandboxProfilesApi";
 import { launchManagedHost, launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
-import { useChatStore } from "@/store/chatStore";
+import { captureLaunchStatus, useChatStore } from "@/store/chatStore";
 
 /**
  * Move an existing session onto a different host, from the composer's
@@ -327,9 +327,10 @@ function SupportedSwitchHostDialog({
       released = true;
       setStranded(true);
       if (sandboxSelected) {
-        // The session's sandbox launch events report progress from here, so
-        // nothing needs marking: the page shows the provisioning sandbox.
-        await launchManagedHost(sessionId, {
+        // The launch's own events report progress from here, but its first ones
+        // may go to another replica's stream; the response shows where it is.
+        const showLaunch = captureLaunchStatus(sessionId);
+        const moved = await launchManagedHost(sessionId, {
           provider: sandboxProvider,
           workspace: composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch) ?? null,
           // Route the launch by the new sandbox's host id.
@@ -337,6 +338,7 @@ function SupportedSwitchHostDialog({
             ? { hostId: randomUUID().replace(/-/g, "") }
             : {}),
         });
+        showLaunch(moved);
       } else if (selectedHostId !== null) {
         await launchRunner(selectedHostId, sessionId, workspaceTrimmed);
         // The new runner is booting but nothing on the wire says so yet, and

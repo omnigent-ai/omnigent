@@ -6807,8 +6807,8 @@ def _start_managed_launch_task(
     # Read before the launch settles, which forgets a superseded entry.
     entry = tracker.get(session_id)
     superseded_note = (
-        "The message wasn't sent: the session moved to another host before "
-        "its new sandbox was ready. Send it again."
+        "The message wasn't sent: the session's move to a new sandbox was cancelled "
+        "before the sandbox was ready. Send it again."
     )
 
     async def release_claim() -> bool:
@@ -6853,7 +6853,9 @@ def _start_managed_launch_task(
         tracker.finish(session_id)
         _publish_sandbox_status(session_id, "ready")
         if startup is not None:
-            await startup.release_held_inputs(session_id, superseded_note)
+            await startup.release_held_inputs(
+                session_id, superseded_note, move_claim=held_runner_id
+            )
 
     async def record_unbound_launch_failure() -> None:
         # Shutdown gave up on the launch. Bound, the host's replica finishes
@@ -6891,7 +6893,9 @@ def _start_managed_launch_task(
             raise
         if entry is not None and entry.superseded:
             if startup is not None:
-                await startup.release_held_inputs(session_id, superseded_note)
+                await startup.release_held_inputs(
+                    session_id, superseded_note, move_claim=held_runner_id
+                )
             return
         failed = tracker.get(session_id)
         if failed is not None and failed.error is not None:

@@ -809,9 +809,7 @@ def register_core_routes(
             held_runner_id=held_runner_id,
         )
 
-    async def _withdraw_managed_launch(
-        request: Request, session_id: str, *, include_tracker: bool = True
-    ) -> None:
+    async def _withdraw_managed_launch(request: Request, session_id: str, claim: str) -> None:
         """
         Undo a launch registration that never started, so messages stop waiting on it.
 
@@ -821,15 +819,10 @@ def register_core_routes(
 
         :param request: The request that registered the launch.
         :param session_id: The session it was registered for.
-        :param include_tracker: Also settle this replica's launch tracker
-            entry; ``False`` when the entry may belong to another attempt.
+        :param claim: The move's claim on the session's runner.
         """
         managed_launches = getattr(request.app.state, "managed_launches", None)
-        if (
-            include_tracker
-            and managed_launches is not None
-            and managed_launches.get(session_id) is not None
-        ):
+        if managed_launches is not None and managed_launches.get(session_id) is not None:
             managed_launches.finish(session_id)
             _publish_sandbox_status(session_id, "ready")
         startup = getattr(request.app.state, "startup_inputs", None)
@@ -840,6 +833,7 @@ def register_core_routes(
                 session_id,
                 "The message wasn't sent: the session's move to a new sandbox was "
                 "refused. Send it again.",
+                move_claim=claim,
             )
         except Exception:  # Must not replace the refusal being raised.
             _logger.warning(
@@ -951,9 +945,9 @@ def register_core_routes(
            with the sandbox labels this attempt removed (*labels*, ``None``
            when it never read them).
         2. Its launch registration is withdrawn, so a message held for it is
-           marked not sent and later ones reach the restored host. Without the
-           claim, only the pending startup it wrote is withdrawn, and not even
-           that while another move holds the session: that startup is theirs.
+           marked not sent and later ones reach the restored host. An attempt
+           that never held the claim wrote nothing to withdraw, and must not
+           touch another attempt's startup.
         3. The claim is released. It is no runner's; left in place it would
            refuse every later move and launch.
 
@@ -965,8 +959,6 @@ def register_core_routes(
         :param labels: The sandbox labels the move removed, or ``None``.
         :param claim: The runner id the move claimed the session with.
         """
-        from omnigent.server.managed_hosts import is_move_claim
-
         try:
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         except Exception:  # Must not replace the refusal being raised.
@@ -1001,10 +993,7 @@ def register_core_routes(
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
-        if holds_claim:
-            await _withdraw_managed_launch(request, session_id)
-        elif current is not None and not is_move_claim(current.runner_id):
-            await _withdraw_managed_launch(request, session_id, include_tracker=False)
+            await _withdraw_managed_launch(request, session_id, claim)
         try:
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if current is not None and current.runner_id == claim:
@@ -5300,9 +5289,9 @@ def register_core_routes(
         if body.host_id is not None:
             await _check_requested_host_id(request, body.host_id, user_id)
 
-        # Claim the session with a runner id no runner holds, through the same
-        # ``WHERE runner_id IS NULL`` bind a host launch uses. A runner bound
-        # since the checks above, or a concurrent move, makes the claim fail.
+        # The session is claimed with a runner id no runner holds, until the
+        # sandbox's runner replaces it. Message handling holds messages for the
+        # sandbox while the claim stands.
         from omnigent.server.managed_hosts import new_move_claim
 
         claim = new_move_claim()
@@ -5328,34 +5317,31 @@ def register_core_routes(
                 )
 
         try:
+            # Against the binding the checks above read, so a runner bound or a
+            # host changed since, or a concurrent move, makes it fail.
+            try:
+                held = await _settled_write(
+                    session_id,
+                    conversation_store.replace_runner_id,
+                    session_id,
+                    claim,
+                    expected_binding=conv,
+                )
+            except ValueError as exc:
+                raise OmnigentError(
+                    "The session's host or runner changed while moving it. Reload and try again.",
+                    code=ErrorCode.CONFLICT,
+                ) from exc
             if getattr(request.app.state, "startup_inputs", None) is not None:
                 from omnigent.server.startup_inputs import STARTUP_LABEL
 
-                # Before the claim, so a message that can see the claim, on any
-                # replica, waits for the sandbox instead of relaunching.
+                # An earlier startup's end state (withdrawn, failed, cancelled)
+                # would settle or hide messages held for this one.
                 await _settled_write(
                     session_id,
                     conversation_store.set_labels,
                     session_id,
                     {STARTUP_LABEL: "pending"},
-                )
-            # The same ``WHERE runner_id IS NULL`` bind a host launch uses, held
-            # until the sandbox binds; a runner bound since the checks above, or
-            # a concurrent move, makes it fail.
-            if not await _settled_write(
-                session_id, conversation_store.set_runner_id, session_id, claim
-            ):
-                raise OmnigentError(
-                    "The session's host or runner changed while moving it. Reload and try again.",
-                    code=ErrorCode.CONFLICT,
-                )
-            held = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if held is None:
-                raise _session_not_found()
-            if held.runner_id != claim or held.host_id != previous_host_id:
-                raise OmnigentError(
-                    "The session's host or runner changed while moving it. Reload and try again.",
-                    code=ErrorCode.CONFLICT,
                 )
             # An earlier sandbox's repositories and host id would steer this
             # launch's relaunches and routing, so they leave with the old binding.
