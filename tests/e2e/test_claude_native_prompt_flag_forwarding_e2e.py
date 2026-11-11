@@ -61,6 +61,7 @@ Usage::
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -71,6 +72,9 @@ from typing import Any
 
 import pytest
 from click.testing import CliRunner
+
+from tests._helpers.compat import release_tuple
+from tests.e2e.conftest import get_mock_message_requests
 
 pytestmark = pytest.mark.skipif(
     shutil.which("claude") is None or sys.platform == "win32",
@@ -142,11 +146,14 @@ def _forwarded_launch_kwargs(
     return captured
 
 
-def _run_real_claude(args: tuple[str, ...] | list[str]) -> str:
+def _run_real_claude(
+    args: tuple[str, ...] | list[str], *, extra_env: dict[str, str] | None = None
+) -> str:
     """
     Run the real ``claude`` binary login-free and return its combined output.
 
     :param args: Argv passed to ``claude``; ``mcp.json`` in its cwd is valid.
+    :param extra_env: Variables added to the stripped environment, e.g. a mock API URL.
     :returns: Combined stdout and stderr.
     """
     workdir = Path(tempfile.mkdtemp(prefix="prompt-forwarding-"))
@@ -161,6 +168,7 @@ def _run_real_claude(args: tuple[str, ...] | list[str]) -> str:
             "PATH": os.environ.get("PATH", ""),
             "HOME": str(workdir),
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            **(extra_env or {}),
         }
         proc = subprocess.run(
             ["claude", *args],
@@ -252,3 +260,103 @@ def test_local_launch_prompt_is_not_forwarded_as_a_value_flags_argument(
         f"cannot swallow it. Forwarded args: {forwarded!r}\nclaude output:\n"
         f"{output.strip()}"
     )
+
+
+@pytest.mark.parametrize(
+    ("with_caller_file", "with_caller_inline"),
+    [(False, True), (True, False), (True, True)],
+    ids=["inline-only", "file-only", "file-and-inline"],
+)
+def test_caller_prompt_file_and_inline_prompt_reach_claude_with_omnigent(
+    isolated_mock_llm_server_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_caller_file: bool,
+    with_caller_inline: bool,
+) -> None:
+    """
+    Real Claude receives caller instructions and Omnigent's startup guidance once.
+
+    Caller files remain native CLI inputs; Omnigent context reaches Claude through
+    its SessionStart hook. Inline-only input keeps the combined prompt ordering.
+
+    :param isolated_mock_llm_server_url: Messages API that records Claude's requests.
+    :param tmp_path: Holds the caller's file and Omnigent's bridge directory.
+    :param monkeypatch: Points the bridge root at ``tmp_path``.
+    :param with_caller_file: Whether the caller supplies a prompt file.
+    :param with_caller_inline: Whether the caller supplies inline prompt text.
+    """
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
+
+    if with_caller_file and with_caller_inline:
+        version = _run_real_claude(["--version"]).split()[0]
+        if release_tuple(version) < (2, 1, 295):
+            pytest.skip("Combined file and inline prompt flags require Claude Code 2.1.295+")
+
+    bridge_root = tmp_path / bridge._BRIDGE_ROOT.relative_to(bridge._TRUSTED_PARENT)
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", bridge_root)
+    profile = tmp_path / "profile.md"
+    profile.write_text("FILE-MARKER caller profile\n", encoding="utf-8")
+    caller_args: list[str] = []
+    caller_markers: list[str] = []
+    if with_caller_file:
+        caller_args.extend(["--append-system-prompt-file", str(profile)])
+        caller_markers.append("FILE-MARKER")
+    if with_caller_inline:
+        caller_args.extend(["--append-system-prompt", "INLINE-MARKER caller prompt"])
+        caller_markers.append("INLINE-MARKER")
+    augmented = bridge.augment_claude_args(
+        tuple(caller_args),
+        bridge_dir=bridge_root / "bridge",
+        workspace=tmp_path,
+        python_executable=sys.executable,
+        append_system_prompt=(
+            f"OMNIGENT-MARKER session instructions\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+        ),
+    )
+
+    prompt_args: list[str] = []
+    for prompt_flag, present in (
+        ("--append-system-prompt-file", with_caller_file),
+        ("--append-system-prompt", with_caller_inline),
+    ):
+        assert augmented.count(prompt_flag) == int(present), augmented
+        if present:
+            prompt_index = augmented.index(prompt_flag)
+            prompt_args.extend(augmented[prompt_index : prompt_index + 2])
+    if with_caller_file:
+        assert prompt_args == caller_args
+    settings_index = augmented.index("--settings")
+    # Keep the production SessionStart hook without starting the MCP server.
+    output = _run_real_claude(
+        [
+            "-p",
+            "hello",
+            *prompt_args,
+            *augmented[settings_index : settings_index + 2],
+        ],
+        extra_env={
+            "ANTHROPIC_BASE_URL": isolated_mock_llm_server_url,
+            "ANTHROPIC_API_KEY": "sk-ant-e2e-placeholder",
+        },
+    )
+
+    assert profile.read_text(encoding="utf-8") == "FILE-MARKER caller profile\n"
+    body = next(
+        (
+            entry["body"]
+            for entry in get_mock_message_requests(isolated_mock_llm_server_url)
+            if caller_markers[0] in json.dumps(entry["body"].get("system"))
+        ),
+        None,
+    )
+    assert body is not None, f"Claude sent no request carrying the prompt flags:\n{output}"
+    request_text = json.dumps(body)
+    for text in (*caller_markers, "OMNIGENT-MARKER", WORKSPACE_IMAGE_INSTRUCTION):
+        assert request_text.count(text) == 1, f"missing or repeated {text}:\n{body}\n{output}"
+    if with_caller_inline:
+        system_text = json.dumps(body["system"])
+        preceding_marker = "FILE-MARKER" if with_caller_file else "OMNIGENT-MARKER"
+        assert system_text.index(preceding_marker) < system_text.index("INLINE-MARKER")

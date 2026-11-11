@@ -198,6 +198,20 @@ describe("themePalette", () => {
     expect(omni.tokens.dark.primary).toBe("#df3c85");
   });
 
+  it("uses magenta links with neutral support controls in Omnigent", () => {
+    const omni = PALETTES.find((palette) => palette.id === "omni")!;
+    for (const mode of ["light", "dark"] as const) {
+      const tokens = omni.tokens[mode];
+      const [red, green, blue] = parseColor(tokens.link).rgb;
+      expect(red).toBeGreaterThan(blue);
+      expect(blue).toBeGreaterThan(green);
+      const accent = parseColor(tokens.accent).rgb;
+      expect(Math.max(...accent) - Math.min(...accent)).toBeLessThanOrEqual(8);
+      expect(contrast(parseColor(tokens.accentForeground).rgb, accent)).toBeGreaterThanOrEqual(4.5);
+      expect(tokens.sidebarPrimary).toBe("var(--link)");
+    }
+  });
+
   it.each(PALETTES)("keeps $label links readable on page and table surfaces", (palette) => {
     for (const mode of ["light", "dark"] as const) {
       const { link, background, cardSolid } = palette.tokens[mode];

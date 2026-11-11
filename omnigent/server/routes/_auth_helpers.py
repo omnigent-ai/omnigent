@@ -81,6 +81,33 @@ def attribution_user(user_id: str | None) -> str | None:
     return user_id
 
 
+def is_session_owner(
+    user_id: str | None,
+    conversation: Conversation,
+    *,
+    auth_provider: AuthProvider | None,
+    permission_store: PermissionStore | None,
+) -> bool:
+    """Whether *user_id* holds the owner grant on *conversation*'s root session.
+
+    Unlike :func:`check_session_access` there is no admin bypass; a sub-agent
+    belongs to its root's owner, as it does there. With auth or permissions
+    off, every caller is the owner.
+
+    :param user_id: The caller, e.g. ``"alice@example.com"``, or ``None``.
+    :param conversation: The session to check, e.g. a side chat's parent.
+    :param auth_provider: The server's auth provider, ``None`` when auth is off.
+    :param permission_store: Store for grant lookups, or ``None``.
+    :returns: ``True`` for the owner of the session's root.
+    """
+    if auth_provider is None or permission_store is None:
+        return True
+    if user_id is None:
+        return False
+    grant = permission_store.get(user_id, conversation.root_conversation_id)
+    return grant is not None and grant.level >= LEVEL_OWNER
+
+
 def require_user(
     request: Request,
     auth_provider: AuthProvider | None,

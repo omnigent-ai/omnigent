@@ -550,9 +550,6 @@ def _gh_arguments(segment: ShellSegment) -> list[str] | None:
 
 def _graphql_setup(segment: ShellSegment) -> bool:
     """Recognize supported checkout preparation before PR-producing commands."""
-    raw = " ".join(segment.raw_tokens)
-    if re.fullmatch(r"[A-Za-z_]\w*=\$\(gh api repos/[\w.-]+/[\w.-]+ (?:--jq|-q) \.node_id\)", raw):
-        return True
     tokens = list(segment.invocation_tokens)
     if tokens[0] == "cd":
         return len(tokens) == 2
