@@ -173,6 +173,9 @@ to customize.
   **Start a new session for each match**. With `automations_v2` on a server
   supporting sub-hour schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
+  When no host is online, Run on shows the connect-host command inline; otherwise
+  **Connect another host from your terminal** expands it (**Reconnect a host from
+  your terminal** when the picked host is offline), so the draft survives connecting one.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
   the same workspace and sandbox Repository controls apply. Unrelated edits
   preserve a continued session when the repository is unchanged or a legacy

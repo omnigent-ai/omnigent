@@ -1563,6 +1563,9 @@ describe("CreateScheduledTaskDialog submit", () => {
     fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
     fireEvent.click(hostTrigger);
     fireEvent.click(screen.getByRole("option", { name: /desktop/ }));
+    expect(screen.getByTestId("task-connect-host-toggle")).toHaveTextContent(
+      "Reconnect a host from your terminal",
+    );
 
     // Omitting the workspace would keep the saved one, so the form keeps showing it.
     expect(screen.getByTestId("task-workspace-browse")).toHaveTextContent("/home/me/repo");
