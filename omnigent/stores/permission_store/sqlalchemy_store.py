@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from typing import cast
 
-from sqlalchemy import delete, exists, literal, select, update
+from sqlalchemy import case, delete, exists, literal, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -182,38 +182,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
 
         def write(session: Session) -> None:
             require_active_account(session, user_id)
-            dialect = self._engine.dialect.name
-            values = {
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "level": level,
-            }
-            stmt: Insert
-            if dialect == "sqlite":
-                stmt = (
-                    sqlite_insert(SqlSessionPermission)
-                    .values(**values)
-                    .on_conflict_do_update(
-                        index_elements=["workspace_id", "user_id", "conversation_id"],
-                        set_={"level": level},
-                    )
-                )
-            elif dialect == "mysql":
-                stmt = (
-                    mysql_insert(SqlSessionPermission)
-                    .values(**values)
-                    .on_duplicate_key_update(level=level)
-                )
-            else:
-                stmt = (
-                    pg_insert(SqlSessionPermission)
-                    .values(**values)
-                    .on_conflict_do_update(
-                        index_elements=["workspace_id", "user_id", "conversation_id"],
-                        set_={"level": level},
-                    )
-                )
-            session.execute(stmt)
+            session.execute(self._upsert_grant(user_id, conversation_id, level))
             session.flush()
 
         run_write_transaction(
@@ -227,6 +196,58 @@ class SqlAlchemyPermissionStore(PermissionStore):
             user_id=user_id,
             conversation_id=conversation_id,
             level=level,
+        )
+
+    def grant_unless_higher(
+        self, user_id: str, conversation_id: str, level: int
+    ) -> SessionPermission | None:
+        """Raise a grant to *level* in one transaction. See base class for contract."""
+
+        def write(session: Session) -> bool:
+            require_active_account(session, user_id)
+            current = session.get(
+                SqlSessionPermission, (current_workspace_id(), user_id, conversation_id)
+            )
+            if current is not None and current.level >= level:
+                return False
+            # A grant inserted concurrently after the read is still never lowered.
+            session.execute(self._upsert_grant(user_id, conversation_id, level, only_raise=True))
+            session.flush()
+            return True
+
+        if not run_write_transaction(self._session_immediate, "raise_permission_grant", write):
+            return None
+        self._invalidate_resolve_cache_for_session(conversation_id)
+        return SessionPermission(user_id=user_id, conversation_id=conversation_id, level=level)
+
+    def _upsert_grant(
+        self, user_id: str, conversation_id: str, level: int, *, only_raise: bool = False
+    ) -> Insert:
+        """Insert or update a grant; with *only_raise*, an existing higher level wins."""
+        values = {"user_id": user_id, "conversation_id": conversation_id, "level": level}
+        keys = ["workspace_id", "user_id", "conversation_id"]
+        lower = SqlSessionPermission.level < level
+        dialect = self._engine.dialect.name
+        if dialect == "mysql":
+            new_level = (
+                case((lower, literal(level)), else_=SqlSessionPermission.level)
+                if only_raise
+                else level
+            )
+            return (
+                mysql_insert(SqlSessionPermission)
+                .values(**values)
+                .on_duplicate_key_update(level=new_level)
+            )
+        insert = sqlite_insert if dialect == "sqlite" else pg_insert
+        return (
+            insert(SqlSessionPermission)
+            .values(**values)
+            .on_conflict_do_update(
+                index_elements=keys,
+                set_={"level": level},
+                where=lower if only_raise else None,
+            )
         )
 
     def revoke(self, user_id: str, conversation_id: str) -> bool:

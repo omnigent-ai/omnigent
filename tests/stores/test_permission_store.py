@@ -164,6 +164,22 @@ def test_grant_upsert_downgrades_level(store: SqlAlchemyPermissionStore, db_uri:
     assert fetched.level == 1, f"Expected persisted level 1 after downgrade, got {fetched.level}."
 
 
+def test_grant_unless_higher_raises_but_never_lowers(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """``grant_unless_higher`` adds or raises a grant and keeps any equal or higher one."""
+    _ensure_user(store, "erin@test.com")
+    conv_id = _create_conversation(db_uri)
+
+    assert store.grant_unless_higher("erin@test.com", conv_id, level=2) is not None
+    assert store.grant_unless_higher("erin@test.com", conv_id, level=2) is None
+    assert store.grant_unless_higher("erin@test.com", conv_id, level=1) is None
+    assert store.get("erin@test.com", conv_id).level == 2  # type: ignore[union-attr]
+    raised = store.grant_unless_higher("erin@test.com", conv_id, level=3)
+    assert raised is not None and raised.level == 3
+    assert store.get("erin@test.com", conv_id).level == 3  # type: ignore[union-attr]
+
+
 def test_grant_with_public_sentinel(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
     """``grant`` with the ``__public__`` sentinel user_id works like any other user.
 

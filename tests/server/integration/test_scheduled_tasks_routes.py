@@ -3142,6 +3142,15 @@ async def test_share_with_round_trips_and_rejects_shares_the_owner_could_not_add
     edit = await auth_client.patch(task_url, json={"share_with": [bob]}, headers=_headers())
     assert edit.status_code == 403, edit.text
     assert "read-only" in edit.json()["error"]["message"]
+    # Restricted sharing never shares the host home an unpinned run starts in.
+    auth_app.state.sharing_mode = lambda: SharingMode.RESTRICTED_READ_ONLY
+    unpinned = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(workspace=None, share_with=[team]),
+        headers=_headers(),
+    )
+    assert unpinned.status_code == 403, unpinned.text
+    assert "Choose a workspace folder" in unpinned.json()["error"]["message"]
 
     cleared = await auth_client.patch(task_url, json={"share_with": None}, headers=_headers())
     assert cleared.status_code == 200, cleared.text

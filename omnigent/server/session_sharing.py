@@ -90,7 +90,8 @@ def write_session_grant(
     Creates the grantee's user row on demand. Blocking; run it off the event loop.
 
     :param keep_higher: Leave an existing grant at or above *level* in place and
-        return ``None``, so the write never lowers access someone already has.
+        return ``None``, so the write never lowers access someone already has,
+        even one raised concurrently (see :meth:`PermissionStore.grant_unless_higher`).
     :returns: The written grant, or ``None`` when ``keep_higher`` kept one.
     :raises OmnigentError: ``FORBIDDEN`` when *user_id* owns the session.
     """
@@ -99,7 +100,7 @@ def write_session_grant(
         existing = permission_store.get(user_id, session_id)
         if existing is not None and existing.level == LEVEL_OWNER:
             raise OmnigentError("Cannot modify owner permissions", code=ErrorCode.FORBIDDEN)
-        if keep_higher and existing is not None and existing.level >= level:
-            return None
         permission_store.ensure_user(user_id)
+        if keep_higher:
+            return permission_store.grant_unless_higher(user_id, session_id, level)
         return permission_store.grant(user_id, session_id, level)
