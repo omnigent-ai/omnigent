@@ -7774,6 +7774,34 @@ def test_inject_slash_command_raises_when_tmux_target_never_published(
 
 
 @pytest.mark.parametrize(
+    "advertisement",
+    [None, "{", "{}", '{"token":"token"}', '{"token":"token","socket":"/test.sock"}'],
+    ids=["missing", "malformed", "empty", "incomplete", "ready"],
+)
+def test_post_tools_changed_zero_timeout_probes_once_without_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, advertisement: str | None
+) -> None:
+    if advertisement is not None:
+        (tmp_path / "server.json").write_text(advertisement)
+    read_json = Mock(wraps=claude_native_bridge._read_json_file)
+    connection = Mock()
+    connection.getresponse.return_value.status = 200
+    connect = Mock(return_value=connection)
+    monkeypatch.setattr(claude_native_bridge, "_read_json_file", read_json)
+    monkeypatch.setattr(claude_native_bridge, "_control_connection", connect)
+
+    if advertisement is not None and "socket" in advertisement:
+        post_tools_changed(tmp_path, timeout_s=0.0)
+        connection.request.assert_called_once()
+        connection.close.assert_called_once()
+    else:
+        with pytest.raises(claude_native_bridge.ClaudeBridgeNotReady):
+            post_tools_changed(tmp_path, timeout_s=0.0)
+        connect.assert_not_called()
+    read_json.assert_called_once_with(tmp_path / "server.json")
+
+
+@pytest.mark.parametrize(
     "transport_error",
     [
         ConnectionRefusedError("bridge unavailable"),
