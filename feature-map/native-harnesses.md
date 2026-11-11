@@ -1389,11 +1389,15 @@ With the default client deadline, cancellation must clear the approval without
 creating the automation. Record the client configuration with the evidence.
 
 Native sessions also get `sys_reminder_set`, which parks on the same approval
-gate with a shorter prompt: the reminder's time (`at ...` or `in N seconds`)
-and its full message, which arrives later as a new turn in the same session.
+gate with a shorter prompt: the reminder's time, resolved as the tool will
+(`at <UTC minute> UTC`, or `N seconds after approval, rounded up to the next
+minute`), and its full message, which arrives later as a new turn in the same
+session.
 `tests/policies/builtins/test_safety.py::test_ask_on_scheduled_task_change_asks_for_a_reminder`
-covers the prompt, and `::test_ask_on_scheduled_task_change_denies_a_reminder_without_message`
-covers the deny for an empty message. For a human check in an isolated instance
+covers the prompt, `::test_reminder_approval_shows_the_resolved_time_whatever_the_raw_text`
+covers padded and long-fraction times, and `::test_reminder_approval_denies_a_time_the_tool_would_reject`
+and `::test_ask_on_scheduled_task_change_denies_a_reminder_without_message` cover
+the denies. For a human check in an isolated instance
 started with `OMNIGENT_FEATURES=automations_v2,one_time_automations` (the database
 scheduler plus one-time automations, both off by default; without them the tool
 refuses), ask a native session to remind it in two minutes. Reject the approval and
