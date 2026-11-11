@@ -10,16 +10,9 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { useHostSshTarget } from "@/hooks/useHostSshTarget";
 import { CODE_EDITORS, editorLink, launchEditorLink } from "@/lib/editorLinks";
 import { isAndroidShell, isIOSShell, supportsFileReveal } from "@/lib/nativeBridge";
-import { useFileViewerConversationId } from "./FileViewerContext";
-import {
-  revealInFileManager,
-  revealLabel,
-  useHostFileTarget,
-  useLocalFileTarget,
-} from "./RevealInFileManager";
+import { revealInFileManager, revealLabel, useLocalFileTarget } from "./RevealInFileManager";
 
 const APP_PREFERENCE_EVENT = "omnigent:open-in-app-changed";
 const PREFERENCE_KEY = "omnigent:default-code-editor";
@@ -61,18 +54,12 @@ interface OpenInAction {
 /** Shared actions for the folder header and the file viewer's responsive toolbar. */
 export function useOpenInActions(path: string | null, directory = false): OpenInAction[] {
   const localTarget = useLocalFileTarget(path);
-  const target = useHostFileTarget(path);
-  const conversationId = useFileViewerConversationId();
   const mobile = isAndroidShell() || isIOSShell();
-  const sshTarget = useHostSshTarget(
-    !mobile && !localTarget ? (target?.hostId ?? null) : null,
-    conversationId,
-  );
   const preferred = useSyncExternalStore(subscribeToAppPreference, readPreferredApp, () => "");
-  if (mobile || !target || (!localTarget && !sshTarget)) return [];
+  if (mobile || !localTarget) return [];
   const actions: OpenInAction[] = [];
   for (const editor of CODE_EDITORS) {
-    const url = editorLink(editor.id, target.path, localTarget ? null : sshTarget, directory);
+    const url = editorLink(editor.id, localTarget.path, null, directory);
     if (!url) continue;
     actions.push({
       key: editor.id,
