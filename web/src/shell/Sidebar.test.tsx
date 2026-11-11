@@ -1432,6 +1432,26 @@ describe("Sidebar session list", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
+  it("renders an extension page as a row below the phone drawer's strip", () => {
+    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...mediaQuery,
+      media: query,
+      matches: query === "(max-width: 767.98px)",
+    }));
+    try {
+      mockConversations(THREE_TYPE_CONVERSATIONS);
+      renderSidebar(true, "/extensions/acme.review/inbox", undefined, undefined, [TEST_EXTENSION]);
+
+      const extension = screen.getByTestId("extension-nav-acme.review.primary-nav");
+      expect(screen.getByTestId("sidebar-primary-nav-strip")).not.toContainElement(extension);
+      expect(extension).toHaveClass("sidebar-row", "w-full", "mobile-touch-target");
+      expect(extension).toHaveAttribute("aria-current", "page");
+    } finally {
+      matchMedia.mockRestore();
+    }
+  });
+
   it("leaves the primary nav unchanged for an empty extension catalog", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar(true, "/", undefined, AUTOMATIONS_INFO);
