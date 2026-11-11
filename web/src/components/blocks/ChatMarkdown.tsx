@@ -28,7 +28,7 @@ import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { MessageResponse } from "@/components/ai-elements/message";
 import {
-  parseOmnigentSessionLink,
+  sameServerSessionPath,
   shortFileCitationLabel,
   splitWorkspaceFileCitation,
   WORKSPACE_FILE_LINK_ATTR,
@@ -297,11 +297,9 @@ function PullRequestLinkLabel({ children }: { children: React.ReactNode }) {
  * The in-app chat path for an `omnigent://<host>/c/<id>` link to the server this
  * page is on, or null. Links to other servers keep their deep-link href.
  */
-function sameServerSessionPath(href: unknown): string | null {
+function currentServerSessionPath(href: unknown): string | null {
   if (typeof href !== "string" || typeof window === "undefined") return null;
-  const link = parseOmnigentSessionLink(href);
-  if (!link || link.host !== window.location.host.toLowerCase()) return null;
-  return `/c/${link.sessionId}`;
+  return sameServerSessionPath(href, window.location);
 }
 
 /** A session link to this server, routed in the app like a session mention pill. */
@@ -371,7 +369,7 @@ function WorkspaceFileLink({
         />
       );
     }
-    const sessionPath = sameServerSessionPath(href);
+    const sessionPath = currentServerSessionPath(href);
     if (sessionPath) {
       return (
         <ServerSessionLink path={sessionPath} className={className} title={title} {...props}>

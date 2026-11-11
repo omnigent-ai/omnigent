@@ -98,8 +98,12 @@ it(
 
       const link = window.getByRole("link", { name: LINK_TEXT });
       await link.waitFor({ timeout: 60_000 });
-      // A link to this server is routed in the app rather than handed to the OS.
-      assert.equal(await link.getAttribute("href"), `/c/${workerId}`);
+      // The reply streams in; wait for the finished link, routed in the app rather than to the OS.
+      await eventually(
+        async () => (await link.getAttribute("href")) === `/c/${workerId}`,
+        "session link routed in the app",
+        20_000,
+      );
       assert.equal(await window.getByText("[blocked]").count(), 0);
       step("reply shows the session link");
       await link.hover();

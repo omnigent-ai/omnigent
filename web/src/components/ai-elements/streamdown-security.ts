@@ -114,7 +114,29 @@ const OMNIGENT_SESSION_LINK =
 /** The server host (`host[:port]`) and session an Omnigent session link names, or null. */
 export function parseOmnigentSessionLink(href: string): { host: string; sessionId: string } | null {
   const match = OMNIGENT_SESSION_LINK.exec(href);
-  return match ? { host: match[1].toLowerCase(), sessionId: match[2] } : null;
+  if (!match) return null;
+  // The pattern admits some authorities no URL can name, such as `[.]` or port 99999.
+  try {
+    new URL(`http://${match[1]}`);
+  } catch {
+    return null;
+  }
+  return { host: match[1].toLowerCase(), sessionId: match[2] };
+}
+
+/**
+ * The in-app chat path for a session link to the server `page` is served from, or
+ * null. The authority is canonicalized with the page's scheme, so a default port
+ * (`example.test:443` on an HTTPS page) still matches.
+ */
+export function sameServerSessionPath(
+  href: string,
+  page: { protocol: string; host: string },
+): string | null {
+  const link = parseOmnigentSessionLink(href);
+  if (!link || (page.protocol !== "http:" && page.protocol !== "https:")) return null;
+  const linkHost = new URL(`${page.protocol}//${link.host}`).host;
+  return linkHost === page.host.toLowerCase() ? `/c/${link.sessionId}` : null;
 }
 
 /** Whether `href` is exactly an Omnigent session deep link. */
