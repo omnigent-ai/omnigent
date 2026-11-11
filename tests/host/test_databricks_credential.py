@@ -15,6 +15,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.host import credential_broker as broker
 from omnigent.host import databricks_credential as dc
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR
 from tests._helpers.polling import poll_until
@@ -70,7 +71,7 @@ def _patch_get(monkeypatch: pytest.MonkeyPatch, resp_or_exc) -> dict:
             raise resp_or_exc
         return resp_or_exc
 
-    monkeypatch.setattr(dc.httpx, "get", fake_get)
+    monkeypatch.setattr(broker.httpx, "get", fake_get)
     return seen
 
 
@@ -567,7 +568,7 @@ def _scripted_get(monkeypatch: pytest.MonkeyPatch, steps: list) -> list[int]:
             raise step
         return step
 
-    monkeypatch.setattr(dc.httpx, "get", fake_get)
+    monkeypatch.setattr(broker.httpx, "get", fake_get)
     return calls
 
 
@@ -583,7 +584,7 @@ def test_main_retries_transient_broker_failures(
     _connected(monkeypatch)
     assert dc.configure_host_databricks("https://omni.example", "h") is True
     capsys.readouterr()  # discard configure-time log output
-    monkeypatch.setattr(dc, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    monkeypatch.setattr(broker, "_RETRY_BACKOFF_S", (0.0, 0.0))
     calls = _scripted_get(monkeypatch, [httpx.ConnectError("reset"), _Resp(503, None), _BEARER_OK])
     assert dc.main(["token"]) == 0
     assert capsys.readouterr().out.strip() == "dbx-tok"
@@ -596,7 +597,7 @@ def test_main_gives_up_after_retries_are_exhausted(
     _connected(monkeypatch)
     assert dc.configure_host_databricks("https://omni.example", "h") is True
     capsys.readouterr()
-    monkeypatch.setattr(dc, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    monkeypatch.setattr(broker, "_RETRY_BACKOFF_S", (0.0, 0.0))
     calls = _scripted_get(
         monkeypatch, [httpx.ConnectError("down"), httpx.ReadTimeout("slow"), _Resp(500, None)]
     )
@@ -613,8 +614,8 @@ def test_main_retries_stay_within_one_timeout_budget(
     assert dc.configure_host_databricks("https://omni.example", "h") is True
     capsys.readouterr()
     clock = [0.0]
-    monkeypatch.setattr(dc.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(dc.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+    monkeypatch.setattr(broker.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(broker.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
     timeouts: list[float] = []
 
     def slow_get(url: str, headers: dict, timeout: float):
@@ -622,10 +623,10 @@ def test_main_retries_stay_within_one_timeout_budget(
         clock[0] += timeout
         raise httpx.ReadTimeout("slow")
 
-    monkeypatch.setattr(dc.httpx, "get", slow_get)
+    monkeypatch.setattr(broker.httpx, "get", slow_get)
     assert dc.main(["token"]) == 0
     assert capsys.readouterr().out == ""
-    assert timeouts == [dc._TIMEOUT_S]
+    assert timeouts == [broker._TIMEOUT_S]
 
 
 def test_main_treats_a_non_transport_http_error_as_final(
@@ -634,7 +635,7 @@ def test_main_treats_a_non_transport_http_error_as_final(
     _connected(monkeypatch)
     assert dc.configure_host_databricks("https://omni.example", "h") is True
     capsys.readouterr()
-    monkeypatch.setattr(dc, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    monkeypatch.setattr(broker, "_RETRY_BACKOFF_S", (0.0, 0.0))
     calls = _scripted_get(monkeypatch, [httpx.TooManyRedirects("loop")])
     assert dc.main(["token"]) == 0
     assert capsys.readouterr().out == ""
@@ -648,7 +649,7 @@ def test_main_does_not_retry_a_rejected_launch_token(
     _connected(monkeypatch)
     assert dc.configure_host_databricks("https://omni.example", "h") is True
     capsys.readouterr()
-    monkeypatch.setattr(dc, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    monkeypatch.setattr(broker, "_RETRY_BACKOFF_S", (0.0, 0.0))
     calls = _scripted_get(monkeypatch, [_Resp(401, None)])
     assert dc.main(["token"]) == 0
     assert capsys.readouterr().out == ""

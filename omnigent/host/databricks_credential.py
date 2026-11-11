@@ -40,22 +40,17 @@ import os
 import shlex
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import httpx
-
-from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
+from omnigent.host.credential_broker import fetch_host_credential
+from omnigent.host.identity import HOST_TOKEN_ENV_VAR
 from omnigent.host.identity_env import in_managed_sandbox
-from omnigent.telemetry.request_headers import client_identity_headers
 
 if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
 
 _logger = logging.getLogger(__name__)
-
-_TIMEOUT_S = 15.0
 
 # The profile our host section is written under. Distinct from any ambient
 # profile so merging never clobbers an operator's existing sections.
@@ -67,50 +62,9 @@ HOST_DATABRICKS_PROFILE = "omnigent"
 _SIDECAR_NAME = ".omnigent-databricks-broker.json"
 
 
-def _credential_url(server: str, host_id: str) -> str:
-    # Generic, provider-keyed host-credential broker (host_credentials.py); the
-    # dedicated per-provider route was removed in favor of this one.
-    return f"{server.rstrip('/')}/v1/hosts/{host_id}/credentials/databricks"
-
-
-# Pauses between broker attempts. A transient blip otherwise surfaces as an empty
-# bearer, and the harness fails the turn on the spot.
-_RETRY_BACKOFF_S: tuple[float, ...] = (0.5, 1.0)
-
-
 def _fetch(server: str, host_id: str, host_token: str) -> dict | None:
-    """Fetch the broker JSON; ``None`` on a permanent failure or once retries run out.
-
-    Connection errors, 429 and 5xx are retried; any other non-200 is final. All
-    attempts share one :data:`_TIMEOUT_S` budget, so retrying never outlasts the
-    single attempt the harness's helper timeout was sized for.
-    """
-    deadline = time.monotonic() + _TIMEOUT_S
-    for attempt in range(len(_RETRY_BACKOFF_S) + 1):
-        if attempt:
-            pause = _RETRY_BACKOFF_S[attempt - 1]
-            if time.monotonic() + pause >= deadline:
-                return None
-            time.sleep(pause)
-        try:
-            resp = httpx.get(
-                _credential_url(server, host_id),
-                headers={**client_identity_headers(), MANAGED_HOST_TOKEN_HEADER: host_token},
-                timeout=max(deadline - time.monotonic(), 0.1),
-            )
-        except httpx.TransportError:
-            continue
-        except httpx.HTTPError:
-            return None
-        if resp.status_code == 429 or resp.status_code >= 500:
-            continue
-        if resp.status_code != 200:
-            return None
-        try:
-            return resp.json()
-        except ValueError:
-            return None
-    return None
+    """Fetch the owner's Databricks broker JSON, or ``None``; see :func:`fetch_host_credential`."""
+    return fetch_host_credential(server, host_id, host_token, "databricks")
 
 
 def fetch_broker_bearer(server: str, host_id: str, host_token: str) -> tuple[str, str] | None:
