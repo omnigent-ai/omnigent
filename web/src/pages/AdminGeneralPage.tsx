@@ -81,7 +81,7 @@ export function AdminGeneralPage() {
       ) : (
         <>
           {isLoading && <p className="text-ui text-muted-foreground">Loading...</p>}
-          {advisorSettings?.can_manage_workspace && (
+          {advisorAvailable && advisorSettings?.can_manage_workspace !== false && (
             <SettingsGroup
               title={PROACTIVE_AGENT_DISPLAY_NAME}
               testId="settings-group-admin-proactive-agent"

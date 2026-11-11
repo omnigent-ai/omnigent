@@ -1972,8 +1972,8 @@ function TerminalClipboardControl() {
 /** App-wide behavior settings. */
 /** The viewer's Omni Advisor switch, where the server offers it. */
 function ProactiveAgentGroup() {
-  const { settings } = useProactiveAgentSettings();
-  if (!settings) return null;
+  const { available } = useProactiveAgentSettings();
+  if (!available) return null;
   return (
     <SettingsGroup title={PROACTIVE_AGENT_DISPLAY_NAME} testId="settings-group-proactive-agent">
       <ProactiveAgentSettingControl scope="me" />

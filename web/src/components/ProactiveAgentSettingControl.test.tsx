@@ -4,13 +4,16 @@ import type { ProactiveAgentSettings } from "@/hooks/useProactiveAgentSettings";
 import { ProactiveAgentSettingControl } from "./ProactiveAgentSettingControl";
 
 const mocks = vi.hoisted(() => ({
+  available: true,
   settings: undefined as ProactiveAgentSettings | undefined,
+  query: { isError: false, isFetching: false, refetch: vi.fn() },
   mutate: vi.fn(),
 }));
 vi.mock("@/hooks/useProactiveAgentSettings", () => ({
   useProactiveAgentSettings: () => ({
-    available: mocks.settings !== undefined,
-    settings: mocks.settings,
+    available: mocks.available,
+    settings: mocks.available ? mocks.settings : undefined,
+    query: mocks.query,
   }),
   useSetProactiveAgentSetting: () => ({ mutate: mocks.mutate, isPending: false }),
 }));
@@ -26,17 +29,40 @@ function settings(overrides: Partial<ProactiveAgentSettings> = {}): ProactiveAge
 }
 
 beforeEach(() => {
+  mocks.available = true;
   mocks.settings = settings();
+  mocks.query = { isError: false, isFetching: false, refetch: vi.fn() };
   mocks.mutate.mockReset();
 });
 afterEach(cleanup);
 
 describe("ProactiveAgentSettingControl", () => {
   it("renders nothing where the server does not offer Omni Advisor", () => {
-    mocks.settings = undefined;
+    mocks.available = false;
     const { container } = render(<ProactiveAgentSettingControl scope="me" />);
     expect(container).toBeEmptyDOMElement();
   });
+
+  it("says the settings are loading rather than hiding the switch", () => {
+    mocks.settings = undefined;
+    render(<ProactiveAgentSettingControl scope="workspace" />);
+    expect(screen.getByText("Loading...")).toBeInTheDocument();
+    expect(screen.queryByRole("switch")).toBeNull();
+  });
+
+  it.each(["me", "workspace"] as const)(
+    "offers a retry when the initial %s settings read failed",
+    (scope) => {
+      mocks.settings = undefined;
+      mocks.query.isError = true;
+      render(<ProactiveAgentSettingControl scope={scope} />);
+      expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t load Omni Advisor settings.");
+      expect(screen.queryByRole("switch")).toBeNull();
+
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      expect(mocks.query.refetch).toHaveBeenCalledOnce();
+    },
+  );
 
   it("turns the viewer's own setting off", () => {
     render(<ProactiveAgentSettingControl scope="me" />);

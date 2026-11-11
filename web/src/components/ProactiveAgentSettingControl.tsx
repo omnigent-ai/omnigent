@@ -1,5 +1,6 @@
 import { useId, useState } from "react";
 import { SettingsLabel } from "@/components/SettingsLabel";
+import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import {
   useProactiveAgentSettings,
@@ -17,14 +18,38 @@ const COPY: Record<ProactiveAgentSettingScope, string> = {
  * On/off switch for the proactive agent (Omni Advisor): the viewer's own
  * setting, or the workspace-wide one for an admin. Renders nothing where the
  * server does not offer the agent, or for a workspace switch the viewer
- * cannot manage.
+ * cannot manage. While the settings load it says so, and a failed initial
+ * read offers a retry instead of dropping the switch from the page.
  */
 export function ProactiveAgentSettingControl({ scope }: { scope: ProactiveAgentSettingScope }) {
-  const { settings } = useProactiveAgentSettings();
+  const { available, settings, query } = useProactiveAgentSettings();
   const setSetting = useSetProactiveAgentSetting();
   const [error, setError] = useState<string | null>(null);
   const labelId = useId();
-  if (!settings || (scope === "workspace" && !settings.can_manage_workspace)) return null;
+  if (!available) return null;
+  if (!settings) {
+    if (query.isError) {
+      return (
+        <div
+          role="alert"
+          className="flex items-center justify-between gap-6 text-ui text-destructive"
+        >
+          <span>Couldn’t load {PROACTIVE_AGENT_DISPLAY_NAME} settings.</span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void query.refetch()}
+            disabled={query.isFetching}
+            componentId={`settings.proactive_agent.${scope}.retry`}
+          >
+            Retry
+          </Button>
+        </div>
+      );
+    }
+    return <p className="text-ui text-muted-foreground">Loading...</p>;
+  }
+  if (scope === "workspace" && !settings.can_manage_workspace) return null;
   const turnedOffByAdmin = scope === "me" && !settings.workspace_enabled;
   const checked =
     scope === "workspace" ? settings.workspace_enabled : settings.user_enabled && !turnedOffByAdmin;

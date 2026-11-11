@@ -79,7 +79,9 @@ it("keeps an accepted toggle when an older settings read lands after it", async 
   // The read saw the old value; it must not undo the accepted setting.
   await act(async () => {
     staleRead.resolve(response(settings(true)));
-    await new Promise((settle) => setTimeout(settle, 20));
+    await new Promise<void>((settle) => {
+      setTimeout(settle, 20);
+    });
   });
   expect(result.current.settings.settings?.enabled).toBe(false);
   expect(authenticatedFetch).toHaveBeenCalledTimes(3);

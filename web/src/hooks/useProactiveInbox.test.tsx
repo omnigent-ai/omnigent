@@ -346,7 +346,7 @@ it.each(["succeeds", "fails"])(
     // behind it. The Unread tab's page holds the unread one.
     const newer: Suggestion = { ...item, id: "newer", status: "read", createdAt: 2 };
     vi.mocked(listSuggestions).mockImplementation(async (_cursor, statuses) =>
-      statuses.length === 1 ? page([item], 1) : { ...page([newer], 1), nextCursor: "1:sug" },
+      statuses?.length === 1 ? page([item], 1) : { ...page([newer], 1), nextCursor: "1:sug" },
     );
     const { result } = renderHook(
       () => ({ all: useProactiveInbox(true), unread: useProactiveInbox(true, ["unread"]) }),

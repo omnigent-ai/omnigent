@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   isAdmin: true,
   singleUser: false,
   nestedAgents: true,
+  advisorAvailable: false,
   advisor: undefined as { can_manage_workspace: boolean } | undefined,
 }));
 vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => mocks.isAdmin }));
@@ -17,7 +18,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 vi.mock("@/hooks/useSharing", () => ({ useSharing: vi.fn(), useSetSharing: vi.fn() }));
 vi.mock("@/hooks/useProactiveAgentSettings", () => ({
   useProactiveAgentSettings: () => ({
-    available: mocks.advisor !== undefined,
+    available: mocks.advisorAvailable || mocks.advisor !== undefined,
     settings: mocks.advisor,
   }),
 }));
@@ -41,6 +42,7 @@ beforeEach(() => {
   mocks.isAdmin = true;
   mocks.singleUser = false;
   mocks.nestedAgents = true;
+  mocks.advisorAvailable = false;
   mocks.advisor = undefined;
   vi.mocked(useSharing).mockReturnValue({
     data: {
@@ -70,6 +72,17 @@ describe("AdminGeneralPage", () => {
     mocks.advisor = { can_manage_workspace: false };
     renderPage();
     expect(screen.queryByTestId("advisor-control-workspace")).toBeNull();
+    expect(screen.queryByTestId("settings-group-admin-proactive-agent")).toBeNull();
+  });
+
+  it("keeps the Omni Advisor group while its settings are loading or failed to load", () => {
+    // The control itself shows the loading or failure state; the page must not
+    // drop the group just because the settings are not in hand yet.
+    mocks.nestedAgents = false;
+    mocks.advisorAvailable = true;
+    renderPage();
+    expect(screen.getByTestId("settings-group-admin-proactive-agent")).toBeInTheDocument();
+    expect(screen.getByTestId("advisor-control-workspace")).toBeInTheDocument();
   });
 
   it.each(["disabled", "non-admin"])("does not expose destinations when %s", (mode) => {
