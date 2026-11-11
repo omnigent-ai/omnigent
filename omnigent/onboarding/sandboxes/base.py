@@ -508,9 +508,6 @@ class SandboxLifecycle(ABC):
     # restricted network) override this.
     wheel_build_index_url: ClassVar[str | None] = None
 
-    # Nested composers must keep this provider's source directory instead of offering worktrees.
-    reuse_source_workspace: ClassVar[bool] = False
-
     # Legacy class vars — kept for backward compat while providers migrate
     # to explicit ``capabilities`` objects. New providers should override
     # the ``capabilities`` property directly instead of setting these.

@@ -986,8 +986,6 @@ class ManagedSandboxDeployment:
             if config.managed_launch_supported and config.provider is not None:
                 launcher = config.launcher_factory()
                 caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
-                if launcher.reuse_source_workspace:
-                    caps[config.provider]["reuse_source_workspace"] = True
                 from omnigent.inference_config import parse_inference_config
                 from omnigent.server.inference_catalog import ambient_gateway_providers
 

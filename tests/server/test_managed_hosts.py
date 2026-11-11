@@ -2332,10 +2332,7 @@ def test_read_managed_repo_workspaces_orders_numerically_and_falls_back() -> Non
     assert read_managed_repo_workspaces({}) == []
 
 
-@pytest.mark.parametrize("reuse_source_workspace", [False, True])
-def test_provider_ui_capabilities_reports_multi_repo_per_provider(
-    reuse_source_workspace: bool,
-) -> None:
+def test_provider_ui_capabilities_reports_multi_repo_per_provider() -> None:
     """The /v1/info map reflects each launchable provider's declared multi_repo,
     keyed by provider name; a provider declaring nothing stays off."""
 
@@ -2345,7 +2342,6 @@ def test_provider_ui_capabilities_reports_multi_repo_per_provider(
             return replace(super().capabilities, multi_repo=True)
 
     single = FakeSandboxLauncher()  # exec-model default → multi_repo False
-    _MultiRepoFake.reuse_source_workspace = reuse_source_workspace
     multi = _MultiRepoFake()
     deployment = ManagedSandboxDeployment(
         configs=(
@@ -2365,10 +2361,7 @@ def test_provider_ui_capabilities_reports_multi_repo_per_provider(
     )
     assert deployment.provider_ui_capabilities() == {
         "single": {"multi_repo": False},
-        "multi": {
-            "multi_repo": True,
-            **({"reuse_source_workspace": True} if reuse_source_workspace else {}),
-        },
+        "multi": {"multi_repo": True},
     }
 
 

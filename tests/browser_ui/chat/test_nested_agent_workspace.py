@@ -14,8 +14,9 @@ from tests.browser_ui.chat.session_contract import ChatSessionContract
 
 
 @pytest.mark.parametrize("width", [1440, 390], ids=["desktop", "mobile"])
+@pytest.mark.parametrize("new_worktree", [False, True], ids=["reuse", "new-worktree"])
 def test_nested_sandbox_keeps_source_directory(
-    page: Page, chat_session_contract: ChatSessionContract, width: int
+    page: Page, chat_session_contract: ChatSessionContract, width: int, new_worktree: bool
 ) -> None:
     chat = chat_session_contract
     contract = chat.contract
@@ -29,7 +30,6 @@ def test_nested_sandbox_keeps_source_directory(
             "single_user": True,
             "sibling_sessions": True,
             "managed_sandboxes_enabled": False,
-            "sandbox_provider_capabilities": {"fixed-workspace": {"reuse_source_workspace": True}},
         },
     )
     contract.json(OWN_AGENTS, {"data": []})
@@ -47,9 +47,22 @@ def test_nested_sandbox_keeps_source_directory(
                     "configured_harnesses": {chat.harness: True},
                 }
                 for host_id, name, provider in (
-                    (chat.host_id, "Research sandbox", "fixed-workspace"),
+                    (chat.host_id, "Research sandbox", "test-sandbox"),
                     ("other-host", "My computer", None),
                 )
+            ]
+        },
+    )
+    contract.json(
+        f"/v1/hosts/{chat.host_id}/worktrees",
+        {
+            "data": [
+                {"path": "/work/repo", "branch": "master", "is_main": True},
+                {
+                    "path": "/work/repo-worktrees/research",
+                    "branch": "feature/research",
+                    "is_main": False,
+                },
             ]
         },
     )
@@ -75,17 +88,16 @@ def test_nested_sandbox_keeps_source_directory(
 
     contract.json("/v1/sessions", create, method="POST")
     page.goto(f"{chat.base_url}/?sibling={chat.session_id}")
-    directory = page.get_by_test_id("composer-workspace-dir")
+    directory = page.get_by_test_id("new-chat-landing-workspace-chip")
     expect(directory).to_have_attribute("aria-label", f"Working directory: {source_directory}")
-    expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_have_count(0)
-    expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_have_count(0)
+    worktree = page.get_by_test_id("new-chat-landing-branch-chip")
+    expect(worktree).to_have_attribute("aria-label", "Existing worktree branch: feature/research")
 
     page.get_by_test_id("new-chat-landing-host-chip").click()
     page.get_by_test_id("new-chat-landing-host-other-host").click()
     expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_have_attribute(
         "aria-label", f"Working directory: {other_directory}"
     )
-    worktree = page.get_by_test_id("new-chat-landing-branch-chip")
     expect(worktree).to_have_text("None")
     worktree.click()
     page.get_by_test_id("new-chat-landing-branch-input").fill("feature/manual-choice")
@@ -95,12 +107,30 @@ def test_nested_sandbox_keeps_source_directory(
     expect(page.get_by_test_id("new-chat-landing-host-menu")).to_be_visible()
     page.get_by_test_id(f"new-chat-landing-host-{chat.host_id}").click()
     expect(directory).to_have_attribute("aria-label", f"Working directory: {source_directory}")
-    expect(worktree).to_have_count(0)
+    expect(worktree).to_have_attribute("aria-label", "Existing worktree branch: feature/research")
+    worktree.click()
+    expect(page.get_by_test_id("new-chat-landing-branch-input")).to_have_value("")
+    expect(
+        page.get_by_test_id("new-chat-landing-worktree-option").get_by_role("radio")
+    ).to_be_checked()
+    if new_worktree:
+        page.get_by_test_id("new-chat-landing-branch-input").fill("feature/nested")
+        expect(page.get_by_test_id("new-chat-landing-base-branch-input")).to_have_value(
+            "feature/research"
+        )
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("new-chat-landing-branch-input")).to_have_count(0)
     page.get_by_test_id("new-chat-landing-input").fill("Review the changes in this checkout")
     page.get_by_test_id("new-chat-landing-submit").click()
     expect(page).to_have_url(chat.url)
+    chat.wait_for_stream()
+    expect(page.get_by_text("Review the changes in this checkout", exact=True)).to_be_visible()
     assert len(creates) == 1
     assert creates[0]["sibling_source_id"] == chat.session_id
     assert creates[0]["host_id"] == chat.host_id
     assert creates[0]["workspace"] == source_directory
-    assert creates[0].get("git") is None
+    assert creates[0]["git"] == (
+        {"branch_name": "feature/nested", "base_branch": "feature/research"}
+        if new_worktree
+        else {"branch_name": "feature/research", "existing_worktree": True}
+    )

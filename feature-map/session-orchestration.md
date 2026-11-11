@@ -129,9 +129,10 @@ MCP independent creation.
   Open **Add nested agent** from a session and inspect its host picker, then try the
   same disallowed destination through the API or MCP.
 - **Add nested agent** starts in the source checkout even when the project or user
-  defaults request new worktrees. On providers advertising `reuse_source_workspace`, the
-  directory is read-only and there is no worktree picker; switching away and back restores that directory.
-  Other connected hosts retain manual directory and worktree selection. Browser
+  defaults request new worktrees. Directory and worktree controls remain editable;
+  switching away and back restores the source directory. A manually created worktree
+  defaults to the selected checkout's actual branch, including `master`, with an
+  editable base branch. Browser
   coverage: `tests/browser_ui/chat/test_nested_agent_workspace.py` (desktop/mobile,
   mocked backend); default and explicit worktree payloads:
   `web/src/shell/NewChatDialog.flow.test.tsx`.
