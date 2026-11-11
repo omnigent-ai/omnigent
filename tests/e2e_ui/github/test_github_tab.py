@@ -1056,12 +1056,18 @@ def test_reply_to_inline_review_conversation(
     assert posts == [{"pr_url": pr_url, "body": "**This handles empty input.**"}]
     assert thread_reads
     fallback = panel.locator('[data-review-thread="outdated"]')
+    expect(fallback).to_have_count(0)
+    panel.get_by_role("button", name="More actions for removed.py", exact=True).click()
+    page.get_by_role("menuitem", name="Show earlier comments", exact=True).click()
     expect(fallback.get_by_role("button", expanded=False)).to_be_visible()
     fallback.get_by_role("button", expanded=False).click()
     expect(fallback.get_by_text("Original code context", exact=True)).to_be_visible()
     expect(fallback.get_by_text("Original context", exact=True)).to_be_visible()
     conversation.scroll_into_view_if_needed()
     page.screenshot(path=str(tmp_path / f"inline-{entry}-posted.png"))
+    panel.get_by_role("button", name="More actions for removed.py", exact=True).click()
+    page.get_by_role("menuitem", name="Hide earlier comments", exact=True).click()
+    expect(fallback).to_have_count(0)
 
     line = file.locator("diffs-container").first.locator(
         ":scope > [data-diff] > [data-code] > [data-gutter] "

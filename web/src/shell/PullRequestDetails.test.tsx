@@ -813,6 +813,7 @@ it("posts a comment once, keeps the draft through unmount, and updates only its 
   const textbox = screen.getByRole("textbox", { name: "New PR comment" });
   const body = "  **Thanks**\n`literal`";
   fireEvent.change(textbox, { target: { value: body } });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Submit" })).toBeEnabled());
   fireEvent.submit(textbox.closest("form")!);
   fireEvent.submit(textbox.closest("form")!);
   await waitFor(() => expect(edits).toHaveLength(1));
