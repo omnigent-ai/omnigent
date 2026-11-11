@@ -18,6 +18,7 @@ import json
 import jsonschema
 import pytest
 
+from omnigent.errors import OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.tool_dispatch import (
     _ALL_LOCAL_TOOLS,
@@ -26,6 +27,7 @@ from omnigent.runner.tool_dispatch import (
     _execute_scheduled_task_tool,
     execute_tool,
 )
+from omnigent.server.scheduled.harness_settings import validate_scheduled_permission_mode
 from omnigent.tools.builtins.scheduled_tasks import SysScheduledTaskUpdateTool
 
 _ALL_NAMES = {
@@ -138,7 +140,10 @@ async def test_create_posts_payload() -> None:
         "session_id": "conv_1",
     }  # unknown fields filtered out
     assert json.loads(out)["id"] == "t1"
-    assert client.headers[-1] == {ORCHESTRATION_SOURCE_HEADER: "conv_source"}
+    assert client.headers[-1] == {
+        ORCHESTRATION_SOURCE_HEADER: "conv_source",
+        "x-omnigent-automation-source": "agent",
+    }
 
 
 @pytest.mark.asyncio
@@ -163,6 +168,8 @@ async def test_current_runner_refuses_incomplete_review_before_dispatch(
     error = json.loads(result)["error"]
     assert missing_field in error
     assert ("List the task" in error) == (tool_name == "sys_scheduled_task_update")
+    if tool_name == "sys_scheduled_task_create":
+        assert "JSON null (not the string 'null')" in error
     assert client.calls == []
 
 
@@ -237,19 +244,23 @@ async def test_list_gets() -> None:
 
 
 @pytest.mark.asyncio
-async def test_update_patches_by_id() -> None:
+@pytest.mark.parametrize(
+    "placement",
+    [
+        {"workspace": "/repo2", "host_id": "fedcba9876543210fedcba9876543210"},
+        {"execution_target": "managed_sandbox", "workspace": "https://github.com/example/runtime"},
+        {"execution_target": "managed_sandbox", "workspace": None},
+    ],
+)
+async def test_update_patches_by_id(placement: dict[str, str | None]) -> None:
     client = _RecordingClient(_Resp(body={"id": "t1", "state": "paused"}))
+    arguments = {**_REVIEW_FIELDS, "scheduled_task_id": _TASK_ID, "state": "paused", **placement}
+    jsonschema.validate(
+        arguments, SysScheduledTaskUpdateTool().get_schema()["function"]["parameters"]
+    )
     await execute_tool(
         tool_name="sys_scheduled_task_update",
-        arguments=json.dumps(
-            {
-                **_REVIEW_FIELDS,
-                "scheduled_task_id": _TASK_ID,
-                "state": "paused",
-                "workspace": "/repo2",
-                "host_id": "fedcba9876543210fedcba9876543210",
-            }
-        ),
+        arguments=json.dumps(arguments),
         server_client=client,
         conversation_id="conv_source",
     )
@@ -258,8 +269,7 @@ async def test_update_patches_by_id() -> None:
     assert body == {
         **_REVIEW_FIELDS,
         "state": "paused",
-        "workspace": "/repo2",
-        "host_id": "fedcba9876543210fedcba9876543210",
+        **placement,
     }
     assert client.headers[-1] == {ORCHESTRATION_SOURCE_HEADER: "conv_source"}
 
@@ -510,6 +520,20 @@ async def test_server_error_becomes_clean_json() -> None:
         server_client=client,
     )
     assert "server returned 400" in json.loads(out)["error"]
+
+
+@pytest.mark.asyncio
+async def test_permission_mode_rejection_reaches_the_agent_whole() -> None:
+    with pytest.raises(OmnigentError) as rejected:
+        validate_scheduled_permission_mode("unknown-permission-mode")
+    body = {"error": {"code": "invalid_input", "message": rejected.value.message}}
+    client = _RecordingClient(_Resp(status_code=400, body=body))
+    out = await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps({**_REVIEW_FIELDS, "name": "x", "rrule": "FREQ=DAILY", "agent_id": "a"}),
+        server_client=client,
+    )
+    assert json.loads(out)["details"] == json.dumps(body)
 
 
 @pytest.mark.asyncio

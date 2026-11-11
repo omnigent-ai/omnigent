@@ -16,6 +16,10 @@
             "description": "Plain-text snapshot of the selected range, used to re-anchor the comment after file edits. `None` if not provided.",
             "title": "Anchor Content"
           },
+          "anchor_metadata": {
+            "title": "Anchor Metadata",
+            "type": "null"
+          },
           "body": {
             "description": "The comment text.",
             "title": "Body",
@@ -241,6 +245,11 @@
             "title": "Id",
             "type": "string"
           },
+          "loads_user_settings": {
+            "default": true,
+            "title": "Loads User Settings",
+            "type": "boolean"
+          },
           "mcp_registry_editable": {
             "default": false,
             "title": "Mcp Registry Editable",
@@ -321,10 +330,12 @@
         "type": "object"
       },
       "AgentList": {
-        "description": "The built-in agent list, plus the packaged names this deployment hides.",
+        "description": "Paginated list of agents; `data` is a page of `AgentObject`.",
         "properties": {
           "data": {
-            "items": {},
+            "items": {
+              "$ref": "#/components/schemas/AgentObject"
+            },
             "title": "Data",
             "type": "array"
           },
@@ -356,6 +367,7 @@
             "title": "Last Id"
           },
           "object": {
+            "const": "list",
             "default": "list",
             "title": "Object",
             "type": "string"
@@ -488,6 +500,12 @@
             "description": "Unique agent identifier, e.g. `\"ag_abc123\"`.",
             "title": "Id",
             "type": "string"
+          },
+          "loads_user_settings": {
+            "default": true,
+            "description": "Whether a claude-sdk session for this agent loads the user's Claude settings and user-scope MCP servers. `False` when the spec's `skills: none` runs the CLI with no setting sources; `True` when the bundle cannot be loaded.",
+            "title": "Loads User Settings",
+            "type": "boolean"
           },
           "mcp_registry_editable": {
             "default": false,
@@ -632,8 +650,92 @@
         "title": "AutomaticSessionRenameResponse",
         "type": "object"
       },
+      "AutomationFailure": {
+        "description": "Latest sessionless failure, without prompts or raw error details.",
+        "properties": {
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "scheduled_at": {
+            "format": "int64",
+            "title": "Scheduled At",
+            "type": "integer"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          },
+          "task_name": {
+            "title": "Task Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "task_name",
+          "run_id",
+          "scheduled_at",
+          "finished_at",
+          "error_code"
+        ],
+        "title": "AutomationFailure",
+        "type": "object"
+      },
+      "AutomationFailurePage": {
+        "description": "Failures from one bounded page of owned automations.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/AutomationFailure"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "data",
+          "next_cursor"
+        ],
+        "title": "AutomationFailurePage",
+        "type": "object"
+      },
       "BackgroundTaskInfo": {
-        "description": "One still-running background shell from the claude-native `Stop` hook.\n\nClaude Code leaves finished shells in the hook's `background_tasks`\narray, so the list surfaced here is filtered to the non-terminal ones \u2014\nits length matches the `background_task_count` tally. Every field is\nbest-effort: the hook shape is external, so an entry missing one field\nstill yields a usable row (e.g. a `description` with no `command`).",
+        "description": "One still-running background shell or agent from the claude-native `Stop` hook.\n\nClaude Code leaves finished shells in the hook's `background_tasks`\narray, so the list surfaced here is filtered to the non-terminal ones \u2014\nits length matches the `background_task_count` tally. Every field is\nbest-effort: the hook shape is external, so an entry missing one field\nstill yields a usable row (e.g. a `description` with no `command`).",
         "properties": {
           "command": {
             "anyOf": [
@@ -668,7 +770,7 @@
                 "type": "null"
               }
             ],
-            "description": "Opaque per-shell identifier, e.g. `\"abc123\"`.",
+            "description": "Opaque per-task identifier, e.g. `\"abc123\"`.",
             "title": "Id"
           },
           "status": {
@@ -692,7 +794,7 @@
                 "type": "null"
               }
             ],
-            "description": "Task kind, e.g. `\"shell\"`.",
+            "description": "Task kind, e.g. `\"shell\"` or `\"subagent\"`.",
             "title": "Type"
           }
         },
@@ -1022,6 +1124,19 @@
             ],
             "description": "Status of the latest task, e.g. `\"completed\"`, `\"in_progress\"`, `\"failed\"`. `None` if no tasks exist.",
             "title": "Current Task Status"
+          },
+          "depth": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Levels below the queried session, `1` for a direct child. Set only by `?descendants=true`, so a client can tell the server returned the whole subtree; `None` otherwise.",
+            "title": "Depth"
           },
           "id": {
             "description": "Child conversation/session identifier, e.g. `\"conv_child123\"`.",
@@ -1839,6 +1954,173 @@
           "name"
         ],
         "title": "CreateProjectRequest",
+        "type": "object"
+      },
+      "CreateScheduledTaskRequest": {
+        "additionalProperties": false,
+        "description": "Body for `POST /v1/scheduled-tasks`.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "base_branch": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Branch"
+          },
+          "execution_target": {
+            "default": "connected_host",
+            "title": "Execution Target",
+            "type": "string"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          },
+          "max_cost_usd": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Cost Usd"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Override"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "permission_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Permission Mode"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
+          "prompt": {
+            "title": "Prompt",
+            "type": "string"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Effort"
+          },
+          "rrule": {
+            "title": "Rrule",
+            "type": "string"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "session_mode": {
+            "default": "new",
+            "enum": [
+              "new",
+              "continue"
+            ],
+            "title": "Session Mode",
+            "type": "string"
+          },
+          "source_session_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Session Id"
+          },
+          "timezone": {
+            "default": "UTC",
+            "title": "Timezone",
+            "type": "string"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace"
+          }
+        },
+        "required": [
+          "name",
+          "prompt",
+          "rrule",
+          "agent_id"
+        ],
+        "title": "CreateScheduledTaskRequest",
         "type": "object"
       },
       "CreateSessionPolicyRequest": {
@@ -3603,6 +3885,20 @@
             ],
             "description": "Optional git worktree options. In create mode the server creates a worktree for a new branch off `workspace` on the host and binds the runner to it (the fork-resume path; mirrors `POST /v1/sessions`). In bind mode (`existing_worktree=True`) `workspace` already IS a worktree \u2014 no worktree is created; `branch_name` is recorded as the session's `git_branch` for display and opt-in cleanup. `None` binds `workspace` directly. `host_id` is always present (it is in the path), so no host check is needed here."
           },
+          "session_env_handoff_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "pattern": "^[A-Za-z0-9_-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque, non-secret ID of the launching CLI's local forwarded-environment file, relayed to the host so only this launch's runner consumes it. `None` when nothing is forwarded.",
+            "title": "Session Env Handoff Id"
+          },
           "session_id": {
             "description": "Session to bind the new runner to, e.g. `\"conv_abc123\"`.",
             "title": "Session Id",
@@ -3619,6 +3915,51 @@
           "workspace"
         ],
         "title": "LaunchRunnerRequest",
+        "type": "object"
+      },
+      "LiveMCPServerStatus": {
+        "description": "One MCP server's connection inside a session's running harness.",
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The harness's reason for a failed connection, or `None`.",
+            "title": "Error"
+          },
+          "name": {
+            "description": "Server name as the harness reports it, e.g. `\"docs\"` or `\"plugin:tools:docs\"`.",
+            "title": "Name",
+            "type": "string"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where the harness loaded the server from, e.g. `\"user\"`.",
+            "title": "Scope"
+          },
+          "status": {
+            "description": "`\"connected\"`, `\"failed\"`, `\"needs-auth\"`, `\"pending\"`, or `\"disabled\"`; other harness values pass through.",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "status"
+        ],
+        "title": "LiveMCPServerStatus",
         "type": "object"
       },
       "LocalImportRequest": {
@@ -3907,6 +4248,71 @@
         "title": "MCPServerSummary",
         "type": "object"
       },
+      "McpServerEnabledRequest": {
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "harness": {
+            "enum": [
+              "claude",
+              "codex"
+            ],
+            "title": "Harness",
+            "type": "string"
+          },
+          "plugin": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plugin"
+          },
+          "server": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Server",
+            "type": "string"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          }
+        },
+        "required": [
+          "harness",
+          "server",
+          "enabled"
+        ],
+        "title": "McpServerEnabledRequest",
+        "type": "object"
+      },
+      "McpServerEnabledResponse": {
+        "properties": {
+          "server": {
+            "$ref": "#/components/schemas/McpServerSummary"
+          }
+        },
+        "required": [
+          "server"
+        ],
+        "title": "McpServerEnabledResponse",
+        "type": "object"
+      },
       "McpServerStartup": {
         "description": "One MCP server's startup state within a `session.mcp_startup` event.",
         "properties": {
@@ -3959,10 +4365,26 @@
             "description": "Account state reported by the host's sign-in manager: `connected` or `sign_in_required`; `None` when nothing reports one.",
             "title": "Auth Status"
           },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
           "harness": {
-            "description": "Harness family that loads it: `claude`, `codex`, or `cursor`.",
+            "description": "Harness family that loads it: `claude`, `codex`, `cursor`, or `pi`.",
             "title": "Harness",
             "type": "string"
+          },
+          "locked": {
+            "default": false,
+            "title": "Locked",
+            "type": "boolean"
           },
           "managed": {
             "default": false,
@@ -4265,7 +4687,7 @@
           },
           "user_authored": {
             "default": false,
-            "description": "Confirmed or conservatively preserved user input; prevents legacy content cleanup from hiding literal agent markup.",
+            "description": "Originated from an explicit user action; may be server-expanded, e.g. skill instructions. Independent of `is_meta`; client-settable by convention, not a trust signal. Also exempts the message from legacy markup cleanup on import.",
             "title": "User Authored",
             "type": "boolean"
           }
@@ -4714,55 +5136,6 @@
           "delta"
         ],
         "title": "OutputTextDeltaEvent",
-        "type": "object"
-      },
-      "PaginatedList": {
-        "description": "A paginated list response following cursor-based pagination.",
-        "properties": {
-          "data": {
-            "description": "Page of results. Items are heterogeneous (`ResponseObject`, `ConversationObject`, `FileObject`, or dicts) and list is invariant, so no single concrete type satisfies all callers.",
-            "items": {},
-            "title": "Data",
-            "type": "array"
-          },
-          "first_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "ID of the first item in the page, or `None` if the page is empty, e.g. `\"resp_abc123\"`.",
-            "title": "First Id"
-          },
-          "has_more": {
-            "default": false,
-            "description": "Whether more items exist beyond this page.",
-            "title": "Has More",
-            "type": "boolean"
-          },
-          "last_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "ID of the last item in the page, or `None` if the page is empty, e.g. `\"resp_xyz789\"`.",
-            "title": "Last Id"
-          },
-          "object": {
-            "default": "list",
-            "description": "Fixed resource type, always `\"list\"`.",
-            "title": "Object",
-            "type": "string"
-          }
-        },
-        "title": "PaginatedList",
         "type": "object"
       },
       "PermissionObject": {
@@ -5377,6 +5750,24 @@
         "title": "ReasoningTextDeltaEvent",
         "type": "object"
       },
+      "ReconnectLiveMCPServerRequest": {
+        "additionalProperties": false,
+        "description": "Body for reconnecting one MCP server in a session's running harness.",
+        "properties": {
+          "name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ReconnectLiveMCPServerRequest",
+        "type": "object"
+      },
       "ResetSessionModelOverrideRequest": {
         "additionalProperties": false,
         "description": "Reset a launch-time model selection only while that selection is current.",
@@ -5892,6 +6283,14 @@
       },
       "SandboxProfilesResponse": {
         "properties": {
+          "default_profile_ids": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "title": "Default Profile Ids",
+            "type": "object"
+          },
           "managed_providers": {
             "items": {
               "type": "string"
@@ -5986,6 +6385,58 @@
         "title": "SandboxStatus",
         "type": "object"
       },
+      "ScheduledRunLogContext": {
+        "description": "Occurrence identity retained with a saved prompt across replica changes.",
+        "properties": {
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "scheduled_at": {
+            "format": "int64",
+            "title": "Scheduled At",
+            "type": "integer"
+          },
+          "session_mode": {
+            "title": "Session Mode",
+            "type": "string"
+          },
+          "target": {
+            "title": "Target",
+            "type": "string"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          },
+          "task_workspace_id": {
+            "format": "int64",
+            "title": "Task Workspace Id",
+            "type": "integer"
+          },
+          "trigger_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger Key"
+          }
+        },
+        "required": [
+          "task_id",
+          "run_id",
+          "task_workspace_id",
+          "scheduled_at",
+          "target",
+          "session_mode"
+        ],
+        "title": "ScheduledRunLogContext",
+        "type": "object"
+      },
       "SendCommentsRequest": {
         "description": "Request body for `POST .../comments/send`.",
         "properties": {
@@ -6041,6 +6492,12 @@
             "default": true,
             "title": "Archive Worktree Cleanup",
             "type": "boolean"
+          },
+          "automation_trigger_poll_minutes": {
+            "default": 10,
+            "format": "int64",
+            "title": "Automation Trigger Poll Minutes",
+            "type": "integer"
           },
           "automations_enabled": {
             "default": false,
@@ -6170,9 +6627,29 @@
             "title": "Sandbox Providers",
             "type": "array"
           },
+          "scheduled_task_approval_skipping_modes": {
+            "default": true,
+            "title": "Scheduled Task Approval Skipping Modes",
+            "type": "boolean"
+          },
+          "scheduled_task_harness_settings": {
+            "default": true,
+            "title": "Scheduled Task Harness Settings",
+            "type": "boolean"
+          },
+          "scheduled_task_inbox": {
+            "default": false,
+            "title": "Scheduled Task Inbox",
+            "type": "boolean"
+          },
           "scheduled_task_projects": {
             "default": false,
             "title": "Scheduled Task Projects",
+            "type": "boolean"
+          },
+          "scheduled_task_sandbox_workspaces": {
+            "default": true,
+            "title": "Scheduled Task Sandbox Workspaces",
             "type": "boolean"
           },
           "scheduled_task_session_modes": {
@@ -6180,9 +6657,39 @@
             "title": "Scheduled Task Session Modes",
             "type": "boolean"
           },
+          "scheduled_task_source_sessions": {
+            "default": true,
+            "title": "Scheduled Task Source Sessions",
+            "type": "boolean"
+          },
+          "scheduled_task_subhour": {
+            "default": true,
+            "title": "Scheduled Task Subhour",
+            "type": "boolean"
+          },
+          "scheduled_task_worktrees": {
+            "default": true,
+            "title": "Scheduled Task Worktrees",
+            "type": "boolean"
+          },
           "server_version": {
             "title": "Server Version",
             "type": "string"
+          },
+          "session_bundle_model_override": {
+            "default": true,
+            "title": "Session Bundle Model Override",
+            "type": "boolean"
+          },
+          "session_bundle_workspaces": {
+            "default": true,
+            "title": "Session Bundle Workspaces",
+            "type": "boolean"
+          },
+          "session_claude_sdk_clear": {
+            "default": false,
+            "title": "Session Claude Sdk Clear",
+            "type": "boolean"
           },
           "session_event_types": {
             "default": [],
@@ -6197,6 +6704,21 @@
             "title": "Session Fork Workspaces",
             "type": "boolean"
           },
+          "session_list_scoped_archives": {
+            "default": true,
+            "title": "Session List Scoped Archives",
+            "type": "boolean"
+          },
+          "session_move_source_checks": {
+            "default": false,
+            "title": "Session Move Source Checks",
+            "type": "boolean"
+          },
+          "session_organize_source_checks": {
+            "default": false,
+            "title": "Session Organize Source Checks",
+            "type": "boolean"
+          },
           "session_pull_requests": {
             "default": false,
             "title": "Session Pull Requests",
@@ -6205,6 +6727,11 @@
           "session_search_scope": {
             "default": true,
             "title": "Session Search Scope",
+            "type": "boolean"
+          },
+          "session_title_instructions": {
+            "default": false,
+            "title": "Session Title Instructions",
             "type": "boolean"
           },
           "sharing_mode": {
@@ -6216,6 +6743,26 @@
             ],
             "title": "Sharing Mode",
             "type": "string"
+          },
+          "sibling_other_project_standalone": {
+            "default": false,
+            "title": "Sibling Other Project Standalone",
+            "type": "boolean"
+          },
+          "sibling_session_destinations": {
+            "default": "any_host",
+            "enum": [
+              "current_host",
+              "current_host_or_new_sandbox",
+              "any_host"
+            ],
+            "title": "Sibling Session Destinations",
+            "type": "string"
+          },
+          "sibling_sessions": {
+            "default": false,
+            "title": "Sibling Sessions",
+            "type": "boolean"
           },
           "single_user": {
             "title": "Single User",
@@ -6282,6 +6829,7 @@
             "response.reasoning_text.delta": "#/components/schemas/ReasoningTextDeltaEvent",
             "response.retry": "#/components/schemas/RetryEvent",
             "session.agent_changed": "#/components/schemas/SessionAgentChangedEvent",
+            "session.background_tasks": "#/components/schemas/SessionBackgroundTasksEvent",
             "session.btw_sidechat": "#/components/schemas/SessionBtwSidechatEvent",
             "session.changed_files.invalidated": "#/components/schemas/SessionChangedFilesInvalidatedEvent",
             "session.child_session.updated": "#/components/schemas/SessionChildSessionUpdatedEvent",
@@ -6339,6 +6887,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionCodexApprovalModeEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionBackgroundTasksEvent"
           },
           {
             "$ref": "#/components/schemas/SessionAgentChangedEvent"
@@ -6531,6 +7082,56 @@
           "agent_name"
         ],
         "title": "SessionAgentChangedEvent",
+        "type": "object"
+      },
+      "SessionBackgroundTasksEvent": {
+        "description": "Background tasks of a session changed between its turns.\n\nEmitted when a codex-native forwarder's listing of its thread's background\nterminals changes. Claude's shells ride on its turn's `session.status`\nedge instead, because Claude reports them only when a turn ends.",
+        "properties": {
+          "background_task_count": {
+            "description": "Background tasks still running, e.g. `1`. `0` clears the composer's indicator.",
+            "format": "int64",
+            "title": "Background Task Count",
+            "type": "integer"
+          },
+          "background_tasks": {
+            "description": "Detail for each counted task, e.g. its command. Category: **transient** (SSE-only). The session snapshot carries the same tally, so reconnecting clients restore it.",
+            "items": {
+              "$ref": "#/components/schemas/BackgroundTaskInfo"
+            },
+            "title": "Background Tasks",
+            "type": "array"
+          },
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.background_tasks",
+            "description": "Always `\"session.background_tasks\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "background_task_count"
+        ],
+        "title": "SessionBackgroundTasksEvent",
         "type": "object"
       },
       "SessionBtwSidechatEvent": {
@@ -6757,6 +7358,143 @@
         "title": "SessionCollaborationModeEvent",
         "type": "object"
       },
+      "SessionCompactionItem": {
+        "description": "`compaction` item: common fields plus `CompactionData`.",
+        "properties": {
+          "compacted_messages": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Compacted Messages"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "last_item_id": {
+            "title": "Last Item Id",
+            "type": "string"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          },
+          "token_count": {
+            "format": "int64",
+            "title": "Token Count",
+            "type": "integer"
+          },
+          "type": {
+            "const": "compaction",
+            "title": "Type",
+            "type": "string"
+          },
+          "window_id": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Window Id"
+          }
+        },
+        "required": [
+          "summary",
+          "last_item_id",
+          "token_count",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionCompactionItem",
+        "type": "object"
+      },
+      "SessionContentBlock": {
+        "additionalProperties": true,
+        "description": "One `content` or `summary` block of a message or reasoning item.\n\nBlocks are heterogeneous (`input_text`, `output_text`,\n`input_image`, `summary_text`, ...), so kinds other than text\ncarry extra keys.",
+        "properties": {
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Text body of a text block; absent for other kinds.",
+            "title": "Text"
+          },
+          "type": {
+            "description": "Block kind, e.g. `\"input_text\"` or `\"output_text\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "SessionContentBlock",
+        "type": "object"
+      },
       "SessionCreatedEvent": {
         "description": "A child (sub-agent) session was spawned from this session.\n\nEmitted by `omnigent/tools/builtins/spawn.py:_spawn_one`\nonto the **parent** session's conversation stream after the\nchild conversation row is created and the child task has been\nstarted. Per the session-rearchitecture spec \u00a73 (\"Event types\nand direction\") and \u00a77 (\"Flow: client interacts with\nsub-agent\"), this lets clients watching the parent session's\nSSE subscribe directly to the child's stream without polling\nhistory for the tunneled `function_call` item.\n\nThe wire shape is FLAT (not enveloped):\n`{\"type\": \"session.created\", \"conversation_id\": <parent>, \"child_session_id\": <child>, \"agent_id\": <agent or None>, \"parent_session_id\": <parent>, \"sequence_number\": null}`.\n\nThe existing tunneled `function_call` ConversationItem\n(carried inside `OutputItemDoneEvent`) is retained\nfor compatibility \u2014 clients that don't yet implement the\n\"subscribe to child stream\" pattern can keep rendering sub-\nagent calls from the parent's persistent history.",
         "properties": {
@@ -6822,6 +7560,168 @@
           "child_session_id"
         ],
         "title": "SessionCreatedEvent",
+        "type": "object"
+      },
+      "SessionErrorItem": {
+        "description": "`error` item: common fields plus `ErrorData`.",
+        "properties": {
+          "cause": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cause"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "level": {
+            "anyOf": [
+              {
+                "enum": [
+                  "error",
+                  "info"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Level"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "remediation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remediation"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "llm",
+              "execution",
+              "tool",
+              "harness"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "type": {
+            "const": "error",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "code",
+          "message",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionErrorItem",
+        "type": "object"
+      },
+      "SessionFamily": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "pinned": {
+            "default": false,
+            "title": "Pinned",
+            "type": "boolean"
+          },
+          "pinned_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pinned At"
+          },
+          "representative_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Representative Id"
+          }
+        },
+        "required": [
+          "id",
+          "representative_id"
+        ],
+        "title": "SessionFamily",
         "type": "object"
       },
       "SessionForkRequest": {
@@ -7004,6 +7904,162 @@
           }
         },
         "title": "SessionForkRequest",
+        "type": "object"
+      },
+      "SessionFunctionCallItem": {
+        "description": "`function_call` item: common fields plus `FunctionCallData`.",
+        "properties": {
+          "arguments": {
+            "title": "Arguments",
+            "type": "string"
+          },
+          "call_id": {
+            "title": "Call Id",
+            "type": "string"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "namespace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Namespace"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "type": {
+            "const": "function_call",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model",
+          "name",
+          "arguments",
+          "call_id",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionFunctionCallItem",
+        "type": "object"
+      },
+      "SessionFunctionCallOutputItem": {
+        "description": "`function_call_output` item: common fields plus `FunctionCallOutputData`.",
+        "properties": {
+          "call_id": {
+            "title": "Call Id",
+            "type": "string"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "output": {
+            "title": "Output",
+            "type": "string"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "subagent_return_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subagent Return Id"
+          },
+          "type": {
+            "const": "function_call_output",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "call_id",
+          "output",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionFunctionCallOutputItem",
         "type": "object"
       },
       "SessionGitOptions": {
@@ -7238,6 +8294,108 @@
         "title": "SessionInterruptedPayload",
         "type": "object"
       },
+      "SessionItem": {
+        "description": "One record of `GET /v1/sessions/{id}/items`; `type` selects the variant.",
+        "discriminator": {
+          "mapping": {
+            "compaction": "#/components/schemas/SessionCompactionItem",
+            "error": "#/components/schemas/SessionErrorItem",
+            "function_call": "#/components/schemas/SessionFunctionCallItem",
+            "function_call_output": "#/components/schemas/SessionFunctionCallOutputItem",
+            "message": "#/components/schemas/SessionMessageItem",
+            "native_tool": "#/components/schemas/SessionNativeToolItem",
+            "reasoning": "#/components/schemas/SessionReasoningItem",
+            "resource_event": "#/components/schemas/SessionResourceEventItem",
+            "routing_decision": "#/components/schemas/SessionRoutingDecisionItem",
+            "slash_command": "#/components/schemas/SessionSlashCommandItem",
+            "terminal_command": "#/components/schemas/SessionTerminalCommandItem"
+          },
+          "propertyName": "type"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/SessionMessageItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionFunctionCallItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionFunctionCallOutputItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionErrorItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionReasoningItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionCompactionItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionNativeToolItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionResourceEventItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionRoutingDecisionItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionSlashCommandItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionTerminalCommandItem"
+          }
+        ],
+        "title": "SessionItem"
+      },
+      "SessionItemList": {
+        "description": "Paginated list of session items; `data` is a page of `SessionItem`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SessionItem"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "SessionItemList",
+        "type": "object"
+      },
       "SessionLabelsResponse": {
         "description": "Lightweight response body for `GET /v1/sessions/{id}/labels`.",
         "properties": {
@@ -7303,6 +8461,16 @@
             "default": "list",
             "title": "Object",
             "type": "string"
+          },
+          "page_boundary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionPageBoundary"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "title": "SessionList",
@@ -7333,6 +8501,24 @@
             "description": "Whether the session is archived. Archived sessions are returned by `GET /v1/sessions` only when the request passes `include_archived=true`; the sidebar groups them into a dedicated \"Archived\" section. `False` for normal sessions.",
             "title": "Archived",
             "type": "boolean"
+          },
+          "background_work_running": {
+            "default": false,
+            "description": "`True` while work outlives the session's ended turn, such as a background shell or a Codex goal that keeps running between turns. The sidebar shows such a session as working; `status` stays as reported, so the session still takes a new message. `False` while the session's runner is offline.",
+            "title": "Background Work Running",
+            "type": "boolean"
+          },
+          "blocked_on": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why the session's agent is parked on a terminal prompt, e.g. `\"permission prompt\"`, from the last status edge, truncated to 128 characters. The sidebar shows such a session as needing input even when no web card exists for the prompt. `None` when it is not parked or its runner is offline.",
+            "title": "Blocked On"
           },
           "comments_count": {
             "default": 0,
@@ -7371,6 +8557,16 @@
             ],
             "description": "Runtime-native session id this conversation wraps, e.g. a Claude Code session uuid for `omnigent claude` sessions. `None` for regular AP-only conversations. Lets the sidebar / picker render a runtime badge without a follow-up GET.",
             "title": "External Session Id"
+          },
+          "family": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionFamily"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "git_branch": {
             "anyOf": [
@@ -7558,6 +8754,18 @@
             "description": "Excerpt of the chat content that matched the request's `search_query`, centered on the match with `\u2026` marking elided ends, so the search UI can show *where* a session matched in its body. Present whenever the query hit an item body (even if the title also matched); `None` on non-search reads and when only the title matched.",
             "title": "Search Snippet"
           },
+          "shared_with_others": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the requesting user owns this session and has granted access to another user (the public link alone doesn't count). `None` when the requester isn't the owner or permissions are disabled, so the grant list never leaks to non-owners.",
+            "title": "Shared With Others"
+          },
           "status": {
             "description": "Derived session lifecycle status.",
             "enum": [
@@ -7629,6 +8837,70 @@
         "title": "SessionListItem",
         "type": "object"
       },
+      "SessionLiveMCPServers": {
+        "description": "The MCP connections a session's running harness reports.",
+        "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Readable explanation for `\"unavailable\"`, or `None`.",
+            "title": "Detail"
+          },
+          "live": {
+            "description": "`True` when the harness answered; `servers` is then current.",
+            "title": "Live",
+            "type": "boolean"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "not_running",
+                  "unsupported",
+                  "unavailable"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why there is no live answer: `\"not_running\"` (no harness process yet; it starts with the next message), `\"unsupported\"` (the harness cannot report MCP status), or `\"unavailable\"` (the harness did not answer). `None` when `live` is true.",
+            "title": "Reason"
+          },
+          "reconnect_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "On a reconnect response, the harness's reason the reconnect failed, or `None` when it succeeded.",
+            "title": "Reconnect Error"
+          },
+          "servers": {
+            "description": "The harness's servers; empty unless `live`.",
+            "items": {
+              "$ref": "#/components/schemas/LiveMCPServerStatus"
+            },
+            "title": "Servers",
+            "type": "array"
+          }
+        },
+        "required": [
+          "live"
+        ],
+        "title": "SessionLiveMCPServers",
+        "type": "object"
+      },
       "SessionMcpStartupEvent": {
         "description": "Per-MCP-server startup progress for a native harness session.\n\nA codex-native session brings up its configured MCP servers when its\nCodex thread starts; slow or failing servers previously left the web\nsession looking hung with no signal. The native forwarder mirrors\nCodex's `mcpServer/startupStatus/updated` notifications as\n`external_mcp_startup` posts, republished here so the web UI can\nshow which servers are still starting and which failed or were\ncancelled.",
         "properties": {
@@ -7671,6 +8943,155 @@
           "servers"
         ],
         "title": "SessionMcpStartupEvent",
+        "type": "object"
+      },
+      "SessionMessageItem": {
+        "description": "`message` item as returned by `GET /v1/sessions/{id}/items`.\n\nMirrors `MessageData` field for field. The entity keeps the blocks\nas free-form dicts, so this variant spells out the typed block shape\ninstead of inheriting it.",
+        "properties": {
+          "content": {
+            "description": "Content blocks in order.",
+            "items": {
+              "$ref": "#/components/schemas/SessionContentBlock"
+            },
+            "title": "Content",
+            "type": "array"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "interrupted": {
+            "default": false,
+            "description": "`True` for a partial assistant response from an interrupted turn; omitted when `False`.",
+            "title": "Interrupted",
+            "type": "boolean"
+          },
+          "is_meta": {
+            "default": false,
+            "description": "`True` for durable context hidden from user-facing transcripts; omitted when `False`.",
+            "title": "Is Meta",
+            "type": "boolean"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Agent name; present on assistant messages, absent on user messages.",
+            "title": "Model"
+          },
+          "phase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Assistant-only harness label, e.g. `\"commentary\"`; omitted when unset.",
+            "title": "Phase"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "role": {
+            "description": "`\"user\"` or `\"assistant\"`.",
+            "enum": [
+              "user",
+              "assistant"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "startup_options": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupInputOptions"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Request options kept while a startup input awaits delivery; omitted when unset."
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "stream_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native live-preview stream finalized by this assistant message.",
+            "title": "Stream Message Id"
+          },
+          "subagent_return_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native task id of an explicitly completed child; omitted when unset.",
+            "title": "Subagent Return Id"
+          },
+          "type": {
+            "const": "message",
+            "description": "Always `\"message\"`.",
+            "title": "Type",
+            "type": "string"
+          },
+          "user_authored": {
+            "default": false,
+            "description": "`True` for confirmed or conservatively preserved user input; omitted when `False`.",
+            "title": "User Authored",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type",
+          "role",
+          "content"
+        ],
+        "title": "SessionMessageItem",
         "type": "object"
       },
       "SessionModelEvent": {
@@ -7747,6 +9168,90 @@
           "conversation_id"
         ],
         "title": "SessionModelOptionsEvent",
+        "type": "object"
+      },
+      "SessionNativeToolItem": {
+        "description": "`native_tool` item: common fields plus `NativeToolData`.",
+        "properties": {
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "item": {
+            "additionalProperties": true,
+            "title": "Item",
+            "type": "object"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "type": {
+            "const": "native_tool",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionNativeToolItem",
+        "type": "object"
+      },
+      "SessionPageBoundary": {
+        "description": "Last visible primary-page row, before family context is appended.",
+        "properties": {
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "int64",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "SessionPageBoundary",
         "type": "object"
       },
       "SessionPermissionModeEvent": {
@@ -8181,6 +9686,101 @@
         "title": "SessionReasoningEffortEvent",
         "type": "object"
       },
+      "SessionReasoningItem": {
+        "description": "`reasoning` item as returned by `GET /v1/sessions/{id}/items`.\n\nMirrors `ReasoningData` field for field, with its text blocks typed\nas `SessionContentBlock` like message content.",
+        "properties": {
+          "content": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SessionContentBlock"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Raw reasoning text blocks; absent when redacted.",
+            "title": "Content"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "encrypted_content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Encrypted reasoning content; absent when none.",
+            "title": "Encrypted Content"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "model": {
+            "description": "Agent name.",
+            "title": "Model",
+            "type": "string"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "summary": {
+            "description": "Summary text blocks, e.g. `[{\"type\": \"summary_text\", \"text\": \"...\"}]`.",
+            "items": {
+              "$ref": "#/components/schemas/SessionContentBlock"
+            },
+            "title": "Summary",
+            "type": "array"
+          },
+          "type": {
+            "const": "reasoning",
+            "description": "Always `\"reasoning\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type",
+          "model",
+          "summary"
+        ],
+        "title": "SessionReasoningItem",
+        "type": "object"
+      },
       "SessionRepositoryBranch": {
         "description": "Current branch and remote availability for one managed repository.\n\n`pushed` is true when the branch exists at the original clone URL,\nfalse when confirmed absent, and null when availability is unknown.\nIt does not indicate whether local commits or working-tree changes are pushed.",
         "properties": {
@@ -8315,6 +9915,85 @@
           "session_id"
         ],
         "title": "SessionResourceDeletedEvent",
+        "type": "object"
+      },
+      "SessionResourceEventItem": {
+        "description": "`resource_event` item: common fields plus `ResourceEventData`.",
+        "properties": {
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "event_type": {
+            "title": "Event Type",
+            "type": "string"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "resource": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resource"
+          },
+          "resource_id": {
+            "title": "Resource Id",
+            "type": "string"
+          },
+          "resource_type": {
+            "title": "Resource Type",
+            "type": "string"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "type": {
+            "const": "resource_event",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_type",
+          "resource_id",
+          "resource_type",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionResourceEventItem",
         "type": "object"
       },
       "SessionResourceObject": {
@@ -8466,6 +10145,21 @@
             "title": "Archived",
             "type": "boolean"
           },
+          "background_agents": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BackgroundTaskInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Background agents a finished claude-native turn left running, while the session waits on them. `status` still reads `\"running\"` then, so older clients keep treating the run as unfinished; clients that know this field show the session as waiting, with its composer free. `None` otherwise.",
+            "title": "Background Agents"
+          },
           "background_task_count": {
             "anyOf": [
               {
@@ -8536,6 +10230,25 @@
             ],
             "description": "Runtime-native session id this conversation wraps, e.g. a Claude Code session uuid for `omnigent claude` sessions. `None` for regular AP-only conversations. Populated by the wrapper bridge.",
             "title": "External Session Id"
+          },
+          "failed_inputs": {
+            "description": "Durable managed-startup inputs that were never delivered, e.g. because the sandbox host did not come online. Same shape as `pending_inputs`, in submission order; their file blocks keep ids that still resolve under this session. Empty when nothing failed.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Failed Inputs",
+            "type": "array"
+          },
+          "family": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionFamily"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "git_branch": {
             "anyOf": [
@@ -8847,13 +10560,35 @@
             "title": "Share Workspace Files",
             "type": "boolean"
           },
+          "side_chat_allowed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Side Chat Allowed"
+          },
+          "side_chat_parent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Side Chat Parent Id"
+          },
           "side_chat_settings_supported": {
             "default": false,
             "title": "Side Chat Settings Supported",
             "type": "boolean"
           },
           "status": {
-            "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Current read paths collapse `\"waiting\"` -> `\"running\"` before building this snapshot; the literal stays a superset of what the runtime can produce so a server that forwards the raw status never 500s on serialization.",
+            "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Read paths collapse `\"waiting\"` -> `\"running\"`, because headless clients poll this field to tell when a run is done; the literal stays a superset so a server that forwards the raw status never 500s.",
             "enum": [
               "idle",
               "running",
@@ -8998,6 +10733,161 @@
         "title": "SessionResponse",
         "type": "object"
       },
+      "SessionRoutingDecisionItem": {
+        "description": "`routing_decision` item: common fields plus `RoutingDecisionData`.",
+        "properties": {
+          "agent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent"
+          },
+          "applied": {
+            "title": "Applied",
+            "type": "boolean"
+          },
+          "attempted_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attempted Override"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "decision_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decision Id"
+          },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Harness"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "rationale": {
+            "title": "Rationale",
+            "type": "string"
+          },
+          "raw_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Raw Model"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "router_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Router Source"
+          },
+          "scope": {
+            "default": "turn",
+            "enum": [
+              "session",
+              "turn",
+              "child_session",
+              "native_subagent"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "task_description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Description"
+          },
+          "type": {
+            "const": "routing_decision",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model",
+          "applied",
+          "rationale",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionRoutingDecisionItem",
+        "type": "object"
+      },
       "SessionSandboxStatusEvent": {
         "description": "Managed-sandbox launch progress for a `host_type=\"managed\"` session.\n\nA managed create returns before its sandbox exists; the Omnigent\nserver emits this event as the background launch pipeline advances\nso the Web UI can show live provisioning progress on the session\npage instead of a silent dead chat: sandbox provision \u2192 repository\nclone \u2192 host startup \u2192 runner connect \u2192 ready, or a terminal\nfailure with the reason.",
         "properties": {
@@ -9087,9 +10977,122 @@
         "title": "SessionSandboxStatusEvent",
         "type": "object"
       },
+      "SessionSlashCommandItem": {
+        "description": "`slash_command` item: common fields plus `SlashCommandData`.",
+        "properties": {
+          "arguments": {
+            "title": "Arguments",
+            "type": "string"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "default": "skill",
+            "enum": [
+              "skill",
+              "command"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "output": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "startup_options": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupInputOptions"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "type": {
+            "const": "slash_command",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model",
+          "name",
+          "arguments",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionSlashCommandItem",
+        "type": "object"
+      },
       "SessionStatusEvent": {
         "description": "Session lifecycle status transition.\n\nEmitted by the runtime / session route handler at every\ntransition between `launching` / `running` / `waiting` /\n`idle` / `failed`. Wire shape is\nFLAT (not enveloped): `{\"type\": \"session.status\", \"conversation_id\": \"...\", \"status\": \"...\", \"sequence_number\": null}`.\n\nThe `waiting` value is emitted by the runtime's parent agent\nloop when it parks on the `async_work_complete` drain\n(`_drain_async_completions(block_for_one=True)` in\n`omnigent/runtime/workflow.py`) \u2014 i.e. while the parent\nturn is suspended waiting for background tools or sub-agents\nto complete. Per the session-rearchitecture spec \u00a73\n(\"Event types and direction\"), `waiting` is the\nsession-status companion of the spec's `turn.waiting`\ntransient \u2014 clients should render the session as actively\nblocked-on-async-work, distinct from `running`. When the\ndrain wakes (a child completed), the runtime emits a follow-up\n`running` to resume.",
         "properties": {
+          "background_agents": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BackgroundTaskInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "On a claude-native `waiting` edge, the background agents the finished turn left running, so the UI can say what the session still waits on. `None` on every other edge.",
+            "title": "Background Agents"
+          },
           "background_task_count": {
             "anyOf": [
               {
@@ -9177,7 +11180,7 @@
             "title": "Sequence Number"
           },
           "status": {
-            "description": "New session status. `\"launching\"` (session or child task created, but no concrete harness start observed), `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (parent turn parked on the async-work drain), or `\"failed\"` (terminal failure).",
+            "description": "New session status. `\"launching\"` (session or child task created, but no concrete harness start observed), `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (parent turn parked on the async-work drain, or a claude-native turn that ended with a background agent running), or `\"failed\"` (terminal failure).",
             "enum": [
               "idle",
               "launching",
@@ -9292,6 +11295,100 @@
         "title": "SessionTerminalActivityEvent",
         "type": "object"
       },
+      "SessionTerminalCommandItem": {
+        "description": "`terminal_command` item: common fields plus `TerminalCommandData`.",
+        "properties": {
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "input": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input"
+          },
+          "kind": {
+            "enum": [
+              "input",
+              "output"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "stderr": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stderr"
+          },
+          "stdout": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stdout"
+          },
+          "type": {
+            "const": "terminal_command",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionTerminalCommandItem",
+        "type": "object"
+      },
       "SessionTerminalPendingEvent": {
         "description": "Terminal spin-up status for a terminal-first session.\n\nTwo sources emit this event:\n\n1. The Omnigent server at `POST /v1/sessions` for host-launched\n   terminal-first sessions \u2014 the earliest possible point, before\n   the runner even starts, so the spinner appears immediately on\n   session create rather than after the runner boots.\n2. The Omnigent relay when the runner's `session.terminal_pending` frame\n   arrives \u2014 covers non-host-launched sessions (e.g. server-dispatched\n   sub-agents) and carries the authoritative `pending=False` clear\n   emitted by the runner's `finally` block.\n\nTogether they allow web to show a spinner on the Terminal pill\nwhile the backend boots the terminal instead of a silent greyed-out\nbutton, and to distinguish \"still starting up\" from \"no terminal\"\n(killed or never created).",
         "properties": {
@@ -9372,6 +11469,56 @@
           "title"
         ],
         "title": "SessionTitleEvent",
+        "type": "object"
+      },
+      "SessionTitleInstructionsRequest": {
+        "additionalProperties": false,
+        "description": "Replace the caller's title instructions; null or blank clears them.\n\nThe stripped value may hold at most 4,000 characters. The raw bound only\ncaps request size before stripping.",
+        "properties": {
+          "instructions": {
+            "anyOf": [
+              {
+                "maxLength": 16000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instructions"
+          }
+        },
+        "required": [
+          "instructions"
+        ],
+        "title": "SessionTitleInstructionsRequest",
+        "type": "object"
+      },
+      "SessionTitleInstructionsResponse": {
+        "description": "The caller's saved title instructions and the limit the server enforces.",
+        "properties": {
+          "instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instructions"
+          },
+          "max_chars": {
+            "format": "int64",
+            "title": "Max Chars",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "instructions",
+          "max_chars"
+        ],
+        "title": "SessionTitleInstructionsResponse",
         "type": "object"
       },
       "SessionTodosEvent": {
@@ -9678,6 +11825,17 @@
             ],
             "title": "Default Public Sessions"
           },
+          "peer_session_messaging": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Peer Session Messaging"
+          },
           "public_sharing": {
             "anyOf": [
               {
@@ -9710,9 +11868,108 @@
               }
             ],
             "title": "Sharing Mode"
+          },
+          "sibling_session_destinations": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sibling Session Destinations"
           }
         },
         "title": "SetSharingRequest",
+        "type": "object"
+      },
+      "SideChatList": {
+        "description": "Paginated list of side chats; `data` is a page of `SideChatSummary`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SideChatSummary"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "SideChatList",
+        "type": "object"
+      },
+      "SideChatSummary": {
+        "description": "A side chat listed in its parent session's Workspace rail.",
+        "properties": {
+          "created_at": {
+            "description": "Unix epoch seconds when the side chat was created.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "id": {
+            "description": "Side-chat session id, e.g. `\"conv_side123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "object": {
+            "const": "side_chat",
+            "default": "side_chat",
+            "description": "Fixed resource type, always `\"side_chat\"`.",
+            "title": "Object",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The side chat's title, when available.",
+            "title": "Title"
+          }
+        },
+        "required": [
+          "id",
+          "created_at"
+        ],
+        "title": "SideChatSummary",
         "type": "object"
       },
       "SkillContentResponse": {
@@ -9899,6 +12156,16 @@
               }
             ],
             "title": "Model Override"
+          },
+          "scheduled_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScheduledRunLogContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "tools": {
             "anyOf": [
@@ -10397,6 +12664,214 @@
         "title": "UpdateProjectRequest",
         "type": "object"
       },
+      "UpdateScheduledTaskRequest": {
+        "additionalProperties": false,
+        "description": "Body for `PATCH /v1/scheduled-tasks/{id}`. Unset fields are unchanged.",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "base_branch": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Branch"
+          },
+          "execution_target": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Target"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          },
+          "max_cost_usd": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Cost Usd"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Override"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "permission_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Permission Mode"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Effort"
+          },
+          "rrule": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rrule"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "session_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "new",
+                  "continue"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Mode"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          },
+          "timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timezone"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace"
+          }
+        },
+        "title": "UpdateScheduledTaskRequest",
+        "type": "object"
+      },
       "UpdateSessionPolicyRequest": {
         "additionalProperties": false,
         "description": "Request body for `PATCH /v1/sessions/{session_id}/policies/{policy_id}`.\n\nAll fields are optional; `None` fields are left unchanged.\nUnknown fields (including `type`, which is immutable) are\nrejected with `422`.",
@@ -10510,6 +12985,17 @@
             ],
             "description": "Runtime-native session id captured by a wrapper bridge (e.g. Claude Code's session uuid for `omnigent claude` sessions). Idempotent on same-value writes; the server rejects attempts to overwrite an already-set different value with `invalid_input` to surface programmer errors. `None` leaves unchanged.",
             "title": "External Session Id"
+          },
+          "family_pinned": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Family Pinned"
           },
           "labels": {
             "anyOf": [
@@ -12871,6 +15357,58 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/mcp-servers/enabled": {
+      "put": {
+        "operationId": "set_mcp_server_enabled_v1_hosts__host_id__mcp_servers_enabled_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpServerEnabledRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpServerEnabledResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Mcp Server Enabled",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/mcp-servers/tools": {
       "post": {
         "operationId": "get_mcp_tools_v1_hosts__host_id__mcp_servers_tools_post",
@@ -13205,7 +15743,7 @@
     },
     "/v1/info": {
       "get": {
-        "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a pre-PR-2008 build for header / OIDC\ndeploys (in particular, the internal hosted product that\nsyncs from this repo).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`, `dictation_available`,\n`single_user`), the short sandbox provider name\n(`sandbox_provider`) the web UI labels the new-session\nsandbox option with, and the installed\n`server_version` (already public via `/api/version`).",
+        "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a build without accounts for header / OIDC\ndeploys (in particular, hosted deployments).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`, `dictation_available`,\n`single_user`), the short sandbox provider name\n(`sandbox_provider`) the web UI labels the new-session\nsandbox option with, and the installed\n`server_version` (already public via `/api/version`).",
         "operationId": "info_v1_info_get",
         "responses": {
           "200": {
@@ -13532,8 +16070,46 @@
     },
     "/v1/projects": {
       "get": {
-        "description": "List the caller's projects.\n\n**Returns:** `{\"object\": \"list\", \"data\": [...]}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode.",
+        "description": "List the caller's projects.\n\nWithout `limit` or `after` this returns every project in the\ncaller's display order, as the sidebar needs. With either, it returns\none creation-ordered page.\n\n**Returns:** `{\"object\": \"list\", \"data\": [...]}`, plus `first_id`, `last_id` and `has_more` for a page.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 400 for an unknown `after`.",
         "operationId": "list_projects_v1_projects_get",
+        "parameters": [
+          {
+            "description": "Page size, e.g. `50`.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 200,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Limit"
+            }
+          },
+          {
+            "description": "The previous page's `last_id`.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -13546,6 +16122,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List Projects",
@@ -14119,6 +16705,400 @@
         ]
       }
     },
+    "/v1/scheduled-tasks": {
+      "get": {
+        "description": "List the caller's scheduled tasks.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
+        "operationId": "list_scheduled_tasks_v1_scheduled_tasks_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "items": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "title": "Response List Scheduled Tasks V1 Scheduled Tasks Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Scheduled Tasks",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      },
+      "post": {
+        "description": "Create a scheduled task and arm it on the live scheduler.",
+        "operationId": "create_scheduled_task_v1_scheduled_tasks_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateScheduledTaskRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Scheduled Task V1 Scheduled Tasks Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/inbox": {
+      "get": {
+        "description": "Latest sessionless failures; session-linked failures use the session Inbox.",
+        "operationId": "list_automation_inbox_v1_scheduled_tasks_inbox_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomationFailurePage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Automation Inbox",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/{scheduled_task_id}": {
+      "delete": {
+        "description": "Check ownership, then delete the task and history in a worker thread.\n\nThe ownership lookup remains synchronous; remove the timer after deletion.",
+        "operationId": "delete_scheduled_task_v1_scheduled_tasks__scheduled_task_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Scheduled Task V1 Scheduled Tasks  Scheduled Task Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      },
+      "get": {
+        "description": "Fetch one of the caller's scheduled tasks.",
+        "operationId": "get_scheduled_task_v1_scheduled_tasks__scheduled_task_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Scheduled Task V1 Scheduled Tasks  Scheduled Task Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      },
+      "patch": {
+        "description": "Update mutable fields of a task and re-sync the scheduler.",
+        "operationId": "update_scheduled_task_v1_scheduled_tasks__scheduled_task_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateScheduledTaskRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Scheduled Task V1 Scheduled Tasks  Scheduled Task Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/{scheduled_task_id}/run": {
+      "post": {
+        "description": "Trigger an immediate fire of one of the caller's scheduled tasks.\n\nA manual override that reuses the SHARED scheduled-fire path (the same\n`on_fire` machinery \u2014 session create, owner grant, runner launch,\nprompt dispatch, run recording). Legacy timers fire through\n`app.state.scheduled_task_run_now` and share its process-local overlap\nguard. With `automations_v2`, the request is recorded as a pending run\nthat the host's owning replica claims and starts like any occurrence, so\nRun now gets the same lease, recovery, and host routing. Each request is\nits own run; it may overlap a scheduled one.\n\nPaused tasks ARE runnable here \u2014 run-now is an explicit manual override,\nso it does not require the `active` state the scheduler enforces.\n\nFire-and-forget: like the scheduler, the session create + launch runs in\nthe background, so this returns `202 Accepted` with the task id rather\nthan the finished run. The new run row appears in the task's `/runs`\nhistory and in the LIST endpoint's `last_run_status`. Legacy timers\nreturn `409` when a fire for this task is already in flight. Both return\n`503` when the scheduler subsystem is not running.\nThe database scheduler also returns `run_id` to identify the queued run.",
+        "operationId": "run_scheduled_task_now_v1_scheduled_tasks__scheduled_task_id__run_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Run Scheduled Task Now V1 Scheduled Tasks  Scheduled Task Id  Run Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Scheduled Task Now",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/{scheduled_task_id}/runs": {
+      "get": {
+        "description": "List the run history for one of the caller's scheduled tasks.\n\nOwner-scoped: a task owned by someone else (or absent) 404s via\n`_require_owned`, so runs aren't enumerable across users. Runs come\nback most-recent-first (`scheduled_at DESC`); an empty history is an\nempty list.\n\nCursor-paginated so history is never silently truncated: pass `limit`\n(1-1000, default 100) and `after` (a prior page's `next_cursor`).\nThe response is `{\"runs\": [...], \"next_cursor\": <id or null>}`; a\n`null` cursor marks the last page.\n\nLazy-on-read backstop: before listing, force-fail any of this task's\nruns still `running` past the 6h max age (`incomplete`). Completion\nitself is event-driven (the `_publish_status` hook); this only\ncatches a genuine orphan \u2014 a run whose terminal event never fired (host\ndied mid-turn) \u2014 so the \"every run eventually terminal\" invariant holds\nwithout a background poll or startup sweep. Pure age check (no\nconversation I/O); a young in-flight run is untouched, and the\nconditional `update_run` never clobbers an already-terminal row.",
+        "operationId": "list_scheduled_task_runs_v1_scheduled_tasks__scheduled_task_id__runs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Scheduled Task Runs V1 Scheduled Tasks  Scheduled Task Id  Runs Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Scheduled Task Runs",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
     "/v1/sessions": {
       "get": {
         "description": "List sessions with cursor-based pagination.\n\nSessions are conversations with a non-`None` `agent_id`\n\u2014 i.e. those created via `POST /v1/sessions`.\nConversations without an agent binding are excluded.\n\n**Returns:** A `PaginatedList` of `SessionListItem`.",
@@ -14309,7 +17289,18 @@
             }
           },
           {
-            "description": "Ownership/archive filter for the sidebar tabs. `\"mine\"` returns only sessions the caller owns (owner-level grant). `\"shared\"` returns only sessions accessible but not owned. `\"archived\"` returns only archived sessions; with `project`, only owned sessions are returned so first-class project names resolve within the caller's projects. `\"all\"` (default) returns all accessible non-archived sessions, matching the legacy behaviour.",
+            "description": "Add owned family context to matching rows, including members outside the agent, pin, and page filters. Ownership and archive filters still apply; search disables expansion. Pagination cursors refer to the original filtered page.",
+            "in": "query",
+            "name": "expand_families",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Expand Families",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Ownership/archive filter for the sidebar tabs. `\"mine\"` returns only sessions the caller owns (owner-level grant). `\"shared\"` returns only sessions accessible but not owned. `\"archived\"` returns only archived sessions; with `project`, only owned sessions are returned so first-class project names resolve within the caller's projects. `\"all\"` (default) returns all accessible non-archived sessions, matching the legacy behaviour. `include_archived` adds archived rows to `\"mine\"`, `\"shared\"` and `\"all\"`.",
             "in": "query",
             "name": "visibility",
             "required": false,
@@ -14780,7 +17771,7 @@
     },
     "/v1/sessions/{session_id}/agent/contents": {
       "get": {
-        "description": "Download the raw `.tar.gz` agent bundle for the session's\nbound agent.\n\nReplaces `GET /api/agents/{id}/contents`. Runners call this\non cache miss to fetch the spec + bundled files.\n\n**Returns:** Raw bundle bytes as `application/gzip`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session, agent, or bundle is not found.",
+        "description": "Download the `.tar.gz` agent bundle for the session's bound agent.\nREAD-only callers receive a minimal redacted bundle.\n\nReplaces `GET /api/agents/{id}/contents`. Runners call this\non cache miss to fetch the spec + bundled files.\n\n**Returns:** Bundle bytes as `application/gzip`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session, agent, or bundle is not found.",
         "operationId": "get_session_agent_contents_v1_sessions__session_id__agent_contents_get",
         "parameters": [
           {
@@ -15182,6 +18173,30 @@
               ],
               "title": "Session Name"
             }
+          },
+          {
+            "description": "Return the whole subtree down to *max_depth* in one response instead of one level, so a client drawing the sub-agent tree makes one request rather than one per node. Rows come breadth-first, each parent's children newest-first (the order a per-level walk sees), with `parent_session_id` set to the row's own parent and `depth` set. *limit* and *after* page through that order. A spawn tree of more than 2000 sub-agents gets the one-level listing instead (rows without `depth`), as from a server without this flag. *before*, *order* and the title filters do not apply.",
+            "in": "query",
+            "name": "descendants",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Descendants",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Levels to return with *descendants*, `1` for direct children only.",
+            "in": "query",
+            "name": "max_depth",
+            "required": false,
+            "schema": {
+              "default": 3,
+              "maximum": 10,
+              "minimum": 1,
+              "title": "Max Depth",
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -15536,7 +18551,7 @@
     },
     "/v1/sessions/{session_id}/comments/send": {
       "post": {
-        "description": "Mark comments as addressed and format them into an agent message.\n\nFetches each requested comment, marks it `addressed`,\nand formats the full set into a grouped, sorted message string\nsuitable for pasting into the chat composer.\n\nRequires `LEVEL_EDIT` on the session in multi-user mode because\nit transitions comment status from `draft` to `addressed`.\n\n**Parameters**\n\n- `body` \u2014 List of comment IDs to send, with an optional custom instruction prefix.\n\n**Returns:** `{\"formatted_message\": str, \"sent_comment_ids\": list[str]}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks edit permission, or 404 if any requested comment is not found or does not belong to this session.",
+        "description": "Mark Files comments addressed and format them into an agent message.\n\nFetches each requested comment, marks it `addressed`,\nand formats the full set into a grouped, sorted message string\nsuitable for pasting into the chat composer.\n\nRequires `LEVEL_EDIT` on the session in multi-user mode because\nit transitions comment status from `draft` to `addressed`.\n\n**Parameters**\n\n- `body` \u2014 List of comment IDs to send, with an optional custom instruction prefix.\n\n**Returns:** `{\"formatted_message\": str, \"sent_comment_ids\": list[str]}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks edit permission, or 404 if any requested comment is not found or does not belong to this session; 400 if a requested comment belongs to a PR review.",
         "operationId": "send_to_agent_v1_sessions__session_id__comments_send_post",
         "parameters": [
           {
@@ -15712,7 +18727,7 @@
     },
     "/v1/sessions/{session_id}/items": {
       "get": {
-        "description": "List items in a session with cursor-based pagination.\n\nDelegates to the conversation items store \u2014 session_id is\nthe conversation_id. Same pagination contract as\n`GET /v1/conversations/{id}/items`.\n\n**Returns:** A `PaginatedList` of conversation items.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
+        "description": "List items in a session with cursor-based pagination.\n\nDelegates to the conversation items store \u2014 session_id is\nthe conversation_id. Same pagination contract as\n`GET /v1/conversations/{id}/items`.\n\n**Returns:** A page of flattened conversation items, documented as `SessionItemList`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
         "operationId": "list_session_items_v1_sessions__session_id__items_get",
         "parameters": [
           {
@@ -15790,7 +18805,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PaginatedList"
+                  "$ref": "#/components/schemas/SessionItemList"
                 }
               }
             },
@@ -15864,6 +18879,102 @@
         "summary": "Get Session Labels",
         "tags": [
           "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/live-mcp-servers": {
+      "get": {
+        "description": "Report the MCP connections the session's running harness holds.\n\nNever starts a harness; a session whose harness has not started yet\nanswers `live: false` with `reason: \"not_running\"`.",
+        "operationId": "get_live_mcp_servers_v1_sessions__session_id__live_mcp_servers_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionLiveMCPServers"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Live Mcp Servers",
+        "tags": [
+          "session_mcp_servers"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/live-mcp-servers/reconnect": {
+      "post": {
+        "description": "Reconnect one MCP server in the session's running harness.\n\nA refused reconnect still answers 200, with the harness's reason in\n`reconnect_error` and the connections as they stand.",
+        "operationId": "reconnect_live_mcp_server_v1_sessions__session_id__live_mcp_servers_reconnect_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReconnectLiveMCPServerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionLiveMCPServers"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reconnect Live Mcp Server",
+        "tags": [
+          "session_mcp_servers"
         ]
       }
     },
@@ -17031,6 +20142,24 @@
               "title": "Order",
               "type": "string"
             }
+          },
+          {
+            "description": "`workspace` confines the read to the workspace root.",
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "const": "workspace",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope"
+            }
           }
         ],
         "responses": {
@@ -17222,6 +20351,24 @@
               "default": false,
               "title": "Download",
               "type": "boolean"
+            }
+          },
+          {
+            "description": "`workspace` also confines owner reads, including symlinks.",
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "const": "workspace",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope"
             }
           }
         ],
@@ -18158,6 +21305,39 @@
               ],
               "title": "Pr Url"
             }
+          },
+          {
+            "description": "With `base_sha`, the revision of the displayed patch; the list is rejected when the PR moved off it.",
+            "in": "query",
+            "name": "head_sha",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Head Sha"
+            }
+          },
+          {
+            "in": "query",
+            "name": "base_sha",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Base Sha"
+            }
           }
         ],
         "responses": {
@@ -18222,6 +21402,81 @@
           }
         },
         "summary": "Create Session Github Comment",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/commits": {
+      "get": {
+        "description": "List the PR's commits, oldest first, at the displayed head.\n\n**Returns:** `list` of `session.github.commit` objects with `has_more`.",
+        "operationId": "list_session_github_commits_v1_sessions__session_id__resources_github_commits_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "pr_url",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pr Url"
+            }
+          },
+          {
+            "description": "The full head commit id the panel shows; rejected when the PR moved.",
+            "in": "query",
+            "name": "head_sha",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Head Sha"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Github Commits",
         "tags": [
           "session_resources"
         ]
@@ -18995,7 +22250,7 @@
         ]
       },
       "post": {
-        "description": "Launch or return an existing terminal resource.\n\nPreserves `sys_terminal_launch` idempotency: an\nalready-running `(terminal, session_key)` returns the\nexisting resource.\n\nUser-initiated creates are gated on the agent's terminal\naccess: the requested `terminal` must be one of the names\ndeclared in the agent spec's `terminals:` block. Native\nharness bootstrap requests (marked `ensure_native_terminal`\nor `bridge_inject_dir` \u2014 the `omnigent claude` / `codex`\nwrappers launching the session's own CLI terminal) are exempt:\nthey launch undeclared names via the runner's\nsynthesize-from-body path and predate the gate. The markers\nare client-controlled, so the exemption is narrowed to the\nexact shape those wrappers send \u2014 a registered native terminal\nname with `session_key` `\"main\"` \u2014 anything else carrying a\nmarker still goes through the declared-name gate (it would\notherwise be an arbitrary-terminal bypass).\n\n**Returns:** The terminal resource object.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 when the requested terminal is not declared by the agent spec (or the agent has no `terminals:` block at all).",
+        "description": "Launch or return an existing terminal resource.\n\nPreserves `sys_terminal_launch` idempotency: an\nalready-running `(terminal, session_key)` returns the\nexisting resource.\n\nUser-initiated creates are gated on the agent's terminal\naccess: the requested `terminal` must be one of the names\ndeclared in the agent spec's `terminals:` block. Native\nharness bootstrap requests (marked `ensure_native_terminal`\nor `bridge_inject_dir` \u2014 the `omnigent claude` / `codex`\nwrappers launching the session's own CLI terminal) are exempt:\nthey launch undeclared names via the runner's\nsynthesize-from-body path and predate the gate. The markers\nare client-controlled, so the exemption is narrowed to the\nexact shape those wrappers send \u2014 a registered native terminal\nname with `session_key` `\"main\"` from a session owner.\nOther callers still pass the declared-name gate, because the\nbootstrap path may synthesize a terminal from the request body.\n\n**Returns:** The terminal resource object.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 when the requested terminal is not declared by the agent spec (or the agent has no `terminals:` block at all).",
         "operationId": "create_session_terminal_v1_sessions__session_id__resources_terminals_post",
         "parameters": [
           {
@@ -19189,6 +22444,80 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/side_chats": {
+      "get": {
+        "description": "List the side chats available in a session's Workspace rail.\n\nOnly the owner of the session's root starts side chats there, so only\nthat owner gets any, in id order; anyone else, admins included, gets an\nempty page. Opening and closing tabs is local to each device.\n\n**Returns:** A `PaginatedList` of `SideChatSummary`.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks READ on `session_id`; 404 if no session exists there.",
+        "operationId": "list_side_chats_v1_sessions__session_id__side_chats_get",
+        "parameters": [
+          {
+            "description": "Parent session id, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum side chats to return (1-20, default 20).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 20,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor: the previous page's `last_id`.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SideChatList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Side Chats",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/sign-in-link": {
       "get": {
         "description": "Return the sign-in link the session's terminal is waiting on right now.\n\nAsked by the error card at click time, so the user opens the live\nprompt rather than a link saved earlier that its launcher process has\nsince abandoned.\n\n**Returns:** The runner's `{\"pending\", \"url\", \"code\", \"terminal_id\"}` payload.",
@@ -19344,7 +22673,7 @@
     },
     "/v1/sessions/{source_id}/fork": {
       "post": {
-        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nThe dialog's run-config picks (`body.model_override`,\n`body.reasoning_effort`, `body.terminal_launch_args` \u2014 the\npermission-/approval-mode selector) override what the fork would\notherwise inherit. Each is opt-in: a field omitted from the request\nkeeps the inherited value (model/effort within the same provider\nfamily; launch args on a same-agent fork), while a field present\nwins \u2014 a clear alias (`\"default\"`) resets to the bound agent's\ndefault, and an explicit launch-args list also drops the source's\ncopied permission-mode / codex-bypass labels so they can't shadow\nthe freshly chosen mode.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n`body.host_type: \"managed\"` gives the fork its own\nserver-provisioned sandbox instead of leaving it unbound for the\ncaller to bind a host to. It schedules the same background launch\na managed create does \u2014 this POST returns before the sandbox\nexists \u2014 and the sandbox is registered to the FORKING caller, not\nto the source session's owner. The fork's workspace is the\nrepository named by `body.workspace`, or the one the source\nrecorded when that field is omitted. `body.host_id` names the\nfork's new sandbox host, as on a managed create.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` names no agent; 403/404 if the caller lacks read access on the source, or on the session that owns a session-scoped `body.agent_id`; 400 if the source has no agent binding, `body.up_to_response_id` names no response in the source session, or a managed fork asks for a sandbox this server has not configured; 409 if `body.host_id` is already in use; 410 if the source's agent was removed or a required bundle copy finds its source missing.",
+        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nThe dialog's run-config picks (`body.model_override`,\n`body.reasoning_effort`, `body.terminal_launch_args` \u2014 the\npermission-/approval-mode selector) override what the fork would\notherwise inherit. Each is opt-in: a field omitted from the request\nkeeps the inherited value (model/effort within the same provider\nfamily; launch args on a same-agent fork), while a field present\nwins \u2014 a clear alias (`\"default\"`) resets to the bound agent's\ndefault, and an explicit launch-args list also drops the source's\ncopied permission-mode / codex-bypass labels so they can't shadow\nthe freshly chosen mode.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n`body.host_type: \"managed\"` gives the fork its own\nserver-provisioned sandbox instead of leaving it unbound for the\ncaller to bind a host to. It schedules the same background launch\na managed create does \u2014 this POST returns before the sandbox\nexists \u2014 and the sandbox is registered to the FORKING caller, not\nto the source session's owner. The fork's workspace is the\nrepository named by `body.workspace`, or the one the source\nrecorded when that field is omitted. `body.host_id` names the\nfork's new sandbox host, as on a managed create.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` names no agent; 403/404 if the caller lacks read access on the source, or on the session that owns a session-scoped `body.agent_id`; 403 for a side chat unless the caller owns the source's root session; 400 if the source has no agent binding, `body.up_to_response_id` names no response in the source session, or a managed fork asks for a sandbox this server has not configured; 409 if `body.host_id` is already in use; 410 if the source's agent was removed or a required bundle copy finds its source missing.",
         "operationId": "fork_session_v1_sessions__source_id__fork_post",
         "parameters": [
           {
@@ -19396,6 +22725,68 @@
         ]
       }
     },
+    "/v1/settings/session-title-instructions": {
+      "get": {
+        "description": "Read the caller's own title instructions.",
+        "operationId": "get_session_title_instructions_v1_settings_session_title_instructions_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTitleInstructionsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Session Title Instructions",
+        "tags": [
+          "settings"
+        ]
+      },
+      "put": {
+        "description": "Save or clear the caller's title instructions.",
+        "operationId": "save_session_title_instructions_v1_settings_session_title_instructions_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionTitleInstructionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTitleInstructionsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Session Title Instructions",
+        "tags": [
+          "settings"
+        ]
+      }
+    },
     "/v1/sharing": {
       "get": {
         "description": "Report every setting, whether each is editable here, and the options.",
@@ -19420,7 +22811,7 @@
         ]
       },
       "put": {
-        "description": "Set the sharing mode, public-access and/or default-public settings (admin only).\n\nUpdates only the fields present in the body; requires at least one.\nRejects an unknown mode value with 400 (no fail-open coercion \u2014 an admin\nsetting a value should learn about a typo). Rejects a write to a setting\nthe deployment manages itself (not file-backed) with 403.",
+        "description": "Update sharing and peer-messaging settings (admin only).\n\nUpdates only the fields present in the body; requires at least one.\nRejects an unknown mode value with 400 (no fail-open coercion \u2014 an admin\nsetting a value should learn about a typo). Rejects a write to a setting\nthe deployment manages itself (not file-backed) with 403.",
         "operationId": "set_sharing_v1_sharing_put",
         "requestBody": {
           "content": {
@@ -19670,6 +23061,11 @@
       "description": "First-class, owner-private containers that group sessions \u2014 create, list, rename, and delete.",
       "name": "projects",
       "x-displayName": "Projects"
+    },
+    {
+      "description": "Automations that start agent sessions on a schedule or a trigger \u2014 create, list, update, delete, and run them now, and read their runs and recent failures.",
+      "name": "scheduled_tasks",
+      "x-displayName": "Scheduled Tasks"
     },
     {
       "description": "Health, version, and identity endpoints for the running server.",

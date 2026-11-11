@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from itertools import pairwise
 from pathlib import Path
 
@@ -160,6 +161,39 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     page.goto(chat.url)
     chat.wait_for_stream()
     bar = page.get_by_test_id("composer-workspace-controls")
+    if is_mobile:
+        expect(bar).to_have_count(0)
+        pill = page.get_by_test_id("mobile-header-controls-slot").get_by_test_id(
+            "background-task-pill"
+        )
+        expect(pill).to_have_accessible_name("1 background task still running")
+        pill.click()
+        expect(page.get_by_text(_MONITOR_TASK["command"], exact=True)).to_be_visible()
+        page.keyboard.press("Escape")
+        menu_button = page.get_by_role(
+            "button", name=re.compile(r"^(?:Conversation|Session) actions$")
+        )
+        menu_button.click()
+        expect(page.get_by_label("Working directory: /work/repo", exact=True)).to_have_text("repo")
+        page.get_by_role("menuitem", name="Pull Requests", exact=True).click()
+        panel = page.get_by_test_id("github-panel-drawer")
+        expect(panel).to_have_attribute("data-state", "open")
+        expect(panel.get_by_text("Acceptance PR", exact=True)).to_be_visible()
+        panel.get_by_role("button", name="Close", exact=True).click()
+        expect(panel).to_have_attribute("data-state", "closed")
+        expect(menu_button).to_be_in_viewport()
+        chat.emit(
+            {
+                "event": "session.status",
+                "data": {
+                    "conversation_id": session_id,
+                    "status": "idle",
+                    "background_task_count": 0,
+                },
+            }
+        )
+        expect(pill).to_have_count(0)
+        return
     pr_link = bar.get_by_test_id("composer-pr-link")
     pr_label = pr_link.locator("span").last
     expect(pr_label).to_have_text(f"#{pr_number}", timeout=30_000)
@@ -205,10 +239,19 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     page.screenshot(path=tmp_path / f"status-page-{theme}.png", animations="disabled")
     directory_icon = icon_bounds["composer-workspace-dir"][0]
     center_y = directory_icon["y"] + directory_icon["height"] / 2
-    expected_bar_height = 28 if is_mobile else 37
-    expected_center_offset = 14 if is_mobile else 19
-    assert bounds["height"] == pytest.approx(expected_bar_height, abs=0.5)
-    assert center_y == pytest.approx(bounds["y"] + expected_center_offset, abs=0.5)
+    if not is_mobile:
+        assert bounds["height"] == pytest.approx(37, abs=0.5)
+        assert center_y == pytest.approx(bounds["y"] + 19, abs=0.5)
+    # Touch layouts may wrap the status controls beneath the directory/branch.
+    # Keep each row aligned and every control contained and in reading order.
+    branch_icon = icon_bounds["composer-git-branch"][0]
+    assert branch_icon["y"] + branch_icon["height"] / 2 == pytest.approx(center_y, abs=0.5)
+    status_center_y = (
+        control_bounds["background-task-pill"]["y"]
+        + control_bounds["background-task-pill"]["height"] / 2
+    )
+    if not is_mobile:
+        assert status_center_y == pytest.approx(center_y, abs=0.5)
     trailing = control_bounds[status_ids[-1]]
     # The context bar uses its compact content inset (1px computed border +
     # 8px padding).
@@ -249,9 +292,13 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     # font-dependent there); its full value stays in the title.
     if viewport_width >= 390:
         assert pr_label.evaluate("el => el.scrollWidth <= el.clientWidth + 1")
-    for test_id in status_ids:
+    pr_center_y = (
+        control_bounds["composer-pr-link"]["y"] + control_bounds["composer-pr-link"]["height"] / 2
+    )
+    assert min(abs(pr_center_y - center_y), abs(pr_center_y - status_center_y)) <= 0.5
+    for test_id in status_ids[1:]:
         rect = control_bounds[test_id]
-        assert rect["y"] + rect["height"] / 2 == pytest.approx(center_y, abs=0.5)
+        assert rect["y"] + rect["height"] / 2 == pytest.approx(status_center_y, abs=0.5)
     for test_id, rect in control_bounds.items():
         assert rect["x"] >= bounds["x"] - 0.5, (test_id, rect, bounds)
         assert rect["x"] + rect["width"] <= bounds["x"] + bounds["width"] + 0.5, (
@@ -285,7 +332,10 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
         for icon in icon_bounds[test_id]
     ]
     for (left_id, left), (right_id, right) in pairwise(ordered_icons):
-        assert left["x"] + left["width"] <= right["x"] + 0.5, (
+        assert (
+            left["x"] + left["width"] <= right["x"] + 0.5
+            or left["y"] + left["height"] <= right["y"] + 0.5
+        ), (
             left_id,
             left,
             right_id,
@@ -337,6 +387,8 @@ def test_long_model_and_permission_remain_single_row(
     label = page.get_by_test_id("composer-agent-config-value")
     expect(label).to_contain_text("Opus 4.8 1M", timeout=30_000)
     permission = page.get_by_test_id("composer-permission-chip")
+    if width < 768:
+        page.get_by_label("Message the agent").focus()
     expect(permission).to_be_visible()
     if width == 3200:
         for text in (

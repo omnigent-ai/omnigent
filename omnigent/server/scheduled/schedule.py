@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -80,3 +81,22 @@ def occurrence_host_id(task: ScheduledTask, trigger_key: str) -> str | None:
 def host_ownership_key(workspace_id: int, host_id: str | None) -> str:
     """Key a replica's ownership check by host, or by workspace for a task with no host."""
     return host_id if host_id is not None else str(workspace_id)
+
+
+# A task doesn't record its template, so, like the web form (``isTriggerPrompt`` in
+# web/src/components/scheduled/triggerTemplates.ts), recognize the opening sentence.
+_TRIGGER_PROMPT_OPENINGS = tuple(
+    f"This automation watches {source} and starts one Omnigent session"
+    for source in ("Jira", "Slack", "GitHub", "Linear", "PagerDuty")
+)
+# A trigger form can save its state as the prompt's first line, before the opening sentence.
+_TRIGGER_HEADER = re.compile(r"<!-- omnigent-trigger v\d+ [^\n]* -->\n")
+
+
+def is_trigger_automation(task: ScheduledTask) -> bool:
+    """Whether a task was set up from a trigger template and polls for new items."""
+    if task.session_mode != "continue":
+        return False
+    header = _TRIGGER_HEADER.match(task.prompt)
+    body = task.prompt[header.end() :] if header else task.prompt
+    return body.startswith(_TRIGGER_PROMPT_OPENINGS)
