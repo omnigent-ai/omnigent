@@ -21,6 +21,7 @@ import {
   parseTerminalClipboardMessage,
   resolveTerminalWorkspaceFileLink,
   sgrWheelReports,
+  TERMINAL_COPY_MAX_LINES,
   terminalBufferText,
   terminalTheme,
   terminalKeyEventPayload,
@@ -1276,6 +1277,24 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
+  it("copies only the newest lines of a long scrollback", async () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    socket.open();
+    const total = TERMINAL_COPY_MAX_LINES + 100;
+    const output = Array.from({ length: total }, (_, index) => `line-${index + 1}`).join("\r\n");
+    await new Promise<void>((resolve) => {
+      term.write(output, resolve);
+    });
+    expect(term.buffer.active.length).toBeGreaterThan(TERMINAL_COPY_MAX_LINES);
+
+    const lines = session.bufferText().split("\n");
+    expect(lines).toHaveLength(TERMINAL_COPY_MAX_LINES);
+    expect(lines[0]).toBe("line-101");
+    expect(lines.at(-1)).toBe(`line-${total}`);
+    session.dispose();
+  });
+
   it("sends touch pastes as input, bracketed when the program asks", async () => {
     const { socket, session } = makeSession();
     const term = (session as unknown as { term: Terminal }).term;
@@ -1285,8 +1304,8 @@ describe("TerminalSession", () => {
         typeof frame === "string" ? [] : [new TextDecoder().decode(frame)],
       );
 
-    session.paste("echo one\necho two");
-    expect(inputs()).toEqual(["echo one\recho two"]);
+    session.paste("echo one\necho two\r\necho three");
+    expect(inputs()).toEqual(["echo one\recho two\recho three"]);
 
     await new Promise<void>((resolve) => {
       term.write("\x1b[?2004h", resolve);

@@ -11,7 +11,7 @@ import type * as TerminalsModule from "@/lib/terminals";
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode, act, useMemo, type ReactElement } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { Toaster } from "@/components/ui/sonner";
 import { FileViewerContext, type OpenFileOptions } from "@/shell/FileViewerContext";
 import { toast } from "sonner";
@@ -1290,7 +1290,7 @@ describe("terminal clipboard", () => {
 
 describe("touch clipboard bar", () => {
   function setCoarsePointer(coarse: boolean): void {
-    vi.spyOn(window, "matchMedia").mockImplementation(
+    const spy = vi.spyOn(window, "matchMedia").mockImplementation(
       (query: string) =>
         ({
           matches: coarse && query === "(pointer: coarse)",
@@ -1303,6 +1303,17 @@ describe("touch clipboard bar", () => {
           dispatchEvent: () => false,
         }) as MediaQueryList,
     );
+    onTestFinished(() => spy.mockRestore());
+  }
+
+  function mockClipboardRead(read: () => Promise<string>): void {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { readText: read },
+    });
+    onTestFinished(() => {
+      Reflect.deleteProperty(navigator, "clipboard");
+    });
   }
 
   async function renderTouchView(readOnly = false) {
@@ -1325,23 +1336,58 @@ describe("touch clipboard bar", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Copy" }));
     const sheet = await screen.findByTestId("terminal-copy-sheet");
-    expect(within(sheet).getByTestId("terminal-copy-text")).toHaveTextContent("$ whoami omni");
+    expect(within(sheet).getByTestId("terminal-copy-text").textContent).toBe("$ whoami\nomni");
     fireEvent.click(within(sheet).getByRole("button", { name: "Copy all" }));
     await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledWith("$ whoami\nomni"));
+    expect(await screen.findByText("Copied terminal text")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByTestId("terminal-copy-sheet")).toBeNull());
     // An explicit touch copy does not grant terminal programs clipboard access.
     expect(screen.queryByTestId("terminal-clipboard-consent")).toBeNull();
     expect(readTerminalClipboardPreference()).toBe("ask");
+    act(() => terminal.onClipboardRequest?.("program text"));
+    await waitFor(() => expect(screen.queryByTestId("terminal-clipboard-consent")).not.toBeNull());
+    expect(clipboardMock.copyText).not.toHaveBeenCalledWith("program text");
 
     act(() => terminal.onState({ kind: "connected" }));
-    const readText = vi.fn(async () => "echo pasted");
-    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { readText } });
-    try {
-      fireEvent.click(screen.getByRole("button", { name: "Paste" }));
-      await waitFor(() => expect(terminal.paste).toHaveBeenCalledWith("echo pasted"));
-      expect(terminal.focus).toHaveBeenCalled();
-    } finally {
-      Reflect.deleteProperty(navigator, "clipboard");
-    }
+    mockClipboardRead(async () => "echo pasted");
+    fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+    await waitFor(() => expect(terminal.paste).toHaveBeenCalledWith("echo pasted"));
+    expect(terminal.focus).toHaveBeenCalled();
+    expect(screen.queryByTestId("terminal-paste-box")).toBeNull();
+  });
+
+  it("drops a paste whose clipboard read outlasts the connection", async () => {
+    setCoarsePointer(true);
+    const terminal = await renderTouchView();
+    act(() => terminal.onState({ kind: "connected" }));
+    let finishRead!: (text: string) => void;
+    mockClipboardRead(
+      () =>
+        new Promise<string>((resolve) => {
+          finishRead = resolve;
+        }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+    act(() => terminal.onState({ kind: "closed", reason: "network", code: 1006 }));
+    await act(async () => finishRead("echo late"));
+
+    expect(
+      await screen.findByText("The terminal isn't connected, so nothing was pasted."),
+    ).toBeInTheDocument();
+    expect(terminal.paste).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Paste" })).toBeDisabled();
+  });
+
+  it("follows a saved block choice", async () => {
+    writeTerminalClipboardPreference("block");
+    setCoarsePointer(true);
+    const terminal = await renderTouchView();
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+
+    expect(await screen.findByText("Copying from this terminal is blocked.")).toBeInTheDocument();
+    expect(terminal.bufferText).not.toHaveBeenCalled();
   });
 
   it("follows a block chosen for this terminal", async () => {

@@ -1,10 +1,5 @@
-// Copy and paste for terminals on touch devices.
-//
-// xterm draws output on a canvas and keeps its input in a hidden textarea, so
-// a phone or tablet has no long-press selection, Copy menu, or Paste target.
-// This bar offers both: Copy opens the terminal text in a sheet that supports
-// the platform's own selection gestures, and Paste reads the clipboard into
-// the terminal (or, when clipboard reads are refused, offers a paste box).
+// Touch copy and paste for canvas-rendered terminals, which offer touch
+// browsers no native selection or paste target.
 
 import { ClipboardPasteIcon, CopyIcon } from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState, type ClipboardEvent } from "react";
@@ -20,8 +15,10 @@ import {
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
 import { copyText } from "@/lib/clipboard";
+import { discardPendingTerminalClipboardWrite } from "@/lib/terminalClipboardWriter";
 
 export const TERMINAL_COPY_BLOCKED_MESSAGE = "Copying from this terminal is blocked.";
+const PASTE_NOT_CONNECTED_MESSAGE = "The terminal isn't connected, so nothing was pasted.";
 
 interface TerminalTouchClipboardBarProps {
   /** Background behind the bar, matching the terminal surface. */
@@ -34,8 +31,8 @@ interface TerminalTouchClipboardBarProps {
   readText: () => string;
   /** Whether the user's terminal clipboard choice blocks copying. */
   isCopyBlocked: () => boolean;
-  /** Sends pasted text to the terminal as input. */
-  onPaste: (text: string) => void;
+  /** Sends pasted text to the terminal as input; false when it can't take input. */
+  onPaste: (text: string) => boolean;
 }
 
 export function TerminalTouchClipboardBar({
@@ -49,6 +46,11 @@ export function TerminalTouchClipboardBar({
   const [sheetText, setSheetText] = useState<string | null>(null);
   const [pasteBoxOpen, setPasteBoxOpen] = useState(false);
 
+  // A paste box left open must not reappear when a read-only terminal becomes writable.
+  useEffect(() => {
+    if (!pasteAvailable) setPasteBoxOpen(false);
+  }, [pasteAvailable]);
+
   const openCopySheet = () => {
     if (isCopyBlocked()) {
       toast.info(TERMINAL_COPY_BLOCKED_MESSAGE, { id: "terminal-clipboard-blocked" });
@@ -59,17 +61,16 @@ export function TerminalTouchClipboardBar({
 
   const paste = async () => {
     // Read inside the tap so the platform can show its own paste confirmation.
-    if (typeof navigator !== "undefined" && navigator.clipboard?.readText) {
-      try {
-        const text = await navigator.clipboard.readText();
-        if (text) onPaste(text);
-        else toast.info("The clipboard has no text to paste.");
-        return;
-      } catch {
-        // Refused or unsupported reads fall back to a paste box below.
-      }
+    let text: string;
+    try {
+      text = await navigator.clipboard.readText();
+    } catch {
+      // Refused or unsupported reads fall back to a paste box.
+      setPasteBoxOpen(true);
+      return;
     }
-    setPasteBoxOpen(true);
+    if (!text) toast.info("The clipboard has no text to paste.");
+    else if (!onPaste(text)) toast.error(PASTE_NOT_CONNECTED_MESSAGE);
   };
 
   return (
@@ -117,8 +118,8 @@ export function TerminalTouchClipboardBar({
           open={pasteBoxOpen}
           enabled={pasteEnabled}
           onSend={(text) => {
-            setPasteBoxOpen(false);
-            onPaste(text);
+            if (onPaste(text)) setPasteBoxOpen(false);
+            else toast.error(PASTE_NOT_CONNECTED_MESSAGE);
           }}
           onClose={() => setPasteBoxOpen(false)}
         />
@@ -151,7 +152,7 @@ function TerminalCopySheet({
       const current = document.getSelection();
       const node = textRef.current;
       if (!current || !node || current.rangeCount === 0) return;
-      if (!node.contains(current.anchorNode)) return;
+      if (!node.contains(current.anchorNode) || !node.contains(current.focusNode)) return;
       setSelection(current.toString());
     };
     document.addEventListener("selectionchange", onSelectionChange);
@@ -170,6 +171,8 @@ function TerminalCopySheet({
       toast.info(TERMINAL_COPY_BLOCKED_MESSAGE, { id: "terminal-clipboard-blocked" });
       return;
     }
+    // This explicit copy supersedes any program copy still waiting to be written.
+    discardPendingTerminalClipboardWrite();
     try {
       await copyText(selection || text);
     } catch {

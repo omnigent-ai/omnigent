@@ -15,28 +15,38 @@ from __future__ import annotations
 
 import os
 import uuid
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
-from playwright.sync_api import Browser, BrowserContext, Locator, Page, ViewportSize, expect
+from playwright.sync_api import Browser, Locator, Page, ViewportSize, expect
+
+from tests._helpers.browser import user_page
 
 _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
+_RECORD_DIR = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
+# Recorded runs hold each state long enough to read; plain runs don't wait.
+_READ_PAUSE_MS = 2_000 if _RECORD_DIR else 0
 
-# Short holds so a recorded run shows each state long enough to read.
-_READ_PAUSE_MS = 2_000
+
+@contextmanager
+def _phone_page(browser: Browser, base_url: str) -> Iterator[Page]:
+    """Open a touch phone page with clipboard access, recording when requested."""
+    recording = {"record_video_dir": _RECORD_DIR} if _RECORD_DIR else {}
+    with user_page(
+        browser,
+        headers={},
+        viewport=_MOBILE_VIEWPORT,
+        has_touch=True,
+        is_mobile=True,
+        **recording,
+    ) as page:
+        page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base_url)
+        yield page
 
 
-def _phone_context(browser: Browser, base_url: str) -> BrowserContext:
-    """Open a touch phone context, recording when the run requests it."""
-    context_kwargs: dict[str, object] = {
-        "viewport": _MOBILE_VIEWPORT,
-        "has_touch": True,
-        "is_mobile": True,
-    }
-    record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
-    if record_dir:
-        context_kwargs["record_video_dir"] = record_dir
-    context = browser.new_context(**context_kwargs)
-    context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base_url)
-    return context
+def _pause(page: Page) -> None:
+    if _READ_PAUSE_MS:
+        page.wait_for_timeout(_READ_PAUSE_MS)
 
 
 def _open_new_shell(page: Page, base_url: str, session_id: str) -> Locator:
@@ -57,11 +67,8 @@ def _open_new_shell(page: Page, base_url: str, session_id: str) -> Locator:
     return terminal_view
 
 
-def _run_command(page: Page, terminal_view: Locator, command: str) -> None:
-    """Type a command into the terminal and run it."""
+def _focus_terminal(terminal_view: Locator) -> None:
     terminal_view.locator("textarea.xterm-helper-textarea").focus()
-    page.keyboard.type(command)
-    page.keyboard.press("Enter")
 
 
 def _open_copy_sheet(terminal_view: Locator, page: Page) -> Locator:
@@ -72,6 +79,36 @@ def _open_copy_sheet(terminal_view: Locator, page: Page) -> Locator:
     sheet = page.get_by_test_id("terminal-copy-sheet")
     expect(sheet).to_be_visible()
     return sheet
+
+
+def _close_copy_sheet(page: Page, sheet: Locator) -> None:
+    page.keyboard.press("Escape")
+    expect(sheet).to_be_hidden()
+
+
+def _open_sheet_when(
+    terminal_view: Locator,
+    page: Page,
+    shows: Callable[[list[str]], bool],
+    expected: str,
+    timeout_ms: int = 15_000,
+) -> Locator:
+    """Reopen the copy sheet, a snapshot of the terminal, until ``shows`` its lines."""
+    remaining_ms = timeout_ms
+    while True:
+        sheet = _open_copy_sheet(terminal_view, page)
+        text = sheet.get_by_test_id("terminal-copy-text").inner_text()
+        if shows(text.split("\n")):
+            return sheet
+        if remaining_ms <= 0:
+            raise AssertionError(f"terminal never showed {expected}; it showed:\n{text}")
+        _close_copy_sheet(page, sheet)
+        page.wait_for_timeout(250)
+        remaining_ms -= 250
+
+
+def _open_sheet_showing_line(terminal_view: Locator, page: Page, line: str) -> Locator:
+    return _open_sheet_when(terminal_view, page, lambda lines: line in lines, f"the line {line!r}")
 
 
 def _clipboard_text(page: Page) -> str:
@@ -85,17 +122,16 @@ def test_phone_copies_terminal_output(
     """CUJ-1: select one line of output and copy it, then copy all of it."""
     base_url, session_id = terminal_session
     marker = f"copied-{uuid.uuid4().hex[:8]}"
-    context = _phone_context(browser, base_url)
-    try:
-        page = context.new_page()
+    with _phone_page(browser, base_url) as page:
         terminal_view = _open_new_shell(page, base_url, session_id)
-        _run_command(page, terminal_view, f"echo {marker}")
-        page.wait_for_timeout(_READ_PAUSE_MS)
+        _focus_terminal(terminal_view)
+        page.keyboard.type(f"echo {marker}")
+        page.keyboard.press("Enter")
+        _pause(page)
 
-        sheet = _open_copy_sheet(terminal_view, page)
+        sheet = _open_sheet_showing_line(terminal_view, page, marker)
         sheet_text = sheet.get_by_test_id("terminal-copy-text")
-        expect(sheet_text).to_contain_text(f"echo {marker}")
-        page.wait_for_timeout(_READ_PAUSE_MS)
+        _pause(page)
 
         # Desktop Chromium cannot drive the iOS long-press, so place the
         # selection a long-press would make: the output line only.
@@ -116,21 +152,18 @@ def test_phone_copies_terminal_output(
         )
         copy_selection = sheet.get_by_role("button", name="Copy selection")
         expect(copy_selection).to_be_visible()
-        page.wait_for_timeout(_READ_PAUSE_MS)
+        _pause(page)
         copy_selection.tap()
         expect(page.get_by_text("Copied selection")).to_be_visible()
         expect(sheet).to_be_hidden()
         assert _clipboard_text(page) == marker
-        page.wait_for_timeout(_READ_PAUSE_MS)
+        _pause(page)
 
         sheet = _open_copy_sheet(terminal_view, page)
         sheet.get_by_role("button", name="Copy all").tap()
         expect(page.get_by_text("Copied terminal text")).to_be_visible()
-        copied = _clipboard_text(page)
-        assert f"echo {marker}\n{marker}" in copied
-        page.wait_for_timeout(_READ_PAUSE_MS)
-    finally:
-        context.close()
+        assert f"echo {marker}\n{marker}" in _clipboard_text(page)
+        _pause(page)
 
 
 def test_phone_pastes_into_terminal(
@@ -139,28 +172,33 @@ def test_phone_pastes_into_terminal(
 ) -> None:
     """CUJ-2: paste clipboard text at the prompt and run it."""
     base_url, session_id = terminal_session
-    context = _phone_context(browser, base_url)
-    try:
-        page = context.new_page()
+    command = f"echo pasted-{uuid.uuid4().hex[:8]}-$((6*7))"
+    with _phone_page(browser, base_url) as page:
         terminal_view = _open_new_shell(page, base_url, session_id)
-        terminal_view.locator("textarea.xterm-helper-textarea").focus()
+        _focus_terminal(terminal_view)
         # Stands in for copying the command in another app.
-        page.evaluate("(text) => navigator.clipboard.writeText(text)", "echo pasted-$((6*7))")
-        page.wait_for_timeout(_READ_PAUSE_MS)
+        page.evaluate("(text) => navigator.clipboard.writeText(text)", command)
+        _pause(page)
 
         paste = terminal_view.get_by_test_id("terminal-touch-clipboard").get_by_role(
             "button", name="Paste", exact=True
         )
         expect(paste).to_be_enabled()
         paste.tap()
-        page.wait_for_timeout(_READ_PAUSE_MS)
-        page.keyboard.press("Enter")
-        page.wait_for_timeout(_READ_PAUSE_MS)
+        # The pasted command waits at the prompt, not yet run.
+        sheet = _open_sheet_when(
+            terminal_view,
+            page,
+            lambda lines: bool(lines) and lines[-1].endswith(command),
+            f"{command!r} at the prompt",
+        )
+        _pause(page)
+        _close_copy_sheet(page, sheet)
+        _pause(page)
 
-        sheet = _open_copy_sheet(terminal_view, page)
-        sheet_text = sheet.get_by_test_id("terminal-copy-text")
-        expect(sheet_text).to_contain_text("echo pasted-$((6*7))")
-        expect(sheet_text).to_contain_text("\npasted-42")
-        page.wait_for_timeout(_READ_PAUSE_MS)
-    finally:
-        context.close()
+        _focus_terminal(terminal_view)
+        page.keyboard.press("Enter")
+        output = command.replace("echo ", "").replace("$((6*7))", "42")
+        sheet = _open_sheet_showing_line(terminal_view, page, output)
+        _pause(page)
+        _close_copy_sheet(page, sheet)

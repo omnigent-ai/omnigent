@@ -510,9 +510,12 @@ export function TerminalView({
   }, [clipboardScope]);
   const pasteIntoTerminal = useCallback(
     (text: string) => {
-      if (readOnly) return;
-      sessionRef.current?.paste(text);
-      sessionRef.current?.focus();
+      // The clipboard read can outlast the connection, so check it at send time.
+      const session = sessionRef.current;
+      if (readOnly || !session || stateRef.current.kind !== "connected") return false;
+      session.paste(text);
+      session.focus();
+      return true;
     },
     [readOnly],
   );

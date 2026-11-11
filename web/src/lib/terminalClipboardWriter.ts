@@ -22,6 +22,11 @@ export function queueTerminalClipboardWrite(request: TerminalClipboardWrite): vo
   void drain();
 }
 
+/** Drop a queued program copy so it can't overwrite a newer explicit copy. */
+export function discardPendingTerminalClipboardWrite(): void {
+  pending = null;
+}
+
 async function drain(): Promise<void> {
   try {
     while (pending !== null) {

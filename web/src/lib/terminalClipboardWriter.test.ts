@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  discardPendingTerminalClipboardWrite,
   isTerminalClipboardWritePending,
   queueTerminalClipboardWrite,
 } from "./terminalClipboardWriter";
@@ -43,6 +44,18 @@ describe("terminal clipboard writer", () => {
     expect(isTerminalClipboardWritePending()).toBe(true);
     await expectIdle();
     expect(write.onResult).toHaveBeenCalledWith(true);
+  });
+
+  it("drops a queued write when a newer explicit copy discards it", async () => {
+    const first = deferredCopy();
+    const queued = request("queued program text");
+    queueTerminalClipboardWrite(request("first"));
+    queueTerminalClipboardWrite(queued);
+    discardPendingTerminalClipboardWrite();
+    first.resolve();
+    await expectIdle();
+    expect(clipboardMock.copyText.mock.calls).toEqual([["first"]]);
+    expect(queued.onResult).not.toHaveBeenCalled();
   });
 
   it("serializes writers and keeps only the latest pending text", async () => {

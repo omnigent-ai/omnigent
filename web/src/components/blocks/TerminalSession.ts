@@ -385,24 +385,26 @@ export const TERMINAL_COPY_MAX_LINES = 5000;
  * Plain text of a terminal buffer for touch copying.
  *
  * Rejoins soft-wrapped rows into one logical line, trims trailing blanks, and
- * keeps only the newest ``maxLines`` lines so a full scrollback stays light.
+ * reads only the newest `maxLines` lines so a full scrollback stays light.
  */
 export function terminalBufferText(
   buffer: Pick<IBuffer, "length" | "getLine">,
   maxLines = TERMINAL_COPY_MAX_LINES,
 ): string {
-  const lines: string[] = [];
-  for (let index = 0; index < buffer.length; index += 1) {
+  const newestFirst: string[] = [];
+  let logicalLine = "";
+  for (let index = buffer.length - 1; index >= 0 && newestFirst.length < maxLines; index -= 1) {
     const line = buffer.getLine(index);
     if (!line) continue;
     // A row that continues on the next keeps its trailing spaces.
     const continues = buffer.getLine(index + 1)?.isWrapped === true;
     const text = continues ? line.translateToString(false) : line.translateToString(true).trimEnd();
-    if (line.isWrapped && lines.length > 0) lines[lines.length - 1] += text;
-    else lines.push(text);
+    logicalLine = text + logicalLine;
+    if (line.isWrapped && index > 0) continue;
+    if (newestFirst.length > 0 || logicalLine.trim() !== "") newestFirst.push(logicalLine);
+    logicalLine = "";
   }
-  while (lines.length > 0 && lines[lines.length - 1].trim() === "") lines.pop();
-  return lines.slice(-maxLines).join("\n");
+  return newestFirst.reverse().join("\n");
 }
 
 /** Largest tmux selection accepted for a browser clipboard write. */
