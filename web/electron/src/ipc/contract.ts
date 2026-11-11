@@ -13,6 +13,7 @@ import type {
   BrowserAction,
   BrowserCallResult,
   BrowserCloseResult,
+  BrowserElementPromptDismiss,
   BrowserElementPromptSubmit,
   BrowserElementSelection,
   BrowserHostOptions,
@@ -354,7 +355,7 @@ export interface PushChannels {
   };
   "browser-element-selected": { args: [payload: BrowserElementSelection] };
   "browser-element-prompt-submit": { args: [payload: BrowserElementPromptSubmit] };
-  "browser-element-prompt-dismiss": { args: [payload: { conversationId: string }] };
+  "browser-element-prompt-dismiss": { args: [payload: BrowserElementPromptDismiss] };
 
   // Setup page.
   "omnigent:connection-progress": {

@@ -88,7 +88,7 @@ const { createBrowserViewRegistry } = withTestOverrides(
   require("./browserViewRegistry.ts"),
 );
 const { createBrowserViewBoundsController } = require("./browserViewBounds.ts");
-const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
+const { goBack, goForward, registerBrowserIpc } = require("./browserIpc.ts");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity.ts");
 const { isDeveloperModeEnabled } = require("./developer_mode.ts");
@@ -5549,12 +5549,13 @@ function registerIpc() {
   serverManager.onChange(broadcastHostStatus);
 
   // Embedded browser pane — the `omnigent:browser-*` surface lives in
-  // browserIpc.js; the trust gate + per-window registry lookup are injected.
+  // browserIpc.ts; the trust gate + per-window registry lookup are injected.
   registerBrowserIpc({
     ipcMain,
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
     getWindowForEvent: (event) => BrowserWindow.fromWebContents(event.sender),
+    dialog,
     getAgentContextForEvent: (event, opts) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       const sourceHostId = typeof opts?.sourceHostId === "string" ? opts.sourceHostId : null;

@@ -386,7 +386,7 @@ electron/
   src/find_preload.ts      # contextBridge for the find bar: window.omnigentFind
   src/browserViewRegistry.ts  # per-conversation WebContentsView registry (browser pane)
   src/browserViewBounds.ts    # CSS-px → window-DIP bounds conversion (browser pane)
-  src/browserIpc.js           # omnigent:browser-* IPC handlers (extracted from main.js)
+  src/browserIpc.ts           # omnigent:browser-* IPC handlers (extracted from main.js)
   src/chromeCookieStore.ts    # per-site Chrome cookie import for the browser pane
   src/loopback-oauth.ts       # RFC 8252 loopback listener shared by browser sign-ins
   src/oidc-credentials.ts     # OIDC loopback sign-in, refresh, and revoke
@@ -693,7 +693,7 @@ including the address bar, chat links, and agent actions, enforces this policy.
   window device-independent pixels (they diverge after `Cmd+/Cmd-` zoom).
 - `src/main.js` — instantiates one registry **per shell window** and injects it
   (plus the `isPinnedOriginSender` trust gate) into `registerBrowserIpc(...)`.
-- `src/browserIpc.js` — the whole `ipcMain.handle('omnigent:browser-*')` surface,
+- `src/browserIpc.ts` — the whole `ipcMain.handle('omnigent:browser-*')` surface,
   extracted out of `main.js` so that file stays bounded:
   `open-or-navigate`, `set-active`, `resize`, `screenshot`
   (`capturePage().toPNG()` → base64), `perform-action`, `has-view`, `close`, plus the
@@ -760,7 +760,7 @@ hovering highlights the element under the cursor (overlay + `<Component>`/tag
 label); clicking opens a popup anchored to that element with an input + Send.
 On Send the popup emits a `console.log` marker (the injected script can't
 `require('electron')`), which the per-view console-message listener in
-`browserIpc.js` forwards to the SPA as `browser-element-prompt-submit`
+`browserIpc.ts` forwards to the SPA as `browser-element-prompt-submit`
 (carrying the element info; a cropped element screenshot arrives on the earlier
 `browser-element-selected` event). **There is no backend
 design-edit route** — `AppShell` (where the relay is hoisted, so it's listening

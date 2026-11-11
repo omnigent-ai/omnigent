@@ -1,4 +1,4 @@
-// Tests for the extracted browser IPC module (src/browserIpc.js), run with
+// Tests for the extracted browser IPC module (src/browserIpc.ts), run with
 // `node --test`. registerBrowserIpc takes injected deps (ipcMain, trust gate,
 // registry resolver) so we can drive every handler with stubs — no Electron.
 //
@@ -23,7 +23,7 @@ const {
   makeDesignModeInputHandler,
   buildDesignModeScript,
   DESIGN_MODE_GESTURE_WINDOW_MS,
-} = require("../src/browserIpc");
+} = require("../src/browserIpc.ts");
 
 /** A fake ipcMain that records `handle(channel, fn)` registrations and lets a
  *  test invoke a channel with a synthetic event + args. */
@@ -683,6 +683,57 @@ describe("browserIpc — trust gate", () => {
     });
     assert.deepEqual(wc.scripts, []);
   });
+});
+
+describe("browserIpc — malformed renderer arguments", () => {
+  // Replies to malformed arguments; explicit `error: undefined` keys are part of the reply.
+  const noView = { ok: false, error: "No browser view" };
+  const noId = { ok: false, error: "conversationId is required" };
+  const expected = {
+    "omnigent:browser-open-or-navigate": noId,
+    "omnigent:browser-set-active": { ok: true, error: undefined },
+    "omnigent:browser-set-suppressed": { ok: true, error: undefined },
+    "omnigent:browser-set-recent-session-switch-supported": { ok: true },
+    "omnigent:browser-set-open-tab-supported": { ok: true },
+    "omnigent:browser-cancel-recent-session-switch": { ok: true },
+    "omnigent:browser-resize": noId,
+    "omnigent:browser-screenshot": noView,
+    "omnigent:browser-perform-action": noView,
+    "omnigent:browser-execute": noView,
+    "omnigent:browser-has-view": { exists: false },
+    "omnigent:browser-close": { ok: true, removed: true },
+    "omnigent:browser-go-back": noView,
+    "omnigent:browser-go-forward": noView,
+    "omnigent:browser-reload": noView,
+    "omnigent:open-browser-devtools": noView,
+    "omnigent:browser-enable-design-mode": noView,
+    "omnigent:browser-disable-design-mode": { ok: false },
+    "omnigent:browser-chrome-cookie-preview": noView,
+    "omnigent:browser-chrome-cookie-import": noView,
+  };
+  for (const [label, args] of [
+    ["no argument", undefined],
+    ["null", null],
+    ["a number", 5],
+    ["a bare conversation ID", "conv_1"],
+    ["an array", ["conv_1"]],
+  ]) {
+    it(`answers ${label} with the expected reply, without touching the view`, async () => {
+      await Promise.all(
+        Object.entries(expected).map(async ([channel, result]) => {
+          const { ipcMain, event, sent, wc } = setup();
+          assert.deepEqual(await ipcMain.invoke(channel, event, args), result, channel);
+          assert.deepEqual(sent, [], channel);
+          assert.deepEqual(wc.calls, [], channel);
+        }),
+      );
+      const { ipcMain, event } = setup();
+      assert.deepEqual(
+        await ipcMain.invoke("omnigent:browser-signal-design-result", event, args),
+        Array.isArray(args) ? noView : { ok: false, error: "bad payload" },
+      );
+    });
+  }
 });
 
 describe("browserIpc — overlay suppression (#3980)", () => {
