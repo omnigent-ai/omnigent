@@ -1094,3 +1094,27 @@ def test_local_single_user_keeps_custom_handler_for_tenant_load(
     loaded = agent_cache.load("handler-local", loc, expand_env=False)
 
     assert loaded.spec.name == "handler-agent"
+
+
+def test_disk_hit_rejects_unregistered_handler_without_repairing_entry(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A published disk entry that a tenant may not use is rejected, not rebuilt."""
+    loc = "handler-disk/h1"
+    _store_bundle(artifact_store, loc, {"config.yaml": _UNREGISTERED_HANDLER_CONFIG})
+    AgentCache(artifact_store=artifact_store, cache_dir=cache_dir).load(
+        "handler-disk", loc, expand_env=True
+    )
+    monkeypatch.setattr(agent_cache_module, "local_single_user_enabled", lambda: False)
+    fresh_cache = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+
+    def fail_on_repair(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("policy rejection must not start cache repair")
+
+    monkeypatch.setattr(fresh_cache, "_recover_disk_entry", fail_on_repair)
+
+    with pytest.raises(OmnigentError, match="not a registered policy handler"):
+        fresh_cache.load("handler-disk", loc, expand_env=False)
+    assert (cache_dir / "handler-disk" / "config.yaml").is_file()

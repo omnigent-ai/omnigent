@@ -1760,6 +1760,16 @@ def _load_default_policy_specs(
                 policy.type,
             )
             continue
+        if not function_policy_handler_allowed(policy.handler, policy.factory_params):
+            # A row whose handler is no longer registered would fail engine construction
+            # for every session; skip it so one stale row cannot take the server down.
+            _logger.warning(
+                "Skipping default policy %r (id=%r): handler %r is not registered.",
+                policy.name,
+                policy.id,
+                policy.handler,
+            )
+            continue
         specs.append(_stored_policy_to_spec(policy))
     _DEFAULT_POLICY_SPECS_CACHE[_DEFAULT_POLICY_SPECS_KEY] = (specs, loaded_at)
     return specs

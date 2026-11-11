@@ -35,6 +35,11 @@ def _cleanup_staging_dir(path: Path) -> None:
         _logger.warning("Could not clean agent cache staging directory %s: %s", path, exc)
 
 
+def _enforces_handler_allowlist(expand_env: bool) -> bool:
+    """Tenant bundles on a multi-user server must use registered handlers."""
+    return not expand_env and not local_single_user_enabled()
+
+
 def _published_location(workdir: Path) -> str | None:
     """Return the bundle location a cache directory holds, or ``None`` if unknown."""
     try:
@@ -88,15 +93,18 @@ class AgentCache:
     def _load_spec(
         self, source: Path | bytes, *, expand_env: bool, dest: Path | None = None
     ) -> AgentSpec:
-        # Tenant (non-operator) bundles must pass the handler registry on every load.
-        # Local single-user servers keep their operator's custom policies.
         return load_spec(
             source,
             dest=dest,
             expand_env=expand_env,
-            enforce_handler_allowlist=not expand_env and not local_single_user_enabled(),
+            enforce_handler_allowlist=_enforces_handler_allowlist(expand_env),
             prune_invalid_sub_agents=True,
         )
+
+    def _check_cached_handlers(self, spec: AgentSpec, *, expand_env: bool) -> None:
+        """Check handlers outside the repair path, so a rejection is not treated as corruption."""
+        if _enforces_handler_allowlist(expand_env):
+            _reject_unregistered_spec_policy_handlers(spec)
 
     def _cache_path(self, agent_id: str) -> Path:
         """Return a direct child of the cache root for an agent id."""
@@ -159,8 +167,7 @@ class AgentCache:
         # changes for a given ``agent_id``.
         cached = self._specs.get(agent_id)
         if cached is not None and cached[0] == bundle_location:
-            if not expand_env and not local_single_user_enabled():
-                _reject_unregistered_spec_policy_handlers(cached[1])
+            self._check_cached_handlers(cached[1], expand_env=expand_env)
             return LoadedAgent(spec=cached[1], workdir=workdir)
 
         # Tier 2: rebuild stale, missing, or corrupt extracted specs from the stored bundle.
@@ -168,12 +175,12 @@ class AgentCache:
             if _published_location(workdir) != bundle_location:
                 return self._recover_disk_entry(agent_id, bundle_location, expand_env=expand_env)
             try:
-                spec = self._load_spec(workdir, expand_env=expand_env)
+                spec = load_spec(workdir, expand_env=expand_env, prune_invalid_sub_agents=True)
             except Exception:
                 return self._recover_disk_entry(agent_id, bundle_location, expand_env=expand_env)
-            else:
-                self._specs[agent_id] = (bundle_location, spec)
-                return LoadedAgent(spec=spec, workdir=workdir)
+            self._check_cached_handlers(spec, expand_env=expand_env)
+            self._specs[agent_id] = (bundle_location, spec)
+            return LoadedAgent(spec=spec, workdir=workdir)
 
         # Cache miss — validate privately before publishing the disk entry.
         bundle_bytes = self._artifact_store.get(bundle_location)
@@ -193,7 +200,7 @@ class AgentCache:
             try:
                 if _published_location(workdir) != bundle_location:
                     raise LookupError("cached directory holds another bundle")
-                spec = self._load_spec(workdir, expand_env=expand_env)
+                spec = load_spec(workdir, expand_env=expand_env, prune_invalid_sub_agents=True)
             except Exception as exc:
                 _logger.warning(
                     "Rebuilding unreadable agent cache entry",
@@ -204,6 +211,7 @@ class AgentCache:
                     ),
                 )
             else:
+                self._check_cached_handlers(spec, expand_env=expand_env)
                 self._specs[agent_id] = (bundle_location, spec)
                 return LoadedAgent(spec=spec, workdir=workdir)
 
