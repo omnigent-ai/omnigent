@@ -890,7 +890,8 @@ class ToolGroupsConfig:
     :param comments: ``list_comments`` and ``update_comment``.
     :param policies: ``sys_add_policy`` and ``sys_policy_registry``.
     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
-    :param projects: ``sys_project_list`` and ``sys_session_update``.
+    :param projects: ``sys_project_list``, ``sys_project_update`` and
+        ``sys_session_update``.
     """
 
     browser: bool = True

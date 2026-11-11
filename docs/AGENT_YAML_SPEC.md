@@ -1070,7 +1070,7 @@ tool_groups:
   comments: false         # list_comments / update_comment
   policies: false         # sys_add_policy / sys_policy_registry
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
-  projects: false         # sys_project_list / sys_session_update
+  projects: false         # sys_project_* / sys_session_update
 ```
 
 Every group defaults to `true`, so omitting the block changes nothing. Values
