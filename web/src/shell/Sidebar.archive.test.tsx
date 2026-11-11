@@ -37,6 +37,7 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { Toaster } from "@/components/ui/sonner";
 import { Sidebar } from "./Sidebar";
+import { resetArchiveUndoBatchForTests } from "./archiveUndoToast";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -93,6 +94,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   localStorage.clear();
+  resetArchiveUndoBatchForTests();
 });
 
 describe("archive flow", () => {
@@ -177,7 +179,11 @@ describe("archive flow", () => {
 });
 
 describe("archive worktree prompt", () => {
-  const WORKTREE_CONV: Conversation = { ...CONV, git_branch: "feature/x" };
+  const WORKTREE_CONV: Conversation = {
+    ...CONV,
+    git_branch: "feature/x",
+    workspace: "/repo/.worktrees/feature-x",
+  };
   const PREF_KEY = "omnigent:delete-worktrees-on-archive";
 
   it("archives a non-worktree session without prompting", () => {
@@ -196,6 +202,11 @@ describe("archive worktree prompt", () => {
 
     await screen.findByTestId("archive-worktree-dialog");
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    // The prompt names the worktree it means: directory name, path, and branch.
+    const [item] = screen.getAllByTestId("archive-worktree-item");
+    expect(item).toHaveTextContent("feature-x");
+    expect(item).toHaveTextContent("/repo/.worktrees/feature-x");
+    expect(item).toHaveTextContent("feature/x");
     fireEvent.click(screen.getByTestId("archive-worktree-delete"));
 
     expect(mocks.archive.mutate).toHaveBeenCalledWith({
@@ -222,6 +233,40 @@ describe("archive worktree prompt", () => {
       deleteWorktree: false,
     });
     expect(localStorage.getItem(PREF_KEY)).toBe("false");
+  });
+
+  it("lists each worktree of a bulk archive once", async () => {
+    mockConversations([
+      { ...WORKTREE_CONV, id: "conv_a", title: "Session A" },
+      { ...WORKTREE_CONV, id: "conv_b", title: "Session B" },
+      {
+        ...CONV,
+        id: "conv_c",
+        title: "Session C",
+        git_branch: "fix/y",
+        workspace: "/repo/.worktrees/fix-y",
+      },
+      { ...CONV, id: "conv_d", title: "Session D" },
+    ]);
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+    for (const title of ["Session A", "Session B", "Session C", "Session D"]) {
+      fireEvent.click(screen.getByRole("link", { name: new RegExp(title) }));
+    }
+    fireEvent.click(screen.getByTestId("bulk-archive"));
+
+    const dialog = await screen.findByTestId("archive-worktree-dialog");
+    expect(dialog).toHaveTextContent("3 of the sessions you're archiving have a git worktree.");
+    // Sessions A and B share one worktree, so it is listed once.
+    const items = screen.getAllByTestId("archive-worktree-item");
+    expect(items.map((item) => item.textContent).sort()).toEqual([
+      "feature-x/repo/.worktrees/feature-xfeature/x",
+      "fix-y/repo/.worktrees/fix-yfix/y",
+    ]);
+    fireEvent.click(screen.getByTestId("archive-worktree-delete"));
+
+    const [{ deleteWorktreeIds }] = mocks.bulkArchive.mutate.mock.calls[0];
+    expect([...deleteWorktreeIds].sort()).toEqual(["conv_a", "conv_b", "conv_c"]);
   });
 
   it("cancels the archive when the prompt is dismissed", async () => {

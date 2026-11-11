@@ -1,3 +1,4 @@
+import { FolderIcon, GitBranchIcon } from "lucide-react";
 import { useCallback, useId, useState, type ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -18,12 +19,38 @@ import {
   writeDeleteWorktreesOnArchive,
 } from "@/lib/archiveWorktreePreferences";
 
+import { basename } from "./WorkspacePicker";
+
 /** Called with the ids whose worktree should be removed (empty = archive only). */
 type ProceedFn = (deleteWorktreeIds: ReadonlySet<string>) => void;
 
+/** One worktree the archive prompt names; several sessions may share it. */
+export interface ArchiveWorktreeTarget {
+  /** Worktree directory, e.g. `"/repo/.worktrees/login"`; null when unknown. */
+  path: string | null;
+  /** Branch checked out in the worktree, e.g. `"feature/login"`. */
+  branch: string;
+}
+
 interface PendingPrompt {
   worktreeCount: number;
+  worktrees: readonly ArchiveWorktreeTarget[];
   choose: (deleteWorktrees: boolean) => void;
+}
+
+/** Distinct worktrees of the sessions, in order; sessions without a path group by branch. */
+export function archiveWorktreeTargets(
+  conversations: readonly Conversation[],
+): ArchiveWorktreeTarget[] {
+  const targets = new Map<string, ArchiveWorktreeTarget>();
+  for (const conversation of conversations) {
+    const branch = conversation.git_branch;
+    if (branch == null) continue;
+    const path = conversation.workspace?.trim() || null;
+    const key = path === null ? `branch:${branch}` : `path:${path}`;
+    if (!targets.has(key)) targets.set(key, { path, branch });
+  }
+  return [...targets.values()];
 }
 
 interface PendingRunningPrompt {
@@ -47,9 +74,8 @@ export function useArchivePrompt(): {
 
   const requestWorktreeChoice = useCallback(
     (conversations: readonly Conversation[], proceed: ProceedFn) => {
-      const worktreeIds = new Set(
-        conversations.filter((c) => c.git_branch != null).map((c) => c.id),
-      );
+      const worktreeSessions = conversations.filter((c) => c.git_branch != null);
+      const worktreeIds = new Set(worktreeSessions.map((c) => c.id));
       if (!cleanupSupported || worktreeIds.size === 0) {
         proceed(new Set());
         return;
@@ -61,6 +87,7 @@ export function useArchivePrompt(): {
       }
       setPending({
         worktreeCount: worktreeIds.size,
+        worktrees: archiveWorktreeTargets(worktreeSessions),
         choose: (deleteWorktrees) => proceed(deleteWorktrees ? worktreeIds : new Set()),
       });
     },
@@ -225,6 +252,7 @@ function ArchiveWorktreeDialog({
               sandboxes, are kept.
             </DialogDescription>
           </DialogHeader>
+          <ArchiveWorktreeList worktrees={pending.worktrees} />
           <div className="flex flex-col gap-1">
             <div className="flex items-center gap-2">
               <Checkbox
@@ -271,5 +299,37 @@ function ArchiveWorktreeDialog({
         </DialogContent>
       )}
     </Dialog>
+  );
+}
+
+function ArchiveWorktreeList({ worktrees }: { worktrees: readonly ArchiveWorktreeTarget[] }) {
+  return (
+    <ul
+      aria-label={worktrees.length === 1 ? "Worktree" : "Worktrees"}
+      className="max-h-48 divide-y divide-border overflow-y-auto rounded-md border border-border"
+      data-testid="archive-worktree-list"
+    >
+      {worktrees.map(({ path, branch }) => (
+        <li
+          key={path ?? `branch:${branch}`}
+          className="flex min-w-0 flex-col gap-0.5 px-3 py-2"
+          data-testid="archive-worktree-item"
+        >
+          {path !== null && (
+            <>
+              <span className="flex min-w-0 items-center gap-1.5 text-ui font-medium">
+                <FolderIcon aria-hidden className="size-3.5 shrink-0" />
+                <span className="truncate">{basename(path)}</span>
+              </span>
+              <span className="break-all pl-5 font-mono text-xs text-muted-foreground">{path}</span>
+            </>
+          )}
+          <span className="flex min-w-0 items-center gap-1.5 font-mono text-xs text-muted-foreground">
+            <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
+            <span className="break-all">{branch}</span>
+          </span>
+        </li>
+      ))}
+    </ul>
   );
 }
