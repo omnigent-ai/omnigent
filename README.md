@@ -336,19 +336,26 @@ Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
 
 <details>
-<summary>Grok Build and Jcode</summary>
+<summary>Grok Build</summary>
 
-Two more coding agents are built in but have no `omnigent <name>` launcher of
-their own, because each ships a CLI that owns its own login or provider
-config. Install the vendor CLI, set it up, then name the harness:
+Grok Build runs two ways: as a native-server harness (`grok agent serve`
+over WebSocket, with Omnigent policies, approvals, transcript mirroring,
+and `sys_*` MCP tools) or headless via ACP (`grok agent stdio`).
 
 ```bash
-# Grok Build (xAI)
 curl -fsSL https://x.ai/cli/install.sh | bash
-grok login --device-auth              # xAI OAuth
-omnigent run --harness grok           # 'grok-build' also works
+grok login --device-auth              # xAI OAuth (or export XAI_API_KEY)
+omnigent grok                         # native-server session in a runner pane
+omnigent run --harness grok           # headless ACP; 'grok-build' also works
+```
 
-# Jcode (https://jcode.sh)
+<summary>Jcode</summary>
+
+Jcode is built in but has no `omnigent <name>` launcher of its own, because it
+ships a CLI that owns its own login and provider config. Install the vendor
+CLI, configure it, then name the harness:
+
+```bash
 curl -fsSL https://jcode.sh/install | bash
 # configure a provider in ~/.jcode/config.toml
 omnigent run --harness jcode
