@@ -266,6 +266,10 @@ export function InboxPage() {
   // Suggestions expanded while unread, kept on screen until collapsed even
   // though marking them read takes them out of the Unread list.
   const [pinnedSuggestions, setPinnedSuggestions] = useState<Record<string, Suggestion>>({});
+  // Pins outlive the list they came from, so drop them once the agent is off.
+  useEffect(() => {
+    if (!proactiveInbox.enabled) setPinnedSuggestions({});
+  }, [proactiveInbox.enabled]);
   const [responded, setResponded] = useState<RespondedMap>({});
   const pendingSubmissions = useRef(new Map<string, RespondedMap[string]>());
   // Manual expand/collapse toggles keyed by entry key. Anything not in
@@ -375,12 +379,13 @@ export function InboxPage() {
   const visibleUnread = showUnread ? unreadItems : [];
   const visibleAutomations = showUnread ? automationInbox.items : [];
   const listedSuggestionIds = new Set(proactiveInbox.items.map((item) => item.id));
-  const visibleSuggestions = showSuggestions
-    ? [
-        ...proactiveInbox.items,
-        ...Object.values(pinnedSuggestions).filter((item) => !listedSuggestionIds.has(item.id)),
-      ]
-    : [];
+  const visibleSuggestions =
+    showSuggestions && proactiveInbox.enabled
+      ? [
+          ...proactiveInbox.items,
+          ...Object.values(pinnedSuggestions).filter((item) => !listedSuggestionIds.has(item.id)),
+        ]
+      : [];
   const visibleCount =
     visibleApprovals.length +
     visibleComments.length +

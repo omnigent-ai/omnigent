@@ -7,8 +7,11 @@ import {
   OPEN_SUGGESTION_STATUSES,
   applySuggestionUpdate,
   listSuggestions,
+  locateSuggestion,
   reconcileSuggestion,
+  restoreSuggestion,
   updateSuggestion,
+  type SuggestionPlace,
   type Suggestion,
   type SuggestionPage,
   type SuggestionStatus,
@@ -81,6 +84,13 @@ export function useProactiveInbox(
       inFlight.current += 1;
       setPendingVersion((v) => v + 1);
       void queryClient.cancelQueries({ queryKey: key });
+      // Where the item was in each cached list, so a failed PATCH can put it back
+      // even when the refetch after it fails too.
+      const places: [readonly unknown[], SuggestionPlace][] = [];
+      for (const [queryKey, data] of queryClient.getQueriesData<Pages>({ queryKey: key })) {
+        const place = data ? locateSuggestion(data.pages, id) : null;
+        if (place) places.push([queryKey, place]);
+      }
       queryClient.setQueriesData<Pages>({ queryKey: key }, (data) =>
         data ? { ...data, pages: applySuggestionUpdate(data.pages, id, change) } : data,
       );
@@ -104,6 +114,12 @@ export function useProactiveInbox(
             queryClient.setQueriesData<Pages>({ queryKey: key }, (data) =>
               data ? { ...data, pages: reconcileSuggestion(data.pages, copy) } : data,
             );
+          } else {
+            for (const [queryKey, place] of places) {
+              queryClient.setQueryData<Pages>(queryKey, (data) =>
+                data ? { ...data, pages: restoreSuggestion(data.pages, place) } : data,
+              );
+            }
           }
         })
         .finally(() => {
@@ -123,6 +139,7 @@ export function useProactiveInbox(
   const first = pages[0];
   const listedStatuses = new Set(statuses);
   return {
+    enabled,
     // A read mark keeps an item in the cache; only list the statuses asked for.
     items: enabled
       ? pages.flatMap((page) => page.data).filter((item) => listedStatuses.has(item.status))

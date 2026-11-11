@@ -191,6 +191,21 @@ it("reports a failed update and reloads the list", async () => {
   expect(listSuggestions).toHaveBeenCalledTimes(2);
 });
 
+it("keeps the item when the update and the recovery fetch both fail", async () => {
+  const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
+  await waitFor(() => expect(result.current.items).toEqual([item]));
+  vi.mocked(updateSuggestion).mockRejectedValueOnce(new Error("offline"));
+  vi.mocked(listSuggestions).mockRejectedValueOnce(new Error("offline"));
+
+  act(() => result.current.update("sug", { resolution: "not_now" }));
+  expect(result.current.items).toEqual([]);
+
+  await waitFor(() => expect(showToast).toHaveBeenCalledOnce());
+  // The server still has the item open; the card comes back so the viewer can retry.
+  await waitFor(() => expect(result.current.items).toEqual([item]));
+  await waitFor(() => expect(result.current.unreadCount).toBe(1));
+});
+
 it("lists only the requested states after a read mark", async () => {
   vi.mocked(updateSuggestion).mockReturnValue(new Promise(() => {}));
   const { result } = renderHook(() => useProactiveInbox(true, ["unread"]), { wrapper });
