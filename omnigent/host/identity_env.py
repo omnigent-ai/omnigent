@@ -18,6 +18,8 @@ import os
 # MANAGED_HOST_TOKEN_HEADER in omnigent.host.identity); HOST_ID / HOST_NAME
 # override the identity file and must be set together.
 HOST_TOKEN_ENV_VAR = "OMNIGENT_HOST_TOKEN"
+# Optional bootstrap-owned, ephemeral credential file for subprocess helpers.
+HOST_TOKEN_FILE_ENV_VAR = "OMNIGENT_HOST_TOKEN_FILE"
 HOST_ID_ENV_VAR = "OMNIGENT_HOST_ID"
 HOST_NAME_ENV_VAR = "OMNIGENT_HOST_NAME"
 

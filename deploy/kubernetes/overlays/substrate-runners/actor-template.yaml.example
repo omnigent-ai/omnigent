@@ -1,0 +1,47 @@
+# Substrate Control resource: use kubectl ate, not kubectl apply.
+metadata:
+  atespace: omnigent-runners
+  name: omnigent-host-v1
+workerSelector:
+  matchLabels:
+    workload: omnigent
+snapshotConfig:
+  preferredFidelity: SNAPSHOT_FIDELITY_VOLUMES
+  goldenSnapshotConfig:
+    mode: GOLDEN_SNAPSHOT_MODE_DISABLED
+resources:
+  limits:
+    cpuMillicores: 1000
+    memoryBytes: 2147483648
+containers:
+  - name: host
+    image: REPLACE_WITH_BUILT_HOST_IMAGE_DIGEST
+    command: [python3, -m, omnigent.host.substrate_bootstrap]
+    env:
+      - name: HOME
+        value: /home/omnigent
+      - name: IS_SANDBOX
+        value: "1"
+    securityContext:
+      capabilities:
+        drop: [ALL]
+    wakeupProbe:
+      httpGet:
+        path: /readyz
+        port: 80
+      timeoutSeconds: 120
+    volumeMounts:
+      - name: home
+        mountPath: /home/omnigent
+      - name: identity
+        mountPath: /run/substrate
+volumes:
+  - name: home
+    durableDir: {}
+  - name: identity
+    systemInfo:
+      dataSources:
+        - actorMetadata:
+            items:
+              - field: ACTOR_METADATA_FIELD_UID
+                path: uid
