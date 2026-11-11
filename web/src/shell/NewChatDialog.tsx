@@ -19,7 +19,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { useLocation, useNavigate, useSearchParams } from "@/lib/routing";
+import { useNavigate, useReplaceSearchParams, useSearchParams } from "@/lib/routing";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
 import { MobileHeaderControlPortal } from "./MobileHeaderControlsSlot";
@@ -240,6 +240,7 @@ import {
   readLastSandboxRepos,
   writeLastSandboxRepos,
 } from "@/lib/repoPreferences";
+import { readLastSandboxProfile, writeLastSandboxProfile } from "@/lib/sandboxProfilePreferences";
 import { readHarnessOptions, writeHarnessOption, type HarnessOptions } from "@/lib/modePreferences";
 import {
   getNewChatPickerCacheKey,
@@ -2250,7 +2251,7 @@ function NewChatLandingContent({
   });
   const landingDraft = draftState.draft;
   const navigate = useNavigate();
-  const location = useLocation();
+  const replaceSearchParams = useReplaceSearchParams();
   const [searchParams] = useSearchParams();
   const linkedPrompt = searchParams.get("prompt");
   const handoffToken = searchParams.get(NEW_SESSION_HANDOFF_PARAM);
@@ -2508,19 +2509,8 @@ function NewChatLandingContent({
     remaining.delete("prompt");
     remaining.delete(NEW_SESSION_HANDOFF_PARAM);
     forgetNewSessionHandoff(handoffToken);
-    navigate(
-      { pathname: location.pathname, search: remaining.toString(), hash: location.hash },
-      { replace: true, state: location.state },
-    );
-  }, [
-    linkedPrompt,
-    handoffToken,
-    searchParams,
-    location.pathname,
-    location.hash,
-    location.state,
-    navigate,
-  ]);
+    replaceSearchParams(remaining);
+  }, [linkedPrompt, handoffToken, searchParams, replaceSearchParams]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -2719,8 +2709,20 @@ function NewChatLandingContent({
   // is what the launch will use.
   const effectiveSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
+  // The profile last picked on this provider seeds the picker, like the last provider.
+  // Reread after each pick, so a composer reset in place (another project) starts on it.
+  const [sandboxProfilePicks, setSandboxProfilePicks] = useState(0);
+  const rememberedSandboxProfileId = useMemo(
+    () => readLastSandboxProfile(effectiveSandboxProvider),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- a pick changes the stored value
+    [effectiveSandboxProvider, sandboxProfilePicks],
+  );
   const { launchError: sandboxProfileError, selection: selectedSandboxProfile } =
-    useSandboxProfileCatalog(sandboxSelected ? effectiveSandboxProvider : null, sandboxProfile);
+    useSandboxProfileCatalog(
+      sandboxSelected ? effectiveSandboxProvider : null,
+      sandboxProfile,
+      rememberedSandboxProfileId,
+    );
   const sandboxMultiRepo =
     info !== "loading" &&
     effectiveSandboxProvider !== null &&
@@ -6830,7 +6832,15 @@ function NewChatLandingContent({
           <SandboxProfilePicker
             provider={effectiveSandboxProvider}
             value={sandboxProfile}
-            onChange={setSandboxProfile}
+            onChange={(profile) => {
+              setSandboxProfile(profile);
+              // Saved on pick, like the agent, harness and sandbox provider.
+              if (profile) {
+                writeLastSandboxProfile(profile.provider, profile.id);
+                setSandboxProfilePicks((picks) => picks + 1);
+              }
+            }}
+            rememberedProfileId={rememberedSandboxProfileId}
           />
         </ComposerWorkspaceBar>
       )}

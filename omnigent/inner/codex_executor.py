@@ -95,6 +95,9 @@ from .codex_staging import (
     prepare_codex_skills_dir,
 )
 from .codex_worker import (
+    BROKERED_CODEX_ALLOWED_ENV,
+    BROKERED_CODEX_AUTH_COMMAND,
+    BROKERED_CODEX_ENV,
     CodexWorkerLaunch,
     prepare_codex_catalog_probe,
     prepare_codex_worker,
@@ -234,6 +237,7 @@ _CODEX_HOME_SYMLINK_DIRS = (
 _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
 _BROKERED_CODEX_PROVIDER_NAME = "omnigent_brokered"
+_GATEWAY_CODEX_PROVIDER_NAME = "omnigent_databricks"
 
 # Environment variables explicitly excluded from the codex subprocess even
 # when their prefix is in the allowlist. ``OPENAI_API_KEY`` is stripped so
@@ -1010,6 +1014,7 @@ def populate_codex_skills_from_bundle(
     *,
     copy_skills: bool = False,
     source_codex_home: Path | None = None,
+    include_host_skills: bool = True,
 ) -> None:
     """
     Populate a CODEX_HOME's ``skills/`` from a bundle + host skills.
@@ -1041,12 +1046,17 @@ def populate_codex_skills_from_bundle(
         skills from instead of ``~/.codex``. The native launch passes the
         ``$CODEX_HOME``-resolved home so the seeded skills match what the CLI
         loads; the wrapped executor omits it and keeps ``~/.codex``.
+    :param include_host_skills: Include host Codex and shared skills. Brokered
+        gateway sessions use only bundle skills.
     :returns: None.
     """
-    skill_sources = codex_skill_sources(bundle_dir, Path.home(), codex_home=source_codex_home)
-    _populate_codex_skills(
-        codex_home / "skills", skills_filter, skill_sources.linked, copy_skills=copy_skills
-    )
+    if include_host_skills:
+        sources = codex_skill_sources(bundle_dir, Path.home(), codex_home=source_codex_home).linked
+    else:
+        sources = (
+            [bundle_dir / "skills"] if bundle_dir and (bundle_dir / "skills").is_dir() else []
+        )
+    _populate_codex_skills(codex_home / "skills", skills_filter, sources, copy_skills=copy_skills)
 
 
 def _is_omnigent_private_codex_home(path: Path) -> bool:
@@ -1164,6 +1174,7 @@ def _populate_codex_home_config(
     supported_efforts: frozenset[str] = CODEX_EFFORTS,
     include_credentials: bool = True,
     required_brokered_probe: tuple[str, Path, OSEnvSpec] | None = None,
+    require_native_tools_disabled: bool = False,
 ) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
@@ -1228,7 +1239,10 @@ def _populate_codex_home_config(
             write_required_brokered_model_catalog(
                 target_dir,
                 codex_path=probe.launch_path,
+                strip_native_tools=require_native_tools_disabled,
             )
+            if require_native_tools_disabled:
+                verify_brokered_codex_native_tools_disabled(probe.launch_path, target_dir)
         finally:
             probe.close()
     if not source_dir.is_dir():
@@ -1482,9 +1496,13 @@ def materialize_codex_provider_config(
             providers[provider_name] = tomlkit.inline_table()
         provider_config = providers[provider_name]
         name = effective_provider.get("name")
-        # Codex validates names when persisting hook trust, even for inherited providers.
+        # Hook-trust writes validate inactive providers too, without CLI name overlays.
         if isinstance(provider_config, MutableMapping) and isinstance(name, str) and name.strip():
-            provider_config.setdefault("name", name)
+            configured_name = provider_config.get("name")
+            if "name" not in provider_config or (
+                isinstance(configured_name, str) and not configured_name.strip()
+            ):
+                provider_config["name"] = name
 
     policy = retry_policy if retry_policy is not None else RetryPolicy()
     for provider_name, provider_config in list(providers.items()):
@@ -1885,6 +1903,18 @@ _CODEX_OMNIGENT_LAUNCH_ENV_VARS: tuple[str, ...] = (
 _CODEX_MODEL_CATALOG_FILENAME = "model_catalog.json"
 _BROKERED_MODEL_CATALOG_MAX_BYTES = 4 * 1024 * 1024
 _BROKERED_MODEL_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
+_BROKERED_DISABLED_FEATURES = (
+    "shell_tool",
+    "apps",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "in_app_browser",
+    "view_image",
+    "image_generation",
+    "multi_agent",
+    "code_mode",
+)
 # Entry a gateway-only model is cloned from: the cheapest current arm, so an
 # unset field inherits a sane current-generation value rather than a frozen one.
 _CATALOG_CLONE_SOURCE_SLUG = CODEX_CATALOG_CLONE_SOURCE_SLUG
@@ -2187,6 +2217,7 @@ def write_required_brokered_model_catalog(
     target_dir: Path,
     *,
     codex_path: str,
+    strip_native_tools: bool = False,
     timeout: float = 10.0,
 ) -> Path:
     """Write the bundled Codex catalog required by a brokered session."""
@@ -2216,6 +2247,11 @@ def write_required_brokered_model_catalog(
         raise RuntimeError("signer-backed Codex requires a valid bundled model catalog") from exc
     if not _valid_brokered_model_catalog(catalog):
         raise RuntimeError("signer-backed Codex requires a valid bundled model catalog")
+    if strip_native_tools:
+        for entry in catalog["models"]:
+            entry["shell_type"] = "disabled"
+            entry["apply_patch_tool_type"] = None
+            entry["experimental_supported_tools"] = []
 
     target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(target_dir, 0o700)
@@ -2242,6 +2278,49 @@ def write_required_brokered_model_catalog(
             catalog_path.unlink()
         raise RuntimeError("signer-backed Codex requires a valid bundled model catalog")
     return catalog_path
+
+
+def verify_brokered_codex_native_tools_disabled(codex_path: str, codex_home: Path) -> None:
+    """Require the installed CLI to honor locked sessions' native-tool switches."""
+    env = {
+        name: value
+        for name in ("PATH", "LANG", "LC_ALL", "TZ")
+        if (value := os.environ.get(name)) is not None
+    }
+    env.setdefault("PATH", os.defpath)
+    env["HOME"] = str(codex_home)
+    env["CODEX_HOME"] = str(codex_home)
+    try:
+        completed = subprocess.run(
+            [
+                codex_path,
+                *(
+                    arg
+                    for name in _BROKERED_DISABLED_FEATURES
+                    for arg in ("-c", f"features.{name}=false")
+                ),
+                "-c",
+                "web_search=disabled",
+                "features",
+                "list",
+            ],
+            capture_output=True,
+            timeout=10,
+            env=env,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise RuntimeError("brokered Codex requires a CLI that disables native tools") from None
+    if completed.returncode != 0 or any(
+        re.search(
+            rb"^" + name.encode() + rb"\s+.+\s+false\s*$",
+            completed.stdout,
+            re.MULTILINE,
+        )
+        is None
+        for name in _BROKERED_DISABLED_FEATURES
+    ):
+        raise RuntimeError("brokered Codex requires a CLI that disables native tools")
 
 
 # Top-level ``model_reasoning_effort = "<value>"`` assignment, tolerating
@@ -2364,7 +2443,7 @@ def _databricks_codex_config_overrides(
         Invalid or missing values retain the legacy shell helper and defaults.
     :returns: Codex TOML-fragment override strings.
     """
-    provider_name = "omnigent_databricks"
+    provider_name = _GATEWAY_CODEX_PROVIDER_NAME
     command = "sh"
     args = ["-c", auth_command]
     timeout_ms = _GATEWAY_AUTH_TIMEOUT_MS
@@ -2387,7 +2466,7 @@ def _databricks_codex_config_overrides(
         f'model_provider="{provider_name}"',
         "model_supports_reasoning_summaries=true",
         (
-            "model_providers.omnigent_databricks="
+            f"model_providers.{provider_name}="
             '{name="Omnigent Databricks",'
             f"base_url={json.dumps(base_url)},"
             f"auth={{command={json.dumps(command)},"
@@ -3128,25 +3207,23 @@ class _CodexAppServerSession:
                 self._codex_home_dir / "skills",
                 exc,
             )
+        brokered_gateway = self._env.get(BROKERED_CODEX_ENV) == "1"
         populate_codex_skills_from_bundle(
             self._codex_home_dir,
             self._bundle_dir,
             self._skills_filter,
             copy_skills=True,
+            include_host_skills=not brokered_gateway,
         )
-        # Bridge the user's authentication and provider config into the
-        # temp CODEX_HOME. The codex CLI reads ``auth.json`` (OAuth tokens
-        # for subscription auth) and ``config.toml`` (model provider
-        # definitions) from ``$CODEX_HOME``; without this step a freshly-
-        # created temp dir has neither, causing 401 Unauthorized errors
-        # for subscription-authenticated users.
+        # Subscription sessions bridge host auth and provider config into the
+        # temp home. Brokered sessions use only generated provider config.
         config_source = _codex_home_config_source_from_env()
         # When the runner advertises a subagent-routing endpoint, the user's
         # hooks.json is merged into a generated file registering the routing
         # hooks instead of being symlinked in untouched. Only an auto-harness
         # Smart Routing session gets that endpoint, so a plain or pinned session
         # keeps the symlink — and with it mid-session edits to the user's file.
-        router_bridge_dir = codex_router_bridge_dir(self._env)
+        router_bridge_dir = None if brokered_gateway else codex_router_bridge_dir(self._env)
         if router_bridge_dir is not None:
             # Probed only on the routing path so a plain session never pays the
             # subprocess. A CLI too old for the spawn gate drops the hooks and
@@ -3164,21 +3241,24 @@ class _CodexAppServerSession:
             _populate_codex_home_config,
             self._codex_home_dir,
             config_source,
-            minimal_config=True if self._signer is not None else None,
+            minimal_config=True if self._signer is not None or brokered_gateway else None,
             inject_hooks=router_bridge_dir is not None,
-            extend_model_catalog=codex_extended_catalog_requested(self._env),
-            include_credentials=self._signer is None,
+            extend_model_catalog=(
+                not brokered_gateway and codex_extended_catalog_requested(self._env)
+            ),
+            include_credentials=self._signer is None and not brokered_gateway,
+            require_native_tools_disabled=brokered_gateway,
             required_brokered_probe=(
                 (
                     self._codex_path,
                     Path(self._cwd or os.getcwd()).resolve(strict=False),
                     self._os_env_spec,
                 )
-                if self._signer is not None and self._os_env_spec is not None
+                if (self._signer is not None or brokered_gateway) and self._os_env_spec is not None
                 else None
             ),
         )
-        if self._signer is None:
+        if self._signer is None and not brokered_gateway:
             from omnigent.harnesses.codex_native.app_server import prepare_codex_provider_config
 
             self._codex_config_overrides = await prepare_codex_provider_config(
@@ -3197,7 +3277,7 @@ class _CodexAppServerSession:
                 self._codex_config_overrides,
                 retry_policy=self._retry_policy,
             )
-        if self._signer is not None:
+        if self._signer is not None or brokered_gateway:
             self._codex_config_overrides.extend(
                 [
                     f"sqlite_home={json.dumps(str(self._codex_home_dir))}",
@@ -3215,13 +3295,16 @@ class _CodexAppServerSession:
         # history) in a private temp directory rather than the user's ~/.codex/.
         # This prevents subagent sessions from polluting the user's Codex history.
         proc_env = {**self._env, "CODEX_HOME": str(self._codex_home_dir)}
-        if self._signer is not None:
+        if self._signer is not None or brokered_gateway:
             # Newer Codex builds keep some SQLite stores relative to HOME even
             # when CODEX_HOME is set. Keep those stores inside the same private,
             # sandbox-writable session directory and away from host ~/.codex.
             proc_env["HOME"] = str(self._codex_home_dir)
             proc_env["CFFIXED_USER_HOME"] = str(self._codex_home_dir)
             proc_env["CODEX_SQLITE_HOME"] = str(self._codex_home_dir)
+        if brokered_gateway:
+            for name in ("TMPDIR", "TMP", "TEMP"):
+                proc_env[name] = str(self._codex_home_dir)
         try:
             process_cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
             # Active egress rules start a parent-side proxy and wait for its
@@ -3924,6 +4007,7 @@ class _CodexAppServerSession:
                 params["developerInstructions"] = system_prompt
             if tools:
                 params["dynamicTools"] = _dynamic_tool_specs(tools)
+            if tools or self._disable_native_tools:
                 tool_config: CodexParams = {
                     "features.unified_exec": False,
                 }
@@ -4809,6 +4893,11 @@ def _default_app_session_factory(
     signer_launch_config: SignerLaunchConfig | None = None,
     active_harnesses: Collection[str] | None = None,
 ) -> _CodexAppServerSession:
+    thread_provider = None
+    if signer_launch_config is not None:
+        thread_provider = _BROKERED_CODEX_PROVIDER_NAME
+    elif env.get(BROKERED_CODEX_ENV) == "1":
+        thread_provider = _GATEWAY_CODEX_PROVIDER_NAME
     return _CodexAppServerSession(
         codex_path=codex_path,
         active_harnesses=active_harnesses,
@@ -4832,9 +4921,7 @@ def _default_app_session_factory(
             if signer_launch_config is not None and signer_launch_config.auth_profile is not None
             else None
         ),
-        thread_model_provider=(
-            _BROKERED_CODEX_PROVIDER_NAME if signer_launch_config is not None else None
-        ),
+        thread_model_provider=thread_provider,
     )
 
 
@@ -4848,6 +4935,7 @@ class CodexExecutor(Executor):
         codex_path: str | None = None,
         app_session_factory: _AppSessionFactory | None = None,
         gateway: bool = False,
+        brokered_gateway: bool = False,
         databricks_profile: str | None = None,
         model_provider_override: str | None = None,
         gateway_host: str | None = None,
@@ -4968,12 +5056,34 @@ class CodexExecutor(Executor):
                 f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
             )
         self._codex_path = resolved_codex
-        self._env = _clean_codex_env(declared_passthrough(self._os_env_spec))
+        if brokered_gateway and (
+            not gateway or gateway_auth_command != BROKERED_CODEX_AUTH_COMMAND
+        ):
+            raise ValueError("brokered Codex requires gateway routing and placeholder auth")
+        self._brokered_gateway = brokered_gateway
+        self._env = _clean_codex_env(
+            () if brokered_gateway else declared_passthrough(self._os_env_spec)
+        )
+        if self._brokered_gateway:
+            if os_env is None or os_env.sandbox is None or os_env.sandbox.type == "none":
+                raise ValueError("brokered Codex gateway requires an active sandbox")
+            if enable_web_search or not disable_native_tools:
+                raise ValueError(
+                    "brokered Codex gateway requires disabled web search and native tools"
+                )
+            self._env = {
+                key: value for key, value in self._env.items() if key in BROKERED_CODEX_ALLOWED_ENV
+            }
+            self._env[BROKERED_CODEX_ENV] = "1"
         # Retry policy → OpenAI SDK env vars (Codex uses the OpenAI
         # SDK internally). Speculative — empirical audit pending.
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._env.update(self._retry_policy.codex_cli.env())
         self._codex_config_overrides: list[str] = []
+        if self._brokered_gateway:
+            self._codex_config_overrides.extend(
+                [f"features.{name}=false" for name in _BROKERED_DISABLED_FEATURES]
+            )
         if signer_launch_config is not None:
             if os_env is None or os_env.sandbox is None or os_env.sandbox.type == "none":
                 raise OSError("signer-backed Codex worker requires an active sandbox")
@@ -5092,7 +5202,8 @@ class CodexExecutor(Executor):
             # ``DATABRICKS_HOST`` is read by the Databricks ``databricks auth
             # token`` fallback auth command; harmless for a generic gateway
             # whose auth command is a static ``printf %s <key>``.
-            self._env["DATABRICKS_HOST"] = host
+            if not self._brokered_gateway:
+                self._env["DATABRICKS_HOST"] = host
             self._codex_config_overrides.extend(
                 _databricks_codex_config_overrides(
                     model=effective_model,

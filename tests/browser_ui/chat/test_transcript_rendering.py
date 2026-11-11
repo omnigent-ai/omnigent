@@ -1071,7 +1071,9 @@ def test_tool_rows_read_as_actions_with_their_outcome(
 
     issue.click()
     read = page.get_by_role("button", name=f"Read {_LONG_TOOL_PATH}", exact=True)
-    edit = page.get_by_role("button", name=re.compile(r"^Edit "))
+    edit = page.get_by_role("button", name=re.compile(r"^Edit ")).filter(
+        has=page.get_by_test_id("tool-line-counts")
+    )
     counts = edit.get_by_test_id("tool-line-counts")
     expect(counts).to_have_text("+2 -1")
     for row in (read, edit):

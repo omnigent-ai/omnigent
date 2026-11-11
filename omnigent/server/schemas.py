@@ -171,6 +171,55 @@ class UpsertMCPServerRequest(BaseModel):
         return self
 
 
+class LiveMCPServerStatus(BaseModel):
+    """
+    One MCP server's connection inside a session's running harness.
+
+    :param name: Server name as the harness reports it, e.g. ``"docs"`` or
+        ``"plugin:tools:docs"``.
+    :param status: ``"connected"``, ``"failed"``, ``"needs-auth"``,
+        ``"pending"``, or ``"disabled"``; other harness values pass through.
+    :param error: The harness's reason for a failed connection, or ``None``.
+    :param scope: Where the harness loaded the server from, e.g. ``"user"``.
+    """
+
+    name: str
+    status: str
+    error: str | None = None
+    scope: str | None = None
+
+
+class SessionLiveMCPServers(BaseModel):
+    """
+    The MCP connections a session's running harness reports.
+
+    :param live: ``True`` when the harness answered; ``servers`` is then current.
+    :param reason: Why there is no live answer: ``"not_running"`` (no harness
+        process yet; it starts with the next message), ``"unsupported"`` (the
+        harness cannot report MCP status), or ``"unavailable"`` (the harness did
+        not answer). ``None`` when ``live`` is true.
+    :param detail: Readable explanation for ``"unavailable"``, or ``None``.
+    :param servers: The harness's servers; empty unless ``live``.
+    :param reconnect_error: On a reconnect response, the harness's reason the
+        reconnect failed, or ``None`` when it succeeded.
+    """
+
+    live: bool
+    reason: Literal["not_running", "unsupported", "unavailable"] | None = None
+    detail: str | None = None
+    servers: list[LiveMCPServerStatus] = Field(default_factory=list)
+    reconnect_error: str | None = None
+
+
+class ReconnectLiveMCPServerRequest(BaseModel):
+    """Body for reconnecting one MCP server in a session's running harness."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # A blank name can never match a server, so reject it before asking the runner.
+    name: str = Field(min_length=1, max_length=256, pattern=r"\S")
+
+
 class MCPServerPatch(BaseModel):
     """Partial MCP declaration; omitted fields and credential keys are preserved."""
 
