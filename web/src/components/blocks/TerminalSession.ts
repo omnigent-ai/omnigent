@@ -13,7 +13,7 @@
 
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
-import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
+import { type FontWeight, type IBuffer, type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { withBasePath } from "@/lib/basePath";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
@@ -376,6 +376,33 @@ export function applyTerminalCopy(
   event.clipboardData?.setData("text/plain", selection);
   event.preventDefault();
   return true;
+}
+
+/** Newest logical lines offered when copying terminal text by touch. */
+export const TERMINAL_COPY_MAX_LINES = 5000;
+
+/**
+ * Plain text of a terminal buffer for touch copying.
+ *
+ * Rejoins soft-wrapped rows into one logical line, trims trailing blanks, and
+ * keeps only the newest ``maxLines`` lines so a full scrollback stays light.
+ */
+export function terminalBufferText(
+  buffer: Pick<IBuffer, "length" | "getLine">,
+  maxLines = TERMINAL_COPY_MAX_LINES,
+): string {
+  const lines: string[] = [];
+  for (let index = 0; index < buffer.length; index += 1) {
+    const line = buffer.getLine(index);
+    if (!line) continue;
+    // A row that continues on the next keeps its trailing spaces.
+    const continues = buffer.getLine(index + 1)?.isWrapped === true;
+    const text = continues ? line.translateToString(false) : line.translateToString(true).trimEnd();
+    if (line.isWrapped && lines.length > 0) lines[lines.length - 1] += text;
+    else lines.push(text);
+  }
+  while (lines.length > 0 && lines[lines.length - 1].trim() === "") lines.pop();
+  return lines.slice(-maxLines).join("\n");
 }
 
 /** Largest tmux selection accepted for a browser clipboard write. */
@@ -997,6 +1024,19 @@ export class TerminalSession {
    */
   focus(): void {
     this.term.focus();
+  }
+
+  /** Text of the visible buffer, scrollback included (see {@link terminalBufferText}). */
+  bufferText(): string {
+    return terminalBufferText(this.term.buffer.active);
+  }
+
+  /**
+   * Send text as a paste. xterm normalizes newlines and adds bracketed-paste
+   * markers when the program asked for them, then forwards it as input.
+   */
+  paste(text: string): void {
+    this.term.paste(text);
   }
 
   /**

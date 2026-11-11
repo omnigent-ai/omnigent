@@ -16,6 +16,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import {
@@ -51,6 +52,7 @@ import {
   type TerminalClipboardDecision,
   type TerminalClipboardPromptReason,
 } from "./TerminalClipboardPrompt";
+import { TerminalTouchClipboardBar } from "./TerminalTouchClipboard";
 import {
   type ConnectionState,
   type TerminalActivityListener,
@@ -498,6 +500,23 @@ export function TerminalView({
     sessionRef.current?.focus();
   }, []);
 
+  const isCoarsePointer = useIsCoarsePointer();
+  const readTerminalText = useCallback(() => sessionRef.current?.bufferText() ?? "", []);
+  const isTouchCopyBlocked = useCallback(() => {
+    if (clipboardConsentRef.current.scope !== clipboardScope) {
+      return readTerminalClipboardPreference() === "block";
+    }
+    return clipboardConsentRef.current.decision === "block";
+  }, [clipboardScope]);
+  const pasteIntoTerminal = useCallback(
+    (text: string) => {
+      if (readOnly) return;
+      sessionRef.current?.paste(text);
+      sessionRef.current?.focus();
+    },
+    [readOnly],
+  );
+
   const visibleClipboardPrompt =
     clipboardPrompt?.scope === clipboardScope &&
     clipboardPrompt.epoch === clipboardScopeEpoch &&
@@ -859,6 +878,16 @@ export function TerminalView({
           />
         )}
       </div>
+      {isCoarsePointer && (
+        <TerminalTouchClipboardBar
+          backgroundColor={terminalBackground}
+          pasteAvailable={!readOnly}
+          pasteEnabled={state.kind === "connected"}
+          readText={readTerminalText}
+          isCopyBlocked={isTouchCopyBlocked}
+          onPaste={pasteIntoTerminal}
+        />
+      )}
     </div>
   );
 }

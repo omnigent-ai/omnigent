@@ -21,6 +21,7 @@ import {
   parseTerminalClipboardMessage,
   resolveTerminalWorkspaceFileLink,
   sgrWheelReports,
+  terminalBufferText,
   terminalTheme,
   terminalKeyEventPayload,
   touchScrollPayload,
@@ -1253,6 +1254,45 @@ describe("TerminalSession", () => {
     const { container, session } = makeSession();
     const observer = FakeResizeObserver.instances[0];
     expect(observer.observed).toContain(container);
+    session.dispose();
+  });
+
+  it("reads its buffer as logical lines for touch copying", async () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    socket.open();
+    const longLine = `${"a".repeat(term.cols - 1)} tail`;
+    const bytes = new TextEncoder().encode(`$ echo hi   \r\nhi\r\n${longLine}\r\n\r\n`);
+    const data = new ArrayBuffer(bytes.length);
+    new Uint8Array(data).set(bytes);
+    socket.emit("message", { data });
+    await new Promise<void>((resolve) => {
+      term.write("", resolve);
+    });
+
+    // The wrapped row rejoins with its boundary space; trailing blanks drop.
+    expect(session.bufferText()).toBe(`$ echo hi\nhi\n${longLine}`);
+    expect(terminalBufferText(term.buffer.active, 2)).toBe(`hi\n${longLine}`);
+    session.dispose();
+  });
+
+  it("sends touch pastes as input, bracketed when the program asks", async () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    socket.open();
+    const inputs = () =>
+      socket.sent.flatMap((frame) =>
+        typeof frame === "string" ? [] : [new TextDecoder().decode(frame)],
+      );
+
+    session.paste("echo one\necho two");
+    expect(inputs()).toEqual(["echo one\recho two"]);
+
+    await new Promise<void>((resolve) => {
+      term.write("\x1b[?2004h", resolve);
+    });
+    session.paste("ls");
+    expect(inputs().at(-1)).toBe("\x1b[200~ls\x1b[201~");
     session.dispose();
   });
 });

@@ -82,6 +82,8 @@ const terminalSessionMock = vi.hoisted(() => ({
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
+    bufferText: ReturnType<typeof vi.fn>;
+    paste: ReturnType<typeof vi.fn>;
   }[],
 }));
 
@@ -94,6 +96,8 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
     focus = vi.fn();
+    bufferText = vi.fn(() => "$ whoami\nomni");
+    paste = vi.fn();
 
     constructor(
       container: HTMLDivElement,
@@ -121,6 +125,8 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
         focus: this.focus,
+        bufferText: this.bufferText,
+        paste: this.paste,
       });
     }
   },
@@ -1279,6 +1285,85 @@ describe("terminal clipboard", () => {
     await requestClipboard("next selection");
     expect(clipboardMock.copyText).toHaveBeenCalledTimes(2);
     expect(visibleClipboardConsent()).toHaveTextContent("Copy needs a click");
+  });
+});
+
+describe("touch clipboard bar", () => {
+  function setCoarsePointer(coarse: boolean): void {
+    vi.spyOn(window, "matchMedia").mockImplementation(
+      (query: string) =>
+        ({
+          matches: coarse && query === "(pointer: coarse)",
+          media: query,
+          onchange: null,
+          addListener: () => {},
+          removeListener: () => {},
+          addEventListener: () => {},
+          removeEventListener: () => {},
+          dispatchEvent: () => false,
+        }) as MediaQueryList,
+    );
+  }
+
+  async function renderTouchView(readOnly = false) {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly={readOnly} />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    return terminalSessionMock.instances[0];
+  }
+
+  it("is absent with a fine pointer", async () => {
+    setCoarsePointer(false);
+    await renderTouchView();
+    expect(screen.queryByTestId("terminal-touch-clipboard")).toBeNull();
+  });
+
+  it("copies the live terminal text and pastes into the session once connected", async () => {
+    setCoarsePointer(true);
+    const terminal = await renderTouchView();
+    const paste = screen.getByRole("button", { name: "Paste" });
+    expect(paste).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+    const sheet = await screen.findByTestId("terminal-copy-sheet");
+    expect(within(sheet).getByTestId("terminal-copy-text")).toHaveTextContent("$ whoami omni");
+    fireEvent.click(within(sheet).getByRole("button", { name: "Copy all" }));
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledWith("$ whoami\nomni"));
+    // An explicit touch copy does not grant terminal programs clipboard access.
+    expect(screen.queryByTestId("terminal-clipboard-consent")).toBeNull();
+    expect(readTerminalClipboardPreference()).toBe("ask");
+
+    act(() => terminal.onState({ kind: "connected" }));
+    const readText = vi.fn(async () => "echo pasted");
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { readText } });
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+      await waitFor(() => expect(terminal.paste).toHaveBeenCalledWith("echo pasted"));
+      expect(terminal.focus).toHaveBeenCalled();
+    } finally {
+      Reflect.deleteProperty(navigator, "clipboard");
+    }
+  });
+
+  it("follows a block chosen for this terminal", async () => {
+    setCoarsePointer(true);
+    const terminal = await renderTouchView();
+    act(() => terminal.onClipboardRequest?.("program text"));
+    await waitFor(() => expect(screen.queryByTestId("terminal-clipboard-consent")).not.toBeNull());
+    fireEvent.click(screen.getByRole("checkbox", { name: "Remember my choice" }));
+    fireEvent.click(screen.getByRole("button", { name: "Block" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+
+    expect(await screen.findByText("Copying from this terminal is blocked.")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-copy-sheet")).toBeNull();
+    expect(terminal.bufferText).not.toHaveBeenCalled();
+  });
+
+  it("offers only Copy on a read-only terminal", async () => {
+    setCoarsePointer(true);
+    await renderTouchView(true);
+    expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Paste" })).toBeNull();
   });
 });
 

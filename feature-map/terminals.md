@@ -18,6 +18,11 @@ reattach when the session moves to another host.
 - `user-shell`: open a shell, type into it, and close it.
 - `scrollback`: scroll back with the mouse wheel (including programs that track
   the mouse), by touch on phones, and by keyboard.
+- `touch-clipboard`: on touch devices (including the iOS app), a bar under the
+  terminal offers Copy and Paste. Copy opens a sheet of the terminal text for
+  native selection, with Copy selection / Copy all. Paste sends the clipboard as
+  terminal input, or opens a paste box when the clipboard can't be read.
+  Read-only terminals show Copy only; a blocked terminal clipboard blocks Copy.
 - `reconnect`: after the terminal connection drops, the terminal shows that it
   is reconnecting and then reattaches without user action.
 - `host-switch-reattach`: after "Switch host…", both the terminal strip and the
@@ -147,6 +152,10 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/shells/test_new_shell.py::test_shell_wheel_scroll_reaches_mouse_tracking_program`
 - **`scrollback`, touch:**
   `tests/e2e_ui/mobile/test_terminal_touch_scroll.py::test_terminal_touch_swipe_scrolls_back`
+- **`touch-clipboard`:**
+  `tests/e2e_ui/mobile/test_terminal_touch_clipboard.py` (phone-viewport
+  Chromium; a real iPhone is needed for the native selection menu and the
+  Paste prompt).
 - **`scrollback`, keyboard:** no e2e coverage. In a Codex terminal with more
   output than fits, press Page Up and expect older output; then check that the
   Codex terminal's other keys still behave as before.
