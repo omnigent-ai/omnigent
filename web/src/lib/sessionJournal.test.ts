@@ -4,6 +4,7 @@ import {
   currentPlan,
   finishedTaskCount,
   isRestart,
+  linkedToPrevious,
   mergeJournalEntries,
   nativeTaskProgress,
   pausedLabel,
@@ -174,6 +175,26 @@ describe("stepProgress", () => {
       "done",
       "failed",
       "waiting",
+    ]);
+  });
+
+  it("links a step to the one before it when one waits on the other", () => {
+    const linked = (...planned: [string, string[]?][]) =>
+      linkedToPrevious(planSteps(plan(0, ...planned)));
+    // batch and pool both wait on profile, so they can run at the same time.
+    expect(
+      linked(
+        ["profile"],
+        ["batch", ["profile"]],
+        ["pool", ["profile"]],
+        ["ship", ["batch", "pool"]],
+      ),
+    ).toEqual([false, true, false, true]);
+    // Listed out of order: check waits on build through test, and on test directly.
+    expect(linked(["build"], ["check", ["test"]], ["test", ["build"]])).toEqual([
+      false,
+      true,
+      true,
     ]);
   });
 

@@ -115,6 +115,8 @@ describe("TasksPanel", () => {
     expect(rows[1].textContent).toContain("Documenting it");
     // Their rows have no history to open, and nothing waits on another.
     expect(within(rows[1]).queryByRole("button")).toBeNull();
+    // The list says nothing about what waits on what, so its strip's gaps mean nothing either.
+    expect(screen.getByTestId("tasks-progress").dataset.links).toBeUndefined();
     expect(within(rows[2]).getByRole("img", { name: "Not started" }).textContent).toBe("3");
     expect(screen.getByTestId("tasks-summary").textContent).toBe("1 of 3 finished");
     expect(screen.queryByTestId("tasks-plan-name")).toBeNull();
@@ -178,7 +180,7 @@ describe("TasksPanel", () => {
     expect(screen.getByText("1 failed")).toBeTruthy();
   });
 
-  it("marks every step that can start as ready", () => {
+  it("marks every step that can start as ready, and links segments that wait on each other", () => {
     showJournal([
       journalPlan(
         0,
@@ -194,6 +196,15 @@ describe("TasksPanel", () => {
     expect(steps.map((step) => step.dataset.state)).toEqual(["done", "ready", "ready", "waiting"]);
     expect(within(steps[1]).getByRole("img", { name: "Ready" }).textContent).toBe("2");
     expect(within(steps[1]).getByText("Ready")).toBeTruthy();
+    // batch and pool can run at the same time, so a gap separates them.
+    expect(screen.getByTestId("tasks-progress").dataset.links).toBe("true");
+    const segments = screen.getAllByTestId("tasks-progress-segment");
+    expect(segments.map((segment) => segment.dataset.linked === "true")).toEqual([
+      false,
+      true,
+      false,
+      true,
+    ]);
   });
 
   it("says on hover which task a progress segment is and where it stands", async () => {
