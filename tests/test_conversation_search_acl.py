@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from omnigent.db.db_models import SqlSessionPermission, workspace_scope
 from omnigent.entities import NewConversationItem
@@ -106,22 +106,75 @@ def test_search_prefetches_permissions_from_separate_database(tmp_path: Path) ->
         f"sqlite:///{tmp_path / 'metadata.db'}",
         conversation_storage_location=f"sqlite:///{tmp_path / 'conversations.db'}",
     )
-    denied = store.create_conversation(workspace=str(tmp_path))
-    allowed = store.create_conversation(workspace=str(tmp_path))
-    store.append(denied.id, [_message("sapphire confidential")])
-    store.append(allowed.id, [_message("sapphire authorized")])
+    # Denied matches rank first, so each window of two candidates is all denied
+    # at first. The search must continue past those windows to find the grants.
+    denied = [store.create_conversation(workspace=str(tmp_path)) for _ in range(3)]
+    allowed = [store.create_conversation(workspace=str(tmp_path)) for _ in range(3)]
+    for conversation in denied:
+        store.append(conversation.id, [_message("sapphire sapphire sapphire confidential")])
+    for conversation in allowed:
+        store.append(conversation.id, [_message("sapphire authorized")])
     with store._session("test_search_acl") as session:
-        session.add(
-            SqlSessionPermission(user_id="caller@example.com", conversation_id=allowed.id, level=4)
+        session.add_all(
+            [
+                SqlSessionPermission(
+                    user_id="caller@example.com", conversation_id=conversation.id, level=4
+                )
+                for conversation in allowed
+            ]
         )
         session.commit()
 
-    matches = store.search("sapphire", limit=1, accessible_by="caller@example.com")
-    assert [item.data for item in matches] == [_message("sapphire authorized").data]
-    assert (
-        store.search("sapphire", conversation_id=denied.id, accessible_by="caller@example.com")
-        == []
-    )
+    expected = [_message("sapphire authorized").data]
+    with patch("omnigent.stores.conversation_store.sqlalchemy_store._SEARCH_CANDIDATE_WINDOW", 2):
+        one = store.search("sapphire", limit=1, accessible_by="caller@example.com")
+        two = store.search("sapphire", limit=2, accessible_by="caller@example.com")
+        every = store.search("sapphire", limit=10, accessible_by="caller@example.com")
+        scoped = store.search(
+            "sapphire", conversation_id=denied[0].id, accessible_by="caller@example.com"
+        )
+
+    assert [item.data for item in one] == expected
+    assert [item.data for item in two] == expected * 2
+    assert [item.data for item in every] == expected * 3
+    assert scoped == []
+
+
+def test_search_fts_join_probes_item_primary_key(tmp_path: Path) -> None:
+    store = SqlAlchemyConversationStore(f"sqlite:///{tmp_path / 'plan.db'}")
+    conversation = store.create_conversation(workspace=str(tmp_path))
+    store.append(conversation.id, [_message("sapphire authorized")])
+    with store._conv_session("test_search_acl") as session:
+        session.add(
+            SqlSessionPermission(
+                user_id="caller@example.com", conversation_id=conversation.id, level=4
+            )
+        )
+        session.commit()
+
+    captured: list[tuple[str, object]] = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany) -> None:
+        if "conversation_items_fts" in statement:
+            captured.append((statement, parameters))
+
+    event.listen(store._conv_engine, "before_cursor_execute", capture)
+    try:
+        store.search("sapphire", limit=1, accessible_by="caller@example.com")
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", capture)
+    statement, parameters = captured[0]
+    with store._conv_session("test_search_acl") as session:
+        plan_rows = (
+            session.connection()
+            .exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters)
+            .all()
+        )
+    plan = " | ".join(str(row) for row in plan_rows)
+
+    # The item lookup must bind the full primary key, not only workspace_id.
+    assert "ci USING" in plan
+    assert "(workspace_id=? AND conversation_id=? AND id=?)" in plan
 
 
 def test_search_matches_dashed_and_legacy_fts_ids(tmp_path: Path) -> None:

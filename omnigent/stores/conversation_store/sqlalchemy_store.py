@@ -16,7 +16,6 @@ from sqlalchemy import (
     Select,
     and_,
     asc,
-    bindparam,
     case,
     delete,
     desc,
@@ -196,9 +195,25 @@ _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
 # ``list_conversations(search_scope=...)`` values; see its docstring.
 _SEARCH_SCOPES = frozenset({"all", "title", "content"})
 
+# Ranked search candidates checked per round when permissions live in another
+# database. Bounds the metadata lookup to one indexed IN batch.
+_SEARCH_CANDIDATE_WINDOW = 200
+
 # Escapes LIKE wildcards in a search query. ``/``, as SQLAlchemy's own
 # ``autoescape`` uses, sidesteps MySQL's backslash handling in string literals.
 _LIKE_ESCAPE = "/"
+
+
+def _binary_id_hex(value: object) -> str:
+    """
+    Return the bare 32-char hex of a raw or Uuid16 conversation/item id.
+
+    :param value: Raw 16-byte id bytes from the driver, or an already-hex string.
+    :returns: The lowercase bare hex form, e.g. ``"a1b2c3..."``.
+    """
+    if isinstance(value, (bytes, memoryview)):
+        return bytes(value).hex()
+    return uuid_to_bytes(value).hex()
 
 
 def _like_contains_pattern(query: str) -> str:
@@ -2616,33 +2631,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             return []
         workspace_id = current_workspace_id()
         acl_pushdown = self._conv_engine is self._engine
-        allowed_ids: list[bytes] | None = None
-        if not acl_pushdown:
-            # Permission rows live on the Omnigent engine, which can differ
-            # from the conversation engine. Keep filtering before LIMIT even
-            # when the query cannot join the two databases.
-            permission_query = select(SqlSessionPermission.conversation_id).where(
-                SqlSessionPermission.workspace_id == workspace_id,
-                SqlSessionPermission.user_id == accessible_by,
-            )
-            if conversation_id is not None:
-                permission_query = permission_query.where(
-                    SqlSessionPermission.conversation_id == conversation_id
-                )
-            with self._session("search_conversations_acl") as meta_session:
-                allowed_ids = [
-                    uuid_to_bytes(cid)
-                    for cid in meta_session.execute(permission_query).scalars().all()
-                ]
-            if not allowed_ids:
-                return []
         acl_filter = (
             "AND EXISTS (SELECT 1 FROM session_permissions AS sp "
             "WHERE sp.workspace_id = ci.workspace_id "
             "AND sp.conversation_id = ci.conversation_id "
             "AND sp.user_id = :user) "
             if acl_pushdown
-            else "AND ci.conversation_id IN :allowed_ids "
+            else ""
         )
         conversation_filter = (
             "AND ci.conversation_id = :cid " if conversation_id is not None else ""
@@ -2654,20 +2649,19 @@ class SqlAlchemyConversationStore(ConversationStore):
             # tsvector indexing is a future optimization (tracked in GAPS.md).
             use_fts = _supports_fts5(self._conv_engine.dialect.name)
             if use_fts:
-                # The FTS mirror stores the original spelling of each id.
-                # Compare its UUID tail to the authoritative binary ids, then
-                # apply workspace and permission filters before ranking.
-                stmt = text(
+                # The FTS mirror stores the original spelling of each id. Decode
+                # its UUID tail on the FTS side so the join probes the item key.
+                stmt = (
                     "SELECT ci.conversation_id, ci.id "
                     "FROM conversation_items_fts AS f "
                     "JOIN conversation_items AS ci "
-                    "ON lower(hex(ci.id)) = lower(substr(replace(f.item_id, '-', ''), -32)) "
-                    "AND lower(hex(ci.conversation_id)) = "
-                    "lower(substr(replace(f.conversation_id, '-', ''), -32)) "
+                    "ON ci.id = unhex(substr(replace(f.item_id, '-', ''), -32)) "
+                    "AND ci.conversation_id = "
+                    "unhex(substr(replace(f.conversation_id, '-', ''), -32)) "
                     "WHERE f.search_text MATCH :query AND ci.workspace_id = :ws "
                     f"{conversation_filter}"
                     f"{acl_filter}"
-                    "ORDER BY f.rank LIMIT :limit"
+                    "ORDER BY f.rank, ci.conversation_id, ci.id"
                 )
             else:
                 # Non-FTS fallback: LIKE/ILIKE on the data column.
@@ -2686,37 +2680,48 @@ class SqlAlchemyConversationStore(ConversationStore):
                 else:
                     data_expr = "ci.data::text"
                     like_op = "ILIKE"
-                stmt = text(
+                stmt = (
                     "SELECT ci.conversation_id, ci.id FROM conversation_items AS ci "
                     "WHERE ci.workspace_id = :ws "
                     f"{conversation_filter}"
                     f"AND {data_expr} {like_op} :query "
                     f"{acl_filter}"
-                    "ORDER BY ci.created_at DESC LIMIT :limit"
+                    "ORDER BY ci.created_at DESC, ci.conversation_id, ci.id"
                 )
                 query = like_pattern
-            if allowed_ids is not None:
-                stmt = stmt.bindparams(bindparam("allowed_ids", expanding=True))
-            params: dict[str, str | int | bytes | list[bytes]] = {
-                "query": query,
-                "limit": limit,
-                "ws": workspace_id,
-            }
+            statement = text(f"{stmt} LIMIT :limit OFFSET :offset")
+            params: dict[str, str | int | bytes] = {"query": query, "ws": workspace_id}
             if acl_pushdown:
                 params["user"] = accessible_by
-            else:
-                params["allowed_ids"] = allowed_ids or []
             if conversation_id is not None:
                 params["cid"] = uuid_to_bytes(conversation_id)
-            item_keys = [
-                tuple(
-                    bytes(value).hex()
-                    if isinstance(value, (bytes, memoryview))
-                    else uuid_to_bytes(value).hex()
-                    for value in row
-                )
-                for row in session.execute(stmt, params).fetchall()
-            ]
+
+            def fetch_candidate_keys(window: int, offset: int) -> list[tuple[str, str]]:
+                rows = session.execute(
+                    statement, {**params, "limit": window, "offset": offset}
+                ).fetchall()
+                return [(_binary_id_hex(conv), _binary_id_hex(item)) for conv, item in rows]
+
+            if acl_pushdown:
+                # The ACL joins in SQL, so one LIMIT query is exact.
+                item_keys = fetch_candidate_keys(limit, 0)
+            else:
+                # Rank candidates in windows and keep only permitted ones, so
+                # denied matches never count toward the limit.
+                item_keys = []
+                offset = 0
+                while len(item_keys) < limit:
+                    window_keys = fetch_candidate_keys(_SEARCH_CANDIDATE_WINDOW, offset)
+                    if not window_keys:
+                        break
+                    offset += len(window_keys)
+                    permitted = self._permitted_conversation_hexes(
+                        {conv for conv, _ in window_keys}, accessible_by
+                    )
+                    item_keys.extend(key for key in window_keys if key[0] in permitted)
+                    if len(window_keys) < _SEARCH_CANDIDATE_WINDOW:
+                        break
+                item_keys = item_keys[:limit]
             if not item_keys:
                 return []
             rows = (
@@ -2738,6 +2743,33 @@ class SqlAlchemyConversationStore(ConversationStore):
             ordered = sorted(rows, key=lambda r: order[(r.conversation_id, r.id)])
             decoded = self._decode_item_data_batch([r.data for r in ordered])
             return [_to_item(r, d) for r, d in zip(ordered, decoded, strict=True)]
+
+    def _permitted_conversation_hexes(
+        self, conversation_hexes: set[str], user_id: str
+    ) -> set[str]:
+        """
+        Return the subset of *conversation_hexes* that *user_id* can read.
+
+        Reads the metadata database, which holds ``session_permissions`` when
+        the conversation tables live elsewhere. The caller bounds the set size.
+
+        :param conversation_hexes: Bare 32-char hex conversation ids.
+        :param user_id: The grantee to check, e.g. ``"alice@example.com"``.
+        :returns: The permitted bare 32-char hex ids.
+        """
+        with self._session("search_conversations_acl") as meta_session:
+            rows = (
+                meta_session.execute(
+                    select(SqlSessionPermission.conversation_id).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.user_id == user_id,
+                        SqlSessionPermission.conversation_id.in_(sorted(conversation_hexes)),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return set(rows)
 
     def list_host_conversation_ids(
         self,
