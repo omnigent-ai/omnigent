@@ -91,11 +91,14 @@ import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { MarkdownTableOfContents } from "./MarkdownTableOfContents";
 import { VideoPlayer } from "@/components/VideoPlayer";
 import { isVideoFile } from "@/lib/video";
+import { FILE_VIEWER_ENGINE, useEngine, type ViewerEngine } from "@/lib/enginePreferences";
 
 // Lazy-load Monaco so small Markdown and preview surfaces avoid its bundle.
 const MonacoCodeEditor = lazy(() =>
   import("./MonacoCodeEditor").then((m) => ({ default: m.MonacoCodeEditor })),
 );
+// The code editor each file viewer engine renders.
+const CODE_EDITORS = { monaco: MonacoCodeEditor } satisfies Record<ViewerEngine, unknown>;
 
 // react-pdf + pdf.js (worker) is heavy; load it only when a PDF is actually
 // viewed so it never enters the initial bundle.
@@ -626,6 +629,7 @@ export function CodeViewer({
   const lang = detectLang(path);
   // Large Markdown edits in the virtualized code editor and shares its save/permission rules.
   const showMonaco = viewMode !== "preview" && (markdownSourceFallback || lang !== "markdown");
+  const CodeEditor = CODE_EDITORS[useEngine(FILE_VIEWER_ENGINE)];
   // HTML, markdown, and notebook previews render through their own surfaces and
   // never read the Shiki tokens, so skipping them avoids a wasted full-file pass.
   const isHtmlPreview = viewMode === "preview" && lang === "html";
@@ -1042,7 +1046,7 @@ export function CodeViewer({
           </div>
         }
       >
-        <MonacoCodeEditor
+        <CodeEditor
           position={position}
           content={content}
           conversationId={conversationId}

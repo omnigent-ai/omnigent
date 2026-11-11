@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { FILE_VIEWER_ENGINE } from "@/lib/enginePreferences";
 import type { useFileContent } from "@/hooks/useFileContent";
 import type * as fileContentModule from "@/hooks/useFileContent";
 import type * as rehypeSlugModule from "rehype-slug";
@@ -440,6 +441,16 @@ describe("CodeViewer editor routing", () => {
     // rather than the Shiki line-by-line DOM render. findByTestId awaits the
     // Suspense boundary resolving the lazy import.
     expect(await screen.findByTestId("monaco-editor-stub")).toBeDefined();
+  });
+
+  it("keeps Monaco when this device has a pin for an engine not offered yet", async () => {
+    localStorage.setItem(FILE_VIEWER_ENGINE.intent.storageKey, "codemirror");
+    try {
+      renderViewer("const x = 1;", true, "src/index.ts");
+      expect(await screen.findByTestId("monaco-editor-stub")).toBeDefined();
+    } finally {
+      localStorage.removeItem(FILE_VIEWER_ENGINE.intent.storageKey);
+    }
   });
 
   it("keeps markdown source on the Shiki path (not Monaco)", () => {
