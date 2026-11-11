@@ -360,8 +360,19 @@ async def test_update_lets_a_family_member_rename_but_not_refile():
     assert len([r for r in requests if r.method == "PATCH"]) == 1
 
 
-def _project_server(requests: list[httpx.Request], *, members: list | None = None, status=200):
-    project = {"id": PROJECT_ID, "name": "Q3", "config": {"icon": "🚀", "model": "fast"}}
+ICON_CONFIG = {"icon": "🚀", "model": "fast"}
+
+
+def _project_server(
+    requests: list[httpx.Request],
+    *,
+    pages: list[list[dict]] | None = None,
+    config: dict | None = None,
+    patch_status: int = 200,
+):
+    """Project Q3 exists with *config*; its sessions are served across cursor *pages*."""
+    project = {"id": PROJECT_ID, "name": "Q3", "config": config or {}}
+    pages = pages or [[]]
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -369,11 +380,16 @@ def _project_server(requests: list[httpx.Request], *, members: list | None = Non
         if path == "/v1/info":
             return httpx.Response(200, json=ORGANIZE_INFO)
         if path == "/v1/projects":
+            if request.method == "POST":
+                return httpx.Response(200, json=project)
             return httpx.Response(200, json={"data": [project]})
         if path == "/v1/sessions":
-            return httpx.Response(200, json={"data": members or [], "has_more": False})
-        if request.method in ("PATCH", "DELETE") and status != 200:
-            return httpx.Response(status, json={"detail": "refused"})
+            index = int(request.url.params.get("after") or 0)
+            more = index + 1 < len(pages)
+            body = {"data": pages[index], "has_more": more, "last_id": str(index + 1)}
+            return httpx.Response(200, json=body)
+        if request.method == "PATCH" and patch_status != 200:
+            return httpx.Response(patch_status, json={"detail": "refused"})
         return httpx.Response(200, json={})
 
     return handler
@@ -381,7 +397,7 @@ def _project_server(requests: list[httpx.Request], *, members: list | None = Non
 
 async def test_project_update_renames_and_keeps_other_config_when_changing_the_icon():
     requests: list[httpx.Request] = []
-    async with _client(_project_server(requests)) as client:
+    async with _client(_project_server(requests, config=ICON_CONFIG)) as client:
         result = json.loads(
             await execute_project_update(
                 {"project": "Q3", "name": "Q3 launch", "icon": "📦"}, client, SOURCE
@@ -419,7 +435,7 @@ async def test_project_update_renames_and_keeps_other_config_when_changing_the_i
 )
 async def test_project_update_rejects_invalid_arguments_before_any_request(args, message):
     requests: list[httpx.Request] = []
-    async with _client(_project_server(requests)) as client:
+    async with _client(_project_server(requests, config=ICON_CONFIG)) as client:
         result = json.loads(await execute_project_update(args, client, SOURCE))
     assert message in result["error"]
     assert requests == []
@@ -427,7 +443,7 @@ async def test_project_update_rejects_invalid_arguments_before_any_request(args,
 
 async def test_project_update_maps_unknown_projects_and_name_conflicts():
     requests: list[httpx.Request] = []
-    async with _client(_project_server(requests, status=409)) as client:
+    async with _client(_project_server(requests, patch_status=409)) as client:
         missing = json.loads(
             await execute_project_update({"project": "Nope", "name": "X"}, client, SOURCE)
         )
@@ -487,29 +503,6 @@ async def test_update_refuses_to_archive_a_session_on_the_callers_runner():
     assert not [r for r in requests if r.method == "PATCH"]
 
 
-def _paged_project_server(requests: list[httpx.Request], pages: list[list[dict]], *, rows=True):
-    """Project Q3 exists (when *rows*); its sessions are served across cursor *pages*."""
-    project = {"id": PROJECT_ID, "name": "Q3", "config": {}}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        path = request.url.path
-        if path == "/v1/info":
-            return httpx.Response(200, json=ORGANIZE_INFO)
-        if path == "/v1/projects" and request.method == "GET":
-            return httpx.Response(200, json={"data": [project] if rows else []})
-        if path == "/v1/projects" and request.method == "POST":
-            return httpx.Response(200, json=project)
-        if path == "/v1/sessions":
-            index = int(request.url.params.get("after") or 0)
-            more = index + 1 < len(pages)
-            body = {"data": pages[index], "has_more": more, "last_id": str(index + 1)}
-            return httpx.Response(200, json=body)
-        return httpx.Response(200, json={})
-
-    return handler
-
-
 async def test_project_rename_refiles_members_that_belong_through_the_legacy_label():
     requests: list[httpx.Request] = []
     members = [
@@ -517,7 +510,7 @@ async def test_project_rename_refiles_members_that_belong_through_the_legacy_lab
         {"id": FAMILY_MEMBER, "family": {"representative_id": PARENT}},
         {"id": SUB_AGENT, "project_id": PROJECT_ID},
     ]
-    async with _client(_paged_project_server(requests, [members])) as client:
+    async with _client(_project_server(requests, pages=[members])) as client:
         result = json.loads(
             await execute_project_update({"project": "Q3", "name": "Q4"}, client, SOURCE)
         )
@@ -616,7 +609,7 @@ async def test_project_rename_reports_members_it_could_not_move_across_pages():
             {"id": READ_SHARED, "labels": {"omni_project": "Q3"}},
         ],
     ]
-    base = _paged_project_server(requests, pages)
+    base = _project_server(requests, pages=pages)
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "PATCH" and request.url.path.endswith(FAILING):
@@ -655,7 +648,7 @@ async def test_project_rename_warns_when_the_member_walk_hits_its_page_cap(monke
 
     monkeypatch.setattr(session_projects, "_MAX_LOOKUP_PAGES", 2)
     requests: list[httpx.Request] = []
-    async with _client(_paged_project_server(requests, [[], [], [], []])) as client:
+    async with _client(_project_server(requests, pages=[[], [], [], []])) as client:
         result = json.loads(
             await execute_project_update({"project": "Q3", "icon": "📦"}, client, SOURCE)
         )
@@ -758,3 +751,38 @@ async def test_archive_never_recreates_a_project_deleted_after_its_preflight():
     assert not [r for r in requests if r.method == "POST"]
     (patched,) = [r for r in requests if r.method == "PATCH"]
     assert json.loads(patched.content)["project_id"] == PROJECT_ID
+
+
+@pytest.mark.parametrize("failure", ["http-500", "transport"])
+async def test_update_refuses_to_archive_when_the_caller_cannot_be_read(failure):
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json=ORGANIZE_INFO)
+        if request.url.path.endswith(SOURCE):
+            if failure == "transport":
+                raise httpx.ConnectError("connection reset")
+            return httpx.Response(500, text="boom")
+        return httpx.Response(200, json={"id": PARENT, "runner_id": "runner-2"})
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_session_update({"session_id": PARENT, "archived": True}, client, SOURCE)
+        )
+    assert "shares the calling session's runner" in result["error"]
+    assert not [r for r in requests if r.method == "PATCH"]
+
+
+async def test_update_restores_an_archived_session():
+    requests: list[httpx.Request] = []
+    snapshot = {"id": PARENT, "archived": True, "labels": {}}
+    async with _client(_organize_server(requests, snapshot)) as client:
+        result = json.loads(
+            await execute_session_update({"session_id": PARENT, "archived": False}, client, SOURCE)
+        )
+    assert result == {"session_id": PARENT, "status": "updated", "archived": False}
+    (patched,) = [r for r in requests if r.method == "PATCH"]
+    assert json.loads(patched.content) == {"archived": False}
+    assert patched.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE

@@ -107,14 +107,11 @@ def require_archive_outside_source_lineage(
     request: Request, session_id: str, conversations: ConversationStore
 ) -> None:
     """
-    Refuse an agent-tool archive of its calling session or any session it runs under.
+    Refuse an agent-tool archive of the calling session or any of its ancestors.
 
-    Archiving stops the target and its running sub-agent descendants, so a
-    caller archiving an ancestor (its parent, even after the parent moved to
-    another runner, or a side chat's source) would stop itself. A lineage
-    deeper than the walk's bound, or a cycle, is refused, since the target's
-    place in it is unknown. Requests without the orchestration-source header
-    are left alone.
+    Archiving stops the target's running sub-agents, so archiving an ancestor
+    would stop the caller. Cyclic or over-depth lineages are refused. Requests
+    without the orchestration-source header bypass this agent-only guard.
     """
     raw_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
     if not raw_source:
