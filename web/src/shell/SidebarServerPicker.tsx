@@ -222,7 +222,9 @@ export function SidebarServerPicker() {
             title={currentDescription}
             data-testid="sidebar-server-picker"
           >
-            <Avatar className="size-7 after:border-0">
+            {/* No ring pseudo-element: its mix-blend-mode makes Chromium composite
+                the phone drawer on its own, and the drawer's glass then blurs nothing. */}
+            <Avatar className="size-7 after:hidden">
               <AvatarFallback className="bg-secondary font-medium text-sm text-secondary-foreground">
                 {userInitials(userName.replace(/\s+/g, "."))}
               </AvatarFallback>

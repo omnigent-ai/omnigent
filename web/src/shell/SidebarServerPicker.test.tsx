@@ -209,7 +209,8 @@ describe("SidebarServerPicker", () => {
     const initials = await screen.findByText("AS");
     expect(initials).toHaveClass("bg-secondary", "text-secondary-foreground");
     expect(initials).toHaveClass("text-sm");
-    expect(initials.parentElement).toHaveClass("size-7", "after:border-0");
+    // The Avatar ring's blend mode would stop the drawer glass blurring on Android.
+    expect(initials.parentElement).toHaveClass("size-7", "after:hidden");
     expect(screen.getByText("alice.smith@example.com")).toHaveClass(
       "text-left",
       "font-medium",
