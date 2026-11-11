@@ -162,7 +162,14 @@ async def test_admin_routes_are_hidden_where_the_agent_is_not_offered(
         assert runs.status_code == 404
 
 
-async def test_admin_routes_require_an_admin(db_uri: str, tmp_path: Path) -> None:
+@pytest.mark.parametrize("local_single_user", [False, True], ids=["multi-user", "local"])
+async def test_admin_routes_require_an_admin(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, local_single_user: bool
+) -> None:
+    """Administrators manage the agent; on a local single-user server, its one user does.
+
+    The CLI gives that server a permission store too, in which its user is no admin.
+    """
     from omnigent.server.app import create_app
     from omnigent.server.auth import UnifiedAuthProvider
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -171,6 +178,10 @@ async def test_admin_routes_require_an_admin(db_uri: str, tmp_path: Path) -> Non
     from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
+    if local_single_user:
+        monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    else:
+        monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("admin@example.com")
     permissions.set_admin("admin@example.com", True)
@@ -183,12 +194,18 @@ async def test_admin_routes_require_an_admin(db_uri: str, tmp_path: Path) -> Non
         inbox_item_store=SqlAlchemyInboxItemStore(db_uri),
         proactive_agent=True,
         proactive_agent_settings_store=ProactiveAgentSettingsStore(db_uri),
-        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=local_single_user),
         permission_store=permissions,
     )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
+        if local_single_user:
+            # No header: the reserved local user, who holds no admin flag.
+            assert (await client.get("/v1/proactive-agent/prompt")).status_code == 200
+            runs = await client.post("/v1/proactive-agent/runs", json={"users": ["*"]})
+            assert runs.status_code != 403
+            return
         user = {"X-Forwarded-Email": "alice@example.com"}
         admin = {"X-Forwarded-Email": "admin@example.com"}
         assert (await client.get("/v1/proactive-agent/prompt", headers=user)).status_code == 403

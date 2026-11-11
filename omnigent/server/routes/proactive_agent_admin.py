@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.entities import ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, local_single_user_enabled
 from omnigent.server.proactive_agent import PROACTIVE_AGENT_ID, find_proactive_task
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.stores import PermissionStore
@@ -98,14 +98,16 @@ def create_proactive_agent_admin_router(
     :param offered: Whether the deployment offers the agent to this request's caller.
     :param default_prompt: Returns the agent's bundled prompt.
     :param auth_provider: Auth provider; ``None`` when auth is off.
-    :param permission_store: Permission store; ``None`` in single-user mode,
-        where the one user is the admin.
+    :param permission_store: Permission store, or ``None``. Without one, or on
+        a local single-user server, the one user is the admin.
     """
 
     async def require_admin(request: Request) -> None:
         if not offered():
             raise HTTPException(status_code=404, detail="not found")
-        if permission_store is None:
+        # The CLI gives a local single-user server a permission store too, and
+        # its one user is no administrator in it; the settings routes agree.
+        if permission_store is None or local_single_user_enabled():
             return
         user_id = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         if not await asyncio.to_thread(permission_store.is_admin, user_id):
