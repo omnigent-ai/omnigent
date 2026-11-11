@@ -1341,6 +1341,35 @@ class HostStore:
             existing.updated_at = now
             return _row_to_host(existing)
 
+    def bind_materialized_sandbox(
+        self,
+        host_id: str,
+        *,
+        expected_sandbox_id: str,
+        expected_token: str,
+        sandbox_id: str,
+    ) -> Host | None:
+        """Record allocation even when deletion raced its remote completion.
+
+        A deleted or detached reservation retains the concrete identity for
+        cleanup; it must never be reactivated by the caller.
+        """
+        with self._lifecycle_session("bind_materialized_sandbox") as session:
+            row = session.get(SqlHost, (current_workspace_id(), host_id), with_for_update=True)
+            if row is None:
+                return None
+            if row.sandbox_id == expected_sandbox_id:
+                if row.deleted_at is None and row.token_hash != hash_host_launch_token(
+                    expected_token
+                ):
+                    return None
+                row.sandbox_id = sandbox_id
+            elif row.terminating_sandbox_id == expected_sandbox_id:
+                row.terminating_sandbox_id = sandbox_id
+            else:
+                return None
+            return _row_to_host(row)
+
     def update_sandbox_id(
         self,
         host_id: str,
@@ -1419,6 +1448,8 @@ class HostStore:
         *,
         sandbox_id: str,
         expected_updated_at: int,
+        expected_token_hash: str | None = None,
+        token_expires_at: int | None = None,
     ) -> Host | None:
         """Claim the exact active generation for a resume that keeps its token.
 
@@ -1426,8 +1457,9 @@ class HostStore:
         token rotation or liveness changes, for providers whose resume restores
         the running host
         (``SandboxCapabilities.resume_preserves_host``). The thawed host still
-        presents the launch token it was started with, so the stored hash and
-        expiry must stay as they are or it can never re-authenticate.
+        presents the launch token it was started with, so its hash must stay.
+        A private bootstrap's matching digest can also authorize extending its
+        expiry without rotating the credential or manufacturing a heartbeat.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         :param sandbox_id: The active sandbox id the caller read.
@@ -1442,7 +1474,15 @@ class HostStore:
             expected_updated_at=expected_updated_at,
             # A redundant resume need not reconnect an already-running host.
             # Preserve its heartbeats without manufacturing a fresh observation.
-            values={"updated_at": SqlHost.updated_at},
+            values={
+                "updated_at": SqlHost.updated_at,
+                **(
+                    {"token_expires_at": token_expires_at}
+                    if expected_token_hash is not None and token_expires_at is not None
+                    else {}
+                ),
+            },
+            expected_token_hash=expected_token_hash,
         )
 
     def _claim_managed_generation(
@@ -1453,6 +1493,7 @@ class HostStore:
         sandbox_id: str,
         expected_updated_at: int,
         values: dict[str, object],
+        expected_token_hash: str | None = None,
     ) -> Host | None:
         """Compare-and-update the active managed generation for a wake.
 
@@ -1486,6 +1527,9 @@ class HostStore:
                             SqlHost.terminating_sandbox_id.is_(None),
                             SqlHost.terminating_sandbox_id != sandbox_id,
                         ),
+                        SqlHost.token_hash == expected_token_hash
+                        if expected_token_hash is not None
+                        else true(),
                     )
                     .values(**values)
                 ),

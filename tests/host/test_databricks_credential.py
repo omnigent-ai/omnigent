@@ -39,6 +39,7 @@ def _isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "host-tok")
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / ".databrickscfg"))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.delenv(dc.HOST_TOKEN_FILE_ENV_VAR, raising=False)
 
 
 @pytest.fixture
@@ -108,6 +109,24 @@ def test_bearer_is_never_persisted_to_disk(
     # The broker returned "dbx-tok"; it must appear nowhere on disk.
     assert "dbx-tok" not in (tmp_path / ".databrickscfg").read_text()
     assert "dbx-tok" not in (tmp_path / dc._SIDECAR_NAME).read_text()
+
+
+def test_sidecar_can_reference_an_ephemeral_launch_token(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _connected(monkeypatch)
+    token_file = tmp_path / "bootstrap-token"
+    token_file.write_text("host-tok")
+    monkeypatch.setenv(dc.HOST_TOKEN_FILE_ENV_VAR, str(token_file))
+    assert dc.configure_host_databricks("https://omni.example", "host-1")
+    sidecar = tmp_path / dc._SIDECAR_NAME
+    assert "host-tok" not in sidecar.read_text()
+    assert json.loads(sidecar.read_text())["host_token_file"] == str(token_file)
+    coordinates = dc._read_sidecar(sidecar)
+    assert coordinates is not None and coordinates["host_token"] == "host-tok"
+    token_file.unlink()
+    assert dc._read_sidecar(sidecar) is None
 
 
 @pytest.mark.parametrize("failure", [None, "write", "replace"])

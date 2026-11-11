@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import sys
 from collections.abc import Callable
+from pathlib import Path
 
 import httpx
 import pytest
@@ -19,15 +20,22 @@ def _force_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
     # The broker host integrations are sandbox-only; default every test to the
     # in-sandbox path. The not-in-sandbox no-op test clears IS_SANDBOX explicitly.
     monkeypatch.setenv("IS_SANDBOX", "1")
+    monkeypatch.delenv(h.HOST_TOKEN_FILE_ENV, raising=False)
 
 
-def test_get_prints_credentials_for_github(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("token_file", [False, True])
+def test_get_prints_credentials_for_github(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, token_file: bool
+) -> None:
     cred = {"connected": True, "username": "x-access-token", "token": "T"}
     monkeypatch.setattr(h, "_fetch", lambda *a, **k: cred)
     monkeypatch.setattr(sys, "stdin", io.StringIO("protocol=https\nhost=github.com\n\n"))
     out = io.StringIO()
     monkeypatch.setattr(sys, "stdout", out)
-    rc = h.main(["--server", "http://s", "--host-id", "hid", "--host-token", "tok", "get"])
+    path = tmp_path / "token"
+    path.write_text("tok")
+    credential = ["--host-token-file", str(path)] if token_file else ["--host-token", "tok"]
+    rc = h.main(["--server", "http://s", "--host-id", "hid", *credential, "get"])
     assert rc == 0
     assert "username=x-access-token" in out.getvalue()
     assert "password=T" in out.getvalue()
@@ -58,8 +66,11 @@ def test_store_and_erase_are_noops(monkeypatch: pytest.MonkeyPatch) -> None:
         assert h.main(["--server", "http://s", "--host-id", "h", "--host-token", "t", op]) == 0
 
 
+@pytest.mark.parametrize("token_file", [False, True])
 def test_configure_host_git_resets_then_adds_broker_helper(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    token_file: bool,
 ) -> None:
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
     monkeypatch.setenv("GIT_TOKEN", "shared-test-token")
@@ -67,7 +78,12 @@ def test_configure_host_git_resets_then_adds_broker_helper(
     monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
     cred = {"connected": True, "owner": "alice@example.com", "login": "octo"}
     monkeypatch.setattr(h, "_fetch", lambda *a, **k: cred)
+    if token_file:
+        monkeypatch.setenv(h.HOST_TOKEN_FILE_ENV, str(tmp_path / "private-token"))
     h.configure_host_git("http://srv", "host1")
+    if token_file:
+        assert "launch-tok" not in repr(calls)
+        assert "--host-token-file" in repr(calls)
 
     # The github.com helper chain is reset (empty value) BEFORE the broker helper
     # is --add'ed, so a wider-scope $GIT_TOKEN helper cannot shadow the broker.

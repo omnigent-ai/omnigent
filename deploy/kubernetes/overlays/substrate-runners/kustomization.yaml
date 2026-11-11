@@ -1,0 +1,26 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+  - serviceaccount.yaml
+  - sandbox-config.yaml
+
+patches:
+  - path: deployment-patch.yaml
+  - target:
+      kind: Namespace
+      name: omnigent
+    patch: |-
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: omnigent
+        labels:
+          ate.dev/api-access: "true"
+
+# Replace with your checkout-built server image, including the substrate extra.
+images:
+  - name: ghcr.io/omnigent-ai/omnigent-server
+    newName: registry.example.com/omnigent-server-substrate
+    newTag: build-required
