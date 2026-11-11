@@ -377,18 +377,12 @@ export function CreateScheduledTaskDialog({
     setEndingMenuOpen(next);
     handleSelectOpenChange(next);
   }
-  const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
-  function changeWorkspaceMenuOpen(next: boolean) {
-    setWorkspaceMenuOpen(next);
-    handleSelectOpenChange(next);
-  }
   function resetMenus() {
     setWorkspaceBrowserOpen(false);
     setProjectMenuOpen(false);
     setAgentMenuOpen(false);
     setScheduleMenuOpen(false);
     setEndingMenuOpen(false);
-    setWorkspaceMenuOpen(false);
     selectOpenCountRef.current = 0;
     nestedMenuOpenCountRef.current = 0;
     nestedMenuClosedAtRef.current = 0;
@@ -1535,139 +1529,132 @@ export function CreateScheduledTaskDialog({
                       </div>
                     )}
                   </div>
-                  <div className="contents">
-                    <div className="contents">
-                      <div className="contents">
-                        <Select
-                          value={sandboxMode ? SANDBOX_HOST : hostId}
-                          componentId="tasks.scheduled.host"
-                          onValueChange={handleTargetChange}
-                          onOpenChange={handleSelectOpenChange}
-                        >
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <span className="inline-flex w-full sm:col-span-2">
-                                <SelectTrigger asChild hideIcon>
-                                  <ComposerHarnessTrigger
-                                    label="Run on"
-                                    model={runTargetLabel}
-                                    icon={
-                                      sandboxMode ? (
-                                        <BoxIcon className="size-4 shrink-0" />
-                                      ) : (
-                                        <MonitorIcon className="size-4 shrink-0" />
-                                      )
-                                    }
-                                    className={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
-                                    data-testid="task-host-trigger"
-                                  />
-                                </SelectTrigger>
+                  <div className="grid min-w-0 grid-cols-1 gap-3 sm:col-span-6 sm:grid-cols-6">
+                    <Select
+                      value={sandboxMode ? SANDBOX_HOST : hostId}
+                      componentId="tasks.scheduled.host"
+                      onValueChange={handleTargetChange}
+                      onOpenChange={handleSelectOpenChange}
+                    >
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <span className="inline-flex w-full sm:col-span-2">
+                            <SelectTrigger asChild hideIcon>
+                              <ComposerHarnessTrigger
+                                label="Run on"
+                                model={runTargetLabel}
+                                icon={
+                                  sandboxMode ? (
+                                    <BoxIcon className="size-4 shrink-0" />
+                                  ) : (
+                                    <MonitorIcon className="size-4 shrink-0" />
+                                  )
+                                }
+                                className={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
+                                data-testid="task-host-trigger"
+                              />
+                            </SelectTrigger>
+                          </span>
+                        </TooltipTrigger>
+                        <TooltipContent>Run on</TooltipContent>
+                      </Tooltip>
+                      <SelectContent position="popper" align="end">
+                        <PickerSectionHeader>Run on</PickerSectionHeader>
+                        {(managedSandboxesEnabled || sandboxMode) && (
+                          <SelectItem value={SANDBOX_HOST} data-testid="task-host-sandbox-option">
+                            {sandboxLabel}
+                          </SelectItem>
+                        )}
+                        {hostOptions.map((host) => (
+                          <SelectItem key={host.host_id} value={host.host_id}>
+                            {host.name} {host.status === "offline" ? "(offline)" : ""}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+
+                    {!editingWorkerSettings && (
+                      <div className="sm:col-span-2" data-testid="task-agent-picker">
+                        <AgentHarnessPicker
+                          agentEntries={agentEntries}
+                          harnessEntries={harnessEntries}
+                          effectiveAgentId={effectiveAgentId}
+                          agentLabel={agentLabel}
+                          hasAgents={selectedAgent !== undefined || agentList.length > 0}
+                          loading={curationPending}
+                          curatedEntries={
+                            curation.restrictToAgentNames.size > 0 ? agentList : undefined
+                          }
+                          host={sandboxMode ? undefined : badgeHost}
+                          onSelectAgent={handleSelectAgent}
+                          pendingAgent={null}
+                          pendingAgentId="__unused_pending_agent__"
+                          onSelectPending={() => {}}
+                          onCreateCustomAgent={() => {}}
+                          sandboxSelected={sandboxMode}
+                          allowCreateCustomAgent={false}
+                          open={agentMenuOpen}
+                          onOpenChange={changeAgentMenuOpen}
+                          dropdownModal={false}
+                          contentClassName="w-80"
+                          contentAlign="end"
+                          triggerDetails={automationPickerDetails}
+                          triggerIcon={
+                            selectedAgent ? (
+                              <span className="flex size-4 shrink-0 items-center justify-center">
+                                <ComposerAgentIcon agent={selectedAgent} />
                               </span>
-                            </TooltipTrigger>
-                            <TooltipContent>Run on</TooltipContent>
-                          </Tooltip>
-                          <SelectContent position="popper" align="end">
-                            <PickerSectionHeader>Run on</PickerSectionHeader>
-                            {(managedSandboxesEnabled || sandboxMode) && (
-                              <SelectItem
-                                value={SANDBOX_HOST}
-                                data-testid="task-host-sandbox-option"
-                              >
-                                {sandboxLabel}
-                              </SelectItem>
-                            )}
-                            {hostOptions.map((host) => (
-                              <SelectItem key={host.host_id} value={host.host_id}>
-                                {host.name} {host.status === "offline" ? "(offline)" : ""}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-
-                        {!editingWorkerSettings && (
-                          <div className="sm:col-span-2" data-testid="task-agent-picker">
-                            <AgentHarnessPicker
-                              agentEntries={agentEntries}
-                              harnessEntries={harnessEntries}
-                              effectiveAgentId={effectiveAgentId}
-                              agentLabel={agentLabel}
-                              hasAgents={selectedAgent !== undefined || agentList.length > 0}
-                              loading={curationPending}
-                              curatedEntries={
-                                curation.restrictToAgentNames.size > 0 ? agentList : undefined
-                              }
-                              host={sandboxMode ? undefined : badgeHost}
-                              onSelectAgent={handleSelectAgent}
-                              pendingAgent={null}
-                              pendingAgentId="__unused_pending_agent__"
-                              onSelectPending={() => {}}
-                              onCreateCustomAgent={() => {}}
-                              sandboxSelected={sandboxMode}
-                              allowCreateCustomAgent={false}
-                              open={agentMenuOpen}
-                              onOpenChange={changeAgentMenuOpen}
-                              dropdownModal={false}
-                              contentClassName="w-80"
-                              contentAlign="end"
-                              triggerDetails={automationPickerDetails}
-                              triggerIcon={
-                                selectedAgent ? (
-                                  <span className="flex size-4 shrink-0 items-center justify-center">
-                                    <ComposerAgentIcon agent={selectedAgent} />
-                                  </span>
-                                ) : null
-                              }
-                              selectedConfigContent={automationPickerConfig}
-                              isEntryConfigurable={(agent) =>
-                                !reusesExistingSession &&
-                                (nativeAgentHasModelSettings(agent) ||
-                                  (agent.id === effectiveAgentId && supportsModel))
-                              }
-                              triggerClassName={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
-                              triggerTooltip="Agent, model, and effort"
-                            />
-                          </div>
-                        )}
-
-                        {!editingWorkerSettings && permissionOptions.length > 0 && (
-                          <Select
-                            disabled={curationPending || reusesExistingSession}
-                            value={permissionSelectValue}
-                            componentId="tasks.scheduled.permission_mode"
-                            valueHasNoPii
-                            onValueChange={handlePermissionChange}
-                            onOpenChange={handleSelectOpenChange}
-                          >
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <span className="inline-flex w-full sm:col-span-2">
-                                  <SelectTrigger asChild hideIcon>
-                                    <ComposerHarnessTrigger
-                                      label="Permissions"
-                                      model={permissionLabel}
-                                      icon={<ShieldCheckIcon className="size-4 shrink-0" />}
-                                      className={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
-                                      data-testid="task-permission-trigger"
-                                    />
-                                  </SelectTrigger>
-                                </span>
-                              </TooltipTrigger>
-                              <TooltipContent>Permissions</TooltipContent>
-                            </Tooltip>
-                            <SelectContent position="popper" align="end">
-                              <PickerSectionHeader>Permissions</PickerSectionHeader>
-                              <SelectItem value={PERMISSION_SELECT_DEFAULT}>Default</SelectItem>
-                              {permissionOptions.map((option) => (
-                                <SelectItem key={option.value} value={option.value}>
-                                  {option.label}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                        )}
+                            ) : null
+                          }
+                          selectedConfigContent={automationPickerConfig}
+                          isEntryConfigurable={(agent) =>
+                            !reusesExistingSession &&
+                            (nativeAgentHasModelSettings(agent) ||
+                              (agent.id === effectiveAgentId && supportsModel))
+                          }
+                          triggerClassName={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
+                          triggerTooltip="Agent, model, and effort"
+                        />
                       </div>
-                    </div>
-                    <Collapsible className="border-t border-border pt-3 sm:col-span-6">
+                    )}
+
+                    {!editingWorkerSettings && permissionOptions.length > 0 && (
+                      <Select
+                        disabled={curationPending || reusesExistingSession}
+                        value={permissionSelectValue}
+                        componentId="tasks.scheduled.permission_mode"
+                        valueHasNoPii
+                        onValueChange={handlePermissionChange}
+                        onOpenChange={handleSelectOpenChange}
+                      >
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span className="inline-flex w-full sm:col-span-2">
+                              <SelectTrigger asChild hideIcon>
+                                <ComposerHarnessTrigger
+                                  label="Permissions"
+                                  model={permissionLabel}
+                                  icon={<ShieldCheckIcon className="size-4 shrink-0" />}
+                                  className={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
+                                  data-testid="task-permission-trigger"
+                                />
+                              </SelectTrigger>
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent>Permissions</TooltipContent>
+                        </Tooltip>
+                        <SelectContent position="popper" align="end">
+                          <PickerSectionHeader>Permissions</PickerSectionHeader>
+                          <SelectItem value={PERMISSION_SELECT_DEFAULT}>Default</SelectItem>
+                          {permissionOptions.map((option) => (
+                            <SelectItem key={option.value} value={option.value}>
+                              {option.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    )}
+                    <Collapsible className="sm:col-span-6">
                       <CollapsibleTrigger
                         className="group flex w-full cursor-pointer items-center justify-start gap-2 rounded-sm text-left text-ui font-medium outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50"
                         data-testid="task-advanced-settings-trigger"
@@ -1823,8 +1810,12 @@ export function CreateScheduledTaskDialog({
                           {!triggerMode && (
                             <div className="flex min-h-9 items-center justify-between gap-4 py-px">
                               <span className="text-ui text-muted-foreground">Ends</span>
-                              <Popover open={endingMenuOpen} onOpenChange={changeEndingMenuOpen}>
-                                <PopoverTrigger asChild>
+                              <DropdownMenu
+                                modal={false}
+                                open={endingMenuOpen}
+                                onOpenChange={changeEndingMenuOpen}
+                              >
+                                <DropdownMenuTrigger asChild>
                                   <ComposerHarnessTrigger
                                     label="Ends"
                                     model={endingSummary}
@@ -1832,17 +1823,17 @@ export function CreateScheduledTaskDialog({
                                     className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
                                     data-testid="task-ending-trigger"
                                   />
-                                </PopoverTrigger>
-                                <PopoverContent
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent
                                   align="end"
-                                  className="menu-surface w-[min(28rem,calc(100vw-2rem))] gap-0 p-0"
+                                  className="w-[max(var(--radix-dropdown-menu-trigger-width),20rem)] max-w-[calc(100vw-2rem)]"
                                   onPointerDownOutside={keepParentPopoverOpenForNestedMenu}
                                   onFocusOutside={keepParentPopoverOpenOnFocus}
                                   onInteractOutside={keepParentPopoverOpenForNestedMenu}
                                 >
                                   {endingFields}
-                                </PopoverContent>
-                              </Popover>
+                                </DropdownMenuContent>
+                              </DropdownMenu>
                             </div>
                           )}
 
@@ -1889,99 +1880,62 @@ export function CreateScheduledTaskDialog({
                                   </SelectContent>
                                 </Select>
                               ) : (
-                                <Popover
-                                  open={workspaceMenuOpen}
-                                  onOpenChange={changeWorkspaceMenuOpen}
-                                >
-                                  <PopoverTrigger asChild>
-                                    <ComposerHarnessTrigger
-                                      label="Workspace"
-                                      model={workspaceSummary}
-                                      icon={<FolderOpenIcon className="size-4 shrink-0" />}
-                                      disabled={hostId === ""}
-                                      className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
-                                      data-testid="task-workspace-trigger"
-                                    />
-                                  </PopoverTrigger>
-                                  <PopoverContent
-                                    align="end"
-                                    className="menu-surface w-[min(26rem,calc(100vw-2rem))] p-3"
-                                  >
-                                    <Button
-                                      type="button"
-                                      variant="outline"
-                                      className="w-full justify-start gap-2"
-                                      disabled={workspaceHostOffline}
-                                      onClick={() => {
-                                        changeWorkspaceMenuOpen(false);
-                                        setWorkspaceBrowserOpen(true);
-                                      }}
-                                      data-testid="task-workspace-browse"
-                                    >
-                                      <FolderOpenIcon className="size-4 text-muted-foreground" />
-                                      <span className="truncate">
-                                        {workspace || "Browse folders…"}
-                                      </span>
-                                    </Button>
-                                    {workspaceHostOffline && (
-                                      <p className="text-sm text-muted-foreground">
-                                        Connect your host to select a workspace.
-                                      </p>
-                                    )}
-                                    {workspace && (
-                                      <p className="truncate font-mono text-sm text-muted-foreground">
-                                        {workspace}
-                                      </p>
-                                    )}
-                                    {workspace &&
-                                      worktreesSupported &&
-                                      (!isGitWorkspace && baseBranch !== null ? (
-                                        <div className="text-sm text-muted-foreground">
-                                          <p>Random worktree is enabled. {worktreeStatus}</p>
-                                          <Button
-                                            type="button"
-                                            variant="link"
-                                            onClick={() => setBaseBranch(null)}
-                                          >
-                                            Turn off random worktree
-                                          </Button>
-                                        </div>
-                                      ) : (
-                                        isGitWorkspace && (
-                                          <>
-                                            <div className="flex items-center gap-2">
-                                              <Checkbox
-                                                id="task-random-worktree"
-                                                checked={baseBranch !== null}
-                                                onCheckedChange={(checked) =>
-                                                  setBaseBranch(
-                                                    checked === true
-                                                      ? RANDOM_WORKTREE_BASE_REF
-                                                      : null,
-                                                  )
-                                                }
-                                                componentId="tasks.scheduled.random_worktree"
-                                              />
-                                              <label
-                                                htmlFor="task-random-worktree"
-                                                className="cursor-pointer text-sm"
-                                              >
-                                                Random worktree
-                                              </label>
-                                            </div>
-                                            <p className="text-sm text-muted-foreground">
-                                              {sessionMode === "continue"
-                                                ? "Creates a random worktree when starting a session. Later runs reuse it."
-                                                : "Creates a fresh random worktree for each run."}
-                                            </p>
-                                          </>
-                                        )
-                                      ))}
-                                  </PopoverContent>
-                                </Popover>
+                                <ComposerHarnessTrigger
+                                  label="Workspace"
+                                  model={workspaceSummary}
+                                  icon={<FolderOpenIcon className="size-4 shrink-0" />}
+                                  disabled={hostId === "" || workspaceHostOffline}
+                                  className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                  data-testid="task-workspace-trigger"
+                                  onClick={() => setWorkspaceBrowserOpen(true)}
+                                />
                               )}
                             </div>
                           )}
+
+                          {!sandboxMode &&
+                            workspace &&
+                            worktreesSupported &&
+                            (!isGitWorkspace && baseBranch !== null ? (
+                              <div className="py-2 text-sm text-muted-foreground">
+                                <p>Random worktree is enabled. {worktreeStatus}</p>
+                                <Button
+                                  type="button"
+                                  variant="link"
+                                  onClick={() => setBaseBranch(null)}
+                                >
+                                  Turn off random worktree
+                                </Button>
+                              </div>
+                            ) : (
+                              isGitWorkspace && (
+                                <div className="space-y-2 py-2">
+                                  <div className="flex items-center gap-2">
+                                    <Checkbox
+                                      id="task-random-worktree"
+                                      checked={baseBranch !== null}
+                                      onCheckedChange={(checked) =>
+                                        setBaseBranch(
+                                          checked === true ? RANDOM_WORKTREE_BASE_REF : null,
+                                        )
+                                      }
+                                      componentId="tasks.scheduled.random_worktree"
+                                    />
+                                    <label
+                                      htmlFor="task-random-worktree"
+                                      className="cursor-pointer text-sm"
+                                    >
+                                      Random worktree
+                                    </label>
+                                  </div>
+                                  <p className="text-sm text-muted-foreground">
+                                    {sessionMode === "continue"
+                                      ? "Creates a random worktree when starting a session. Later runs reuse it."
+                                      : "Creates a fresh random worktree for each run."}
+                                  </p>
+                                </div>
+                              )
+                            ))}
 
                           {projectsSupported && (
                             <div

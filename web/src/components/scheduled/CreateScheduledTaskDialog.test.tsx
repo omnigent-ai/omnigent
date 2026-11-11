@@ -356,14 +356,10 @@ function openAutomationSection(name: AutomationSectionName) {
     const trigger = screen.getByTestId("task-schedule-trigger");
     if (trigger.getAttribute("aria-expanded") === "false") fireEvent.click(trigger);
   }
-  if (name === "Context") {
-    const trigger = screen.queryByTestId("task-workspace-trigger");
-    if (trigger?.getAttribute("aria-expanded") === "false") fireEvent.click(trigger);
-  }
 }
 
 function closeTopLevelPopovers() {
-  for (const testId of ["task-schedule-trigger", "task-ending-trigger", "task-workspace-trigger"]) {
+  for (const testId of ["task-schedule-trigger", "task-ending-trigger"]) {
     const trigger = screen.queryByTestId(testId);
     if (trigger?.getAttribute("aria-expanded") === "true") fireEvent.click(trigger);
   }
@@ -374,9 +370,19 @@ function selectSchedulePreset(label: string) {
   fireEvent.click(screen.getByRole("radio", { name: label }));
 }
 
+function selectScheduleEnding(label: string) {
+  openTopLevelPopover("task-ending-trigger");
+  fireEvent.click(screen.getByRole("menuitemradio", { name: label }));
+}
+
 function openTopLevelPopover(testId: string) {
   const trigger = screen.getByTestId(testId);
-  if (trigger.getAttribute("aria-expanded") === "false") fireEvent.click(trigger);
+  if (trigger.getAttribute("aria-expanded") !== "false") return;
+  if (testId === "task-ending-trigger") {
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+  } else {
+    fireEvent.click(trigger);
+  }
 }
 
 function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } = {}) {
@@ -401,11 +407,7 @@ function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } 
       fireEvent.click(advancedTrigger);
     }
     if (!expandAdvanced) return;
-    for (const testId of [
-      "task-workspace-trigger",
-      "task-ending-trigger",
-      "task-schedule-trigger",
-    ]) {
+    for (const testId of ["task-ending-trigger", "task-schedule-trigger"]) {
       const trigger = screen.queryByTestId(testId);
       if (trigger?.getAttribute("aria-expanded") === "false") fireEvent.click(trigger);
     }
@@ -601,9 +603,12 @@ describe("prompt-first automation setup", () => {
     expect(screen.getByLabelText("Timezone", { exact: true })).toBeVisible();
     await userEvent.click(instructions);
     await waitFor(() => expect(scheduleTrigger).toHaveAttribute("aria-expanded", "false"));
-    fireEvent.click(screen.getByTestId("task-ending-trigger"));
+    openTopLevelPopover("task-ending-trigger");
     expect(screen.getByLabelText("Schedule ends")).toBeVisible();
-    fireEvent.click(screen.getByTestId("task-ending-trigger"));
+    fireEvent.pointerDown(screen.getByTestId("task-ending-trigger"), {
+      button: 0,
+      ctrlKey: false,
+    });
 
     fireEvent.change(instructions, { target: { value: "Review pull requests" } });
     expect(screen.queryByTestId("task-execution-summary")).not.toBeInTheDocument();
@@ -760,11 +765,11 @@ describe("prompt-first automation setup", () => {
     expect(endingControl).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByLabelText("End date")).toBeVisible();
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-    fireEvent.click(endingControl);
+    fireEvent.pointerDown(endingControl, { button: 0, ctrlKey: false });
     expect(screen.queryByLabelText("End date")).not.toBeInTheDocument();
     expect(scheduleSection).toHaveTextContent("Needs attention");
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-    fireEvent.click(endingControl);
+    fireEvent.pointerDown(endingControl, { button: 0, ctrlKey: false });
     expect(screen.getByLabelText("End date")).toBeVisible();
   });
 
@@ -1053,7 +1058,7 @@ describe("CreateScheduledTaskDialog validation", () => {
     fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
     openAutomationSection("Context");
 
-    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    fireEvent.click(screen.getByTestId("task-workspace-trigger"));
     expect(screen.getByTestId("workspace-picker-dialog")).toBeInTheDocument();
     expect(screen.queryByText("/home/me/repo")).toBeNull();
 
@@ -1061,17 +1066,17 @@ describe("CreateScheduledTaskDialog validation", () => {
     expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
     expect(onOpenChange).not.toHaveBeenCalled();
     openAutomationSection("Context");
-    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    fireEvent.click(screen.getByTestId("task-workspace-trigger"));
 
     fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
     openAutomationSection("Context");
 
     expect(screen.queryByTestId("workspace-picker-dialog")).toBeNull();
-    expect(screen.getAllByText("/home/me/repo")).toHaveLength(3);
+    expect(screen.getByText("/home/me/repo")).toBeVisible();
 
     expect(gitWorkspace.query).toHaveBeenLastCalledWith("host_1", "/home/me/repo");
     fireEvent.click(screen.getByRole("checkbox", { name: "Random worktree" }));
-    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    fireEvent.click(screen.getByTestId("task-workspace-trigger"));
     expect(screen.getByTestId("workspace-picker-dialog")).toBeInTheDocument();
     vi.mocked(hostsHook.useHosts).mockReturnValue({
       data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "offline" }],
@@ -1079,23 +1084,23 @@ describe("CreateScheduledTaskDialog validation", () => {
     rerender(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
     expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
     openAutomationSection("Context");
-    expect(screen.getByTestId("task-workspace-browse")).toBeDisabled();
+    expect(screen.getByTestId("task-workspace-trigger")).toBeDisabled();
     expect(gitWorkspace.query).toHaveBeenLastCalledWith(null, "/home/me/repo");
     expect(screen.queryByRole("checkbox", { name: "Random worktree" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Turn off random worktree" })).toBeEnabled();
-    expect(screen.getAllByText("/home/me/repo")).toHaveLength(3);
+    expect(screen.getByText("/home/me/repo")).toBeVisible();
 
     vi.mocked(hostsHook.useHosts).mockReturnValue({
       data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "online" }],
     } as unknown as ReturnType<typeof hostsHook.useHosts>);
     rerender(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
     openAutomationSection("Context");
-    expect(screen.getByTestId("task-workspace-browse")).toBeEnabled();
+    expect(screen.getByTestId("task-workspace-trigger")).toBeEnabled();
     expect(gitWorkspace.query).toHaveBeenLastCalledWith("host_1", "/home/me/repo");
     expect(screen.getByRole("checkbox", { name: "Random worktree" })).toBeChecked();
     expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
     expect(screen.queryByText("Connect your host to select a workspace.")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    fireEvent.click(screen.getByTestId("task-workspace-trigger"));
     expect(screen.getByTestId("workspace-picker-dialog")).toBeInTheDocument();
   });
 });
@@ -1299,9 +1304,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
       expect(screen.getByRole("alert")).toHaveTextContent("This schedule can't be edited");
       expect(screen.getByLabelText("Frequency")).toBeVisible();
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-      openTopLevelPopover("task-ending-trigger");
-      fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
-      fireEvent.click(await screen.findByRole("option", { name: "After" }));
+      selectScheduleEnding("After");
       fireEvent.change(screen.getByLabelText("Occurrences"), { target: { value: "3" } });
       expect(screen.getByRole("alert")).toHaveTextContent("This schedule can't be edited");
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
@@ -1485,7 +1488,7 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
         openHostSelect();
         fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
       }
-      expect(screen.queryByTestId("task-workspace-browse")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("task-workspace-trigger")).not.toBeInTheDocument();
       expect(screen.getByLabelText("Repository")).toHaveTextContent(label);
       const sessionLock = /This automation continues in an existing session/;
       if (editing) {
@@ -1570,8 +1573,7 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
       openHostSelect();
       fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
       expect(screen.queryByLabelText("Repository")).not.toBeInTheDocument();
-      fireEvent.click(screen.getByTestId("task-workspace-trigger"));
-      expect(screen.getByTestId("task-workspace-browse")).toHaveTextContent("Browse folders");
+      expect(screen.getByTestId("task-workspace-trigger")).toHaveTextContent("No workspace");
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
       expect(mutateAsync.mock.calls[0][0]).toMatchObject({ hostId: "host_1" });
@@ -1589,7 +1591,7 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
     openHostSelect();
     fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
 
-    expect(screen.queryByTestId("task-workspace-browse")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-workspace-trigger")).not.toBeInTheDocument();
     expect(screen.queryByText("Connect your host to select a workspace.")).not.toBeInTheDocument();
 
     const submit = screen.getByTestId("create-scheduled-task-submit");
@@ -1680,11 +1682,10 @@ describe("CreateScheduledTaskDialog submit", () => {
     fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
 
     await waitFor(() => expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled());
-    fireEvent.click(screen.getByTestId("task-workspace-trigger"));
-    const browse = screen.getByTestId("task-workspace-browse");
-    expect(browse).toBeDisabled();
-    expect(screen.getByText("Connect your host to select a workspace.")).toBeVisible();
-    fireEvent.click(browse);
+    const workspaceTrigger = screen.getByTestId("task-workspace-trigger");
+    expect(workspaceTrigger).toBeDisabled();
+    expect(screen.getByText("This host is offline. Runs fail until it reconnects.")).toBeVisible();
+    fireEvent.click(workspaceTrigger);
     expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
   });
 
@@ -1709,10 +1710,10 @@ describe("CreateScheduledTaskDialog submit", () => {
 
     // Omitting the workspace would keep the saved one, so the form keeps showing it.
     openAutomationSection("Context");
-    expect(screen.getByTestId("task-workspace-browse")).toHaveTextContent("/home/me/repo");
-    expect(screen.getByTestId("task-workspace-browse")).toBeDisabled();
-    expect(screen.getByText("Connect your host to select a workspace.")).toBeInTheDocument();
-    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    expect(screen.getByTestId("task-workspace-trigger")).toHaveTextContent("/home/me/repo");
+    expect(screen.getByTestId("task-workspace-trigger")).toBeDisabled();
+    expect(screen.getByText("This host is offline. Runs fail until it reconnects.")).toBeVisible();
+    fireEvent.click(screen.getByTestId("task-workspace-trigger"));
     expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
 
@@ -2022,9 +2023,7 @@ describe("CreateScheduledTaskDialog submit", () => {
     await waitFor(() =>
       expect(screen.getByLabelText("Timezone")).toHaveTextContent("Asia/Singapore"),
     );
-    openTopLevelPopover("task-ending-trigger");
-    fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "After" }));
+    selectScheduleEnding("After");
     fireEvent.change(screen.getByLabelText("Occurrences"), { target: { value: "1" } });
     const occurrences = screen.getByLabelText("Occurrences");
     const endingError = within(screen.getByTestId("schedule-ending-fields")).getByRole("alert");
@@ -2034,14 +2033,10 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(screen.queryByTestId("schedule-error")).not.toBeInTheDocument();
     openAutomationSection("Schedule");
     expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent(recurrenceSummary!);
-    openTopLevelPopover("task-ending-trigger");
-    fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "On date" }));
+    selectScheduleEnding("On date");
     openAutomationSection("Schedule");
     expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent(recurrenceSummary!);
-    openTopLevelPopover("task-ending-trigger");
-    fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "After" }));
+    selectScheduleEnding("After");
     fireEvent.change(screen.getByLabelText("Occurrences"), { target: { value: "6" } });
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
@@ -2169,9 +2164,7 @@ describe("CreateScheduledTaskDialog submit", () => {
           within(screen.getByTestId("schedule-fields")).getByLabelText("Timezone"),
         ).toHaveTextContent("Asia/Singapore");
       }
-      openTopLevelPopover("task-ending-trigger");
-      fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
-      fireEvent.click(await screen.findByRole("option", { name: "On date" }));
+      selectScheduleEnding("On date");
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
       if (minutely) {
         expect(
@@ -2443,7 +2436,7 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
       );
 
       openAutomationSection("Context");
-      fireEvent.click(screen.getByTestId("task-workspace-browse"));
+      fireEvent.click(screen.getByTestId("task-workspace-trigger"));
       fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
       expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
       closeTopLevelPopovers();
@@ -2630,10 +2623,10 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
       );
       // The picker returns an alias; only the server can resolve it to the saved directory.
       openAutomationSection("Context");
-      fireEvent.click(screen.getByTestId("task-workspace-browse"));
+      fireEvent.click(screen.getByTestId("task-workspace-trigger"));
       fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
       openAutomationSection("Context");
-      expect(screen.getByTestId("task-workspace-browse")).toHaveTextContent("/home/me/repo");
+      expect(screen.getByTestId("task-workspace-trigger")).toHaveTextContent("/home/me/repo");
       for (const field of ["model", "effort", "permission"]) {
         expect(screen.getByTestId(`task-${field}-trigger`)).toBeDisabled();
       }
@@ -3607,11 +3600,16 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     type("task-trigger-instructions", "Triage it.");
   }
 
-  function showWarnings() {
-    if (!screen.queryByRole("tooltip")) {
-      fireEvent.click(screen.getByRole("button", { name: "Session instructions warnings" }));
-    }
-    return within(screen.getByRole("tooltip"));
+  function expectWarningMessage(testId: string, message: string) {
+    expect(screen.getByTestId(testId)).toHaveAttribute(
+      "aria-label",
+      expect.stringContaining(message),
+    );
+  }
+
+  function showMoreTriggerDetails() {
+    fireEvent.focus(screen.getByRole("button", { name: "More trigger details" }));
+    return screen.getByRole("tooltip");
   }
 
   async function submittedPrompt(): Promise<string> {
@@ -3669,8 +3667,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
   });
 
-  it("replaces the prompt with a trigger builder, runs hourly and keeps one session", async () => {
-    const user = userEvent.setup();
+  it("replaces the prompt with a trigger builder, runs hourly and keeps one session", () => {
     const { onOpenChange } = renderTrigger("jira");
     expect(screen.getByTestId("task-name-input")).toHaveValue("Jira tickets");
     expect(screen.queryByTestId("task-prompt-input")).toBeNull();
@@ -3679,61 +3676,82 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Hourly");
     // The trigger always keeps one session, so the form doesn't ask.
     expect(screen.queryByTestId("task-session-mode-field")).toBeNull();
-    expect(screen.getByTestId("task-trigger-fields")).toHaveTextContent(
-      "Runs your automation on all new tickets that match these conditions. Older tickets are skipped, even if they are edited to match later.",
+    expect(screen.getByTestId("task-trigger-description")).toHaveTextContent(
+      "Runs your automation on all new tickets that match these conditions.",
     );
-    expect(screen.getByTestId("task-trigger-fields")).toHaveTextContent(
+    const triggerDetails = showMoreTriggerDetails();
+    expect(triggerDetails).toHaveTextContent(
+      "Older tickets are skipped, even if they are edited to match later.",
+    );
+    expect(within(triggerDetails).getByTestId("task-trigger-attribution-note")).toHaveTextContent(
       'Up to 10 matches per run; remaining matches wait for the next run · Posts include "Sent with Omnigent".',
     );
-    expect(screen.queryByRole("tooltip")).toBeNull();
-    expect(screen.getByTestId("task-trigger-untrusted-note")).toBeVisible();
-    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveClass("text-warning");
-    const warningsButton = screen.getByRole("button", { name: "Session instructions warnings" });
-    await user.hover(warningsButton);
-    expect(await screen.findByRole("tooltip")).toBeInTheDocument();
-    fireEvent.keyDown(warningsButton, { key: "Escape" });
-    expect(screen.queryByRole("tooltip")).toBeNull();
-    // Focus alone opens it; the following touch click must keep it open.
-    fireEvent.focus(warningsButton);
-    expect(screen.getByRole("tooltip")).toBeInTheDocument();
-    fireEvent.click(warningsButton);
-    expect(screen.getByRole("tooltip")).toBeInTheDocument();
-    // The source and account warnings stay visible outside the tooltip.
-    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
-      "Anyone who can create a ticket in this project may direct the agent using your tools and permissions. Only use trusted sources.",
-    );
-    const note = screen.getByTestId("task-trigger-attribution-note");
-    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
-      "Links are posted with your Jira account.",
-    );
-    expect(note).toHaveTextContent('Posts include "Sent with Omnigent".');
-    // Runs can only search where the agent has the service's tools.
-    expect(showWarnings().getByTestId("task-trigger-tools-note")).toHaveTextContent(
-      "This only works if the agent has a Jira MCP server where this task runs. Without one, each run stops and says so in its reply.",
-    );
-    expect(screen.getByRole("tooltip")).toBeInTheDocument();
-    fireEvent.keyDown(screen.getByRole("button", { name: "Session instructions warnings" }), {
+    fireEvent.keyDown(screen.getByRole("button", { name: "More trigger details" }), {
       key: "Escape",
     });
-    expect(screen.queryByRole("tooltip")).toBeNull();
-    expect(onOpenChange).not.toHaveBeenCalled();
+    const triggerCard = screen.getByTestId("task-trigger-card");
+    expect(triggerCard).toContainElement(screen.getByTestId("task-trigger-description"));
+    expect(triggerCard).toContainElement(screen.getByTestId("task-trigger-builder"));
+    expect(triggerCard).toContainElement(screen.getByTestId("task-trigger-link-back"));
+    expect(screen.queryByTestId("task-trigger-safety")).toBeNull();
+    const triggerTab = screen.getByRole("tab", { name: "Trigger" });
+    const instructionsTab = screen.getByRole("tab", { name: "Instructions" });
+    expect(screen.getByTestId("task-trigger-instructions-required")).toBeInTheDocument();
+    type("task-trigger-instructions", "Triage it.");
+    expect(screen.queryByTestId("task-trigger-instructions-required")).toBeNull();
+    type("task-trigger-instructions", "");
+    expect(screen.getByTestId("task-trigger-instructions-required")).toBeInTheDocument();
+    const tabs = screen.getByTestId("task-trigger-tabs");
+    expect(tabs).toContainElement(triggerTab);
+    expect(tabs).toContainElement(instructionsTab);
+    expect(tabs).toContainElement(triggerCard);
+    expect(triggerTab).toHaveAttribute("aria-selected", "true");
+    expect(triggerCard).toBeVisible();
+    expect(screen.getByTestId("task-trigger-instructions")).not.toBeVisible();
     const linkBack = screen.getByRole("checkbox", {
       name: "Comment the session link on the ticket",
     });
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toBeVisible();
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveClass("text-muted-foreground");
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent("Untrusted source");
+    expectWarningMessage(
+      "task-trigger-untrusted-note",
+      "Anyone who can create a ticket in this project may direct the agent using your tools and permissions. Only use trusted sources.",
+    );
+    expectWarningMessage("task-trigger-untrusted-note", "Links are posted with your Jira account.");
+    // Runs can only search where the agent has the service's tools.
+    expect(screen.getByTestId("task-trigger-tools-note")).toHaveTextContent("MCP required");
+    expectWarningMessage(
+      "task-trigger-tools-note",
+      "This only works if the agent has a Jira MCP server where this task runs. Without one, each run stops and says so in its reply.",
+    );
+    const toolsTag = screen.getByTestId("task-trigger-tools-note");
+    fireEvent.focus(toolsTag);
+    expect(screen.getByRole("tooltip")).toHaveTextContent(
+      "This only works if the agent has a Jira MCP server where this task runs.",
+    );
+    fireEvent.keyDown(toolsTag, { key: "Escape" });
+    expect(onOpenChange).not.toHaveBeenCalled();
+    fireEvent.focus(instructionsTab);
+    fireEvent.click(instructionsTab);
+    expect(instructionsTab).toHaveAttribute("aria-selected", "true");
+    expect(tabs).toContainElement(screen.getByTestId("task-trigger-instructions-panel"));
+    expect(screen.getByTestId("task-trigger-instructions")).toBeVisible();
+    expect(triggerCard).not.toBeVisible();
+    fireEvent.focus(triggerTab);
+    fireEvent.click(triggerTab);
     expect(linkBack).toBeChecked();
     expect(screen.getByTestId("task-trigger-builder")).not.toContainElement(linkBack);
     expect(screen.queryByRole("combobox", { name: "Then" })).toBeNull();
     fireEvent.click(linkBack);
     expect(linkBack).not.toBeChecked();
-    expect(screen.getByTestId("task-trigger-untrusted-note")).not.toHaveTextContent(
-      "Links are posted",
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveAttribute(
+      "aria-label",
+      expect.not.stringContaining("Links are posted"),
     );
-    expect(note).toHaveTextContent("Sent with Omnigent");
     fireEvent.click(screen.getByText("Comment the session link on the ticket"));
     expect(linkBack).toBeChecked();
-    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
-      "Links are posted with your Jira account.",
-    );
+    expectWarningMessage("task-trigger-untrusted-note", "Links are posted with your Jira account.");
   });
 
   it.each([
@@ -3750,7 +3768,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     fireEvent.click(host);
     fireEvent.click(screen.getByRole("option", { name: "laptop" }));
     // On a connected host the agent may lack the tools, so the warning shows.
-    expect(showWarnings().getByTestId("task-trigger-tools-note")).toBeInTheDocument();
+    expect(screen.getByTestId("task-trigger-tools-note")).toBeInTheDocument();
     fireEvent.pointerDown(host, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
     fireEvent.click(host);
     fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
@@ -3758,9 +3776,8 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     if (hidden) {
       expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Arclet Sandbox");
       expect(screen.queryByTestId("task-trigger-tools-note")).toBeNull();
-      expect(screen.queryByRole("button", { name: "Session instructions warnings" })).toBeNull();
     } else {
-      expect(showWarnings().getByTestId("task-trigger-tools-note")).toBeInTheDocument();
+      expect(screen.getByTestId("task-trigger-tools-note")).toBeInTheDocument();
     }
     // The untrusted-source warning is about the source, not the tools, so it stays.
     expect(screen.getByTestId("task-trigger-untrusted-note")).toBeInTheDocument();
@@ -3799,9 +3816,6 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     // A new row starts empty and blocks saving until it's filled in or removed.
     fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
     expect(submit).toBeDisabled();
-    expect(screen.getByTestId("task-trigger-empty-condition")).toHaveTextContent(
-      "Fill in or remove each condition.",
-    );
     type("task-trigger-condition-0-value", "omnigent");
     expect(submit).toBeEnabled();
     fireEvent.click(screen.getByTestId("task-trigger-condition-0-remove"));
@@ -3883,7 +3897,8 @@ describe("CreateScheduledTaskDialog trigger template", () => {
   it("still starts sessions without a link-back when the checkbox is unchecked", async () => {
     renderTrigger("slack");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Message posted");
-    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+    expectWarningMessage(
+      "task-trigger-untrusted-note",
       "Anyone who can post in this channel may direct the agent",
     );
     type("task-trigger-scope", "#eng-support");
@@ -3920,7 +3935,8 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     // Channel names aren't people, and Author repeats the sender.
     expect(screen.getByTestId("task-trigger-scope")).toHaveValue("");
     expect(screen.queryByTestId("task-trigger-condition-0")).not.toBeInTheDocument();
-    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+    expectWarningMessage(
+      "task-trigger-untrusted-note",
       "Anyone who can send you a direct message from one of these accounts may direct the agent",
     );
 
@@ -3949,10 +3965,12 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.getByTestId("task-name-input")).toHaveValue("Linear issues");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Issue created");
     expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("where team");
-    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+    expectWarningMessage(
+      "task-trigger-untrusted-note",
       "Anyone who can create an issue in this team may direct the agent",
     );
-    expect(showWarnings().getByTestId("task-trigger-tools-note")).toHaveTextContent(
+    expectWarningMessage(
+      "task-trigger-tools-note",
       "This only works if the agent has a Linear MCP server where this task runs.",
     );
     type("task-trigger-scope", "ENG");
@@ -3974,10 +3992,12 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.getByTestId("task-name-input")).toHaveValue("PagerDuty incidents");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Incident triggered");
     expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("where service");
-    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+    expectWarningMessage(
+      "task-trigger-untrusted-note",
       "Anyone who can trigger an incident on this service may direct the agent",
     );
-    expect(showWarnings().getByTestId("task-trigger-tools-note")).toHaveTextContent(
+    expectWarningMessage(
+      "task-trigger-tools-note",
       "This only works if the agent has a PagerDuty MCP server where this task runs.",
     );
     type("task-trigger-scope", "Checkout API");
@@ -4036,8 +4056,14 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("from");
     expect(screen.getByTestId("task-trigger-target")).toHaveValue("me");
     expect(screen.getByTestId("task-trigger-description")).toHaveTextContent(
-      "Runs your automation each time a matching review is requested on an open pull request that isn't a draft, including re-requests. Requests made before this automation existed are skipped.",
+      "Runs your automation each time a matching review is requested on an open pull request that isn't a draft, including re-requests.",
     );
+    expect(showMoreTriggerDetails()).toHaveTextContent(
+      "Requests made before this automation existed are skipped.",
+    );
+    fireEvent.keyDown(screen.getByRole("button", { name: "More trigger details" }), {
+      key: "Escape",
+    });
     expect(
       screen.getByRole("checkbox", { name: "Comment the session link on it" }),
     ).not.toBeChecked();
@@ -4121,11 +4147,13 @@ describe("CreateScheduledTaskDialog trigger template", () => {
   it("separates the rendered system and user prompts on Edit as prompt", async () => {
     renderTrigger("github");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Issue opened");
-    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+    expectWarningMessage(
+      "task-trigger-untrusted-note",
       "Anyone who can open an issue in this repository may direct the agent",
     );
     pick("task-trigger-event", "task-trigger-event-pr");
-    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+    expectWarningMessage(
+      "task-trigger-untrusted-note",
       "Anyone who can open a pull request in this repository may direct the agent",
     );
     type("task-trigger-scope", "acme/app");
@@ -4654,11 +4682,11 @@ describe("scheduler capabilities", () => {
       ).toEqual(["Every hour", "Every day", "Every weekday", "Every week"]);
       selectSchedulePreset("Every hour");
       openTopLevelPopover("task-ending-trigger");
-      fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
-      expect((await screen.findAllByRole("option")).map((option) => option.textContent)).toEqual([
-        "Never",
-        "On date",
-      ]);
+      expect(
+        within(screen.getByLabelText("Schedule ends"))
+          .getAllByRole("menuitemradio")
+          .map((option) => option.textContent),
+      ).toEqual(["Never", "On date"]);
     },
   );
 
@@ -4710,8 +4738,7 @@ describe("scheduler capabilities", () => {
           openTopLevelPopover("task-ending-trigger");
           expect(screen.getByLabelText("Occurrences")).toHaveValue(3);
           expect(screen.getByLabelText("Occurrences")).toBeDisabled();
-          fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
-          fireEvent.click(screen.getByRole("option", { name: "Never" }));
+          fireEvent.click(screen.getByRole("menuitemradio", { name: "Never" }));
         }
         if (index < replacements.length - 1) {
           expect(screen.getByRole("alert")).toHaveTextContent(
@@ -5336,7 +5363,7 @@ describe("automation random worktree", () => {
       if (directoryChanged) {
         gitWorkspace.path = "/ordinary-folder";
         openAutomationSection("Context");
-        fireEvent.click(screen.getByTestId("task-workspace-browse"));
+        fireEvent.click(screen.getByTestId("task-workspace-trigger"));
         fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
       }
       gitWorkspace.available = false;
@@ -5350,7 +5377,7 @@ describe("automation random worktree", () => {
       } else {
         // Reselect the ordinary folder to render the negative discovery result.
         openAutomationSection("Context");
-        fireEvent.click(screen.getByTestId("task-workspace-browse"));
+        fireEvent.click(screen.getByTestId("task-workspace-trigger"));
         fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
       }
       openAutomationSection("Context");
@@ -5372,7 +5399,7 @@ describe("automation random worktree", () => {
         gitWorkspace.available = true;
         gitWorkspace.path = "/home/me/repo";
         openAutomationSection("Context");
-        fireEvent.click(screen.getByTestId("task-workspace-browse"));
+        fireEvent.click(screen.getByTestId("task-workspace-trigger"));
         fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
         openAutomationSection("Context");
         expect(screen.getByRole("checkbox", { name: "Random worktree" })).not.toBeChecked();
@@ -5455,7 +5482,7 @@ describe("automation random worktree", () => {
     fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
     fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
     openAutomationSection("Context");
-    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    fireEvent.click(screen.getByTestId("task-workspace-trigger"));
     fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
     openAutomationSection("Context");
     const checkbox = screen.getByRole("checkbox", { name: "Random worktree" });

@@ -555,68 +555,108 @@ export function ScheduleFields({
       )}
     </div>
   );
+  const endingOptions: { value: string; label: string; disabled?: boolean }[] = [
+    { value: "never", label: "Never" },
+    { value: "until", label: "On date" },
+    ...(anchoredScheduling || model.end?.type === "count"
+      ? [{ value: "count", label: "After", disabled: !anchoredScheduling }]
+      : []),
+  ];
+  const endingDetails = (
+    <>
+      {model.end?.type === "until" && (
+        <>
+          <Input
+            type="date"
+            aria-label="End date"
+            aria-invalid={endingError ? true : undefined}
+            aria-describedby={endingError ? endingErrorId : undefined}
+            className="w-auto"
+            value={activeDateInput?.value ?? (until ? dateInTimezone(until, timezone) : "")}
+            onChange={(event) => changeEndDate(event.target.value, timezone)}
+          />
+          {minutely && timezonePicker}
+        </>
+      )}
+      {model.end?.type === "count" && (
+        <>
+          <Input
+            type="number"
+            aria-label="Occurrences"
+            aria-invalid={endingError ? true : undefined}
+            aria-describedby={endingError ? endingErrorId : undefined}
+            disabled={!anchoredScheduling}
+            min={2}
+            max={2147483647}
+            step={1}
+            className="w-24"
+            value={Number.isFinite(model.end.count) ? model.end.count : ""}
+            onChange={(event) =>
+              onChange({
+                ...model,
+                end: {
+                  type: "count",
+                  count: event.target.value === "" ? NaN : Number(event.target.value),
+                },
+              })
+            }
+          />
+          <span>occurrences</span>
+        </>
+      )}
+    </>
+  );
   const endingFields = (
     <div
-      className={cn("space-y-2 px-4 py-3", !embedded && "rounded-xl border border-border")}
+      className={cn("space-y-2", !embedded && "rounded-xl border border-border px-4 py-3")}
       data-testid="schedule-ending-fields"
     >
-      <div className="flex flex-wrap items-center gap-2 text-muted-foreground">
-        <span className="mr-auto text-foreground">Ends</span>
-        <ScheduleChoice
-          className="border-0 bg-transparent text-muted-foreground shadow-none dark:bg-transparent"
-          label="Schedule ends"
-          value={model.end?.type ?? "never"}
-          options={[
-            { value: "never", label: "Never" },
-            { value: "until", label: "On date" },
-            ...(anchoredScheduling || model.end?.type === "count"
-              ? [{ value: "count", label: "After", disabled: !anchoredScheduling }]
-              : []),
-          ]}
-          onChange={changeEnd}
-          onOpenChange={onSelectOpenChange}
-        />
-        {model.end?.type === "until" && (
-          <>
-            <Input
-              type="date"
-              aria-label="End date"
-              aria-invalid={endingError ? true : undefined}
-              aria-describedby={endingError ? endingErrorId : undefined}
-              className="w-auto"
-              value={activeDateInput?.value ?? (until ? dateInTimezone(until, timezone) : "")}
-              onChange={(event) => changeEndDate(event.target.value, timezone)}
-            />
-            {minutely && timezonePicker}
-          </>
-        )}
-        {model.end?.type === "count" && (
-          <>
-            <Input
-              type="number"
-              aria-label="Occurrences"
-              aria-invalid={endingError ? true : undefined}
-              aria-describedby={endingError ? endingErrorId : undefined}
-              disabled={!anchoredScheduling}
-              min={2}
-              max={2147483647}
-              step={1}
-              className="w-24"
-              value={Number.isFinite(model.end.count) ? model.end.count : ""}
-              onChange={(event) =>
-                onChange({
-                  ...model,
-                  end: {
-                    type: "count",
-                    count: event.target.value === "" ? NaN : Number(event.target.value),
-                  },
-                })
-              }
-            />
-            <span>occurrences</span>
-          </>
-        )}
-      </div>
+      {embedded ? (
+        <>
+          <DropdownMenuRadioGroup
+            value={model.end?.type ?? "never"}
+            onValueChange={changeEnd}
+            aria-label="Schedule ends"
+          >
+            {endingOptions.map((option) => {
+              return (
+                <DropdownMenuRadioItem
+                  key={option.value}
+                  value={option.value}
+                  disabled={option.disabled}
+                  className="data-[state=checked]:bg-muted data-[state=checked]:font-medium"
+                  onSelect={(event) => {
+                    if (option.value !== "never") event.preventDefault();
+                  }}
+                >
+                  {option.label}
+                </DropdownMenuRadioItem>
+              );
+            })}
+          </DropdownMenuRadioGroup>
+          {model.end && (
+            <div
+              className="flex flex-wrap items-center justify-end gap-2 border-t border-border px-1.5 pt-2 text-muted-foreground"
+              onKeyDown={(event) => event.stopPropagation()}
+            >
+              {endingDetails}
+            </div>
+          )}
+        </>
+      ) : (
+        <div className="flex flex-wrap items-center gap-2 text-muted-foreground">
+          <span className="mr-auto text-foreground">Ends</span>
+          <ScheduleChoice
+            className="border-0 bg-transparent text-muted-foreground shadow-none dark:bg-transparent"
+            label="Schedule ends"
+            value={model.end?.type ?? "never"}
+            options={endingOptions}
+            onChange={changeEnd}
+            onOpenChange={onSelectOpenChange}
+          />
+          {endingDetails}
+        </div>
+      )}
       {model.end?.type === "count" && (
         <p className="text-sm text-muted-foreground">
           Counts scheduled occurrences since creation.
