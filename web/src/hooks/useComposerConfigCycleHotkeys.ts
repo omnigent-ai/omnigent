@@ -4,6 +4,7 @@ import type { ComposerConfigChoice } from "@/components/composer/ComposerConfigS
 import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 /** Ctrl+Alt+M/E cycles the same model/effort choices offered by the composer menu. */
 export function useComposerConfigCycleHotkeys(
@@ -67,21 +68,17 @@ export function useComposerConfigCycleHotkeys(
       if (
         event.defaultPrevented ||
         event.repeat ||
-        isImeCompositionKeyEvent({ nativeEvent: event }) ||
-        !event.ctrlKey ||
-        !event.altKey ||
-        event.metaKey ||
-        event.shiftKey ||
-        event.getModifierState("AltGraph")
+        isImeCompositionKeyEvent({ nativeEvent: event })
       )
         return;
       // Ctrl on macOS too: Cmd+Alt+M minimizes every window.
-      const choices =
-        event.code === "KeyM"
-          ? latest.current.models
-          : event.code === "KeyE"
-            ? latest.current.efforts
-            : undefined;
+      const section = matchesShortcut(event, "model.cycle")
+        ? "models"
+        : matchesShortcut(event, "effort.cycle")
+          ? "efforts"
+          : undefined;
+      if (section === undefined) return;
+      const choices = section === "models" ? latest.current.models : latest.current.efforts;
       if (!choices?.length) return;
       const embedRoot = getEmbedRoot();
       if (isEmbedded && (!embedRoot || !event.composedPath().includes(embedRoot))) return;
@@ -98,7 +95,7 @@ export function useComposerConfigCycleHotkeys(
         event.preventDefault();
         event.stopPropagation();
         choice.onSelect();
-        setPreviewRequest({ section: event.code === "KeyM" ? "models" : "efforts" });
+        setPreviewRequest({ section });
         return;
       }
     };
