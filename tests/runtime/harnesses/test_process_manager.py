@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import shutil
@@ -47,6 +48,7 @@ from omnigent.runtime.harnesses.process_manager import (
     HarnessProcessManager,
     NoLiveHarnessError,
     _default_tmp_parent,
+    _HarnessHttpClient,
     _kill_orphan_runners,
     _model_env_key,
     _pid_alive,
@@ -145,6 +147,46 @@ async def test_get_client_before_start_raises(
     """
     with pytest.raises(RuntimeError, match="before start"):
         await manager.get_client("conv_x", _TEST_HARNESS_NAME)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Привет 🐍", "Привет 🐍 recording-\udcff.txt \ud800", r"literal \udcff"],
+    ids=["unicode", "surrogates", "literal-escape"],
+)
+async def test_harness_client_preserves_json_text(text: str) -> None:
+    """Escaping surrogate code points preserves text, header overrides and strict JSON."""
+    async with _HarnessHttpClient(
+        headers={"Content-Type": "application/vnd.harness+json"}
+    ) as client:
+        event = {"content": [{"text": text}], text: "nested key"}
+        request = client.build_request("POST", "http://harness/events", json=event)
+        assert json.loads(request.content) == event
+        assert request.headers["content-type"] == "application/vnd.harness+json"
+        assert text.split()[0] in request.content.decode("utf-8")
+        with pytest.raises(ValueError, match="Out of range float"):
+            client.build_request(
+                "POST", "http://harness/events", json={"text": text, "n": float("nan")}
+            )
+
+
+async def test_harness_client_delivers_json_with_surrogate_text(
+    manager: HarnessProcessManager,
+) -> None:
+    """Surrogates in retained content cannot crash HTTPX before harness delivery."""
+    event = {"type": "interrupt", "content": "Привет 🐍 recording-\udcff.txt \ud800"}
+    await manager.start()
+    try:
+        client = await manager.get_client("conv_unicode", _TEST_HARNESS_NAME)
+        async with client.stream(
+            "POST", "/v1/sessions/conv_unicode/events", json=event
+        ) as response:
+            assert response.status_code == 204
+        assert response.request.headers["content-type"] == "application/json"
+        assert json.loads(response.request.content) == event
+        assert "Привет 🐍" in response.request.content.decode("utf-8")
+    finally:
+        await manager.shutdown()
 
 
 async def test_start_creates_instance_dir_with_sentinel(
@@ -446,6 +488,55 @@ async def test_release_terminates_subprocess(
                 break
             await asyncio.sleep(0.05)
         assert not _pid_alive(pid)
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "change", ["replacement", "late_registration", "ownership", "activity", None]
+)
+async def test_conditional_release_rechecks_ownership_after_spawn_lock(
+    manager: HarnessProcessManager, change: str | None
+) -> None:
+    """A delayed release retires only its original registration and ownership."""
+    await manager.start()
+    try:
+        session_id = "conditional-release"
+        assert manager.registered_client(session_id) is None
+        original = await manager.get_client(session_id, _TEST_HARNESS_NAME)
+        assert manager.registered_client(session_id) is original
+        original_epoch = 1
+        current_epoch = original_epoch
+        spawn_lock = await manager._get_spawn_lock(session_id)
+        async with spawn_lock:
+            closing = asyncio.create_task(
+                manager.release(
+                    session_id,
+                    expected_client=None if change == "late_registration" else original,
+                    can_release=lambda: current_epoch == original_epoch,
+                )
+            )
+            await asyncio.sleep(0)
+            assert not closing.done()
+            if change == "replacement":
+                replacement = httpx.AsyncClient()
+                manager._entries[session_id].client = replacement
+            elif change == "ownership":
+                current_epoch += 1
+            elif change == "activity":
+                manager.note_activity(session_id)
+            manager.mark_in_flight(session_id, "live-response")
+        await closing
+        if change in {"replacement", "late_registration", "ownership"}:
+            assert manager.has_session(session_id)
+            assert manager.has_active_turn(session_id)
+            assert not original.is_closed
+            assert session_id not in manager._release_generations
+        else:
+            assert not manager.has_session(session_id)
+            assert not manager.has_active_turn(session_id)
+            assert original.is_closed
+        await original.aclose()
     finally:
         await manager.shutdown()
 

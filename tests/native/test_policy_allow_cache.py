@@ -218,6 +218,34 @@ def _compact(payload: dict[str, object]) -> str:
     return json.dumps(payload, separators=(",", ":"))
 
 
+# Claude Code 2.1.312 sends its effort setting as an object before the event keys.
+_CLAUDE_TOOL_CALL = {
+    "session_id": "2f722723-fef0-4a6e-b3e0-bee6f5edd71a",
+    "transcript_path": "/home/u/.claude/projects/-tmp-w/2f722723.jsonl",
+    "cwd": "/tmp/w",
+    "prompt_id": "33d1d7ea-3a6b-4827-8bb0-c34c23c14a44",
+    "permission_mode": "default",
+    "effort": {"level": "medium"},
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Read",
+    "tool_input": {"file_path": "/tmp/w/x.txt"},
+}
+_CODEX_TOOL_CALL = {
+    "session_id": "s",
+    "turn_id": "t",
+    "agent_id": None,
+    "agent_type": None,
+    "transcript_path": None,
+    "cwd": "/tmp/w",
+    "hook_event_name": "PreToolUse",
+    "model": "gpt-5.5",
+    "permission_mode": "default",
+    "tool_name": "exec_command",
+    "tool_input": {"cmd": "ls"},
+    "tool_use_id": "u",
+}
+
+
 @pytest.mark.parametrize(
     ("payload", "window", "answered_in_shell"),
     [
@@ -237,6 +265,79 @@ def _compact(payload: dict[str, object]) -> str:
             False,
         ),
         (_compact({"hook_event_name": "PermissionRequest", "tool_name": "Bash"}), "open", False),
+        (_compact(_CLAUDE_TOOL_CALL), "open", True),
+        (
+            _compact(
+                {**_CLAUDE_TOOL_CALL, "hook_event_name": "PostToolUse", "tool_response": {"ok": 1}}
+            ),
+            "open",
+            True,
+        ),
+        (_compact(_CODEX_TOOL_CALL), "open", True),
+        (
+            _compact(
+                {
+                    "tags": ["a", {"b": [1]}],
+                    "meta": {"c": {}},
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                }
+            ),
+            "open",
+            True,
+        ),
+        (
+            _compact(
+                {
+                    "effort": {"level": "medium"},
+                    "tool_input": {"hook_event_name": "UserPromptSubmit"},
+                }
+            ),
+            "open",
+            False,
+        ),
+        (
+            _compact(
+                {
+                    "effort": {"level": "medium"},
+                    "hook_event_name": "PreToolUse",
+                    "tool_input": {"tool_name": "Bash"},
+                }
+            ),
+            "open",
+            False,
+        ),
+        (
+            _compact({"cwd": "/tmp/a]}b", "hook_event_name": "PreToolUse", "tool_name": "Bash"}),
+            "open",
+            True,
+        ),
+        (
+            _compact({"tool_input": {"a": "}", "hook_event_name": "UserPromptSubmit"}}),
+            "open",
+            False,
+        ),
+        (
+            _compact(
+                {
+                    "meta": {"a": "]}", "hook_event_name": "UserPromptSubmit"},
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                }
+            ),
+            "open",
+            False,
+        ),
+        (
+            _compact({"cwd": "C:\\w", "hook_event_name": "PreToolUse", "tool_name": "Bash"}),
+            "open",
+            False,
+        ),
+        (
+            _compact({"cwd": 'a"b', "hook_event_name": "PreToolUse", "tool_name": "Bash"}),
+            "open",
+            False,
+        ),
         (
             _compact(
                 {
@@ -253,6 +354,11 @@ def _compact(payload: dict[str, object]) -> str:
         (_compact({"hook_event_name": "PreToolUse", "tool_name": "Bash"}), "unreadable", False),
         (_compact({"hook_event_name": "PreToolUse", "tool_name": "Bash"}), "absent", False),
         (_compact({"hook_event_name": "PreToolUse", "tool_name": "Bash"}), "revoked", False),
+        (
+            _compact({"hook_event_name": "PreToolUse", "tool_name": "Bash"}) + "\n\n",
+            "absent",
+            False,
+        ),
     ],
     ids=[
         "tool_call",
@@ -263,12 +369,24 @@ def _compact(payload: dict[str, object]) -> str:
         "tool_name_nested_in_input",
         "event_name_nested_in_input",
         "other_event_with_tool_name",
+        "claude_tool_call_after_effort",
+        "claude_tool_result_after_effort",
+        "codex_tool_call",
+        "nested_metadata_before_keys",
+        "event_name_nested_after_metadata",
+        "tool_name_nested_after_metadata",
+        "brackets_in_string_value",
+        "nested_key_after_closer_in_string",
+        "nested_key_in_metadata_after_closers_in_string",
+        "escaped_backslash_defers",
+        "escaped_quote_defers",
         "large_tool_result",
         "large_payload_without_keys",
         "expired",
         "unreadable",
         "absent",
         "revoked",
+        "closed_window_keeps_stdin_exact",
     ],
 )
 def test_guarded_hook_command_answers_only_open_windows_and_valid_events(

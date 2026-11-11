@@ -41,11 +41,19 @@ _SOURCE_IDS = {
 
 class _ShellPermissionStore(_StubPermissionStore):
     def list_for_session(
-        self, session_id: str, *, limit: int
-    ) -> tuple[list[SessionPermission], None]:
-        return [grant for grant in self._grants.values() if grant.conversation_id == session_id][
-            :limit
-        ], None
+        self, session_id: str, *, limit: int = 100, after_user_id: str | None = None
+    ) -> tuple[list[SessionPermission], str | None]:
+        grants = sorted(
+            (
+                grant
+                for grant in self._grants.values()
+                if grant.conversation_id == session_id
+                and (after_user_id is None or grant.user_id > after_user_id)
+            ),
+            key=lambda grant: grant.user_id,
+        )
+        page = grants[:limit]
+        return page, page[-1].user_id if len(grants) > limit else None
 
 
 class _ShellRunnerClient(_FakeRunnerClient):
@@ -97,7 +105,9 @@ async def codex_client(
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
         permission_store=permissions,
     )
-    app.state.feature_flags = FeatureFlags(frozenset({Feature.SESSION_ORCHESTRATION}))
+    app.state.feature_flags = FeatureFlags(
+        frozenset({Feature.SESSION_ORCHESTRATION, Feature.PEER_SESSION_MESSAGING})
+    )
     pending_inputs.reset_for_tests()
     try:
         async with httpx.AsyncClient(
