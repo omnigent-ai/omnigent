@@ -68,6 +68,7 @@ export type FeatureKey =
   | "grid_sessions_display_ui"
   | "automations_v2"
   | "splittable_terminal_view_ui"
+  | "sidebar_windowed_rows"
   | "session_orchestration";
 
 /** Deployment-wide release-feature values advertised by the server. */

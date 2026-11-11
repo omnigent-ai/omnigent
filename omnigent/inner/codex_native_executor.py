@@ -11,6 +11,7 @@ import logging
 import os
 import uuid
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal, cast
 
@@ -139,6 +140,13 @@ _CODEX_DELIVERY_UNCONFIRMED_FAILURE = CodexStartupFailure(
     title="Codex delivery is unconfirmed",
     remediation="Check the native terminal for the message before sending it again.",
 )
+_CODEX_SETTINGS_UPDATE_FAILED = CodexStartupFailure(
+    message="Codex did not confirm the model settings, so this message was not delivered.",
+    code="codex_settings_update_failed",
+    title="Codex model settings unconfirmed",
+    remediation="Check the model settings in the native terminal, then retry this message. "
+    "The settings may already have changed.",
+)
 _CODEX_SHELL_AUTHORIZATION_REQUIRED = CodexStartupFailure(
     message="This shell command was not delivered because the server did not authorize "
     "native shell execution.",
@@ -171,6 +179,14 @@ class _CodexNativeInputUndelivered(RuntimeError):
         self.failure = failure
         self.preserve_session = preserve_session
         super().__init__(failure.message)
+
+
+class _CodexNativeSettingsUpdateFailed(RuntimeError):
+    """A settings request failed before any native input was submitted."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        super().__init__(str(error))
 
 
 async def _wait_for_bridge_state(
@@ -571,13 +587,17 @@ async def _start_codex_turn(
         )
     if settings_overrides:
         _require_codex_binding(bridge_dir, state)
-        await client.request(
-            "thread/settings/update",
-            {
-                "threadId": state.thread_id,
-                **settings_overrides,
-            },
-        )
+        try:
+            async with asyncio.timeout(_DELIVERY_RPC_TIMEOUT_SECONDS):
+                await client.request(
+                    "thread/settings/update",
+                    {
+                        "threadId": state.thread_id,
+                        **settings_overrides,
+                    },
+                )
+        except (CodexAppServerResponseError, OSError, WebSocketException) as exc:
+            raise _CodexNativeSettingsUpdateFailed(exc) from exc
         _require_codex_binding(bridge_dir, state)
         # The forwarder and a fresh forwarder state (thread resume / reconnect)
         # re-read config.toml, so mirror what applied; without it they would
@@ -1302,6 +1322,17 @@ class CodexNativeExecutor(Executor):
                                 settings_overrides=settings_overrides,
                             )
                     except Exception as exc:
+                        settings_update_failed = isinstance(exc, _CodexNativeSettingsUpdateFailed)
+                        if isinstance(exc, _CodexNativeSettingsUpdateFailed):
+                            exc = exc.error
+                            startup_failure = _CODEX_SETTINGS_UPDATE_FAILED
+                            if isinstance(exc, CodexAppServerResponseError) and exc.message:
+                                startup_failure = replace(
+                                    startup_failure,
+                                    message=f"{startup_failure.message}\n\n{exc.message}",
+                                )
+                            undelivered = True
+                            preserve_session = True
                         if isinstance(exc, InjectionDeliveryAmbiguous):
                             startup_failure = _CODEX_DELIVERY_UNCONFIRMED_FAILURE
                             delivery_unconfirmed = True
@@ -1351,7 +1382,9 @@ class CodexNativeExecutor(Executor):
                                         if isinstance(exc, CodexAppServerResponseError)
                                         else None
                                     ),
-                                    stage="native_rpc",
+                                    stage="settings_update"
+                                    if settings_update_failed
+                                    else "native_rpc",
                                     outcome="undelivered" if undelivered else "error",
                                 )
                             ),
