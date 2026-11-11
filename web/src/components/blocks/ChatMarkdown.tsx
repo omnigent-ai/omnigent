@@ -31,7 +31,9 @@ import {
   shortFileCitationLabel,
   splitWorkspaceFileCitation,
   WORKSPACE_FILE_LINK_ATTR,
+  WORKSPACE_IMAGE_ATTR,
 } from "@/components/ai-elements/streamdown-security";
+import { WorkspaceMarkdownImage } from "./WorkspaceMarkdownImage";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import {
   ContextMenu,
@@ -517,8 +519,12 @@ function ZoomableMarkdownImage({
   src,
   alt,
   node: _node,
+  [WORKSPACE_IMAGE_ATTR]: workspacePath,
   ...props
-}: WithHastNode<React.ComponentProps<"img">>) {
+}: WithHastNode<React.ComponentProps<"img">> & { [WORKSPACE_IMAGE_ATTR]?: string }) {
+  if (workspacePath) {
+    return <WorkspaceMarkdownImage path={workspacePath} alt={alt ?? ""} />;
+  }
   const resolvedSrc = typeof src === "string" ? src : undefined;
   return <ZoomableImage {...props} src={resolvedSrc} alt={alt ?? ""} />;
 }

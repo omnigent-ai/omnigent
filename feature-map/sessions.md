@@ -312,7 +312,10 @@ the automation's page for the automations list. With automations off for the
 caller, the session is deleted alone and its automation pauses at its next run.
 
 **Project folder:** right-click its header or open its three-dot menu, then
-choose Rename project. Start typing as soon as the dialog opens.
+choose Rename project. Start typing as soon as the dialog opens. Delete project
+archives every session in the folder; when any of them has an agent working,
+awaiting approval, or running background work, the dialog says how many and
+that deleting stops them, then asks again with Delete anyway.
 
 **Project folder sessions:** expand a project with more than five sessions,
 then click Show more under its rows. Opening one of its older sessions from

@@ -671,10 +671,21 @@ def _default_claude_model_from(entries: list[_PiModelEntry]) -> str | None:
 
 def _select_databricks_claude_model(model: str | None, claude_models: list[_PiModelEntry]) -> str:
     """Resolve an implicit Databricks default to an equivalent served Claude id."""
-    selected_model = (
-        model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id
-    )
-    if model is not None or not claude_models:
+    if model:
+        return model
+    try:
+        selected_model = model_catalog.resolve_catalog_model(
+            "databricks", family="claude"
+        ).model_id
+    except model_catalog.ModelResolutionError:
+        # The catalog only ranks the served ids, so an unreachable catalog must
+        # not cost the launch its provider when the workspace listed Claude models.
+        fallback = _default_claude_model_from(claude_models)
+        if fallback is None:
+            raise
+        _LOGGER.warning("pi-native: model catalog unavailable; using served model %s", fallback)
+        return fallback
+    if not claude_models:
         return selected_model
     served_model = preferred_served_claude_model(
         (model_id for item in claude_models if isinstance((model_id := item.get("id")), str)),
