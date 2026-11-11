@@ -1,17 +1,18 @@
-// Tests for the pure helpers in src/omnigent_cli.js, run with `node --test`
+// Tests for the pure helpers in src/omnigent_cli.ts, run with `node --test`
 // (no extra deps). Most spawning functions need a real binary and are covered by
 // the manual verification flow; here we test path resolution order, server-URL
 // matching, status parsing, and runCli's failure classification — the logic that
 // decides "is this machine connected to server X?" and "which omnigent binary do we run?".
 
-const { describe, it, mock, afterEach } = require("node:test");
-const assert = require("node:assert/strict");
-const fs = require("fs");
-const http = require("http");
-const os = require("os");
-const path = require("path");
+import { describe, it, mock, afterEach } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
+import os from "node:os";
+import path from "node:path";
 
-const {
+import {
   normalizeServerUrl,
   isLoopbackServer,
   sameLoopbackServer,
@@ -32,7 +33,17 @@ const {
   localHostId,
   readLocalHostId,
   liveDaemonRecordFor,
-} = require("../src/omnigent_cli");
+  type DaemonRecord,
+} from "../src/omnigent_cli.ts";
+
+/** The `fetch` options these probes pass. */
+interface FetchInit {
+  headers: Record<string, string>;
+  redirect?: string;
+}
+
+/** A partial registry record; the function under test reads only these fields. */
+const daemonFixture = (fields: Partial<DaemonRecord>) => fields as DaemonRecord;
 
 describe("cliCommandParts", () => {
   it("keeps plain CLI paths bare and adds fixed isaac argv without a shell", () => {
@@ -63,7 +74,10 @@ describe("cliCommandParts", () => {
 });
 
 describe("runCli", () => {
-  const nodeScript = (source) => ({ executable: process.execPath, prefixArgs: ["-e", source] });
+  const nodeScript = (source: string) => ({
+    executable: process.execPath,
+    prefixArgs: ["-e", source],
+  });
 
   it("resolves a clean exit with its output and no failure", async () => {
     assert.deepEqual(await runCli(nodeScript('process.stdout.write("hi")'), []), {
@@ -83,7 +97,7 @@ describe("runCli", () => {
     "keeps the timeout diagnosis when the child answers the kill with an exit code",
     { skip: process.platform === "win32" && "POSIX signals", timeout: 10000 },
     async () => {
-      const trapsSigterm = path.join(__dirname, "fixtures", "traps-sigterm.sh");
+      const trapsSigterm = path.join(import.meta.dirname, "fixtures", "traps-sigterm.sh");
       const res = await runCli({ executable: "/bin/sh", prefixArgs: [trapsSigterm] }, [], {
         timeoutMs: 1000,
       });
@@ -172,7 +186,7 @@ describe("localServerHealthy", () => {
   });
 
   // Point the data dir at a temp dir holding `pidfile` (or none).
-  function withPidfile(pidfile) {
+  function withPidfile(pidfile: string | undefined) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-pidfile-test-"));
     if (pidfile !== undefined) fs.writeFileSync(path.join(dir, "local_server.pid"), pidfile);
     process.env.OMNIGENT_DATA_DIR = dir;
@@ -181,10 +195,10 @@ describe("localServerHealthy", () => {
   // A loopback server answering /health; resolves its port.
   async function healthServer() {
     const server = http.createServer((_req, res) => res.end("ok"));
-    await new Promise((resolve) => {
+    await new Promise<void>((resolve) => {
       server.listen(0, "127.0.0.1", resolve);
     });
-    return { server, port: server.address().port };
+    return { server, port: (server.address() as AddressInfo).port };
   }
 
   it("is null without a pidfile", async () => {
@@ -384,7 +398,7 @@ describe("parseDaemonRecord", () => {
   });
 
   it("coerces a string pid (registry writes it either way)", () => {
-    assert.equal(parseDaemonRecord({ pid: "99", target: "local", mode: "local" }).pid, 99);
+    assert.equal(parseDaemonRecord({ pid: "99", target: "local", mode: "local" })?.pid, 99);
   });
 
   it("rejects malformed records", () => {
@@ -399,18 +413,20 @@ describe("parseDaemonRecord", () => {
 describe("daemonServerUrl", () => {
   it("uses resolved_server_url for a local-mode daemon, stripping trailing slash", () => {
     assert.equal(
-      daemonServerUrl({ mode: "local", resolved_server_url: "http://127.0.0.1:6767/" }),
+      daemonServerUrl(
+        daemonFixture({ mode: "local", resolved_server_url: "http://127.0.0.1:6767/" }),
+      ),
       "http://127.0.0.1:6767",
     );
   });
 
   it("uses server_url (then target) for a server-mode daemon", () => {
     assert.equal(
-      daemonServerUrl({ mode: "server", server_url: "https://x.com/" }),
+      daemonServerUrl(daemonFixture({ mode: "server", server_url: "https://x.com/" })),
       "https://x.com",
     );
     assert.equal(
-      daemonServerUrl({ mode: "server", server_url: null, target: "https://y.com" }),
+      daemonServerUrl(daemonFixture({ mode: "server", server_url: null, target: "https://y.com" })),
       "https://y.com",
     );
   });
@@ -440,8 +456,8 @@ describe("getHostConnectionFast — probe destination & token handling (S1)", ()
     mock.method(fs, "readdirSync", () => ["x.json"]);
     mock.method(fs, "readFileSync", () => JSON.stringify(record));
 
-    const calls = [];
-    mock.method(globalThis, "fetch", async (target, init) => {
+    const calls: { target: unknown; headers: Record<string, string> }[] = [];
+    mock.method(globalThis, "fetch", async (target: unknown, init?: FetchInit) => {
       calls.push({ target, headers: init?.headers ?? {} });
       return { ok: true, json: async () => ({ status: "online" }) };
     });
@@ -452,7 +468,7 @@ describe("getHostConnectionFast — probe destination & token handling (S1)", ()
     // Exact-match the full probe URL: it pins the host to the window's
     // serverUrl, proving the probe did NOT go to the record's `server_url`
     // (https://evil.com).
-    assert.equal(calls[0].target, "http://localhost:6767/v1/hosts/host_abc");
+    assert.equal(calls[0]?.target, "http://localhost:6767/v1/hosts/host_abc");
     assert.equal(res.connected, true);
   });
 
@@ -471,8 +487,8 @@ describe("getHostConnectionFast — probe destination & token handling (S1)", ()
     mock.method(fs, "readdirSync", () => ["x.json"]);
     mock.method(fs, "readFileSync", () => JSON.stringify(record));
 
-    const calls = [];
-    mock.method(globalThis, "fetch", async (target, init) => {
+    const calls: { target: unknown; headers: Record<string, string> }[] = [];
+    mock.method(globalThis, "fetch", async (target: unknown, init?: FetchInit) => {
       calls.push({ target, headers: init?.headers ?? {} });
       return { ok: true, json: async () => ({ status: "online" }) };
     });
@@ -480,7 +496,7 @@ describe("getHostConnectionFast — probe destination & token handling (S1)", ()
     await getHostConnectionFast("http://localhost:6767", { timeoutMs: 100 });
 
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].headers.Authorization, undefined);
+    assert.equal(calls[0]?.headers.Authorization, undefined);
   });
 });
 
@@ -491,8 +507,8 @@ describe("probeServerAuth — /v1/me auth gate", () => {
 
   it("returns authed for a 200 and targets {server}/v1/me with redirect:manual", async () => {
     mock.method(fs, "readFileSync", () => "{}"); // no stored token
-    const calls = [];
-    mock.method(globalThis, "fetch", async (target, init) => {
+    const calls: { target: unknown; init: FetchInit | undefined }[] = [];
+    mock.method(globalThis, "fetch", async (target: unknown, init?: FetchInit) => {
       calls.push({ target, init });
       return { status: 200 };
     });
@@ -501,8 +517,8 @@ describe("probeServerAuth — /v1/me auth gate", () => {
 
     assert.deepEqual(res, { authed: true, reachable: true });
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].target, "https://app.example.com/v1/me");
-    assert.equal(calls[0].init.redirect, "manual");
+    assert.equal(calls[0]?.target, "https://app.example.com/v1/me");
+    assert.equal(calls[0]?.init?.redirect, "manual");
   });
 
   it("returns not-authed for non-200 statuses (Databricks 302, opaque-redirect 0, 401)", async () => {
@@ -541,31 +557,33 @@ describe("probeServerAuth — /v1/me auth gate", () => {
     mock.method(fs, "readFileSync", () =>
       JSON.stringify({ [url]: { token: "sess-123", expires_at: Date.now() / 1000 + 3600 } }),
     );
-    let seen;
-    mock.method(globalThis, "fetch", async (_target, init) => {
+    let seen: Record<string, string> | undefined;
+    mock.method(globalThis, "fetch", async (_target: unknown, init: FetchInit) => {
       seen = init.headers;
       return { status: 200 };
     });
     await probeServerAuth(url);
-    assert.equal(seen.Authorization, "Bearer sess-123");
+    assert.equal(seen?.Authorization, "Bearer sess-123");
 
     // Databricks pointer → no in-process token → no Authorization header (the
     // unauthenticated probe correctly yields not-authed and defers to login).
     mock.method(fs, "readFileSync", () =>
       JSON.stringify({ [url]: { auth_type: "databricks", workspace_host: "https://ws" } }),
     );
-    seen = undefined;
-    mock.method(globalThis, "fetch", async (_target, init) => {
+    // Widened again: the fetch mock below assigns it.
+    seen = undefined as Record<string, string> | undefined;
+    mock.method(globalThis, "fetch", async (_target: unknown, init: FetchInit) => {
       seen = init.headers;
       return { status: 302 };
     });
     await probeServerAuth(url);
+    assert.ok(seen, "the pointer probe still calls fetch");
     assert.equal(seen.Authorization, undefined);
   });
 
   it("returns unreachable without fetching for an empty server URL", async () => {
-    const calls = [];
-    mock.method(globalThis, "fetch", async (target) => {
+    const calls: unknown[] = [];
+    mock.method(globalThis, "fetch", async (target: unknown) => {
       calls.push(target);
       return { status: 200 };
     });
@@ -582,7 +600,7 @@ describe("liveDaemonRecordFor", () => {
 
   it("skips a dead matching record before a live record", async () => {
     const dead = process.pid + 1;
-    mock.method(process, "kill", (pid) => {
+    mock.method(process, "kill", (pid: number) => {
       if (pid === dead) throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
       assert.equal(pid, process.pid);
       return true;
@@ -594,10 +612,10 @@ describe("liveDaemonRecordFor", () => {
       host_id: "local",
     }));
     mock.method(fs, "readdirSync", () => ["dead.json", "live.json"]);
-    mock.method(fs, "readFileSync", (filename) =>
+    mock.method(fs, "readFileSync", (filename: string) =>
       JSON.stringify(records[filename.endsWith("dead.json") ? 0 : 1]),
     );
-    assert.equal(liveDaemonRecordFor("https://server.example").pid, process.pid);
+    assert.equal(liveDaemonRecordFor("https://server.example")?.pid, process.pid);
     assert.equal(
       (await getHostConnectionFast("https://server.example", { probe: false })).connected,
       true,
@@ -614,7 +632,7 @@ describe("liveDaemonRecordFor", () => {
     };
     mock.method(fs, "readdirSync", () => ["live.json"]);
     mock.method(fs, "readFileSync", () => JSON.stringify(record));
-    assert.equal(liveDaemonRecordFor("http://localhost:6767").pid, process.pid);
+    assert.equal(liveDaemonRecordFor("http://localhost:6767")?.pid, process.pid);
     assert.equal(liveDaemonRecordFor("http://localhost:6768"), null);
   });
 });
@@ -659,7 +677,7 @@ describe("probeHostTunnel slice key", () => {
   });
 
   // A stored live token for `serverUrl`, and a fetch that reports the host online.
-  function probeWithToken(serverUrl) {
+  function probeWithToken(serverUrl: string) {
     mock.method(fs, "readFileSync", () =>
       JSON.stringify({ [serverUrl]: { token: "tok", expires_at: Date.now() / 1000 + 3600 } }),
     );
@@ -669,8 +687,10 @@ describe("probeHostTunnel slice key", () => {
     }));
   }
 
-  const sliceKey = (fetch, call = 0) =>
-    fetch.mock.calls[call].arguments[1].headers["X-Databricks-Omnigent-Slice-Key"];
+  const sliceKey = (fetch: ReturnType<typeof probeWithToken>, call = 0) =>
+    (fetch.mock.calls[call]?.arguments[1] as FetchInit | undefined)?.headers[
+      "X-Databricks-Omnigent-Slice-Key"
+    ];
 
   it("keys the probe by host on the workspace mount", async () => {
     delete process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED;

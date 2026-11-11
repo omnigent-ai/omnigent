@@ -1,37 +1,44 @@
-"use strict";
+import assert from "node:assert/strict";
+import Module, { createRequire } from "node:module";
+import { afterEach, describe, it } from "node:test";
 
-const assert = require("node:assert/strict");
-const Module = require("node:module");
-const { afterEach, describe, it } = require("node:test");
+import { registerTestOverride, withTestOverrides } from "../src/testOverrides.ts";
 
-const { registerTestOverride, withTestOverrides } = require("../src/testOverrides");
-
+const require = createRequire(import.meta.url);
 const originalRequire = Module.prototype.require;
 
-/** Make `require("electron")` return `electron` in every module. */
-function stubRequireElectron(electron) {
-  Module.prototype.require = function (id, ...args) {
-    if (id === "electron") return electron;
-    return originalRequire.call(this, id, ...args);
+/** Replace `require` in every module; `load` answers an id or defers to Node. */
+function stubRequire(load: (id: string) => { value: unknown } | undefined) {
+  Module.prototype.require = function (this: Module, id: string, ...args: unknown[]): unknown {
+    const stubbed = load(id);
+    if (stubbed) return stubbed.value;
+    return Reflect.apply(originalRequire, this, [id, ...args]);
   };
 }
 
+/** Make `require("electron")` return `electron` in every module. */
+function stubRequireElectron(electron: unknown) {
+  stubRequire((id) => (id === "electron" ? { value: electron } : undefined));
+}
+
 /** Make `require("electron")` return an app with the given packaging state. */
-function stubElectron(isPackaged) {
+function stubElectron(isPackaged: boolean) {
   stubRequireElectron({ app: { isPackaged } });
 }
 
 afterEach(() => {
   Module.prototype.require = originalRequire;
-  delete globalThis.omnigentTestOverrides;
+  Reflect.deleteProperty(globalThis, "omnigentTestOverrides");
 });
 
 describe("withTestOverrides", () => {
   it("applies overrides in registration order in an unpackaged app", () => {
     stubElectron(false);
-    const original = { greet: (name) => `hello ${name}`, keep: () => "kept" };
+    const original = { greet: (name: string) => `hello ${name}`, keep: () => "kept" };
     registerTestOverride("greeter", () => ({ greet: () => "replaced" }));
-    registerTestOverride("greeter", ({ greet }) => ({ greet: (name) => `${greet(name)}!` }));
+    registerTestOverride("greeter", ({ greet }) => ({
+      greet: (name: string) => `${(greet as (name: string) => string)(name)}!`,
+    }));
 
     const overridden = withTestOverrides("greeter", original);
 
@@ -58,10 +65,10 @@ describe("withTestOverrides", () => {
   });
 
   it("returns the exports unchanged without loading Electron when nothing is registered", () => {
-    Module.prototype.require = function (id, ...args) {
+    stubRequire((id) => {
       assert.notEqual(id, "electron");
-      return originalRequire.call(this, id, ...args);
-    };
+      return undefined;
+    });
     const original = { greet: () => "hello" };
 
     assert.equal(withTestOverrides("greeter", original), original);
@@ -71,7 +78,8 @@ describe("withTestOverrides", () => {
 
   it("overrides exports of an ES module namespace", async () => {
     stubElectron(false);
-    const namespace = await import("data:text/javascript,export const answer = () => 1;");
+    const source = "data:text/javascript,export const answer = () => 1;";
+    const namespace: { answer: () => number } = await import(source);
     registerTestOverride("answers", () => ({ answer: () => 2 }));
 
     assert.equal(withTestOverrides("answers", namespace).answer(), 2);
@@ -90,7 +98,11 @@ describe("withTestOverrides", () => {
     // A fresh copy so the onboarding module requires its dependency again.
     const onboardingPath = require.resolve("../src/arca_onboarding");
     Reflect.deleteProperty(require.cache, onboardingPath);
-    const { startArcaSetup } = require(onboardingPath);
+    const {
+      startArcaSetup,
+    }: {
+      startArcaSetup: (url: string) => { command: unknown; promise: Promise<unknown> };
+    } = require(onboardingPath);
     Reflect.deleteProperty(require.cache, onboardingPath);
 
     const run = startArcaSetup("https://example.com");

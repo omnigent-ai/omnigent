@@ -1,7 +1,7 @@
 "use strict";
 
 const { spawn } = require("node:child_process");
-const { withTestOverrides } = require("./testOverrides");
+const { withTestOverrides } = require("./testOverrides.ts");
 
 const { buildConnectArgs, describeConnectFailure, resolveArcaPath } = withTestOverrides(
   "arca",

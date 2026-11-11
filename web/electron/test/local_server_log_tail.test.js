@@ -1,4 +1,4 @@
-// Tests for the setup-terminal log tail helpers (src/omnigent_cli.js), run with
+// Tests for the setup-terminal log tail helpers (src/omnigent_cli.ts), run with
 // `node --test`. Focus: the line splitter's partial-line buffering across chunk
 // boundaries (the classic tail bug — never emit a half line), CRLF trimming,
 // ANSI stripping, live-log discovery (freshest file, stale rejected), and the
@@ -15,7 +15,7 @@ const {
   stripAnsi,
   findLiveServerLog,
   tailLocalServerLog,
-} = require("../src/omnigent_cli");
+} = require("../src/omnigent_cli.ts");
 
 describe("makeLineSplitter", () => {
   it("emits whole lines and buffers a trailing partial across chunks", () => {

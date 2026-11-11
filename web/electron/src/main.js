@@ -41,7 +41,7 @@ const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window.ts"
 const { registerFileReveal } = require("./fileReveal.ts");
 const { registerFolderChooser } = require("./folderChooser.ts");
 const { ICON_PNG, pagePath, preloadPath } = require("./paths.ts");
-const { withTestOverrides } = require("./testOverrides");
+const { withTestOverrides } = require("./testOverrides.ts");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -139,9 +139,11 @@ const {
   registerDesktopCommandStateReset,
   sanitizeDesktopCommandState,
 } = require("./desktopCommands.ts");
-const omnigentCli = withTestOverrides("omnigent_cli", require("./omnigent_cli"));
+const omnigentCli = withTestOverrides("omnigent_cli", require("./omnigent_cli.ts"));
 
-const serverManager = require("./server_manager");
+const { createServerManager } = require("./server_manager.ts");
+// One per process: it tracks the host processes and local server this app started.
+const serverManager = createServerManager();
 const { diagnostics } = require("./diagnostics.ts");
 
 const isHostThisMachine = createHostThisMachineChecker({ cli: omnigentCli });

@@ -2,51 +2,57 @@
 //
 // The desktop manages servers by shelling out to the same `omnigent` binary a
 // user would run by hand — `server --background/stop/status` and `host status` (the
-// long-lived `host` connection is spawned by server_manager.js, which owns its
+// long-lived `host` connection is spawned by server_manager.ts, which owns its
 // lifetime). This module locates the binary, runs the short exit-quick
 // commands, and parses their `--json` output. The CLI is the single source of
 // truth for live state; nothing here is persisted.
 //
-// Unlike src/url.js this is main-process only (it needs child_process / fs),
-// so it's a plain CommonJS module — never loaded in the renderer.
+// Unlike src/url.ts this is main-process only (it needs child_process / fs),
+// so it's never loaded in the renderer.
 //
 // The pure helpers (matchesServer, parseDaemonRecord, normalizeServerUrl,
 // candidatePaths, resolveCliPath with injected probes) are unit-tested in
-// test/omnigent_cli.test.js, as is runCli's failure classification against real
+// test/omnigent_cli.test.ts, as is runCli's failure classification against real
 // subprocesses; the other spawning functions are exercised in the manual
 // verification flow.
 
-"use strict";
+import { execFile, execFileSync, type ExecFileException } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { load as loadYaml } from "js-yaml";
 
-const { execFile, execFileSync } = require("child_process");
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
-const yaml = require("js-yaml");
-
-const url = require("./url.ts");
+import * as url from "./url.ts";
 
 /** Default timeout for the short status commands. */
-const DEFAULT_TIMEOUT_MS = 10000;
+export const DEFAULT_TIMEOUT_MS = 10000;
 
 /** Ceiling for `login`, just past the CLI's own 300s OIDC ticket deadline. */
-const LOGIN_TIMEOUT_MS = 305000;
+export const LOGIN_TIMEOUT_MS = 305000;
 
 /**
  * One-liner shown on the setup page when the CLI is missing. Mirrors the
  * install instructions in the repo root README.
  */
-const INSTALL_COMMAND =
+export const INSTALL_COMMAND =
   "curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh";
+
+/** A property of an untrusted value, read the way `value?.[key]` would. */
+function propertyOf(value: unknown, key: string): unknown {
+  return value == null ? undefined : (value as Record<string, unknown>)[key];
+}
+
+/** `new URL(value)` on an untrusted value. */
+function parseUrl(value: unknown): URL {
+  // The constructor stringifies any value itself; the cast only lets TypeScript pass it.
+  return new URL(value as string);
+}
 
 /**
  * Strip a trailing slash so URL comparisons survive the difference between
  * what the user typed and what the CLI records in a daemon target.
- *
- * @param {unknown} value
- * @returns {string}
  */
-function normalizeServerUrl(value) {
+export function normalizeServerUrl(value: unknown): string {
   if (typeof value !== "string") return "";
   return value.trim().replace(/\/+$/, "");
 }
@@ -54,13 +60,10 @@ function normalizeServerUrl(value) {
 /**
  * True when a server URL points at the local machine — loopback host. Only
  * loopback servers expose the local-server background/stop controls. Reuses the
- * shared LOCAL_HOSTS set from url.js so the desktop never disagrees on what
+ * shared LOCAL_HOSTS set from url.ts so the desktop never disagrees on what
  * "local" means.
- *
- * @param {string} serverUrl
- * @returns {boolean}
  */
-function isLoopbackServer(serverUrl) {
+export function isLoopbackServer(serverUrl: string): boolean {
   try {
     return url.LOCAL_HOSTS.has(new URL(serverUrl).hostname);
   } catch {
@@ -72,16 +75,12 @@ function isLoopbackServer(serverUrl) {
  * True when two URLs refer to the same local server — both loopback hosts on
  * the same endpoint with only the loopback hostname substituted. Used to
  * confirm the CLI's local server is the one a window is actually connected
- * to before showing its controls.
- *
- * @param {string} a
- * @param {string} b
- * @returns {boolean}
+ * to before showing its controls. Either side may be an unchecked record field.
  */
-function sameLoopbackServer(a, b) {
+export function sameLoopbackServer(a: unknown, b: unknown): boolean {
   try {
-    const ua = new URL(a);
-    const ub = new URL(b);
+    const ua = parseUrl(a);
+    const ub = parseUrl(b);
     if (!url.LOCAL_HOSTS.has(ua.hostname) || !url.LOCAL_HOSTS.has(ub.hostname)) return false;
     ua.hostname = ub.hostname;
     return normalizeServerUrl(ua.href) === normalizeServerUrl(ub.href);
@@ -94,10 +93,8 @@ function sameLoopbackServer(a, b) {
  * The Omnigent local runtime data dir — `$OMNIGENT_DATA_DIR` (with `~`
  * expanded) or `~/.omnigent`. Mirrors `_local_data_dir()` in
  * omnigent/host/local_server.py. The local-server pidfile lives here.
- *
- * @returns {string}
  */
-function localDataDir() {
+function localDataDir(): string {
   const raw = process.env.OMNIGENT_DATA_DIR;
   if (raw && raw.trim() !== "") {
     const expanded = raw.startsWith("~") ? path.join(os.homedir(), raw.slice(1)) : raw;
@@ -110,10 +107,8 @@ function localDataDir() {
  * The Omnigent config dir — `$OMNIGENT_CONFIG_HOME` (with `~` expanded) or
  * `~/.omnigent`. config.yaml (machine identity) lives here; it can differ from
  * the data dir under test env overrides, but is the same by default.
- *
- * @returns {string}
  */
-function localConfigDir() {
+function localConfigDir(): string {
   const raw = process.env.OMNIGENT_CONFIG_HOME;
   if (raw && raw.trim() !== "") {
     const expanded = raw.startsWith("~") ? path.join(os.homedir(), raw.slice(1)) : raw;
@@ -129,15 +124,13 @@ function localConfigDir() {
  * omnigent/cli.py (both hardcode `Path.home()/".omnigent"`). The auth-token
  * store and the daemon registry live here — NOT under the data dir. Only the
  * local-server pidfile honors `$OMNIGENT_DATA_DIR` (see {@link localDataDir}).
- *
- * @returns {string}
  */
-function stateDir() {
+function stateDir(): string {
   return path.join(os.homedir(), ".omnigent");
 }
 
 /** Memoized machine host id (stable once generated; never cache a null). */
-let cachedHostId = null;
+let cachedHostId: string | null = null;
 
 /**
  * This machine's Omnigent host id (bare 32-char hex, e.g. "ab12…"), read from
@@ -152,20 +145,21 @@ let cachedHostId = null;
  * is a Uuid16 column). The renderer compares these as plain strings — it is the
  * one consumer the server's own prefix-tolerance can't rescue — so strip the
  * prefix here, mirroring `_normalize_host_id` in omnigent/host/identity.py.
- *
- * @returns {string | null}
  */
-function localHostId() {
+export function localHostId(): string | null {
   if (cachedHostId) return cachedHostId;
   cachedHostId = readLocalHostId();
   return cachedHostId;
 }
 
 /** Read the current machine identity without retaining a stale config value. */
-function readLocalHostId() {
+export function readLocalHostId(): string | null {
   try {
-    const parsed = yaml.load(fs.readFileSync(path.join(localConfigDir(), "config.yaml"), "utf8"));
-    const id = parsed && typeof parsed === "object" ? parsed.host?.host_id : null;
+    const parsed = loadYaml(fs.readFileSync(path.join(localConfigDir(), "config.yaml"), "utf8"));
+    const id =
+      parsed && typeof parsed === "object"
+        ? propertyOf(propertyOf(parsed, "host"), "host_id")
+        : null;
     if (typeof id === "string" && id) return id.replace(/^host_/, "") || null;
   } catch {
     // No config yet, or unparseable.
@@ -173,20 +167,23 @@ function readLocalHostId() {
   return null;
 }
 
+/** The PID and port recorded in the local-server pidfile. */
+export interface LocalServerPidfile {
+  pid: number;
+  port: number;
+}
+
 /**
  * Parse the local-server pidfile contents: two lines, PID then port. Returns
  * null when malformed. Mirrors `_read_local_server_pid_file()` in
  * omnigent/host/local_server.py.
- *
- * @param {string} text
- * @returns {{ pid: number, port: number } | null}
  */
-function parseLocalServerPidfile(text) {
+export function parseLocalServerPidfile(text: unknown): LocalServerPidfile | null {
   if (typeof text !== "string") return null;
-  const lines = text.trim().split(/\r?\n/);
-  if (lines.length < 2) return null;
-  const pid = Number.parseInt(lines[0], 10);
-  const port = Number.parseInt(lines[1], 10);
+  const [pidLine, portLine] = text.trim().split(/\r?\n/);
+  if (pidLine === undefined || portLine === undefined) return null;
+  const pid = Number.parseInt(pidLine, 10);
+  const port = Number.parseInt(portLine, 10);
   if (!Number.isFinite(pid) || !Number.isFinite(port)) return null;
   return { pid, port };
 }
@@ -195,26 +192,19 @@ function parseLocalServerPidfile(text) {
  * True when a process with this pid exists. `process.kill(pid, 0)` sends no
  * signal — it only probes existence: it throws ESRCH when gone, EPERM when the
  * process exists but isn't ours (still alive).
- *
- * @param {number} pid
- * @returns {boolean}
  */
-function isPidAlive(pid) {
+export function isPidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
   } catch (err) {
-    return Boolean(err) && err.code === "EPERM";
+    return Boolean(err) && propertyOf(err, "code") === "EPERM";
   }
 }
 
-/**
- * Read + parse the local-server pidfile. Returns { pid, port } or null.
- *
- * @returns {{ pid: number, port: number } | null}
- */
-function readLocalServerPidfile() {
+/** Read + parse the local-server pidfile. Returns { pid, port } or null. */
+export function readLocalServerPidfile(): LocalServerPidfile | null {
   let text;
   try {
     text = fs.readFileSync(path.join(localDataDir(), "local_server.pid"), "utf8");
@@ -222,6 +212,17 @@ function readLocalServerPidfile() {
     return null;
   }
   return parseLocalServerPidfile(text);
+}
+
+/** A local server recorded as running, with the URL it serves. */
+export interface LocalServerStatus extends LocalServerPidfile {
+  running: true;
+  url: string;
+}
+
+/** A local server whose `/health` answered. */
+export interface HealthyLocalServer extends LocalServerPidfile {
+  url: string;
 }
 
 /**
@@ -235,10 +236,8 @@ function readLocalServerPidfile() {
  * port matches the server the window is already connected to — so a server is
  * provably up there. Decisions made WITHOUT that guarantee (e.g. reusing a
  * server before navigating) must use {@link localServerHealthy} instead.
- *
- * @returns {{ running: true, url: string, pid: number, port: number } | null}
  */
-function localServerStatus() {
+export function localServerStatus(): LocalServerStatus | null {
   const rec = readLocalServerPidfile();
   if (!rec || !isPidAlive(rec.pid)) return null;
   return { running: true, url: `http://127.0.0.1:${rec.port}`, pid: rec.pid, port: rec.port };
@@ -251,11 +250,8 @@ function localServerStatus() {
  * reused pid with nothing listening → connection refused fast, or a hung server
  * → times out). Use this before reusing a server you're about to navigate to,
  * so a stale pidfile doesn't send the window to a dead URL.
- *
- * @param {number} [timeoutMs]
- * @returns {Promise<{ url: string, pid: number, port: number } | null>}
  */
-async function localServerHealthy(timeoutMs = 1500) {
+export async function localServerHealthy(timeoutMs = 1500): Promise<HealthyLocalServer | null> {
   const rec = readLocalServerPidfile();
   if (!rec || !isPidAlive(rec.pid)) return null;
   const localUrl = `http://127.0.0.1:${rec.port}`;
@@ -283,10 +279,8 @@ const CLI_NAMES = ["omnigent", "omni"];
  * the rest cover Homebrew and source/cargo installs. Probing these matters
  * because a GUI-launched Electron app inherits a minimal PATH that usually
  * omits ~/.local/bin, so `command -v` alone is not enough.
- *
- * @returns {string[]}
  */
-function candidatePaths() {
+export function candidatePaths(): string[] {
   const home = os.homedir();
   const dirs = [
     path.join(home, ".local", "bin"),
@@ -297,13 +291,8 @@ function candidatePaths() {
   return dirs.flatMap((dir) => CLI_NAMES.map((name) => path.join(dir, name)));
 }
 
-/**
- * True when `p` exists, is a regular file, and is executable by this process.
- *
- * @param {string} p
- * @returns {boolean}
- */
-function isExecutableFile(p) {
+/** True when `p` exists, is a regular file, and is executable by this process. */
+export function isExecutableFile(p: string): boolean {
   try {
     if (!fs.statSync(p).isFile()) return false;
     fs.accessSync(p, fs.constants.X_OK);
@@ -318,10 +307,9 @@ function isExecutableFile(p) {
  * null when not found. On POSIX we go through `command -v` so shell-managed
  * PATHs (uv shims) resolve; on Windows we use `where`.
  *
- * @param {string} name e.g. "omnigent" or "omni"
- * @returns {string | null}
+ * @param name e.g. "omnigent" or "omni"
  */
-function whichName(name) {
+function whichName(name: string): string | null {
   try {
     if (process.platform === "win32") {
       const out = execFileSync("where", [name], { encoding: "utf8" });
@@ -339,15 +327,26 @@ function whichName(name) {
 /**
  * Resolve the CLI on PATH, trying `omnigent` then the `omni` alias. Returns the
  * first hit, or null when neither is on PATH.
- *
- * @returns {string | null}
  */
-function whichOmnigent() {
+export function whichOmnigent(): string | null {
   for (const name of CLI_NAMES) {
     const found = whichName(name);
     if (found) return found;
   }
   return null;
+}
+
+/** The executability and PATH probes behind {@link resolveCliPath}. */
+export interface ResolveCliPathDeps {
+  isExecutableFile?: ((p: string) => boolean) | undefined;
+  whichOmnigent?: (() => string | null) | undefined;
+  candidatePaths?: (() => string[]) | undefined;
+}
+
+/** A usable CLI binary and which lookup found it. */
+export interface ResolvedCliPath {
+  path: string;
+  source: "configured" | "path" | "candidate";
 }
 
 /**
@@ -358,15 +357,12 @@ function whichOmnigent() {
  * `deps` lets the tests inject the executability/PATH probes so the resolution
  * order can be verified without a real binary on disk.
  *
- * @param {string | null | undefined} configuredPath settings.omnigent_path
- * @param {{
- *   isExecutableFile?: (p: string) => boolean,
- *   whichOmnigent?: () => string | null,
- *   candidatePaths?: () => string[],
- * }} [deps]
- * @returns {{ path: string, source: "configured" | "path" | "candidate" } | null}
+ * @param configuredPath settings.omnigent_path
  */
-function resolveCliPath(configuredPath, deps = {}) {
+export function resolveCliPath(
+  configuredPath: string | null | undefined,
+  deps: ResolveCliPathDeps = {},
+): ResolvedCliPath | null {
   const isExec = deps.isExecutableFile || isExecutableFile;
   const which = deps.whichOmnigent || whichOmnigent;
   const candidates = (deps.candidatePaths || candidatePaths)();
@@ -386,39 +382,59 @@ function resolveCliPath(configuredPath, deps = {}) {
   return null;
 }
 
+/** An executable with a fixed argv prefix, e.g. a managed host's CLI. */
+export interface CliCommandDescriptor {
+  executable: string;
+  prefixArgs?: string[] | undefined;
+  displayName?: string | undefined;
+}
+
+/** A CLI path, or an executable with a fixed argv prefix. */
+export type CliCommand = string | CliCommandDescriptor;
+
+/** A validated CLI invocation. */
+export interface CliCommandParts {
+  executable: string;
+  prefixArgs: string[];
+  displayName: string;
+}
+
+/** The descriptor fields of an unchecked object, before validation. */
+interface UncheckedCliCommand {
+  executable?: unknown;
+  prefixArgs?: unknown;
+  displayName?: unknown;
+}
+
 /**
  * Normalize a CLI invocation. A plain path passes a string (`/path/omnigent`);
  * managed host enrollment passes an executable + fixed argv prefix
- * (`/usr/local/bin/isaac`, `["omni"]`). Both stay shell-free.
- *
- * @param {string | {
- *   executable: string,
- *   prefixArgs?: string[],
- *   displayName?: string,
- * }} command
- * @returns {{ executable: string, prefixArgs: string[], displayName: string }}
+ * (`/usr/local/bin/isaac`, `["omni"]`). Both stay shell-free. Callers pass
+ * settings values unchecked, so anything else throws.
  */
-function cliCommandParts(command) {
+export function cliCommandParts(command: unknown): CliCommandParts {
   if (typeof command === "string" && command !== "") {
     return { executable: command, prefixArgs: [], displayName: "omnigent" };
   }
+  // Only read after the object check below; the cast lets TypeScript name the fields.
+  const descriptor = command as UncheckedCliCommand;
   if (
     command &&
     typeof command === "object" &&
-    typeof command.executable === "string" &&
-    command.executable !== "" &&
-    (command.prefixArgs === undefined ||
-      (Array.isArray(command.prefixArgs) &&
-        command.prefixArgs.every((arg) => typeof arg === "string")))
+    typeof descriptor.executable === "string" &&
+    descriptor.executable !== "" &&
+    (descriptor.prefixArgs === undefined ||
+      (Array.isArray(descriptor.prefixArgs) &&
+        descriptor.prefixArgs.every((arg): arg is string => typeof arg === "string")))
   ) {
-    const prefixArgs = command.prefixArgs ?? [];
+    const prefixArgs: string[] = descriptor.prefixArgs ?? [];
     return {
-      executable: command.executable,
+      executable: descriptor.executable,
       prefixArgs,
       displayName:
-        typeof command.displayName === "string" && command.displayName !== ""
-          ? command.displayName
-          : [path.basename(command.executable), ...prefixArgs].join(" "),
+        typeof descriptor.displayName === "string" && descriptor.displayName !== ""
+          ? descriptor.displayName
+          : [path.basename(descriptor.executable), ...prefixArgs].join(" "),
     };
   }
   throw new TypeError("invalid CLI command");
@@ -427,14 +443,13 @@ function cliCommandParts(command) {
 /**
  * Why a CLI subprocess failed, built only from process-level facts so it is
  * safe to show or log: CLI output can carry auth material and is never read.
- *
- * @typedef {{
- *   kind: "cli-not-found" | "spawn-failed" | "timed-out" | "signal" | "exited" | "failed",
- *   exitCode?: number,
- *   signal?: string,
- *   errorCode?: string,
- * }} CliFailure
  */
+export interface CliFailure {
+  kind: "cli-not-found" | "spawn-failed" | "timed-out" | "signal" | "exited" | "failed";
+  exitCode?: number;
+  signal?: string;
+  errorCode?: string;
+}
 
 /**
  * Classify an `execFile` error. execFile sets `err.code` to the numeric exit
@@ -442,11 +457,8 @@ function cliCommandParts(command) {
  * `spawn …` syscall when the spawn itself failed; `killed` marks its own
  * timeout kill, which a child that handles the signal can still answer with an
  * exit code instead of dying by the signal.
- *
- * @param {Error & { code?: unknown, syscall?: unknown, killed?: boolean, signal?: string | null }} err
- * @returns {CliFailure}
  */
-function cliFailureOf(err) {
+function cliFailureOf(err: ExecFileException): CliFailure {
   if (err.killed) {
     return {
       kind: "timed-out",
@@ -466,18 +478,30 @@ function cliFailureOf(err) {
   return { kind: "failed" };
 }
 
+/** A per-call timeout for a CLI subprocess. */
+export interface CliTimeoutOptions {
+  timeoutMs?: number | undefined;
+}
+
+/** A finished CLI subprocess. */
+export interface CliRunResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+  failure?: CliFailure;
+}
+
 /**
  * Run an Omnigent CLI subcommand and resolve with its captured output. Never
  * rejects — a failure surfaces as a non-zero `code` (1 when there's no exit
  * code) plus stderr and a {@link CliFailure} so callers can decide. `execFile`
- * (no shell) avoids quoting pitfalls.
- *
- * @param {Parameters<typeof cliCommandParts>[0]} command
- * @param {string[]} args
- * @param {{ timeoutMs?: number }} [opts]
- * @returns {Promise<{ code: number, stdout: string, stderr: string, failure?: CliFailure }>}
+ * (no shell) avoids quoting pitfalls. An invalid command throws before any spawn.
  */
-function runCli(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+export function runCli(
+  command: CliCommand,
+  args: string[],
+  { timeoutMs = DEFAULT_TIMEOUT_MS }: CliTimeoutOptions = {},
+): Promise<CliRunResult> {
   const { executable, prefixArgs } = cliCommandParts(command);
   return new Promise((resolve) => {
     execFile(
@@ -503,30 +527,41 @@ function runCli(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
  * omnigent/cli_auth.py: keyed by the trailing-slash-stripped URL, a record is
  * valid if it's a Databricks pointer (has `workspace_host`) or a non-expired
  * session token. The CLI's `state_dir()` is hardcoded to `~/.omnigent`.
- *
- * @param {string} serverUrl
- * @returns {boolean}
  */
-function serverAuthed(serverUrl) {
+export function serverAuthed(serverUrl: string): boolean {
   if (typeof serverUrl !== "string" || serverUrl === "") return false;
   const key = serverUrl.replace(/\/+$/, "");
-  let data;
+  let data: unknown;
   try {
     data = JSON.parse(fs.readFileSync(path.join(stateDir(), "auth_tokens.json"), "utf8"));
   } catch {
     return false;
   }
-  const entry = data && typeof data === "object" ? data[key] : null;
+  const entry = data && typeof data === "object" ? propertyOf(data, key) : null;
   if (!entry || typeof entry !== "object") return false;
-  if (entry.auth_type === "databricks") {
-    return typeof entry.workspace_host === "string" && entry.workspace_host !== "";
+  if (propertyOf(entry, "auth_type") === "databricks") {
+    const workspaceHost = propertyOf(entry, "workspace_host");
+    return typeof workspaceHost === "string" && workspaceHost !== "";
   }
-  if (typeof entry.token === "string" && entry.token !== "") {
+  const token = propertyOf(entry, "token");
+  if (typeof token === "string" && token !== "") {
     // expires_at is unix seconds (cli_auth uses time.time()); treat absent as
     // non-expiring.
-    return typeof entry.expires_at === "number" ? entry.expires_at >= Date.now() / 1000 : true;
+    const expiresAt = propertyOf(entry, "expires_at");
+    return typeof expiresAt === "number" ? expiresAt >= Date.now() / 1000 : true;
   }
   return false;
+}
+
+/** Whether a CLI command exited cleanly, with its trimmed output. */
+export interface CliCommandResult {
+  ok: boolean;
+  output: string;
+}
+
+/** A finished `login`, with the process-level failure when it failed. */
+export interface CliLoginResult extends CliCommandResult {
+  failure?: CliFailure;
 }
 
 /**
@@ -537,13 +572,12 @@ function serverAuthed(serverUrl) {
  * completing the browser sign-in isn't SIGKILLed mid-flow — the CLI's own OIDC
  * ticket deadline (300s, `_CLI_LOGIN_TIMEOUT_SECONDS` in omnigent/cli.py)
  * governs first.
- *
- * @param {string} cliPath
- * @param {string} serverUrl
- * @param {{ timeoutMs?: number }} [opts]
- * @returns {Promise<{ ok: boolean, output: string, failure?: CliFailure }>}
  */
-async function loginServer(cliPath, serverUrl, { timeoutMs = LOGIN_TIMEOUT_MS } = {}) {
+export async function loginServer(
+  cliPath: CliCommand,
+  serverUrl: string,
+  { timeoutMs = LOGIN_TIMEOUT_MS }: CliTimeoutOptions = {},
+): Promise<CliLoginResult> {
   const res = await runCli(cliPath, ["login", serverUrl], { timeoutMs });
   return {
     ok: res.code === 0,
@@ -555,12 +589,10 @@ async function loginServer(cliPath, serverUrl, { timeoutMs = LOGIN_TIMEOUT_MS } 
 /**
  * Parse the first JSON object out of CLI stdout. The status commands emit a
  * single JSON blob, but tolerate a stray leading warning line by falling back
- * to the outermost `{…}` slice. Returns null when nothing parses.
- *
- * @param {string} stdout
- * @returns {Record<string, unknown> | null}
+ * to the outermost `{…}` slice. Returns null when nothing parses; any other
+ * JSON value is returned unchecked.
  */
-function parseJsonLoose(stdout) {
+export function parseJsonLoose(stdout: string | null | undefined): unknown {
   const text = (stdout || "").trim();
   if (text === "") return null;
   try {
@@ -580,21 +612,21 @@ function parseJsonLoose(stdout) {
   return null;
 }
 
+/** Whether a usable CLI is installed, and how to install one. */
+export interface CliStatus {
+  installed: boolean;
+  path: string | null;
+  version: string | null;
+  source: ResolvedCliPath["source"] | null;
+  installCommand: string;
+}
+
 /**
  * Probe the CLI and report whether it's installed and usable. Validates the
  * resolved path by actually running `--version`, so a stale or wrong configured
  * path reports `installed:false` rather than failing later.
- *
- * @param {string | null | undefined} configuredPath
- * @returns {Promise<{
- *   installed: boolean,
- *   path: string | null,
- *   version: string | null,
- *   source: string | null,
- *   installCommand: string,
- * }>}
  */
-async function getCliStatus(configuredPath) {
+export async function getCliStatus(configuredPath: string | null | undefined): Promise<CliStatus> {
   const resolved = resolveCliPath(configuredPath);
   if (!resolved) {
     return {
@@ -623,12 +655,10 @@ async function getCliStatus(configuredPath) {
 
 /**
  * `omnigent server status --json`. Returns the parsed payload, or a synthetic
- * not-running shape when the command produced no JSON.
- *
- * @param {string} cliPath
- * @returns {Promise<Record<string, unknown>>}
+ * not-running shape when the command produced no JSON. The payload is
+ * unchecked CLI output.
  */
-async function getServerStatus(cliPath) {
+export async function getServerStatus(cliPath: CliCommand): Promise<unknown> {
   const res = await runCli(cliPath, ["server", "status", "--json"]);
   const json = parseJsonLoose(res.stdout);
   if (!json) {
@@ -637,18 +667,38 @@ async function getServerStatus(cliPath) {
   return json;
 }
 
+/** A local server the CLI reports running after a start. */
+export interface LocalServerStarted {
+  ok: true;
+  url: string;
+  port: unknown;
+  pid: unknown;
+}
+
+/** A failed CLI operation and its message. */
+export interface CliError {
+  ok: false;
+  error: string;
+}
+
+export type StartLocalServerResult = LocalServerStarted | CliError;
+
 /**
  * Start (or reuse) the local background server, then re-read status for a
- * reliable URL. `server --background` is idempotent on the CLI side.
- *
- * @param {string} cliPath
- * @returns {Promise<{ ok: boolean, url?: string, port?: number, pid?: number, error?: string }>}
+ * reliable URL. `server --background` is idempotent on the CLI side. The
+ * port and pid are passed through from the status output unchecked.
  */
-async function startLocalServer(cliPath) {
+export async function startLocalServer(cliPath: CliCommand): Promise<StartLocalServerResult> {
   const res = await runCli(cliPath, ["server", "--background"], { timeoutMs: 30000 });
   const status = await getServerStatus(cliPath);
-  if (status && status.running && typeof status.url === "string") {
-    return { ok: true, url: status.url, port: status.port, pid: status.pid };
+  const statusUrl = status ? propertyOf(status, "url") : undefined;
+  if (status && propertyOf(status, "running") && typeof statusUrl === "string") {
+    return {
+      ok: true,
+      url: statusUrl,
+      port: propertyOf(status, "port"),
+      pid: propertyOf(status, "pid"),
+    };
   }
   return {
     ok: false,
@@ -659,7 +709,7 @@ async function startLocalServer(cliPath) {
 /** Directory the background server writes its per-run logfile into. Mirrors
  * `open_process_log_file("server", root=<data_dir>/logs)` in local_server.py:
  * files are named `server-<timestamp>.log` and created at spawn time. */
-function localServerLogDir() {
+function localServerLogDir(): string {
   return path.join(localDataDir(), "logs", "server");
 }
 
@@ -674,10 +724,10 @@ function localServerLogDir() {
  * real logfile, by contrast, is created the moment it spawns. The `startedAtMs`
  * floor rejects a previous run's log so a failed start never tails stale lines.
  *
- * @param {number} startedAtMs Only consider files modified at/after this (ms).
- * @returns {string | null} Absolute path of the freshest matching log, or null.
+ * @param startedAtMs Only consider files modified at/after this (ms).
+ * @returns Absolute path of the freshest matching log, or null.
  */
-function findLiveServerLog(startedAtMs) {
+export function findLiveServerLog(startedAtMs: number): string | null {
   const dir = localServerLogDir();
   let entries;
   try {
@@ -685,7 +735,7 @@ function findLiveServerLog(startedAtMs) {
   } catch {
     return null; // dir not created yet (child hasn't spawned)
   }
-  let best = null;
+  let best: string | null = null;
   let bestMtime = -1;
   // A small floor tolerance: the child may open its log a beat before our
   // recorded start, and mtime resolution is coarse on some filesystems.
@@ -707,17 +757,20 @@ function findLiveServerLog(startedAtMs) {
   return best;
 }
 
+// eslint-disable-next-line no-control-regex
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+
 /**
  * Strip ANSI SGR/escape sequences so log lines render as plain text in the
  * setup terminal (uvicorn/app logs may be colorized).
- *
- * @param {string} s
- * @returns {string}
  */
-// eslint-disable-next-line no-control-regex
-const ANSI_RE = /\x1b\[[0-9;]*m/g;
-function stripAnsi(s) {
+export function stripAnsi(s: string): string {
   return s.replace(ANSI_RE, "");
+}
+
+/** Receives chunks of a growing stream. */
+export interface LineSplitter {
+  push: (chunk: string) => void;
 }
 
 /**
@@ -725,11 +778,8 @@ function stripAnsi(s) {
  * each chunk to `push`; complete lines (newline-terminated) are emitted via
  * `onLine`, and a trailing partial line is buffered until its newline arrives.
  * The classic bug this avoids: emitting a half line when a chunk splits mid-line.
- *
- * @param {(line: string) => void} onLine
- * @returns {{ push: (chunk: string) => void }}
  */
-function makeLineSplitter(onLine) {
+export function makeLineSplitter(onLine: (line: string) => void): LineSplitter {
   let buf = "";
   return {
     push(chunk) {
@@ -744,6 +794,15 @@ function makeLineSplitter(onLine) {
   };
 }
 
+export interface TailLocalServerLogOptions {
+  /** Stops the tail; the caller aborts it once the start resolves. */
+  signal?: AbortSignal | undefined;
+  /** Floors log discovery so stale logs are ignored (default: now). */
+  startedAtMs?: number | undefined;
+  discoverTimeoutMs?: number | undefined;
+  pollMs?: number | undefined;
+}
+
 /**
  * Tail the background server's boot logfile, forwarding each new line to
  * `onLine`, until the caller signals stop (its `omnigent server --background`
@@ -756,19 +815,18 @@ function makeLineSplitter(onLine) {
  * lines stream DURING boot, and a prior run's stale log is never adopted. Naive
  * read-from-offset driven by `fs.watch` + a poll fallback; no tail library.
  *
- * @param {(line: string) => void} onLine
- * @param {{ signal?: AbortSignal, startedAtMs?: number, discoverTimeoutMs?: number, pollMs?: number }} [opts]
- *   `signal` stops the tail (the caller aborts it once the start resolves);
- *   `startedAtMs` floors log discovery so stale logs are ignored (default: now).
- * @returns {Promise<void>} resolves when tailing stops (aborted, timed out, or
- *   the log couldn't be found).
+ * @returns resolves when tailing stops (aborted, timed out, or the log couldn't
+ *   be found).
  */
-async function tailLocalServerLog(onLine, opts = {}) {
+export async function tailLocalServerLog(
+  onLine: (line: string) => void,
+  opts: TailLocalServerLogOptions = {},
+): Promise<void> {
   const { signal, startedAtMs = Date.now(), discoverTimeoutMs = 15000, pollMs = 200 } = opts;
   const emit = makeLineSplitter((line) => onLine(stripAnsi(line)));
   const aborted = () => signal?.aborted === true;
-  const sleep = (ms) =>
-    new Promise((resolve) => {
+  const sleep = (ms: number) =>
+    new Promise<void>((resolve) => {
       const t = setTimeout(resolve, ms);
       signal?.addEventListener(
         "abort",
@@ -783,14 +841,15 @@ async function tailLocalServerLog(onLine, opts = {}) {
   // 1. Wait for the child's logfile to appear. It's created at spawn, so this
   //    is a short wait — bounded so a start that never writes a log can't hang.
   const discoverDeadline = Date.now() + discoverTimeoutMs;
-  let logPath = null;
+  let found: string | null = null;
   while (!aborted() && Date.now() < discoverDeadline) {
-    logPath = findLiveServerLog(startedAtMs);
-    if (logPath) break;
+    found = findLiveServerLog(startedAtMs);
+    if (found) break;
     // eslint-disable-next-line no-await-in-loop -- sequential poll for a file that appears at spawn
     await sleep(pollMs);
   }
-  if (!logPath) return; // No logfile found — the caller still reports ready/fail.
+  if (!found) return; // No logfile found — the caller still reports ready/fail.
+  const logPath = found;
 
   // 2. Read from the start, then follow appended bytes. fs.watch can miss rapid
   //    writes, so a poll tick also drains until the caller aborts.
@@ -824,7 +883,7 @@ async function tailLocalServerLog(onLine, opts = {}) {
     }
   };
 
-  let watcher = null;
+  let watcher: fs.FSWatcher | null = null;
   try {
     watcher = fs.watch(logPath, { persistent: false }, readNew);
   } catch {
@@ -843,13 +902,8 @@ async function tailLocalServerLog(onLine, opts = {}) {
   }
 }
 
-/**
- * Stop the local background server (and its attached host daemon).
- *
- * @param {string} cliPath
- * @returns {Promise<{ ok: boolean, output: string }>}
- */
-async function stopLocalServer(cliPath) {
+/** Stop the local background server (and its attached host daemon). */
+export async function stopLocalServer(cliPath: CliCommand): Promise<CliCommandResult> {
   const res = await runCli(cliPath, ["server", "stop"], { timeoutMs: 15000 });
   return { ok: res.code === 0, output: (res.stdout || res.stderr).trim() };
 }
@@ -857,12 +911,8 @@ async function stopLocalServer(cliPath) {
 /**
  * Tell the server to drop a host daemon it owns for this target. Used to
  * disconnect a daemon the desktop adopted rather than spawned.
- *
- * @param {string} cliPath
- * @param {string} serverUrl
- * @returns {Promise<{ ok: boolean, output: string }>}
  */
-async function stopHost(cliPath, serverUrl) {
+export async function stopHost(cliPath: CliCommand, serverUrl: string): Promise<CliCommandResult> {
   const res = await runCli(cliPath, ["host", "stop", "--server", serverUrl], {
     timeoutMs: 15000,
   });
@@ -871,23 +921,34 @@ async function stopHost(cliPath, serverUrl) {
 
 /** True when any recorded server URL matches, including loopback aliases.
  * Local-mode records may carry the URL only in resolved_server_url. */
-function matchesServer(daemon, serverUrl) {
+export function matchesServer(daemon: unknown, serverUrl: unknown): boolean {
   if (!daemon || typeof daemon !== "object") return false;
   const want = normalizeServerUrl(serverUrl);
   if (want === "") return false;
-  return [daemon.server_url, daemon.target, daemon.resolved_server_url].some(
-    (field) => normalizeServerUrl(field) === want || sameLoopbackServer(field, serverUrl),
-  );
+  return [
+    propertyOf(daemon, "server_url"),
+    propertyOf(daemon, "target"),
+    propertyOf(daemon, "resolved_server_url"),
+  ].some((field) => normalizeServerUrl(field) === want || sameLoopbackServer(field, serverUrl));
 }
 
 /**
  * Directory holding per-target daemon registry records, mirroring
  * `_daemon_registry_dir()` in omnigent/cli.py (`<state_dir>/daemons`).
- *
- * @returns {string}
  */
-function daemonRegistryDir() {
+export function daemonRegistryDir(): string {
   return path.join(stateDir(), "daemons");
+}
+
+/** The subset of a daemon registry record the desktop needs. */
+export interface DaemonRecord {
+  pid: number;
+  target: string;
+  mode: "local" | "server";
+  server_url: string | null;
+  resolved_server_url: string | null;
+  host_id: string | null;
+  log_path: string | null;
 }
 
 /**
@@ -895,39 +956,31 @@ function daemonRegistryDir() {
  * Mirrors the validation in `_record_from_json()` (omnigent/cli.py): a usable
  * record needs a positive integer `pid`, a non-empty `target`, and a known
  * `mode`. Returns null for malformed records.
- *
- * @param {unknown} raw
- * @returns {{
- *   pid: number,
- *   target: string,
- *   mode: "local" | "server",
- *   server_url: string | null,
- *   resolved_server_url: string | null,
- *   host_id: string | null,
- *   log_path: string | null,
- * } | null}
  */
-function parseDaemonRecord(raw) {
+export function parseDaemonRecord(raw: unknown): DaemonRecord | null {
   if (!raw || typeof raw !== "object") return null;
+  const rawPid = propertyOf(raw, "pid");
   const pid =
-    typeof raw.pid === "number"
-      ? raw.pid
-      : typeof raw.pid === "string"
-        ? Number.parseInt(raw.pid, 10)
+    typeof rawPid === "number"
+      ? rawPid
+      : typeof rawPid === "string"
+        ? Number.parseInt(rawPid, 10)
         : NaN;
   if (!Number.isInteger(pid) || pid <= 0) return null;
-  const target = typeof raw.target === "string" ? raw.target : "";
-  const mode = raw.mode === "local" || raw.mode === "server" ? raw.mode : "";
+  const rawTarget = propertyOf(raw, "target");
+  const target = typeof rawTarget === "string" ? rawTarget : "";
+  const rawMode = propertyOf(raw, "mode");
+  const mode = rawMode === "local" || rawMode === "server" ? rawMode : "";
   if (!target || !mode) return null;
-  const str = (v) => (typeof v === "string" && v ? v : null);
+  const str = (v: unknown) => (typeof v === "string" && v ? v : null);
   return {
     pid,
     target,
     mode,
-    server_url: str(raw.server_url),
-    resolved_server_url: str(raw.resolved_server_url),
-    host_id: str(raw.host_id),
-    log_path: str(raw.log_path),
+    server_url: str(propertyOf(raw, "server_url")),
+    resolved_server_url: str(propertyOf(raw, "resolved_server_url")),
+    host_id: str(propertyOf(raw, "host_id")),
+    log_path: str(propertyOf(raw, "log_path")),
   };
 }
 
@@ -938,10 +991,8 @@ function parseDaemonRecord(raw) {
  * per-session runner probes that make the CLI command slow. Tunnel health
  * ({@link probeHostTunnel}) is layered on separately. Returns [] when the
  * registry is absent.
- *
- * @returns {ReturnType<typeof parseDaemonRecord>[]}
  */
-function readDaemonRecords() {
+export function readDaemonRecords(): DaemonRecord[] {
   const dir = daemonRegistryDir();
   let names;
   try {
@@ -949,7 +1000,7 @@ function readDaemonRecords() {
   } catch {
     return [];
   }
-  const records = [];
+  const records: DaemonRecord[] = [];
   for (const name of names) {
     if (!name.endsWith(".json")) continue;
     try {
@@ -968,11 +1019,8 @@ function readDaemonRecords() {
  * `_daemon_base_url()` (omnigent/cli.py): a local-mode daemon's URL lives in
  * `resolved_server_url` (falling back to a healthy local server's URL); a
  * server-mode daemon's is its `server_url`/`target`.
- *
- * @param {ReturnType<typeof parseDaemonRecord>} record
- * @returns {string | null}
  */
-function daemonServerUrl(record) {
+export function daemonServerUrl(record: DaemonRecord | null | undefined): string | null {
   if (!record) return null;
   if (record.mode === "local") {
     if (record.resolved_server_url) return record.resolved_server_url.replace(/\/+$/, "");
@@ -997,24 +1045,23 @@ function daemonServerUrl(record) {
  * GUI launch and the per-URL stored token below covers the real auth path. A
  * desktop started with the env var set just falls to the optimistic/unverified
  * status path — already the behavior for SDK / Databricks-pointer auth.
- *
- * @param {string} serverUrl
- * @returns {string | null}
  */
-function bearerTokenFor(serverUrl) {
+export function bearerTokenFor(serverUrl: string): string | null {
   if (typeof serverUrl !== "string" || serverUrl === "") return null;
   const key = serverUrl.replace(/\/+$/, "");
-  let data;
+  let data: unknown;
   try {
     data = JSON.parse(fs.readFileSync(path.join(stateDir(), "auth_tokens.json"), "utf8"));
   } catch {
     return null;
   }
-  const entry = data && typeof data === "object" ? data[key] : null;
+  const entry = data && typeof data === "object" ? propertyOf(data, key) : null;
   if (!entry || typeof entry !== "object") return null;
-  if (typeof entry.token === "string" && entry.token !== "") {
-    if (typeof entry.expires_at === "number" && entry.expires_at < Date.now() / 1000) return null;
-    return entry.token;
+  const token = propertyOf(entry, "token");
+  if (typeof token === "string" && token !== "") {
+    const expiresAt = propertyOf(entry, "expires_at");
+    if (typeof expiresAt === "number" && expiresAt < Date.now() / 1000) return null;
+    return token;
   }
   return null;
 }
@@ -1027,11 +1074,8 @@ const WORKSPACE_API_PATH = "/api/2.0/omnigent";
  * rule as `databricks_request_headers()` (omnigent/cli_auth.py): on by default
  * for workspace mounts, opt-in on other servers with
  * `OMNIGENT_HOST_SLICE_KEY_ENABLED=1`, and off for either when it is "0".
- *
- * @param {string} serverUrl
- * @returns {boolean}
  */
-function hostRoutingEnabled(serverUrl) {
+export function hostRoutingEnabled(serverUrl: string): boolean {
   const setting = process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED;
   if (setting === "0") return false;
   if (setting === "1") return true;
@@ -1040,6 +1084,13 @@ function hostRoutingEnabled(serverUrl) {
   } catch {
     return false;
   }
+}
+
+/** A host tunnel's reported status, or why it could not be read. */
+export interface HostTunnelProbe {
+  status: string | null;
+  reachable: boolean;
+  authMissing: boolean;
 }
 
 /**
@@ -1051,17 +1102,16 @@ function hostRoutingEnabled(serverUrl) {
  * in-process (a Databricks-pointer login, or auth supplied only via the SDK /
  * the env var the desktop no longer reads), returns `authMissing` so the caller
  * can avoid falsely reporting the tunnel down.
- *
- * @param {string} serverUrl
- * @param {string | null} hostId
- * @param {{ timeoutMs?: number }} [opts]
- * @returns {Promise<{ status: string | null, reachable: boolean, authMissing: boolean }>}
  */
-async function probeHostTunnel(serverUrl, hostId, { timeoutMs = 2000 } = {}) {
+export async function probeHostTunnel(
+  serverUrl: string,
+  hostId: string | null,
+  { timeoutMs = 2000 }: CliTimeoutOptions = {},
+): Promise<HostTunnelProbe> {
   if (typeof serverUrl !== "string" || !serverUrl || typeof hostId !== "string" || !hostId) {
     return { status: null, reachable: false, authMissing: false };
   }
-  const headers = {};
+  const headers: Record<string, string> = {};
   // A loopback server is usually single-user (no auth), but send a stored token
   // if one happens to exist so an authed loopback server still verifies. A
   // remote server with no obtainable token can't be probed in-process (a
@@ -1078,13 +1128,20 @@ async function probeHostTunnel(serverUrl, hostId, { timeoutMs = 2000 } = {}) {
   try {
     const resp = await fetch(target, { headers, signal: AbortSignal.timeout(timeoutMs) });
     if (!resp.ok) return { status: null, reachable: true, authMissing: false };
-    const body = await resp.json().catch(() => null);
-    const status = body && typeof body.status === "string" ? body.status : null;
+    const body: unknown = await resp.json().catch(() => null);
+    const bodyStatus = body ? propertyOf(body, "status") : undefined;
+    const status = body && typeof bodyStatus === "string" ? bodyStatus : null;
     return { status, reachable: true, authMissing: false };
   } catch {
     // Connection refused / unreachable / timed out → can't confirm the tunnel.
     return { status: null, reachable: false, authMissing: false };
   }
+}
+
+/** Whether `/v1/me` answered 200, and whether the server answered at all. */
+export interface ServerAuthProbe {
+  authed: boolean;
+  reachable: boolean;
 }
 
 /**
@@ -1106,16 +1163,15 @@ async function probeHostTunnel(serverUrl, hostId, { timeoutMs = 2000 } = {}) {
  * page — an opaque redirect surfaces as a non-200 status, which is the answer we
  * want. `reachable:false` (a thrown fetch) lets the caller skip a doomed login
  * and let the connect attempt raise its own, clearer error. Never throws.
- *
- * @param {string} serverUrl
- * @param {{ timeoutMs?: number }} [opts]
- * @returns {Promise<{ authed: boolean, reachable: boolean }>}
  */
-async function probeServerAuth(serverUrl, { timeoutMs = 10000 } = {}) {
+export async function probeServerAuth(
+  serverUrl: string,
+  { timeoutMs = 10000 }: CliTimeoutOptions = {},
+): Promise<ServerAuthProbe> {
   if (typeof serverUrl !== "string" || serverUrl === "") {
     return { authed: false, reachable: false };
   }
-  const headers = {};
+  const headers: Record<string, string> = {};
   const token = bearerTokenFor(serverUrl);
   if (token) headers.Authorization = `Bearer ${token}`;
   const base = serverUrl.replace(/\/+$/, "");
@@ -1134,6 +1190,20 @@ async function probeServerAuth(serverUrl, { timeoutMs = 10000 } = {}) {
   }
 }
 
+export interface HostConnectionOptions extends CliTimeoutOptions {
+  probe?: boolean | undefined;
+}
+
+/** This machine's host connection to a server. */
+export interface HostConnection {
+  connected: boolean;
+  process: "online" | "offline";
+  hostStatus: string | null;
+  pid: number | null;
+  error: string | null;
+  verified: boolean;
+}
+
 /**
  * This machine's connection to `serverUrl`, resolved WITHOUT the slow `omnigent
  * host status` subprocess: daemon metadata + process state come from the
@@ -1142,19 +1212,11 @@ async function probeServerAuth(serverUrl, { timeoutMs = 10000 } = {}) {
  * hostStatus, pid, error }` plus `verified` (false when the tunnel couldn't be
  * probed — e.g. Databricks-pointer auth — so process-alive is reported
  * optimistically rather than as offline).
- *
- * @param {string} serverUrl
- * @param {{ probe?: boolean, timeoutMs?: number }} [opts]
- * @returns {Promise<{
- *   connected: boolean,
- *   process: "online" | "offline",
- *   hostStatus: string | null,
- *   pid: number | null,
- *   error: string | null,
- *   verified: boolean,
- * }>}
  */
-async function getHostConnectionFast(serverUrl, { probe = true, timeoutMs = 2000 } = {}) {
+export async function getHostConnectionFast(
+  serverUrl: string,
+  { probe = true, timeoutMs = 2000 }: HostConnectionOptions = {},
+): Promise<HostConnection> {
   const match = liveDaemonRecordFor(serverUrl);
   if (!match) {
     return {
@@ -1222,55 +1284,10 @@ async function getHostConnectionFast(serverUrl, { probe = true, timeoutMs = 2000
 }
 
 /** Find a live daemon enrolled with this server, including loopback URL aliases. */
-function liveDaemonRecordFor(serverUrl) {
+export function liveDaemonRecordFor(serverUrl: string): DaemonRecord | null {
   return (
     readDaemonRecords().find(
       (record) => isPidAlive(record.pid) && matchesServer(record, serverUrl),
     ) ?? null
   );
 }
-
-module.exports = {
-  INSTALL_COMMAND,
-  DEFAULT_TIMEOUT_MS,
-  LOGIN_TIMEOUT_MS,
-  normalizeServerUrl,
-  isLoopbackServer,
-  sameLoopbackServer,
-  localHostId,
-  readLocalHostId,
-  liveDaemonRecordFor,
-  parseLocalServerPidfile,
-  isPidAlive,
-  readLocalServerPidfile,
-  localServerStatus,
-  localServerHealthy,
-  candidatePaths,
-  isExecutableFile,
-  whichOmnigent,
-  resolveCliPath,
-  cliCommandParts,
-  runCli,
-  parseJsonLoose,
-  getCliStatus,
-  getServerStatus,
-  startLocalServer,
-  findLiveServerLog,
-  makeLineSplitter,
-  stripAnsi,
-  tailLocalServerLog,
-  stopLocalServer,
-  stopHost,
-  serverAuthed,
-  probeServerAuth,
-  loginServer,
-  matchesServer,
-  daemonRegistryDir,
-  parseDaemonRecord,
-  readDaemonRecords,
-  daemonServerUrl,
-  bearerTokenFor,
-  hostRoutingEnabled,
-  probeHostTunnel,
-  getHostConnectionFast,
-};

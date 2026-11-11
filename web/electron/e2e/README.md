@@ -46,7 +46,7 @@ backend — no real provider creds.
 The app runs the bundle in `app/`, which has its own copy of every `src/`
 module, so reassigning exports of a `require`d `src/` module has no effect. A
 `-r` script instead calls `registerTestOverride(moduleName, (moduleExports) =>
-replacements)` from `src/testOverrides.js`; the main process applies it where
+replacements)` from `src/testOverrides.ts`; the main process applies it where
 it requires that module through `withTestOverrides`. Overrides are ignored when
 `app.isPackaged` is true.
 

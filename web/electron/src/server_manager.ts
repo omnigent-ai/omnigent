@@ -1,0 +1,664 @@
+// Process lifecycle for desktop-managed Omnigent servers and host connections.
+//
+// This is the only place the desktop spawns long-lived processes. It owns:
+//   - hostChildren: the foreground `omnigent host --server <url>` processes this
+//     app started. They are torn down when the app quits (the confirmed
+//     lifecycle: the desktop owns what it starts).
+//   - ownedLocalServer: a local `omnigent server` we started ourselves (and so
+//     are responsible for stopping). If a server was already running when we
+//     looked, we do NOT claim ownership and leave it alone.
+//
+// Status is never cached here — every query re-reads it from the CLI
+// (omnigent_cli.ts), which is the single source of truth. This module only
+// tracks *ownership* (did we start it?), which the CLI can't tell us.
+
+import { spawn } from "node:child_process";
+
+import * as omnigentCli from "./omnigent_cli.ts";
+import type { CliCommand, CliFailure } from "./omnigent_cli.ts";
+import { withTestOverrides } from "./testOverrides.ts";
+
+/** Max seconds to wait for `host` to print its connected marker before giving up. */
+const CONNECT_TIMEOUT_MS = 30000;
+/** Grace period after SIGTERM before escalating to SIGKILL on shutdown. */
+const KILL_GRACE_MS = 4000;
+/** The line `omnigent host` prints once the websocket tunnel is up. */
+const CONNECTED_MARKER = "✓ Connected";
+/** Cap the in-memory per-host log so a chatty daemon can't grow unbounded. */
+const MAX_LOG_CHARS = 8000;
+
+/** The `omnigent_cli` helpers the server manager calls. */
+export interface ServerManagerCli {
+  LOGIN_TIMEOUT_MS: number;
+  cliCommandParts: typeof omnigentCli.cliCommandParts;
+  normalizeServerUrl: typeof omnigentCli.normalizeServerUrl;
+  isLoopbackServer: typeof omnigentCli.isLoopbackServer;
+  probeServerAuth: typeof omnigentCli.probeServerAuth;
+  loginServer: typeof omnigentCli.loginServer;
+  getHostConnectionFast: typeof omnigentCli.getHostConnectionFast;
+  stopHost: typeof omnigentCli.stopHost;
+  localServerHealthy: typeof omnigentCli.localServerHealthy;
+  tailLocalServerLog: typeof omnigentCli.tailLocalServerLog;
+  startLocalServer: typeof omnigentCli.startLocalServer;
+  stopLocalServer: typeof omnigentCli.stopLocalServer;
+}
+
+/** A host child's output stream, as far as collecting its log goes. */
+export interface HostChildOutput {
+  on: (event: "data", listener: (chunk: unknown) => void) => unknown;
+}
+
+/** The part of a spawned `ChildProcess` the server manager uses. */
+export interface HostChild {
+  exitCode: number | null;
+  killed: boolean;
+  stdout: HostChildOutput;
+  stderr: HostChildOutput;
+  kill: (signal: NodeJS.Signals) => unknown;
+  // Node passes an `Error` for "error", and the exit code and signal for "exit".
+  on: (event: "error" | "exit", listener: (value: unknown, signal: unknown) => void) => unknown;
+  once: (event: "exit", listener: () => void) => unknown;
+}
+
+export interface HostSpawnOptions {
+  stdio: ["ignore", "pipe", "pipe"];
+}
+
+/** `child_process.spawn`, injectable so tests need no real CLI. */
+export type SpawnHost = (command: string, args: string[], options: HostSpawnOptions) => HostChild;
+
+export interface ServerManagerDeps {
+  /** Defaults to `omnigent_cli` with any registered e2e test overrides applied. */
+  cli?: ServerManagerCli | undefined;
+  spawn?: SpawnHost | undefined;
+}
+
+/** The newest output of a host child, capped at `MAX_LOG_CHARS`. */
+export interface HostLog {
+  text: string;
+}
+
+/** A host process this app started. */
+export interface HostChildEntry {
+  child: HostChild;
+  serverUrl: string;
+  log: HostLog;
+}
+
+type HostSpawnResult =
+  | { ok: true; child: HostChild; holder: HostLog }
+  | { ok: false; child: HostChild | null; holder: HostLog; error: string };
+
+export type HostConnectResult =
+  | { ok: true; ownedByDesktop: boolean; adopted?: true }
+  | { ok: false; ownedByDesktop: false; error: string; authError?: boolean };
+
+export interface DisconnectHostResult {
+  ok: boolean;
+  error?: string | undefined;
+}
+
+export interface EnsureServerAuthOptions {
+  /** Fires just before the login (which may open the browser) runs. */
+  onLogin?: (() => void) | undefined;
+  loginTimeoutMs?: number | undefined;
+}
+
+/** A failed sign-in, with copy the UI can show. */
+export interface ServerAuthFailure {
+  ok: false;
+  authError: true;
+  error: string;
+  errorMessage: string;
+  errorAction: string;
+  failure?: CliFailure;
+}
+
+export type ServerAuthResult = { ok: true } | ServerAuthFailure;
+
+export type StartOwnedLocalServerResult =
+  { ok: true; url: string; alreadyRunning?: true } | { ok: false; error: string };
+
+/** A local server this app started; port and pid are the CLI's unchecked output. */
+interface OwnedLocalServer {
+  url: string;
+  port: unknown;
+  pid: unknown;
+}
+
+/** What `shutdown` would stop right now. */
+export interface RunningWork {
+  hosts: number;
+  localServer: boolean;
+}
+
+/** `err.message` of what spawn or the child's "error" event raised. */
+function messageOf(err: unknown): string {
+  // Both raise Error objects; read the field as the plain property access did.
+  return (err as Error).message;
+}
+
+/**
+ * Heuristically classify a host-connect error as an authentication failure,
+ * from `omnigent host`'s own messages (HostConnectError: "Authentication
+ * failed", "HTTP 401", login-page redirect, or the `omnigent login` hint). Lets
+ * the UI show a friendly "sign in" prompt instead of a scary raw error.
+ */
+function isAuthError(text: string | undefined): boolean {
+  return /authentication failed|http 401|unauthor|login page|omnigent login/i.test(
+    String(text || ""),
+  );
+}
+
+/**
+ * True when `omnigent host` refused to start because a daemon already serves
+ * this target — which means a host is in fact already connected, so we can
+ * adopt it instead of treating the conflict as a failure.
+ */
+function isDaemonConflict(text: string | undefined): boolean {
+  return /already running for this server|host daemon is already running/i.test(String(text || ""));
+}
+
+/** Append to a capped log buffer (newest kept). */
+function appendLog(holder: HostLog, chunk: string): void {
+  holder.text = (holder.text + chunk).slice(-MAX_LOG_CHARS);
+}
+
+/** A login timeout as copy, e.g. "5 minutes" or "0.3 seconds". */
+function formatDuration(ms: number): string {
+  if (ms >= 60000) {
+    const minutes = Math.round(ms / 60000);
+    return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+  const seconds = Math.round(ms / 100) / 10;
+  return `${seconds} second${seconds === 1 ? "" : "s"}`;
+}
+
+/**
+ * SIGTERM a child, escalating to SIGKILL after a grace period, and resolve once
+ * it has actually exited.
+ */
+function stopChild(child: HostChild | null): Promise<void> {
+  return new Promise((resolve) => {
+    if (!child || child.exitCode !== null) {
+      resolve();
+      return;
+    }
+    const t = setTimeout(() => {
+      if (child.exitCode === null) child.kill("SIGKILL");
+    }, KILL_GRACE_MS);
+    // Don't let the escalation timer keep the event loop alive at quit.
+    if (typeof t.unref === "function") t.unref();
+    child.once("exit", () => {
+      clearTimeout(t);
+      resolve();
+    });
+    child.kill("SIGTERM");
+  });
+}
+
+/**
+ * The desktop's managed host connections and local server. Main creates one
+ * per process; it holds which processes this app started.
+ */
+export function createServerManager({
+  cli = withTestOverrides("omnigent_cli", omnigentCli),
+  spawn: spawnHost = spawn,
+}: ServerManagerDeps = {}) {
+  /** serverUrl(normalized) -> { child, serverUrl, log } for host processes we started. */
+  const hostChildren = new Map<string, HostChildEntry>();
+
+  /** serverUrl(normalized) -> in-flight ensureHostConnected promise (dedup). */
+  const connectingHosts = new Map<string, Promise<HostConnectResult>>();
+
+  /**
+   * Every `omnigent host` child we have spawned and not yet seen exit — including
+   * one still mid-connect, before it lands in `hostChildren` (the connect await
+   * can take up to CONNECT_TIMEOUT_MS). `shutdown` SIGTERMs this set so a quit
+   * during a connect can't orphan the child. Entries self-remove on exit.
+   */
+  const spawnedHostChildren = new Set<HostChild>();
+
+  /** { url, port, pid } when this app started the local server; null otherwise. */
+  let ownedLocalServer: OwnedLocalServer | null = null;
+
+  /** Single listener notified when a host child's lifecycle changes (no polling). */
+  let changeListener: (() => void) | null = null;
+
+  /**
+   * Register a callback fired when a managed host child connects or exits on its
+   * own, so the main process can push a status ping to the renderer without
+   * polling. One listener; a second call replaces the first.
+   */
+  function onChange(cb: (() => void) | null): void {
+    changeListener = typeof cb === "function" ? cb : null;
+  }
+
+  /** Fire the change listener, swallowing listener errors. */
+  function emitChange(): void {
+    if (changeListener) {
+      try {
+        changeListener();
+      } catch {
+        // A broken listener must not take down lifecycle handling.
+      }
+    }
+  }
+
+  /**
+   * True when we hold a live (not yet exited) host child for this server.
+   *
+   * @param key Normalized server URL.
+   */
+  function ownsLiveHost(key: string): boolean {
+    const entry = hostChildren.get(key);
+    return Boolean(entry && entry.child.exitCode === null && !entry.child.killed);
+  }
+
+  /**
+   * Spawn `omnigent host --server <url>` and resolve once it reports connected
+   * (or fails / times out). On success the child keeps running; the caller
+   * registers it. Never rejects.
+   */
+  function spawnHostChild(cliCommand: CliCommand, serverUrl: string): Promise<HostSpawnResult> {
+    return new Promise((resolve) => {
+      const holder: HostLog = { text: "" };
+      let child: HostChild;
+      try {
+        const { executable, prefixArgs } = cli.cliCommandParts(cliCommand);
+        // `--non-interactive`: the desktop owns the sign-in step (ensureServerAuth
+        // runs `omnigent login` first), so the host daemon must never try its own
+        // interactive login. Without the flag, an unauthed connect relies on the
+        // spawned child's stdin not being a TTY to bail — with it, the CLI raises a
+        // deterministic "run `omnigent login`" error that `isAuthError` classifies,
+        // so any residual auth gap becomes a fast, surfaced authError, not a hang.
+        child = spawnHost(
+          executable,
+          [...prefixArgs, "host", "--server", serverUrl, "--non-interactive"],
+          {
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        );
+      } catch (err) {
+        resolve({ ok: false, child: null, holder, error: messageOf(err) });
+        return;
+      }
+      // Track from the instant it exists so `shutdown` can kill it even while the
+      // connect is still in flight (not yet in hostChildren). Self-removes on exit.
+      spawnedHostChildren.add(child);
+      child.once("exit", () => spawnedHostChildren.delete(child));
+
+      let settled = false;
+      const finish = (result: HostSpawnResult) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+      };
+
+      const timer = setTimeout(() => {
+        finish({ ok: false, child, holder, error: "timed out waiting for host to connect" });
+      }, CONNECT_TIMEOUT_MS);
+
+      const onData = (buf: unknown) => {
+        // Pipes deliver Buffers.
+        const text = (buf as Buffer).toString();
+        appendLog(holder, text);
+        if (text.includes(CONNECTED_MARKER)) finish({ ok: true, child, holder });
+      };
+      child.stdout.on("data", onData);
+      child.stderr.on("data", onData);
+      child.on("error", (err) => finish({ ok: false, child, holder, error: messageOf(err) }));
+      // An exit *before* the connected marker is a failure (auth error, conflict,
+      // bad URL). The settled guard makes this a no-op once connected, so the
+      // persistent cleanup listener (registered by the caller) handles later exits.
+      child.on("exit", (code, signal) =>
+        finish({
+          ok: false,
+          child,
+          holder,
+          error: holder.text.trim() || `host exited (code=${code}, signal=${signal})`,
+        }),
+      );
+    });
+  }
+
+  /**
+   * Ensure this machine is connected as a host to `serverUrl`.
+   *
+   * If a live daemon already serves it (e.g. one the user started by hand), we
+   * *adopt* it without spawning a duplicate — `omnigent host` would otherwise
+   * error on the conflict, and we must not kill a daemon we didn't start. Adopted
+   * connections report ownedByDesktop:false.
+   */
+  async function ensureHostConnected(
+    cliCommand: CliCommand,
+    serverUrl: string,
+  ): Promise<HostConnectResult> {
+    const key = cli.normalizeServerUrl(serverUrl);
+    if (key === "") return { ok: false, ownedByDesktop: false, error: "missing server URL" };
+    if (ownsLiveHost(key)) return { ok: true, ownedByDesktop: true };
+    // Dedupe concurrent connects for the same server (the restore-on-load path
+    // racing the connect-time path, or a double-clicked Start) so we never spawn
+    // two `omnigent host` processes for one target.
+    const inflight = connectingHosts.get(key);
+    if (inflight) return inflight;
+    const op = connectHost(cliCommand, serverUrl, key);
+    connectingHosts.set(key, op);
+    // Ping the renderer right away so it re-reads (e.g. refetches the server's
+    // host list), then again once the connect settles.
+    emitChange();
+    try {
+      return await op;
+    } finally {
+      connectingHosts.delete(key);
+      emitChange();
+    }
+  }
+
+  /**
+   * The actual connect: adopt a daemon already serving this target, else spawn
+   * and track one. Serialized per target by ensureHostConnected.
+   *
+   * @param key Normalized server URL.
+   */
+  async function connectHost(
+    cliCommand: CliCommand,
+    serverUrl: string,
+    key: string,
+  ): Promise<HostConnectResult> {
+    // Adopt only a daemon we can VERIFY is connected (live process + an online
+    // tunnel, via the fast disk-read + single HTTP probe — not the slow `omnigent
+    // host status` subprocess). PID-liveness alone is not enough: a stale registry
+    // record whose pid was recycled by an unrelated process would otherwise make
+    // us "adopt" a daemon that isn't there. If a genuine daemon exists but its
+    // tunnel is momentarily down, we fall through to spawn and the isDaemonConflict
+    // backstop below adopts it instead of creating a duplicate.
+    const conn = await cli.getHostConnectionFast(serverUrl);
+    if (conn.connected) {
+      return { ok: true, ownedByDesktop: false, adopted: true };
+    }
+
+    const spawned = await spawnHostChild(cliCommand, serverUrl);
+    if (!spawned.ok) {
+      // Connect failed or timed out. Await the child's termination — escalating to
+      // SIGKILL after the grace period — rather than firing a single SIGTERM and
+      // moving on: a child that ignores or is slow to handle SIGTERM would keep
+      // running as a connected host while we report {ok:false}, leaving the
+      // machine hosting in contradiction to the state we return. stopChild is a
+      // no-op for a child that already exited (the common conflict/error case).
+      await stopChild(spawned.child);
+      // The CLI refuses to start a second daemon for a target already served by
+      // one (e.g. a local-mode daemon our pre-check couldn't match). That means a
+      // host is in fact already connected — adopt it rather than report failure.
+      if (isDaemonConflict(spawned.error)) {
+        return { ok: true, ownedByDesktop: false, adopted: true };
+      }
+      return {
+        ok: false,
+        ownedByDesktop: false,
+        error: spawned.error,
+        authError: isAuthError(spawned.error),
+      };
+    }
+    hostChildren.set(key, { child: spawned.child, serverUrl, log: spawned.holder });
+    // Persistent cleanup: drop the entry when this child eventually exits. If the
+    // entry is still ours here, this is a SPONTANEOUS exit (crash / external
+    // kill), not a user-initiated disconnect (which removes the entry first), so
+    // ping the UI — this is how a dying daemon is reflected without polling.
+    spawned.child.on("exit", () => {
+      if (hostChildren.get(key)?.child === spawned.child) {
+        hostChildren.delete(key);
+        emitChange();
+      }
+    });
+    return { ok: true, ownedByDesktop: true };
+  }
+
+  /**
+   * Disconnect this machine from `serverUrl`. A desktop-owned child is killed; a
+   * daemon we merely adopted is asked to stop via the CLI (the user explicitly
+   * toggled off, so honoring that is correct even for an adopted daemon).
+   */
+  async function disconnectHost(
+    cliCommand: CliCommand,
+    serverUrl: string,
+  ): Promise<DisconnectHostResult> {
+    const key = cli.normalizeServerUrl(serverUrl);
+    const entry = hostChildren.get(key);
+    if (entry) {
+      hostChildren.delete(key);
+      // Await the exit so a follow-up restart spawns fresh rather than adopting
+      // the daemon we're tearing down.
+      await stopChild(entry.child);
+      return { ok: true };
+    }
+    // No desktop-owned child: ask the CLI to stop a daemon we'd adopted.
+    const res = await cli.stopHost(cliCommand, serverUrl);
+    return { ok: res.ok, error: res.ok ? undefined : res.output };
+  }
+
+  /**
+   * Ensure the CLI is authenticated for a server before connecting a host to it.
+   * Local (loopback) servers need no auth. For a remote server, this probes the
+   * server (via `omnigent_cli.probeServerAuth`) instead of trusting the
+   * on-disk token file, which may be stale. When not authed it runs `omnigent login <url>`,
+   * which is idempotent and opens the browser only for a dead grant. Hosts started
+   * through `isaac omni` always log in, since a legacy token can pass the probe.
+   *
+   * Returns ok for an already-authed unmanaged CLI, when the server is unreachable (so the connect
+   * attempt can raise its own, clearer error), or after a successful login. On
+   * login failure returns `{ ok:false, authError:true, error, errorMessage, errorAction, failure? }`
+   * so the UI can offer a sign-in/retry affordance instead of a generic failure;
+   * `failure` is the process-level {@link CliFailure} behind the copy.
+   */
+  async function ensureServerAuth(
+    cliCommand: CliCommand,
+    serverUrl: string,
+    { onLogin, loginTimeoutMs }: EnsureServerAuthOptions = {},
+  ): Promise<ServerAuthResult> {
+    if (cli.isLoopbackServer(serverUrl)) return { ok: true };
+    const probe = await cli.probeServerAuth(serverUrl);
+    const managedOmni = cli.cliCommandParts(cliCommand).prefixArgs[0] === "omni";
+    // A legacy token can pass /v1/me but cannot supply the managed host's OAuth grant.
+    // Skip unreachable servers so the connect attempt reports the connectivity error.
+    if ((!managedOmni && probe.authed) || !probe.reachable) return { ok: true };
+    onLogin?.();
+    const loginOptions: [] | [{ timeoutMs: number }] =
+      loginTimeoutMs === undefined ? [] : [{ timeoutMs: loginTimeoutMs }];
+    const res = await cli.loginServer(cliCommand, serverUrl, ...loginOptions);
+    if (res.ok) return { ok: true };
+    const { errorMessage, errorAction } = loginFailureCopy(
+      cliCommand,
+      serverUrl,
+      res.failure,
+      loginTimeoutMs ?? cli.LOGIN_TIMEOUT_MS,
+    );
+    return {
+      ok: false,
+      authError: true,
+      error: `${errorMessage} ${errorAction}`,
+      errorMessage,
+      errorAction,
+      ...(res.failure ? { failure: res.failure } : {}),
+    };
+  }
+
+  /**
+   * Diagnosis and recovery copy for a failed login, built only from the server
+   * URL, the command's display name, and process-level facts. Never from `login`
+   * output: on the OIDC path it carries the login-ticket URL (`…/auth/login?ticket=…`),
+   * which is auth material. The executable path is left out because it can reveal
+   * the user's home directory to the server-loaded renderer.
+   */
+  function loginFailureCopy(
+    cliCommand: CliCommand,
+    serverUrl: string,
+    failure: CliFailure | undefined,
+    timeoutMs: number,
+  ): { errorMessage: string; errorAction: string } {
+    const { displayName } = cli.cliCommandParts(cliCommand);
+    const rerun = `\`${displayName} login ${serverUrl}\``;
+    switch (failure?.kind) {
+      case undefined:
+        // No process-level facts to classify: keep the generic browser-flow copy.
+        return {
+          errorMessage: `Sign-in to ${serverUrl} didn't complete. A browser window should have opened.`,
+          errorAction: `Finish signing in and try again (or run ${rerun} in a terminal).`,
+        };
+      case "cli-not-found":
+        return {
+          errorMessage: `Couldn't start sign-in to ${serverUrl}: \`${displayName}\` or the interpreter it runs with wasn't found.`,
+          errorAction:
+            "Check that it's installed and on your PATH (or at the configured CLI path). If it is, reinstall it to repair it, then try again.",
+        };
+      case "spawn-failed":
+        return {
+          errorMessage: `Couldn't start sign-in to ${serverUrl}: \`${displayName}\` couldn't be run (${failure.errorCode}).`,
+          errorAction:
+            "Check that it's installed and executable, on your PATH or at the configured CLI path, then try again.",
+        };
+      case "timed-out":
+        return {
+          errorMessage: `Sign-in to ${serverUrl} wasn't finished within ${formatDuration(timeoutMs)}, so it was stopped.`,
+          errorAction: `Try again and finish any browser sign-in promptly, or run ${rerun} in a terminal.`,
+        };
+      case "signal":
+        return {
+          errorMessage: `Sign-in to ${serverUrl} stopped unexpectedly: \`${displayName} login\` was terminated by ${failure.signal}.`,
+          errorAction: `Try again, or run ${rerun} in a terminal.`,
+        };
+      case "exited":
+        return {
+          errorMessage: `Sign-in to ${serverUrl} failed: \`${displayName} login\` exited with code ${failure.exitCode}.`,
+          errorAction: `Try again and complete any browser sign-in that appears; if it still fails, run ${rerun} in a terminal to see the details.`,
+        };
+      default:
+        return {
+          errorMessage: `Sign-in to ${serverUrl} didn't complete.`,
+          errorAction: `Run ${rerun} in a terminal to see the details, then try again.`,
+        };
+    }
+  }
+
+  /**
+   * Restart this machine's host connection: stop (awaiting the daemon down), then
+   * reconnect.
+   */
+  async function restartHost(
+    cliCommand: CliCommand,
+    serverUrl: string,
+  ): Promise<HostConnectResult> {
+    await disconnectHost(cliCommand, serverUrl);
+    return ensureHostConnected(cliCommand, serverUrl);
+  }
+
+  /**
+   * Start (or reuse) the local background server. Ownership is recorded only when
+   * *we* actually start it — a server that was already running is left to its
+   * own lifecycle.
+   *
+   * When `onLine` is given, forward the fresh server's startup log lines to it
+   * while it boots (Option B: tail the daemon's own logfile — we don't own the
+   * process). A reused server has no fresh startup, so it gets one status line.
+   */
+  async function startLocalServer(
+    cliPath: CliCommand,
+    onLine?: (line: string) => void,
+  ): Promise<StartOwnedLocalServerResult> {
+    // Reuse a server that's already running — but health-verify it (pidfile +
+    // pid + /health), not just pid-liveness, since we're about to navigate the
+    // window to this URL: a stale pidfile (dead/reused pid, hung server) must NOT
+    // be reused or we'd send the window to a dead URL. Still far faster than
+    // `omnigent server status` (a Python cold start). We didn't start it, so no
+    // ownership claim.
+    const existing = await cli.localServerHealthy();
+    if (existing) {
+      if (onLine) onLine("Server already running — connecting…");
+      return { ok: true, url: existing.url, alreadyRunning: true };
+    }
+    // Tail the daemon's boot logfile alongside the start so lines stream live as
+    // it boots. `omnigent server --background` blocks until the server is healthy
+    // or fails, so it IS the authoritative "boot finished" signal: abort the tail
+    // the moment it resolves rather than letting the tail poll on its own. This
+    // keeps a failed start from waiting on the tail (no ~60s stall), and the
+    // startedAt floor makes the tail ignore any stale log from a prior crash. A
+    // tail failure must never fail the start, so it's isolated with catch.
+    const startedAtMs = Date.now();
+    const controller = onLine ? new AbortController() : null;
+    const tail =
+      controller && onLine
+        ? cli.tailLocalServerLog(onLine, { signal: controller.signal, startedAtMs }).catch(() => {})
+        : Promise.resolve();
+    try {
+      const res = await cli.startLocalServer(cliPath);
+      if (res.ok) {
+        ownedLocalServer = { url: res.url, port: res.port, pid: res.pid };
+        return { ok: true, url: res.url };
+      }
+      return { ok: false, error: res.error };
+    } finally {
+      controller?.abort();
+      await tail; // let it drain the final lines and close its watcher
+    }
+  }
+
+  /**
+   * Stop the local server only if this app started it (used at quit). A server
+   * the desktop didn't start is left running.
+   */
+  async function stopOwnedLocalServer(
+    cliPath: CliCommand,
+  ): Promise<{ ok: boolean; skipped?: true }> {
+    if (!ownedLocalServer) return { ok: true, skipped: true };
+    const res = await cli.stopLocalServer(cliPath);
+    ownedLocalServer = null;
+    return { ok: res.ok };
+  }
+
+  /**
+   * Tear down everything this app started: SIGTERM all host children (await their
+   * exit within the grace period), then stop an owned local server. Called from
+   * the app's before-quit handler.
+   */
+  async function shutdown(cliPath: CliCommand | null): Promise<void> {
+    // Iterate the spawned-children set, not hostChildren: it also covers a child
+    // still mid-connect (spawned but not yet tracked in hostChildren), so a quit
+    // during a connect can't leave an orphaned `omnigent host` process.
+    const exits = [];
+    for (const child of spawnedHostChildren) {
+      exits.push(stopChild(child));
+    }
+    await Promise.all(exits);
+    hostChildren.clear();
+    spawnedHostChildren.clear();
+    if (cliPath) await stopOwnedLocalServer(cliPath);
+  }
+
+  /**
+   * What `shutdown` would stop right now: connected host processes and a local
+   * server this app started. Read-only; the quit prompt uses it for its wording.
+   */
+  function runningWork(): RunningWork {
+    let hosts = 0;
+    for (const key of hostChildren.keys()) {
+      if (ownsLiveHost(key)) hosts += 1;
+    }
+    return { hosts, localServer: ownedLocalServer !== null };
+  }
+
+  return {
+    ensureHostConnected,
+    ensureServerAuth,
+    disconnectHost,
+    restartHost,
+    startLocalServer,
+    stopOwnedLocalServer,
+    shutdown,
+    runningWork,
+    onChange,
+    // Exposed for tests / introspection.
+    _hostChildren: hostChildren,
+    ownsLiveHost,
+  };
+}

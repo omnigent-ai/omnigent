@@ -13,7 +13,7 @@
  * unit-testable.
  */
 
-const { normalizeServerUrl } = require("./omnigent_cli");
+const { normalizeServerUrl } = require("./omnigent_cli.ts");
 
 /** Keep the tail of the command output for failure diagnostics. */
 const OUTPUT_TAIL_CHARS = 8000;

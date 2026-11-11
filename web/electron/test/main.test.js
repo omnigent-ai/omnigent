@@ -199,6 +199,7 @@ function loadNavigationHarness({
     arcaSetups: [],
     arcaSetupCancels: 0,
     sshConnects: [],
+    serverManagers: [],
   };
   const pickers = [];
   const findBars = [];
@@ -677,22 +678,27 @@ function loadNavigationHarness({
           now: localHostNow,
         }),
     },
-    "./omnigent_cli": {
+    "./omnigent_cli.ts": {
       isExecutableFile: () => false,
       resolveCliPath: () => (cliPath ? { path: cliPath } : null),
-      cliCommandParts: require("../src/omnigent_cli").cliCommandParts,
-      normalizeServerUrl: require("../src/omnigent_cli").normalizeServerUrl,
+      cliCommandParts: require("../src/omnigent_cli.ts").cliCommandParts,
+      normalizeServerUrl: require("../src/omnigent_cli.ts").normalizeServerUrl,
       localHostId: () => "host_test",
       getCliStatus: () => ({ installed: false }),
     },
-    "./server_manager": {
-      shutdown: async () => {},
-      onChange: () => {},
-      ensureServerAuth: async () => serverAuthResult,
-      ensureHostConnected: async () => hostConnectResult,
-      restartHost: async () => ({ ok: true }),
-      disconnectHost: async () => ({ ok: true }),
-      startLocalServer: async () => ({ ok: false }),
+    "./server_manager.ts": {
+      createServerManager: (deps) => {
+        calls.serverManagers.push(deps);
+        return {
+          shutdown: async () => {},
+          onChange: () => {},
+          ensureServerAuth: async () => serverAuthResult,
+          ensureHostConnected: async () => hostConnectResult,
+          restartHost: async () => ({ ok: true }),
+          disconnectHost: async () => ({ ok: true }),
+          startLocalServer: async () => ({ ok: false }),
+        };
+      },
     },
   };
 
@@ -4529,6 +4535,16 @@ describe("Databricks credentials wiring", () => {
     await h.api.loadServerUrl(h.win, "https://host.example/ml/omnigents");
     assert.equal(h.calls.databricksOAuth.length, 1);
     assert.equal(h.calls.databricksSessions.length, 1);
+  });
+});
+
+describe("server manager wiring", () => {
+  it("creates one server manager at load with its default CLI and spawn", async (t) => {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    assert.deepEqual(h.calls.serverManagers, [undefined]);
+    await h.api.loadServerUrl(h.win, "https://host.example/ml/omnigents");
+    assert.equal(h.calls.serverManagers.length, 1);
   });
 });
 
