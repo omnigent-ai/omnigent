@@ -124,7 +124,11 @@ def test_transcript_metadata_scan_bounds_memory(tmp_path: Path, reader: str) -> 
             handle.write(json.dumps({"type": "progress", "padding": "x" * 4096}) + "\n")
         handle.write(json.dumps(marker) + "\n")
 
-    tracemalloc.start()
+    was_tracing = tracemalloc.is_tracing()
+    if not was_tracing:
+        tracemalloc.start()
+    baseline, _ = tracemalloc.get_traced_memory()
+    tracemalloc.reset_peak()
     try:
         if reader == "recent_command":
             found = claude_native_bridge.transcript_has_recent_local_command(
@@ -139,10 +143,12 @@ def test_transcript_metadata_scan_bounds_memory(tmp_path: Path, reader: str) -> 
             )
         _, peak = tracemalloc.get_traced_memory()
     finally:
-        tracemalloc.stop()
+        if not was_tracing:
+            tracemalloc.stop()
 
     assert found
-    assert peak < 4 * 1024 * 1024, f"metadata scan allocated {peak:,} bytes"
+    assert tracemalloc.is_tracing() is was_tracing
+    assert peak - baseline < 4 * 1024 * 1024, f"metadata scan allocated {peak - baseline:,} bytes"
 
 
 @pytest.mark.parametrize("reader", ["recent_command", "fork_marker"])
