@@ -139,7 +139,7 @@ const HIGHLIGHT_ALL = "md-preview-search";
 const HIGHLIGHT_CURRENT = "md-preview-search-current";
 
 /** True when the browser supports the CSS Custom Highlight API. */
-function highlightsSupported(): boolean {
+export function highlightsSupported(): boolean {
   return typeof CSS !== "undefined" && !!CSS.highlights && typeof Highlight !== "undefined";
 }
 

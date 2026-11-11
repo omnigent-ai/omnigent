@@ -140,6 +140,10 @@ _PER_TURN_TIMEOUT_S = 120.0
 # Overall budget for following one headless ``-p`` session to idle
 # (first-turn recovery and the extra-turns loop share it).
 _LOOP_TIMEOUT_S = 1800.0  # 30 min total
+# Snapshot statuses that keep a headless ``-p`` run going. The server reports any
+# ``waiting`` (an async orchestrator's, or a claude-native turn's background-agent
+# hold) as ``running``; ``waiting`` is here in case a snapshot ever carries it raw.
+_HEADLESS_UNFINISHED_STATUSES = frozenset({"running", "launching", "waiting"})
 
 # Optional bearer token for remote omnigent servers that sit
 # behind an auth proxy (for example Databricks Apps). When set, the
@@ -2802,7 +2806,7 @@ async def _run_bound_turn(
             async with asyncio.timeout(_LOOP_TIMEOUT_S):
                 while True:
                     await chat.refresh()
-                    if chat.status not in ("running", "launching"):
+                    if chat.status not in _HEADLESS_UNFINISHED_STATUSES:
                         break
                     await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
         reconciled = await _persisted_turn_text(client, bound.id)
@@ -2871,7 +2875,7 @@ async def _run_bound_turn(
         # relay cache holds "waiting" (sub-agents still running); "idle" means
         # truly done (single-turn agent, or synthesis completed in the probe).
         await chat.refresh()
-        if chat.status not in ("running", "launching"):
+        if chat.status not in _HEADLESS_UNFINISHED_STATUSES:
             return
         # Async orchestrator confirmed. Loop, refreshing after each turn.
         for _ in range(_MAX_EXTRA_TURNS):
@@ -2879,7 +2883,7 @@ async def _run_bound_turn(
             if extra.text:
                 all_text_parts.append(extra.text)
             await chat.refresh()
-            if chat.status not in ("running", "launching"):
+            if chat.status not in _HEADLESS_UNFINISHED_STATUSES:
                 return  # Idle: synthesis done or all sub-agents complete.
         logger.warning(
             "headless -p hit the %d-turn guard for session %s; "
@@ -2902,7 +2906,7 @@ async def _run_bound_turn(
         return "\n\n".join(p for p in all_text_parts if p)
     # An auto-woken turn can finish between live-stream subscriptions.
     # Recheck its durable output once the session has stopped running.
-    if chat.status not in ("running", "launching"):
+    if chat.status not in _HEADLESS_UNFINISHED_STATUSES:
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             logger.info("Recovered headless output from completed session %s", bound.id)
