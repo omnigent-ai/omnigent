@@ -766,6 +766,12 @@ Cross-harness journeys:
   unchanged. Databricks codex launch discovery skips models whose
   `supported_api_types` list omits `codex/v1/responses`.
 - **`model-and-effort`, Codex runtime settings:**
+  A model/effort update before message delivery has a 30-second RPC budget.
+  If its reply is rejected or lost, the message remains unsent even if the
+  settings already changed; no request is replayed automatically. The real
+  loopback cases in
+  `tests/inner/test_codex_native_executor.py::test_transport_failure_keeps_native_work_running`
+  cover failed settings, concurrent native work and replacement ownership.
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_clamps_unsupported_effort`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_preserves_supported_effort`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_model_switch_clamps_inherited_effort`,
