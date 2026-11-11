@@ -148,9 +148,12 @@ async def test_unfinished_fire_return_warns_and_leaves_run_for_recovery(store, c
     assert store.list_runs(task.id)[0][0].status == "failed"
 
 
-async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store) -> None:
+# COUNT=1 is a reminder whose minute passed during an outage: it still runs once,
+# completes, and is never replayed.
+@pytest.mark.parametrize("rrule", ["FREQ=HOURLY", "FREQ=HOURLY;COUNT=1"])
+async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store, rrule) -> None:
     with workspace_scope(42):
-        task = _task(store)
+        task = _task(store, rrule=rrule)
     clock = FakeClock(task.next_run_at + 7200)
     fired = []
 
@@ -172,11 +175,21 @@ async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store) -> None:
     assert len(fired) == 1
     assert fired[0].scheduled_at == task.next_run_at
     with workspace_scope(42):
-        assert store.get(task.id).next_run_at > clock.now()
+        saved = store.get(task.id)
+        if rrule.endswith("COUNT=1"):
+            assert (saved.state, saved.next_run_at) == ("completed", None)
+        else:
+            assert saved.next_run_at > clock.now()
         assert len(store.list_runs(task.id)[0]) == 1
     await schedulers[0].poll_once()
     await _drain(schedulers[0])
     assert len(fired) == 1
+    if rrule.endswith("COUNT=1"):
+        # Even an hour later, when the rule would match again, nothing replays.
+        clock.advance(3600)
+        await schedulers[0].poll_once()
+        await _drain(schedulers[0])
+        assert len(fired) == 1
 
 
 async def test_scan_pages_past_unowned_tasks_and_ownership_errors(

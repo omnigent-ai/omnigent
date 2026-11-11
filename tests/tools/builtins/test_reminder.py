@@ -59,6 +59,8 @@ def test_at_is_converted_to_utc() -> None:
         ({"delay_seconds": 1e300}, "at most 364 days"),
         ({"at": "0001-01-01T00:00:00+05:00"}, "outside the supported date range"),
         ({"at": "9999-12-31T23:59:59-05:00"}, "outside the supported date range"),
+        # Rounding up to the next minute is what overflows here.
+        ({"at": "9999-12-31T23:59:59Z"}, "outside the supported date range"),
     ],
 )
 def test_invalid_times_are_rejected(args: dict[str, object], error: str) -> None:

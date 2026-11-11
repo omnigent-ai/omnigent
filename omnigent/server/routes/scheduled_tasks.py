@@ -8,8 +8,9 @@ sync on every mutation so a change takes effect without a restart.
 Ownership mirrors hosts: tasks are scoped to the calling user (``"local"`` when
 auth is disabled). The RRULE is validated on create/update with
 :func:`validate_rrule` — an invalid rule (bad syntax, never-fires, fires-once, or
-below the minimum-interval floor) is a 400. With the database scheduler, an
-explicit ``COUNT=1`` is accepted as a one-time schedule such as a reminder.
+below the minimum-interval floor) is a 400. With the database scheduler and the
+``one_time_automations`` release feature, an explicit ``COUNT=1`` is accepted as a
+one-time schedule such as a reminder.
 """
 
 from __future__ import annotations
@@ -327,12 +328,14 @@ def _run_to_response(
 
 
 def one_time_schedules_supported(request: Request) -> bool:
-    """Whether this server runs ``COUNT=1`` schedules once.
+    """Whether this server creates ``COUNT=1`` schedules.
 
     Only the database scheduler counts ``COUNT`` from the task's creation; the
-    legacy timer counts from midnight of each re-arm and would fire again.
+    legacy timer counts from midnight of each re-arm and would fire again. The
+    ``one_time_automations`` release feature also gates creation, because an
+    older database scheduler polling the same database would pause such a task.
     """
-    return bool(getattr(request.app.state, "scheduled_task_dispatch_enabled", False))
+    return bool(getattr(request.app.state, "one_time_automations_enabled", False))
 
 
 async def _validate_rrule_or_400(
@@ -881,7 +884,7 @@ def create_scheduled_tasks_router(
         if body.first_run_at is not None and not one_time_schedules_supported(request):
             # Only the database scheduler saves the next run the check compares.
             raise OmnigentError(
-                "first_run_at needs the database scheduler, which this server does not run",
+                "first_run_at needs one-time automations, which this server does not enable",
                 code=ErrorCode.INVALID_INPUT,
             )
         _validate_timezone_or_400(body.timezone)

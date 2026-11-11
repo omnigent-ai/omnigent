@@ -94,6 +94,7 @@ def _build_app(
     tmp_path: Path,
     *,
     persistent: bool = False,
+    one_time: bool = False,
     local_single_user: bool = False,
     projects: bool = True,
     automations: bool | Callable[[], bool] | None = None,
@@ -118,7 +119,12 @@ def _build_app(
         automations=automations,
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=local_single_user),
         feature_flags=resolve_feature_flags(
-            {"OMNIGENT_FEATURES": "automations_v2" if persistent else "-automations_v2"}
+            {
+                "OMNIGENT_FEATURES": (
+                    ("automations_v2" if persistent else "-automations_v2")
+                    + (",one_time_automations" if one_time else "")
+                )
+            }
         ),
         server_config={"scheduled_task_scheduler": {"startup_retry_seconds": 0.01}},
         scheduled_task_dispatch=(
@@ -133,7 +139,10 @@ def _build_app(
 def auth_app(
     runtime_init: None, db_uri: str, tmp_path: Path, request: pytest.FixtureRequest
 ) -> FastAPI:
-    app = _build_app(db_uri, tmp_path, persistent=getattr(request, "param", False))
+    # ``True`` turns on the database scheduler; ``"one_time"`` also enables
+    # one-time automations on it.
+    param = getattr(request, "param", False)
+    app = _build_app(db_uri, tmp_path, persistent=bool(param), one_time=param == "one_time")
     _make_user(db_uri)
     _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
     return app
@@ -747,7 +756,7 @@ def _one_time_rule_in(hours: int) -> tuple[str, int]:
     return reminder_rrule(when), int(when.timestamp())
 
 
-@pytest.mark.parametrize("auth_app", [True], indirect=True)
+@pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
 async def test_database_scheduler_accepts_a_one_time_rule(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
@@ -774,7 +783,7 @@ async def test_database_scheduler_accepts_a_one_time_rule(
     assert renamed.status_code == 200, renamed.text
 
 
-@pytest.mark.parametrize("auth_app", [True], indirect=True)
+@pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
 async def test_late_create_refuses_a_one_time_rule_instead_of_moving_it_a_year(
     auth_app: FastAPI,
     auth_client: httpx.AsyncClient,
@@ -797,7 +806,7 @@ async def test_late_create_refuses_a_one_time_rule_instead_of_moving_it_a_year(
     assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
 
 
-@pytest.mark.parametrize("auth_app", [True], indirect=True)
+@pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
 @pytest.mark.parametrize("first_run_at", [0, 253402300800, 9223372036854775807])
 async def test_out_of_range_first_run_at_is_rejected(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, first_run_at: int
@@ -821,7 +830,25 @@ async def test_legacy_scheduler_refuses_first_run_at(
         "/v1/scheduled-tasks", json=_create_body(first_run_at=fire_at), headers=_headers()
     )
     assert resp.status_code == 400, resp.text
-    assert "first_run_at needs the database scheduler" in resp.text
+    assert "first_run_at needs one-time automations" in resp.text
+    assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+async def test_one_time_rules_wait_for_their_release_feature(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    # The database scheduler alone accepts one-time rules but doesn't create them,
+    # so a reminder can't reach an older scheduler that would pause it.
+    info = (await auth_client.get("/v1/info", headers=_headers())).json()
+    assert info["scheduled_task_one_time"] is False
+    rule, fire_at = _one_time_rule_in(hours=2)
+    for body in (
+        _create_body(rrule=rule, timezone="UTC"),
+        _create_body(rrule=rule, timezone="UTC", first_run_at=fire_at),
+    ):
+        resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+        assert resp.status_code == 400, resp.text
     assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
 
 

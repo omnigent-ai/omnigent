@@ -455,11 +455,11 @@ def resolve_reminder_time(args: dict[str, Any], now: datetime) -> datetime | str
         when = now + timedelta(seconds=delay)
     try:
         when = when.astimezone(UTC)
+        if when.second or when.microsecond:
+            when = when.replace(second=0, microsecond=0) + timedelta(minutes=1)
     except OverflowError:
         # Only an 'at' near the ends of the datetime range gets here.
         return "'at' is outside the supported date range."
-    if when.second or when.microsecond:
-        when = when.replace(second=0, microsecond=0) + timedelta(minutes=1)
     if when < now + MIN_REMINDER_DELAY:
         return "A reminder must be at least one minute in the future."
     if when > now + MAX_REMINDER_DELAY:
@@ -511,7 +511,9 @@ class SysReminderSetTool(Tool):
         return (
             "Set a one-time reminder: at the given time, the message is sent into "
             "this session as a new turn, even if the session has gone idle, the "
-            "runner has stopped, or the server restarted in between. Give either "
+            "runner has stopped, or the server restarted in between. The session's "
+            "host must be online then; a reminder that can't be delivered is "
+            "recorded as a failed run and not retried. Give either "
             "'at' (an ISO-8601 time with a UTC offset) or 'delay_seconds'; the "
             "time is rounded up to the next minute, must be at least a minute "
             "away, and at most 364 days. Write the message for your future self: "

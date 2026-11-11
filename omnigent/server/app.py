@@ -302,7 +302,8 @@ class ServerInfoResponse(BaseModel):
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
     # Scheduled tasks accept an explicit ``COUNT=1`` rule that fires once, such as
-    # a reminder. Only the database scheduler supports it; absent on older servers.
+    # a reminder, and ``first_run_at``. Needs the database scheduler and the
+    # ``one_time_automations`` release feature; absent on older servers.
     scheduled_task_one_time: bool = False
     automation_trigger_poll_minutes: int = 10
     # Scheduled permissions use the selected native harness's vocabulary.
@@ -2403,6 +2404,11 @@ def create_app(
 
     app.state.automations_available = automations_available
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
+    # Separate from dispatch: schedulers accept one-time rules from this release on,
+    # and creating them waits until every scheduler on the database does.
+    app.state.one_time_automations_enabled = automations_v2_enabled and (
+        resolved_feature_flags.enabled(Feature.ONE_TIME_AUTOMATIONS)
+    )
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
     # strip) can prefix it themselves. "" for a root deployment.
@@ -3746,7 +3752,7 @@ def create_app(
                 "scheduled_task_projects": project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
                 "scheduled_task_one_time": automations_enabled
-                and bool(app.state.scheduled_task_dispatch_enabled),
+                and bool(app.state.one_time_automations_enabled),
                 "session_move_source_checks": True,
                 "automations_enabled": automations_enabled,
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
