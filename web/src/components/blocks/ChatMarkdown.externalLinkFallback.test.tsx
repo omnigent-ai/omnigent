@@ -197,6 +197,22 @@ describe("external chat link clicks", () => {
     expect(openSpy).not.toHaveBeenCalled();
   });
 
+  it("links a session link to this server under the base path outside the router", () => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    try {
+      const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+      const link = renderExternalLink(`omnigent://${window.location.host}/c/worker_1`);
+      expect(link).toHaveAttribute("href", "/proxy/6767/c/worker_1");
+      expect(link).not.toHaveAttribute("target");
+      const event = click(link);
+
+      expect(event.defaultPrevented).toBe(false);
+      expect(openSpy).not.toHaveBeenCalled();
+    } finally {
+      delete window.__OMNIGENT_BASE_PATH__;
+    }
+  });
+
   it("leaves mail links to the browser without opening an empty tab", () => {
     const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
 

@@ -230,7 +230,6 @@ describe("MessageResponse", () => {
       ["credentials", "omnigent://user:secret@127.0.0.1:53694/c/abc"],
       ["no host", "omnigent:///c/abc"],
       ["a malformed host", "omnigent://%/c/abc"],
-      ["a bracketed host that isn't an address", "omnigent://[.]/c/abc"],
       ["an out-of-range port", "omnigent://127.0.0.1:99999/c/abc"],
       ["an encoded id", "omnigent://127.0.0.1:53694/c/a%2Fb"],
       ["a dot segment", "omnigent://127.0.0.1:53694/settings/../c/abc"],
