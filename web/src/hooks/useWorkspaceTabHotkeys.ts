@@ -5,25 +5,11 @@
 import { type RefObject, useEffect } from "react";
 
 import { isMacPlatform } from "@/lib/hotkeys";
-
-const DIGIT_CODES = [
-  "Digit1",
-  "Digit2",
-  "Digit3",
-  "Digit4",
-  "Digit5",
-  "Digit6",
-  "Digit7",
-  "Digit8",
-  "Digit9",
-] as const;
+import { matchedShortcutChordIndex } from "@/lib/shortcuts/registry";
 
 /** Index of the workspace tab a keydown picks, or -1 when it isn't the chord. */
 export function workspaceTabIndex(e: globalThis.KeyboardEvent, isMac = isMacPlatform()): number {
-  const chord = isMac ? e.ctrlKey && !e.altKey : e.altKey && !e.ctrlKey;
-  if (!chord || e.metaKey || e.shiftKey) return -1;
-  if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return -1;
-  return DIGIT_CODES.indexOf(e.code as (typeof DIGIT_CODES)[number]);
+  return matchedShortcutChordIndex(e, "workspace.tab", { mac: isMac });
 }
 
 /**
