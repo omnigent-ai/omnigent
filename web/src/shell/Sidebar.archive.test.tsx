@@ -204,7 +204,7 @@ describe("archive worktree prompt", () => {
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
     // The prompt names the worktree it means: directory name, path, and branch.
     const [item] = screen.getAllByTestId("archive-worktree-item");
-    expect(item).toHaveTextContent("feature-x");
+    expect(screen.getByTestId("archive-worktree-name")).toHaveTextContent(/^feature-x$/);
     expect(item).toHaveTextContent("/repo/.worktrees/feature-x");
     expect(item).toHaveTextContent("feature/x");
     fireEvent.click(screen.getByTestId("archive-worktree-delete"));

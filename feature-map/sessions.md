@@ -384,8 +384,9 @@ action offers the same choices.
 **Archive worktree prompt:** archive a worktree session from the row menu,
 bulk selection, or header menu; the "Also delete the worktree?" dialog offers
 "No, archive only" and "Yes, delete worktree", plus Remember my choice.
-It lists each affected worktree once, with its directory name, path, and
-branch; a bulk archive whose sessions share a worktree lists it once.
+It lists each affected worktree once, with its directory name, root path, and
+branch; a session opened in a worktree subdirectory names the enclosing root,
+and the host appears when one archive spans several hosts.
 The prompt explains that worktrees inside sandboxes or used by other sessions,
 including archived sessions, are retained.
 Dismissing it cancels the archive. Settings → Git → Worktrees holds the saved
@@ -760,11 +761,12 @@ plain `uv run pytest`, which starts a private server for the test.
   the rejected request without archive. The prompt, remembered choice, and the
   archive-only fallback on a server without cleanup have component coverage in
   `web/src/shell/Sidebar.archive.test.tsx` and
-  `web/src/shell/HeaderConversationMenu.test.tsx`; the worktree list's
-  deduplication is unit-tested in `web/src/shell/ArchivePrompt.test.ts`.
+  `web/src/shell/HeaderConversationMenu.test.tsx`; root resolution and the
+  worktree list's deduplication are unit-tested in
+  `web/src/lib/worktreeRoot.test.ts` and `web/src/shell/ArchivePrompt.test.tsx`.
   Manually: archive a worktree session from the row menu, bulk selection, and
-  header menu, and expect the dialog to name each worktree every time; an idle session without a worktree archives
-  silently.
+  header menu, and expect the dialog to name each worktree every time; an idle
+  session without a worktree archives silently.
 - **`unarchive`, header menu:**
   `tests/e2e_ui/sessions/test_archived_session_header_menu.py::test_archived_session_header_menu_offers_unarchive`.
 - **`unarchive`, open archived session's sidebar row:**

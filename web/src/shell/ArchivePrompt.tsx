@@ -1,5 +1,5 @@
-import { FolderIcon, GitBranchIcon } from "lucide-react";
-import { useCallback, useId, useState, type ReactNode } from "react";
+import { FolderIcon, GitBranchIcon, ServerIcon } from "lucide-react";
+import { useCallback, useId, useRef, useState, type ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -12,12 +12,14 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { Conversation } from "@/hooks/useConversations";
+import { useHosts } from "@/hooks/useHosts";
 import { isSessionWorking } from "@/hooks/useSessionState";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   readDeleteWorktreesOnArchive,
   writeDeleteWorktreesOnArchive,
 } from "@/lib/archiveWorktreePreferences";
+import { recordedWorktreeRoot, WORKTREE_ROOT_LABEL_KEY } from "@/lib/worktreeRoot";
 
 import { basename } from "./WorkspacePicker";
 
@@ -26,7 +28,9 @@ type ProceedFn = (deleteWorktreeIds: ReadonlySet<string>) => void;
 
 /** One worktree the archive prompt names; several sessions may share it. */
 export interface ArchiveWorktreeTarget {
-  /** Worktree directory, e.g. `"/repo/.worktrees/login"`; null when unknown. */
+  /** Host holding the worktree, e.g. `"host_a1b2"`; null when not host-bound. */
+  hostId: string | null;
+  /** Worktree root directory, e.g. `"/repo/.worktrees/login"`; null when unknown. */
   path: string | null;
   /** Branch checked out in the worktree, e.g. `"feature/login"`. */
   branch: string;
@@ -38,25 +42,45 @@ interface PendingPrompt {
   choose: (deleteWorktrees: boolean) => void;
 }
 
-/** Distinct worktrees of the sessions, in order; sessions without a path group by branch. */
-export function archiveWorktreeTargets(
+/** Directory archive cleanup would remove for the session, or null when unknown. */
+function sessionWorktreeRoot(conversation: Conversation): Promise<string | null> {
+  const workspace = conversation.workspace;
+  if (!workspace?.trim()) return Promise.resolve(null);
+  return recordedWorktreeRoot(workspace, conversation.labels?.[WORKTREE_ROOT_LABEL_KEY]);
+}
+
+function worktreeTargetKey({ hostId, path, branch }: ArchiveWorktreeTarget): string {
+  return JSON.stringify(path === null ? [hostId, "branch", branch] : [hostId, "path", path]);
+}
+
+/** Distinct worktrees of the sessions, in order; sessions without a root group by branch. */
+export async function archiveWorktreeTargets(
   conversations: readonly Conversation[],
-): ArchiveWorktreeTarget[] {
-  const targets = new Map<string, ArchiveWorktreeTarget>();
-  for (const conversation of conversations) {
-    const branch = conversation.git_branch;
-    if (branch == null) continue;
-    const path = conversation.workspace?.trim() || null;
-    const key = path === null ? `branch:${branch}` : `path:${path}`;
-    if (!targets.has(key)) targets.set(key, { path, branch });
-  }
-  // Git checks a branch out in one worktree at a time, so a pathless entry
-  // whose branch has a known path names that same worktree.
-  const values = [...targets.values()];
-  const branchesWithPath = new Set(
-    values.filter((target) => target.path !== null).map((target) => target.branch),
+): Promise<ArchiveWorktreeTarget[]> {
+  const resolved = await Promise.all(
+    conversations.flatMap((conversation) => {
+      const branch = conversation.git_branch;
+      if (branch == null) return [];
+      const hostId = conversation.host_id ?? null;
+      return [sessionWorktreeRoot(conversation).then((path) => ({ hostId, path, branch }))];
+    }),
   );
-  return values.filter((target) => target.path !== null || !branchesWithPath.has(target.branch));
+  const targets = new Map<string, ArchiveWorktreeTarget>();
+  for (const target of resolved) {
+    const key = worktreeTargetKey(target);
+    if (!targets.has(key)) targets.set(key, target);
+  }
+  // Git checks a branch out in one worktree at a time, so a rootless entry
+  // whose branch has a known root on the same host names that worktree.
+  const values = [...targets.values()];
+  const branchesWithRoot = new Set(
+    values
+      .filter((target) => target.path !== null)
+      .map((target) => worktreeTargetKey({ ...target, path: null })),
+  );
+  return values.filter(
+    (target) => target.path !== null || !branchesWithRoot.has(worktreeTargetKey(target)),
+  );
 }
 
 interface PendingRunningPrompt {
@@ -74,6 +98,7 @@ export function useArchivePrompt(): {
   dialog: ReactNode;
 } {
   const [pending, setPending] = useState<PendingPrompt | null>(null);
+  const latestWorktreeRequest = useRef(0);
   const [pendingRunning, setPendingRunning] = useState<PendingRunningPrompt | null>(null);
   const serverInfo = useServerInfo();
   const cleanupSupported = serverInfo !== "loading" && serverInfo.archive_worktree_cleanup === true;
@@ -91,10 +116,14 @@ export function useArchivePrompt(): {
         proceed(preference ? worktreeIds : new Set());
         return;
       }
-      setPending({
-        worktreeCount: worktreeIds.size,
-        worktrees: archiveWorktreeTargets(worktreeSessions),
-        choose: (deleteWorktrees) => proceed(deleteWorktrees ? worktreeIds : new Set()),
+      const request = ++latestWorktreeRequest.current;
+      void archiveWorktreeTargets(worktreeSessions).then((worktrees) => {
+        if (request !== latestWorktreeRequest.current) return;
+        setPending({
+          worktreeCount: worktreeIds.size,
+          worktrees,
+          choose: (deleteWorktrees) => proceed(deleteWorktrees ? worktreeIds : new Set()),
+        });
       });
     },
     [cleanupSupported],
@@ -308,34 +337,59 @@ function ArchiveWorktreeDialog({
   );
 }
 
-function ArchiveWorktreeList({ worktrees }: { worktrees: readonly ArchiveWorktreeTarget[] }) {
+export function ArchiveWorktreeList({
+  worktrees,
+}: {
+  worktrees: readonly ArchiveWorktreeTarget[];
+}) {
+  const spansHosts = new Set(worktrees.map((target) => target.hostId)).size > 1;
   return (
     <ul
       aria-label={worktrees.length === 1 ? "Worktree" : "Worktrees"}
       className="max-h-48 divide-y divide-border overflow-y-auto rounded-md border border-border"
       data-testid="archive-worktree-list"
     >
-      {worktrees.map(({ path, branch }) => (
+      {worktrees.map((target) => (
         <li
-          key={path ?? `branch:${branch}`}
+          key={worktreeTargetKey(target)}
           className="flex min-w-0 flex-col gap-0.5 px-3 py-2"
           data-testid="archive-worktree-item"
         >
-          {path !== null && (
+          {target.path !== null && (
             <>
               <span className="flex min-w-0 items-center gap-1.5 text-ui font-medium">
                 <FolderIcon aria-hidden className="size-3.5 shrink-0" />
-                <span className="truncate">{basename(path)}</span>
+                <span className="truncate" data-testid="archive-worktree-name">
+                  {basename(target.path)}
+                </span>
               </span>
-              <span className="break-all pl-5 font-mono text-xs text-muted-foreground">{path}</span>
+              <span className="break-all pl-5 font-mono text-xs text-muted-foreground">
+                {target.path}
+              </span>
             </>
           )}
           <span className="flex min-w-0 items-center gap-1.5 font-mono text-xs text-muted-foreground">
             <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
-            <span className="break-all">{branch}</span>
+            <span className="break-all">{target.branch}</span>
           </span>
+          {spansHosts && <ArchiveWorktreeHost hostId={target.hostId} />}
         </li>
       ))}
     </ul>
+  );
+}
+
+/** Host line, shown only when one archive spans worktrees on several hosts. */
+function ArchiveWorktreeHost({ hostId }: { hostId: string | null }) {
+  const { data: hosts } = useHosts({ includeSandbox: true });
+  const label =
+    hostId === null ? "No host" : (hosts?.find((host) => host.host_id === hostId)?.name ?? hostId);
+  return (
+    <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+      <ServerIcon aria-hidden className="size-3.5 shrink-0" />
+      <span className="truncate" data-testid="archive-worktree-host">
+        {label}
+      </span>
+    </span>
   );
 }
