@@ -10,6 +10,8 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // filed-but-not-pinned session reveals it; a pinned session is already
 // reachable from the Pinned section, so the effect must skip pinned targets.
 
+import type * as SessionsApiModule from "@/lib/sessionsApi";
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -17,6 +19,7 @@ import { sessionNumberAriaShortcut } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { sidebarConfig } from "@/lib/sidebarConfig";
+import type { Session } from "@/lib/types";
 import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "@/shell/sidebarNav";
 
 // Server-authoritative pinned set for the mock; tests push the pinned conv here.
@@ -35,12 +38,19 @@ vi.mock("@/hooks/useConversations", async () => {
   };
 });
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+// Snapshot reads keep their real behavior unless a test stubs a child's parent.
+vi.mock("@/lib/sessionsApi", async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionsApiModule>();
+  return { ...actual, getSessionSlim: vi.fn(actual.getSessionSlim) };
+});
 
 import { useConversations, useProjectSessions } from "@/hooks/useConversations";
+import { getSessionSlim } from "@/lib/sessionsApi";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
 const useProjectSessionsMock = vi.mocked(useProjectSessions);
+const getSessionSlimMock = vi.mocked(getSessionSlim);
 
 function conv(id: string, project?: string): Conversation {
   return {
@@ -86,6 +96,7 @@ function expandedProjects(): unknown {
 beforeEach(() => {
   useConvMock.mockReset();
   useProjectSessionsMock.mockReset();
+  getSessionSlimMock.mockReset();
   // ProjectFolder fetches its own paginated list when expanded. The tests
   // above already seed the top-level list; mirror it for the folder query so
   // an expanded folder actually renders rows.
@@ -154,6 +165,30 @@ describe("sidebar auto-expand vs. pinned sessions (#2506)", () => {
     const { rerenderSidebar } = renderAt("/c/pinned_a");
     expect(expandedProjects()).toEqual([]);
 
+    pinnedRef.current = [];
+    act(() => rerenderSidebar());
+    const header = screen.getByRole("button", { name: "Repro 2506" });
+    expect(header).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(header);
+    pinnedRef.current = [conv("pinned_x")];
+    act(() => rerenderSidebar());
+    expect(screen.getByRole("button", { name: "Repro 2506" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(expandedProjects()).toEqual([]);
+  });
+
+  it("expands an already revealed project again when the open session is pinned then unpinned", () => {
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify([]));
+    mockConversations([conv("sibling_b", "Repro 2506")]);
+    const { rerenderSidebar } = renderAt("/c/sibling_b");
+    fireEvent.click(screen.getByRole("button", { name: "Repro 2506" }));
+
+    pinnedRef.current = [conv("sibling_b", "Repro 2506")];
+    act(() => rerenderSidebar());
+    expect(expandedProjects()).toEqual([]);
     pinnedRef.current = [];
     act(() => rerenderSidebar());
     const header = screen.getByRole("button", { name: "Repro 2506" });
@@ -306,5 +341,39 @@ describe("collapsing the project that holds the open session", () => {
     );
     expect(expandedProjects()).toEqual([]);
     expect(screen.getAllByRole("link", { name: /sibling_b/ })).toHaveLength(1);
+  });
+
+  it("stays collapsed when an open child session resolves to its parent", async () => {
+    // child_c's listed row stands in for the open-session row shown while its parent loads.
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify([]));
+    mockConversations([conv("child_c", "Repro 2506"), conv("sibling_b", "Repro 2506")]);
+    let releaseParent = () => {};
+    const parentGate = new Promise<void>((resolve) => {
+      releaseParent = resolve;
+    });
+    const snapshot = (id: string, parentSessionId: string | null) =>
+      ({ id, labels: {}, items: [], parentSessionId }) as unknown as Session;
+    getSessionSlimMock.mockImplementation(async (id: string) => {
+      if (id === "child_c") return snapshot("child_c", "sibling_b");
+      await parentGate;
+      return snapshot(id, null);
+    });
+    renderAt("/c/child_c");
+    const header = screen.getByRole("button", { name: "Repro 2506" });
+    expect(header).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(header);
+    await act(async () => {
+      releaseParent();
+      await parentGate;
+    });
+
+    // The collapsed folder now holds the resolved parent's row.
+    expect(await screen.findByRole("link", { name: /sibling_b/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Repro 2506" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(expandedProjects()).toEqual([]);
   });
 });

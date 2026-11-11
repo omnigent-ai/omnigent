@@ -2906,23 +2906,27 @@ function ConversationList({
     if (active.archived === true && activeTab !== "archived") return null;
     return projects.find((p) => sessionBelongsToProject(active, p, viewerId))?.name ?? null;
   }, [displayedActiveId, allConversations, folderConversations, activeTab, projects, viewerId]);
-  // Reveal the selected session's folder once per session and project, so a later
-  // pin or route update can't re-open a folder the user collapsed. Pinned sessions
-  // are skipped: the Pinned section already shows them.
+  // Reveal the selected session's folder once per navigation and project, so a later
+  // pin, parent lookup or route commit can't re-open a folder the user collapsed.
+  // Pinned sessions are skipped (the Pinned section shows them) until unpinned.
+  const selectedRouteId = optimisticActiveId ?? activeId ?? null;
   const autoExpanded = useRef<{ id: string | null; project: string | null }>({
     id: null,
     project: null,
   });
   useEffect(() => {
-    if (autoExpanded.current.id !== displayedActiveId) {
-      autoExpanded.current = { id: displayedActiveId, project: null };
+    if (autoExpanded.current.id !== selectedRouteId) {
+      autoExpanded.current = { id: selectedRouteId, project: null };
     }
     if (!displayedActiveId || !activeProjectName) return;
+    if (pinnedSet.has(displayedActiveId)) {
+      autoExpanded.current.project = null;
+      return;
+    }
     if (autoExpanded.current.project === activeProjectName) return;
-    if (pinnedSet.has(displayedActiveId)) return;
     autoExpanded.current.project = activeProjectName;
     expandProject(activeProjectName);
-  }, [displayedActiveId, activeProjectName, pinnedSet, expandProject]);
+  }, [selectedRouteId, displayedActiveId, activeProjectName, pinnedSet, expandProject]);
   // A folder's rows in render order: those above "Show more" while expanded,
   // otherwise the open session it holds under its collapsed header.
   const folderListedRows = useCallback(
