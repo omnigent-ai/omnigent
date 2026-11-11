@@ -49,11 +49,12 @@ interface ScopeState {
    */
   confirmed: Map<string, SuggestionStatus>;
   /**
-   * The lists whose loaded pages held each pending item when its first change
-   * was made. A fresh page from one of them that lacks the item was served
-   * after the server applied the change, so its total already reflects it.
+   * When each pending item's first change was made. A list whose data is
+   * older than that still shows the state before the change; a list fetched
+   * after it was served while the change was in flight or after it applied,
+   * and when the item is absent from it, its total already reflects the move.
    */
-  holders: Map<string, Set<string>>;
+  started: Map<string, number>;
   /** Instances to re-render when the overlay changes. */
   listeners: Set<() => void>;
 }
@@ -74,7 +75,7 @@ function scopeState(queryClient: QueryClient, scopeKeyText: string): ScopeState 
       chains: new Map(),
       resolved: new Set(),
       confirmed: new Map(),
-      holders: new Map(),
+      started: new Map(),
       listeners: new Set(),
     };
     byKey.set(scopeKeyText, state);
@@ -82,21 +83,17 @@ function scopeState(queryClient: QueryClient, scopeKeyText: string): ScopeState 
   return state;
 }
 
-/** The item's status in the cached lists that hold it, and which lists those are. */
-function locateInCaches(
+/** The item's status in whichever cached list holds it, if any. */
+function cachedStatus(
   queryClient: QueryClient,
   key: readonly unknown[],
   id: string,
-): { status: SuggestionStatus | undefined; holders: Set<string> } {
-  let status: SuggestionStatus | undefined;
-  const holders = new Set<string>();
-  for (const [queryKey, data] of queryClient.getQueriesData<Pages>({ queryKey: key })) {
+): SuggestionStatus | undefined {
+  for (const [, data] of queryClient.getQueriesData<Pages>({ queryKey: key })) {
     const place = data ? locateSuggestion(data.pages, id) : null;
-    if (!place) continue;
-    status ??= place.item.status;
-    holders.add(JSON.stringify(queryKey));
+    if (place) return place.item.status;
   }
-  return { status, holders };
+  return undefined;
 }
 
 /**
@@ -125,10 +122,9 @@ export function useProactiveInbox(
     viewerId,
   ];
   const scopeKeyText = JSON.stringify(scopeKey);
-  const queryKey = [...scopeKey, [...statuses]];
   const enabled = identityReady && settings?.enabled === true;
   const query = useInfiniteQuery({
-    queryKey,
+    queryKey: [...scopeKey, [...statuses]],
     queryFn: ({ pageParam }) => listSuggestions(pageParam, statuses),
     initialPageParam: null as string | null,
     getNextPageParam: (page) => page.nextCursor ?? undefined,
@@ -159,11 +155,11 @@ export function useProactiveInbox(
       }
       const key = JSON.parse(scopeKeyText) as unknown[];
       // The first unconfirmed change on an item records what the server last
-      // agreed to and which lists hold the item; later changes build on that.
-      if (!scope.holders.has(id)) {
-        const found = locateInCaches(queryClient, key, id);
-        if (found.status) scope.confirmed.set(id, found.status);
-        scope.holders.set(id, found.holders);
+      // agreed to and when the change was made; later changes build on that.
+      if (!scope.started.has(id)) {
+        const known = cachedStatus(queryClient, key, id);
+        if (known) scope.confirmed.set(id, known);
+        scope.started.set(id, Date.now());
       }
       scope.pending.set(id, change);
       scope.inFlight += 1;
@@ -196,7 +192,7 @@ export function useProactiveInbox(
           if (scope.pending.get(id) === change) {
             scope.pending.delete(id);
             scope.confirmed.delete(id);
-            scope.holders.delete(id);
+            scope.started.delete(id);
           }
           if (scope.chains.get(id) === request) scope.chains.delete(id);
           scope.inFlight -= 1;
@@ -209,13 +205,13 @@ export function useProactiveInbox(
   );
 
   let pages = query.data?.pages ?? [];
-  // Fetched pages carry the server's totals, so the overlay moves them from
-  // the confirmed status to the pending one, once. A list that held the item
-  // and no longer does was served after the change; its total already moved.
-  const ownKeyText = JSON.stringify(queryKey);
+  // Pages carry the server's totals, so the overlay moves them from the
+  // confirmed status to the pending one, once. Data older than the change
+  // predates it; data fetched since was cancelled at the change and so began
+  // after it, and when it lacks the item its total already reflects the move.
   for (const [id, change] of state.pending) {
-    const from = state.holders.get(id)?.has(ownKeyText) ? undefined : state.confirmed.get(id);
-    pages = applySuggestionUpdate(pages, id, change, from);
+    const stale = query.dataUpdatedAt <= (state.started.get(id) ?? 0);
+    pages = applySuggestionUpdate(pages, id, change, stale ? state.confirmed.get(id) : undefined);
   }
   const first = pages[0];
   const listedStatuses = new Set(statuses);

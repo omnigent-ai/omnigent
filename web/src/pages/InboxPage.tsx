@@ -260,9 +260,11 @@ export function InboxPage() {
   // stays selected while that is still loading.
   const advisorTab = advisorAvailable && advisorSettings?.enabled !== false;
   // Suggestions load only once the settings say the agent is on, so until they
-  // arrive the page is still assembling, and a failed read is a failure to show.
+  // arrive the page is still assembling, and a failed first read is a failure
+  // to show. A failed refetch keeps the settings it had, and the cards with them.
   const advisorSettingsPending = advisorAvailable && advisorSettingsQuery.isPending;
-  const advisorSettingsFailed = advisorAvailable && advisorSettingsQuery.isError;
+  const advisorSettingsFailed =
+    advisorAvailable && advisorSettingsQuery.isError && advisorSettings === undefined;
   const filter: InboxFilter = storedFilter === "advisor" && !advisorTab ? "all" : storedFilter;
   const advisorOnly = filter === "advisor";
   // The Unread tab pages through unread suggestions only, so an older unread

@@ -430,6 +430,34 @@ it("does not subtract again when a poll already reflects the committed change, a
   expect(result.current.inbox.items).toEqual(others);
 });
 
+it("trusts the total of a list first loaded while the dismissal is in flight", async () => {
+  const others = [
+    { ...item, id: "two", createdAt: 2 },
+    { ...item, id: "three", createdAt: 3 },
+  ];
+  vi.mocked(listSuggestions).mockResolvedValue(page([...others, item], 3));
+  const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
+  await waitFor(() => expect(result.current.unreadCount).toBe(3));
+  const patch = deferred<SuggestionUpdateResult>();
+  vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
+  act(() => result.current.update("sug", { resolution: "not_now" }));
+  expect(result.current.unreadCount).toBe(2);
+
+  // The Unread tab opens now; the server has applied the dismissal, so its
+  // first page lacks the item and already counts two.
+  vi.mocked(listSuggestions).mockResolvedValue(page(others, 2));
+  const unread = renderHook(() => useProactiveInbox(true, ["unread"]), { wrapper });
+  await waitFor(() => expect(unread.result.current.items).toEqual(others));
+  expect(unread.result.current.unreadCount).toBe(2);
+  expect(result.current.unreadCount).toBe(2);
+
+  await act(async () =>
+    patch.resolve(saved({ ...item, status: "dismissed", resolution: "not_now" }, 2)),
+  );
+  expect(unread.result.current.unreadCount).toBe(2);
+  expect(result.current.unreadCount).toBe(2);
+});
+
 it.each(["succeeds", "fails"])(
   "moves a list's unread total even when its loaded pages stop before the item, and the PATCH %s",
   async (outcome) => {

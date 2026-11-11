@@ -16,7 +16,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Insert
 
-from omnigent.db.account_authority import require_active_account
+from omnigent.db.account_authority import lock_account, require_active_account
 from omnigent.db.compression import decode
 from omnigent.db.db_models import SqlPreference, current_workspace_id
 from omnigent.db.utils import (
@@ -24,6 +24,7 @@ from omnigent.db.utils import (
     make_named_managed_session_maker,
     run_write_transaction,
 )
+from omnigent.errors import ErrorCode, OmnigentError
 
 # Reserved owner of workspace-wide rows; account user names start with a letter or digit.
 WORKSPACE_SETTINGS_USER = "__workspace_settings__"
@@ -80,12 +81,32 @@ class ProactiveAgentSettingsStore:
             _decode_enabled(values.get(user_id)),
         )
 
-    def set_workspace_enabled(self, enabled: bool) -> None:
-        """Turn the agent on or off for the whole workspace."""
+    def set_workspace_enabled(
+        self, enabled: bool, *, actor: str | None, require_admin: bool = False
+    ) -> None:
+        """Turn the agent on or off for the whole workspace, on *actor*'s behalf.
+
+        The route checked the actor before calling; the actor's account is
+        checked again under its lock in the same transaction as the write, so
+        a request that was in flight when the actor was deleted or demoted
+        cannot land. With *require_admin* the actor must still be an admin;
+        identities without an accounts row (header, OIDC, the local user) have
+        no row to check and keep the route's decision.
+        """
+
+        def write(session: Session) -> None:
+            require_active_account(session, actor)
+            if require_admin and actor is not None:
+                row = lock_account(session, actor)
+                if row is not None and not row.is_admin:
+                    raise OmnigentError(
+                        "Admin privileges required to change the workspace setting",
+                        code=ErrorCode.FORBIDDEN,
+                    )
+            self._write(session, WORKSPACE_SETTINGS_USER, enabled)
+
         run_write_transaction(
-            self._session_immediate,
-            "write_proactive_agent_workspace_setting",
-            lambda session: self._write(session, WORKSPACE_SETTINGS_USER, enabled),
+            self._session_immediate, "write_proactive_agent_workspace_setting", write
         )
 
     def set_user_enabled(self, user_id: str, enabled: bool) -> None:
