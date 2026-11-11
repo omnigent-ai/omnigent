@@ -364,11 +364,11 @@ def decode_scheduled_task_run_status(code: int) -> str:
     return _decode(SCHEDULED_TASK_RUN_STATUS, code, field="scheduled_task_runs.status")
 
 
-def encode_inbox_item_state(name: str) -> int:
-    """Encode an ``inbox_items.state`` name to its int code."""
-    return _encode(INBOX_ITEM_STATE, name, field="inbox_items.state")
+def encode_inbox_item_status(name: str) -> int:
+    """Encode an ``inbox_items.status`` name to its int code."""
+    return _encode(INBOX_ITEM_STATUS, name, field="inbox_items.status")
 
 
-def decode_inbox_item_state(code: int) -> str:
-    """Decode an ``inbox_items.state`` int code to its name."""
-    return _decode(INBOX_ITEM_STATE, code, field="inbox_items.state")
+def decode_inbox_item_status(code: int) -> str:
+    """Decode an ``inbox_items.status`` int code to its name."""
+    return _decode(INBOX_ITEM_STATUS, code, field="inbox_items.status")

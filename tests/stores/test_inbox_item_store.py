@@ -45,7 +45,7 @@ def test_create_and_read_back(store: SqlAlchemyInboxItemStore) -> None:
     chart = {"type": "chart", "chart": {"title": "Errors", "x": ["a"], "series": []}}
     created = store.create(_new(media=[chart]))
 
-    assert (created.state, created.resolution, created.resolution_action) == (
+    assert (created.status, created.resolution, created.resolution_action) == (
         "unread",
         "none",
         None,
@@ -63,7 +63,7 @@ def test_items_are_scoped_to_their_owner(store: SqlAlchemyInboxItemStore) -> Non
 
     assert store.get(created.id, "bob") is None
     assert store.get_by_dedupe_key("bob", "v1:aaa") is None
-    assert store.update(created.id, "bob", state="read", now=10) is None
+    assert store.update(created.id, "bob", status="read", now=10) is None
     assert store.list_for_user("bob") == ([], None)
 
 
@@ -167,8 +167,8 @@ def test_retiring_an_expired_item_frees_its_key(store: SqlAlchemyInboxItemStore)
 
 def test_list_pages_newest_first_and_filters(store: SqlAlchemyInboxItemStore) -> None:
     items = [store.create(_new(dedupe_key=f"v1:{n}")) for n in range(4)]
-    store.update(items[0].id, "alice", state="dismissed", resolution="not_relevant", now=10)
-    store.update(items[1].id, "alice", state="read", now=10)
+    store.update(items[0].id, "alice", status="dismissed", resolution="not_relevant", now=10)
+    store.update(items[1].id, "alice", status="read", now=10)
     newest_first = sorted(items, key=lambda i: (i.created_at, i.id), reverse=True)
 
     first, cursor = store.list_for_user("alice", limit=3)
@@ -177,10 +177,10 @@ def test_list_pages_newest_first_and_filters(store: SqlAlchemyInboxItemStore) ->
     assert end is None
 
     open_first, open_cursor = store.list_for_user(
-        "alice", states=frozenset({"unread", "read"}), limit=2
+        "alice", statuses=frozenset({"unread", "read"}), limit=2
     )
     open_rest, open_end = store.list_for_user(
-        "alice", states=frozenset({"unread", "read"}), after=open_cursor, limit=2
+        "alice", statuses=frozenset({"unread", "read"}), after=open_cursor, limit=2
     )
     expected_open = [item.id for item in newest_first if item.id != items[0].id]
     assert [item.id for item in open_first + open_rest] == expected_open
@@ -201,36 +201,38 @@ def test_update_records_the_answer_and_when_it_was_given(
 ) -> None:
     created = store.create(_new())
 
-    read = store.update(created.id, "alice", state="read", now=100)
-    assert read is not None and (read.state, read.resolved_at) == ("read", None)
+    read = store.update(created.id, "alice", status="read", now=100)
+    assert read is not None and (read.status, read.resolved_at) == ("read", None)
 
     acted = store.update(
         created.id,
         "alice",
-        state="done",
+        status="done",
         resolution="action_taken",
         resolution_action=0,
         feedback_text="thanks",
         now=200,
     )
     assert acted is not None
-    assert (acted.state, acted.resolution, acted.resolution_action) == ("done", "action_taken", 0)
+    assert (acted.status, acted.resolution, acted.resolution_action) == ("done", "action_taken", 0)
     assert (acted.resolved_at, acted.feedback_text) == (200, "thanks")
     assert store.get(created.id, "alice") == acted
 
     # Reopening clears the action but keeps the comment; a late read mark changes nothing.
-    reopened = store.update(created.id, "alice", state="read", resolution="none", now=300)
+    reopened = store.update(created.id, "alice", status="read", resolution="none", now=300)
     assert reopened is not None
-    assert (reopened.state, reopened.resolution, reopened.resolution_action) == (
+    assert (reopened.status, reopened.resolution, reopened.resolution_action) == (
         "read",
         "none",
         None,
     )
     assert (reopened.feedback_text, reopened.resolved_at) == ("thanks", 200)
-    dismissed = store.update(created.id, "alice", state="dismissed", resolution="not_now", now=400)
+    dismissed = store.update(
+        created.id, "alice", status="dismissed", resolution="not_now", now=400
+    )
     assert dismissed is not None and dismissed.resolved_at == 400
-    late_read = store.update(created.id, "alice", state="read", now=500)
-    assert late_read is not None and (late_read.state, late_read.resolution) == (
+    late_read = store.update(created.id, "alice", status="read", now=500)
+    assert late_read is not None and (late_read.status, late_read.resolution) == (
         "dismissed",
         "not_now",
     )
@@ -253,7 +255,7 @@ def test_mysql_deep_pages_seek_to_the_cursor(store: SqlAlchemyInboxItemStore) ->
             "source_session_id": f"{index // 10:032x}",
             "agent_id": "a" * 32,
             "dedupe_key": f"v1:{index}",
-            "state": 1 + index % 2,
+            "status": 1 + index % 2,
             "content": {
                 "kind": "info",
                 "title": "t",
@@ -284,7 +286,7 @@ def test_mysql_deep_pages_seek_to_the_cursor(store: SqlAlchemyInboxItemStore) ->
     try:
         store.list_for_user("plan-owner", after=(100, f"{1005:032x}"), limit=50)
         store.list_for_user(
-            "plan-owner", states=frozenset({"unread"}), after=(100, f"{1005:032x}"), limit=50
+            "plan-owner", statuses=frozenset({"unread"}), after=(100, f"{1005:032x}"), limit=50
         )
     finally:
         event.remove(store._engine, "before_cursor_execute", explain)

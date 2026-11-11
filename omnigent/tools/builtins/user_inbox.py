@@ -158,7 +158,7 @@ class SysUserInboxListTool(Tool):
         """:returns: Human-readable description of the tool."""
         return (
             f"List the user's Inbox items from the last {USER_INBOX_LIST_WINDOW_DAYS} days in "
-            "every state, with each item's topic and how the user responded: read, an action "
+            "every status, with each item's topic and how the user responded: read, an action "
             "taken, or a Dismiss reason (already done, useful, not relevant, incorrect, not "
             "now). Use it before posting to avoid repeats and to learn what the user wants."
         )

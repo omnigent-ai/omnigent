@@ -32,7 +32,7 @@ class InboxItem:
         e.g. ``"rampup-flag"``.
     :param dedupe_key: Versioned duplicate-detection key; see
         :mod:`omnigent.server.inbox_dedupe`.
-    :param state: ``"unread"``, ``"read"``, ``"done"``, or ``"dismissed"``.
+    :param status: ``"unread"``, ``"read"``, ``"done"``, or ``"dismissed"``.
     :param resolution: How the owner closed the item: ``"none"`` while open,
         ``"action_taken"``, or a Dismiss reason (``"already_done"``,
         ``"useful"``, ``"not_relevant"``, ``"incorrect"``, ``"not_now"``).
@@ -59,7 +59,7 @@ class InboxItem:
     primary_link: str | None
     topic: str
     dedupe_key: str
-    state: str
+    status: str
     resolution: str
     feedback_text: str | None
     created_at: int
