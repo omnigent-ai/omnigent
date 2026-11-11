@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.inner.bwrap_sandbox import _resolve_root
+from omnigent.inner.bwrap_sandbox import _resolve_grant
 from omnigent.inner.sandbox import resolve_sandbox
 from omnigent.server.bundles import validate_agent_bundle
 
@@ -138,7 +138,7 @@ class UploadedBundleSandboxGrantValidationTest(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, "outside its working directory"):
                             resolve_sandbox(spec.os_env, workspace)
                         with self.assertRaisesRegex(ValueError, "outside its working directory"):
-                            _resolve_root(workspace, "linked/file")
+                            _resolve_grant(workspace, "linked/file")
                     (workspace / "linked").unlink()
 
     def test_contained_symlink_and_trusted_absolute_grant_remain_usable(self) -> None:
