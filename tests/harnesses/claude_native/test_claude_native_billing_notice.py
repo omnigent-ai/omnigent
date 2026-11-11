@@ -291,6 +291,10 @@ def _held_injection_lock(bridge_dir: Path, holder: str) -> Iterator[None]:
         with bridge._bridge_injection_lock(bridge_dir):
             yield
         return
+    if holder == "metadata":
+        with bridge._bridge_metadata_write_lock(bridge_dir):
+            yield
+        return
     ready = bridge_dir / "writer-ready"
     script = """\
 import sys
@@ -326,7 +330,7 @@ with _bridge_injection_file_lock(Path(sys.argv[1])):
     assert process.returncode == 0
 
 
-@pytest.mark.parametrize("holder", ["thread", "process"])
+@pytest.mark.parametrize("holder", ["thread", "process", "metadata"])
 def test_cancelled_writer_exits_before_lock_holder_releases(
     monkeypatch: pytest.MonkeyPatch, bridge_dir: Path, holder: str
 ) -> None:
@@ -335,13 +339,21 @@ def test_cancelled_writer_exits_before_lock_holder_releases(
     finished = threading.Event()
     errors: list[Exception] = []
     sends = Mock()
-    monkeypatch.setattr(bridge, "_run_tmux", sends)
+    if holder == "metadata":
+        monkeypatch.setattr("subprocess.run", sends)
+    else:
+        monkeypatch.setattr(bridge, "_run_tmux", sends)
 
     def deliver() -> None:
-        with bridge.cancellable_injection(cancelled):
+        with bridge.cancellable_injection(
+            cancelled, bridge_dir=bridge_dir, request_session_id="current-session"
+        ):
             started.set()
             try:
-                bridge.inject_user_message(bridge_dir, content="must not be delivered")
+                if holder == "metadata":
+                    bridge._run_tmux("/tmp/test.sock", "send-keys", "-t", "main", "Enter")
+                else:
+                    bridge.inject_user_message(bridge_dir, content="must not be delivered")
             except Exception as exc:
                 errors.append(exc)
             finally:
@@ -371,6 +383,21 @@ def test_cancelled_writer_exits_before_lock_holder_releases(
             pass
     finally:
         lock.release()
+
+
+def test_cleanup_metadata_lock_wait_has_a_deadline(
+    monkeypatch: pytest.MonkeyPatch, bridge_dir: Path
+) -> None:
+    sends = Mock(side_effect=AssertionError("a locked metadata writer received input"))
+    monkeypatch.setattr("subprocess.run", sends)
+    monkeypatch.setattr(bridge, "_TMUX_SEND_TIMEOUT_S", 0.01)
+    with _held_injection_lock(bridge_dir, "metadata"):
+        with bridge.cancellable_injection(
+            threading.Event(), bridge_dir=bridge_dir, request_session_id="current-session"
+        ):
+            with pytest.raises(RuntimeError, match="terminal metadata is busy"):
+                bridge._run_tmux("/tmp/test.sock", "kill-session", "-t", "main")
+    sends.assert_not_called()
 
 
 def test_message_reclaim_acknowledges_notice_instead_of_cancelling(
