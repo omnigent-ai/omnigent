@@ -915,9 +915,11 @@ async function fetchPullRequestThroughHead(
   const query = new URLSearchParams({ pr_url: prUrl, head_sha: headSha, from_sha: commitSha });
   return fetchPullRequestPatch(conversationId, "compare-diff", `?${query}`).catch(
     (error: unknown) => {
-      // A server without the route still serves single commits, so only this view is unavailable.
+      // A peer without the route still serves single commits, so only this view is unavailable.
       if (error instanceof PullRequestApiError && error.status === 404) {
-        throw new Error("Showing changes through the head needs an updated Omnigent server.");
+        throw new Error(
+          "Showing changes through the head needs an updated Omnigent server and host.",
+        );
       }
       throw error;
     },

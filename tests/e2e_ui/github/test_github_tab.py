@@ -1622,7 +1622,15 @@ def test_changes_commits_view_lists_and_opens_a_commit(
 
     def through_head_patch(route: Route) -> None:
         compare_urls.append(route.request.url)
-        route.fulfill(json={"object": "session.github.pr_diff", "patch": _PR_DIFF["patch"]})
+        start = re.search(r"from_sha=([0-9a-f]+)", route.request.url)
+        assert start is not None, route.request.url
+        # From the first commit the head holds both commits' changes; from the last, its own.
+        patch = (
+            _COMMIT_PATCHES[_COMMIT_ONE] + _COMMIT_PATCHES[_COMMIT_TWO]
+            if start.group(1) == _COMMIT_ONE
+            else _COMMIT_PATCHES[_COMMIT_TWO]
+        )
+        route.fulfill(json={"object": "session.github.pr_diff", "patch": patch})
 
     page.route(re.compile(r"/resources/github/compare-diff\?"), through_head_patch)
     page.goto(f"{base_url}/c/{session_id}")
@@ -1657,9 +1665,6 @@ def test_changes_commits_view_lists_and_opens_a_commit(
     assert f"commit_sha={_COMMIT_ONE}" in patch_urls[-1], patch_urls
     page.screenshot(path=str(tmp_path / f"commits-{entry}-diff.png"), animations="disabled")
 
-    panel.get_by_role("button", name="Next commit").click()
-    expect(files).to_have_attribute("data-github-file", "README.md")
-
     through_head = panel.get_by_role("button", name="Through head")
     expect(through_head).to_have_attribute("aria-pressed", "false")
     through_head.click()
@@ -1667,13 +1672,19 @@ def test_changes_commits_view_lists_and_opens_a_commit(
     expect(files).to_have_count(2)
     # The widened patch is pinned to the head the Changes list shows, from the open commit.
     assert "head_sha=head" in compare_urls[-1], compare_urls
-    assert f"from_sha={_COMMIT_TWO}" in compare_urls[-1], compare_urls
+    assert f"from_sha={_COMMIT_ONE}" in compare_urls[-1], compare_urls
     expect(panel.get_by_role("checkbox", name="Hide viewed")).to_have_count(0)
     page.screenshot(
         path=str(tmp_path / f"commits-{entry}-through-head.png"), animations="disabled"
     )
+
+    # Stepping keeps Through head on; turning it off narrows to the commit's own files.
+    panel.get_by_role("button", name="Next commit").click()
+    expect(through_head).to_have_attribute("aria-pressed", "true")
+    expect(files).to_have_attribute("data-github-file", "README.md")
+    assert f"from_sha={_COMMIT_TWO}" in compare_urls[-1], compare_urls
     through_head.click()
-    expect(files).to_have_count(1)
+    expect(through_head).to_have_attribute("aria-pressed", "false")
     expect(files).to_have_attribute("data-github-file", "README.md")
 
     panel.get_by_role("button", name="Back to commits").click()

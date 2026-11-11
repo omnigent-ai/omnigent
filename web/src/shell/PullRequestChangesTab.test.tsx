@@ -177,6 +177,7 @@ function renderTab({
   threads = [],
   listing = {},
   commitHistory = false,
+  headRepositoryUrl,
 }: {
   conversationId: string;
   files?: PullRequestChangedFile[];
@@ -186,6 +187,8 @@ function renderTab({
   listing?: { has_more?: boolean; total_count?: number | null; head_sha?: string | null };
   /** The provider lists commits, so the Changes toolbar offers the Commits view. */
   commitHistory?: boolean;
+  /** A GitHub head repository, so files can be opened on GitHub. */
+  headRepositoryUrl?: string;
 }) {
   const prUrl = prUrlFor(conversationId);
   const tabProps = (current: string) =>
@@ -195,8 +198,15 @@ function renderTab({
         selected_pr_url: prUrl,
         capabilities: commitHistory ? { commit_history: true } : {},
         auth: { selected_account: null },
+        ...(headRepositoryUrl ? { provider: "github" } : {}),
       },
-      pr: { url: prUrl, head_sha: "head", base_sha: "base", state: "OPEN" },
+      pr: {
+        url: prUrl,
+        head_sha: "head",
+        base_sha: "base",
+        state: "OPEN",
+        head_repository_url: headRepositoryUrl,
+      },
       prUrl,
       canEdit: false,
       selected: true,
@@ -1600,6 +1610,7 @@ describe("PullRequestChangesTab commits", () => {
       conversationId: "commits-through-head",
       commitHistory: true,
       listing: { head_sha: "head" },
+      headRepositoryUrl: "https://github.com/fork/app",
     });
     fireEvent.click(screen.getByRole("button", { name: "Commits" }));
     fireEvent.click(screen.getByRole("button", { name: /Add a\.ts/ }));
@@ -1612,6 +1623,15 @@ describe("PullRequestChangesTab commits", () => {
     expect(isListed("a.ts")).toBe(true);
     expect(isListed("b.ts")).toBe(true);
     expect(mocks.commitDiffReads).toContainEqual([SHA_A, "head"]);
+    // The widened patch is the head's, so its files open at the head rather than the commit.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for a.ts" }), {
+      button: 0,
+    });
+    expect(screen.getByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute(
+      "href",
+      "https://github.com/fork/app/blob/head/a.ts",
+    );
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
 
     fireEvent.click(screen.getByRole("button", { name: "Next commit" }));
     expect(toggle()).toHaveAttribute("aria-pressed", "true");
