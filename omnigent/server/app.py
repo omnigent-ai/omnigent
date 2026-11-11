@@ -351,6 +351,9 @@ class ServerInfoResponse(BaseModel):
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
+    # An agent's create that names a project other than its source's project makes a
+    # standalone session; older servers refuse it while sibling sessions are on.
+    sibling_other_project_standalone: bool = False
     branding: BrandingInfo
     picker: PickerInfo = PickerInfo()
 
@@ -3754,6 +3757,7 @@ def create_app(
                 "scheduled_task_one_time": automations_enabled
                 and bool(app.state.one_time_automations_enabled),
                 "session_move_source_checks": True,
+                "sibling_other_project_standalone": True,
                 "automations_enabled": automations_enabled,
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),

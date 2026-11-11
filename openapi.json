@@ -6758,6 +6758,11 @@
             "title": "Sharing Mode",
             "type": "string"
           },
+          "sibling_other_project_standalone": {
+            "default": false,
+            "title": "Sibling Other Project Standalone",
+            "type": "boolean"
+          },
           "sibling_session_destinations": {
             "default": "any_host",
             "enum": [
