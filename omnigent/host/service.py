@@ -6,6 +6,8 @@ import os
 import platform
 import plistlib
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from omnigent.cli_invocation import WRAPPER_COMMAND_ENV
 from omnigent.process_logging import data_dir
 
 LAUNCHD_LABEL = "ai.omnigent.host"
@@ -62,9 +65,33 @@ def _service_for_current_platform() -> HostService:
     )
 
 
-def _service_command(server_url: str | None) -> list[str]:
+def _wrapper_command(environment: Mapping[str, str]) -> list[str] | None:
+    """Return the configured CLI wrapper, resolved to an absolute path.
+
+    A wrapper's cache venv can be deleted between boots, so don't pin its interpreter.
+    """
+    configured = environment.get(WRAPPER_COMMAND_ENV, "").strip()
+    if not configured:
+        return None
+    try:
+        executable, *arguments = shlex.split(configured)
+    except ValueError as exc:
+        raise HostServiceError(f"Cannot parse {WRAPPER_COMMAND_ENV}={configured!r}.") from exc
+    resolved = shutil.which(executable, path=environment.get("PATH"))
+    if resolved is None:
+        raise HostServiceError(
+            f"Cannot find {executable!r} from {WRAPPER_COMMAND_ENV} on PATH; "
+            "the host service launches through it."
+        )
+    return [os.path.abspath(resolved), *arguments]
+
+
+def _service_command(server_url: str | None, environment: Mapping[str, str]) -> list[str]:
     """Build the persistent service entry-point command."""
     mode = ["--server", server_url] if server_url else ["--local"]
+    wrapper = _wrapper_command(environment)
+    if wrapper is not None:
+        return [*wrapper, "host", "service-entry", *mode]
     return [sys.executable, "-P", "-m", "omnigent.host.service_entry", *mode]
 
 
@@ -285,8 +312,8 @@ def enable_user_host_service(
 ) -> HostService:
     """Install, enable, and start the current user's host service."""
     service = _service_for_current_platform()
-    command = _service_command(server_url)
     clean_environment = _clean_environment(environment)
+    command = _service_command(server_url, clean_environment)
     if service.kind == "launchd":
         content = _launchd_payload(
             service,

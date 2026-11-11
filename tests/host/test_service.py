@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import plistlib
+import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -176,6 +179,77 @@ def test_enable_systemd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyP
         ["systemctl", "--user", "daemon-reload"],
         ["systemctl", "--user", "enable", "--now", "omnigent-host.service"],
     ]
+
+
+def _recorded_command(installed: service.HostService) -> list[str]:
+    contents = installed.path.read_bytes()
+    if installed.kind == "launchd":
+        return list(plistlib.loads(contents)["ProgramArguments"])
+    (exec_start,) = (
+        line for line in contents.decode().splitlines() if line.startswith("ExecStart=")
+    )
+    return shlex.split(exec_start.removeprefix("ExecStart="))
+
+
+@pytest.mark.parametrize("system", ["Darwin", "Linux"])
+def test_wrapper_launched_service_survives_interpreter_cache_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, system: str
+) -> None:
+    """A wrapper's cache venv can be gone after a restart; the service must not pin it."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(service.platform, "system", lambda: system)
+    monkeypatch.setattr(service.os, "getuid", lambda: 501)
+    cache_venv = tmp_path / "cache" / "wrapper-venv"
+    cache_python = cache_venv / "bin" / "python"
+    cache_python.parent.mkdir(parents=True)
+    cache_python.write_text("")
+    cache_python.chmod(0o755)
+    monkeypatch.setattr(service.sys, "executable", str(cache_python))
+    wrapper = tmp_path / "bin" / "wrapper"
+    wrapper.parent.mkdir()
+    wrapper.write_text("#!/bin/sh\n")
+    wrapper.chmod(0o755)
+    _capture_runs(monkeypatch)
+
+    installed = service.enable_user_host_service(
+        "https://example.com",
+        environment={
+            "HOME": str(tmp_path),
+            "PATH": f"{wrapper.parent}:/usr/bin:/bin",
+            "OMNIGENT_WRAPPER_COMMAND": "wrapper omni",
+        },
+    )
+    shutil.rmtree(cache_venv)
+
+    command = _recorded_command(installed)
+    assert os.access(command[0], os.X_OK), f"service launches missing {command[0]}"
+    assert command == [
+        str(wrapper),
+        "omni",
+        "host",
+        "service-entry",
+        "--server",
+        "https://example.com",
+    ]
+
+
+def test_service_refuses_wrapper_missing_from_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(service.platform, "system", lambda: "Linux")
+    calls = _capture_runs(monkeypatch)
+
+    with pytest.raises(service.HostServiceError, match="Cannot find 'wrapper'"):
+        service.enable_user_host_service(
+            None,
+            environment={"PATH": str(tmp_path), "OMNIGENT_WRAPPER_COMMAND": "wrapper omni"},
+        )
+
+    assert calls == []
+    assert not (tmp_path / "xdg/systemd/user/omnigent-host.service").exists()
 
 
 def test_systemd_unit_escapes_specifiers_and_literal_dollars() -> None:

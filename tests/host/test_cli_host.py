@@ -499,6 +499,36 @@ def test_host_disable_subcommand_removes_user_service(
     assert "Disabled the Omnigent host user service" in result.output
 
 
+@pytest.mark.parametrize(
+    ("args", "servers", "exit_code"),
+    [
+        pytest.param(["--server", "https://example.com"], ["https://example.com"], 3, id="remote"),
+        pytest.param(["--local"], [""], 3, id="local"),
+        pytest.param([], [], 2, id="missing-mode"),
+        pytest.param(["--local", "--server", "https://example.com"], [], 2, id="both-modes"),
+    ],
+)
+def test_host_service_entry_runs_the_service_host(
+    monkeypatch: pytest.MonkeyPatch,
+    args: list[str],
+    servers: list[str],
+    exit_code: int,
+) -> None:
+    """Verify the wrapper-launched service command reaches the service entry point."""
+    started: list[str] = []
+
+    def _run(server: str) -> int:
+        started.append(server)
+        return 3
+
+    monkeypatch.setattr("omnigent.host.service_entry.run", _run)
+
+    result = CliRunner().invoke(cli, ["host", "service-entry", *args])
+
+    assert result.exit_code == exit_code, result.output
+    assert started == servers
+
+
 def test_host_rejects_unknown_plain_token_as_subcommand(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

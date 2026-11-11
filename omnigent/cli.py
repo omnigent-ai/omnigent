@@ -11157,6 +11157,22 @@ def host_disable() -> None:
     click.echo(f"Removed service definition: {_display_path(service.path)}")
 
 
+@host.command("service-entry", hidden=True)
+@click.option("--server", default=None, help="Remote Omnigent server URL.")
+@click.option("--local", is_flag=True, default=False, help="Run a local Omnigent server.")
+def host_service_entry(server: str | None, local: bool) -> None:
+    """Run the host under a service manager that launches it through a CLI wrapper.
+
+    :param server: Remote Omnigent server URL; ``None`` with ``--local``.
+    :param local: Run a local Omnigent server instead of a remote one.
+    """
+    if local == (server is not None):
+        raise click.UsageError("Pass exactly one of --server or --local.")
+    from omnigent.host.service_entry import run
+
+    raise SystemExit(run(server or ""))
+
+
 @host.command("status")
 @click.option("--server", default=None, help="Inspect only this server target.")
 @click.option("--all", "all_targets", is_flag=True, help="Inspect all known daemon targets.")
