@@ -771,10 +771,18 @@ async def execute_project_update(
                 {"project": current_name, "error": _project_refusal(response, new_name)}
             )
         status = "updated"
-    # Sessions that still belong through the legacy label follow the project row,
-    # so after a rename they would stay behind in a folder under the old name.
+    renamed = new_name is not None and new_name != current_name
+    if not (renamed or promoted):
+        # The name is unchanged, so label members still match this folder.
+        result: dict[str, Any] = {"project": current_name, "status": status}
+        if "icon" in args:
+            result["icon"] = icon or None
+        return json.dumps(result)
+    # Sessions that still belong through the legacy label would stay behind in a
+    # folder under the old name, so file them into this project's row.
+    project_id = str(project["id"])
     try:
-        stragglers, complete = await _project_members(client, current_name)
+        listed, complete = await _project_members(client, current_name)
     except (httpx.HTTPError, ValueError) as exc:
         return json.dumps(
             {
@@ -783,14 +791,22 @@ async def execute_project_update(
                 "error": f"project updated, but its sessions could not be checked: {exc}",
             }
         )
+    # The old name can already belong to another project, whose sessions the
+    # listing also returns; only label members not filed elsewhere move.
+    stragglers = [
+        member
+        for member in listed
+        if (member.get("labels") or {}).get(PROJECT_LABEL_KEY) == current_name
+        and (member.get("project_id") or "") in ("", project_id)
+    ]
     moved, not_moved = await _refile_members(
-        client, stragglers, project_id=str(project["id"]), headers=headers
+        client, stragglers, project_id=project_id, headers=headers
     )
     if moved:
         status = "updated"
     if not_moved or not complete:
         status = "partial"
-    result: dict[str, Any] = {"project": new_name or current_name, "status": status}
+    result = {"project": new_name or current_name, "status": status}
     if not_moved:
         result["sessions_not_moved"] = not_moved
     if not complete:

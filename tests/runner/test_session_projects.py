@@ -377,32 +377,34 @@ def _project_server(
     return handler
 
 
-async def test_project_update_renames_and_keeps_other_config_when_changing_the_icon():
+@pytest.mark.parametrize(
+    ("args", "expected", "body"),
+    [
+        (
+            {"project": "Q3", "name": "Q3 launch", "icon": "📦"},
+            {"project": "Q3 launch", "status": "updated", "previous_name": "Q3", "icon": "📦"},
+            {"name": "Q3 launch", "config": {"model": "fast", "icon": "📦"}},
+        ),
+        (
+            {"project": "Q3", "icon": ""},
+            {"project": "Q3", "status": "updated", "icon": None},
+            {"config": {"model": "fast"}},
+        ),
+    ],
+    ids=["rename-and-replace-icon", "clear-icon"],
+)
+async def test_project_update_keeps_other_config_when_changing_the_icon(args, expected, body):
     requests: list[httpx.Request] = []
     async with _client(_project_server(requests, config=ICON_CONFIG)) as client:
-        result = json.loads(
-            await execute_project_update(
-                {"project": "Q3", "name": "Q3 launch", "icon": "📦"}, client, SOURCE
-            )
-        )
-        cleared = json.loads(
-            await execute_project_update({"project": "Q3", "icon": ""}, client, SOURCE)
-        )
-    assert result == {
-        "project": "Q3 launch",
-        "status": "updated",
-        "previous_name": "Q3",
-        "icon": "📦",
-    }
-    assert cleared == {"project": "Q3", "status": "updated", "icon": None}
-    first, second = [r for r in requests if r.method == "PATCH"]
-    assert first.url.path == f"/v1/projects/{PROJECT_ID}"
-    assert first.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
-    assert json.loads(first.content) == {
-        "name": "Q3 launch",
-        "config": {"model": "fast", "icon": "📦"},
-    }
-    assert json.loads(second.content) == {"config": {"model": "fast"}}
+        result = json.loads(await execute_project_update(args, client, SOURCE))
+    assert result == expected
+    (patched,) = [r for r in requests if r.method == "PATCH"]
+    assert patched.url.path == f"/v1/projects/{PROJECT_ID}"
+    assert patched.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+    assert json.loads(patched.content) == body
+    # Only a rename has label members left behind under the old name to look for.
+    swept = [r for r in requests if r.url.path == "/v1/sessions"]
+    assert len(swept) == (1 if "name" in args else 0)
 
 
 @pytest.mark.parametrize(
@@ -635,7 +637,7 @@ async def test_project_rename_warns_when_the_member_walk_hits_its_page_cap(monke
     requests: list[httpx.Request] = []
     async with _client(_project_server(requests, pages=[[], [], [], []])) as client:
         result = json.loads(
-            await execute_project_update({"project": "Q3", "icon": "📦"}, client, SOURCE)
+            await execute_project_update({"project": "Q3", "name": "Q4"}, client, SOURCE)
         )
     assert result["status"] == "partial"
     assert result["warning"].startswith("the project has too many sessions to check them all;")
@@ -825,3 +827,23 @@ async def test_project_rename_reports_a_member_check_that_fails_after_the_rename
         "could not list the project's sessions: HTTP 503",
     }
     assert [r.url.path for r in requests if r.method == "PATCH"] == [f"/v1/projects/{PROJECT_ID}"]
+
+
+async def test_project_rename_does_not_move_sessions_from_a_reused_old_name():
+    requests: list[httpx.Request] = []
+    other_project = "9" * 32
+    # After the rename, "Q3" names another project, and the listing returns its sessions.
+    members = [
+        {"id": FAMILY_MEMBER, "project_id": other_project, "labels": {}},
+        {"id": SUB_AGENT, "project_id": other_project, "labels": {"omni_project": "Q3"}},
+        {"id": PARENT, "labels": {"omni_project": "Q3"}},
+    ]
+    async with _client(_project_server(requests, pages=[members])) as client:
+        result = json.loads(
+            await execute_project_update({"project": "Q3", "name": "Q4"}, client, SOURCE)
+        )
+    assert result == {"project": "Q4", "status": "updated", "previous_name": "Q3"}
+    assert [r.url.path for r in requests if r.method == "PATCH"] == [
+        f"/v1/projects/{PROJECT_ID}",
+        f"/v1/sessions/{PARENT}",
+    ]
