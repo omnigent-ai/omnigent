@@ -20,7 +20,6 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.proactive_agent_settings_store import (
-    WORKSPACE_SETTINGS_USER,
     ProactiveAgentSettingsStore,
 )
 
