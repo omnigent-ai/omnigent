@@ -306,8 +306,11 @@ every supported engine that has a length-bounded binary type. On MySQL that is
 the application checks. On engines without such a type (`BYTEA`, SQLite `BLOB`)
 the size cap above, enforced on every write path, is the bound. A bare
 SQLAlchemy `LargeBinary()` therefore fails this rule unless the definition
-carries a `VARBINARY` or `BINARY` variant for MySQL. Existing BLOB columns are
-in scope only when the PR changes their definition.
+carries a `VARBINARY` or `BINARY` variant for MySQL. Also account for MySQL's
+aggregate row-size limit (65,535 bytes across all of a row's columns): several
+individually compliant `VARBINARY(n)` columns can exceed it together, so reduce
+the declared bounds, split the row, or use artifact storage when they would.
+Existing BLOB columns are in scope only when the PR changes their definition.
 
 **Recommended:** Prefer structured columns or artifact storage when they
 suffice. Depending on engine and row format, large values can require off-page
