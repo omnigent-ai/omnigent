@@ -5227,12 +5227,13 @@ def _publish_status(
             "turn.completed", session_id, occurrence=turn_id, response_id=turn_id
         )
     elif status == "failed" and previous_status != "failed" and persist_live_status:
-        turn_id = response_id or _session_active_response_cache.get(session_id)
+        # A late failure of an earlier turn can arrive while the next one runs, so
+        # the active response identifies the occurrence but is not reported.
         session_triggers.notify(
             "turn.failed",
             session_id,
-            occurrence=turn_id,
-            response_id=turn_id,
+            occurrence=response_id or _session_active_response_cache.get(session_id),
+            response_id=response_id,
             error_code=error.code if error is not None else None,
         )
     # Mirror the transition onto the conversation row (best-effort,

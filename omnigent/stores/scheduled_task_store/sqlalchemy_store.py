@@ -1656,22 +1656,15 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             ):
                 return "duplicate"
             if coalesce:
-                # The newest receipt names the run the task's latest event went to;
-                # coalescing only ever adds to that run while it waits for a claim.
-                latest_run_id = session.scalar(
-                    select(SqlScheduledTaskEventReceipt.run_id)
-                    .where(*receipts)
-                    .order_by(
-                        SqlScheduledTaskEventReceipt.created_at.desc(),
-                        SqlScheduledTaskEventReceipt.id.desc(),
-                    )
-                    .limit(1)
-                )
+                # The task row names the run its events go to while that run waits
+                # for a claim; the task lock orders every writer of the pointer.
                 pending = (
                     session.get(
-                        SqlScheduledTaskRun, (workspace_id, latest_run_id), with_for_update=True
+                        SqlScheduledTaskRun,
+                        (workspace_id, row.pending_event_run_id),
+                        with_for_update=True,
                     )
-                    if latest_run_id is not None
+                    if row.pending_event_run_id is not None
                     else None
                 )
                 if (
@@ -1744,6 +1737,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     event=_dump_bounded_json(first_document),
                 )
             )
+            if coalesce:
+                # Bookkeeping, like adopting a session: updated_at is unchanged.
+                row.pending_event_run_id = run_id
             receipt(session, run_id)
             return "recorded"
 

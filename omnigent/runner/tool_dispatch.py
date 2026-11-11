@@ -5145,7 +5145,10 @@ async def _execute_scheduled_task_tool(
                 resp = None
                 if project_name is not None:
                     # Confirm the task first so a bad id doesn't leave a new project behind.
-                    existing = await server_client.get(task_url, timeout=30.0)
+                    # Event-triggered tasks are read only by clients that ask for them.
+                    existing = await server_client.get(
+                        f"{task_url}?event_triggers=1", timeout=30.0
+                    )
                     if existing.status_code >= 400:
                         resp = existing
                     else:
