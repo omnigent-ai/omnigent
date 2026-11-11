@@ -55,6 +55,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+from collections import deque
 from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -3623,10 +3624,12 @@ def transcript_has_recent_local_command(
         record exists near ``recorded_at`` for ``claude_session_id``.
     """
     try:
-        lines = transcript_path.read_text(encoding="utf-8").splitlines()
+        lines = _read_transcript_edge_lines(
+            transcript_path, head_limit=0, tail_limit=_RECENT_LOCAL_COMMAND_LINE_LIMIT
+        )
     except FileNotFoundError:
         return False
-    for line in lines[-_RECENT_LOCAL_COMMAND_LINE_LIMIT:]:
+    for line in lines:
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
@@ -3674,10 +3677,12 @@ def transcript_has_forked_from_marker(
         expected source session.
     """
     try:
-        lines = transcript_path.read_text(encoding="utf-8").splitlines()
+        lines = _read_transcript_edge_lines(
+            transcript_path, head_limit=_FORKED_FROM_LINE_LIMIT, tail_limit=_FORKED_FROM_LINE_LIMIT
+        )
     except FileNotFoundError:
         return False
-    for line in _sample_transcript_edges(lines, _FORKED_FROM_LINE_LIMIT):
+    for line in lines:
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
@@ -3703,18 +3708,29 @@ def transcript_has_forked_from_marker(
     return False
 
 
-def _sample_transcript_edges(lines: list[str], limit: int) -> list[str]:
-    """
-    Return transcript lines from the start and end of a file.
+def _read_transcript_edge_lines(
+    transcript_path: Path, *, head_limit: int, tail_limit: int
+) -> list[str]:
+    """Sample a finite JSONL snapshot without retaining its middle records.
 
-    :param lines: Transcript JSONL lines.
-    :param limit: Maximum number of lines to take from each edge,
-        e.g. ``200``.
-    :returns: Sampled lines, preserving file order.
+    Memory scales with the selected edge records and largest individual line.
+    Unicode line separators inside JSON strings remain part of their record.
     """
-    if limit <= 0 or len(lines) <= limit * 2:
-        return lines
-    return [*lines[:limit], *lines[-limit:]]
+    head: list[str] = []
+    tail: deque[str] = deque(maxlen=tail_limit)
+    with transcript_path.open("rb") as handle:
+        remaining = os.fstat(handle.fileno()).st_size
+        while remaining > 0:
+            raw_line = handle.readline(remaining)
+            if not raw_line:
+                break
+            remaining -= len(raw_line)
+            line = raw_line.decode("utf-8").rstrip("\r\n")
+            if len(head) < head_limit:
+                head.append(line)
+            else:
+                tail.append(line)
+    return [*head, *tail]
 
 
 def _transcript_timestamp(value: object) -> float | None:
