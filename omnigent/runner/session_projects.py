@@ -620,6 +620,34 @@ def _project_refusal(response: httpx.Response, name: str | None) -> str:
     return f"HTTP {response.status_code}: {detail or response.text[:300]}"
 
 
+async def _promote_label_folder(
+    client: httpx.AsyncClient,
+    name: str,
+    config: dict[str, Any],
+    *,
+    reuse_existing: bool,
+    headers: dict[str, str],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """
+    Create the project row a label-only folder becomes, or return the error.
+
+    A 409 means the name is taken. Without a rename that is a concurrent
+    promotion of this same folder, whose row is reused; with one, the name
+    belongs to another project, and reusing it would merge the two folders.
+    """
+    created = await client.post(
+        "/v1/projects", json={"name": name, "config": config}, headers=headers, timeout=30.0
+    )
+    if created.status_code < 400:
+        return created.json(), None
+    if created.status_code == 409:
+        existing = await _find_project(client, name) if reuse_existing else None
+        if existing is not None:
+            return existing, None
+        return None, f"a project named {name!r} already exists"
+    return None, _project_refusal(created, name)
+
+
 async def _owned_project(
     client: httpx.AsyncClient, tool_name: str, name: str
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -682,19 +710,27 @@ async def execute_project_update(
         return _unchecked_server_error("sys_project_update", "a project")
     headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
     project, error = await _owned_project(client, "sys_project_update", current_name)
+    promoted = False
     if project is None:
-        # A folder can exist only through its sessions' legacy label; promote it to
-        # a project row, as the sidebar does, so it can be renamed or given an icon.
+        # A folder can exist only through its sessions' legacy label. Like the
+        # sidebar, promote it by creating the row under its final name and icon,
+        # so a refused create leaves nothing behind.
         try:
             members, _ = await _project_members(client, current_name)
             if not members:
                 return json.dumps({"project": current_name, "error": error})
-            promoted_id, _ = await resolve_project_id(client, current_name, headers=headers)
-            project = await _find_project(client, current_name)
+            project, error = await _promote_label_folder(
+                client,
+                new_name or current_name,
+                {"icon": icon} if icon else {},
+                reuse_existing=new_name is None or new_name == current_name,
+                headers=headers,
+            )
         except (httpx.HTTPError, ValueError) as exc:
             return json.dumps({"project": current_name, "error": f"sys_project_update: {exc}"})
-        if project is None or project.get("id") != promoted_id:
+        if project is None:
             return json.dumps({"project": current_name, "error": error})
+        promoted = True
     payload: dict[str, Any] = {}
     if new_name is not None and new_name != project.get("name"):
         payload["name"] = new_name
@@ -705,7 +741,7 @@ async def execute_project_update(
             config["icon"] = icon
         if config != stored:
             payload["config"] = config
-    status = "unchanged"
+    status = "updated" if promoted else "unchanged"
     if payload:
         try:
             response = await client.patch(

@@ -254,7 +254,15 @@ async def test_update_rejects_invalid_organizing_fields_before_any_request(args,
     assert requests == []
 
 
-async def test_update_of_other_fields_needs_the_organize_source_check():
+@pytest.mark.parametrize(
+    ("execute", "args"),
+    [
+        (execute_session_update, {"session_id": PARENT, "title": "New"}),
+        (execute_project_update, {"project": "Q3", "name": "New"}),
+    ],
+    ids=["session-title", "project-rename"],
+)
+async def test_organizing_writes_need_the_organize_source_check(execute, args):
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -262,9 +270,7 @@ async def test_update_of_other_fields_needs_the_organize_source_check():
         return httpx.Response(200, json=CHECKED_INFO)
 
     async with _client(handler) as client:
-        result = json.loads(
-            await execute_session_update({"session_id": PARENT, "title": "New"}, client, SOURCE)
-        )
+        result = json.loads(await execute(args, client, SOURCE))
     assert "cannot check the calling session's sharing" in result["error"]
     assert [(r.method, r.url.path) for r in requests] == [("GET", "/v1/info")]
 
@@ -432,21 +438,6 @@ async def test_project_update_maps_unknown_projects_and_name_conflicts():
     assert taken["error"] == "a project named 'Taken' already exists"
 
 
-async def test_project_update_needs_the_organize_source_check():
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(200, json=CHECKED_INFO)
-
-    async with _client(handler) as client:
-        result = json.loads(
-            await execute_project_update({"project": "Q3", "name": "New"}, client, SOURCE)
-        )
-    assert "cannot check the calling session's sharing" in result["error"]
-    assert [(r.method, r.url.path) for r in requests] == [("GET", "/v1/info")]
-
-
 async def test_list_forwards_search_and_filters_and_marks_pinned_and_archived():
     seen: list[httpx.QueryParams] = []
 
@@ -543,30 +534,75 @@ async def test_project_rename_refiles_members_that_belong_through_the_legacy_lab
     }
 
 
-async def test_project_update_promotes_a_label_only_folder():
-    requests: list[httpx.Request] = []
-    rows = {"value": False}
-    base = _paged_project_server(requests, [[{"id": PARENT, "labels": {"omni_project": "Q3"}}]])
+def _label_folder_server(requests: list[httpx.Request], *, create_status: int = 200):
+    """Q3 exists only as a session label; project lists must be paged."""
+    created = {"id": PROJECT_ID, "name": "", "config": {}}
+    raced = {"id": PROJECT_ID, "name": "Q3", "config": {}}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/projects" and request.method == "GET" and not rows["value"]:
-            requests.append(request)
-            return httpx.Response(200, json={"data": []})
-        if request.url.path == "/v1/projects" and request.method == "POST":
-            rows["value"] = True
-        return base(request)
+        requests.append(request)
+        path = request.url.path
+        if path == "/v1/info":
+            return httpx.Response(200, json=ORGANIZE_INFO)
+        if path == "/v1/projects" and request.method == "GET":
+            assert request.url.params.get("limit"), "project lists must be paged"
+            if create_status == 409 and request.url.params.get("after") == "1" * 32:
+                return httpx.Response(200, json={"data": [raced], "has_more": False})
+            first = {"id": "1" * 32, "name": "Other"}
+            more = create_status == 409 and len([r for r in requests if r.method == "POST"]) > 0
+            body = {"data": [first], "has_more": more, "last_id": first["id"]}
+            return httpx.Response(200, json=body)
+        if path == "/v1/projects" and request.method == "POST":
+            if create_status != 200:
+                return httpx.Response(create_status, json={"detail": "taken"})
+            body = json.loads(request.content)
+            return httpx.Response(200, json={**created, **body})
+        if path == "/v1/sessions":
+            row = {"id": PARENT, "labels": {"omni_project": "Q3"}}
+            return httpx.Response(200, json={"data": [row], "has_more": False})
+        return httpx.Response(200, json={})
 
-    async with _client(handler) as client:
+    return handler
+
+
+async def test_project_update_promotes_a_label_only_folder_under_its_final_name():
+    requests: list[httpx.Request] = []
+    async with _client(_label_folder_server(requests)) as client:
+        result = json.loads(
+            await execute_project_update(
+                {"project": "Q3", "name": "Q4", "icon": "🧪"}, client, SOURCE
+            )
+        )
+    assert result == {"project": "Q4", "status": "updated", "previous_name": "Q3", "icon": "🧪"}
+    (created,) = [r for r in requests if r.method == "POST"]
+    assert json.loads(created.content) == {"name": "Q4", "config": {"icon": "🧪"}}
+    assert created.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+    assert [r.url.path for r in requests if r.method == "PATCH"] == [f"/v1/sessions/{PARENT}"]
+
+
+async def test_label_only_rename_into_a_taken_name_changes_nothing():
+    requests: list[httpx.Request] = []
+    async with _client(_label_folder_server(requests, create_status=409)) as client:
+        result = json.loads(
+            await execute_project_update({"project": "Q3", "name": "Taken"}, client, SOURCE)
+        )
+    assert result == {"project": "Q3", "error": "a project named 'Taken' already exists"}
+    assert [r.method for r in requests if r.method not in ("GET",)] == ["POST"]
+
+
+async def test_label_only_promotion_reuses_a_concurrent_promotion_found_on_a_later_page():
+    requests: list[httpx.Request] = []
+    async with _client(_label_folder_server(requests, create_status=409)) as client:
         result = json.loads(
             await execute_project_update({"project": "Q3", "icon": "🧪"}, client, SOURCE)
         )
-    assert result["status"] == "updated" and result["icon"] == "🧪"
-    (created,) = [r for r in requests if r.method == "POST"]
-    assert json.loads(created.content) == {"name": "Q3"}
-    assert created.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
-    assert [r.url.path for r in requests if r.method == "PATCH"] == [
-        f"/v1/projects/{PROJECT_ID}",
-        f"/v1/sessions/{PARENT}",
+    assert result == {"project": "Q3", "status": "updated", "icon": "🧪"}
+    lookups = [r.url.params.get("after") for r in requests if r.url.path == "/v1/projects"]
+    assert lookups[-2:] == [None, "1" * 32]
+    patched = [(r.url.path, json.loads(r.content)) for r in requests if r.method == "PATCH"]
+    assert patched == [
+        (f"/v1/projects/{PROJECT_ID}", {"config": {"icon": "🧪"}}),
+        (f"/v1/sessions/{PARENT}", {"project_id": PROJECT_ID, "labels": {"omni_project": ""}}),
     ]
 
 
@@ -626,3 +662,41 @@ async def test_project_rename_warns_when_the_member_walk_hits_its_page_cap(monke
     assert result["status"] == "updated"
     assert result["warning"] == "the project has too many sessions to check them all"
     assert len([r for r in requests if r.url.path == "/v1/sessions"]) == 2
+
+
+async def test_update_sends_title_archive_and_an_existing_project_in_one_patch():
+    requests: list[httpx.Request] = []
+    snapshot = {"id": PARENT, "title": "Old", "labels": {}}
+    base = _organize_server(requests, snapshot)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/projects":
+            requests.append(request)
+            return httpx.Response(200, json={"data": [{"id": PROJECT_ID, "name": "Q3"}]})
+        return base(request)
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_session_update(
+                {"session_id": PARENT, "title": "Done", "archived": True, "project": "Q3"},
+                client,
+                SOURCE,
+            )
+        )
+    assert result == {
+        "session_id": PARENT,
+        "status": "updated",
+        "project": "Q3",
+        "project_created": False,
+        "title": "Done",
+        "archived": True,
+    }
+    (patched,) = [r for r in requests if r.method == "PATCH"]
+    assert patched.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+    assert json.loads(patched.content) == {
+        "project_id": PROJECT_ID,
+        "title": "Done",
+        "archived": True,
+        "labels": {"omni_project": ""},
+    }
+    assert not [r for r in requests if r.method == "POST"]
