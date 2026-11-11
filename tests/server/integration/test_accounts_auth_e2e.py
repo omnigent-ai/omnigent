@@ -661,23 +661,26 @@ async def test_mixed_case_revoke_and_leave_remove_the_login_identity_grant(
     assert await _grantees(client, session_id, admin_headers) == {_ADMIN_USERNAME: 4}
 
 
-async def test_revoke_by_exact_id_removes_a_non_canonical_grant(
+async def test_revoke_by_typed_id_removes_both_spellings_idempotently(
     client: httpx.AsyncClient,
     tmp_path: Path,
 ) -> None:
-    """A grant already stored under a mixed-case ID stays revocable by that ID."""
+    """Revoking a mixed-case ID removes its stored and canonical grants, and repeats cleanly."""
     admin_headers = _cookie_header(await _login(client, _ADMIN_USERNAME, _ADMIN_PASSWORD))
     session_id = await _create_session(client, admin_headers)
     permission_store = SqlAlchemyPermissionStore(f"sqlite:///{tmp_path}/test.db")
-    permission_store.ensure_user("Alice@Example.com")
-    permission_store.grant("Alice@Example.com", session_id, LEVEL_READ)
+    for stored_user_id in ("Alice@Example.com", "alice@example.com"):
+        permission_store.ensure_user(stored_user_id)
+        permission_store.grant(stored_user_id, session_id, LEVEL_READ)
     assert await _grantees(client, session_id, admin_headers) == {
         _ADMIN_USERNAME: 4,
         "Alice@Example.com": LEVEL_READ,
+        "alice@example.com": LEVEL_READ,
     }
 
-    revoke_resp = await client.delete(
-        f"/v1/sessions/{session_id}/permissions/Alice@Example.com", headers=admin_headers
-    )
-    assert revoke_resp.status_code == 204, revoke_resp.text
-    assert await _grantees(client, session_id, admin_headers) == {_ADMIN_USERNAME: 4}
+    for _ in range(2):
+        revoke_resp = await client.delete(
+            f"/v1/sessions/{session_id}/permissions/Alice@Example.com", headers=admin_headers
+        )
+        assert revoke_resp.status_code == 204, revoke_resp.text
+        assert await _grantees(client, session_id, admin_headers) == {_ADMIN_USERNAME: 4}

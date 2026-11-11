@@ -1197,8 +1197,7 @@ async def test_header_identity_grant_keeps_its_case(
     auth_client: httpx.AsyncClient,
 ) -> None:
     """Header mode grants the exact identity the proxy asserts, including its case."""
-    agent = await create_test_agent(auth_client, user="bryan")
-    session_id = (await _create_session_as(auth_client, agent["id"], "user-a"))["id"]
+    session_id = (await _create_session_as(auth_client, "", "user-a"))["id"]
 
     resp = await _grant_permission(
         auth_client,

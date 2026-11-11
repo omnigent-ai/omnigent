@@ -602,11 +602,14 @@ class UnifiedAuthProvider(AuthProvider):
     def canonical_user_id(self, user_id: str) -> str:
         """Lowercase *user_id* in OIDC and accounts modes, whose sign-in lowercases it.
 
-        Header mode keeps the proxy's value verbatim.
+        Header mode and the case-sensitive client-credentials machine subject keep their IDs.
         """
-        if self._source in ("oidc", "accounts"):
-            return user_id.strip().lower()
-        return user_id
+        if self._source not in ("oidc", "accounts"):
+            return user_id
+        from omnigent.server.routes.client_credentials import configured_machine_sub
+
+        stripped = user_id.strip()
+        return stripped if stripped == configured_machine_sub() else stripped.lower()
 
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:
         """

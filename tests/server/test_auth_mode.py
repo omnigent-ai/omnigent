@@ -6,6 +6,7 @@ clients read before loading anything to decide how to sign in.
 
 from __future__ import annotations
 
+import pytest
 from starlette.requests import HTTPConnection
 
 from omnigent.server.accounts_config import AccountsConfig
@@ -84,3 +85,15 @@ def test_canonical_user_id_matches_each_source_sign_in() -> None:
     assert accounts.canonical_user_id("Alice@Example.com") == "alice@example.com"
     assert header.canonical_user_id("Alice@Example.com") == "Alice@Example.com"
     assert _CustomProvider().canonical_user_id("Alice@Example.com") == "Alice@Example.com"
+
+
+def test_canonical_user_id_keeps_the_machine_subject_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_MACHINE_SUB", "BuildBot@Example.com")
+    oidc = UnifiedAuthProvider(source="oidc", oidc_config=_oidc_config("https://a.test/cb"))
+    accounts = UnifiedAuthProvider(source="accounts", accounts_config=_accounts_config())
+
+    for provider in (oidc, accounts):
+        assert provider.canonical_user_id(" BuildBot@Example.com ") == "BuildBot@Example.com"
+        assert provider.canonical_user_id("BUILDBOT@EXAMPLE.COM") == "buildbot@example.com"

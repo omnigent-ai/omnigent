@@ -245,7 +245,9 @@ def register_permissions_routes(
         # exists and is visible to the caller without leaking others' via
         # 403/404.
         canonical_target = _canonical_user_id(auth_provider, target_user_id)
-        leaving_self = canonical_target == user_id
+        # A grant stored before canonicalization keeps the typed ID, so both spellings go.
+        target_ids = list(dict.fromkeys((target_user_id, canonical_target)))
+        leaving_self = user_id in target_ids
         await _require_access(
             user_id,
             session_id,
@@ -277,24 +279,21 @@ def register_permissions_routes(
                     f"Leave the parent session {conv.parent_conversation_id!r} instead.",
                     code=ErrorCode.INVALID_INPUT,
                 )
-        # An existing grant may be stored under the exact non-canonical ID.
-        revoked_user_id = canonical_target if leaving_self else target_user_id
-        existing = await asyncio.to_thread(permission_store.get, revoked_user_id, session_id)
-        if existing is None and revoked_user_id != canonical_target:
-            revoked_user_id = canonical_target
+        for revoked_user_id in target_ids:
             existing = await asyncio.to_thread(permission_store.get, revoked_user_id, session_id)
-        if existing is not None and existing.level == LEVEL_OWNER:
-            raise OmnigentError(
-                "Cannot leave a session you own. Delete or archive it instead."
-                if leaving_self
-                else "Cannot revoke owner permissions",
-                code=ErrorCode.FORBIDDEN,
-            )
-        await asyncio.to_thread(permission_store.revoke, revoked_user_id, session_id)
+            if existing is not None and existing.level == LEVEL_OWNER:
+                raise OmnigentError(
+                    "Cannot leave a session you own. Delete or archive it instead."
+                    if leaving_self
+                    else "Cannot revoke owner permissions",
+                    code=ErrorCode.FORBIDDEN,
+                )
+        for revoked_user_id in target_ids:
+            await asyncio.to_thread(permission_store.revoke, revoked_user_id, session_id)
         # The leaver's own tab drops the row via the client mutation's success
         # handler; their other tabs converge on the next watch-set diff, which
         # reports the now-inaccessible id as removed. No extra push needed.
-        add_audit_attrs(target_user_id=revoked_user_id, left_self=leaving_self)
+        add_audit_attrs(target_user_id=canonical_target, left_self=leaving_self)
         return Response(status_code=204)
 
     @router.get(
