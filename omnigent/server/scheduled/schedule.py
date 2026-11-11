@@ -74,11 +74,6 @@ def is_event_trigger_key(trigger_key: str | None) -> bool:
     return trigger_key is not None and trigger_key.startswith(EVENT_TRIGGER_KEY_PREFIX)
 
 
-def is_event_triggered(task: ScheduledTask) -> bool:
-    """Whether a task runs on provider events instead of a schedule."""
-    return task.trigger_config is not None
-
-
 def manual_trigger_key() -> str:
     """A fresh key for one Run now request; each request is its own occurrence."""
     return f"manual:{uuid.uuid4().hex}"

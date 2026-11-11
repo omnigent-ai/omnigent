@@ -1228,10 +1228,12 @@ def register_core_routes(
                         "Sender host/workspace is invalid for independent creation",
                         code=ErrorCode.INVALID_INPUT,
                     ) from exc
+        agent_sibling = False
         if source is not None and request.app.state.feature_flags.enabled(
             Feature.SIBLING_SESSIONS
         ):
             body.sibling_source_id = source.root_conversation_id
+            agent_sibling = True
         if body.sibling_source_id is not None:
             from omnigent.server.session_families import authorize_sibling_source
 
@@ -1254,12 +1256,17 @@ def register_core_routes(
                 "project_id" in body.model_fields_set
                 and body.project_id != sibling_source.project_id
             ):
-                raise OmnigentError(
-                    "Nested agents stay in their source session's project",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            body.sibling_source_id = sibling_source.id
-            body.project_id = sibling_source.project_id
+                if not agent_sibling:
+                    raise OmnigentError(
+                        "Nested agents stay in their source session's project",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                # An agent that names another project gets a standalone session there;
+                # the source and destination checks above still apply.
+                body.sibling_source_id = None
+            else:
+                body.sibling_source_id = sibling_source.id
+                body.project_id = sibling_source.project_id
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp, conv = await _create_session_from_existing_agent(
             conversation_store,
@@ -4139,7 +4146,8 @@ def register_core_routes(
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
         if body.archived is True and not archived_before:
-            session_triggers.notify("session.archived", session_id, occurrence="archived")
+            # Each archive is its own occurrence; unarchiving and archiving again fires again.
+            session_triggers.notify("session.archived", session_id)
         if body.archived is True:
             _prune_session_read_state(session_id)
             # Stop asynchronously after the archive commits and Undo grace elapses.

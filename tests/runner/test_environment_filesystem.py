@@ -2117,6 +2117,58 @@ async def test_content_search_live_workspace(
     assert not (workspace / "injected").exists()
 
 
+# The web panel's Whole word cases, shared with its unit test, run through real ripgrep.
+_WHOLE_WORD_FIXTURE = json.loads(
+    (
+        Path(__file__).resolve().parents[2]
+        / "web/src/lib/__fixtures__/contentSearchWholeWord.json"
+    ).read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    _WHOLE_WORD_FIXTURE["cases"],
+    ids=[case["name"] for case in _WHOLE_WORD_FIXTURE["cases"]],
+)
+async def test_content_search_whole_word_patterns(
+    client: httpx.AsyncClient, workspace: Path, case: dict[str, Any]
+) -> None:
+    (workspace / "words.txt").write_text(
+        "\n".join(_WHOLE_WORD_FIXTURE["corpus"]) + "\n", encoding="utf-8"
+    )
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/content-search",
+        params={
+            "q": case["pattern"],
+            "regex": str(case["sentRegex"]).lower(),
+            "case_sensitive": str(case["caseSensitive"]).lower(),
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert [match["line"] for match in response.json()["matches"]] == case["lines"]
+
+
+@pytest.mark.asyncio
+async def test_content_search_whole_word_reports_the_word_itself(
+    client: httpx.AsyncClient, workspace: Path
+) -> None:
+    (workspace / "words.txt").write_text("x(needle)y\ncafe\u0301 au lait\n", encoding="utf-8")
+    endpoint = "/v1/sessions/conv_test/resources/environments/default/content-search"
+    response = await client.get(endpoint, params={"q": r"\bneedle\b", "regex": "true"})
+    match = response.json()["matches"][0]
+    assert (match["match_start"], match["match_end"]) == (2, 8)
+    # The panel's own pattern classifies the accent in ripgrep; it must consume only the accent.
+    decomposed = next(
+        case for case in _WHOLE_WORD_FIXTURE["cases"] if case["name"] == "decomposed accent"
+    )
+    response = await client.get(endpoint, params={"q": decomposed["pattern"], "regex": "true"})
+    match = response.json()["matches"][0]
+    # Offsets are UTF-16 units: the combining accent is one more unit after "cafe".
+    assert (match["match_start"], match["match_end"]) == (0, 5)
+
+
 @pytest.mark.asyncio
 async def test_content_search_limits_errors_and_hidden_files(
     client: httpx.AsyncClient, workspace: Path

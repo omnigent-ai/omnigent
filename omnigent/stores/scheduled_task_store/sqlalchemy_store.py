@@ -11,7 +11,7 @@ from functools import partial
 from operator import ge, gt, le, lt
 from typing import Any, cast
 
-from sqlalchemy import and_, asc, desc, func, or_, select, tuple_, update
+from sqlalchemy import and_, asc, delete, desc, func, or_, select, tuple_, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
@@ -22,6 +22,7 @@ from omnigent.db.db_models import (
     SqlHost,
     SqlPreference,
     SqlScheduledTask,
+    SqlScheduledTaskEventReceipt,
     SqlScheduledTaskRun,
     current_workspace_id,
     workspace_scope,
@@ -92,11 +93,27 @@ _PENDING_RUN_FILTER = (
 _MAX_COALESCED_EVENTS = 20
 # Runs in this window count toward an event-triggered task's per-minute cap.
 _EVENT_RATE_WINDOW_SECONDS = 60
+# JSON documents stay well below the columns' 16,383 stored bytes before compression.
+_MAX_JSON_DOCUMENT_CHARS = 12_000
+# How long an occurrence receipt keeps a repeated delivery from recording again.
+_EVENT_RECEIPT_RETENTION_SECONDS = 7 * 24 * 3600
+# Expired receipts removed per accepted event, so cleanup keeps pace with intake.
+_EVENT_RECEIPT_CLEANUP_BATCH = 20
+# Resumes a deleted task's purge after a page of receipts, before any run cursor.
+_RECEIPTS_PURGED_CURSOR = (-1, "0" * 32)
 
 
 def _dump_json(value: dict[str, Any] | None) -> str | None:
     """Encode a JSON column value compactly, keeping ``None`` as NULL."""
     return None if value is None else json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def _dump_bounded_json(value: dict[str, Any] | None) -> str | None:
+    """Encode a JSON column value, refusing one too large for its column."""
+    encoded = _dump_json(value)
+    if encoded is not None and len(encoded) > _MAX_JSON_DOCUMENT_CHARS:
+        raise ValueError(f"JSON document exceeds {_MAX_JSON_DOCUMENT_CHARS} characters")
+    return encoded
 
 
 def _load_json(raw: str | None) -> dict[str, Any] | None:
@@ -136,8 +153,23 @@ def _purge_finished_deleted_task(
         .limit(1)
         .with_for_update()
     )
-    if remaining is None:
+    if remaining is None and not _has_receipts(session, task.workspace_id, task.id):
         session.delete(task)
+
+
+def _has_receipts(session: Session, workspace_id: int, task_id: str) -> bool:
+    """Whether a task still has occurrence receipts; the deleted-task sweep removes them."""
+    return (
+        session.scalar(
+            select(SqlScheduledTaskEventReceipt.id)
+            .where(
+                SqlScheduledTaskEventReceipt.workspace_id == workspace_id,
+                SqlScheduledTaskEventReceipt.scheduled_task_id == task_id,
+            )
+            .limit(1)
+        )
+        is not None
+    )
 
 
 def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
@@ -316,7 +348,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 host_id=host_id,
                 project_id=project_id,
                 delegation_ref=delegation_ref,
-                trigger_config=_dump_json(trigger_config),
+                trigger_config=_dump_bounded_json(trigger_config),
                 state=encode_scheduled_task_state(state),
                 last_run_at=None,
                 last_run_conversation_id=None,
@@ -485,7 +517,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 row.rrule = rrule
                 changed = True
             if trigger_config is not _UNSET:
-                encoded_trigger = _dump_json(trigger_config)
+                encoded_trigger = _dump_bounded_json(trigger_config)
                 if row.trigger_config != encoded_trigger:
                     row.trigger_config = encoded_trigger
                     changed = True
@@ -691,6 +723,25 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
             if task is None or task.state != encode_scheduled_task_state("deleted"):
                 return None
+            receipt_ids = list(
+                session.scalars(
+                    select(SqlScheduledTaskEventReceipt.id)
+                    .where(
+                        SqlScheduledTaskEventReceipt.workspace_id == current_workspace_id(),
+                        SqlScheduledTaskEventReceipt.scheduled_task_id == task_id,
+                    )
+                    .limit(self._cleanup_batch_size)
+                )
+            )
+            if receipt_ids:
+                session.execute(
+                    delete(SqlScheduledTaskEventReceipt).where(
+                        SqlScheduledTaskEventReceipt.workspace_id == current_workspace_id(),
+                        SqlScheduledTaskEventReceipt.id.in_(receipt_ids),
+                    )
+                )
+                # Runs follow on later pages, once every receipt is gone.
+                return after if after is not None else _RECEIPTS_PURGED_CURSOR
             columns = (SqlScheduledTaskRun.scheduled_at, SqlScheduledTaskRun.id)
             stmt = (
                 select(SqlScheduledTaskRun)
@@ -1244,8 +1295,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 .where(
                     SqlScheduledTask.state == encode_scheduled_task_state("active"),
                     SqlScheduledTask.next_run_at.is_(None),
-                    # Event-triggered tasks never get a next run time.
-                    SqlScheduledTask.trigger_config.is_(None),
+                    # Event-triggered tasks have no rule and never get a next run time.
+                    SqlScheduledTask.rrule.is_not(None),
                 )
                 .order_by(
                     *(
@@ -1465,12 +1516,16 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         return run_write_transaction(self._session_immediate, "request_manual_run", write)
 
-    def list_event_triggered_tasks(self) -> builtins.list[ScheduledTask]:
-        """Active event-triggered tasks in the current workspace, oldest first.
+    def list_event_triggered_tasks(
+        self, *, after: str | None = None, limit: int = 500
+    ) -> builtins.list[ScheduledTask]:
+        """One page of the current workspace's active event-triggered tasks, by id.
 
-        Event-triggered tasks are active with no next run time, so this seeks the
-        due-task index on ``(state, next_run_at, workspace_id)``.
+        Such a task is active with no rule and no next run time, so the page seeks
+        the due-task index on ``(state, next_run_at, workspace_id, id)``.
         """
+        if limit < 1:
+            raise ValueError("The event-triggered task page size must be at least 1.")
         with self._session("list_event_triggered_tasks") as session:
             stmt = (
                 select(SqlScheduledTask)
@@ -1478,10 +1533,13 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     SqlScheduledTask.state == encode_scheduled_task_state("active"),
                     SqlScheduledTask.next_run_at.is_(None),
                     SqlScheduledTask.workspace_id == current_workspace_id(),
-                    SqlScheduledTask.trigger_config.is_not(None),
+                    SqlScheduledTask.rrule.is_(None),
                 )
-                .order_by(SqlScheduledTask.created_at, SqlScheduledTask.id)
+                .order_by(SqlScheduledTask.id)
+                .limit(limit)
             )
+            if after is not None:
+                stmt = stmt.where(SqlScheduledTask.id > after)
             return [_to_entity(row) for row in session.scalars(stmt)]
 
     def record_event_run(
@@ -1495,7 +1553,11 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         coalesce: bool,
         max_runs_per_minute: int,
     ) -> EventRunOutcome:
-        """Insert or coalesce under the task lock, like :meth:`request_manual_run`."""
+        """Record or coalesce under the task lock, like :meth:`request_manual_run`.
+
+        Every accepted occurrence gets a receipt, unique per task, so a repeated
+        delivery records nothing even after its coalesced run was claimed.
+        """
         if task.workspace_id != current_workspace_id():
             return "inactive"
         if not is_event_trigger_key(trigger_key):
@@ -1503,27 +1565,70 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 f"An event run's trigger key must start with {EVENT_TRIGGER_KEY_PREFIX!r}."
             )
         entry = {**event, "key": trigger_key}
+        workspace_id = task.workspace_id
+
+        def receipt(session: Session, run_id: str | None) -> None:
+            session.add(
+                SqlScheduledTaskEventReceipt(
+                    workspace_id=workspace_id,
+                    id=uuid.uuid4().hex,
+                    scheduled_task_id=task.id,
+                    trigger_key=trigger_key,
+                    run_id=run_id,
+                    created_at=now,
+                )
+            )
+            # Bounded cleanup with each accepted event keeps receipts to the retention.
+            expired = list(
+                session.scalars(
+                    select(SqlScheduledTaskEventReceipt.id)
+                    .where(
+                        SqlScheduledTaskEventReceipt.workspace_id == workspace_id,
+                        SqlScheduledTaskEventReceipt.scheduled_task_id == task.id,
+                        SqlScheduledTaskEventReceipt.created_at
+                        < now - _EVENT_RECEIPT_RETENTION_SECONDS,
+                    )
+                    .order_by(SqlScheduledTaskEventReceipt.created_at)
+                    .limit(_EVENT_RECEIPT_CLEANUP_BATCH)
+                )
+            )
+            if expired:
+                session.execute(
+                    delete(SqlScheduledTaskEventReceipt).where(
+                        SqlScheduledTaskEventReceipt.workspace_id == workspace_id,
+                        SqlScheduledTaskEventReceipt.id.in_(expired),
+                    )
+                )
 
         def write(session: Session) -> EventRunOutcome:
-            row = session.get(SqlScheduledTask, (task.workspace_id, task.id), with_for_update=True)
+            row = session.get(SqlScheduledTask, (workspace_id, task.id), with_for_update=True)
             if (
                 row is None
                 or row.state != encode_scheduled_task_state("active")
                 or row.trigger_config is None
             ):
                 return "inactive"
+            received = session.scalar(
+                select(SqlScheduledTaskEventReceipt.id).where(
+                    SqlScheduledTaskEventReceipt.workspace_id == workspace_id,
+                    SqlScheduledTaskEventReceipt.scheduled_task_id == task.id,
+                    SqlScheduledTaskEventReceipt.trigger_key == trigger_key,
+                )
+            )
             task_runs = (
-                SqlScheduledTaskRun.workspace_id == task.workspace_id,
+                SqlScheduledTaskRun.workspace_id == workspace_id,
                 SqlScheduledTaskRun.scheduled_task_id == task.id,
             )
-            existing = session.scalar(
+            # A run keyed by the occurrence outlives the occurrence's receipt.
+            if received is not None or session.scalar(
                 select(SqlScheduledTaskRun.id).where(
                     *task_runs, SqlScheduledTaskRun.trigger_key == trigger_key
                 )
-            )
-            if existing is not None:
+            ):
                 return "duplicate"
             if coalesce:
+                # The task-status index finds the unclaimed run among the task's
+                # pending runs, not its whole history.
                 pending = session.scalar(
                     select(SqlScheduledTaskRun)
                     .where(
@@ -1539,28 +1644,30 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     document = _load_json(pending.event) or {}
                     events = document.get("events")
                     events = events if isinstance(events, list) else []
-                    if any(isinstance(e, dict) and e.get("key") == trigger_key for e in events):
-                        return "duplicate"
-                    if len(events) < _MAX_COALESCED_EVENTS:
-                        events.append(entry)
+                    listed = {**document, "events": [*events, entry]}
+                    if (
+                        len(events) < _MAX_COALESCED_EVENTS
+                        and len(_dump_json(listed) or "") <= _MAX_JSON_DOCUMENT_CHARS
+                    ):
+                        document = listed
                     else:
                         document["omitted"] = int(document.get("omitted") or 0) + 1
-                    document["events"] = events
-                    pending.event = _dump_json(document)
+                    pending.event = _dump_bounded_json(document)
+                    receipt(session, pending.id)
                     return "coalesced"
-            recent = session.scalar(
-                select(func.count())
-                .select_from(SqlScheduledTaskRun)
+            # Reading at most the cap's worth of rows establishes saturation.
+            recent = session.scalars(
+                select(SqlScheduledTaskRun.id)
                 .where(
                     *task_runs,
                     SqlScheduledTaskRun.scheduled_at > now - _EVENT_RATE_WINDOW_SECONDS,
                     SqlScheduledTaskRun.status != encode_scheduled_task_run_status("skipped"),
                 )
-            )
-            if (recent or 0) >= max_runs_per_minute:
+                .limit(max_runs_per_minute)
+            ).all()
+            if len(recent) >= max_runs_per_minute:
                 # One visible skip per minute, keyed so further drops add no rows.
-                minute = now // _EVENT_RATE_WINDOW_SECONDS
-                limit_key = f"rate_limited:{minute}"
+                limit_key = f"rate_limited:{now // _EVENT_RATE_WINDOW_SECONDS}"
                 recorded = session.scalar(
                     select(SqlScheduledTaskRun.id).where(
                         *task_runs, SqlScheduledTaskRun.trigger_key == limit_key
@@ -1569,7 +1676,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 if recorded is None:
                     session.add(
                         SqlScheduledTaskRun(
-                            workspace_id=task.workspace_id,
+                            workspace_id=workspace_id,
                             id=uuid.uuid4().hex,
                             scheduled_task_id=task.id,
                             status=encode_scheduled_task_run_status("skipped"),
@@ -1581,22 +1688,24 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                                 "later events in this minute were dropped."
                             ),
                             error_code="rate_limited",
-                            event=_dump_json({"events": [entry]}),
+                            event=_dump_bounded_json({"events": [entry]}),
                         )
                     )
                 return "rate_limited"
+            run_id = uuid.uuid4().hex
             session.add(
                 SqlScheduledTaskRun(
-                    workspace_id=task.workspace_id,
-                    id=uuid.uuid4().hex,
+                    workspace_id=workspace_id,
+                    id=run_id,
                     scheduled_task_id=task.id,
                     status=encode_scheduled_task_run_status("scheduled"),
                     scheduled_at=now,
                     trigger_key=trigger_key,
                     host_id=host_id,
-                    event=_dump_json({"events": [entry]}),
+                    event=_dump_bounded_json({"events": [entry]}),
                 )
             )
+            receipt(session, run_id)
             return "recorded"
 
         return run_write_transaction(self._session_immediate, "record_event_run", write)

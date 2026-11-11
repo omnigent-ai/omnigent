@@ -1,33 +1,10 @@
 """Session triggers: automations that run on Omnigent's own session events.
 
-A task whose ``trigger_config`` names the ``omnigent`` provider runs when a
-session it can see is created, renamed, archived or deleted, finishes or fails a
-turn, asks for input (an approval or a question), or gets a comment. These are
-the events the web Inbox shows, plus the session lifecycle.
-
-The server calls :func:`notify` where each event happens. Matching and recording
-run on a background worker, off the request and the event loop: for every active
-session-triggered task in the workspace whose filters match, the worker records a
-pending run (``scheduled``, no lease) keyed by the event's occurrence key, and the
-host owner's :class:`~omnigent.server.scheduled.dispatch_scheduler.PersistentTaskScheduler`
-claims it on its next poll like a Run now request. The run is in the database
-before the event is acknowledged anywhere, so a replica restart after recording
-does not lose it, and the unique occurrence key drops a repeat.
-
-Guards:
-
-* **Access.** Only sessions the task owner holds a grant on (owned or shared
-  with them) fire. Admin access and public sessions don't count. A sub-agent
-  session is checked through its root session, as session reads are.
-* **Loops.** By default a task ignores sessions it created and the session it
-  continues, and those sessions' sub-agents (``include_own_sessions``).
-* **Volume.** A task records at most :data:`MAX_EVENT_RUNS_PER_MINUTE` runs a
-  minute; further events in that minute are dropped, with one ``skipped`` run
-  (``rate_limited``) recording the drop. A task that continues one session adds
-  events to its unclaimed pending run instead of recording another, and the
-  scheduler holds that run while the session is busy.
-* **Content.** A run's event carries IDs and metadata, never titles, messages or
-  comment text. The agent reads those with its own session tools.
+The server calls :func:`notify` where an event happens; a background worker
+matches it to session-triggered tasks and records pending runs, which the host
+owner's scheduler claims like Run now requests. Recorded runs survive a replica
+restart; queued notifications are best effort. Behavior, guards and limits are
+described under "Session triggers" in ``README.md``.
 """
 
 from __future__ import annotations
@@ -73,6 +50,8 @@ SESSION_EVENT_TYPES: tuple[str, ...] = get_args(SessionEventType)
 
 # A loop between automations, or a burst of turns, stops at this many runs a minute.
 MAX_EVENT_RUNS_PER_MINUTE = 10
+# Tasks read per query while listing a workspace's session-triggered tasks.
+_TASK_PAGE_SIZE = 500
 # Longer occurrence IDs are hashed so the occurrence key fits its column.
 _MAX_OCCURRENCE_CHARS = 128
 # How long a replica reuses its list of a workspace's session-triggered tasks.
@@ -242,8 +221,8 @@ def notify(
         milliseconds, which never deduplicates.
     :param conversation: The session as the caller already has it. Required for
         ``session.deleted``, since the row is gone by the time the worker runs.
-    :param readers: Users holding a grant on the session (or its root), captured
-        before a deletion removed the grants. ``None`` reads them when matching.
+    :param readers: The result of :func:`readers_of`, captured before a deletion
+        removed the session's grants. ``None`` checks each task owner's grant.
     :param ids: Extra IDs for the run, e.g. ``response_id="resp_1"``. ``None``
         values are dropped.
     :returns: The queued work, for tests, or ``None`` when triggers are off.
@@ -261,21 +240,31 @@ def notify(
     return _submit(_record, event, conversation, readers)
 
 
-def readers_of(conversation: Conversation) -> frozenset[str] | None:
-    """Users holding a grant on a session's root, for a ``session.deleted`` event.
+def readers_of(conversation: Conversation, event_type: SessionEventType) -> frozenset[str] | None:
+    """Owners of tasks listening for *event_type* who hold a grant on the session.
 
-    Blocking; returns ``None`` without reading when triggers are off or the
-    server has no permissions, so callers can capture it before a deletion.
+    Blocking. A route calls it before a deletion removes the session's grants and
+    passes the result to :func:`notify`. Returns ``None`` without reading when
+    triggers are off or the server has no permissions.
     """
     wiring = _wiring
     if wiring is None or wiring.permission_store is None:
         return None
-    return _readers(wiring.permission_store, _access_root_id(conversation))
+    owners = {
+        task.user_id
+        for task in _session_triggered_tasks(wiring)
+        if task.user_id is not None
+        and (config := parse_session_trigger(task.trigger_config)) is not None
+        and event_type in config.events
+    }
+    root_id = _access_root_id(conversation)
+    return frozenset(owner for owner in owners if _holds_grant(wiring, owner, root_id))
 
 
-def _readers(permission_store: PermissionStore, session_id: str) -> frozenset[str]:
-    grants = permission_store.list_for_sessions([session_id]).get(session_id, [])
-    return frozenset(grant.user_id for grant in grants)
+def _holds_grant(wiring: _Wiring, user_id: str, session_id: str) -> bool:
+    """Whether *user_id* has its own grant on the session: one indexed row."""
+    assert wiring.permission_store is not None
+    return wiring.permission_store.get(user_id, session_id) is not None
 
 
 def _submit(fn: Callable[..., None], *args: object) -> Future[None]:
@@ -300,11 +289,20 @@ def _session_triggered_tasks(wiring: _Wiring) -> list[ScheduledTask]:
     now = time.monotonic()
     if cached is not None and now - cached[0] < _TASK_LIST_TTL_SECONDS:
         return cached[1]
-    tasks = [
-        task
-        for task in wiring.scheduled_task_store.list_event_triggered_tasks()
-        if (task.trigger_config or {}).get("provider") == SESSION_TRIGGER_PROVIDER
-    ]
+    tasks: list[ScheduledTask] = []
+    after: str | None = None
+    while True:
+        page = wiring.scheduled_task_store.list_event_triggered_tasks(
+            after=after, limit=_TASK_PAGE_SIZE
+        )
+        tasks.extend(
+            task
+            for task in page
+            if (task.trigger_config or {}).get("provider") == SESSION_TRIGGER_PROVIDER
+        )
+        if len(page) < _TASK_PAGE_SIZE:
+            break
+        after = page[-1].id
     _task_lists[_TASK_LIST_KEY] = (now, tasks)
     return tasks
 
@@ -347,8 +345,6 @@ def _record(
     root = conv
     if root_id != conv.id:
         root = wiring.conversation_store.get_conversation(root_id) or conv
-    if readers is None and wiring.permission_store is not None:
-        readers = _readers(wiring.permission_store, root_id)
     document = event.document(conv)
     now = int(time.time())
     for task, config in matched:
@@ -357,8 +353,12 @@ def _record(
         if not config.include_own_sessions and _is_own_session(task, conv, root):
             continue
         # Single-user servers have no grants: every session is the owner's.
-        if readers is not None and task.user_id is not None and task.user_id not in readers:
-            continue
+        if task.user_id is not None and wiring.permission_store is not None:
+            if readers is not None:
+                if task.user_id not in readers:
+                    continue
+            elif not _holds_grant(wiring, task.user_id, root_id):
+                continue
         trigger_key = event.trigger_key
         outcome = wiring.scheduled_task_store.record_event_run(
             task,

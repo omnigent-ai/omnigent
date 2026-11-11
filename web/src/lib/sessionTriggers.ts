@@ -1,7 +1,7 @@
 // Labels and summaries for automations that run on Omnigent session events
 // (`trigger_config` provider `omnigent`) instead of an RRULE schedule.
 
-import { describeSchedule } from "./scheduleText";
+import { describeSchedule, EVENT_TRIGGER_SUMMARY } from "./scheduleText";
 import type { ScheduledTask, SessionTrigger, SessionTriggerEvent } from "./scheduledTasksApi";
 
 /** Picker labels for each event, in the order the form lists them. */
@@ -43,5 +43,5 @@ export function describeSessionTrigger(trigger: SessionTrigger): string {
 /** What starts an automation's runs: its schedule, or the session events it watches. */
 export function describeTaskTrigger(task: Pick<ScheduledTask, "rrule" | "sessionTrigger">): string {
   if (task.sessionTrigger) return describeSessionTrigger(task.sessionTrigger);
-  return task.rrule !== null ? describeSchedule(task.rrule) : "On events";
+  return task.rrule !== null ? describeSchedule(task.rrule) : EVENT_TRIGGER_SUMMARY;
 }

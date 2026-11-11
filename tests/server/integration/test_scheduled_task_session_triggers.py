@@ -15,6 +15,7 @@ from omnigent.server.scheduled import session_triggers
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.conftest import ControllableMockClient
+from tests.server.integration import test_scheduled_tasks_routes as routes_tests
 from tests.server.integration.test_scheduled_tasks_routes import (
     _build_app,
     _create_body,
@@ -44,8 +45,18 @@ async def client(
     tmp_path: Path,
     mock_llm: ControllableMockClient,
     request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[httpx.AsyncClient]:
-    app: FastAPI = _build_app(db_uri, tmp_path, persistent=getattr(request, "param", True))
+    # param: (database scheduler, session_triggers feature)
+    persistent, triggers = getattr(request, "param", (True, True))
+    resolve = routes_tests.resolve_feature_flags
+
+    def with_triggers(env: dict[str, str]) -> object:
+        suffix = ",session_triggers" if triggers else ""
+        return resolve({"OMNIGENT_FEATURES": env["OMNIGENT_FEATURES"] + suffix})
+
+    monkeypatch.setattr(routes_tests, "resolve_feature_flags", with_triggers)
+    app: FastAPI = _build_app(db_uri, tmp_path, persistent=persistent)
     _make_user(db_uri)
     _register_host(app, _HOST, "alice@example.com")
     async with _serve(app, mock_llm, tmp_path) as client:
@@ -101,13 +112,18 @@ async def test_create_rejects_invalid_triggers(
     assert message in response.text
 
 
-@pytest.mark.parametrize("client", [False], indirect=True)
-async def test_legacy_timers_reject_event_triggers(client: httpx.AsyncClient) -> None:
+@pytest.mark.parametrize(
+    "client", [(False, True), (True, False)], indirect=True, ids=["legacy-timers", "flag-off"]
+)
+async def test_event_triggers_need_the_scheduler_and_the_feature(
+    client: httpx.AsyncClient,
+) -> None:
+    # Older servers would pause event tasks, so the feature stays off until all have it.
     info = (await client.get("/v1/info", headers=_headers())).json()
     assert info["scheduled_task_session_triggers"] is False
     response = await client.post("/v1/scheduled-tasks", json=_trigger_body(), headers=_headers())
     assert response.status_code == 400, response.text
-    assert "database scheduler" in response.text
+    assert "not enabled on this server" in response.text
 
 
 async def test_patch_switches_between_schedule_and_events(client: httpx.AsyncClient) -> None:

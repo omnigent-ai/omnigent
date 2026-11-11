@@ -127,15 +127,16 @@ def test_a_task_ignores_the_sessions_it_created_or_continues(stores: _Stores) ->
         agent_id=AGENT, parent_conversation_id=created.id, kind="sub_agent"
     )
     everyone = stores.task(include_own_sessions=True)
-    stores.tasks.update(everyone.id, name="everyone")
-    for conv in (continued, created, child):
+    its_own = stores.session(labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: everyone.id})
+    for conv in (continued, created, child, its_own):
         _notify("turn.completed", conv.id, occurrence="r")
-    assert stores.events(watcher) == []
-    # The opt-in sees all three; its own sessions are other tasks' here.
+    assert {e["session_id"] for e in stores.events(watcher)} == {its_own.id}
+    # The opt-in also hears the session it started itself.
     assert {e["session_id"] for e in stores.events(everyone)} == {
         continued.id,
         created.id,
         child.id,
+        its_own.id,
     }
 
 
@@ -159,11 +160,15 @@ def test_only_sessions_the_owner_holds_a_grant_on_fire(stores: _Stores) -> None:
     )
 
 
-def test_a_deleted_session_fires_from_what_the_route_captured(stores: _Stores) -> None:
+async def test_a_deleted_session_fires_from_what_the_route_captured(stores: _Stores) -> None:
     task = stores.task(events=["session.deleted"])
+    stores.task(owner=BOB, events=["session.deleted"])
     conv = stores.session()
-    readers = session_triggers.readers_of(conv)
+    # Only listening owners with a grant on the session are captured.
+    readers = session_triggers.readers_of(conv, "session.deleted")
     assert readers == frozenset({ALICE})
+    assert session_triggers.readers_of(conv, "turn.completed") == frozenset()
+    assert await stores.conversations.delete_conversation(conv.id)
     stores.permissions.revoke(ALICE, conv.id)
     _notify("session.deleted", conv.id, occurrence="deleted", conversation=conv, readers=readers)
     assert [e["type"] for e in stores.events(task)] == ["session.deleted"]
@@ -237,6 +242,11 @@ def test_status_edges_report_turn_ends_with_their_response(
     # A stop publishes idle without persisting it, which is no turn end.
     helpers._publish_status(session, "running", response_id="resp_3")
     helpers._publish_status(session, "idle", persist_live_status=False)
+    # A previous turn's late failure lands after the next turn started; that turn's
+    # confirmed completion still counts.
+    helpers._publish_status(session, "running", response_id="resp_4")
+    helpers._publish_status(session, "failed")
+    helpers._publish_status(session, "idle", response_id="resp_4", turn_completed=True)
     assert seen == [
         ("turn.completed", session, {"occurrence": "resp_1", "response_id": "resp_1"}),
         (
@@ -244,6 +254,12 @@ def test_status_edges_report_turn_ends_with_their_response(
             session,
             {"occurrence": "resp_2", "response_id": "resp_2", "error_code": "runner_error"},
         ),
+        (
+            "turn.failed",
+            session,
+            {"occurrence": "resp_4", "response_id": "resp_4", "error_code": None},
+        ),
+        ("turn.completed", session, {"occurrence": "resp_4", "response_id": "resp_4"}),
     ]
 
 
@@ -279,3 +295,36 @@ def test_a_long_occurrence_is_hashed_into_the_key() -> None:
             type="turn.completed", session_id="s" * 32, occurrence="r" * 500, occurred_at=1
         ).trigger_key
     )
+
+
+async def test_the_event_hold_checks_the_continued_sessions_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.server.scheduled.fire import build_event_session_busy
+
+    task = SimpleNamespace(continues_session=True, session_id="conv_1")
+    activity: dict[str, Any] = {}
+    deps = SimpleNamespace(
+        scheduled_task_store=SimpleNamespace(get=lambda _id: task),
+        conversation_store=SimpleNamespace(get_session_activity=lambda ids: activity),
+    )
+    busy = build_event_session_busy(deps)  # type: ignore[arg-type]
+    run = SimpleNamespace(scheduled_task_id="st_1")
+
+    def session(**fields: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            **{"live_status": "idle", "runner_id": None, "pending_elicitation_count": 0, **fields}
+        )
+
+    assert await busy(run) is False  # no session recorded activity
+    activity["conv_1"] = session()
+    assert await busy(run) is False
+    activity["conv_1"] = session(live_status="running")
+    assert await busy(run) is True
+    # An idle native session waiting on an approval or a question is busy too.
+    activity["conv_1"] = session(runner_id="runner_1", pending_elicitation_count=1)
+    assert await busy(run) is True
+    task.continues_session = False
+    assert await busy(run) is False
