@@ -1598,6 +1598,9 @@ class SqlScheduledTask(OmnigentBase):
     trigger_config: Mapped[str | None] = mapped_column(
         CompressedText(max_stored_bytes=16_383), nullable=True
     )
+    # The provider named in trigger_config, e.g. "omnigent", or NULL for a scheduled
+    # task: the scalar SQL filters event-triggered tasks on.
+    trigger_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # Session-owner identity: the spawned run's LEVEL_OWNER grant is written
     # for this user. Nullable — None in single-user/OSS mode (the fire path
     # resolves null to the reserved "local" user). String(128) to match
@@ -1662,6 +1665,21 @@ class SqlScheduledTask(OmnigentBase):
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
         CheckConstraint("session_mode IN (1, 2)", name="ck_scheduled_tasks_session_mode"),
         Index("ix_scheduled_tasks_due", "state", "next_run_at", "workspace_id", "id"),
+        # A workspace's active tasks for one trigger provider, and scheduled tasks
+        # (no provider) that still need a next run time, by equality seeks.
+        Index(
+            "ix_scheduled_tasks_trigger",
+            "state",
+            "trigger_provider",
+            "next_run_at",
+            "workspace_id",
+            "id",
+        ),
+        # SQLite ignores VARCHAR lengths: 32 characters at up to four bytes each.
+        CheckConstraint(
+            "trigger_provider IS NULL OR length(CAST(trigger_provider AS BLOB)) <= 128",
+            name="ck_scheduled_tasks_trigger_provider_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
         # Covers a user's task listing ordered by creation time.
         Index(
             "ix_scheduled_tasks_user_scope",
@@ -1772,16 +1790,6 @@ class SqlScheduledTaskRun(OmnigentBase):
             "workspace_id",
             "scheduled_task_id",
             "scheduled_at",
-            "id",
-        ),
-        # A task's runs in one status by key prefix, e.g. its unclaimed pending
-        # event run among pending Run now requests.
-        Index(
-            "ix_scheduled_task_runs_task_status",
-            "workspace_id",
-            "scheduled_task_id",
-            "status",
-            "trigger_key",
             "id",
         ),
         # Reverse lookup conversation_id -> run for the event-driven completion
