@@ -257,9 +257,13 @@ export function InboxPage() {
     settings: advisorSettings,
     query: advisorSettingsQuery,
   } = useProactiveAgentSettings();
-  // The Omni Advisor tab exists only while the agent is on for the viewer; it
-  // stays selected while that is still loading.
-  const advisorTab = advisorAvailable && advisorSettings?.enabled !== false;
+  // The Omni Advisor tab exists only while the agent is on for the viewer. While
+  // the settings are still loading it shows only where it was already selected,
+  // so a viewer who turned the agent off never sees it appear and vanish.
+  const advisorTab =
+    advisorAvailable &&
+    (advisorSettings?.enabled === true ||
+      (advisorSettings === undefined && storedFilter === "advisor"));
   // Suggestions load only once the settings say the agent is on, so until they
   // arrive the page is still assembling, and a failed first read is a failure
   // to show. A failed refetch keeps the settings it had, and the cards with them.
