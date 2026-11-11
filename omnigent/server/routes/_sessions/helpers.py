@@ -327,6 +327,7 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
+    MUTED_LABEL_KEY,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
@@ -11065,6 +11066,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"{PINNED_LABEL_KEY!r} key to pin for yourself",
             code=ErrorCode.INVALID_INPUT,
         )
+    # Mutes are per-user the same way.
+    suffixed_mute = next((k for k in labels if k.startswith(f"{MUTED_LABEL_KEY}.")), None)
+    if suffixed_mute is not None:
+        raise OmnigentError(
+            f"label {suffixed_mute!r} is server-derived; set the bare "
+            f"{MUTED_LABEL_KEY!r} key to mute for yourself",
+            code=ErrorCode.INVALID_INPUT,
+        )
     # Sandbox lifecycle labels are written only by server internals and re-read
     # across a relaunch to rebuild the runner Pod (e.g. the repository it
     # re-clones). A client seed here would forge that reconstruction state, so
@@ -11614,7 +11623,11 @@ def _child_session_summary_from_conversation(
     # sidebar rows only), but strip any per-user ``omnigent.pinned.<user>`` keys
     # defensively so a shared child's summary can never expose another viewer's
     # pin key. No collapse-to-canonical here: there's no pin to surface.
-    raw_labels = {k: v for k, v in conv.labels.items() if not k.startswith(f"{PINNED_LABEL_KEY}.")}
+    raw_labels = {
+        k: v
+        for k, v in conv.labels.items()
+        if not k.startswith((f"{PINNED_LABEL_KEY}.", f"{MUTED_LABEL_KEY}."))
+    }
     labels = labels_with_closed_status(raw_labels, conv.title)
     tool: str | None
     session_name: str | None

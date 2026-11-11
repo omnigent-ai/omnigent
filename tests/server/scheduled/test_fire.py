@@ -4044,6 +4044,15 @@ def test_session_approval_skipping_mode(
     assert fire_mod.session_approval_skipping_mode(conv) == expected
 
 
+def test_a_muted_task_starts_its_sessions_muted_for_its_owner() -> None:
+    from omnigent.stores.conversation_store import muted_label_key
+
+    owner_key = muted_label_key("alice@example.com")
+    assert owner_key not in fire_mod._session_labels(_task(user_id="alice@example.com"))
+    labels = fire_mod._session_labels(_task(user_id="alice@example.com", muted=True))
+    assert labels[owner_key] == "1"
+
+
 # ── Runs that start from a copy of a session ───────────────────────────────
 
 

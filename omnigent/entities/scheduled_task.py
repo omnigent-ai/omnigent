@@ -94,6 +94,8 @@ class ScheduledTask:
         firing, or ``None``.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
+    :param muted: Whether every session the task fires starts muted for its
+        owner. Defaults to ``False``.
     """
 
     id: str
@@ -124,6 +126,7 @@ class ScheduledTask:
     next_run_at: int | None = None
     project_id: str | None = None
     delegation_ref: str | None = None
+    muted: bool = False
 
     @property
     def continues_session(self) -> bool:

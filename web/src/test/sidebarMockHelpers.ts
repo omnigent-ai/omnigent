@@ -5,6 +5,9 @@ import type { SidebarListQuery } from "@/hooks/useSidebarData";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 
+/** Records the row menu's mute/unmute writes. */
+export const setConversationMutedMock = vi.fn();
+
 export function conversationHooksMock() {
   return {
     useConversations: vi.fn(),
@@ -29,6 +32,7 @@ export function conversationHooksMock() {
       mutateAsync: vi.fn(() => Promise.resolve({})),
     }),
     useReorderPinnedConversations: () => ({ mutate: vi.fn() }),
+    useSetConversationMuted: () => ({ mutate: setConversationMutedMock }),
     setConversationPinned: vi.fn(() => Promise.resolve({})),
     PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
     retryListFetch: () => false,

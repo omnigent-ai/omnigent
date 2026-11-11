@@ -106,6 +106,7 @@ from omnigent.stores.conversation_store import (
     FORK_SOURCE_LABEL_KEY,
     MAX_PENDING_INPUTS,
     MAX_SESSION_FAMILY_MEMBERS,
+    MUTED_LABEL_KEY,
     PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
@@ -6425,6 +6426,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     | dropped_label_keys
                 )
                 and not key.startswith(f"{PINNED_LABEL_KEY}.")
+                and not key.startswith(f"{MUTED_LABEL_KEY}.")
                 and not key.startswith(FAMILY_PIN_LABEL_PREFIX)
                 and not key.startswith(f"{_SANDBOX_REPO_LABEL_KEY}.")
                 and not (source_workspace_missing and key.startswith("omnigent.last_task_error_"))

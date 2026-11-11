@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
 from omnigent.server.routes._sessions.orchestration import _labels_for_viewer
-from omnigent.stores.conversation_store import pinned_label_key
+from omnigent.stores.conversation_store import muted_label_key, pinned_label_key
 
 
 def test_collapses_per_repo_labels_to_the_bare_space_joined_key() -> None:
@@ -48,3 +48,11 @@ def test_still_collapses_the_pin_family() -> None:
     # This viewer's pin surfaces as the canonical bare key; others' don't leak.
     assert viewer.get("omnigent.pinned") == "1721760000000"
     assert not any(k.startswith("omnigent.pinned.") for k in viewer)
+
+
+def test_collapses_the_mute_family_to_the_viewers_own_mute() -> None:
+    """Only this viewer's mute surfaces, as the bare key; another user's never leaks."""
+    labels = {muted_label_key("bob@example.com"): "1"}
+    assert _labels_for_viewer(labels, "alice@example.com") == {}
+    labels[muted_label_key("alice@example.com")] = "1"
+    assert _labels_for_viewer(labels, "alice@example.com") == {"omnigent.muted": "1"}

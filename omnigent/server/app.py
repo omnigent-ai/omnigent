@@ -299,6 +299,8 @@ class ServerInfoResponse(BaseModel):
     # Scheduled tasks accept ``source_session_id``: each run starts from a copy
     # of a session. Older servers reject it.
     scheduled_task_source_sessions: bool = True
+    # Scheduled tasks accept ``muted``; older servers reject it.
+    scheduled_task_muted: bool = True
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
     automation_trigger_poll_minutes: int = 10

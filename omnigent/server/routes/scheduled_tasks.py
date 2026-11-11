@@ -130,6 +130,8 @@ class CreateScheduledTaskRequest(BaseModel):
     # A session the caller owns. Create copies it, and every run starts a new
     # session from that copy; responses carry the copy's id here.
     source_session_id: str | None = Field(default=None, min_length=1)
+    # Every session the task creates starts muted for its owner.
+    muted: bool = False
 
     @model_validator(mode="after")
     def _validate_create(self) -> CreateScheduledTaskRequest:
@@ -173,6 +175,7 @@ class UpdateScheduledTaskRequest(BaseModel):
     execution_target: str | None = Field(default=None, min_length=1)
     state: str | None = None
     project_id: str | None = None  # null unfiles future runs
+    muted: bool | None = None  # applies to sessions created after the change
 
     @model_validator(mode="after")
     def _validate_patch(self) -> UpdateScheduledTaskRequest:
@@ -253,6 +256,7 @@ def _to_response(
         "host_id": task.host_id,
         "execution_target": task.execution_target,
         "project_id": task.project_id,
+        "muted": task.muted,
         "state": task.state,
         "last_run_at": task.last_run_at,
         "last_run_status": last_run_status,
@@ -940,6 +944,7 @@ def create_scheduled_tasks_router(
                 host_id=host_id,
                 project_id=project_id,
                 execution_target=body.execution_target,
+                muted=body.muted,
             )
         except Exception as exc:
             if source_copy is not None:

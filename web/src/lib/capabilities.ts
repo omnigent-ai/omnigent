@@ -307,6 +307,8 @@ export interface ServerInfo {
   filesystem_attachments?: FilesystemAttachmentsInfo | null;
   /** Scheduled tasks accept a project; absent on older servers (off). */
   scheduled_task_projects?: boolean;
+  /** Scheduled tasks accept `muted`; absent on older servers (off). */
+  scheduled_task_muted?: boolean;
   /** Latest sessionless automation failures can be listed for Inbox. */
   scheduled_task_inbox?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
@@ -643,6 +645,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_title_instructions: data.session_title_instructions === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
+          scheduled_task_muted: data.scheduled_task_muted === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:

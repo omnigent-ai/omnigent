@@ -140,6 +140,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
+    muted_label_key,
 )
 
 if TYPE_CHECKING:
@@ -1674,13 +1675,16 @@ def _sandbox_workspaces(task: ScheduledTask) -> list[str]:
 def _session_labels(task: ScheduledTask) -> dict[str, str]:
     """Labels a fired session starts with.
 
-    A continue task's sandbox session records the host id it routes by, so a
-    relaunched sandbox keeps connecting to the replica that owns that id.
+    A muted task's sessions start muted for its owner. A continue task's sandbox
+    session records the host id it routes by, so a relaunched sandbox keeps
+    connecting to the replica that owns that id.
     """
     labels = {
         SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id,
         **managed_repo_labels(_sandbox_workspaces(task)),
     }
+    if task.muted:
+        labels[muted_label_key(task.user_id)] = "1"
     if task.execution_target == "managed_sandbox" and task.session_mode == "continue":
         from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
 

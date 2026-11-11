@@ -1128,6 +1128,52 @@ async def test_read_only_grantee_can_pin_shared_session(db_uri: str, tmp_path: P
     assert pinned_label_key(_GRANTEE) not in conv.labels
 
 
+async def test_read_only_grantee_mutes_shared_session_only_for_themselves(
+    db_uri: str, tmp_path: Path
+) -> None:
+    """Muting is per-viewer like pinning: a read-only collaborator can mute, the
+    mute is stored under their own key, and the owner still sees it unmuted."""
+    from omnigent.db.utils import generate_agent_id
+    from omnigent.stores.conversation_store import muted_label_key
+
+    permission_store = SqlAlchemyPermissionStore(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="mute-agent", bundle_location="test:///bundle")
+    conv = conversation_store.create_conversation(agent_id=agent_id)
+    permission_store.ensure_user(_OWNER)
+    permission_store.grant(_OWNER, conv.id, LEVEL_OWNER)
+    permission_store.ensure_user(_GRANTEE)
+    permission_store.grant(_GRANTEE, conv.id, LEVEL_READ)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        permission_store=permission_store,
+        auth_provider=UnifiedAuthProvider(source="header"),
+    )
+
+    async with _client(app, _GRANTEE) as c:
+        resp = await c.patch(f"/v1/sessions/{conv.id}", json={"labels": {"omnigent.muted": "1"}})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["labels"].get("omnigent.muted") == "1"
+    stored = conversation_store.get_conversation(conv.id)
+    assert stored is not None
+    assert stored.labels.get(muted_label_key(_GRANTEE)) == "1"
+
+    async with _client(app, _OWNER) as c:
+        owner_view = await c.get(f"/v1/sessions/{conv.id}")
+        assert owner_view.status_code == 200, owner_view.text
+        assert "omnigent.muted" not in owner_view.json()["labels"]
+
+    async with _client(app, _GRANTEE) as c:
+        resp = await c.patch(f"/v1/sessions/{conv.id}", json={"labels": {"omnigent.muted": ""}})
+        assert resp.status_code == 200, resp.text
+    stored = conversation_store.get_conversation(conv.id)
+    assert stored is not None
+    assert muted_label_key(_GRANTEE) not in stored.labels
+
+
 async def test_read_only_grantee_cannot_edit_other_labels(db_uri: str, tmp_path: Path) -> None:
     """The pin-only downgrade is narrow: a read-only collaborator PATCHing any
     non-pin field (or bundling one alongside the pin) still hits the edit gate."""

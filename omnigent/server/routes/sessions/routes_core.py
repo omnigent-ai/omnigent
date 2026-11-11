@@ -252,12 +252,14 @@ from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY as _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
 )
 from omnigent.stores.conversation_store import (
+    MUTED_LABEL_KEY,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
+    muted_label_key,
     pinned_label_key,
     runner_seen_is_fresh,
 )
@@ -3164,10 +3166,13 @@ def register_core_routes(
             or _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY in (body.labels or {})
         )
         set_share_workspace = "share_workspace_files" in body.model_fields_set
-        pin_only = body.model_fields_set == {"labels"} and set(body.labels or {}) == {
-            PINNED_LABEL_KEY
-        }
-        if pin_only:
+        # Mute is a per-viewer preference like a pin, so it needs only READ too.
+        viewer_preference_only = (
+            body.model_fields_set == {"labels"}
+            and bool(body.labels)
+            and set(body.labels) <= {PINNED_LABEL_KEY, MUTED_LABEL_KEY}
+        )
+        if viewer_preference_only:
             required_level = LEVEL_READ
         elif body.archived is not None or set_project or set_launch_args:
             required_level = LEVEL_OWNER
@@ -3376,6 +3381,8 @@ def register_core_routes(
         # through to the delete-clear loop below under the per-user key.
         if PINNED_LABEL_KEY in labels_to_set:
             labels_to_set[pinned_label_key(user_id)] = labels_to_set.pop(PINNED_LABEL_KEY)
+        if MUTED_LABEL_KEY in labels_to_set:
+            labels_to_set[muted_label_key(user_id)] = labels_to_set.pop(MUTED_LABEL_KEY)
         if requested_codex_collaboration_mode is not None:
             labels_to_set[_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY] = (
                 requested_codex_collaboration_mode
@@ -4152,7 +4159,7 @@ def register_core_routes(
         # so without this an empty string would linger as a stored value.
         # The pinned key was rewritten to the caller's per-user key above, so
         # clear that one (not the canonical bare key) on an empty value.
-        for _clear_key in (PROJECT_LABEL_KEY, pinned_label_key(user_id)):
+        for _clear_key in (PROJECT_LABEL_KEY, pinned_label_key(user_id), muted_label_key(user_id)):
             if labels_to_set.get(_clear_key) == "":
                 labels_to_set = {k: v for k, v in labels_to_set.items() if k != _clear_key}
                 await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
