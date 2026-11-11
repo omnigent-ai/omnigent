@@ -201,7 +201,7 @@ def test_grant_unless_higher_keeps_a_higher_grant_its_read_missed(
         return real_get(self, entity, ident, **kw)  # type: ignore[arg-type]
 
     monkeypatch.setattr(Session, "get", read_before_the_concurrent_insert)
-    store.grant_unless_higher("fay@test.com", conv_id, level=1)
+    assert store.grant_unless_higher("fay@test.com", conv_id, level=1) is None
     monkeypatch.undo()
     assert store.get("fay@test.com", conv_id).level == 3  # type: ignore[union-attr]
 

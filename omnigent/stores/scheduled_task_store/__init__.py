@@ -264,7 +264,8 @@ class ScheduledTaskStore(ABC):
         conversation, so past runs keep the agent they actually ran.
 
         ``expected_schedule`` guards the recurrence, session mode, execution
-        target and shares read before validation. A mismatch raises a conflict before any
+        target and shares read before validation, plus the continued session
+        when ``share_with`` is saved. A mismatch raises a conflict before any
         changes are saved; callers must reload and revalidate before retrying.
 
         Returns ``None`` if the task does not exist.
