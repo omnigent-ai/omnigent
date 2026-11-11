@@ -16,8 +16,10 @@ class InboxItem:
     :param source_session_id: Session whose agent posted the item,
         e.g. ``"conv_abc123"``.
     :param agent_id: Agent of that session.
-    :param prompt_version: Content hash of the agent bundle the session ran,
-        or ``None`` when it could not be resolved.
+    :param prompt_version: Content hash of the agent's bundle when the item was
+        posted, or ``None`` when it could not be resolved. A session that keeps
+        running across an agent update is attributed to the newer bundle: the
+        server does not record which bundle a session loaded.
     :param kind: ``"followup"``, ``"info"``, or ``"reminder"``.
     :param title: One-line summary shown on the collapsed card.
     :param body_md: Markdown body.
