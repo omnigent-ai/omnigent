@@ -1204,8 +1204,9 @@ class OpenCodeNativeForwarder:
         signature = tuple(sorted(data.items()))
         if signature == self._last_usage_signature:
             return
-        self._last_usage_signature = signature
-        await self._post_event(_EXTERNAL_SESSION_USAGE, data)
+        response = await self._post_event(_EXTERNAL_SESSION_USAGE, data)
+        if response is not None and response.is_success:
+            self._last_usage_signature = signature
 
     async def _observe_model(self, model: str | None, *, explicit: bool) -> None:
         """Mirror a model change to Omnigent (``external_model_change``), deduped.

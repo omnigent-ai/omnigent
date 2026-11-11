@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -838,18 +839,42 @@ async def test_usage_updated_overrides_cumulative_totals() -> None:
     assert usage["context_tokens"] == 100  # latest step, not the totals
 
 
-async def test_usage_dedupes_identical_posts() -> None:
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_step_started("msg_a"))
+@pytest.mark.parametrize("first_delivery", ["accepted", "transport-error", "401", "503", "302"])
+async def test_usage_dedupes_identical_posts(first_delivery: str) -> None:
+    attempts: list[dict[str, Any]] = []
+    accepted: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        event = json.loads(request.content)
+        if event["type"] != "external_session_usage":
+            return httpx.Response(200)
+        attempts.append(event["data"])
+        if len(attempts) == 1 and first_delivery != "accepted":
+            if first_delivery == "transport-error":
+                raise httpx.ConnectError("Server unavailable", request=request)
+            return httpx.Response(int(first_delivery))
+        accepted.append(event["data"])
+        return httpx.Response(200)
+
+    opencode = _FakeOpenCodeClient()
     ended = _step_ended(
         "msg_a",
         cost=0.01,
         tokens={"input": 1, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}},
     )
-    await fwd.handle_event(ended)
-    await fwd.handle_event(ended)
-    assert len(_datas(server.posts, "external_session_usage")) == 1
+    async with httpx.AsyncClient(
+        base_url="http://server.test", transport=httpx.MockTransport(respond)
+    ) as server:
+        fwd = _forwarder(server, opencode)  # type: ignore[arg-type]
+        await fwd.handle_event(_step_started("msg_a"))
+        await fwd.handle_event(ended)
+        await fwd.handle_event(_event("session.execution.succeeded"))
+        await fwd.handle_event(ended)
+
+    assert len(attempts) == (1 if first_delivery == "accepted" else 2)
+    assert accepted == [attempts[0]]
+    assert accepted[0]["cumulative_cost_usd"] == 0.01
+    assert accepted[0]["cumulative_input_tokens"] == 1
 
 
 async def test_step_failed_flushes_text_and_records_usage() -> None:
