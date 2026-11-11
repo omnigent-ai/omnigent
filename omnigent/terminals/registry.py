@@ -299,9 +299,9 @@ class TerminalRegistry:
         if existing is not None and existing.running:
             if await existing.is_alive():
                 return existing
-            await self.close(conversation_id, terminal_name, session_key)
+            await self.close(conversation_id, terminal_name, session_key, expected=existing)
         elif existing is not None:
-            await self.close(conversation_id, terminal_name, session_key)
+            await self.close(conversation_id, terminal_name, session_key, expected=existing)
 
         # Lock-free section: ``create_terminal_instance`` and
         # ``launch`` may take real time (tmux spawn). Holding the

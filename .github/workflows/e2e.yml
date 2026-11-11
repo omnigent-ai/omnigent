@@ -60,6 +60,7 @@ permissions:
   contents: read
 
 env:
+  OMNIGENT_CI_PIPELINE: e2e
   # No web SPA build during `uv sync`: this job never serves the
   # bundle and the build hits public npm with no registry mirror.
   OMNIGENT_SKIP_WEB_UI: "true"

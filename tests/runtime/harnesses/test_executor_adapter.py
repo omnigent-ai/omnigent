@@ -416,8 +416,10 @@ async def test_executor_error_terminates_with_response_failed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("preserve_session", [False, True])
+@pytest.mark.parametrize("retryable", [False, True])
 async def test_executor_error_preserves_only_explicitly_reusable_sessions(
     preserve_session: bool,
+    retryable: bool,
 ) -> None:
     """Ordinary errors still tear down; explicitly reusable executors can be retained."""
     import asyncio
@@ -429,7 +431,7 @@ async def test_executor_error_preserves_only_explicitly_reusable_sessions(
     from omnigent.server.schemas import CreateResponseRequest
 
     executor = MockExecutor()
-    error = ExecutorError(message="model unavailable", retryable=True)
+    error = ExecutorError(message="model unavailable", retryable=retryable, undelivered=True)
     if preserve_session:
         error.preserve_session = True
         executor.enqueue_events([error])
@@ -445,9 +447,10 @@ async def test_executor_error_preserves_only_explicitly_reusable_sessions(
         response_id="resp_failed", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
     )
 
-    with pytest.raises(RuntimeError, match="model unavailable"):
+    with pytest.raises(RuntimeError, match="model unavailable") as raised:
         await adapter.run_turn(request, ctx)
 
+    assert adapter._build_error_detail(raised.value).undelivered is True
     if preserve_session:
         assert adapter._executor is executor
         assert adapter._abandoned_executor_cleanup is None
@@ -1331,6 +1334,113 @@ def test_translate_input_to_messages_drops_empty_message_blocks() -> None:
         f"Expected 2 messages (empty assistant skipped), got {len(messages)}: {messages!r}."
     )
     assert [m["role"] for m in messages] == ["user", "user"]
+
+
+@pytest.mark.parametrize("content", ["", [], [{"type": "input_text", "text": ""}]])
+@pytest.mark.parametrize("preserve_content_blocks", [False, True])
+@pytest.mark.parametrize("include_tool_history", [False, True])
+@pytest.mark.parametrize("preserve_empty_initiating_message", [False, True])
+def test_translate_input_to_messages_empty_initiating_item_requires_opt_in(
+    content, preserve_content_blocks, include_tool_history, preserve_empty_initiating_message
+) -> None:
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    messages = _translate_input_to_messages(
+        [
+            {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+            {"type": "message", "role": "user", "id": "msg_old_empty", "content": []},
+            {"type": "message", "role": "assistant", "content": []},
+            {"type": "message", "role": "user", "id": "msg_empty", "content": content},
+        ],
+        preserve_content_blocks=preserve_content_blocks,
+        include_tool_history=include_tool_history,
+        preserve_empty_initiating_message=preserve_empty_initiating_message,
+    )
+
+    normalized_content = content if preserve_content_blocks else ""
+    if not normalized_content and not preserve_empty_initiating_message:
+        assert messages == [{"role": "user", "content": "old"}]
+        return
+    assert len(messages) == 2
+    assert "input_item_id" not in messages[0]
+    assert messages[-1] == {
+        "role": "user",
+        "content": normalized_content,
+        "input_item_id": "msg_empty",
+    }
+
+
+@pytest.mark.parametrize("executor_name", ["acp", "goose", "qwen", "default"])
+@pytest.mark.parametrize("content", ["", [], [{"type": "input_text", "text": ""}]])
+async def test_adapter_only_preserves_empty_input_for_opted_in_executors(
+    executor_name, content, monkeypatch
+) -> None:
+    import asyncio
+
+    from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+    from omnigent.inner.executor import MockExecutor, TurnComplete
+    from omnigent.inner.goose_executor import GooseExecutor
+    from omnigent.inner.qwen_executor import QwenExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    factories = {
+        "acp": lambda: AcpExecutor(AcpAgentConfig(command="unused", omnigent_mcp=False)),
+        "goose": GooseExecutor,
+        "qwen": QwenExecutor,
+        "default": MockExecutor,
+    }
+    executor = factories[executor_name]()
+    captured = []
+
+    async def capture(messages, tools, system_prompt, config=None):
+        captured.extend(messages)
+        yield TurnComplete(response=None)
+
+    monkeypatch.setattr(executor, "run_turn", capture)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    request = CreateResponseRequest(
+        model="test-agent",
+        input=[
+            {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+            {"type": "message", "role": "user", "id": "msg_empty", "content": content},
+        ],
+    )
+    ctx = TurnContext(
+        response_id=f"resp_{uuid.uuid4().hex}",
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+
+    await adapter.run_turn(request, ctx)
+
+    if executor_name == "default":
+        assert len(captured) == 1
+        assert captured[-1]["content"] == "old"
+        assert "input_item_id" not in captured[-1]
+    else:
+        assert len(captured) == 2
+        assert captured[-1]["content"] == ""
+        assert captured[-1]["input_item_id"] == "msg_empty"
+
+
+@pytest.mark.parametrize("has_output", [False, True], ids=["tool-call", "tool-call-and-output"])
+def test_translate_input_to_messages_tool_resume_has_no_input_item_id(has_output) -> None:
+    """A tool tail must not reuse the user ID when the agent produced no text."""
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    history = [
+        {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+        {"type": "function_call", "name": "read", "call_id": "call_1", "arguments": "{}"},
+    ]
+    if has_output:
+        history.append({"type": "function_call_output", "call_id": "call_1", "output": "done"})
+
+    messages = _translate_input_to_messages(history)
+
+    assert messages == [{"role": "user", "content": "old"}]
+    assert "input_item_id" not in messages[-1]
 
 
 def test_translate_input_to_messages_carries_tool_history() -> None:
@@ -3902,3 +4012,137 @@ async def test_ask_user_question_roundtrip_real_executor_hook_through_adapter_br
     payload = getattr(params, "ask_user_question", None)
     assert payload is not None
     assert payload["questions"][0]["question"] == "Env?"
+
+
+class _LiveMcpExecutor(Executor):
+    """Executor whose MCP connections a test scripts, failing a reconnect on request."""
+
+    def __init__(self, reconnect_failure: BaseException | None = None) -> None:
+        from omnigent.inner.executor import LiveMcpServerStatus
+
+        self.statuses = [LiveMcpServerStatus(name="docs", status="failed", error="HTTP 401")]
+        self.reconnect_failure = reconnect_failure
+        self.status_failure: BaseException | None = None
+        self.reconnected: list[tuple[str, str]] = []
+
+    def supports_live_mcp_control(self) -> bool:
+        return True
+
+    async def live_mcp_statuses(self, session_key: str) -> list[Any] | None:
+        if self.status_failure is not None:
+            raise self.status_failure
+        return self.statuses
+
+    async def reconnect_live_mcp_server(self, session_key: str, name: str) -> None:
+        from omnigent.inner.executor import LiveMcpServerStatus
+
+        self.reconnected.append((session_key, name))
+        if self.reconnect_failure is not None:
+            raise self.reconnect_failure
+        self.statuses = [LiveMcpServerStatus(name=name, status="connected")]
+
+
+@contextlib.asynccontextmanager
+async def _live_mcp_client(adapter: Any) -> AsyncIterator[httpx.AsyncClient]:
+    app = adapter.build()
+    app.state.conversation_id = "conv_live_mcp"
+    app.state.harness_auth_token = "spawn-token"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://harness",
+        headers={"Authorization": "Bearer spawn-token"},
+    ) as client:
+        yield client
+
+
+async def test_live_mcp_routes_reach_only_an_executor_that_reports_them() -> None:
+    from omnigent.inner.executor import (
+        LiveMcpHarnessNotRunning,
+        LiveMcpReconnectRefused,
+        LiveMcpServerUnknown,
+    )
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    status_path = "/v1/sessions/conv_live_mcp/mcp-status"
+    reconnect_path = "/v1/sessions/conv_live_mcp/mcp-reconnect"
+
+    # Before the first turn builds the executor, nothing is connected yet.
+    adapter = ExecutorAdapter(executor_factory=_LiveMcpExecutor, session_key="conv_live_mcp")
+    async with _live_mcp_client(adapter) as client:
+        assert (await client.get(status_path)).json() == {"running": False, "servers": []}
+        resp = await client.post(reconnect_path, json={"name": "docs"})
+        assert (resp.status_code, resp.json()["error"]) == (409, "harness_not_running")
+
+        executor = adapter._ensure_executor()
+        resp = await client.get(status_path)
+        assert resp.json() == {
+            "running": True,
+            "servers": [{"name": "docs", "status": "failed", "error": "HTTP 401"}],
+        }
+        resp = await client.post(reconnect_path, json={"name": "docs"})
+        assert resp.json() == {
+            "running": True,
+            "servers": [{"name": "docs", "status": "connected"}],
+        }
+        assert executor.reconnected == [("conv_live_mcp", "docs")]
+
+        for body in ({}, {"name": " "}, ["docs"]):
+            assert (await client.post(reconnect_path, json=body)).status_code == 400
+        assert (await client.get("/v1/sessions/conv_other/mcp-status")).status_code == 404
+        unauthenticated = await client.get(status_path, headers={"Authorization": "Bearer wrong"})
+        assert unauthenticated.status_code == 401
+
+    # The harness's refusal comes back with the connections as they stand; other
+    # failures keep their text out of the answer.
+    for failure, expected_status, expected_body in (
+        (
+            LiveMcpReconnectRefused("still unauthorized"),
+            200,
+            {"reconnect_error": "still unauthorized"},
+        ),
+        (RuntimeError("internal detail"), 502, {"error": "mcp_reconnect_failed"}),
+        (LiveMcpServerUnknown("docs"), 404, {"error": "mcp_server_unknown"}),
+        (LiveMcpHarnessNotRunning("conv_live_mcp"), 409, {"error": "harness_not_running"}),
+        (TimeoutError(), 504, {"error": "mcp_reconnect_timeout"}),
+    ):
+        adapter = ExecutorAdapter(
+            executor_factory=lambda failure=failure: _LiveMcpExecutor(failure),
+            session_key="conv_live_mcp",
+        )
+        adapter._ensure_executor()
+        async with _live_mcp_client(adapter) as client:
+            resp = await client.post(reconnect_path, json={"name": "docs"})
+        assert resp.status_code == expected_status
+        assert expected_body.items() <= resp.json().items()
+        assert "internal detail" not in resp.text
+
+    # A failed status read reports the harness as running, without the exception's text.
+    adapter = ExecutorAdapter(
+        executor_factory=lambda: _LiveMcpExecutor(LiveMcpReconnectRefused("still unauthorized")),
+        session_key="conv_live_mcp",
+    )
+    executor = adapter._ensure_executor()
+    executor.status_failure = RuntimeError("internal detail")
+    async with _live_mcp_client(adapter) as client:
+        resp = await client.get(status_path)
+        assert (resp.status_code, resp.json()) == (502, {"error": "mcp_status_failed"})
+        resp = await client.post(reconnect_path, json={"name": "docs"})
+    assert (resp.status_code, resp.json()) == (
+        200,
+        {
+            "running": True,
+            "servers": [],
+            "status_unavailable": True,
+            "reconnect_error": "still unauthorized",
+        },
+    )
+
+    # A harness that can't report MCP status says so instead of answering empty.
+    adapter = ExecutorAdapter(executor_factory=_StubExecutor, session_key="conv_live_mcp")
+    adapter._ensure_executor()
+    async with _live_mcp_client(adapter) as client:
+        for resp in (
+            await client.get(status_path),
+            await client.post(reconnect_path, json={"name": "docs"}),
+        ):
+            assert (resp.status_code, resp.json()["error"]) == (404, "unsupported")

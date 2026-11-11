@@ -41,6 +41,23 @@ class SessionHistory:
     seed_last_server_item_id: Callable[[str], Coroutine[Any, Any, None]]
 
 
+# The user-role item Stop appends; it closes the turn rather than asking for one.
+CANCELLATION_MARKER_TEXT = INTERRUPTION_MARKER_TEXT
+
+
+def is_cancellation_marker(item: dict[str, object]) -> bool:
+    """Whether *item* is the marker Stop appends to a session's history."""
+    content = item.get("content")
+    return (
+        item.get("type") == "message"
+        and item.get("role") == "user"
+        and isinstance(content, list)
+        and len(content) == 1
+        and isinstance(content[0], dict)
+        and content[0].get("text") == CANCELLATION_MARKER_TEXT
+    )
+
+
 def build_session_history(
     *,
     _background_tasks: set[asyncio.Task[Any]],
@@ -221,6 +238,7 @@ def build_session_history(
                         "type": "message",
                         "role": item.get("role", "user"),
                         "content": item.get("content", []),
+                        "id": item.get("id"),
                     }
                 )
             elif item_type == "function_call":
