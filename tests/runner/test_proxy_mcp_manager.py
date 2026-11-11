@@ -546,15 +546,23 @@ async def test_call_tool_reattaches_expired_execution_after_server_disconnect(
 class _HeldResponseTransport(httpx.AsyncBaseTransport):
     """Return scripted responses, advancing a fake clock by each response's hold."""
 
-    def __init__(self, responses: list[tuple[float, httpx.Response]]) -> None:
+    def __init__(self, responses: list[tuple[float, httpx.Response | Exception]]) -> None:
         self.now = 0.0
         self.calls: list[_Call] = []
+        self.read_timeouts: list[float] = []
         self._responses = list(responses)
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(_Call(url=str(request.url), body=json.loads(request.content)))
+        read_timeout = request.extensions["timeout"]["read"]
+        self.read_timeouts.append(read_timeout)
         held_s, response = self._responses.pop(0)
+        if held_s > read_timeout:
+            self.now += read_timeout
+            raise httpx.ReadTimeout("read timed out", request=request)
         self.now += held_s
+        if isinstance(response, Exception):
+            raise response
         return response
 
 
@@ -661,6 +669,53 @@ async def test_call_tool_does_not_repost_unattachable_http_failures(
             await manager.call_tool(spec, tool_name, {})
 
     assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retry", "error"),
+    [
+        pytest.param(
+            (
+                2.0,
+                _json_resp(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {"content": [{"type": "text", "text": "done"}]},
+                    }
+                ),
+            ),
+            "did not finish within 300s",
+            id="reattach-outlives-budget",
+        ),
+        pytest.param(
+            (0.0, httpx.ConnectError("server restarting")),
+            "connected within 0s",
+            id="reconnect-wait-outlives-budget",
+        ),
+    ],
+)
+async def test_call_tool_bounds_reattach_by_remaining_call_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    retry: tuple[float, httpx.Response | Exception],
+    error: str,
+) -> None:
+    """A reattach admitted just before the deadline gets only the remaining budget."""
+    from omnigent.runner import proxy_mcp_manager
+
+    transport = _HeldResponseTransport([(299.5, httpx.Response(504)), retry])
+    monkeypatch.setattr(proxy_mcp_manager, "monotonic", lambda: transport.now)
+    monkeypatch.setattr(proxy_mcp_manager, "MCP_PROXY_CALL_TIMEOUT_S", 300.0)
+    monkeypatch.setattr(proxy_mcp_manager, "_SERVER_RECONNECT_WAIT_S", 5.0)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
+        manager = ProxyMcpManager(
+            session_id="conv_test", ap_client=client, execution_registry=McpExecutionRegistry()
+        )
+        with pytest.raises(RuntimeError, match=error):
+            await manager.call_tool(None, "sys_os_shell", {})
+
+    assert transport.read_timeouts == [300.0, 0.5]
 
 
 @pytest.mark.asyncio
