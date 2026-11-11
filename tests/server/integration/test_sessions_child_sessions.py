@@ -2064,6 +2064,54 @@ async def test_codex_side_settings_are_saved_and_forwarded_only_to_child_turn(
     assert parent_after.reasoning_effort == parent_before.reasoning_effort
 
 
+async def test_fork_of_a_closed_codex_side_chat_accepts_messages(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forking a side chat whose tab was closed continues it as an open session."""
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=None))
+    parent = await _create_parent_session(client, agent_name="side-fork")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(parent["id"], {"omnigent.wrapper": "codex-native-ui"})
+    store.set_runner_id(parent["id"], "runner_parent")
+    created = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread-side", "agent_nickname": "Side chat"},
+        },
+    )
+    assert created.status_code == 202, created.text
+    child_id = created.json()["child_session_id"]
+    # Closing the side chat's tab stops it, which seals the child.
+    stopped = await client.post(f"/v1/sessions/{child_id}/events", json={"type": "stop_session"})
+    assert stopped.status_code == 202, stopped.text
+    child = (await client.get(f"/v1/sessions/{child_id}")).json()
+    assert child["labels"][CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
+
+    forked = await client.post(f"/v1/sessions/{child_id}/fork", json={})
+
+    assert forked.status_code == 201, forked.text
+    fork = (await client.get(f"/v1/sessions/{forked.json()['id']}")).json()
+    assert fork["parent_session_id"] is None
+    assert CLOSED_LABEL_KEY not in fork["labels"]
+    sent = await client.post(
+        f"/v1/sessions/{fork['id']}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "Go on"}]},
+        },
+    )
+    # No runner is bound here, so the send gets as far as runner routing.
+    assert sent.status_code == 503, sent.text
+    assert sent.json()["error"]["code"] == "runner_unavailable"
+    child_after = (await client.get(f"/v1/sessions/{child_id}")).json()
+    assert child_after["labels"][CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
+
+
 async def test_subagent_idle_forward_recovers_via_parent_when_child_runner_stale(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
