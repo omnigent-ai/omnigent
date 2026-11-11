@@ -1100,6 +1100,10 @@ class SqlConversationLabel(ConversationBase):
     """
 
     __tablename__ = "conversation_labels"
+    __table_args__ = (
+        # Finds sessions carrying one key (e.g. a viewer's pins) without scanning every label.
+        Index("ix_conversation_labels_key", "workspace_id", "key", "conversation_id"),
+    )
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
