@@ -21,6 +21,7 @@ from omnigent._wrapper_labels import (
     CURSOR_NATIVE_WRAPPER_VALUE,
     DEVIN_NATIVE_WRAPPER_VALUE,
     GOOSE_NATIVE_WRAPPER_VALUE,
+    GROK_NATIVE_WRAPPER_VALUE,
     HERMES_NATIVE_WRAPPER_VALUE,
     KIMI_NATIVE_WRAPPER_VALUE,
     KIRO_NATIVE_WRAPPER_VALUE,
@@ -470,6 +471,24 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_prompt=_SHELL_PROMPT,
         instruction_delivery=_ID.NOT_DELIVERED,
     ),
+    # grok-native drives `grok agent serve` — ACP over WebSocket plus the
+    # x.ai/hooks client-registration extension (pre_tool_use/stop blocking).
+    # Deltas arrive as session/update chunks; session/cancel interrupts;
+    # session load/resume warm-reattaches; auth is grok's own login or
+    # XAI_API_KEY. NATIVE_SERVER, so shell_tool_* stay None.
+    "grok-native": _C(
+        _IM.NATIVE_SERVER,
+        _EL.HOOK,
+        _RS.WARM_REATTACH,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+        fork_history=_FH.NONE,
+        instruction_delivery=_ID.NOT_DELIVERED,
+    ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "qwen-native": _C(
         _IM.NATIVE_TUI,
@@ -779,6 +798,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "devin-native",
             "goose",
             "goose-native",
+            "grok-native",
             "hermes",
             "hermes-native",
             "kimi",
@@ -812,6 +832,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "cursor-native": "omnigent.inner.cursor_native_harness",
         "goose": "omnigent.inner.goose_harness",
         "goose-native": "omnigent.inner.goose_native_harness",
+        "grok-native": "omnigent.inner.grok_native_harness",
         "hermes": "omnigent.inner.hermes_harness",
         "hermes-native": "omnigent.inner.hermes_native_harness",
         "kimi": "omnigent.inner.kimi_harness",
@@ -846,6 +867,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "native-antigravity": "antigravity-native",
         "native-devin": "devin-native",
         "native-goose": "goose-native",
+        "native-grok": "grok-native",
         "native-hermes": "hermes-native",
         "native-kimi": "kimi-native",
         "native-kiro": "kiro-native",
@@ -865,6 +887,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "cursor-native",
             "devin-native",
             "goose-native",
+            "grok-native",
             "hermes-native",
             "kimi-native",
             "kiro-native",
@@ -875,6 +898,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "native-cursor",
             "native-devin",
             "native-goose",
+            "native-grok",
             "native-hermes",
             "native-kimi",
             "native-kiro",
