@@ -1,6 +1,8 @@
-// Fuzzy matching of one query token against one picker field. Matches rank by
-// class (exact, prefix, word-boundary substring, substring, fuzzy subsequence)
-// and then by a penalty within the class; ranges locate the matched characters.
+// Query matching for pickers. Each query word must match some field of a row;
+// rows rank by match class (exact, prefix, word-boundary substring, substring,
+// fuzzy subsequence), then penalty, then field weight. A field holding the whole
+// multi-word query as one phrase outranks words matched separately, so "show files"
+// finds "Show Files" before rows that only list those words as keywords.
 
 /** A half-open `[start, end)` range of UTF-16 offsets into the source text. */
 export interface MatchRange {
@@ -10,9 +12,20 @@ export interface MatchRange {
 
 /**
  * - `fuzzy`: any in-order subsequence, preferring the last path component, for paths and titles.
+ * - `words`: a subsequence made of word beginnings ("nt" in "New tab"), or one held inside a
+ *   single word ("stng" in "Settings"), for short named things such as commands.
  * - `contiguous`: substrings only.
  */
-export type MatchStrategy = "fuzzy" | "contiguous";
+export type MatchStrategy = "fuzzy" | "words" | "contiguous";
+
+export interface SearchField {
+  /** Identifies the field whose ranges get highlighted; omit for hidden aliases. */
+  key?: string;
+  text: string;
+  /** Higher weights win ties between equally good matches. */
+  weight: number;
+  matching?: MatchStrategy;
+}
 
 export const MatchClass = {
   exact: 0,
@@ -29,6 +42,17 @@ export interface FieldMatch {
   /** The field's weight, passed through so callers can break ties between fields. */
   weight: number;
   ranges: MatchRange[];
+}
+
+export interface CandidateMatch {
+  /** One field holds the whole multi-word query, in order; `weight` is then that field's. */
+  wholeQuery: boolean;
+  worstClass: number;
+  classTotal: number;
+  penalty: number;
+  weight: number;
+  /** Highlight ranges keyed by `SearchField.key`. */
+  ranges: Record<string, MatchRange[]>;
 }
 
 interface FoldedCharacter {
@@ -229,6 +253,60 @@ function subsequenceMatch(
   return match ? { score: match.score * 10, offsets: match.offsets } : null;
 }
 
+/** Each word's `[start, end)` span in folded characters. */
+function wordSpans(target: FoldedText): [number, number][] {
+  const spans: [number, number][] = [];
+  target.characters.forEach((character, index) => {
+    if (!character.isWord) return;
+    const previous = spans.at(-1);
+    if (previous && previous[1] === index) previous[1] = index + 1;
+    else spans.push([index, index + 1]);
+  });
+  return spans;
+}
+
+/**
+ * The query as consecutive pieces taken from words in order, each starting at its
+ * word's first letter and continuing as a subsequence inside that word, so "gostng"
+ * finds "Go to Settings". Fewer pieces, skipped words, and gaps score better.
+ */
+function wordsMatch(query: readonly string[], target: FoldedText): SubsequenceMatch | null {
+  const values = target.values;
+  const spans = wordSpans(target);
+  const memo = new Map<number, SubsequenceMatch | null>();
+  const search = (queryIndex: number, spanIndex: number): SubsequenceMatch | null => {
+    if (queryIndex === query.length) return { score: 0, offsets: [] };
+    const key = queryIndex * (spans.length + 1) + spanIndex;
+    const known = memo.get(key);
+    if (known !== undefined) return known;
+    let best: SubsequenceMatch | null = null;
+    for (let index = spanIndex; index < spans.length; index++) {
+      const [start, end] = spans[index];
+      if (values[start] !== query[queryIndex]) continue;
+      // The leftmost placement of each longer piece inside this word.
+      const offsets = [start];
+      let gaps = 0;
+      for (;;) {
+        const rest = search(queryIndex + offsets.length, index + 1);
+        if (rest) {
+          const score = rest.score + 1 + (index - spanIndex) + gaps;
+          if (!best || score < best.score) best = { score, offsets: [...offsets, ...rest.offsets] };
+        }
+        const next = queryIndex + offsets.length;
+        if (next === query.length) break;
+        let position = offsets.at(-1)! + 1;
+        while (position < end && values[position] !== query[next]) position++;
+        if (position === end) break;
+        gaps += position - offsets.at(-1)! - 1;
+        offsets.push(position);
+      }
+    }
+    memo.set(key, best);
+    return best;
+  };
+  return search(0, 0);
+}
+
 export function matchField(
   query: readonly string[],
   target: FoldedText,
@@ -260,7 +338,7 @@ export function matchField(
     };
   }
   if (matching === "contiguous") return null;
-  const match = subsequenceMatch(query, values);
+  const match = matching === "words" ? wordsMatch(query, target) : subsequenceMatch(query, values);
   if (!match) return null;
   return {
     matchClass: MatchClass.subsequence,
@@ -268,4 +346,165 @@ export function matchField(
     weight,
     ranges: mergeRanges(match.offsets.map((offset) => sourceRange(target, offset, offset))),
   };
+}
+
+function isBetterField(candidate: FieldMatch, current: FieldMatch): boolean {
+  if (candidate.matchClass !== current.matchClass) return candidate.matchClass < current.matchClass;
+  if (candidate.penalty !== current.penalty) return candidate.penalty < current.penalty;
+  return candidate.weight > current.weight;
+}
+
+export interface PreparedField {
+  key?: string;
+  target: FoldedText;
+  weight: number;
+  matching: MatchStrategy;
+}
+
+export function prepareFields(fields: readonly SearchField[]): PreparedField[] {
+  return fields
+    .filter((field) => field.text.length > 0)
+    .map((field) => ({
+      key: field.key,
+      target: foldText(field.text),
+      weight: field.weight,
+      matching: field.matching ?? "fuzzy",
+    }));
+}
+
+/** A query token prepared once per keystroke. */
+export type QueryToken = string[];
+
+// Pull request numbers display as `#1234` while fields usually store `1234`.
+function searchableToken(token: string): string {
+  return /^#\d+$/.test(token) ? token.slice(1) : token;
+}
+
+export function tokenizeQuery(query: string): QueryToken[] {
+  return query
+    .trim()
+    .split(/\s+/)
+    .filter((token) => token.length > 0)
+    .map((token) => foldText(searchableToken(token)).values);
+}
+
+interface PhraseOccurrence {
+  start: number;
+  matchClass: number;
+  penalty: number;
+}
+
+/** The phrase's best occurrence in `target`: at the start, then at a word, then anywhere. */
+function phraseOccurrence(phrase: readonly string[], target: FoldedText): PhraseOccurrence | null {
+  const substring = bestSubstring(phrase, target);
+  if (!substring) return null;
+  const { start, atWordStart } = substring;
+  const length = target.values.length;
+  if (start === 0) {
+    return phrase.length === length
+      ? { start, matchClass: MatchClass.exact, penalty: 0 }
+      : { start, matchClass: MatchClass.prefix, penalty: length - phrase.length };
+  }
+  return {
+    start,
+    matchClass: atWordStart ? MatchClass.boundarySubstring : MatchClass.substring,
+    penalty: start + length - phrase.length,
+  };
+}
+
+/**
+ * Every token in order, one space apart, inside one field. The weightiest such
+ * field wins, so a label holding the phrase beats an alias holding it exactly.
+ */
+function wholeQueryMatch(
+  tokens: readonly QueryToken[],
+  fields: readonly PreparedField[],
+): CandidateMatch | null {
+  if (tokens.length < 2) return null;
+  const phrase = tokens.flatMap((token, index) => (index === 0 ? token : [" ", ...token]));
+  let best: PhraseOccurrence | null = null;
+  let bestField: PreparedField | undefined;
+  for (const field of fields) {
+    const occurrence = phraseOccurrence(phrase, field.target);
+    if (!occurrence) continue;
+    const better =
+      !best ||
+      !bestField ||
+      field.weight > bestField.weight ||
+      (field.weight === bestField.weight &&
+        (occurrence.matchClass < best.matchClass ||
+          (occurrence.matchClass === best.matchClass && occurrence.penalty < best.penalty)));
+    if (better) {
+      best = occurrence;
+      bestField = field;
+    }
+  }
+  if (!best || !bestField) return null;
+  const ranges: Record<string, MatchRange[]> = {};
+  if (bestField.key !== undefined) {
+    // Mark each word, not the spaces between them, as separately matched words are marked.
+    let wordStart = best.start;
+    ranges[bestField.key] = tokens.map((token) => {
+      const range = sourceRange(bestField.target, wordStart, wordStart + token.length - 1);
+      wordStart += token.length + 1;
+      return range;
+    });
+  }
+  return {
+    wholeQuery: true,
+    worstClass: best.matchClass,
+    classTotal: best.matchClass,
+    penalty: best.penalty,
+    weight: bestField.weight,
+    ranges,
+  };
+}
+
+/** Returns null when any token fails to match every field. */
+export function matchCandidate(
+  tokens: readonly QueryToken[],
+  fields: readonly PreparedField[],
+): CandidateMatch | null {
+  const whole = wholeQueryMatch(tokens, fields);
+  if (whole) return whole;
+  let worstClass = 0;
+  let classTotal = 0;
+  let penalty = 0;
+  let weight = 0;
+  const ranges: Record<string, MatchRange[]> = {};
+  for (const token of tokens) {
+    let best: FieldMatch | null = null;
+    let bestKey: string | undefined;
+    for (const field of fields) {
+      const match = matchField(token, field.target, field.weight, field.matching);
+      if (match && (!best || isBetterField(match, best))) {
+        best = match;
+        bestKey = field.key;
+      }
+    }
+    if (!best) return null;
+    worstClass = Math.max(worstClass, best.matchClass);
+    classTotal += best.matchClass;
+    penalty += best.penalty;
+    weight += best.weight;
+    if (bestKey !== undefined) (ranges[bestKey] ??= []).push(...best.ranges);
+  }
+  for (const key of Object.keys(ranges)) ranges[key] = mergeRanges(ranges[key]);
+  return { wholeQuery: false, worstClass, classTotal, penalty, weight, ranges };
+}
+
+/**
+ * Orders candidates best first; callers break ties. Whole-query matches lead, by
+ * the weight of the field holding the phrase and then its quality; the rest by
+ * match quality, then field weight.
+ */
+export function compareCandidateMatches(first: CandidateMatch, second: CandidateMatch): number {
+  if (first.wholeQuery !== second.wholeQuery) return first.wholeQuery ? -1 : 1;
+  if (first.wholeQuery && first.weight !== second.weight) return second.weight - first.weight;
+  return (
+    first.worstClass - second.worstClass ||
+    first.classTotal - second.classTotal ||
+    first.penalty - second.penalty ||
+    second.weight - first.weight
+  );
 }
