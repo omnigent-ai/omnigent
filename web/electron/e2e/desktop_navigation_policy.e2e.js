@@ -808,20 +808,20 @@ it(
     const recordDir =
       process.env.OMNIGENT_DESKTOP_RECORD_DIR ||
       fs.mkdtempSync(path.join(os.tmpdir(), "omni-localhost-subdomain-recordings-"));
-    const devRequests = [];
+    const previewRequests = [];
     // A dev server that routes on the Host header, like a *.localhost reverse proxy.
     const fixture = http.createServer((request, response) => {
-      devRequests.push({ url: request.url, host: request.headers.host });
+      previewRequests.push({ url: request.url, host: request.headers.host });
       response.writeHead(200, { "Content-Type": "text/html", "Cache-Control": "no-store" });
       response.end(
-        `<title>spog dev</title><body style="font:20px system-ui;padding:24px">` +
-          `<h1>spog dev server</h1><p>Host header: <b>${escapeHtml(request.headers.host)}</b></p>` +
+        `<title>preview dev</title><body style="font:20px system-ui;padding:24px">` +
+          `<h1>preview dev server</h1><p>Host header: <b>${escapeHtml(request.headers.host)}</b></p>` +
           `<p>Path: <b>${escapeHtml(request.url)}</b></p></body>`,
       );
     });
-    const devUpgrades = [];
+    const previewUpgrades = [];
     fixture.on("upgrade", (request, socket) => {
-      devUpgrades.push(request.headers.host);
+      previewUpgrades.push(request.headers.host);
       echoOneWebSocketFrame(request, socket);
     });
     await new Promise((resolve) => {
@@ -842,8 +842,8 @@ it(
     await new Promise((resolve) => {
       proxyFixture.listen(0, "127.0.0.1", resolve);
     });
-    const devHost = `spog.dev.localhost:${fixture.address().port}`;
-    const devUrl = (view) => `http://${devHost}/one?view=${view}`;
+    const previewHost = `preview.dev.localhost:${fixture.address().port}`;
+    const previewUrl = (view) => `http://${previewHost}/one?view=${view}`;
     const marks = [];
     let backend;
     let desktop;
@@ -894,11 +894,11 @@ it(
           });
           return entry.view.webContents.executeJavaScript("document.body.innerText");
         }, viewId);
-      const expectDevPage = async (url, label) => {
+      const expectPreviewPage = async (url, label) => {
         const view = await eventually(() => viewAt(url), label);
         assert.equal(view.hostIsThisMachine, true, label);
         const text = await pageText(view.id);
-        assert.match(text, new RegExp(`Host header: ${devHost.replaceAll(".", "\\.")}`));
+        assert.match(text, new RegExp(`Host header: ${previewHost.replaceAll(".", "\\.")}`));
         return view;
       };
 
@@ -906,14 +906,14 @@ it(
       await openSessionBrowserTab(window, backend.serverUrl, backend.sessionId);
       const bar = window.getByRole("textbox", { name: "Address bar" });
       await bar.click();
-      await bar.pressSequentially(devUrl("address-bar"), { delay: typingDelay });
+      await bar.pressSequentially(previewUrl("address-bar"), { delay: typingDelay });
       await bar.press("Enter");
-      const addressView = await expectDevPage(
-        devUrl("address-bar"),
+      const addressView = await expectPreviewPage(
+        previewUrl("address-bar"),
         "address-bar *.localhost preview",
       );
       // Dev servers push hot reloads over a WebSocket on the same host.
-      const socketUrl = `ws://${devHost}/hmr`;
+      const socketUrl = `ws://${previewHost}/hmr`;
       const socketEcho = (viewId, url) =>
         electronApp.evaluate(
           async (_electron, { id, wanted }) =>
@@ -930,7 +930,7 @@ it(
         );
       const echo = await socketEcho(addressView.id, socketUrl);
       assert.equal(echo, "hmr-ping", "a *.localhost WebSocket upgrade completes");
-      assert.deepEqual(devUpgrades, [devHost]);
+      assert.deepEqual(previewUpgrades, [previewHost]);
       const upgrades = (await electronApp.evaluate(() => global.allowedNetworkResponses)).filter(
         (response) => response.url === socketUrl,
       );
@@ -961,7 +961,7 @@ it(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           key: "gpt-4o-mini",
-          text: `The dev server is up: [Open spog dev](${devUrl("chat-link")})`,
+          text: `The preview server is up: [Open preview](${previewUrl("chat-link")})`,
           stream: true,
         }),
         signal: AbortSignal.timeout(30_000),
@@ -971,32 +971,32 @@ it(
       await composer.click();
       await composer.pressSequentially("Where is the dev server?", { delay: typingDelay });
       await composer.press("Enter");
-      const link = window.getByRole("link", { name: "Open spog dev", exact: true });
+      const link = window.getByRole("link", { name: "Open preview", exact: true });
       await link.waitFor({ timeout: 60_000 });
       await hold(1500);
       await link.click();
-      await expectDevPage(devUrl("chat-link"), "chat-link *.localhost preview");
+      await expectPreviewPage(previewUrl("chat-link"), "chat-link *.localhost preview");
       await hold(3000);
 
       mark("CUJ-3 agent navigation");
       const agent = await requestAgentNavigation(
         backend.serverUrl,
         backend.sessionId,
-        devUrl("agent"),
+        previewUrl("agent"),
       );
       assert.equal(agent.ok, true, JSON.stringify(agent));
-      await expectDevPage(devUrl("agent"), "agent *.localhost preview");
+      await expectPreviewPage(previewUrl("agent"), "agent *.localhost preview");
       await hold(3000);
       assert.deepEqual(
-        devRequests.map((request) => request.host),
-        [devHost, devHost, devHost],
+        previewRequests.map((request) => request.host),
+        [previewHost, previewHost, previewHost],
         "the dev server sees its *.localhost Host header",
       );
 
       mark("proxy routes");
       // Chromium sends *.localhost around an ordinary proxy; only an explicit
       // `<-loopback>` rule routes it through one, and the guard refuses that.
-      const agentView = await viewAt(devUrl("agent"));
+      const agentView = await viewAt(previewUrl("agent"));
       const setViewProxy = (config) =>
         electronApp.evaluate(
           (_electron, { id, proxyConfig }) =>
@@ -1010,17 +1010,17 @@ it(
       const bypassed = await requestAgentNavigation(
         backend.serverUrl,
         backend.sessionId,
-        devUrl("system-proxy"),
+        previewUrl("system-proxy"),
       );
       assert.equal(bypassed.ok, true, JSON.stringify(bypassed));
-      await expectDevPage(devUrl("system-proxy"), "*.localhost beside a system proxy");
+      await expectPreviewPage(previewUrl("system-proxy"), "*.localhost beside a system proxy");
       // Chromium proxies WebSockets by the `https=` rule even when `http=` has none.
       await setViewProxy({
         proxyRules: `https=127.0.0.1:${proxyFixture.address().port}`,
         proxyBypassRules: "<-loopback>",
       });
       assert.equal(
-        await socketEcho(agentView.id, `ws://${devHost}/scheme-proxy`),
+        await socketEcho(agentView.id, `ws://${previewHost}/scheme-proxy`),
         "failed",
         "a WebSocket the https= rule would proxy is refused",
       );
@@ -1028,7 +1028,7 @@ it(
       const forced = await requestAgentNavigation(
         backend.serverUrl,
         backend.sessionId,
-        devUrl("forced-proxy"),
+        previewUrl("forced-proxy"),
       );
       assert.equal(forced.ok, true, "the IPC hop accepts the URL; the network guard cancels it");
       // The relay answers before the load settles; wait for the cancelled attempt to finish.
@@ -1039,13 +1039,17 @@ it(
               const { webContents } = global.omnigentTestBrowserRegistries[0].get(id).view;
               return webContents.getURL() === wanted && !webContents.isLoading() ? true : null;
             },
-            { id: agentView.id, wanted: devUrl("forced-proxy") },
+            { id: agentView.id, wanted: previewUrl("forced-proxy") },
           ),
         "forced-proxy navigation settles",
       );
       assert.equal(await pageText(agentView.id), "", "the proxied *.localhost page stays blank");
       await setViewProxy({ mode: "direct" });
-      assert.equal(devRequests.length, 4, "the forced-proxy request never reaches the dev server");
+      assert.equal(
+        previewRequests.length,
+        4,
+        "the forced-proxy request never reaches the preview server",
+      );
       assert.deepEqual(proxyRequests, [], "no *.localhost request is sent through the proxy");
 
       mark("CUJ-4 remote session refused");
@@ -1055,7 +1059,7 @@ it(
         const result = await requestAgentNavigation(
           backend.serverUrl,
           backend.otherSessionId,
-          devUrl("remote-agent"),
+          previewUrl("remote-agent"),
         );
         return result.error === "no browser renderer is connected" ? null : result;
       }, "remote session browser relay");
@@ -1065,11 +1069,11 @@ it(
       await openSessionBrowserTab(window, backend.serverUrl, backend.otherSessionId);
       const remoteBar = window.getByRole("textbox", { name: "Address bar" });
       await remoteBar.click();
-      await remoteBar.pressSequentially(devUrl("remote"), { delay: typingDelay });
+      await remoteBar.pressSequentially(previewUrl("remote"), { delay: typingDelay });
       await remoteBar.press("Enter");
       const refusal = window.getByRole("alert").filter({ hasText: "is a loopback/internal host" });
       await refusal.waitFor();
-      assert.equal(devRequests.length, 4, "a remote session sends no *.localhost request");
+      assert.equal(previewRequests.length, 4, "a remote session sends no *.localhost request");
       await wait(recording ? 4000 : 1000);
       assert.equal(await refusal.isVisible(), true, "the refusal stays on screen");
       mark("end");
@@ -1078,7 +1082,7 @@ it(
       fs.mkdirSync(recordDir, { recursive: true });
       fs.writeFileSync(
         path.join(recordDir, "localhost-subdomain-evidence.json"),
-        JSON.stringify({ marks, devRequests, proxyRequests }, null, 2),
+        JSON.stringify({ marks, devRequests: previewRequests, proxyRequests }, null, 2),
       );
       if (desktop) {
         await desktop.window.unrouteAll({ behavior: "wait" });

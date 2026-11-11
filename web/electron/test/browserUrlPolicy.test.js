@@ -26,7 +26,7 @@ describe("browserUrlPolicy — agent navigation allowlist", () => {
       "127.0.0.1",
       "[::1]",
       "app.localhost",
-      "spog.dev.localhost",
+      "preview.dev.localhost",
       "xn--bcher-kva.localhost",
     ]) {
       assert.equal(
@@ -37,7 +37,7 @@ describe("browserUrlPolicy — agent navigation allowlist", () => {
       assert.equal(isAgentNavigationAllowed(`http://${host}/`).ok, false);
     }
     assert.equal(
-      isAgentNavigationAllowed("https://SPOG.dev.localhost:23090/one?view=1", {
+      isAgentNavigationAllowed("https://PREVIEW.dev.localhost:23090/one?view=1", {
         allowLocalhost: true,
       }).ok,
       true,
@@ -292,21 +292,27 @@ describe("browserUrlPolicy — DNS-aware agent navigation", () => {
     assert.equal((await checkAgentNavigation("http://8.8.8.8/", { resolveHost })).ok, true);
     assert.equal((await checkAgentNavigation("file:///etc/passwd", { resolveHost })).ok, false);
     assert.equal((await checkAgentNavigation("http://[fd12::1]/", { resolveHost })).ok, false);
-    const arca = { resolveHost, allowLocalhost: true };
-    assert.equal((await checkAgentNavigation("http://localhost:5173/", arca)).ok, true);
+    const loopbackEligible = { resolveHost, allowLocalhost: true };
+    assert.equal((await checkAgentNavigation("http://localhost:5173/", loopbackEligible)).ok, true);
     // Chromium resolves *.localhost to loopback itself; the connected-address
     // check verifies where the request actually went.
-    assert.equal((await checkAgentNavigation("http://spog.dev.localhost:5173/", arca)).ok, true);
+    assert.equal(
+      (await checkAgentNavigation("http://preview.dev.localhost:5173/", loopbackEligible)).ok,
+      true,
+    );
     assert.deepEqual(lookups, []);
     assert.equal(
-      (await checkAgentNavigation("http://spog.dev.localhost:5173/", { resolveHost })).ok,
+      (await checkAgentNavigation("http://preview.dev.localhost:5173/", { resolveHost })).ok,
       false,
     );
     // Only the final label decides; a public domain containing "localhost" still resolves.
-    assert.equal((await checkAgentNavigation("http://localhost.lvh.me/", arca)).ok, false);
+    assert.equal(
+      (await checkAgentNavigation("http://localhost.lvh.me/", loopbackEligible)).ok,
+      false,
+    );
     assert.deepEqual(lookups, ["localhost.lvh.me"]);
     // A DNS alias for loopback is not part of the Arca exception.
-    assert.equal((await checkAgentNavigation("http://lvh.me:5173/", arca)).ok, false);
+    assert.equal((await checkAgentNavigation("http://lvh.me:5173/", loopbackEligible)).ok, false);
   });
 });
 
@@ -353,7 +359,7 @@ describe("browserUrlPolicy — connected address check", () => {
 
   it("allows *.localhost only when an eligible view connected to loopback", () => {
     const eligible = { allowLocalhost: true };
-    const url = "https://spog.dev.localhost:23090/one";
+    const url = "https://preview.dev.localhost:23090/one";
     for (const ip of ["127.0.0.1", "127.0.1.1", "::1", "::ffff:7f00:1"]) {
       assert.equal(isAgentConnectionAllowed(url, ip, eligible).ok, true, ip);
       assert.equal(isAgentConnectionAllowed(url, ip).ok, false, ip);
@@ -372,12 +378,12 @@ describe("browserUrlPolicy — loopback preview URLs", () => {
       "http://localhost:5173/",
       "https://127.0.0.1/",
       "http://[::1]:8080/",
-      "https://spog.dev.localhost:23090/one",
+      "https://preview.dev.localhost:23090/one",
     ]) {
       assert.equal(isLoopbackPreviewUrl(url), true, url);
     }
     for (const url of [
-      "ws://spog.dev.localhost/",
+      "ws://preview.dev.localhost/",
       "file:///etc/hosts",
       "http://app.localhost./",
       "http://a..localhost/",

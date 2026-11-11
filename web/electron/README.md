@@ -500,7 +500,7 @@ sequenceDiagram
 
 Sessions running on this desktop machine can open HTTP(S) `localhost`,
 `127.0.0.1`, `[::1]`, and `*.localhost` subdomains such as
-`spog.dev.localhost` through the address bar, opted-in chat/file links, and
+`preview.dev.localhost` through the address bar, opted-in chat/file links, and
 the agent's browser tools. Start the app locally, open **+** > **Browser**,
 and enter its URL. `localhost` and its subdomains always name the desktop
 machine; the page still receives the subdomain in its `Host` header.

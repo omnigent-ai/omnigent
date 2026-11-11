@@ -1115,7 +1115,7 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
           return route;
         },
       });
-      const url = "http://spog.dev.localhost:5173/";
+      const url = "http://preview.dev.localhost:5173/";
       registry.openOrNavigate("conv_1", url, undefined, { agent: true, agentContext: context });
       const webContentsId = idOf("conv_1");
       const cancels = await Promise.all(
@@ -1127,8 +1127,8 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     assert.deepEqual(direct.cancels, [false, false, true, true]);
     // Only loopback responses reach the route check.
     assert.deepEqual(direct.proxyLookups, [
-      "http://spog.dev.localhost:5173/",
-      "http://spog.dev.localhost:5173/",
+      "http://preview.dev.localhost:5173/",
+      "http://preview.dev.localhost:5173/",
     ]);
     // A local proxy answers from loopback but resolves the name on its own network.
     const localProxy = await responsesOn("PROXY 127.0.0.1:3128", ["127.0.0.1"]);
@@ -1145,14 +1145,18 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
         allowsLocalhost: (ctx) => ctx === context,
         resolveProxy,
       });
-      registry.openOrNavigate("local", "http://spog.dev.localhost:5173/", undefined, {
+      registry.openOrNavigate("local", "http://preview.dev.localhost:5173/", undefined, {
         agent: true,
         agentContext: context,
       });
       registry.openOrNavigate("remote", "https://example.com/", undefined, { agent: true });
       const webContentsId = idOf(viewId);
-      const page = { webContentsId, url: "http://spog.dev.localhost:5173/", resourceType: "xhr" };
-      const socket = { webContentsId, url: "ws://spog.dev.localhost:5173/hmr" };
+      const page = {
+        webContentsId,
+        url: "http://preview.dev.localhost:5173/",
+        resourceType: "xhr",
+      };
+      const socket = { webContentsId, url: "ws://preview.dev.localhost:5173/hmr" };
       const worker = { ...page, webContentsId: undefined };
       const verdicts = {
         request: await registry.shouldCancelAgentRequest(page),
@@ -1192,10 +1196,10 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     );
     // WebSockets are looked up by their own scheme, which picks their proxy.
     assert.deepEqual(directLookups, [
-      "http://spog.dev.localhost:5173/",
-      "http://spog.dev.localhost:5173/",
-      "ws://spog.dev.localhost:5173/hmr",
-      "ws://spog.dev.localhost:5173/hmr",
+      "http://preview.dev.localhost:5173/",
+      "http://preview.dev.localhost:5173/",
+      "ws://preview.dev.localhost:5173/hmr",
+      "ws://preview.dev.localhost:5173/hmr",
     ]);
     // An `https=`-only proxy rule carries WebSockets but not plain HTTP.
     assert.deepEqual(
