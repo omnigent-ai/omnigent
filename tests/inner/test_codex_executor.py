@@ -55,8 +55,6 @@ from omnigent.inner.executor import (
 from omnigent.inner.model_auth import ProviderAuthRequired
 from omnigent.inner.model_egress import FrozenModelRoute
 from omnigent.inner.model_signer import SignerLaunchConfig, SubprocessModelSigner
-from omnigent.models.codex_model_vocabulary import codex_spawn_model
-from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 
 
@@ -512,9 +510,8 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertIsInstance(events[2], ToolCallComplete)
             self.assertIsInstance(events[3], TurnComplete)
             self.assertEqual(fake_session.calls[0]["system_prompt"], "Be helpful.")
-            # Codex's own login defaults from codex's catalog, not the generic
-            # OpenAI one, whose newest row is a family alias codex rejects.
-            self.assertEqual(fake_session.calls[0]["model"], CODEX_DEFAULT_MODEL)
+            # Codex's own login leaves the model to codex.
+            self.assertIsNone(fake_session.calls[0]["model"])
             self.assertEqual(fake_session.calls[0]["tools"][0]["name"], "calculate")
 
         _run(_t())
@@ -4965,9 +4962,9 @@ def test_materialize_attributes_effective_gateway_without_copying_credentials(
     assert providers == tomllib.loads(resolved_config)["model_providers"]
 
 
-@pytest.mark.parametrize("existing_name", [None, "My Gateway", ""])
+@pytest.mark.parametrize("existing_name", [None, "My Gateway", "", " \t", 7, False])
 def test_materialize_inherited_gateway_name_preserves_explicit_values(
-    tmp_path: Path, existing_name: str | None
+    tmp_path: Path, existing_name: str | int | bool | None
 ) -> None:
     import tomllib
 
@@ -4977,12 +4974,15 @@ def test_materialize_inherited_gateway_name_preserves_explicit_values(
     private_home.mkdir()
     config_path = private_home / "config.toml"
     config_path.write_text(
+        'model_provider = "Selected"\n'
+        '[model_providers.Selected]\nname = "Selected"\n'
+        'base_url = "https://other.example.test/v1"\n'
         "[model_providers.Managed]\nrequest_max_retries = 2\n"
         + (f"name = {json.dumps(existing_name)}\n" if existing_name is not None else "")
     )
     materialize_codex_provider_config(
         private_home,
-        [],
+        ['model_provider="Selected"'],
         effective_providers={
             "Managed": {
                 "name": "Managed Gateway",
@@ -4991,7 +4991,12 @@ def test_materialize_inherited_gateway_name_preserves_explicit_values(
         },
     )
     provider = tomllib.loads(config_path.read_text())["model_providers"]["Managed"]
-    assert provider["name"] == ("Managed Gateway" if existing_name is None else existing_name)
+    expected_name = (
+        "Managed Gateway"
+        if existing_name is None or (isinstance(existing_name, str) and not existing_name.strip())
+        else existing_name
+    )
+    assert provider["name"] == expected_name
     assert "base_url" not in provider
 
 
@@ -5953,12 +5958,11 @@ def test_signer_backed_executor_rejects_ordinary_egress_rules_before_session() -
         )
 
 
-def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
-    """With no model anywhere, a codex-login turn gets a model codex accepts.
+def test_run_turn_leaves_the_default_to_codex_on_codexs_own_login():
+    """With no model anywhere, a codex-login turn starts on codex's own default.
 
-    The bundled OpenAI catalog's newest row is the bare family alias
-    ``gpt-5.6``, which a ChatGPT-account backend rejects with a 400, so this
-    path must default from codex's own catalog instead.
+    Omnigent names no model, so codex resolves its configured or catalog
+    default instead of a release-pinned arm that can lag codex's catalog.
     """
 
     async def _t():
@@ -5974,8 +5978,7 @@ def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
         ):
             pass
         model = fake_session.calls[0]["model"]
-        assert model == CODEX_DEFAULT_MODEL
-        assert codex_spawn_model(model) == model, "not codex's own spelling"
+        assert model is None
 
     _run(_t())
 

@@ -40,6 +40,12 @@ _WRAPPED_SELECT_QUESTION = _QUESTION.replace("Enter to select", "Enter to\nselec
 _WRAPPED_MULTISELECT = _WRAPPED_QUESTION.replace(
     "Enter to select", "Space to select · Enter to\nsubmit"
 )
+_SPLIT_CANCEL_QUESTION = _QUESTION.replace("cancel", "ca\nncel")
+_SPLIT_SELECT_QUESTION = _QUESTION.replace("select", "sel\nect")
+_SPLIT_ESCAPE_QUESTION = _QUESTION.replace("Esc", "Es\nc")
+_SPLIT_SUBMIT_QUESTION = _QUESTION.replace(
+    "Enter to select", "Space to select · Enter to sub\nmit"
+)
 _EXIT_PLAN_QUESTION = """\
 ────────────────────────────────────────────────────────────────────────────────
  Exit plan mode?
@@ -55,6 +61,21 @@ _WRAPPED_EXIT_PLAN_TITLE = _EXIT_PLAN_QUESTION.replace("Exit plan mode?", "Exit 
 _WRAPPED_EXIT_PLAN_EXPLANATION = _EXIT_PLAN_QUESTION.replace(
     "Claude wants to exit plan mode", "Claude wants to exit\n plan mode"
 )
+_READY_PLAN_QUESTION = """\
+Synthetic plan: update the example configuration.
+────────────────────────────────────────────────────────────────────────────────
+   Claude has written up a plan and is ready to execute. Would you like to proceed?
+   ❯ 1. Yes, and use auto mode
+     2. Yes, manually approve edits
+     3. Tell Claude what to change
+        shift+tab to approve with this feedback
+   ctrl+g to edit in VS Code · ~/.claude/plans/example-plan.md
+"""
+_READY_PLAN_MANUAL = _READY_PLAN_QUESTION.replace("❯ 1.", "  1.").replace("  2. Yes", "❯ 2. Yes")
+_READY_PLAN_FEEDBACK = _READY_PLAN_QUESTION.replace("❯ 1.", "  1.").replace(
+    "  3. Tell", "❯ 3. Tell"
+)
+_WRAPPED_READY_PLAN_QUESTION = _READY_PLAN_QUESTION.replace("execute. Would", "execute.\n   Would")
 
 
 @pytest.fixture
@@ -95,12 +116,20 @@ def test_live_hook_protects_a_prompt_even_during_a_torn_capture(
         _WRAPPED_QUESTION,
         _WRAPPED_SELECT_QUESTION,
         _WRAPPED_MULTISELECT,
+        _SPLIT_CANCEL_QUESTION,
+        _SPLIT_SELECT_QUESTION,
+        _SPLIT_ESCAPE_QUESTION,
+        _SPLIT_SUBMIT_QUESTION,
         _PERMISSION,
         _EXIT_PLAN_QUESTION,
         _EXIT_PLAN_QUESTION.replace("❯ 1.", "  1.").replace("  2. No", "❯ 2. No"),
         _WRAPPED_EXIT_PLAN_QUESTION,
         _WRAPPED_EXIT_PLAN_TITLE,
         _WRAPPED_EXIT_PLAN_EXPLANATION,
+        _READY_PLAN_QUESTION,
+        _READY_PLAN_MANUAL,
+        _READY_PLAN_FEEDBACK,
+        _WRAPPED_READY_PLAN_QUESTION,
     ],
     ids=[
         "question",
@@ -108,12 +137,20 @@ def test_live_hook_protects_a_prompt_even_during_a_torn_capture(
         "wrapped-cancel",
         "wrapped-select",
         "wrapped-submit",
+        "split-cancel-word",
+        "split-select-word",
+        "split-escape-word",
+        "split-submit-word",
         "permission",
         "clipped-plan-yes",
         "clipped-plan-no",
         "clipped-plan-wrapped",
         "wrapped-plan-title",
         "wrapped-plan-explanation",
+        "ready-plan-auto",
+        "ready-plan-manual",
+        "ready-plan-feedback",
+        "ready-plan-wrapped",
     ],
 )
 @pytest.mark.parametrize("operation", ["message", "settings"])
@@ -142,20 +179,36 @@ def test_terminal_fallback_prompt_receives_no_injected_keystrokes(
         _WRAPPED_QUESTION,
         _WRAPPED_SELECT_QUESTION,
         _WRAPPED_MULTISELECT,
+        _SPLIT_CANCEL_QUESTION,
+        _SPLIT_SELECT_QUESTION,
+        _SPLIT_ESCAPE_QUESTION,
+        _SPLIT_SUBMIT_QUESTION,
         _PERMISSION,
         _EXIT_PLAN_QUESTION,
         _WRAPPED_EXIT_PLAN_TITLE,
         _WRAPPED_EXIT_PLAN_EXPLANATION,
+        _READY_PLAN_QUESTION,
+        _READY_PLAN_MANUAL,
+        _READY_PLAN_FEEDBACK,
+        _WRAPPED_READY_PLAN_QUESTION,
     ],
     ids=[
         "question",
         "wrapped-cancel",
         "wrapped-select",
         "wrapped-submit",
+        "split-cancel-word",
+        "split-select-word",
+        "split-escape-word",
+        "split-submit-word",
         "permission",
         "clipped-plan",
         "wrapped-plan-title",
         "wrapped-plan-explanation",
+        "ready-plan-auto",
+        "ready-plan-manual",
+        "ready-plan-feedback",
+        "ready-plan-wrapped",
     ],
 )
 def test_decision_text_above_a_ready_composer_does_not_block_delivery(
@@ -175,6 +228,16 @@ def test_decision_text_above_a_ready_composer_does_not_block_delivery(
         _COMPOSER.replace("❯\n", "❯ " + _EXIT_PLAN_QUESTION.split("\n", 1)[1]),
         _EXIT_PLAN_QUESTION.split("\n", 1)[1],
         _EXIT_PLAN_QUESTION + "─" * 80 + "\nLauncher starting\n",
+        _READY_PLAN_QUESTION.replace("❯", " "),
+        _READY_PLAN_QUESTION.replace("     3. Tell Claude what to change\n", ""),
+        "\n".join("> " + line for line in _READY_PLAN_QUESTION.splitlines()),
+        _READY_PLAN_QUESTION.replace("─" * 80 + "\n", ""),
+        _READY_PLAN_QUESTION + "─" * 80 + "\nLauncher starting\n",
+        _READY_PLAN_QUESTION.replace("  2. Yes", "❯ 2. Yes"),
+        _READY_PLAN_QUESTION.replace("Would you like to proceed?", "Review the plan."),
+        _READY_PLAN_QUESTION.replace(
+            "2. Yes, manually approve edits", "4. Yes, manually approve edits"
+        ),
     ],
     ids=[
         "no-selection",
@@ -184,6 +247,14 @@ def test_decision_text_above_a_ready_composer_does_not_block_delivery(
         "draft",
         "no-rule",
         "old-decision-above-last-rule",
+        "ready-plan-no-selection",
+        "ready-plan-incomplete-controls",
+        "ready-plan-quoted-text",
+        "ready-plan-no-rule",
+        "ready-plan-above-last-rule",
+        "ready-plan-two-selections",
+        "ready-plan-no-banner",
+        "ready-plan-wrong-choice-order",
     ],
 )
 def test_plan_decision_text_without_live_controls_does_not_block_delivery(
@@ -193,8 +264,17 @@ def test_plan_decision_text_without_live_controls_does_not_block_delivery(
     assert not bridge.has_pending_user_prompt(native_bridge)
 
 
+@pytest.mark.parametrize(
+    "pane",
+    [
+        "Settings panel\nEscape to close",
+        "──────────────────────────────\n"
+        "Showing detailed transcript · ctrl+o to toggle · ? for shortcuts\n",
+    ],
+    ids=["settings", "detailed-transcript"],
+)
 def test_hook_that_parks_between_overlay_captures_prevents_escape(
-    native_bridge: Path, monkeypatch: pytest.MonkeyPatch
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str
 ) -> None:
     captures = 0
     sent = []
@@ -204,7 +284,7 @@ def test_hook_that_parks_between_overlay_captures_prevents_escape(
         captures += 1
         if captures == 2:
             _park_hook(native_bridge)
-        return "Settings panel\nEscape to close"
+        return pane
 
     monkeypatch.setattr(bridge, "_capture_pane", capture)
     monkeypatch.setattr(bridge, "_run_tmux", lambda *args: sent.append(args))
@@ -235,18 +315,34 @@ def test_question_appearing_after_readiness_prevents_paste(
         _WRAPPED_QUESTION,
         _WRAPPED_SELECT_QUESTION,
         _WRAPPED_MULTISELECT,
+        _SPLIT_CANCEL_QUESTION,
+        _SPLIT_SELECT_QUESTION,
+        _SPLIT_ESCAPE_QUESTION,
+        _SPLIT_SUBMIT_QUESTION,
         _EXIT_PLAN_QUESTION,
         _WRAPPED_EXIT_PLAN_TITLE,
         _WRAPPED_EXIT_PLAN_EXPLANATION,
+        _READY_PLAN_QUESTION,
+        _READY_PLAN_MANUAL,
+        _READY_PLAN_FEEDBACK,
+        _WRAPPED_READY_PLAN_QUESTION,
     ],
     ids=[
         "question",
         "wrapped-cancel",
         "wrapped-select",
         "wrapped-submit",
+        "split-cancel-word",
+        "split-select-word",
+        "split-escape-word",
+        "split-submit-word",
         "clipped-plan",
         "wrapped-plan-title",
         "wrapped-plan-explanation",
+        "ready-plan-auto",
+        "ready-plan-manual",
+        "ready-plan-feedback",
+        "ready-plan-wrapped",
     ],
 )
 def test_question_appearing_during_readiness_does_not_become_a_terminal_timeout(

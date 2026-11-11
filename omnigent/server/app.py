@@ -344,6 +344,9 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_projects: bool = False
     # Bounded latest-failure feed for the Inbox.
     scheduled_task_inbox: bool = False
+    # Session PATCH and project create check the agent tool's calling session;
+    # absent on older servers, where moves must not run.
+    session_move_source_checks: bool = False
     branding: BrandingInfo
     picker: PickerInfo = PickerInfo()
 
@@ -3739,6 +3742,7 @@ def create_app(
                 },
                 "scheduled_task_projects": project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
+                "session_move_source_checks": True,
                 "automations_enabled": automations_enabled,
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),
@@ -4071,6 +4075,8 @@ def create_app(
             create_projects_router(
                 project_store=project_store,
                 auth_provider=auth_provider,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
             ),
             prefix="/v1",
             tags=["projects"],

@@ -679,20 +679,57 @@ export function PullRequestChangesTab({
       return { ...prev, owned };
     });
   }, []);
-  // Marking a file collapses it; unmarking leaves its current state alone.
-  const toggleViewed = useCallback(
+  // A file marked viewed collapses; the collapse belongs to the mark until the reader toggles it.
+  const collapseMarked = useCallback(
     (path: string) => {
-      const markViewed = !viewedFiles.viewed.has(path);
-      viewedFiles.setMany([path], markViewed);
-      if (!markViewed) return;
       if (!collapsedPaths.has(path)) {
         setSeed((prev) => ({ ...prev, owned: new Set(prev.owned).add(path) }));
       }
       clearReveal(path);
       setCollapsedPaths((prev) => (prev.has(path) ? prev : new Set(prev).add(path)));
     },
-    [viewedFiles, clearReveal, collapsedPaths],
+    [clearReveal, collapsedPaths],
   );
+  // Hide viewed can remove the file just marked, and with it the focused box. Focus then moves to
+  // the next shown file's Viewed box, or to Hide viewed when no file follows.
+  const viewedRowRef = useRef<HTMLDivElement>(null);
+  const [focusAfterHide, setFocusAfterHide] = useState<{ nextPath: string | null } | null>(null);
+  useEffect(() => {
+    if (!focusAfterHide) return;
+    const nextBox = focusAfterHide.nextPath
+      ? scrollRef.current?.querySelector<HTMLElement>(
+          `[role="checkbox"][aria-label="${CSS.escape(`Viewed ${focusAfterHide.nextPath}`)}"]`,
+        )
+      : null;
+    (nextBox ?? viewedRowRef.current?.querySelector<HTMLElement>('[role="checkbox"]'))?.focus();
+  }, [focusAfterHide]);
+  // Unmarking leaves the file's current state alone.
+  const toggleViewed = useCallback(
+    (path: string) => {
+      const markViewed = !viewedFiles.viewed.has(path);
+      viewedFiles.setMany([path], markViewed);
+      if (!markViewed) return;
+      if (view.hideViewed && reviewing) {
+        const index = visibleFiles.findIndex((file) => file.path === path);
+        setFocusAfterHide({ nextPath: visibleFiles[index + 1]?.path ?? null });
+      }
+      collapseMarked(path);
+    },
+    [viewedFiles, collapseMarked, view.hideViewed, reviewing, visibleFiles],
+  );
+  // Marks another tab stores arrive as storage events. A file that becomes viewed on the same head
+  // collapses here. A head change or an unavailable snapshot resets the baseline instead.
+  const previousViewed = useRef<{ head: string | null; viewed: ReadonlySet<string> } | null>(null);
+  useEffect(() => {
+    const previous = previousViewed.current;
+    previousViewed.current = viewedFiles.available
+      ? { head: renderedHead, viewed: viewedFiles.viewed }
+      : null;
+    if (!previous || !viewedFiles.available || previous.head !== renderedHead) return;
+    for (const path of viewedFiles.viewed) {
+      if (!previous.viewed.has(path)) collapseMarked(path);
+    }
+  }, [viewedFiles.available, viewedFiles.viewed, renderedHead, collapseMarked]);
 
   // Fixed id keeps repeated failures from stacking toasts.
   useEffect(() => {
@@ -1262,6 +1299,7 @@ export function PullRequestChangesTab({
                 mobile={mobile}
                 hideViewed={view.hideViewed}
                 onHideViewedChange={view.setHideViewed}
+                rowRef={viewedRowRef}
               />
             ) : undefined
           }

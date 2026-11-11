@@ -1788,6 +1788,69 @@ async def test_relay_completion_idle_clears_only_a_disconnect_failure(
 
 
 @pytest.mark.asyncio
+async def test_relay_forwards_the_background_agents_a_waiting_edge_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Claude turn waiting on its background agent keeps the agents for the stream and snapshot.
+
+    The next edge (here the agent finishing) drops them.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    agent = {"id": "a1", "type": "subagent", "status": "running", "description": "Audit"}
+    edges = [
+        {"type": "session.status", "status": "waiting", "background_agents": [agent, "junk"]},
+        {"type": "session.status", "status": "idle"},
+    ]
+    fake_runner = _ScriptedThenDropRunnerClient(
+        [f"data: {json.dumps(edge)}\n\n" for edge in edges], gate
+    )
+    store = _RecordingLabelStore(live_status="idle")
+    session_id = "a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2"
+    sessions_module._session_status_cache[session_id] = "idle"
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_background_agent",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+        gate.set()
+
+        waiting = await collector.next_event()
+        assert waiting["status"] == "waiting"
+        assert waiting["background_agents"] == [{**agent, "command": None}]
+        settled = await collector.next_event()
+        assert settled["status"] == "idle"
+        assert "background_agents" not in settled
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        assert sessions_module._session_background_agents_cache.get(session_id) is None
+    finally:
+        gate.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_background_agents_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("server_status", ["idle", "failed", "running"])
 @pytest.mark.parametrize("blocked_on", ["terminal prompt", None], ids=["raise", "clear"])
 async def test_relay_applies_an_inferred_reason_only_to_a_running_turn(
@@ -3565,6 +3628,80 @@ async def test_offline_sweep_preserves_cause_when_session_rebound_mid_sweep(
     finally:
         session_live_state.configure(None)
         sessions_module._session_status_cache.pop(conv.id, None)
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("snapshot_age", "current_age", "transferred"),
+    [
+        (60, 0, True),
+        (None, 0, True),
+        (0, 0, False),
+        (3600, 1800, False),
+        (60, None, False),
+    ],
+    ids=["renewed", "first-heartbeat", "unchanged", "expired-renewal", "cleared"],
+)
+async def test_offline_sweep_preserves_runner_renewed_on_another_replica(
+    db_uri: str,
+    snapshot_age: int | None,
+    current_age: int | None,
+    transferred: bool,
+) -> None:
+    """A fresh heartbeat after the sweep snapshot belongs to the adopting replica."""
+    import time
+
+    from omnigent.runtime import session_stream
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    runner_id = "runner-remote-renewal"
+    conv = store.create_conversation(runner_id=runner_id)
+    store.set_session_live_status(conv.id, "running")
+    now = int(time.time())
+    if snapshot_age is not None:
+        store.touch_runner_liveness([runner_id], now=now - snapshot_age)
+    snapshot = store.get_conversation(conv.id)
+    assert snapshot is not None
+    # Another replica's connection leaves this replica's caches unchanged.
+    if current_age is None:
+        store.clear_runner_liveness(runner_id)
+    else:
+        store.touch_runner_liveness([runner_id], now=now - current_age)
+    sessions_module._session_status_cache[conv.id] = "running"
+    sessions_module._session_active_response_cache[conv.id] = "response-remote-renewal"
+    session_live_state.configure(store)
+    try:
+        with capture_debug_rows("server") as rows:
+            await sessions_module._mark_runner_sessions_offline(
+                [snapshot],
+                ErrorDetail(
+                    code="runner_disconnected", message="Runner disconnected unexpectedly."
+                ),
+                store,
+            )
+            session_live_state.submit("drain", lambda: None).result(timeout=10)
+        refreshed = store.get_conversation(conv.id)
+        assert refreshed is not None
+        failures = [row for row in rows if row["event_name"] == "session_turn_failed"]
+        if transferred:
+            assert refreshed.live_status == "running"
+            assert sessions_module._last_task_error_from_labels(refreshed.labels) is None
+            assert conv.id not in sessions_module._session_status_cache
+            assert conv.id not in sessions_module._session_active_response_cache
+            assert not failures
+        else:
+            assert refreshed.live_status == "failed"
+            assert sessions_module._session_status_cache.get(conv.id) == "failed"
+            assert sessions_module._last_task_error_from_labels(refreshed.labels) is not None
+            assert len(failures) == 1
+    finally:
+        session_live_state.configure(None)
+        sessions_module._session_status_cache.pop(conv.id, None)
+        sessions_module._session_active_response_cache.pop(conv.id, None)
         session_stream.close(conv.id)
 
 

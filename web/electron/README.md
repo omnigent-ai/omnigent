@@ -635,7 +635,9 @@ including the address bar, chat links, and agent actions, enforces this policy.
   `nodeIntegration:false, contextIsolation:true, sandbox:true`.
   Page-initiated `window.open` / `target=_blank` never spawns a window: an
   http(s) target navigates the same view in place (still allowlist-checked on
-  a policy-enforced view), and right-click offers "Open Link in Browser" /
+  a policy-enforced view). A Cmd/Ctrl- or middle-clicked link instead opens a
+  new background Browser tab in the same session when the loaded UI declares
+  support (`browser-open-tab`). Right-click offers "Open Link in Browser" /
   "Copy Link Address".
 - `src/browserUrlPolicy.js` — the browser navigation policy: http(s) only, and
   no private, link-local, metadata, or other non-public address in
