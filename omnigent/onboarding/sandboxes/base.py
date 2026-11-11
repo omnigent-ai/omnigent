@@ -708,6 +708,10 @@ class SandboxLifecycle(ABC):
             "own tooling."
         )
 
+    def wait_for_idle(self, sandbox_id: str, generation: str) -> None:
+        """Confirm an acknowledged host quiescence has finished all process cleanup."""
+        raise self._capability_error("confirm idle quiescence")
+
     def stop(self, sandbox_id: str) -> None:
         """
         Stop a sandbox's compute without deleting it, so :meth:`resume` can

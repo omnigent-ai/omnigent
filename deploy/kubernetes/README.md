@@ -2,8 +2,8 @@
 
 For experimental managed hosts running as Agent Substrate Actors, see
 [Substrate runners](overlays/substrate-runners/README.md). The server remains an
-ordinary Kubernetes Deployment. Automatic idle suspension and production
-qualification are not yet complete.
+ordinary Kubernetes Deployment. Updated hosts automatically suspend after all
+runner work is idle; full production qualification remains outstanding.
 
 To try multiple server replicas, see the [NGINX example](multi_replica/README.md).
 It explains how browser requests reach the server connected to each host and

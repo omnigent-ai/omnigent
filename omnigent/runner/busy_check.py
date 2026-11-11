@@ -19,6 +19,31 @@ import time
 from collections.abc import Callable
 
 
+class MutatingRequestActivity:
+    """Reserve mutations before scheduling so queued work cannot appear idle."""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self.clock = clock
+        self.active = 0
+        self.last_activity_at: float | None = None
+
+    def admit(self, method: str) -> Callable[[], None]:
+        mutation = method not in {"GET", "HEAD", "OPTIONS"}
+        released = False
+        if mutation:
+            self.active += 1
+            self.last_activity_at = self.clock()
+
+        def release() -> None:
+            nonlocal released
+            if mutation and not released:
+                self.active -= 1
+                self.last_activity_at = self.clock()
+            released = True
+
+        return release
+
+
 class RunnerBusyCheck:
     """Whether a runner did work since the previous :meth:`check`.
 

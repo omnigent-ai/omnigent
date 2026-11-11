@@ -9,8 +9,8 @@ the `omnigent.sandbox_providers` entrypoint group.
 The experimental `substrate` provider runs managed hosts as Agent Substrate
 Actors while the server stays on Kubernetes. See the
 [deployment runbook](../../deploy/kubernetes/overlays/substrate-runners/README.md)
-for prerequisites and qualification limits. Automatic idle suspension and memory
-resume are not yet supported.
+for prerequisites and qualification limits. Updated hosts support automatic
+work-aware idle suspension; exported memory snapshots remain unsupported.
 
 ## Harness providers and model lists
 
