@@ -294,6 +294,13 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   a server without agent install.
 - `mobile-labels`: on narrow screens labels collapse to icons without
   overlapping the stop button.
+- `mobile-project-chip`: on phones the new-session composer's controls under
+  "Start a new session in" lead with a project chip naming the selected project
+  (with its icon) or "No project". Its menu lists No project, then every
+  project, with no search field; picking one sets `?project=<name>` and its
+  defaults prefill the composer, and No project removes only that parameter.
+  The draft text and attachments stay. Desktop names the project in the
+  heading instead and has no chip; Add nested agent has none either.
 
 ## How to get to it (user POV)
 
@@ -431,6 +438,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - Open a project's actions menu in the sidebar → **Project settings**, pick
   Claude Code, Codex, or Pi as the agent, then set **Model** and **Effort**.
   Click **New session in project** and check the pill shows both.
+- On a phone, type a draft, then tap the **No project** chip under "Start a new
+  session in" and pick a project. The chip shows its name, the composer takes
+  its defaults, and the draft stays. Pick **No project** to switch back.
 - Attach files or type `/` before the first send.
 - For a managed sandbox, submit a prompt and close the browser once the session
   URL appears, while provisioning is still in progress. Reopen that URL after
@@ -962,6 +972,11 @@ Other connection providers alone do not enable the managed MCP picker.
   server agent keeps the dialog open with the server's reason.
 - **`mobile-labels`, new-session composer:**
   `tests/e2e_ui/mobile/test_composer_model_label_stop_overlap.py::test_new_session_composer_collapses_labels_to_icons_on_mobile`
+- **`mobile-project-chip`:** no browser-level coverage;
+  `web/src/shell/NewChatLandingScreen.mobileChrome.test.tsx` (project chip)
+  covers the label, the menu rows and which one is checked, setting and clearing `?project=`, and its
+  absence on desktop. Prefill after the switch is the `project-session-defaults`
+  path.
 
 ## Gotchas
 
