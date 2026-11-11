@@ -199,7 +199,9 @@ the header menu), and each place is a separate entry point.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
   (Default / Status / Harness / Created / Updated), Display (All / My / Shared with me / Archived), Ordering
   (Updated / Created / Custom) and Show (Updated / Environment / Repo / Branch) submenus,
-  saved per device. Created ordering keeps sessions newest-created first as messages
+  saved per device. On phone layouts a submenu replaces the menu's list under a
+  back row with its name, and reopening the menu starts at the main list.
+  Created ordering keeps sessions newest-created first as messages
   arrive;
   requests, pagination, and project folders use that order too. Switching order
   clears the cached rows and shows loading while session timestamps refresh,
@@ -316,7 +318,10 @@ the automation's page for the automations list. With automations off for the
 caller, the session is deleted alone and its automation pauses at its next run.
 
 **Project folder:** right-click its header or open its three-dot menu, then
-choose Rename project. Start typing as soon as the dialog opens.
+choose Rename project. Start typing as soon as the dialog opens. Delete project
+archives every session in the folder; when any of them has an agent working,
+awaiting approval, or running background work, the dialog says how many and
+that deleting stops them, then asks again with Delete anyway.
 
 **Project folder sessions:** expand a project with more than five sessions,
 then click Show more under its rows. Opening one of its older sessions from
@@ -1211,13 +1216,14 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_canvas_creation.py::test_stale_regular_creation_url_returns_to_new_session`.
 - **`view-options`:**
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_harness_grouping_persists_across_reload`
-  (desktop and narrow-browser navigation),
+  (desktop and narrow-browser navigation, with every Grouping option inside the viewport),
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_grouping_and_show_toggles_persist_across_reload`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_created_ordering_persists_and_flag_off_uses_updated`
   (the flag-off case disables it by patching `GET /v1/info`). Unit tests in
   `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
-  that the flag-off sidebar ignores stored view options.
+  that the flag-off sidebar ignores stored view options; "Sidebar view options"
+  covers the phone-layout submenus opening in place with their back row.
 - **`project-show-more`:** no browser test drives it. Component tests in
   `web/src/shell/Sidebar.test.tsx` ("Sidebar project Show more") cover paging,
   the next server page, the slide and its reduced-motion skip, the open-session

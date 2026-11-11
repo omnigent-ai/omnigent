@@ -3874,30 +3874,81 @@ const SHOW_LABELS: Record<SidebarShowField, string> = {
   branch: "Branch",
 };
 
+// Mobile has no room for a side flyout, so filter submenus replace the main
+// menu body in place. `open` is the shown submenu's test id, or null for the main list.
+interface FilterMenuPages {
+  open: string | null;
+  setOpen: (testId: string | null) => void;
+}
+
+const FILTER_MENU_OPTIONS_CLASS =
+  "[&_[role=menuitemradio]]:text-ui [&_[role=menuitemcheckbox]]:text-ui";
+
 // A filter-menu submenu whose trigger shows the current pick at its right edge.
 function FilterMenuSub({
   label,
   value,
   testId,
+  pages,
   children,
 }: {
   label: string;
   value?: string;
   testId: string;
+  pages?: FilterMenuPages;
   children: ReactNode;
 }) {
+  const triggerLabel = (
+    <span className="flex-1 flex justify-between">
+      {label}
+      {value && <span className="ml-auto text-muted-foreground">{value}</span>}
+    </span>
+  );
+  if (!pages) {
+    return (
+      <DropdownMenuSub>
+        <DropdownMenuSubTrigger className="mobile-touch-target" data-testid={testId}>
+          {triggerLabel}
+        </DropdownMenuSubTrigger>
+        <DropdownMenuSubContent className={cn("min-w-40", FILTER_MENU_OPTIONS_CLASS)}>
+          {children}
+        </DropdownMenuSubContent>
+      </DropdownMenuSub>
+    );
+  }
+  if (pages.open === null) {
+    return (
+      <DropdownMenuItem
+        className="mobile-touch-target"
+        data-testid={testId}
+        onSelect={(event) => {
+          event.preventDefault();
+          pages.setOpen(testId);
+        }}
+      >
+        {triggerLabel}
+        <ChevronRightIcon className="ml-auto" />
+      </DropdownMenuItem>
+    );
+  }
+  if (pages.open !== testId) return null;
   return (
-    <DropdownMenuSub>
-      <DropdownMenuSubTrigger className="mobile-touch-target" data-testid={testId}>
-        <span className="flex-1 flex justify-between">
-          {label}
-          {value && <span className="ml-auto text-muted-foreground">{value}</span>}
-        </span>
-      </DropdownMenuSubTrigger>
-      <DropdownMenuSubContent className="min-w-40 [&_[role=menuitemradio]]:text-ui [&_[role=menuitemcheckbox]]:text-ui">
-        {children}
-      </DropdownMenuSubContent>
-    </DropdownMenuSub>
+    <div className={FILTER_MENU_OPTIONS_CLASS}>
+      <DropdownMenuItem
+        className="mobile-touch-target"
+        data-testid="session-filter-menu-back"
+        aria-label={`Back from ${label}`}
+        onSelect={(event) => {
+          event.preventDefault();
+          pages.setOpen(null);
+        }}
+      >
+        <ChevronLeftIcon className="size-3.5" />
+        {label}
+      </DropdownMenuItem>
+      <DropdownMenuSeparator />
+      {children}
+    </div>
   );
 }
 
@@ -3917,6 +3968,9 @@ function SessionFilterMenu({
 }) {
   const triggerLabel = view === null ? "Filter sessions" : "Group, sort, and filter sessions";
   const [menuOpen, setMenuOpen] = useState(false);
+  const [openPage, setOpenPage] = useState<string | null>(null);
+  const isMobile = useIsMobileViewport();
+  const pages = isMobile ? { open: openPage, setOpen: setOpenPage } : undefined;
   const tooltip = useMenuGuardedTooltip(menuOpen);
   const filters = multiUser
     ? SIDEBAR_FILTERS
@@ -3936,7 +3990,12 @@ function SessionFilterMenu({
     </DropdownMenuRadioGroup>
   );
   return (
-    <DropdownMenu onOpenChange={setMenuOpen}>
+    <DropdownMenu
+      onOpenChange={(open) => {
+        setMenuOpen(open);
+        if (!open) setOpenPage(null);
+      }}
+    >
       <Tooltip disableHoverableContent open={tooltip.open} onOpenChange={tooltip.onOpenChange}>
         <TooltipTrigger asChild>
           {/* Separate nodes keep the Radix tooltip and menu trigger states independent. */}
@@ -3972,6 +4031,7 @@ function SessionFilterMenu({
             label="Grouping"
             value={GROUPING_LABELS[view.grouping]}
             testId="session-grouping-menu"
+            pages={pages}
           >
             <DropdownMenuRadioGroup
               value={view.grouping}
@@ -3993,6 +4053,7 @@ function SessionFilterMenu({
             label="Display"
             value={filters.find((filter) => filter.value === value)?.label}
             testId="session-display-menu"
+            pages={pages}
           >
             {displayOptions}
           </FilterMenuSub>
@@ -4000,6 +4061,7 @@ function SessionFilterMenu({
             label="Ordering"
             value={ORDERING_LABELS[view.ordering]}
             testId="session-ordering-menu"
+            pages={pages}
           >
             <DropdownMenuRadioGroup
               value={view.ordering}
@@ -4017,8 +4079,8 @@ function SessionFilterMenu({
               ))}
             </DropdownMenuRadioGroup>
           </FilterMenuSub>
-          <DropdownMenuSeparator />
-          <FilterMenuSub label="Show" testId="session-show-menu">
+          {!pages?.open && <DropdownMenuSeparator />}
+          <FilterMenuSub label="Show" testId="session-show-menu" pages={pages}>
             {SIDEBAR_SHOW_FIELDS.map((field) => (
               <DropdownMenuCheckboxItem
                 className="mobile-touch-target"
@@ -6868,6 +6930,8 @@ function useProjectFolderMenu(
 ): { actions: ProjectFolderMenuActions; dialogs: ReactNode } {
   const [menuOpen, setMenuOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  // Set once the first Delete click finds members whose agents are working.
+  const [deleteRunningCount, setDeleteRunningCount] = useState<number | null>(null);
   const [renameOpen, setRenameOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
@@ -6914,6 +6978,7 @@ function useProjectFolderMenu(
       },
       openDelete: () => {
         menuOpenedDialogRef.current = true;
+        setDeleteRunningCount(null);
         setDeleteOpen(true);
       },
       onMenuOpen: () => {
@@ -7134,14 +7199,26 @@ function useProjectFolderMenu(
         <DialogContent onClick={(e) => e.stopPropagation()}>
           <DialogHeader>
             <DialogTitle>Delete project?</DialogTitle>
-            <DialogDescription>
-              This deletes the project{" "}
-              <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em] break-all">
-                {projectName}
-              </span>{" "}
-              and archives <span className="font-medium">all of its sessions</span>. Their history
-              is kept. You can find and restore them anytime from Settings.
-            </DialogDescription>
+            {deleteRunningCount === null ? (
+              <DialogDescription>
+                This deletes the project{" "}
+                <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em] break-all">
+                  {projectName}
+                </span>{" "}
+                and archives <span className="font-medium">all of its sessions</span>. Their history
+                is kept. You can find and restore them anytime from Settings.
+              </DialogDescription>
+            ) : (
+              <DialogDescription data-testid="delete-project-running-warning">
+                {deleteRunningCount === 1 ? "1 session in " : `${deleteRunningCount} sessions in `}
+                <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em] break-all">
+                  {projectName}
+                </span>{" "}
+                {deleteRunningCount === 1
+                  ? "has an agent still working. Deleting the project archives it, which stops its agent."
+                  : "have agents still working. Deleting the project archives them, which stops their agents."}
+              </DialogDescription>
+            )}
           </DialogHeader>
           {deleteProject.isError && (
             <p className="text-ui text-destructive" role="alert">
@@ -7163,9 +7240,15 @@ function useProjectFolderMenu(
               loading={deleteProject.isPending}
               onClick={() => {
                 deleteProject.mutate(
-                  { id: projectId, name: projectName },
+                  deleteRunningCount === null
+                    ? { id: projectId, name: projectName }
+                    : { id: projectId, name: projectName, stopRunning: true },
                   {
-                    onSuccess: () => {
+                    onSuccess: (result) => {
+                      if (result.status === "needs_running_confirmation") {
+                        setDeleteRunningCount(result.runningCount);
+                        return;
+                      }
                       setDeleteOpen(false);
                       setMenuOpen(false);
                     },
@@ -7173,7 +7256,7 @@ function useProjectFolderMenu(
                 );
               }}
             >
-              Delete project
+              {deleteRunningCount === null ? "Delete project" : "Delete anyway"}
             </Button>
           </DialogFooter>
         </DialogContent>
