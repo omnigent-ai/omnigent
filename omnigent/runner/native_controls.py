@@ -537,9 +537,11 @@ def build_native_controls(
     ) -> tuple[Response, _JsonObject]:
         """Apply *settings* and return the response with the settings as resolved."""
         from omnigent.harnesses.codex_native.app_server import (
+            CodexAccountModelIncompatibleError,
             CodexAppServerResponseError,
             client_for_transport,
             resolve_codex_effort_for_model,
+            validate_codex_account_model,
         )
         from omnigent.harnesses.codex_native.bridge import (
             bridge_dir_for_codex_home,
@@ -661,6 +663,8 @@ def build_native_controls(
                     ready_deadline=ready_deadline,
                     retry_unreachable=False,
                 )
+            if isinstance(model, str):
+                await validate_codex_account_model(codex_client, model)
             if "model" in settings or "effort" in settings:
                 # Only an absent key inherits config; null selects the model's default.
                 effort = (
@@ -723,6 +727,11 @@ def build_native_controls(
                         "detail": "Codex did not confirm the settings update in time.",
                     },
                 ), settings
+        except CodexAccountModelIncompatibleError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"error": exc.code, "detail": exc.message},
+            ), settings
         except Exception as exc:
             _logger.warning(
                 "Codex-native thread/settings/update failed for session=%s thread=%s settings=%s",
