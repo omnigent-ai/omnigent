@@ -11,6 +11,7 @@ import { withBasePath } from "@/lib/basePath";
 import { isDatabricksWorkspace, resolveMediaUrl } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
 import { getSessionHost, isHostKeyless } from "@/lib/sessionHost";
+import { readVideoResponse } from "@/lib/videoFetch";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { isTempConvId } from "@/lib/tempConversationId";
 import {
@@ -81,20 +82,24 @@ export function workspaceFileMediaUrl(conversationId: string, path: string): str
   return resolveMediaUrl(workspaceFileUrl(conversationId, path, query));
 }
 
-/** Read complete media bytes through the host's authenticated transport, with cancellation. */
-export async function fetchWorkspaceFileBlob(
+/**
+ * A video's bytes for the player, through the host's authenticated transport,
+ * typed with its allowlisted video type and capped at the video payload limit.
+ */
+export async function fetchWorkspaceVideoBlob(
   conversationId: string,
   path: string,
   signal?: AbortSignal,
 ): Promise<Blob> {
   const res = await authenticatedFetch(
     workspaceFileUrl(conversationId, path, { download: "true" }),
-    {
-      signal,
-    },
+    { signal },
   );
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return res.blob();
+  if (!res.ok) {
+    void res.body?.cancel().catch(() => {});
+    throw new Error(`${res.status} ${res.statusText}`);
+  }
+  return readVideoResponse(res, path, { signal });
 }
 
 export async function fetchFileContent(
