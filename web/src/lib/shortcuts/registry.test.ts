@@ -34,6 +34,11 @@ describe("shortcut registry", () => {
       "history.forward",
       "sessions.recent",
       "session.number",
+      "view.mode",
+      "sidebar.left",
+      "sidebar.right",
+      "workspace.tab",
+      "terminal.new",
     ]);
     for (const binding of SHORTCUT_BINDINGS) expect(shortcutBinding(binding.id)).toBe(binding);
     expect(shortcutBinding("settings.open").label).toBe("Open Settings");
@@ -219,6 +224,66 @@ describe("General and Navigation bindings", () => {
     ).toBe(false);
     expect(
       matchesShortcut(press({ key: "Tab", ctrlKey: true, ...altGraph }), "sessions.recent", other),
+    ).toBe(false);
+  });
+});
+
+describe("View bindings", () => {
+  it("toggles Chat / Terminal with ⌘⌥\\ by physical key", () => {
+    const toggle = press({ key: "«", code: "Backslash", metaKey: true, altKey: true });
+    expect(matchesShortcut(toggle, "view.mode", mac)).toBe(true);
+    expect(matchesShortcut({ ...toggle, shiftKey: true }, "view.mode", mac)).toBe(false);
+  });
+
+  it("toggles the sidebars with ⌘B / ⇧⌘B natively and ⌘⌥[ / ⌘⌥] in a browser", () => {
+    const native = { ...mac, native: true };
+    expect(matchesShortcut(press({ key: "b", metaKey: true }), "sidebar.left", native)).toBe(true);
+    expect(
+      matchesShortcut(press({ key: "B", metaKey: true, shiftKey: true }), "sidebar.right", native),
+    ).toBe(true);
+    expect(matchesShortcut(press({ key: "b", metaKey: true }), "sidebar.left", mac)).toBe(false);
+    const left = press({ key: "“", code: "BracketLeft", metaKey: true, altKey: true });
+    expect(matchesShortcut(left, "sidebar.left", mac)).toBe(true);
+    expect(matchesShortcut(left, "sidebar.left", native)).toBe(false);
+    expect(
+      matchesShortcut(
+        press({ key: "]", code: "BracketRight", ctrlKey: true, altKey: true }),
+        "sidebar.right",
+        other,
+      ),
+    ).toBe(true);
+  });
+
+  it("picks workspace tabs 1–9 with Control on macOS and Alt elsewhere", () => {
+    const control = press({ key: "1", code: "Digit1", ctrlKey: true });
+    const alt = press({ key: "¡", code: "Digit1", altKey: true });
+    expect(matchedShortcutChordIndex(control, "workspace.tab", mac)).toBe(0);
+    expect(matchedShortcutChordIndex(alt, "workspace.tab", mac)).toBe(-1);
+    expect(matchedShortcutChordIndex(alt, "workspace.tab", other)).toBe(0);
+    expect(matchedShortcutChordIndex(control, "workspace.tab", other)).toBe(-1);
+    expect(
+      matchedShortcutChordIndex(
+        press({ key: "9", code: "Digit9", ctrlKey: true }),
+        "workspace.tab",
+        mac,
+      ),
+    ).toBe(8);
+    expect(
+      matchedShortcutChordIndex(
+        press({ key: "0", code: "Digit0", ctrlKey: true }),
+        "workspace.tab",
+        mac,
+      ),
+    ).toBe(-1);
+  });
+
+  it("opens a new shell with literal Control+` on every platform, even under AltGr", () => {
+    const shell = press({ key: "`", code: "Backquote", ctrlKey: true });
+    expect(matchesShortcut(shell, "terminal.new", mac)).toBe(true);
+    expect(matchesShortcut(shell, "terminal.new", other)).toBe(true);
+    expect(matchesShortcut({ ...shell, altGraph: true }, "terminal.new", other)).toBe(true);
+    expect(
+      matchesShortcut(press({ key: "`", code: "Backquote", metaKey: true }), "terminal.new", mac),
     ).toBe(false);
   });
 });
