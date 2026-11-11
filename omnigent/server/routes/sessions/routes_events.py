@@ -41,7 +41,7 @@ from omnigent.entities import (
 from omnigent.entities.conversation import (
     parse_item_data,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.harness_plugins import NativeCodingAgent
 from omnigent.harnesses.codex_native.shell_input import shell_command_from_input
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
@@ -506,8 +506,8 @@ async def _raise_if_runner_on_another_replica(
     :param app_state: ``request.app.state`` — supplies the host registry and
         the host store.
     :param conversation_store: Store used to resolve a sub-agent's ancestors.
-    :raises OmnigentError: ``WRONG_REPLICA`` when the routing host is live on
-        another replica.
+    :raises WrongReplicaError: When the routing host is live on another
+        replica.
     """
     host_registry = getattr(app_state, "host_registry", None)
     host_store = getattr(app_state, "host_store", None)
@@ -518,10 +518,7 @@ async def _raise_if_runner_on_another_replica(
         return
     host = await asyncio.to_thread(host_store.get_host, host_id)
     if host is not None and host_is_live(host):
-        raise OmnigentError(
-            "session runner is on another replica; retry",
-            code=ErrorCode.WRONG_REPLICA,
-        )
+        raise WrongReplicaError("session runner is on another replica", host_id=host_id)
 
 
 async def _raise_if_runner_re_tunnelled_to_another_replica(
@@ -1887,8 +1884,8 @@ def register_events_routes(
                 # the runner tunnel registers on the same replica as its host,
                 # so an absent tunnel here while the host is live elsewhere
                 # means the key routed to the wrong replica. Signal it (same as
-                # the message path) so the client re-addresses without the key,
-                # rather than getting a false "reconnect" 503 for a session that
+                # the message path) so the client re-addresses with the key it
+                # names, rather than getting a false "reconnect" 503 for a session that
                 # is actually wakeable on another replica.
                 _host_store = getattr(_app_state, "host_store", None)
                 if (
@@ -1898,9 +1895,8 @@ def register_events_routes(
                 ):
                     _elsewhere = await asyncio.to_thread(_host_store.get_host, wake_conv.host_id)
                     if _elsewhere is not None and host_is_live(_elsewhere):
-                        raise OmnigentError(
-                            "session runner is on another replica; retry",
-                            code=ErrorCode.WRONG_REPLICA,
+                        raise WrongReplicaError(
+                            "session runner is on another replica", host_id=wake_conv.host_id
                         )
                 _relaunched_runner_id: str | None = None
                 _host_conn = _host_reg.get(wake_conv.host_id) if _host_reg is not None else None

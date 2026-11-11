@@ -46,7 +46,14 @@ from omnigent.entities import (
     synthesize_conversation_title,
 )
 from omnigent.entities.permission import SessionPermission
-from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.errors import (
+    ErrorCategory,
+    ErrorCode,
+    ErrorImpact,
+    ErrorPhase,
+    OmnigentError,
+    WrongReplicaError,
+)
 from omnigent.harnesses.codex_native.side_chat import EFFORT_RESET_LABEL, is_side_chat_child
 from omnigent.harnesses.codex_native.timeouts import (
     SETTINGS_FORWARD_TIMEOUT_SECONDS as _CODEX_SETTINGS_FORWARD_TIMEOUT_S,
@@ -3542,9 +3549,9 @@ def register_core_routes(
                     if host_id is not None and await asyncio.to_thread(
                         runner_router.host_is_on_another_replica, host_id
                     ):
-                        raise OmnigentError(
+                        raise WrongReplicaError(
                             "side chat runner is connected to another server replica",
-                            code=ErrorCode.WRONG_REPLICA,
+                            host_id=host_id,
                         )
                 runner_id = _sf._registered_runner_id(
                     runner_router, body.runner_id, user_id=user_id
