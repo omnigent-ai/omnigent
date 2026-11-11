@@ -522,6 +522,11 @@ class EgressProxy:
     ) -> None:
         """Handle CONNECT — TLS MITM, inspect inner HTTP, enforce rules."""
         host, port = self._parse_host_port(target, default_port=443)
+        host_rule = self._cred_by_host.get(host.lower())
+        if host_rule is not None and host_rule.required_tls_port is not None:
+            if port != host_rule.required_tls_port:
+                await self._send_forbidden(writer, "credential-bound host has invalid TLS port")
+                return
 
         # S5 (security): hostname canonicalization. Reject any host
         # carrying a byte outside the DNS grammar ``[A-Za-z0-9.-]``
@@ -993,6 +998,12 @@ class EgressProxy:
             await self._send_forbidden(writer, "host contains forbidden character")
             return
 
+        if (
+            host_rule := self._cred_by_host.get(host.lower())
+        ) is not None and host_rule.https_only:
+            await self._send_forbidden(writer, "credential-bound hosts require HTTPS")
+            return
+
         if not check_request(self._rules, method, host, path):
             logger.warning("BLOCKED %s http://%s%s", method, host, path)
             await self._send_forbidden(writer, f"{method} http://{host}{path} denied by policy")
@@ -1450,7 +1461,7 @@ class EgressProxy:
                 del msg["Authorization"]
                 for value in rewritten:
                     msg["Authorization"] = value
-        elif host_rule is not None:
+        elif host_rule is not None and host_rule.inject_on_missing:
             # Swap-on-access: the request reached a bound host with no
             # Authorization header, so attach the real credential now.
             msg["Authorization"] = format_auth(host_rule)

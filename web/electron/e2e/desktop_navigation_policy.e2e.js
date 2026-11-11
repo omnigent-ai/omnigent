@@ -1100,3 +1100,135 @@ it(
     }
   },
 );
+
+it(
+  "opens a Cmd/Ctrl+clicked page link in a new browser tab and keeps the clicked tab's page",
+  { skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}`, timeout: 120_000 },
+  async () => {
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "omni-modifier-click-"));
+    const recordDir =
+      process.env.OMNIGENT_DESKTOP_RECORD_DIR ||
+      fs.mkdtempSync(path.join(os.tmpdir(), "omni-modifier-click-recordings-"));
+    const fixture = http.createServer((request, response) => {
+      response.writeHead(200, { "Content-Type": "text/html", "Cache-Control": "no-store" });
+      response.end(
+        request.url === "/linked"
+          ? `<title>Linked page</title><body style="font:20px system-ui;padding:24px"><h1>Linked page</h1></body>`
+          : `<title>Link source page</title><body style="font:20px system-ui;padding:24px">` +
+              `<h1>Link source page</h1><p><a href="/linked">Open linked page</a></p></body>`,
+      );
+    });
+    await new Promise((resolve) => {
+      fixture.listen(0, "127.0.0.1", resolve);
+    });
+    const sourceUrl = `http://localhost:${fixture.address().port}/`;
+    const linkedUrl = `${sourceUrl}linked`;
+    const marks = [];
+    let started = Date.now();
+    const mark = (label) => {
+      marks.push({ label, seconds: (Date.now() - started) / 1000 });
+    };
+    // Pauses only pace the recording.
+    const recording = Boolean(process.env.OMNIGENT_DESKTOP_RECORD_DIR);
+    const hold = (ms) =>
+      recording
+        ? new Promise((resolve) => {
+            setTimeout(resolve, ms);
+          })
+        : Promise.resolve();
+    let backend;
+    let desktop;
+    let tabsAfterClick;
+    try {
+      backend = await startDesignBackend(scratch);
+      started = Date.now();
+      ({ desktop } = await launchThisMachineDesktop({ backend, scratch, recordDir }));
+      const { window, electronApp } = desktop;
+      const sessionBrowserTabs = () =>
+        electronApp.evaluate((_electron, sessionId) => {
+          const tabs = [];
+          global.omnigentTestBrowserRegistries[0].forEach((entry, id) => {
+            if (id.startsWith(`browser-tab:${sessionId}:`)) {
+              const { webContents } = entry.view;
+              tabs.push({
+                id,
+                url: webContents.getURL(),
+                loading: webContents.isLoading(),
+                policyEnforced: entry.navigationPolicyEnforced,
+              });
+            }
+          });
+          return tabs;
+        }, backend.sessionId);
+
+      mark("open browser tab");
+      await openSessionBrowserTab(window, backend.serverUrl, backend.sessionId);
+      const bar = window.getByRole("textbox", { name: "Address bar" });
+      await bar.click();
+      await bar.pressSequentially(sourceUrl, { delay: recording ? 25 : 0 });
+      await bar.press("Enter");
+      const [original] = await eventually(async () => {
+        const tabs = await sessionBrowserTabs();
+        return tabs.length === 1 && tabs[0].url === sourceUrl ? tabs : null;
+      }, "source page in the browser tab");
+      const sourcePage = await eventually(
+        () => electronApp.windows().find((page) => page.url() === sourceUrl),
+        "source page target",
+      );
+      const link = sourcePage.getByRole("link", { name: "Open linked page" });
+      await link.waitFor();
+      mark("source page loaded");
+      await hold(3000);
+      await link.hover();
+      await hold(2500);
+      mark("modifier click");
+      await link.click({ modifiers: ["ControlOrMeta"] });
+      await eventually(async () => {
+        const tabs = await sessionBrowserTabs();
+        return tabs.some((tab) => tab.url === linkedUrl) ? tabs : null;
+      }, "linked page in a browser tab");
+      await window.getByRole("button", { name: "Close Linked page", exact: true }).waitFor();
+      // Re-read once settled, so a late in-place load of the clicked tab is caught.
+      tabsAfterClick = await eventually(async () => {
+        const tabs = await sessionBrowserTabs();
+        return tabs.every((tab) => !tab.loading) ? tabs : null;
+      }, "browser tabs finished loading");
+      mark("linked page loaded");
+      await hold(6000);
+      mark("end");
+      // End the clip on this state rather than on the window closing.
+      await desktop.stopDisplayCapture();
+      assert.deepEqual(
+        tabsAfterClick.map(({ id, url, policyEnforced }) => ({
+          clickedTab: id === original.id,
+          url,
+          policyEnforced,
+        })),
+        [
+          { clickedTab: true, url: sourceUrl, policyEnforced: true },
+          { clickedTab: false, url: linkedUrl, policyEnforced: true },
+        ],
+      );
+      await window.getByRole("button", { name: "Close Link source page", exact: true }).waitFor();
+    } finally {
+      fs.mkdirSync(recordDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(recordDir, "modifier-click-evidence.json"),
+        JSON.stringify({ marks, sourceUrl, linkedUrl, tabsAfterClick }, null, 2),
+      );
+      if (desktop) {
+        await desktop.window.unrouteAll({ behavior: "wait" });
+        await desktop.electronApp.close();
+        await desktop.stopDisplayCapture();
+        console.log(saveRecording(recordDir, "modifier-click"));
+        fs.rmSync(desktop.userDataDir, { recursive: true, force: true });
+      }
+      if (backend) await backend.close();
+      fixture.closeAllConnections();
+      await new Promise((resolve) => {
+        fixture.close(resolve);
+      });
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  },
+);

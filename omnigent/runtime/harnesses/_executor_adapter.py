@@ -34,6 +34,8 @@ from omnigent.inner.executor import (
     ExecutorError,
     ExecutorEvent,
     InjectionDeliveryAmbiguous,
+    LiveMcpHarnessNotRunning,
+    LiveMcpServerStatus,
     Message,
     ReasoningChunk,
     SubAgentCompleted,
@@ -1079,6 +1081,26 @@ class ExecutorAdapter(HarnessApp):
             )
         evaluation_id = f"poleval_{secrets.token_hex(16)}"
         return await ctx.evaluate_policy(evaluation_id, phase, data)
+
+    def supports_live_mcp_control(self) -> bool:
+        """Whether the inner executor reports its MCP connections.
+
+        Before the first turn builds the executor, nothing is connected yet, so
+        the harness answers as not running rather than unsupported.
+        """
+        return self._executor is None or self._executor.supports_live_mcp_control()
+
+    async def live_mcp_statuses(self) -> list[LiveMcpServerStatus] | None:
+        """The inner executor's MCP connections for this conversation."""
+        if self._executor is None:
+            return None
+        return await self._executor.live_mcp_statuses(self._session_key)
+
+    async def reconnect_live_mcp_server(self, name: str) -> None:
+        """Reconnect one of the inner executor's MCP servers for this conversation."""
+        if self._executor is None:
+            raise LiveMcpHarnessNotRunning
+        await self._executor.reconnect_live_mcp_server(self._session_key, name)
 
     def _ensure_executor(self) -> Executor:
         """
