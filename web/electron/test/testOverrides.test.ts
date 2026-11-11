@@ -95,15 +95,12 @@ describe("withTestOverrides", () => {
         return null;
       },
     }));
-    // A fresh copy so the onboarding module requires its dependency again.
-    const onboardingPath = require.resolve("../src/arca_onboarding");
-    Reflect.deleteProperty(require.cache, onboardingPath);
+    // First load in this process, so the module reads its dependency after the override.
     const {
       startArcaSetup,
     }: {
       startArcaSetup: (url: string) => { command: unknown; promise: Promise<unknown> };
-    } = require(onboardingPath);
-    Reflect.deleteProperty(require.cache, onboardingPath);
+    } = require("../src/arca_onboarding.ts");
 
     const run = startArcaSetup("https://example.com");
 

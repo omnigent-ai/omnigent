@@ -23,9 +23,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
-// The remote-host module is still JavaScript; TypeScript reads these two
-// types from its JSDoc: `lastLine(text: string): string` and a `RegExp`.
-import { lastLine, SAFE_URL_RE } from "./arca.js";
+import { lastLine, SAFE_URL_RE } from "./arca.ts";
 import {
   readArcaIdentity,
   IDENTITY_START,

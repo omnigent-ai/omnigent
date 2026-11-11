@@ -99,12 +99,12 @@ const {
   getManagedServerNames,
   getManagedServerUrls,
 } = withTestOverrides("managed_preferences", require("./managed_preferences.ts"));
-const arca = withTestOverrides("arca", require("./arca"));
-const arcaOnboarding = withTestOverrides("arca_onboarding", require("./arca_onboarding"));
+const arca = withTestOverrides("arca", require("./arca.ts"));
+const arcaOnboarding = withTestOverrides("arca_onboarding", require("./arca_onboarding.ts"));
 const cliInstall = require("./cli_install.ts");
-const isaac = withTestOverrides("isaac", require("./isaac"));
-const { createArcaConnectFlow } = require("./arca_connect_window");
-const { createArcaAutoConnect } = require("./arca_autoconnect");
+const isaac = withTestOverrides("isaac", require("./isaac.ts"));
+const { createArcaConnectFlow } = require("./arca_connect_window.ts");
+const { createArcaAutoConnect } = require("./arca_autoconnect.ts");
 const sshConnect = require("./ssh_connect.ts");
 const { createSshConnectFlow } = require("./ssh_connect_window.ts");
 const { registerSessionExpiryReload } = require("./session-expiry.ts");
@@ -529,7 +529,7 @@ const onboardingArcaSetups = new Map();
  *   errorMessage?: string,
  *   errorAction?: string,
  *   authError?: boolean,
- *   errorKind?: import("./arca").ArcaErrorKind,
+ *   errorKind?: import("./arca.ts").ArcaErrorKind,
  * }>}
  */
 async function connectOnboardingArca(serverUrl, log, sender) {
@@ -5416,7 +5416,7 @@ function registerIpc() {
   // by running `isaac omni host --background` on the instance over `arca ssh`.
   // Gated three ways: pinned-origin sender, the managed features flag re-checked
   // HERE (the renderer is not trusted to have checked it), and user consent in
-  // the connect console (arca_connect_window.js), which shows the exact command.
+  // the connect console (arca_connect_window.ts), which shows the exact command.
   // A connect already in flight is re-surfaced, never refused. The runner
   // enforces CONNECT_TIMEOUT_MS so a wedged command always settles.
   ipcMain.handle("omnigent:arca-connect", async (event) => {

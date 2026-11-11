@@ -1,15 +1,14 @@
-"use strict";
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { resolveIsaacPath } = require("../src/isaac");
+import { resolveIsaacPath } from "../src/isaac.ts";
 
 describe("isaac binary resolution", () => {
   it("prefers PATH, then well-known locations, and fails closed", () => {
     assert.equal(
       resolveIsaacPath({
         whichIsaac: () => "/from/path/isaac",
-        isExecutableFile: (value) => value === "/from/path/isaac",
+        isExecutableFile: (value: string) => value === "/from/path/isaac",
         candidatePaths: () => ["/usr/local/bin/isaac"],
       }),
       "/from/path/isaac",
@@ -17,7 +16,7 @@ describe("isaac binary resolution", () => {
     assert.equal(
       resolveIsaacPath({
         whichIsaac: () => null,
-        isExecutableFile: (value) => value === "/usr/local/bin/isaac",
+        isExecutableFile: (value: string) => value === "/usr/local/bin/isaac",
         candidatePaths: () => ["/usr/local/bin/isaac"],
       }),
       "/usr/local/bin/isaac",

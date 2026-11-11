@@ -490,8 +490,8 @@ function loadNavigationHarness({
     },
     "./workspace-chrome.ts": { registerWorkspaceChromeHide: () => {} },
     // Never probe for or spawn a real arca from tests.
-    "./arca": {
-      ...require("../src/arca"),
+    "./arca.ts": {
+      ...require("../src/arca.ts"),
       resolveArcaPath: () => arcaPath,
       resolveArcaPathAsync: async () => arcaPath,
       runArcaExtend: async (mode) => {
@@ -532,8 +532,8 @@ function loadNavigationHarness({
         };
       },
     },
-    "./arca_onboarding": {
-      ...require("../src/arca_onboarding"),
+    "./arca_onboarding.ts": {
+      ...require("../src/arca_onboarding.ts"),
       startArcaSetup: (url) => {
         calls.arcaSetups.push(url);
         const result =
@@ -703,7 +703,7 @@ function loadNavigationHarness({
   };
 
   if (arcaConsentResult !== undefined) {
-    localRequires["./arca_connect_window"] = {
+    localRequires["./arca_connect_window.ts"] = {
       createArcaConnectFlow: (deps) => ({
         run: async (_parentWin, consentServerUrl, options) => {
           calls.arcaConsentRuns.push({ serverUrl: consentServerUrl, options });
