@@ -610,6 +610,8 @@ class ManagedLaunch:
     settled: asyncio.Event
     error: str | None = None
     bound: asyncio.Event = dataclass_field(default_factory=asyncio.Event)
+    # Set when another host took the session before its sandbox was ready.
+    superseded: bool = False
     host_online_failure_hint: Callable[[], str | None] | None = None
 
 

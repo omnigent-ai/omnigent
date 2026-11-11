@@ -4919,6 +4919,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         expected_host_id: str | None = None,
         expected_sandbox_id: str | None = None,
         expected_runner_id: str | None = None,
+        keep_runner: bool = False,
         clear_profile: bool = False,
     ) -> Conversation:
         """
@@ -4935,6 +4936,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             still matches this identity; otherwise leave every binding field unchanged.
         :param expected_runner_id: When supplied, clear only if the current
             runner is still this one; otherwise leave every binding field unchanged.
+        :param keep_runner: Leave ``runner_id`` in place and clear only the host fields.
         :returns: The current :class:`Conversation` after the conditional clear.
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
@@ -4980,7 +4982,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta.host_id = None
             meta.workspace = None
             meta.git_branch = None
-            _bind_runner(meta, None)
+            if not keep_runner:
+                _bind_runner(meta, None)
             return meta
 
         meta = run_write_transaction(self._session_immediate, "clear_host_binding", write)
@@ -5436,13 +5439,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         workspace: str | None = None,
         git_branch: str | None = None,
         *,
-        require_unbound: bool = False,
+        expected_runner_id: str | None = None,
     ) -> Conversation:
         """
         Set the host that launched (or should launch) the runner.
 
         Last-write-wins — mirrors :meth:`replace_runner_id` — unless
-        *require_unbound* is set.
+        *expected_runner_id* is set.
 
         ``workspace`` is updated together with ``host_id`` when
         provided so the row never violates
@@ -5466,13 +5469,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             resume path). ``None`` preserves the branch on the same
             host/workspace, but clears it when the host or an explicitly
             supplied workspace changes.
-        :param require_unbound: Bind only while the session has no runner
-            and no other host, checked under the row lock.
+        :param expected_runner_id: Bind only while the session's runner is
+            still this one and it has no other host, checked under the row lock.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
-        :raises ValueError: If *require_unbound* is set and the session
-            has a runner or another host.
+        :raises ValueError: If *expected_runner_id* is set and the session
+            has another runner or another host.
         :raises IntegrityError: If the resulting row violates
             ``ck_conversations_workspace_required_for_host`` (i.e.
             ``host_id`` is being set on a row with no ``workspace``
@@ -5490,8 +5493,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            if require_unbound and (
-                meta.runner_id is not None
+            if expected_runner_id is not None and (
+                meta.runner_id != expected_runner_id
                 or (meta.host_id is not None and meta.host_id != host_id)
             ):
                 raise ValueError("The session binding changed; retry the request")

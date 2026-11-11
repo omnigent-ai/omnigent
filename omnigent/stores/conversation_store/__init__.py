@@ -1880,6 +1880,7 @@ class ConversationStore(ABC):
         expected_host_id: str | None = None,
         expected_sandbox_id: str | None = None,
         expected_runner_id: str | None = None,
+        keep_runner: bool = False,
         clear_profile: bool = False,
     ) -> Conversation:
         """
@@ -1907,6 +1908,8 @@ class ConversationStore(ABC):
             still matches this identity; otherwise leave every binding field unchanged.
         :param expected_runner_id: When supplied, clear only if the current
             runner is still this one; otherwise leave every binding field unchanged.
+        :param keep_runner: Leave ``runner_id`` in place and clear only the
+            host fields, e.g. so a move keeps its claim while it detaches.
         :param clear_profile: Allow detaching a profiled session from a live host.
             When false, that binding is left unchanged. Accepted profile labels are retained.
         :returns: The current :class:`Conversation` after the conditional clear.
@@ -2065,14 +2068,14 @@ class ConversationStore(ABC):
         workspace: str | None = None,
         git_branch: str | None = None,
         *,
-        require_unbound: bool = False,
+        expected_runner_id: str | None = None,
     ) -> Conversation:
         """
         Set the host that launched (or should launch) the runner.
 
         Used when the server asks a host to spawn a runner for
         an existing session. Last-write-wins semantics (like
-        :meth:`replace_runner_id`) unless *require_unbound* is set.
+        :meth:`replace_runner_id`) unless *expected_runner_id* is set.
 
         Runner/host binding is live state, not conversation activity, so
         this must NOT bump ``updated_at`` (it drives sidebar ordering
@@ -2094,14 +2097,14 @@ class ConversationStore(ABC):
             worktree (the fork resume path). ``None`` preserves the
             branch on the same host/workspace, but clears it when
             the host or an explicitly supplied workspace changes.
-        :param require_unbound: Bind only while the session has no runner
-            and no other host, checked atomically with the write, so a
-            binding made concurrently wins.
+        :param expected_runner_id: Bind only while the session's runner is
+            still this one and it has no other host, checked atomically with
+            the write, e.g. the claim a move holds on the session.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
-        :raises ValueError: If *require_unbound* is set and the session
-            has a runner or another host.
+        :raises ValueError: If *expected_runner_id* is set and the session
+            has another runner or another host.
         """
         ...
 

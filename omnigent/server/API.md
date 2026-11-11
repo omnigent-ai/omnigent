@@ -1435,20 +1435,23 @@ session's runner first with `PATCH /v1/sessions/{id}` and
 `{"runner_id": ""}`. The call then claims the session through the
 same `runner_id IS NULL` transition a host launch binds with, so a
 runner bound in the meantime, or a concurrent move, makes it fail with
-409. It clears the session's host, workspace and branch, plus any
+409. The claim stays on the session until the sandbox binds, so a host
+launch meanwhile is refused on every replica. The call registers the
+launch (the session's startup label and launch tracker) before it
+clears the session's host, workspace and branch, so a message sent at
+any point during the move is held for the sandbox. It also drops any
 earlier sandbox's `omnigent.sandbox.repo*` and
-`omnigent.sandbox.requested_host_id` labels, and schedules the same
-background launch a `host_type: "managed"` create does, registering
-the sandbox to the caller. Like a managed fork, the request should be
-routed by the new sandbox's `host_id`, where the launch connects.
-Until the sandbox host binds, the session behaves like an in-flight
-managed create: a message posted meanwhile is held for the launch, and
-a failed launch leaves the session unbound with the reason in
-`sandbox_status`. A host that binds the session while the sandbox
-provisions keeps it: the sandbox binds only if the session is still
-unbound, and is torn down otherwise. A request the server refuses
-restores the previous binding and labels unless the session was rebound
-meanwhile. Files don't move with the session; the transcript does.
+`omnigent.sandbox.requested_host_id` labels, and registers the sandbox
+to the caller. Like a managed fork, the request should be routed by the
+new sandbox's `host_id`, where the launch connects. A failed launch
+releases the claim and leaves the session unbound with the reason in
+`sandbox_status`; held messages are reported as not delivered. If the
+claim is released while the sandbox provisions and another host binds
+the session, that binding wins: the sandbox is torn down without
+failing the session, and held messages are marked not sent. A request
+the server refuses restores the previous binding and labels, unless
+another host took the session meanwhile, and releases the claim. Files
+don't move with the session; the transcript does.
 
 ### Read Fork Repository Branch Suggestions
 

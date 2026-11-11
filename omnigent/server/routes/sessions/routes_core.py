@@ -655,7 +655,8 @@ def register_core_routes(
         sandbox_provider: str | None,
         workspaces: list[str],
         requested_host_id: str | None = None,
-        require_unbound: bool = False,
+        held_runner_id: str | None = None,
+        before_start: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """
         Provision a managed sandbox host for a session that has no host.
@@ -693,8 +694,12 @@ def register_core_routes(
         :param requested_host_id: Host id the caller chose for the sandbox
             host (already checked against existing hosts),
             or ``None`` to let the launch mint one.
-        :param require_unbound: Bind the sandbox only if the session is still
-            unbound once it is ready (a move onto a new sandbox).
+        :param held_runner_id: The claim a move holds on the session's runner
+            until the sandbox binds; see :func:`_run_managed_launch`.
+        :param before_start: Run once the launch is visible to message
+            handling (startup label and tracker entry) and before it starts,
+            e.g. a move detaching the old host. If it raises, the launch is
+            withdrawn and the error propagates.
         :raises OmnigentError: If managed hosts aren't configured or the
             provider isn't offered.
         """
@@ -777,6 +782,12 @@ def register_core_routes(
             "provisioning",
             provider=sandbox_provider or sandbox_config.default.provider,
         )
+        if before_start is not None:
+            try:
+                await before_start()
+            except BaseException:
+                await _withdraw_managed_launch(request, session_id)
+                raise
         launch = _run_managed_launch(
             session_id=session_id,
             # On auth-disabled servers user_id is None; the sandbox
@@ -794,7 +805,7 @@ def register_core_routes(
             agent_id=agent_id,
             host_id=requested_host_id,
             sandbox_profiles=profile_catalog,
-            require_unbound=require_unbound,
+            held_runner_id=held_runner_id,
         )
         _start_managed_launch_task(
             session_id,
@@ -802,7 +813,40 @@ def register_core_routes(
             conversation_store=conversation_store,
             tracker=managed_launches,
             startup=getattr(request.app.state, "startup_inputs", None),
+            held_runner_id=held_runner_id,
         )
+
+    async def _withdraw_managed_launch(request: Request, session_id: str) -> None:
+        """
+        Undo a launch registration that never started, so messages stop waiting on it.
+
+        Best effort, like the rest of a refused move's rollback. A message saved
+        for the launch in the meantime can't be delivered by it, so it is
+        reported as not sent rather than left pending.
+
+        :param request: The request that registered the launch.
+        :param session_id: The session it was registered for.
+        """
+        managed_launches = getattr(request.app.state, "managed_launches", None)
+        if managed_launches is not None:
+            managed_launches.finish(session_id)
+        _publish_sandbox_status(session_id, "ready")
+        startup = getattr(request.app.state, "startup_inputs", None)
+        if startup is None:
+            return
+        try:
+            await startup.release_held_inputs(
+                session_id,
+                "The message wasn't sent: the session's move to a new sandbox was "
+                "refused. Send it again.",
+            )
+        except Exception:  # Must not replace the refusal being raised.
+            _logger.warning(
+                "Could not withdraw session %s's sandbox launch",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
 
     async def _check_requested_host_id(
         request: Request, requested_host_id: str, user_id: str | None
@@ -860,17 +904,21 @@ def register_core_routes(
         workspace: str,
         git_branch: str | None,
         labels: dict[str, str],
+        claim: str,
     ) -> None:
         """
-        Put back the binding a refused sandbox move cleared, unless it was rebound.
+        Put back the binding a refused sandbox move cleared, then release its claim.
 
-        Best effort: the caller re-raises the refusal, which is the error to report.
+        Restores only while the move's claim still holds the session, so a host
+        that took it after the claim was released keeps it. Best effort: the
+        caller re-raises the refusal, which is the error to report.
 
         :param session_id: The session the move unbound, e.g. ``"conv_abc123"``.
         :param host_id: The host it was bound to before the move.
         :param workspace: Its working directory on that host.
         :param git_branch: Its worktree branch there, or ``None``.
         :param labels: The sandbox labels the move removed.
+        :param claim: The runner id the move claimed the session with.
         """
         try:
             try:
@@ -880,17 +928,25 @@ def register_core_routes(
                     host_id,
                     workspace,
                     git_branch,
-                    require_unbound=True,
+                    expected_runner_id=claim,
                 )
             except ValueError:
-                return  # Rebound meanwhile; that binding wins.
-            # A launch refused after writing its own sandbox labels leaves them behind.
+                pass  # Taken by another host meanwhile; that binding wins.
+            else:
+                # A launch refused after writing its own sandbox labels leaves them behind.
+                current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                for key in [] if current is None else list(current.labels):
+                    if _is_sandbox_launch_label(key) and key not in labels:
+                        await asyncio.to_thread(conversation_store.delete_label, session_id, key)
+                if labels:
+                    await asyncio.to_thread(conversation_store.set_labels, session_id, labels)
+            # The claim is no runner's; left in place it would refuse every
+            # later move and launch.
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            for key in [] if current is None else list(current.labels):
-                if _is_sandbox_launch_label(key) and key not in labels:
-                    await asyncio.to_thread(conversation_store.delete_label, session_id, key)
-            if labels:
-                await asyncio.to_thread(conversation_store.set_labels, session_id, labels)
+            if current is not None and current.runner_id == claim:
+                await asyncio.to_thread(
+                    conversation_store.clear_runner_id, session_id, expected_binding=current
+                )
         except Exception:  # Must not replace the refusal being raised.
             _logger.warning(
                 "Could not restore session %s's host binding after a refused sandbox move",
@@ -5091,11 +5147,12 @@ def register_core_routes(
 
         The sandbox counterpart of ``POST /v1/hosts/{host_id}/runners``: the
         caller first releases the session's runner (``PATCH`` with
-        ``runner_id: ""``), then this drops the old host binding and
-        schedules the background launch a managed create does. It returns
-        before the sandbox exists. Until the new host binds, the session
-        looks like an in-flight managed create, so a message sent meanwhile
-        waits for the launch rather than relaunching on the old host.
+        ``runner_id: ""``), then this claims the session's runner, registers
+        the background launch a managed create does, and only then drops the
+        old host binding. It returns before the sandbox exists. Until the new
+        host binds, the claim keeps any other host from taking the session and
+        a message sent meanwhile waits for the launch rather than relaunching
+        on the old host.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session to move, e.g. ``"conv_abc123"``.
@@ -5188,7 +5245,27 @@ def register_core_routes(
                 "The session's host or runner changed while moving it. Reload and try again.",
                 code=ErrorCode.CONFLICT,
             )
-        held: Conversation | None = None
+        # From here the claim stays on the session until the sandbox binds, so no
+        # host launch can take it on any replica; every refusal below puts the
+        # old binding back and releases the claim.
+        stale_labels: dict[str, str] = {}
+
+        async def detach_old_host() -> None:
+            # Runs once the launch is visible to message handling, so a message
+            # sent from now on waits for the sandbox instead of being dropped.
+            cleared = await asyncio.to_thread(
+                conversation_store.clear_host_binding,
+                session_id,
+                expected_host_id=previous_host_id,
+                expected_runner_id=claim,
+                keep_runner=True,
+            )
+            if cleared.host_id is not None or cleared.runner_id != claim:
+                raise OmnigentError(
+                    "The session's host or runner changed while moving it. Reload and try again.",
+                    code=ErrorCode.CONFLICT,
+                )
+
         try:
             held = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if held is None:
@@ -5203,33 +5280,6 @@ def register_core_routes(
             stale_labels = {
                 key: value for key, value in held.labels.items() if _is_sandbox_launch_label(key)
             }
-            # Hostless until the sandbox binds, so nothing relaunches on the old
-            # host. Clearing only while the claim stands also releases it.
-            cleared = await asyncio.to_thread(
-                conversation_store.clear_host_binding,
-                session_id,
-                expected_host_id=previous_host_id,
-                expected_runner_id=claim,
-            )
-            if cleared.host_id is not None or cleared.runner_id is not None:
-                raise OmnigentError(
-                    "The session's host or runner changed while moving it. Reload and try again.",
-                    code=ErrorCode.CONFLICT,
-                )
-        except BaseException as exc:
-            # Nothing else holds this runner id, so a claim left behind would
-            # refuse every later move and launch.
-            standing = held if held is not None and held.runner_id == claim else None
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(
-                    conversation_store.clear_runner_id,
-                    session_id,
-                    expected_binding=standing or dataclasses.replace(conv, runner_id=claim),
-                )
-            if isinstance(exc, ConversationNotFoundError):
-                raise _session_not_found() from exc
-            raise
-        try:
             for key in stale_labels:
                 await asyncio.to_thread(conversation_store.delete_label, session_id, key)
             await _schedule_managed_launch(
@@ -5240,15 +5290,17 @@ def register_core_routes(
                 sandbox_provider=body.sandbox_provider,
                 workspaces=[body.workspace] if body.workspace is not None else [],
                 requested_host_id=body.host_id,
-                require_unbound=True,
+                held_runner_id=claim,
+                before_start=detach_old_host,
             )
-        except Exception as exc:
+        except BaseException as exc:
             await _restore_host_binding(
                 session_id,
                 host_id=previous_host_id,
                 workspace=previous_workspace,
                 git_branch=conv.git_branch,
                 labels=stale_labels,
+                claim=claim,
             )
             if isinstance(exc, ConversationNotFoundError):
                 raise _session_not_found() from exc

@@ -6755,6 +6755,7 @@ def _start_managed_launch_task(
     conversation_store: ConversationStore,
     tracker: ManagedLaunchTracker,
     startup: ManagedStartupInputs | None,
+    held_runner_id: str | None = None,
 ) -> asyncio.Task[None]:
     """
     Run a managed launch in the background, failing saved inputs it can't deliver.
@@ -6770,8 +6771,23 @@ def _start_managed_launch_task(
     :param tracker: The app's launch tracker; a settled failure is read here.
     :param startup: The server's saved-input service, or ``None`` when the
         server has none.
+    :param held_runner_id: The claim a move holds on the session's runner
+        while this launch provisions, released if shutdown abandons it.
     :returns: The launch task.
     """
+    # Read before the launch settles, which forgets a superseded entry.
+    entry = tracker.get(session_id)
+
+    async def release_claim() -> None:
+        # The claim is no runner's; left in place after a failed launch it
+        # would refuse every later move and launch.
+        if held_runner_id is not None:
+            with contextlib.suppress(ConversationNotFoundError):
+                await asyncio.to_thread(
+                    conversation_store.clear_host_binding,
+                    session_id,
+                    expected_runner_id=held_runner_id,
+                )
 
     async def record_unbound_launch_failure() -> None:
         # Shutdown gave up on the launch. Bound, the host's replica finishes
@@ -6788,6 +6804,10 @@ def _start_managed_launch_task(
         try:
             await launch
         except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    release_claim(), timeout=_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S
+                )
             if startup is not None:
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(
@@ -6796,14 +6816,24 @@ def _start_managed_launch_task(
                     )
             raise
         except Exception as exc:
+            await release_claim()
             if startup is not None:
                 await startup.record_launch_failure(
                     session_id, f"managed sandbox failed to launch: {exc}"
                 )
             raise
+        if startup is not None and entry is not None and entry.superseded:
+            await startup.release_held_inputs(
+                session_id,
+                "The message wasn't sent: the session moved to another host before "
+                "its new sandbox was ready. Send it again.",
+            )
+            return
         failed = tracker.get(session_id)
-        if startup is not None and failed is not None and failed.error is not None:
-            await startup.record_launch_failure(session_id, failed.error)
+        if failed is not None and failed.error is not None:
+            await release_claim()
+            if startup is not None:
+                await startup.record_launch_failure(session_id, failed.error)
 
     launch_task = asyncio.create_task(launch_and_record_failure())
     _managed_launch_tasks.add(launch_task)

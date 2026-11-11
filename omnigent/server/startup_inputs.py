@@ -246,6 +246,36 @@ class ManagedStartupInputs:
             )
         return reason
 
+    async def release_held_inputs(self, session_id: str, message: str) -> None:
+        """
+        Settle a startup whose launch won't happen, without failing the session.
+
+        The session keeps running where it is (its old host, or one that took
+        it before the sandbox was ready). Messages held for the sandbox were
+        never sent: they are failed with *message* so the user can send them
+        again, and the startup label goes so later messages reach that host.
+
+        :param session_id: The session the launch was for.
+        :param message: Transcript note for the held messages, e.g. why they
+            weren't sent.
+        """
+        undelivered = False
+        for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
+            if item.status == "in_progress":
+                undelivered |= await asyncio.to_thread(
+                    self.conversations.transition_pending_input,
+                    session_id,
+                    item.id,
+                    expected="in_progress",
+                    status="failed",
+                )
+        with contextlib.suppress(ConversationNotFoundError):
+            await asyncio.to_thread(self.conversations.delete_label, session_id, STARTUP_LABEL)
+        if undelivered:
+            await self._report_failure(
+                session_id, "launch_withdrawn", message, publish_status=False
+            )
+
     async def accepts(self, conv: Conversation, app: Any) -> bool:
         """Whether a new message must wait behind the session's startup."""
         state = conv.labels.get(STARTUP_LABEL)
@@ -613,8 +643,10 @@ class ManagedStartupInputs:
                     status=None,
                 )
 
-    async def _report_failure(self, session_id: str, failure_id: str, message: str) -> None:
-        """Record a startup failure in the transcript and the session's status."""
+    async def _report_failure(
+        self, session_id: str, failure_id: str, message: str, *, publish_status: bool = True
+    ) -> None:
+        """Record a startup failure in the transcript and, by default, the session's status."""
         from omnigent.server.routes.sessions import _publish_sandbox_status, _publish_status
 
         if await asyncio.to_thread(self.conversations.get_conversation, session_id) is None:
@@ -636,8 +668,9 @@ class ManagedStartupInputs:
                 )
             ],
         )
-        _publish_sandbox_status(session_id, "failed", message)
-        _publish_status(session_id, "failed", failure_origin="startup_input_failed")
+        if publish_status:
+            _publish_sandbox_status(session_id, "failed", message)
+            _publish_status(session_id, "failed", failure_origin="startup_input_failed")
 
     async def shutdown(self) -> None:
         tasks = [task for _, task, _ in self._workers.values()] + list(self._deliveries.values())

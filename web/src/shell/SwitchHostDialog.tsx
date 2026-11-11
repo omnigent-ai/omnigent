@@ -63,11 +63,8 @@ import { useChatStore } from "@/store/chatStore";
  * A directory is always required: workspaces are per-machine, so the
  * old path means nothing on the new host even when it reads the same.
  *
- * When ``/v1/info`` reports ``managed_sandboxes_enabled``, the picker
- * also offers a new server-provisioned sandbox per provider. Step 2 is
- * then ``POST /v1/sessions/{id}/managed-host``, which returns as soon as
- * the launch is scheduled; the session page follows its progress. The
- * sandbox's workspace is a repository the server clones into it.
+ * Sandbox targets use the managed-host endpoint; the session page tracks
+ * provisioning.
  *
  * The first available host is selected on open and its directory
  * defaulted, so the common "just move it over there" case is one click.
@@ -157,7 +154,11 @@ function SupportedSwitchHostDialog({
   // A provider that manages sandbox profiles binds one at session create, so
   // the server refuses to move a session onto it.
   const profilesEnabled = moveSupported && sandboxProfilesEnabled(info);
-  const { data: profileCatalog } = useQuery({
+  const {
+    data: profileCatalog,
+    isError: profileCatalogFailed,
+    refetch: retryProfileCatalog,
+  } = useQuery({
     queryKey: [...SANDBOX_PROFILES_QUERY_KEY, null],
     queryFn: ({ signal }) => fetchSandboxProfiles(undefined, { signal }),
     enabled: profilesEnabled,
@@ -370,6 +371,9 @@ function SupportedSwitchHostDialog({
 
   const noTargets =
     hosts !== undefined && targetHosts.length === 0 && sandboxProviderRows.length === 0;
+  // Sandboxes are withheld until it's known which providers use profiles; say
+  // so instead of implying there is nowhere to move the session.
+  const sandboxesUnknown = profilesEnabled && !sessionHostless && profileCatalog === undefined;
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -383,7 +387,26 @@ function SupportedSwitchHostDialog({
           </DialogDescription>
         </DialogHeader>
 
-        {noTargets ? (
+        {noTargets && sandboxesUnknown && profileCatalogFailed ? (
+          <div
+            role="alert"
+            className="flex items-center gap-2 text-xs text-muted-foreground"
+            data-testid="switch-host-sandboxes-unavailable"
+          >
+            <span>Couldn't check which sandboxes can take this session.</span>
+            <Button variant="link" size="xs" onClick={() => void retryProfileCatalog()}>
+              Try again
+            </Button>
+          </div>
+        ) : noTargets && sandboxesUnknown ? (
+          <p
+            role="status"
+            className="text-xs text-muted-foreground"
+            data-testid="switch-host-sandboxes-checking"
+          >
+            Checking which sandboxes can take this session…
+          </p>
+        ) : noTargets ? (
           <p className="text-xs text-muted-foreground" data-testid="switch-host-no-targets">
             No other hosts are online. Connect one with <code>omnigent host</code> and try again.
           </p>

@@ -4609,7 +4609,7 @@ async def _run_managed_launch(
     agent_id: str | None = None,
     host_id: str | None = None,
     sandbox_profiles: Any = None,
-    require_unbound: bool = False,
+    held_runner_id: str | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -4675,9 +4675,9 @@ async def _run_managed_launch(
         classifier, or ``None`` to leave it unstamped.
     :param host_id: Host id a managed create asked for, or
         ``None`` to mint one. Ignored on a relaunch.
-    :param require_unbound: Bind the sandbox only if the session is still
-        unbound when it is ready; a move sets this so a host bound while it
-        provisioned keeps the session.
+    :param held_runner_id: The claim a move holds on the session's runner
+        while it provisions, or ``None``. The sandbox binds only while that
+        claim stands, and any failure releases it.
     """
     from omnigent.server.managed_hosts import (
         deployment_with_inference_snapshot,
@@ -4783,7 +4783,7 @@ async def _run_managed_launch(
             relaunch_host=relaunch_host,
             sandbox_profiles=sandbox_profiles,
             sandbox_profile=profile,
-            require_unbound=require_unbound,
+            held_runner_id=held_runner_id,
         )
 
 
@@ -4807,7 +4807,7 @@ async def _bind_and_launch_managed_runner(
     relaunch_host: Host | None = None,
     sandbox_profiles: Any = None,
     sandbox_profile: dict[str, Any] | None = None,
-    require_unbound: bool = False,
+    held_runner_id: str | None = None,
 ) -> None:
     """
     Bind a provisioned managed host to its session and launch a runner.
@@ -4840,9 +4840,12 @@ async def _bind_and_launch_managed_runner(
     :param relaunch_host: Existing managed host row being relaunched, or
         ``None`` for a first launch (a fresh host identity was just
         minted for ``managed.host_id``).
-    :param require_unbound: Bind only if the session has no runner and no
-        other host; otherwise the binding made meanwhile wins and the fresh
-        sandbox is torn down.
+    :param held_runner_id: The claim a move holds on the session's runner,
+        or ``None``. The sandbox binds only while it stands; if the claim was
+        released and another host took the session, that binding wins, the
+        fresh sandbox is torn down, and the launch settles without failing the
+        session. :func:`_start_managed_launch_task` releases the claim when the
+        launch fails.
     """
     from omnigent.server.managed_hosts import terminate_managed_host
 
@@ -4852,10 +4855,13 @@ async def _bind_and_launch_managed_runner(
             if sandbox_profiles is not None
             else None
         )
-        if snapshot is None and require_unbound:
+        if snapshot is None and held_runner_id is not None:
             try:
                 conv = conversation_store.set_host_id(
-                    session_id, managed.host_id, managed.workspace, require_unbound=True
+                    session_id,
+                    managed.host_id,
+                    managed.workspace,
+                    expected_runner_id=held_runner_id,
                 )
             except ValueError as exc:
                 raise _SessionReboundDuringProvision from exc
@@ -4894,6 +4900,7 @@ async def _bind_and_launch_managed_runner(
             await terminate_managed_host(host, host_store, sandbox_config, keep_if_bound=True)
 
     reason: str | None = None
+    superseded = False
     cancelled = False
     try:
         try:
@@ -4902,7 +4909,7 @@ async def _bind_and_launch_managed_runner(
             reason = "session was deleted while its sandbox was provisioning"
             return
         except _SessionReboundDuringProvision:
-            reason = _SESSION_REBOUND_REASON
+            reason, superseded = _SESSION_REBOUND_REASON, True
             return
         except Exception:  # noqa: BLE001 — settle the tracker and release the fresh sandbox
             _logger.exception("Failed to bind managed host", extra={"session_id": session_id})
@@ -4968,14 +4975,14 @@ async def _bind_and_launch_managed_runner(
         if reason is not None or cancelled:
 
             async def settle_failure() -> None:
-                nonlocal reason
+                nonlocal reason, superseded
                 # A cancelled thread can still commit the binding before raising.
                 try:
                     await bind
                 except ConversationNotFoundError:
                     reason = "session was deleted while its sandbox was provisioning"
                 except _SessionReboundDuringProvision:
-                    reason = _SESSION_REBOUND_REASON
+                    reason, superseded = _SESSION_REBOUND_REASON, True
                 except Exception:  # noqa: BLE001 — drain the transaction before compensating
                     reason = "failed to bind managed host"
                 if reason is None:
@@ -4986,8 +4993,15 @@ async def _bind_and_launch_managed_runner(
                 try:
                     await rollback_fresh_host()
                 finally:
-                    tracker.fail(session_id, reason)
-                    _publish_sandbox_status(session_id, "failed", reason)
+                    if superseded:
+                        # The session runs on the host that took it; nothing failed.
+                        if (launch := tracker.get(session_id)) is not None:
+                            launch.superseded = True
+                        tracker.finish(session_id)
+                        _publish_sandbox_status(session_id, "ready")
+                    else:
+                        tracker.fail(session_id, reason)
+                        _publish_sandbox_status(session_id, "failed", reason)
 
             cleanup = asyncio.create_task(settle_failure())
             cleanup_cancelled = False

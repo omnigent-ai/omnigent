@@ -494,19 +494,37 @@ describe("SwitchHostDialog", () => {
     });
 
     it("offers no sandbox while it can't tell which providers use profiles", async () => {
-      vi.mocked(fetchSandboxProfiles).mockRejectedValue(new Error("profiles unavailable"));
+      vi.mocked(fetchSandboxProfiles).mockRejectedValueOnce(new Error("profiles unavailable"));
       onlyOriginHostOnline();
       renderDialog({
         ...SANDBOX_SERVER,
         sandbox_providers: ["modal", "profiled"],
         features: { sandbox_profiles: true },
       });
-      await waitFor(() => expect(fetchSandboxProfiles).toHaveBeenCalled());
-      // Nothing to pick, so nothing can release the runner.
-      expect(await screen.findByTestId("switch-host-no-targets")).toBeVisible();
+      // Nothing to pick, so nothing can release the runner; the dialog says why.
+      expect(await screen.findByTestId("switch-host-sandboxes-unavailable")).toBeVisible();
+      expect(screen.queryByTestId("switch-host-no-targets")).toBeNull();
       expect(screen.queryByTestId("switch-host-sandbox-option-modal")).toBeNull();
       expect(screen.queryByTestId("switch-host-button")).toBeNull();
       expect(updateSessionMock).not.toHaveBeenCalled();
+
+      vi.mocked(fetchSandboxProfiles).mockResolvedValueOnce({
+        profiles: [],
+        managed_providers: ["profiled"],
+        default_profile_ids: {},
+        next_cursor: null,
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      expect(await screen.findByTestId("switch-host-sandbox-option-modal")).toBeInTheDocument();
+      expect(screen.queryByTestId("switch-host-sandbox-option-profiled")).toBeNull();
+    });
+
+    it("says it is checking the sandboxes while profile discovery runs", async () => {
+      vi.mocked(fetchSandboxProfiles).mockReturnValue(new Promise(() => {}));
+      onlyOriginHostOnline();
+      renderDialog({ ...SANDBOX_SERVER, features: { sandbox_profiles: true } });
+      expect(await screen.findByTestId("switch-host-sandboxes-checking")).toBeVisible();
+      expect(screen.queryByTestId("switch-host-no-targets")).toBeNull();
     });
 
     it("moves the session onto a new sandbox after releasing its runner", async () => {
