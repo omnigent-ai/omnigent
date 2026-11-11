@@ -356,7 +356,13 @@ export function describeSchedule(rrule: string): string {
     if (o.freq === RRule.YEARLY && monthName !== undefined && monthDays.length === 1) {
       return `Once on ${monthName} ${monthDays[0]}${timeSuffix}`;
     }
-    return `Once: ${describeSchedule(rrule.replace(/;?\bCOUNT=0*1\b/i, ""))}`;
+    // Drop the whole COUNT property wherever it sits, keeping any RRULE: prefix.
+    const recurring = rrule
+      .replace(/^RRULE:/i, "")
+      .split(";")
+      .filter((part) => !/^\s*COUNT\s*=/i.test(part))
+      .join(";");
+    return `Once: ${describeSchedule(recurring)}`;
   }
 
   if (o.freq === RRule.MINUTELY) {

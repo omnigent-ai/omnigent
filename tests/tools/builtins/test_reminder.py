@@ -13,7 +13,6 @@ import pytest
 
 from omnigent.server.scheduled.rrule import get_next_fire_time, validate_rrule
 from omnigent.tools.builtins.scheduled_tasks import (
-    MAX_REMINDER_DELAY,
     SysReminderSetTool,
     reminder_name,
     reminder_prompt,
@@ -69,7 +68,6 @@ def test_at_is_converted_to_utc() -> None:
         ({"delay_seconds": 10}, "at least one minute"),
         ({"delay_seconds": 364 * 86400 + 1}, "at most 364 days"),
         ({"at": "2026-11-10T22:00:00Z"}, "at least one minute"),
-        ({"delay_seconds": MAX_REMINDER_DELAY.total_seconds() + 1}, "at most 364 days"),
         ({"at": "2027-11-10T22:15:00Z"}, "at most 364 days"),
         # Values that would overflow a float or a timedelta before the range check.
         ({"delay_seconds": 10**400}, "at most 364 days"),

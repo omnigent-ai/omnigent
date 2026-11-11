@@ -205,9 +205,13 @@ describe("describeSchedule", () => {
         "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=23;BYMINUTE=0;BYSECOND=0;COUNT=1",
       ),
     ).toBe("Once on November 12 at 11:00 PM");
-    expect(describeSchedule("FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=1")).toBe(
-      "Once: Every day at 9:00 AM",
-    );
+    for (const rule of [
+      "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=1",
+      "COUNT=1;FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+      "RRULE:COUNT=1;FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+    ]) {
+      expect(describeSchedule(rule)).toBe("Once: Every day at 9:00 AM");
+    }
   });
 
   it.each([
