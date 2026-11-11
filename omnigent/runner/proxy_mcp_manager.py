@@ -48,6 +48,10 @@ _logger = logging.getLogger(__name__)
 
 _EventPublisher = Callable[[str, _JsonObject], None]
 _SERVER_RECONNECT_WAIT_S = 120.0
+# A gateway in front of the server can sever a long-held request with one of
+# these statuses; a 5xx after at least the floor is a sever, not a fast failure.
+_GATEWAY_SEVER_STATUSES = frozenset({502, 503, 504})
+_HELD_REQUEST_SEVER_FLOOR_S = 10.0
 
 
 def _json_object(value: object) -> _JsonObject | None:
@@ -461,6 +465,7 @@ class ProxyMcpManager:
 
         payload = _initial_payload()
         approval_retries = 0
+        call_deadline = monotonic() + MCP_PROXY_CALL_TIMEOUT_S
 
         while True:
             request_generation = pending_approvals.current_server_generation()
@@ -507,6 +512,31 @@ class ProxyMcpManager:
                 payload = cast("_JsonObject", {**payload, "id": request_id})
                 continue
             except Exception as exc:
+                held_s = monotonic() - started
+                registry = self._execution_registry
+                # The runner keeps executing a severed call, so re-POSTing the same
+                # operation attaches to it. The server consumes an approval on first
+                # use, so an approved reply is never re-sent.
+                if (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and exc.response.status_code in _GATEWAY_SEVER_STATUSES
+                    and held_s >= _HELD_REQUEST_SEVER_FLOOR_S
+                    and not managed
+                    and approval_retries == 0
+                    and monotonic() < call_deadline
+                    and registry is not None
+                    and registry.has_operation(self._session_id, operation_id)
+                ):
+                    _logger.warning(
+                        "MCP proxy request for operation %s was severed with HTTP %d "
+                        "after %.0fs; reattaching",
+                        operation_id,
+                        exc.response.status_code,
+                        held_s,
+                    )
+                    request_id += 1
+                    payload = cast("_JsonObject", {**payload, "id": request_id})
+                    continue
                 _record_failure(
                     exc,
                     phase=failure_phase,

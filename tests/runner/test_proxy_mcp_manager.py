@@ -34,6 +34,7 @@ from omnigent.runner.mcp_execution_registry import (
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.spec.types import AgentSpec, MCPServerConfig
+from tests._helpers.polling import poll_until_async
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -540,6 +541,172 @@ async def test_call_tool_reattaches_expired_execution_after_server_disconnect(
     first_params, retry_params = [call.body["params"] for call in transport.calls]
     assert retry_params == first_params
     assert first_params[MCP_OPERATION_ID_PARAM].startswith("mcpop_")
+
+
+class _HeldResponseTransport(httpx.AsyncBaseTransport):
+    """Return scripted responses, advancing a fake clock by each response's hold."""
+
+    def __init__(self, responses: list[tuple[float, httpx.Response]]) -> None:
+        self.now = 0.0
+        self.calls: list[_Call] = []
+        self._responses = list(responses)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.calls.append(_Call(url=str(request.url), body=json.loads(request.content)))
+        held_s, response = self._responses.pop(0)
+        self.now += held_s
+        return response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [502, 503, 504])
+async def test_call_tool_reattaches_after_gateway_severs_held_request(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """A gateway 5xx after a long hold reattaches to the still-running tool."""
+    from omnigent.runner import proxy_mcp_manager
+
+    registry = McpExecutionRegistry()
+    work_released = asyncio.Event()
+    external_invocations = 0
+    severed_handlers: list[asyncio.Future[McpExecutionResult]] = []
+
+    async def _shell_work() -> McpExecutionResult:
+        nonlocal external_invocations
+        external_invocations += 1
+        await work_released.wait()
+        return McpExecutionResult(status_code=200, content={"result": {"output": "done"}})
+
+    class _SeveringGatewayTransport(_HeldResponseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            execution = registry.execute(
+                session_id="conv_test",
+                operation_id=body["params"][MCP_OPERATION_ID_PARAM],
+                step="initial",
+                params={"name": body["params"]["name"], "arguments": body["params"]["arguments"]},
+                run=_shell_work,
+            )
+            if not self.calls:
+                # The gateway answers while the server's forward stays pinned to the runner.
+                severed_handlers.append(asyncio.ensure_future(execution))
+                await asyncio.sleep(0)
+            else:
+                work_released.set()
+                await execution
+            return await super().handle_async_request(request)
+
+    transport = _SeveringGatewayTransport(
+        [
+            (300.0, httpx.Response(status)),
+            (
+                1.0,
+                _json_resp(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {"content": [{"type": "text", "text": "done"}]},
+                    }
+                ),
+            ),
+        ]
+    )
+    monkeypatch.setattr(proxy_mcp_manager, "monotonic", lambda: transport.now)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
+        manager = ProxyMcpManager(
+            session_id="conv_test", ap_client=client, execution_registry=registry
+        )
+        assert await manager.call_tool(None, "sys_os_shell", {"command": "sleep 600"}) == "done"
+    await asyncio.gather(*severed_handlers)
+
+    assert external_invocations == 1
+    assert [call.body["id"] for call in transport.calls] == [1, 2]
+    first_params, retry_params = [call.body["params"] for call in transport.calls]
+    assert retry_params == first_params
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "status", "held_s", "call_budget_s"),
+    [
+        pytest.param("sys_os_shell", 504, 1.0, 7260.0, id="fast-failure"),
+        pytest.param("sys_os_shell", 500, 300.0, 7260.0, id="server-error"),
+        pytest.param("tracker__read_ticket", 504, 300.0, 7260.0, id="registry-route"),
+        pytest.param("sys_os_shell", 504, 300.0, 300.0, id="call-budget-spent"),
+    ],
+)
+async def test_call_tool_does_not_repost_unattachable_http_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    status: int,
+    held_s: float,
+    call_budget_s: float,
+) -> None:
+    """Only a held gateway sever on a runner-retained operation is re-POSTed."""
+    from omnigent.runner import proxy_mcp_manager
+
+    transport = _HeldResponseTransport([(held_s, httpx.Response(status))])
+    monkeypatch.setattr(proxy_mcp_manager, "monotonic", lambda: transport.now)
+    monkeypatch.setattr(proxy_mcp_manager, "MCP_PROXY_CALL_TIMEOUT_S", call_budget_s)
+    spec = AgentSpec(
+        spec_version=1,
+        name="test-agent",
+        mcp_servers=[MCPServerConfig(name="tracker", transport="registry")],
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
+        manager = ProxyMcpManager(
+            session_id="conv_test", ap_client=client, execution_registry=McpExecutionRegistry()
+        )
+        with pytest.raises(RuntimeError, match=str(status)):
+            await manager.call_tool(spec, tool_name, {})
+
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_call_tool_does_not_resend_approved_reply_after_gateway_sever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server consumes an approval on first use, so a severed approved reply fails."""
+    from omnigent.runner import proxy_mcp_manager
+
+    elicitation_id = "elicit_shell"
+    input_required = _json_resp(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "resultType": "input_required",
+                "inputRequests": {
+                    elicitation_id: {
+                        "method": "elicitation/create",
+                        "params": {"message": "Approve shell command?"},
+                    }
+                },
+                "requestState": "approval-state",
+            },
+        }
+    )
+    transport = _HeldResponseTransport([(0.0, input_required), (300.0, httpx.Response(504))])
+    monkeypatch.setattr(proxy_mcp_manager, "monotonic", lambda: transport.now)
+    pending_approvals.reset_for_tests()
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
+        manager = ProxyMcpManager(
+            session_id="conv_test", ap_client=client, execution_registry=McpExecutionRegistry()
+        )
+        task = asyncio.create_task(manager.call_tool(None, "sys_os_shell", {}))
+        try:
+            await poll_until_async(lambda: elicitation_id in pending_approvals._pending)
+            assert pending_approvals.resolve(elicitation_id, approved=True)
+            with pytest.raises(RuntimeError, match="504"):
+                await task
+        finally:
+            if not task.done():
+                task.cancel()
+            pending_approvals.reset_for_tests()
+
+    assert [call.body["id"] for call in transport.calls] == [1, 2]
+    assert transport.calls[1].body["params"]["requestState"] == "approval-state"
 
 
 @pytest.mark.asyncio
