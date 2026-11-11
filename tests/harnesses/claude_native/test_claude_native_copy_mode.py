@@ -34,8 +34,8 @@ import tty
 from pathlib import Path
 
 received, delivered = map(Path, sys.argv[1:3])
-panel_kind = sys.argv[3] if len(sys.argv) > 3 else ""
-panel_open = panel_kind in {"btw", "transcript", "question"}
+surface = sys.argv[3] if len(sys.argv) > 3 else ""
+panel_open = surface in {"btw", "background", "empty_background", "transcript", "question"}
 tty.setraw(sys.stdin.fileno())
 sys.stdout.write("\x1b[?2004h")
 
@@ -46,7 +46,7 @@ def render(draft=""):
     sys.stdout.flush()
 
 
-if panel_kind == "question":
+if surface == "question":
     rule = "─" * os.get_terminal_size().columns
     sys.stdout.write("\x1b[H\x1b[2J" + rule + "\r\n"
         "Which bridge should we use?\r\n❯ 1. Keep overlay\r\n"
@@ -54,14 +54,22 @@ if panel_kind == "question":
         + rule + "\r\n  4. Chat about this\r\n"
         "Enter to select · ↑/↓ to navigate · Esc to cancel\r\n")
     sys.stdout.flush()
-elif panel_kind == "transcript":
+elif surface == "transcript":
     sys.stdout.write("\x1b[H\x1b[2J" + "─" * os.get_terminal_size().columns + "\r\n"
         "  Showing detailed transcript · ctrl+o to toggle · ? for shortcuts\r\n")
     sys.stdout.flush()
-elif panel_open:
+elif surface == "btw":
     sys.stdout.write("\x1b[H\x1b[2J" + "▔" * os.get_terminal_size().columns + "\r\n"
         "    /btw do the checks pass?\r\n      Yes, the checks pass.\r\n"
         "    ↑/↓ to scroll · c to copy · f to fork · Esc to close\r\n")
+    sys.stdout.flush()
+elif panel_open:
+    body = ("  No tasks currently running\r\n" if surface == "empty_background"
+        else "  1 active shell\r\n  ❯ ● make test   running\r\n")
+    stop_hint = "" if surface == "empty_background" else "x to stop · "
+    sys.stdout.write("\x1b[H\x1b[2J" + "─" * os.get_terminal_size().columns + "\r\n"
+        + "  Background\r\n" + body
+        + "  ↑/↓ to select · Enter to view · " + stop_hint + "Esc to close\r\n")
     sys.stdout.flush()
 else:
     render()
@@ -74,9 +82,9 @@ while True:
         log.write(chunk)
     buffer += chunk
     if panel_open:
-        close_key = b"1\r" if panel_kind == "question" else (
-            b"\x0f" if panel_kind == "transcript" else b"\x1b")
-        if close_key in buffer or (panel_kind == "question" and b"\x1b" in buffer):
+        close_key = b"1\r" if surface == "question" else (
+            b"\x0f" if surface == "transcript" else b"\x1b")
+        if close_key in buffer or (surface == "question" and b"\x1b" in buffer):
             panel_open = False
             buffer = b""
             render()
@@ -150,7 +158,13 @@ def pane(
                     "-s",
                     "main",
                     "-x",
-                    "46" if panel == "question" else "48" if panel else "120",
+                    {
+                        "background": "50",
+                        "empty_background": "41",
+                        "btw": "48",
+                        "transcript": "48",
+                        "question": "46",
+                    }.get(panel, "120"),
                     "-y",
                     "24",
                     command,
@@ -175,6 +189,8 @@ def pane(
                 if panel == "question"
                 else "Showing detailed transcript"
                 if panel == "transcript"
+                else "Background"
+                if "background" in panel
                 else "▔"
                 if panel
                 else "❯"
@@ -263,6 +279,27 @@ def test_quick_answer_can_be_read_and_closed_in_a_narrow_pane(pane: _Pane) -> No
     assert _wait_for_bytes(pane.received, b"\x1b") == b"\x1b"
     bridge.inject_user_message(pane.bridge_dir, content="SENT_AFTER_QUICK_ANSWER", timeout_s=5.0)
     assert json.loads(pane.delivered.read_text()) == ["SENT_AFTER_QUICK_ANSWER"]
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [("emacs", "background"), ("emacs", "empty_background")],
+    indirect=True,
+    ids=["populated", "empty"],
+)
+def test_web_message_dismisses_wrapped_background_panel(
+    pane: _Pane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real terminal wraps the close hint before delivery reclaims the composer."""
+    monkeypatch.setattr(bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 2.0)
+    captured = bridge._capture_pane(pane.tmux[-1], "main")
+    assert "Esc to close" not in captured
+    assert "Esc\nto close" in captured or "Esc to\nclose" in captured
+
+    bridge.inject_user_message(pane.bridge_dir, content="AFTER_BACKGROUND_PANEL", timeout_s=2.0)
+
+    assert json.loads(pane.delivered.read_text()) == ["AFTER_BACKGROUND_PANEL"]
+    assert pane.received.read_bytes().count(b"\x1b[200~") == 1
 
 
 def test_interrupt_reaches_scrolled_back_pane(pane: _Pane) -> None:

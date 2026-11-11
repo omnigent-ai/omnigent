@@ -1068,6 +1068,10 @@ Cross-harness journeys:
   occupies Claude Code's input box afterwards, the web message is refused with a
   notice to open the terminal, dismiss it, and resend. No message text is typed
   into the pane.
+  Dismissal hints above the current pane rule do not send Escape into a starting
+  terminal; `tests/harnesses/claude_native/test_claude_native_bridge.py::test_inject_user_message_sends_no_escape_into_launcher_output`
+  covers initial and late startup frames, with wrapped panels checked through
+  real tmux in `tests/harnesses/claude_native/test_claude_native_copy_mode.py`.
   `tests/harnesses/claude_native/test_claude_native_bridge.py::test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_clear`
   covers the refusal with a fake tmux (plain `uv run pytest`);
   `tests/e2e_ui/messages/test_claude_native_refused_delivery_persistence.py::test_claude_refused_message_survives_reload`
