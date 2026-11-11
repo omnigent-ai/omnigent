@@ -1,6 +1,6 @@
 """Tests for :mod:`omnigent.cli_invocation`.
 
-Followup hints must name the configured wrapper (``isaac omni stop``) when
+Followup hints must name the configured wrapper (``example-wrapper omni stop``) when
 ``OMNIGENT_WRAPPER_COMMAND`` is set, and fall back to the naked binary token
 otherwise so default output is unchanged.
 """
@@ -23,9 +23,9 @@ def test_preserves_omni_alias_when_wrapper_unset() -> None:
 
 
 def test_wrapper_command_overrides_both_names() -> None:
-    env = {WRAPPER_COMMAND_ENV: "isaac omni"}
-    assert cli_invocation(env=env) == "isaac omni"
-    assert cli_invocation(name="omni", env=env) == "isaac omni"
+    env = {WRAPPER_COMMAND_ENV: "example-wrapper omni"}
+    assert cli_invocation(env=env) == "example-wrapper omni"
+    assert cli_invocation(name="omni", env=env) == "example-wrapper omni"
 
 
 def test_blank_wrapper_command_is_ignored() -> None:
@@ -34,17 +34,20 @@ def test_blank_wrapper_command_is_ignored() -> None:
 
 
 def test_wrapper_command_is_stripped() -> None:
-    assert cli_invocation(env={WRAPPER_COMMAND_ENV: "  isaac omni  "}) == "isaac omni"
+    assert (
+        cli_invocation(env={WRAPPER_COMMAND_ENV: "  example-wrapper omni  "})
+        == "example-wrapper omni"
+    )
 
 
 def test_reads_process_environment_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(WRAPPER_COMMAND_ENV, "isaac omni")
-    assert cli_invocation() == "isaac omni"
+    monkeypatch.setenv(WRAPPER_COMMAND_ENV, "example-wrapper omni")
+    assert cli_invocation() == "example-wrapper omni"
     monkeypatch.delenv(WRAPPER_COMMAND_ENV, raising=False)
     assert cli_invocation() == "omnigent"
 
 
 def test_rendered_hint_names_the_wrapper() -> None:
-    env = {WRAPPER_COMMAND_ENV: "isaac omni"}
-    assert f"Run `{cli_invocation(env=env)} stop`" == "Run `isaac omni stop`"
+    env = {WRAPPER_COMMAND_ENV: "example-wrapper omni"}
+    assert f"Run `{cli_invocation(env=env)} stop`" == "Run `example-wrapper omni stop`"
     assert f"Run `{cli_invocation(env={})} stop`" == "Run `omnigent stop`"

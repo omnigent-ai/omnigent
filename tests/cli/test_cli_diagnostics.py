@@ -278,12 +278,12 @@ def test_stale_host_hint_names_configured_wrapper(
     """Under a wrapper deployment the hint suggests the wrapper, not naked `omnigent`."""
     terminal_stderr = io.StringIO()
     monkeypatch.setattr(sys, "stderr", terminal_stderr)
-    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "example-wrapper omni")
 
     cli_diagnostics.print_stale_host_hint()
 
     hint = terminal_stderr.getvalue()
-    assert "`isaac omni stop`" in hint
+    assert "`example-wrapper omni stop`" in hint
     # The naked binary token must not be suggested when it would be refused.
     assert "`omnigent stop`" not in hint
 
@@ -530,7 +530,7 @@ async def test_slash_command_exceptions_reach_cli_log(
             "failed before a response arrived (ReadTimeout)",
             True,
         ),
-        (401, "Sign in with `isaac omni login https://server.example`", False),
+        (401, "Sign in with `example-wrapper omni login https://server.example`", False),
     ],
 )
 def test_main_reports_discovery_failure_without_runner_recovery_hint(
@@ -554,7 +554,7 @@ def test_main_reports_discovery_failure_without_runner_recovery_hint(
         return httpx.Response(failure, request=httpx.Request("GET", url))
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "example-wrapper omni")
     monkeypatch.setattr(chat_module.httpx, "get", _get)
     monkeypatch.setattr(cli_module, "_load_global_config", dict)
     argv = ["omnigent", "run", "--server", server_url, "-p", "hi"]

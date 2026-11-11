@@ -90,7 +90,7 @@ _RUNNER_NOT_AVAILABLE = (
 def _host_offline_message() -> str:
     """Return the failure text a send gets when its session's host is offline.
 
-    Built from ``cli_invocation()`` so hosts that wrap the CLI (``isaac omni``)
+    Built from ``cli_invocation()`` so hosts that wrap the CLI (``example-wrapper omni``)
     see the same spelling the server renders.
     """
     return (
@@ -917,8 +917,8 @@ async def test_inline_create_harness_not_configured_stays_lenient(
             HARNESS_NOT_CONFIGURED_ERROR_CODE,
             HARNESS_NOT_CONFIGURED_ERROR_CODE,
             "",
-            ("isaac omni setup",),
-            "isaac omni",
+            ("example-wrapper omni setup",),
+            "example-wrapper omni",
         ),
         (
             WORKSPACE_MISSING_ERROR_CODE,
