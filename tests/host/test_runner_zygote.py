@@ -803,7 +803,7 @@ def test_fork_after_stop_raises_unavailable(manager: ZygoteManager, tmp_path) ->
     ids=["timeout", "partial-timeout", "malformed", "non-object", "invalid-utf8"],
 )
 def test_failed_control_channel_never_assigns_a_late_reply(
-    tmp_path: Path, initial_reply: bytes, late_reply: bytes
+    tmp_path: Path, initial_reply: bytes, late_reply: bytes, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A concurrent launch must not receive an earlier fork's delayed PID."""
     client, peer = socket.socketpair()
@@ -823,13 +823,24 @@ def test_failed_control_channel_never_assigns_a_late_reply(
         with pytest.raises(BlockingIOError):
             peer.recv(1)
         assert client.fileno() >= 0
+        events = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "runner_zygote_control_lost"
+        ]
+        assert len(events) == 1
+        assert events[0].attributes["control_command"] == "fork"
+        assert events[0].attributes["zygote_state"] == "unknown"
     finally:
         manager.stop()
         peer.close()
 
 
 def test_failed_control_channel_preserves_live_children(
-    manager: ZygoteManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    manager: ZygoteManager,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Losing control replies cannot stop the shared parent or fail live runners."""
     child = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"), str(tmp_path))
@@ -850,12 +861,56 @@ def test_failed_control_channel_preserves_live_children(
         assert child.poll() is None
         with pytest.raises(ZygoteUnavailable):
             manager.start()
+        events = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "runner_zygote_control_lost"
+        ]
+        assert len(events) == 1
+        assert events[0].attributes == {
+            "host_pid": os.getpid(),
+            "zygote_pid": manager.pid,
+            "zygote_generation": manager._generation,
+            "zygote_state": "running",
+            "zygote_returncode": None,
+            "control_command": "poll",
+            "runner_pid": child.pid,
+            "error_type": "TimeoutError",
+        }
         child.kill()
         assert _wait_exit(child) == _ZYGOTE_LOST_EXIT_CODE
         manager.stop()
         manager.start()
         fresh = manager.fork_runner(_fork_env(7), str(tmp_path / "fresh.log"), str(tmp_path))
         assert _wait_exit(fresh) == 7
+    finally:
+        child.kill()
+
+
+def test_dead_forkserver_reports_its_own_exit_not_the_runner_sentinel(
+    manager: ZygoteManager, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    child = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"), str(tmp_path))
+    parent = manager._proc
+    assert parent is not None
+    try:
+        parent.kill()
+        assert parent.wait(timeout=5) == -signal.SIGKILL
+        assert child.poll() is None
+        assert child.poll() is None
+        events = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "runner_zygote_control_lost"
+        ]
+        assert len(events) == 1
+        assert events[0].attributes["zygote_pid"] == parent.pid
+        assert events[0].attributes["zygote_state"] == "exited"
+        assert events[0].attributes["zygote_returncode"] == -signal.SIGKILL
+        assert events[0].attributes["runner_pid"] == child.pid
+        assert events[0].attributes["host_pid"] == os.getpid()
+        child.kill()
+        assert _wait_exit(child) == _ZYGOTE_LOST_EXIT_CODE
     finally:
         child.kill()
 
