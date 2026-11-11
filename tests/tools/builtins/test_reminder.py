@@ -94,11 +94,9 @@ def test_rule_fires_once_at_the_requested_minute(created: datetime, delay: timed
 
 
 def test_rule_ignores_the_callers_offset() -> None:
-    when = resolve_reminder_time(
-        {"at": datetime(2026, 11, 11, 9, 30, tzinfo=timezone(timedelta(hours=9))).isoformat()},
-        _NOW,
-    )
-    assert isinstance(when, datetime)
+    # 09:30 at +09:00 is 00:30 UTC; the rule must name the UTC calendar fields
+    # even when handed a time that hasn't been converted yet.
+    when = datetime(2026, 11, 11, 9, 30, tzinfo=timezone(timedelta(hours=9)))
     assert reminder_rrule(when) == (
         "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=11;BYHOUR=0;BYMINUTE=30;BYSECOND=0;COUNT=1"
     )
