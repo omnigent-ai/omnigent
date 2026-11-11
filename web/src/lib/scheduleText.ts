@@ -352,11 +352,22 @@ export function describeSchedule(rrule: string): string {
   if (o.count === 1) {
     const months = normalizeNums(o.bymonth);
     const monthDays = normalizeNums(o.bymonthday);
+    const hours = normalizeNums(o.byhour);
+    const minutes = normalizeNums(o.byminute);
     const monthName = months.length === 1 ? MONTH_NAMES[months[0]! - 1] : undefined;
-    if (o.freq === RRule.YEARLY && monthName !== undefined && monthDays.length === 1) {
+    // A literal date only for the reminder shape: one month, one positive day and
+    // one time. Anything else (negative days, several times) names no single moment.
+    if (
+      o.freq === RRule.YEARLY &&
+      monthName !== undefined &&
+      monthDays.length === 1 &&
+      monthDays[0]! > 0 &&
+      hours.length <= 1 &&
+      minutes.length <= 1
+    ) {
       return `Once on ${monthName} ${monthDays[0]}${timeSuffix}`;
     }
-    // Drop the whole COUNT property wherever it sits, keeping any RRULE: prefix.
+    // Remove COUNT before describing the underlying recurrence.
     const recurring = rrule
       .replace(/^RRULE:/i, "")
       .split(";")

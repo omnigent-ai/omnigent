@@ -212,6 +212,16 @@ describe("describeSchedule", () => {
     ]) {
       expect(describeSchedule(rule)).toBe("Once: Every day at 9:00 AM");
     }
+    // These name no single literal moment, so they keep the recurrence wording.
+    for (const rule of [
+      "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=-1;BYHOUR=9;BYMINUTE=0;COUNT=1",
+      "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=9,17;BYMINUTE=0;COUNT=1",
+    ]) {
+      const text = describeSchedule(rule);
+      expect(text.startsWith("Once: ")).toBe(true);
+      expect(text).not.toMatch(/^Once on /);
+      expect(text).not.toContain("November -1");
+    }
   });
 
   it.each([
