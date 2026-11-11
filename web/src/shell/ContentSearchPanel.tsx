@@ -2,9 +2,9 @@ import { type RefObject, useEffect, useId, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { FileIcon, FilterIcon, SearchIcon } from "lucide-react";
 import {
-  closesUnopenedGroup,
   contentSearchPattern,
   fitsContentSearchLimit,
+  wholeWordRegexProblem,
 } from "@/lib/contentSearch";
 import { authenticatedFetch } from "@/lib/identity";
 import { Button } from "@/components/ui/button";
@@ -69,9 +69,9 @@ export function ContentSearchPanel({
   // Whole word is sent as a regular expression, which can outgrow the server's query limit.
   const sent = contentSearchPattern({ query, regex, wholeWord });
   const tooLong = wholeWord && !fitsContentSearchLimit(sent.pattern);
-  // Such an expression would close the Whole word wrapper and escape its boundaries.
-  const unopenedGroup = wholeWord && regex && closesUnopenedGroup(query);
-  const canSearch = query.trim() !== "" && !tooLong && !unopenedGroup;
+  // Such an expression could escape the Whole word wrapper and lose its boundaries.
+  const regexProblem = wholeWord && regex ? wholeWordRegexProblem(query) : null;
+  const canSearch = query.trim() !== "" && !tooLong && regexProblem === null;
   useEffect(() => {
     queryClient.setQueryData(["content-search-input", conversationId], input);
   }, [conversationId, input, queryClient]);
@@ -181,10 +181,16 @@ export function ContentSearchPanel({
             This search is too long to match whole words. Shorten it, or turn off Whole word.
           </p>
         )}
-        {unopenedGroup && (
+        {regexProblem === "unopened-group" && (
           <p role="alert" className="text-xs text-destructive">
             This expression closes a group it never opened, so it can’t match whole words. Balance
             its parentheses, or turn off Whole word.
+          </p>
+        )}
+        {regexProblem === "verbose" && (
+          <p role="alert" className="text-xs text-destructive">
+            Whole word can’t be used with verbose mode (?x). Remove that flag, or turn off Whole
+            word.
           </p>
         )}
         <div id={filtersId} hidden={!showFilters} className="space-y-2 text-xs">

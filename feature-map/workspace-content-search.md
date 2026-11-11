@@ -79,7 +79,8 @@ shortcut should be unavailable.
 - Whole word follows ripgrep's Unicode word characters. A literal that starts or
   ends with punctuation matches as typed on that side (`C++` also finds `C++x`);
   a regular expression always needs a word boundary at both ends. An expression
-  that closes a group it never opened (`foo)|(bar`) is refused with Whole word on.
+  that closes a group it never opened (`foo)|(bar`) or turns on verbose mode
+  (`(?x)`) is refused with Whole word on.
 - Search state stays in memory per conversation until the page reloads. Returning
   to a conversation restores its last search; submit again to refresh the results.
 - Search covers the session workspace on disk, including hidden and untracked

@@ -25,7 +25,10 @@
     "a&b",
     "[x]",
     "\ud839\udec0",
-    "x«quote»y"
+    "x«quote»y",
+    "xcafé",
+    "caféx",
+    "иглаx"
   ],
   "cases": [
     {

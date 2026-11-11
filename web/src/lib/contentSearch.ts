@@ -64,15 +64,23 @@ export function contentSearchPattern({ query, regex, wholeWord }: ContentSearchP
   return { pattern: `${first}${middle}${last}`, regex: true };
 }
 
+/** Why Whole word can't wrap a regular expression in `\b(?:…)\b`. */
+export type WholeWordRegexProblem = "unopened-group" | "verbose";
+
 /**
- * Whether a ripgrep regular expression closes a group it never opened, as in
- * `foo)|(bar`. Ripgrep accepts that, so wrapping it in `\b(?:…)\b` would let it
- * close the wrapper and leave an alternative without its boundary. Escapes and
- * (nested) character classes are skipped, as ripgrep reads them. Verbose `(?x)`
- * mode can only make this refuse more: ignored whitespace may end a class here
- * sooner, and a `#` comment swallows the wrapper's `)`, which ripgrep rejects.
+ * Whether a ripgrep regular expression could escape the `\b(?:…)\b` Whole word
+ * wrapper, leaving an alternative without its boundary.
+ *
+ * - `unopened-group`: it closes a group it never opened, as in `foo)|(bar`.
+ *   Ripgrep accepts that, so wrapped, it would close the wrapper instead.
+ * - `verbose`: it turns on verbose mode, as in `(?x)`, where ignored whitespace
+ *   and comments change how ripgrep reads brackets. Rather than model that,
+ *   such an expression is refused.
+ *
+ * Escapes and (nested) character classes are skipped as ripgrep reads them,
+ * which is exact up to the first flag group that could turn on verbose mode.
  */
-export function closesUnopenedGroup(query: string): boolean {
+export function wholeWordRegexProblem(query: string): WholeWordRegexProblem | null {
   let groups = 0;
   let classes = 0;
   // Just after `[` or `[^`, where a `]` is a literal rather than the end of the class.
@@ -89,13 +97,16 @@ export function closesUnopenedGroup(query: string): boolean {
       if (character === "]" && !classStart) classes -= 1;
       classStart = classStart && character === "^" && query[index - 1] === "[";
     } else if (character === "(") {
+      // A flag group, `(?flags)` or `(?flags:…)`; the flags before any `-` are turned on.
+      const flags = /^\?([A-Za-z-]*)[):]/.exec(query.slice(index + 1));
+      if (flags?.[1].split("-")[0].includes("x")) return "verbose";
       groups += 1;
     } else if (character === ")") {
       groups -= 1;
-      if (groups < 0) return true;
+      if (groups < 0) return "unopened-group";
     }
   }
-  return false;
+  return null;
 }
 
 /** Whether `pattern` fits the server's limit, counting code points as the server does. */

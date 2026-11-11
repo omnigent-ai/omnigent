@@ -295,7 +295,7 @@ it("refuses a whole-word search that outgrows the server's limit without sending
   expect(url.searchParams.get("regex")).toBe("false");
 });
 
-it("refuses a whole-word expression that closes a group it never opened", async () => {
+it("refuses whole-word expressions that could escape the boundaries", async () => {
   vi.mocked(authenticatedFetch).mockImplementation(
     async () => new Response(JSON.stringify({ matches: [], truncated: false, warning: null })),
   );
@@ -313,6 +313,14 @@ it("refuses a whole-word expression that closes a group it never opened", async 
   expect(screen.getByRole("button", { name: "Search" })).toBeDisabled();
   fireEvent.submit(screen.getByRole("searchbox").closest("form")!);
   expect(authenticatedFetch).not.toHaveBeenCalled();
+  fireEvent.change(screen.getByRole("searchbox"), { target: { value: "(?x)[ ](]foo)|(bar" } });
+  expect(screen.getByRole("alert")).toHaveTextContent(
+    "Whole word can’t be used with verbose mode (?x).",
+  );
+  expect(screen.getByRole("button", { name: "Search" })).toBeDisabled();
+  fireEvent.submit(screen.getByRole("searchbox").closest("form")!);
+  expect(authenticatedFetch).not.toHaveBeenCalled();
+  fireEvent.change(screen.getByRole("searchbox"), { target: { value: "foo)|(bar" } });
   // With Whole word off the expression goes to ripgrep unchanged, as before.
   fireEvent.click(screen.getByLabelText("Whole word"));
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();

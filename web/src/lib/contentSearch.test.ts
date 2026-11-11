@@ -3,9 +3,9 @@ import { describe, expect, it } from "vitest";
 import wholeWordCases from "@/lib/__fixtures__/contentSearchWholeWord.json";
 import {
   CONTENT_SEARCH_QUERY_LIMIT,
-  closesUnopenedGroup,
   contentSearchPattern,
   fitsContentSearchLimit,
+  wholeWordRegexProblem,
 } from "@/lib/contentSearch";
 
 // The runner test sends each case's pattern through real ripgrep against the
@@ -40,35 +40,50 @@ describe("contentSearchPattern", () => {
   });
 });
 
-describe("closesUnopenedGroup", () => {
+describe("wholeWordRegexProblem", () => {
   it("finds a group closed before it is opened, which would escape the wrapper", () => {
     // `\b(?:foo)|(bar)\b` would match inside `foobar`, `xbar` and `foox`.
-    expect(closesUnopenedGroup("foo)|(bar")).toBe(true);
-    expect(closesUnopenedGroup("foo))|((bar")).toBe(true);
-    expect(closesUnopenedGroup("(a)b)")).toBe(true);
+    for (const query of ["foo)|(bar", "foo))|((bar", "(a)b)", "[ ])", "[^^])"]) {
+      expect(wholeWordRegexProblem(query)).toBe("unopened-group");
+    }
   });
 
   it("accepts balanced groups and parentheses ripgrep reads as literals", () => {
     for (const query of [
       "needle|pin",
       "(?i)foo",
+      "(?i:foo)|bar",
+      "(?-x)foo",
+      "(?P<x>foo)",
       "(a|b)(c)",
       "a\\)b",
+      "\\(?x\\)",
       "[)]",
+      "[(?x)]",
+      "[])]",
+      "[^])]",
       "[]x)]",
-      "[^]x)]",
       "[[)]a]",
       "[[:alpha:])]",
       "(unclosed",
     ]) {
-      expect(closesUnopenedGroup(query)).toBe(false);
+      expect(wholeWordRegexProblem(query)).toBeNull();
     }
   });
 
-  it("does not treat a literal `]` at the start of a class as its end", () => {
-    expect(closesUnopenedGroup("[])]")).toBe(false);
-    expect(closesUnopenedGroup("[^])]")).toBe(false);
-    expect(closesUnopenedGroup("[^^])")).toBe(true);
+  it("refuses verbose mode, where whitespace changes how brackets read", () => {
+    // Ripgrep reads `[ ](]` as one class here, so a later `)` closes the wrapper.
+    for (const query of [
+      "(?x)[ ](]foo)|(bar",
+      "(?x)[ ^ ](]foo)|(bar",
+      "(?x)[ ])]",
+      "(?ix)foo",
+      "(?x:foo)",
+      "(?x-i)foo",
+      "a(?x)b",
+    ]) {
+      expect(wholeWordRegexProblem(query)).toBe("verbose");
+    }
   });
 });
 
