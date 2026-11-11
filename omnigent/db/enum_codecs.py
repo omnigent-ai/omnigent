@@ -134,7 +134,7 @@ SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
 }
 
 # Proactive-agent Inbox items (``inbox_items``).
-INBOX_ITEM_STATE: dict[str, int] = {
+INBOX_ITEM_STATUS: dict[str, int] = {
     "unread": 1,
     "read": 2,
     "done": 3,
