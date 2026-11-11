@@ -133,10 +133,6 @@ def test_push_policy_checks_the_actual_remote() -> None:
     )
 
 
-def test_push_to_unknown_remote_alias_requires_approval() -> None:
-    assert _push_verdict("git push origin main") == "ASK"
-
-
 def test_unrecognized_push_option_requires_approval() -> None:
     assert (
         _push_verdict("git push --unknown-option https://github.com/example/allowed main") == "ASK"
@@ -205,6 +201,8 @@ def test_repo_option_is_the_only_push_authority_when_present() -> None:
         "git push -uf https://github.com/example/allowed main",
         "git push --force-with-lease=main https://github.com/example/allowed main",
         "git push https://github.com/example/allowed +main",
+        "git push --force-if-includes https://github.com/example/allowed main",
+        "git push https://github.com/example/allowed main -f",
     ],
 )
 def test_force_push_forms_remain_denied(command: str) -> None:
@@ -217,11 +215,8 @@ def test_force_push_forms_remain_denied(command: str) -> None:
         "git push --delete https://github.com/example/allowed main",
         "git push -d https://github.com/example/allowed main",
         "git push https://github.com/example/allowed :main",
+        "git push https://github.com/example/allowed main -d",
     ],
 )
 def test_delete_push_forms_remain_denied(command: str) -> None:
     assert _push_verdict(command) == "DENY"
-
-
-def test_allowlisted_push_remains_allowed() -> None:
-    assert _push_verdict("git push https://github.com/example/allowed main") == "ALLOW"

@@ -337,6 +337,12 @@ def test_shell_push_to_url_repo_allowed() -> None:
     assert policy(_sh("git push https://github.com/octo/hello main")) is None
 
 
+def test_shell_push_to_allowed_repo_and_branch_is_allowed() -> None:
+    """A push to an allowlisted repo on an allowlisted branch abstains."""
+    policy = github_policy(write_repos=["example/allowed"], write_branches=["main"])
+    assert policy(_sh("git push https://github.com/example/allowed main")) is None
+
+
 def test_shell_push_to_url_repo_denied() -> None:
     """A push to a determinable non-allowlisted repo is denied."""
     policy = github_policy(write_repos=[_REPO])
@@ -829,15 +835,11 @@ def test_unresolvable_wrapper_head_asks_instead_of_abstaining() -> None:
 def test_shell_lookalike_host_read_not_treated_as_github(host: str) -> None:
     """A look-alike host is not parsed as ``github.com`` for reads.
 
-    A clone from ``<host>/octocat/Hello-World`` must NOT resolve to the
-    allowlisted ``octocat/Hello-World``; with reads restricted and no real repo
-    determinable, it falls to ASK rather than wrongly ALLOWing. Covers alnum
-    AND hyphen/underscore prefixes. The alnum hosts were already ASK before
-    the fix (the original guard); the hyphen/underscore hosts were silently
-    parsed as real ``github.com`` until the ``_REPO_URL_PATTERN`` lookbehind
-    was widened to include ``-`` and ``_``. Dropping those two chars again
-    would flip the hyphen/underscore rows back to ALLOW, leaking a foreign
-    host's clone into the allowlisted repo.
+    A clone from ``<host>/octocat/Hello-World`` must not resolve to the
+    allowlisted ``octocat/Hello-World``. The URL host is compared exactly with
+    ``github.com``, so a prefix before it (alnum, hyphen, or underscore) must
+    never be stripped to match. With reads restricted and no determinable repo,
+    the call falls to ASK.
     """
     policy = github_policy(read_all=False, read_repos=["octocat/Hello-World"])
     assert _action(policy(_sh(f"git clone https://{host}/octocat/Hello-World"))) == "ASK"
