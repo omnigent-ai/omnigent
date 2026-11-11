@@ -386,27 +386,6 @@ def test_parse_modal_without_image_defaults_to_official(
     assert fake.image is None
 
 
-def test_parse_non_modal_provider_yields_rejecting_factory() -> None:
-    """
-    lakebox configs parse (a deployment can stage config before
-    managed-launch support lands), but their factory rejects with a 400
-    naming the provider when a managed session is actually requested.
-    """
-    cfg = parse_sandbox_config({"provider": "lakebox", "server_url": "https://s.example.com"})
-    assert cfg is not None
-    cfg = cfg.default
-    # A staged provider must not advertise managed launch on /v1/info —
-    # the web UI would offer a sandbox option every create rejects.
-    assert cfg.managed_launch_supported is False
-    # The provider is still parsed onto the config; /v1/info gates on
-    # managed_launch_supported, so the name is not surfaced while staged.
-    assert cfg.provider == "lakebox"
-    with pytest.raises(HTTPException) as exc:
-        cfg.launcher_factory()
-    assert exc.value.status_code == 400
-    assert "lakebox" in exc.value.detail
-
-
 def test_parse_valid_daytona_config_builds_parameterized_factory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2531,9 +2510,6 @@ async def test_lifespan_gates_one_deployment_wide_managed_sandbox_reaper(
         # No `sandbox:` section → a managed create would 400; the option
         # must not be advertised and no provider is named.
         (None, False, None),
-        # advertising it would offer a create path that always fails, so
-        # the option is hidden and the provider stays unnamed.
-        ({"provider": "lakebox", "server_url": "https://s.example.com"}, False, None),
         # Daytona has managed-launch support like modal → offered and
         # named so the UI can label it ("Daytona Sandbox").
         ({"provider": "daytona", "server_url": "https://s.example.com"}, True, "daytona"),
@@ -3208,24 +3184,6 @@ async def test_update_sandbox_id_is_fenced_to_the_armed_generation(
     assert swapped.updated_at == connected.updated_at
     assert not host_store.is_online(host.host_id)
     assert host_store.resolve_launch_token(host.host_id, token) is not None
-
-
-async def test_launch_unsupported_yaml_provider_rejects_before_provisioning(
-    db_uri: str,
-) -> None:
-    """
-    A staged-but-unimplemented YAML provider (lakebox) fails with a 400
-    naming the provider BEFORE any provisioning happens.
-    """
-    config = parse_sandbox_config({"provider": "lakebox", "server_url": "https://s.example.com"})
-    assert config is not None
-    host_store = HostStore(db_uri)
-    with pytest.raises(HTTPException) as exc:
-        await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
-    assert exc.value.status_code == 400
-    assert "lakebox" in exc.value.detail
-    # No host row was pre-registered.
-    assert host_store.list_hosts(_OWNER) == []
 
 
 async def test_launch_provision_failure_maps_to_502(
@@ -5397,58 +5355,38 @@ def test_parse_multi_provider_validates_provider_blocks() -> None:
         )
 
 
-def test_parse_multi_provider_excludes_staged_providers_from_choices() -> None:
-    """
-    A staged provider (lakebox parses, then rejects at launch) stays
-    configurable but is never offered as a choice.
-    """
-    config = parse_sandbox_config(
-        {
-            "server_url": "https://s.example.com",
-            "providers": [{"provider": "modal"}, {"provider": "lakebox"}],
-        }
-    )
-    assert config is not None
-    assert config.launchable_providers() == ("modal",)
-    # Still resolvable by name, so a host launched on it can be torn down.
-    assert config.for_provider("lakebox") is not None
+def test_multi_provider_excludes_unavailable_configs_from_choices() -> None:
+    """An unavailable custom launcher remains addressable but is not offered."""
+    available = replace(_injected_config(FakeSandboxLauncher()).default, provider="custom")
+    unavailable = replace(available, provider="unavailable", managed_launch_supported=False)
+    config = ManagedSandboxDeployment(configs=(available, unavailable))
+
+    assert config.launchable_providers() == ("custom",)
+    assert config.for_provider("unavailable") is unavailable
 
 
-def test_parse_multi_provider_default_skips_leading_staged_provider() -> None:
-    """
-    A staged provider (parse-but-reject) listed first is never the
-    default: the default is the first launch-capable entry, so the
-    default launcher and ``managed_launch_supported`` agree.
-    """
-    config = parse_sandbox_config(
-        {
-            "server_url": "https://s.example.com",
-            "providers": [{"provider": "lakebox"}, {"provider": "modal"}],
-        }
-    )
-    assert config is not None
+def test_multi_provider_default_skips_leading_unavailable_config() -> None:
+    """The first launch-capable custom launcher is the default."""
+    available = replace(_injected_config(FakeSandboxLauncher()).default, provider="custom")
+    unavailable = replace(available, provider="unavailable", managed_launch_supported=False)
+    config = ManagedSandboxDeployment(configs=(unavailable, available))
+
     assert config.managed_launch_supported is True
-    # lakebox is first in configured order but cannot launch, so modal
-    # backs a provider-less request.
-    assert config.default.provider == "modal"
+    assert config.default is available
     assert config.for_provider(None) is config.default
 
 
-def test_parse_multi_provider_default_falls_back_when_none_launchable() -> None:
-    """
-    A deployment of only staged providers still resolves a default (the
-    first entry), rather than raising — teardown of a host launched
-    before support was pulled must still find a config.
-    """
-    config = parse_sandbox_config(
-        {
-            "server_url": "https://s.example.com",
-            "providers": [{"provider": "lakebox"}],
-        }
+def test_multi_provider_default_falls_back_when_none_launchable() -> None:
+    """An unavailable custom launcher remains usable for host teardown."""
+    unavailable = replace(
+        _injected_config(FakeSandboxLauncher()).default,
+        provider="unavailable",
+        managed_launch_supported=False,
     )
-    assert config is not None
+    config = ManagedSandboxDeployment.single(unavailable)
+
     assert config.managed_launch_supported is False
-    assert config.default.provider == "lakebox"
+    assert config.default is unavailable
 
 
 @pytest.mark.parametrize(
@@ -5724,7 +5662,7 @@ async def test_info_lists_every_offered_provider(db_uri: str, tmp_path: Path) ->
     config = parse_sandbox_config(
         {
             "server_url": "https://s.example.com",
-            "providers": [{"provider": "modal"}, {"provider": "e2b"}, {"provider": "lakebox"}],
+            "providers": [{"provider": "modal"}, {"provider": "e2b"}],
         }
     )
     app = _capability_probe_app(db_uri, tmp_path, config)
@@ -5734,7 +5672,6 @@ async def test_info_lists_every_offered_provider(db_uri: str, tmp_path: Path) ->
     body = resp.json()
     assert body["managed_sandboxes_enabled"] is True
     assert body["sandbox_provider"] == "modal"
-    # Staged lakebox is configurable but never offered as a choice.
     assert body["sandbox_providers"] == ["modal", "e2b"]
 
 
@@ -6812,21 +6749,6 @@ def test_unknown_provider_is_still_rejected(contributed_acme_provider: None) -> 
     """Consulting the registry does not make every name acceptable."""
     with pytest.raises(ValueError, match=r"sandbox\.provider"):
         parse_sandbox_config({"provider": "nope", "server_url": "https://s.example.com"})
-
-
-def test_builtin_without_a_branch_is_unaffected_by_the_registry(
-    contributed_acme_provider: None,
-) -> None:
-    """
-    `lakebox` is registered in the registry AND listed as supported here, but
-    has no config branch, so it must keep falling through to the staged
-    rejection instead of gaining a launcher from the registry.
-    """
-    cfg = parse_sandbox_config({"provider": "lakebox", "server_url": "https://s.example.com"})
-    assert cfg is not None
-    assert cfg.default.managed_launch_supported is False
-    with pytest.raises(HTTPException):
-        cfg.default.launcher_factory()
 
 
 def test_agent_sandbox_reuses_the_kubernetes_config_block() -> None:

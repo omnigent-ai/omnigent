@@ -57,7 +57,6 @@ from omnigent.cli_config import (
 from omnigent.cli_diagnostics import printable as _printable
 from omnigent.cli_invocation import WRAPPER_COMMAND_ENV, cli_invocation
 from omnigent.cli_native import register_native_commands as _register_native_commands
-from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
 from omnigent.config import (
     _ignored_project_harness_keys,
@@ -2135,7 +2134,6 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "_internal",
         "kimi",
         "kiro",
-        "lakebox",
         "login",
         "opencode",
         "pane-picker",
@@ -12356,12 +12354,8 @@ def setup(internal_beta: bool) -> None:
 # The provider-agnostic sandbox CLI lives in omnigent/cli_sandbox.py.
 # Provider launcher modules are optional and may be absent from a given
 # distribution; hide the group when none are available.
-# `omnigent lakebox` is kept as an alias for `omnigent sandbox …
-# --provider lakebox`, registered only when the lakebox provider ships.
 if _sandbox_providers():
     cli.add_command(_sandbox_group)
-    if "lakebox" in _sandbox_providers():
-        cli.add_command(_lakebox_alias_group)
 
 # ─── debug group ──────────────────────────────────────────────────
 #
