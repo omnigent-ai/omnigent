@@ -79,6 +79,8 @@ _AUTH_STATUS_CODES = frozenset({401, 403})
 _MAX_DEDUPE_KEYS = 8192
 # Web status label cap for a retry notice.
 _MAX_BLOCKED_ON_CHARS = 200
+# Usage callbacks must not park the event consumer behind an unlimited read timeout.
+_USAGE_POST_TIMEOUT_SECONDS = 30.0
 
 _JsonMapping: TypeAlias = Mapping[str, object]
 
@@ -1204,7 +1206,12 @@ class OpenCodeNativeForwarder:
         signature = tuple(sorted(data.items()))
         if signature == self._last_usage_signature:
             return
-        response = await self._post_event(_EXTERNAL_SESSION_USAGE, data)
+        try:
+            async with asyncio.timeout(_USAGE_POST_TIMEOUT_SECONDS):
+                response = await self._post_event(_EXTERNAL_SESSION_USAGE, data)
+        except TimeoutError:
+            _logger.warning("OpenCode usage report timed out for session=%s", self._session_id)
+            return
         if response is not None and response.is_success:
             self._last_usage_signature = signature
 
