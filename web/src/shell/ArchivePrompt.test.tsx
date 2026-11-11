@@ -12,61 +12,70 @@ const ROOT_A_FINGERPRINT = "1a1329852b078cc01f5b390143afdd4bffbbaf52772d4b7c36ff
 const WINDOWS_ROOT_A_FINGERPRINT =
   "80ecddbd344246011666ff6a111ee0be2278a0b1ca388463f48dda5983de1a61";
 
+const HOST = "host_1";
+
+function onHost(id: string, fields: Parameters<typeof conversation>[1]) {
+  return conversation(id, { host_id: HOST, ...fields });
+}
+
 describe("archiveWorktreeTargets", () => {
   it("lists each worktree once in selection order and skips sessions without one", () => {
     const targets = archiveWorktreeTargets([
-      conversation("a", { git_branch: "fix/b", workspace: "/repo/.worktrees/b" }),
-      conversation("b", { workspace: "/repo" }),
-      conversation("c", { git_branch: "feat/a", workspace: "/repo/.worktrees/a" }),
-      conversation("d", { git_branch: "fix/b", workspace: "/repo/.worktrees/b" }),
+      onHost("a", { git_branch: "fix/b", workspace: "/repo/.worktrees/b" }),
+      onHost("b", { workspace: "/repo" }),
+      onHost("c", { git_branch: "feat/a", workspace: "/repo/.worktrees/a" }),
+      onHost("d", { git_branch: "fix/b", workspace: "/repo/.worktrees/b" }),
     ]);
 
     expect(targets).toEqual([
-      { hostId: null, path: "/repo/.worktrees/b", branch: "fix/b" },
-      { hostId: null, path: "/repo/.worktrees/a", branch: "feat/a" },
+      { hostId: HOST, path: "/repo/.worktrees/b", branch: "fix/b" },
+      { hostId: HOST, path: "/repo/.worktrees/a", branch: "feat/a" },
     ]);
   });
 
   it("names the recorded root of sessions in worktree subdirectories", () => {
     const labels = { [WORKTREE_ROOT_LABEL_KEY]: ROOT_A_FINGERPRINT };
     const targets = archiveWorktreeTargets([
-      conversation("a", { git_branch: "feat/a", workspace: "/repo/.worktrees/a/web", labels }),
-      conversation("b", { git_branch: "feat/a", workspace: "/repo/.worktrees/a/api", labels }),
-      conversation("c", { git_branch: "feat/c", workspace: "/repo/elsewhere", labels }),
+      onHost("a", { git_branch: "feat/a", workspace: "/repo/.worktrees/a/web", labels }),
+      onHost("b", { git_branch: "feat/a", workspace: "/repo/.worktrees/a/api", labels }),
+      onHost("c", { git_branch: "feat/c", workspace: "/repo/elsewhere", labels }),
     ]);
 
     expect(targets).toEqual([
-      { hostId: null, path: "/repo/.worktrees/a", branch: "feat/a" },
-      { hostId: null, path: null, branch: "feat/c" },
+      { hostId: HOST, path: "/repo/.worktrees/a", branch: "feat/a" },
+      { hostId: HOST, path: null, branch: "feat/c" },
     ]);
   });
 
   it("groups rootless sessions by branch unless that branch has a known root", () => {
     const targets = archiveWorktreeTargets([
-      conversation("a", { git_branch: "feat/a", workspace: null }),
-      conversation("b", { git_branch: "feat/a", workspace: "/repo/.worktrees/a" }),
-      conversation("c", { git_branch: "feat/c", workspace: "  " }),
-      conversation("d", { git_branch: "feat/c" }),
+      onHost("a", { git_branch: "feat/a", workspace: null }),
+      onHost("b", { git_branch: "feat/a", workspace: "/repo/.worktrees/a" }),
+      onHost("c", { git_branch: "feat/c", workspace: "  " }),
+      onHost("d", { git_branch: "feat/c" }),
+      // Cleanup needs a host, so a hostless session has no root either.
+      conversation("e", { git_branch: "feat/e", workspace: "/repo/.worktrees/e" }),
     ]);
 
     expect(targets).toEqual([
-      { hostId: null, path: "/repo/.worktrees/a", branch: "feat/a" },
-      { hostId: null, path: null, branch: "feat/c" },
+      { hostId: HOST, path: "/repo/.worktrees/a", branch: "feat/a" },
+      { hostId: HOST, path: null, branch: "feat/c" },
+      { hostId: null, path: null, branch: "feat/e" },
     ]);
   });
 
   it("lists one worktree once however its Windows root is spelled", () => {
     const labels = { [WORKTREE_ROOT_LABEL_KEY]: WINDOWS_ROOT_A_FINGERPRINT };
     const targets = archiveWorktreeTargets([
-      conversation("a", { git_branch: "feat/a", workspace: "C:/repo/.worktrees/a/web", labels }),
-      conversation("b", {
+      onHost("a", { git_branch: "feat/a", workspace: "C:/repo/.worktrees/a/web", labels }),
+      onHost("b", {
         git_branch: "feat/a",
         workspace: "c:\\repo\\.worktrees\\a\\api",
         labels,
       }),
     ]);
 
-    expect(targets).toEqual([{ hostId: null, path: "C:\\repo\\.worktrees\\a", branch: "feat/a" }]);
+    expect(targets).toEqual([{ hostId: HOST, path: "C:\\repo\\.worktrees\\a", branch: "feat/a" }]);
   });
 
   it("keeps the same path on different hosts apart", () => {

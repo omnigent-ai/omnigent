@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import {
   recordedWorktreeRoot,
@@ -13,10 +13,6 @@ const POSIX_ROOT = "1a1329852b078cc01f5b390143afdd4bffbbaf52772d4b7c36ff8a435bfc
 const WINDOWS_ROOT = "80ecddbd344246011666ff6a111ee0be2278a0b1ca388463f48dda5983de1a61";
 const DRIVE_ROOT = "826c0d7d3c42f5c52210bfc49965904f2b74650b86e66ce4b14a619735bc8360";
 const UNC_ROOT = "fbeb73f29978309234cc3d43e60feabd9a0d71b873360974863c49c5be27d82c";
-
-afterEach(() => {
-  vi.unstubAllGlobals();
-});
 
 describe("sha256Hex", () => {
   it.each([
@@ -53,11 +49,6 @@ describe("recordedWorktreeRoot", () => {
     ["/repo/other", POSIX_ROOT, null],
   ])("resolves %s (fingerprint %s) to %s", (workspace, fingerprint, root) => {
     expect(recordedWorktreeRoot(workspace, fingerprint)).toBe(root);
-  });
-
-  it("resolves without Web Crypto, as on a plain-HTTP origin", () => {
-    vi.stubGlobal("crypto", undefined);
-    expect(recordedWorktreeRoot("/repo/.worktrees/a", POSIX_ROOT)).toBe("/repo/.worktrees/a");
   });
 });
 

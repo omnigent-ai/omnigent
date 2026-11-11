@@ -8,7 +8,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Settings unarchive: SettingsPage.test.tsx; cache overlays: useConversations.test.ts.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -181,6 +181,7 @@ describe("archive flow", () => {
 describe("archive worktree prompt", () => {
   const WORKTREE_CONV: Conversation = {
     ...CONV,
+    host_id: "host_1",
     git_branch: "feature/x",
     workspace: "/repo/.worktrees/feature-x",
   };
@@ -240,7 +241,7 @@ describe("archive worktree prompt", () => {
       { ...WORKTREE_CONV, id: "conv_a", title: "Session A" },
       { ...WORKTREE_CONV, id: "conv_b", title: "Session B" },
       {
-        ...CONV,
+        ...WORKTREE_CONV,
         id: "conv_c",
         title: "Session C",
         git_branch: "fix/y",
@@ -259,10 +260,17 @@ describe("archive worktree prompt", () => {
     expect(dialog).toHaveTextContent("3 of the sessions you're archiving have a git worktree.");
     // Sessions A and B share one worktree, so it is listed once.
     const items = screen.getAllByTestId("archive-worktree-item");
-    expect(items.map((item) => item.textContent).sort()).toEqual([
-      "feature-x/repo/.worktrees/feature-xfeature/x",
-      "fix-y/repo/.worktrees/fix-yfix/y",
-    ]);
+    expect(items).toHaveLength(2);
+    for (const [name, path, branch] of [
+      ["feature-x", "/repo/.worktrees/feature-x", "feature/x"],
+      ["fix-y", "/repo/.worktrees/fix-y", "fix/y"],
+    ]) {
+      const item = items.find(
+        (candidate) => within(candidate).getByTestId("archive-worktree-name").textContent === name,
+      );
+      expect(item).toHaveTextContent(path);
+      expect(item).toHaveTextContent(branch);
+    }
     fireEvent.click(screen.getByTestId("archive-worktree-delete"));
 
     const [{ deleteWorktreeIds }] = mocks.bulkArchive.mutate.mock.calls[0];

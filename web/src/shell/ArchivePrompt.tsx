@@ -45,10 +45,10 @@ interface PendingPrompt {
   choose: (deleteWorktrees: boolean) => void;
 }
 
-/** Directory archive cleanup would remove for the session, or null when it removes none. */
+/** Directory archive cleanup removes for the session; like the server, none without a host. */
 function sessionWorktreeRoot(conversation: Conversation): string | null {
   const workspace = conversation.workspace;
-  if (!workspace?.trim()) return null;
+  if (!conversation.host_id || !workspace?.trim()) return null;
   return recordedWorktreeRoot(workspace, conversation.labels?.[WORKTREE_ROOT_LABEL_KEY]);
 }
 
