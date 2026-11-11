@@ -3,8 +3,8 @@
 Verifies the migration creates both tables with the expected shape, that
 neither carries a database-level foreign key (schema Rule R032 — the
 ``agent_id`` / ``conversation_id`` / ``scheduled_task_id`` relationships are
-application-owned), that ``scheduled_tasks.rrule`` is NOT NULL and the
-``scheduled_task_runs.status`` CHECK is enforced, and that a downgrade drops both
+application-owned), that ``scheduled_tasks.rrule`` is nullable for event
+triggers and the ``scheduled_task_runs.status`` CHECK is enforced, and that a downgrade drops both
 tables cleanly. Dispatch coverage includes occurrence deduplication,
 legacy writers, history preservation, and guarded rollback.
 """
@@ -23,7 +23,11 @@ from alembic import command
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
-from omnigent.db.db_models import SqlScheduledTask, SqlScheduledTaskRun
+from omnigent.db.db_models import (
+    SqlScheduledTask,
+    SqlScheduledTaskEventReceipt,
+    SqlScheduledTaskRun,
+)
 from omnigent.db.utils import (
     _build_alembic_config,
     clear_engine_cache,
@@ -40,6 +44,7 @@ _MCP_SERVICES_PREVIOUS = "1ad1db53f99d"
 _MCP_SERVICES_REVISION = "f2c6a9d1b3e8"
 _COMMENT_ANCHOR_REVISION = "f9b3e6c2a401"
 _MCP_SERVICES_MERGE_REVISION = "a7d4c2e9f610"
+_TRIGGER_CONFIG_REVISION = "bdd2c8a6005c"
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -64,6 +69,7 @@ def db_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[Engine
         engine = sa.create_engine(uri)
         SqlScheduledTask.__table__.create(engine)
         SqlScheduledTaskRun.__table__.create(engine)
+        SqlScheduledTaskEventReceipt.__table__.create(engine)
     else:
         engine = get_or_create_engine(uri)
     try:
@@ -93,6 +99,8 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     assert columns["session_id"]["nullable"] is True
     assert columns["source_session_id"]["nullable"] is True
     assert columns["mcp_services"]["nullable"] is True
+    assert columns["trigger_config"]["nullable"] is True
+    assert columns["rrule"]["nullable"] is True
     cols = set(columns)
     assert cols == {
         "workspace_id",
@@ -124,6 +132,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "session_mode",
         "session_id",
         "source_session_id",
+        "trigger_config",
     }
 
 
@@ -151,6 +160,7 @@ def test_scheduled_task_runs_columns(db_engine: Engine) -> None:
         "trigger_key",
         "host_id",
         "lease_expires_at",
+        "event",
     }
 
 
@@ -235,6 +245,13 @@ def test_expected_indexes(db_engine: Engine) -> None:
         "workspace_id",
         "conversation_id",
         "status",
+        "id",
+    ]
+    assert runs_idx_cols["ix_scheduled_task_runs_task_status"] == [
+        "workspace_id",
+        "scheduled_task_id",
+        "status",
+        "scheduled_at",
         "id",
     ]
     unique_keys = {
@@ -357,19 +374,20 @@ def test_rrule_accepts_recurring_row(db_engine: Engine) -> None:
         )
 
 
-def test_rrule_is_not_null(db_engine: Engine) -> None:
-    """A row omitting ``rrule`` fails the NOT NULL constraint."""
-    with pytest.raises(IntegrityError):
-        with db_engine.begin() as conn:
-            conn.execute(
-                sa.text(
-                    "INSERT INTO scheduled_tasks "
-                    "(id, name, prompt, user_id, agent_id, timezone, "
-                    " created_at) "
-                    "VALUES (X'000000000000000000000000000000e0', 'n', 'p', "
-                    "'u', 'ag', 'UTC', 1)"
-                )
+def test_rrule_is_nullable_for_event_triggers(db_engine: Engine) -> None:
+    """An event-triggered row has no ``rrule``."""
+    with db_engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO scheduled_tasks "
+                "(id, name, prompt, user_id, agent_id, timezone, "
+                " created_at) "
+                "VALUES (X'000000000000000000000000000000e0', 'n', 'p', "
+                "'u', 'ag', 'UTC', 1)"
             )
+        )
+        rrule = conn.execute(sa.text("SELECT rrule FROM scheduled_tasks")).scalar_one()
+    assert rrule is None
 
 
 def test_state_stored_as_smallint(db_engine: Engine) -> None:
@@ -1008,3 +1026,108 @@ def test_merge_reconciles_mcp_services_and_comment_anchor_branches(
             _MCP_SERVICES_REVISION,
             _COMMENT_ANCHOR_REVISION,
         }
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_event_receipts_table(db_engine: Engine) -> None:
+    """One receipt per task occurrence, led by the workspace, with an age index."""
+    insp = sa.inspect(db_engine)
+    columns = {c["name"]: c for c in insp.get_columns("scheduled_task_event_receipts")}
+    assert set(columns) == {
+        "workspace_id",
+        "id",
+        "scheduled_task_id",
+        "trigger_key",
+        "run_id",
+        "created_at",
+    }
+    assert [name for name, c in columns.items() if c["nullable"]] == ["run_id"]
+    assert insp.get_pk_constraint("scheduled_task_event_receipts")["constrained_columns"] == [
+        "workspace_id",
+        "id",
+    ]
+    assert insp.get_foreign_keys("scheduled_task_event_receipts") == []
+    unique = {
+        key["name"]: key["column_names"]
+        for key in insp.get_unique_constraints("scheduled_task_event_receipts")
+    }
+    assert unique["uq_scheduled_task_event_receipts_occurrence"] == [
+        "workspace_id",
+        "scheduled_task_id",
+        "trigger_key",
+    ]
+    indexes = {
+        i["name"]: list(i["column_names"])
+        for i in insp.get_indexes("scheduled_task_event_receipts")
+    }
+    assert indexes["ix_scheduled_task_event_receipts_age"] == [
+        "workspace_id",
+        "scheduled_task_id",
+        "created_at",
+        "id",
+    ]
+
+
+def test_json_columns_cap_stored_bytes() -> None:
+    """Both JSON documents stay below the 16,384-byte column bound."""
+    for column in (
+        SqlScheduledTask.__table__.c.trigger_config,
+        SqlScheduledTaskRun.__table__.c.event,
+    ):
+        assert column.type.max_stored_bytes == 16_383
+
+
+def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
+    dispatch_migration_engine: Engine,
+) -> None:
+    """Existing tasks keep their rule; downgrade waits until no task lacks one."""
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    command.upgrade(config, _MCP_SERVICES_MERGE_REVISION)
+    values = {
+        "name": "nightly",
+        "prompt": b"p",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    before = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(before.insert().values(id=b"a" * 16, rrule="FREQ=DAILY", **values))
+    command.upgrade(config, _TRIGGER_CONFIG_REVISION)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
+    receipts = sa.Table("scheduled_task_event_receipts", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(tasks.c.rrule, tasks.c.trigger_config)).one() == (
+            "FREQ=DAILY",
+            None,
+        )
+        # The ORM type compresses on write; a raw insert only needs a non-NULL value.
+        conn.execute(
+            tasks.insert().values(id=b"b" * 16, rrule=None, trigger_config=b"{}", **values)
+        )
+        conn.execute(
+            runs.insert().values(
+                id=b"r" * 16, scheduled_task_id=b"b" * 16, status=1, scheduled_at=1, event=b"{}"
+            )
+        )
+        receipt = {"scheduled_task_id": b"b" * 16, "trigger_key": "event:x:1", "created_at": 1}
+        conn.execute(receipts.insert().values(id=b"c" * 16, **receipt))
+    with pytest.raises(IntegrityError):
+        with engine.begin() as conn:
+            conn.execute(receipts.insert().values(id=b"d" * 16, **receipt))
+    with pytest.raises(RuntimeError, match="no rrule"):
+        command.downgrade(config, _MCP_SERVICES_MERGE_REVISION)
+    with engine.begin() as conn:
+        conn.execute(tasks.delete().where(tasks.c.id == b"b" * 16))
+    command.downgrade(config, _MCP_SERVICES_MERGE_REVISION)
+    inspector = sa.inspect(engine)
+    task_columns = {c["name"]: c for c in inspector.get_columns("scheduled_tasks")}
+    assert "trigger_config" not in task_columns
+    assert task_columns["rrule"]["nullable"] is False
+    assert "event" not in {c["name"] for c in inspector.get_columns("scheduled_task_runs")}
+    assert "ix_scheduled_task_runs_task_status" not in {
+        i["name"] for i in inspector.get_indexes("scheduled_task_runs")
+    }
+    assert "scheduled_task_event_receipts" not in inspector.get_table_names()
