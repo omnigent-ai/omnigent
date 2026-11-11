@@ -2231,6 +2231,35 @@ def test_ensure_default_agents_never_suppresses_operator_extras(
     assert server_app._DEBBY_AGENT_NAME in suppressed
 
 
+@pytest.mark.parametrize(
+    ("allowlist", "devin_hidden"),
+    [("claude-native-ui", True), ("claude-native-ui,devin", False)],
+    ids=["left-out", "allowlisted"],
+)
+def test_ensure_default_agents_hides_a_built_in_row_an_earlier_version_seeded(
+    seed_stores: _SeedStores,
+    monkeypatch: pytest.MonkeyPatch,
+    allowlist: str,
+    devin_hidden: bool,
+) -> None:
+    """A retired built-in obeys the allowlist like a packaged one; other server agents don't."""
+    from omnigent.db.utils import builtin_agent_id, generate_agent_id
+
+    # ``devin`` is the ACP row v0.14 seeded; no helper owns that name today.
+    seed_stores.agent_store.create(builtin_agent_id("devin"), "devin", "old/bundle")
+    seed_stores.agent_store.create(generate_agent_id(), "house-agent", "house/bundle")
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, allowlist)
+
+    suppressed = server_app._ensure_default_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+    assert ("devin" in suppressed) is devin_hidden
+    assert "house-agent" not in suppressed
+    # Hidden, not deleted: sessions bound to the old row still find it.
+    assert seed_stores.agent_store.get_by_name("devin") is not None
+
+
 def test_ensure_default_agents_warns_on_unknown_allowlist_names(
     seed_stores: _SeedStores,
     monkeypatch: pytest.MonkeyPatch,

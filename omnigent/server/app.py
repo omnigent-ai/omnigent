@@ -1170,6 +1170,35 @@ def _warn_on_empty_picker_restriction(
         )
 
 
+def _retired_builtin_agent_names(agent_store: AgentStore, owned: frozenset[str]) -> frozenset[str]:
+    """
+    Name the built-in rows an earlier version seeded that no current seeding owns.
+
+    A built-in row has a server-scope id derived from its name
+    (:func:`~omnigent.db.utils.builtin_agent_id`), which no other agent gets.
+
+    :param agent_store: Store for agent metadata.
+    :param owned: Names this boot's seeding owns, e.g. ``{"polly", "devin-acp"}``.
+    :returns: The retired names, e.g. ``{"devin"}``.
+    """
+    from omnigent.db.utils import builtin_agent_id
+
+    retired: set[str] = set()
+    after: str | None = None
+    while True:
+        page = agent_store.list(limit=100, after=after, order="asc")
+        retired.update(
+            agent.name
+            for agent in page.data
+            if agent.session_id is None
+            and agent.id == builtin_agent_id(agent.name)
+            and agent.name not in owned
+        )
+        if not page.has_more or page.last_id is None:
+            return frozenset(retired)
+        after = page.last_id
+
+
 def _ensure_default_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
@@ -1187,7 +1216,8 @@ def _ensure_default_agents(
     ``OMNIGENT_SEEDED_AGENTS`` trims the packaged roster. Each helper
     returns the packaged names it owns (seeded or not), so whatever the
     allowlist leaves out is returned here and hidden from ``GET /v1/agents``
-    by the caller that stores it. A row seeded by an earlier boot is
+    by the caller that stores it. A built-in row an earlier version seeded,
+    which no helper owns any more, counts as packaged too. A row seeded by an earlier boot is
     suppressed rather than deleted: sessions look their agent up by
     ``conversations.agent_id``, so dropping the row would leave them without one.
 
@@ -1210,6 +1240,10 @@ def _ensure_default_agents(
     extras = _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
     if allowlist is None:
         return frozenset()
+    # A built-in an earlier version seeded is still packaged roster, so the
+    # allowlist hides it too; its row stays for the sessions bound to it.
+    retired = _retired_builtin_agent_names(agent_store, packaged | extras)
+    packaged |= retired
     unknown = allowlist - packaged
     if unknown:
         _logger.warning(
