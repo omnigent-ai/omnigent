@@ -5212,6 +5212,15 @@ def _publish_status(
         # A turn can open or merge a PR while nobody watches; refresh what the server
         # stores. Stops and archives publish idle without persisting it, and skip this.
         session_pull_requests.notify_turn_end(session_id)
+    if (
+        status == "idle"
+        and persist_live_status
+        # A confirmed completion counts even after a previous turn's late failure.
+        and (
+            previous_status in ("running", "waiting")
+            or (turn_completed and previous_status == "failed")
+        )
+    ):
         # Native harnesses settle turns only through these edges, never response events.
         turn_id = response_id or _session_active_response_cache.get(session_id)
         session_triggers.notify(

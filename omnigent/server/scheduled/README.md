@@ -284,17 +284,27 @@ wrong:
 ## Event triggers
 
 A task with a `trigger_config` runs on events instead of a schedule. It has no
-`rrule` and no `next_run_at`: the scheduler never lists it as due or fills in
-its next run time, and legacy timers never arm it. The JSON names a `provider`;
+`rrule` (`rrule IS NULL` is how SQL tells it apart) and no `next_run_at`: the
+scheduler never lists it as due or fills in its next run time, and legacy timers
+never arm it. The JSON names a `provider`;
 each provider validates its own shape. An event records a `scheduled` run with
 the event's IDs in the run's `event` column, keyed `event:<provider>:<occurrence>`
-in `trigger_key`, so a repeated event records nothing. The host owner claims it
+in `trigger_key`. Every accepted occurrence also gets a row in
+`scheduled_task_event_receipts`, unique per task, so a repeated event records
+nothing, including one that joined another event's run. Receipts older than 7
+days are removed a few at a time as new events arrive, and with the task's
+history when it is deleted. The host owner claims a pending run
 on a later poll like a Run now request, and the run sends the task's prompt
 followed by the events as JSON lines. A run whose task was paused, or lost its
 trigger, before the claim is recorded as `skipped` (`trigger_inactive`).
 
-Event triggers need the database scheduler; the API rejects them otherwise and
-advertises `scheduled_task_session_triggers` when it accepts them.
+Event triggers need the database scheduler and the `session_triggers` feature;
+the API rejects them otherwise and advertises `scheduled_task_session_triggers`
+when it accepts them. Turn the feature on only once no server older than this
+change runs against the database: an older server reads a task with no `rrule`
+as an invalid schedule and pauses it. A rollback to such a server needs the
+event-triggered tasks deleted first, and the migration's downgrade refuses
+until they are.
 
 ### Session triggers
 
@@ -309,8 +319,11 @@ the server's own session events: `session.created`, `session.renamed`,
 ```
 
 - The server queues each event where it happens; one background worker matches
-  it and records runs, so the request path does no extra database work. Native
-  Claude and Codex turns are seen through their `session.status` edges.
+  it and records runs, so the request path does no extra database work. A run
+  survives a replica restart once it is recorded; an event still queued when
+  the replica stops is lost. Native Claude and Codex turns are seen through
+  their `session.status` edges, including a confirmed completion that arrives
+  after a previous turn's late failure.
 - Only sessions the owner holds a grant on (their own, or shared with them)
   fire; admin access and public sessions don't count. A sub-agent session is
   checked through its root.
@@ -319,7 +332,8 @@ the server's own session events: `session.created`, `session.renamed`,
 - A task records at most 10 runs a minute. Further events that minute are
   dropped, and one `skipped` run (`rate_limited`) per minute records the drop.
 - A task that continues one session adds new events to its unclaimed pending
-  run instead of recording another (up to 20 listed, the rest counted). The
+  run instead of recording another (up to 20 listed, the rest counted, and the
+  document kept under the column's size). The
   scheduler holds that run while the session is running or waiting on an
   approval, for at most 10 minutes, so a busy session gets one prompt.
 - A run's event carries IDs and metadata (session, response, elicitation or

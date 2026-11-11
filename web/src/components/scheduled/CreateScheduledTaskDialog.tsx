@@ -527,7 +527,7 @@ export function CreateScheduledTaskDialog({
     [anchoredScheduling, subhourSupported, triggerPollMinutes],
   );
   const savedSchedule = useMemo(
-    () => (editingTask ? parseRRuleToScheduleModel(editingTask.rrule) : null),
+    () => (editingTask?.rrule != null ? parseRRuleToScheduleModel(editingTask.rrule) : null),
     [editingTask],
   );
 
@@ -567,7 +567,7 @@ export function CreateScheduledTaskDialog({
         setPickedEffort(editingTask.reasoningEffort ?? "");
         setPickedPermission(editingTask.permissionMode ?? "");
         setSchedule(parsedSchedule ?? DEFAULT_SCHEDULE_MODEL);
-        setScheduleUnsupported(parsedSchedule === null);
+        setScheduleUnsupported(parsedSchedule === null && editingTask.rrule !== null);
         setHostId(editingTask.hostId ?? "");
         setWorkspace(savedWorkspace);
         setBaseBranch(editingTask.baseBranch ?? null);

@@ -4225,7 +4225,7 @@ def register_events_routes(
         _intentional_stop_sessions.pop(session_id, None)
         # Grants go with the session, so read who could see it first.
         readers = (
-            await asyncio.to_thread(session_triggers.readers_of, conv)
+            await asyncio.to_thread(session_triggers.readers_of, conv, "session.deleted")
             if session_triggers.enabled()
             else None
         )

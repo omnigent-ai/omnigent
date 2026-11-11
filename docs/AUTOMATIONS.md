@@ -165,7 +165,7 @@ The transcript hides only the exact tagged unattended-run note appended by the s
 
 ## Running on session events
 
-An automation can run when something happens to an Omnigent session instead of on a schedule. Send `trigger_config` in place of `rrule` to `POST /v1/scheduled-tasks`; a task has exactly one of the two. This needs the database scheduler (`automations_v2`), and the server advertises `scheduled_task_session_triggers` in `/v1/info` when it accepts the field.
+An automation can run when something happens to an Omnigent session instead of on a schedule. Send `trigger_config` in place of `rrule` to `POST /v1/scheduled-tasks`; a task has exactly one of the two. This needs the database scheduler (`automations_v2`) and the `session_triggers` feature, and the server advertises `scheduled_task_session_triggers` in `/v1/info` when it accepts the field. Enable `session_triggers` only after every server on the database runs a version with it: an older server pauses an automation that has no `rrule`. To roll back to such a version, delete the session-triggered automations first.
 
 ```json
 {"provider": "omnigent", "events": ["turn.completed", "input.requested"],
@@ -189,7 +189,7 @@ An automation can run when something happens to an Omnigent session instead of o
 - An automation runs at most 10 times a minute. Events past that are dropped, and the run history shows one `skipped` run with `error_code` `rate_limited` for that minute.
 - With `session_mode: "continue"`, events that arrive while a run waits to start join it, and a run waits while the continued session is busy (at most 10 minutes), so the session gets one message per batch. On a managed sandbox, session triggers must use `continue`.
 - A run sends the automation's prompt followed by one JSON line per event, with IDs and metadata only: event type, session, response, approval or comment ID, agent, project and parent session. Titles and message text are never included; the agent reads them with its session tools. The run's `event` field in run history holds the same list.
-- The server records a pending run in the database as soon as it sees the event, and the next scheduler poll starts it. A repeated event (for example the same turn reported twice) records nothing. An event recorded before the automation was paused is `skipped` with `error_code` `trigger_inactive`.
+- The server records a pending run in the database shortly after it sees the event, and the next scheduler poll starts it. A recorded run survives a server restart; an event the server had not recorded yet when it stopped is lost. A repeated event (for example the same turn reported twice) records nothing, also when it had joined a run that already started. An event recorded before the automation was paused is `skipped` with `error_code` `trigger_inactive`.
 - `PATCH` with `trigger_config` switches a scheduled automation to events, and `PATCH` with an `rrule` (or `trigger_config: null` and an `rrule`) switches it back. Run now works as for a schedule and sends the prompt without events.
 
 ## Run history

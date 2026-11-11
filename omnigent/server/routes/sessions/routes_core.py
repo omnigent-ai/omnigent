@@ -4139,7 +4139,8 @@ def register_core_routes(
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
         if body.archived is True and not archived_before:
-            session_triggers.notify("session.archived", session_id, occurrence="archived")
+            # Each archive is its own occurrence; unarchiving and archiving again fires again.
+            session_triggers.notify("session.archived", session_id)
         if body.archived is True:
             _prune_session_read_state(session_id)
             # Stop asynchronously after the archive commits and Undo grace elapses.

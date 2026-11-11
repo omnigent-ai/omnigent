@@ -121,6 +121,29 @@ async def test_unarchive_restores_session_to_default_listing(
     assert session_id in listed_ids
 
 
+async def test_each_archive_reports_its_own_session_event(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Archive, unarchive and archive again report two archives; a repeat reports none."""
+    from omnigent.server.scheduled import session_triggers
+
+    seen: list[tuple[str, str, str | None]] = []
+    monkeypatch.setattr(
+        session_triggers,
+        "notify",
+        lambda event_type, session_id, occurrence=None, **_: seen.append(
+            (event_type, session_id, occurrence)
+        ),
+    )
+    session = await create_test_session(client, name="archive-twice")
+    session_id = session["id"]
+    for archived in (True, True, False, True):
+        response = await client.patch(f"/v1/sessions/{session_id}", json={"archived": archived})
+        assert response.status_code == 200, response.text
+    archives = [event for event in seen if event[0] == "session.archived"]
+    assert archives == [("session.archived", session_id, None)] * 2
+
+
 # ── Best-effort stop before archive ───────────────────────
 
 

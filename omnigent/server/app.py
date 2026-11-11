@@ -344,8 +344,8 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_projects: bool = False
     # Bounded latest-failure feed for the Inbox.
     scheduled_task_inbox: bool = False
-    # Scheduled tasks accept an ``omnigent`` ``trigger`` that runs them on session
-    # events; servers without the database scheduler, and older ones, reject it.
+    # Scheduled tasks accept an ``omnigent`` ``trigger_config`` that runs them on
+    # session events (the ``session_triggers`` feature); older servers reject it.
     scheduled_task_session_triggers: bool = False
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
@@ -1849,6 +1849,11 @@ def create_app(
         else mcp_disabled_servers
     )
     automations_v2_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS_V2)
+    # Only the database scheduler claims event runs, and an older server would pause
+    # an event-triggered task, so operators turn this on once every server has it.
+    session_triggers_enabled = automations_v2_enabled and resolved_feature_flags.enabled(
+        Feature.SESSION_TRIGGERS
+    )
     if automations_v2_enabled:
         if scheduled_task_store is None:
             raise ValueError(
@@ -2133,9 +2138,8 @@ def create_app(
         # The release flag selects one scheduler for the lifetime of this server.
         scheduler_start_retry: asyncio.Task[None] | None = None
         scheduled_task_scheduler: ScheduledTaskScheduler | PersistentTaskScheduler | None = None
-        # Only the database scheduler claims the pending runs session events record.
         session_triggers.configure(
-            scheduled_task_store if automations_v2_enabled else None,
+            scheduled_task_store if session_triggers_enabled else None,
             conversation_store,
             permission_store,
         )
@@ -2415,6 +2419,7 @@ def create_app(
 
     app.state.automations_available = automations_available
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
+    app.state.scheduled_task_session_triggers_enabled = session_triggers_enabled
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
     # strip) can prefix it themselves. "" for a root deployment.
@@ -3757,7 +3762,8 @@ def create_app(
                 },
                 "scheduled_task_projects": project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
-                "scheduled_task_session_triggers": automations_enabled and automations_v2_enabled,
+                "scheduled_task_session_triggers": automations_enabled
+                and session_triggers_enabled,
                 "session_move_source_checks": True,
                 "automations_enabled": automations_enabled,
                 "automation_trigger_poll_minutes": trigger_poll_minutes,

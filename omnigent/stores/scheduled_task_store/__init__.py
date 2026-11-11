@@ -305,11 +305,15 @@ class ScheduledTaskStore(ABC):
         """
         ...
 
-    def list_event_triggered_tasks(self) -> builtins.list[ScheduledTask]:
-        """List the current workspace's active tasks that have a ``trigger_config``.
+    def list_event_triggered_tasks(
+        self, *, after: str | None = None, limit: int = 500
+    ) -> builtins.list[ScheduledTask]:
+        """One page of the current workspace's active event-triggered tasks, ordered by id.
 
-        Stores without event triggers return an empty list, so no event fires.
+        Pass the last task's id as ``after`` for the next page. Stores without
+        event triggers return an empty list, so no event fires.
         """
+        del after, limit
         return []
 
     def record_event_run(
@@ -326,8 +330,9 @@ class ScheduledTaskStore(ABC):
         """Record a pending run for one provider event, under the task lock.
 
         The run waits for the host owner's scheduler to claim it, like a Run now
-        request. ``trigger_key`` is the event's occurrence key, so a redelivered
-        event is a ``"duplicate"``. With ``coalesce``, an event for a task that
+        request. ``trigger_key`` is the event's occurrence key; every accepted
+        occurrence keeps a receipt, so a redelivered event is a ``"duplicate"``,
+        also after the run it joined was claimed. With ``coalesce``, an event for a task that
         already has an unclaimed pending event run is added to that run instead.
         Once the task's runs in the last minute reach ``max_runs_per_minute``,
         the event is dropped as ``"rate_limited"``, and one ``skipped`` run per

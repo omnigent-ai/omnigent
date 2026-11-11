@@ -358,9 +358,10 @@ def _validate_trigger_or_400(
             "(session_mode 'continue').",
             code=ErrorCode.INVALID_INPUT,
         )
-    if not getattr(request.app.state, "scheduled_task_dispatch_enabled", False):
+    if not getattr(request.app.state, "scheduled_task_session_triggers_enabled", False):
         raise OmnigentError(
-            "Event-triggered automations need the database scheduler (automations_v2).",
+            "Event-triggered automations are not enabled on this server "
+            "(features automations_v2 and session_triggers).",
             code=ErrorCode.INVALID_INPUT,
         )
     provider = trigger_config.get("provider")

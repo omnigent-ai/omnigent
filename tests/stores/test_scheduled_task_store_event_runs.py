@@ -33,6 +33,7 @@ def store(db_uri: str) -> SqlAlchemyScheduledTaskStore:
 def _event_task(
     store: SqlAlchemyScheduledTaskStore, seed: str = "event", **kwargs: Any
 ) -> ScheduledTask:
+    kwargs.setdefault("trigger_config", _TRIGGER)
     task = store.create(
         _uid(seed),
         seed,
@@ -42,7 +43,6 @@ def _event_task(
         _uid("agent"),
         "UTC",
         host_id=_uid("host"),
-        trigger_config=_TRIGGER,
         **kwargs,
     )
     stored = store.get(task.id)
@@ -141,6 +141,76 @@ def test_a_continued_task_coalesces_events_into_its_pending_run(
     # Once claimed, the next event starts a new pending run.
     assert store.claim_pending_run(pending, now=1_001, lease_seconds=120) is not None
     assert _record(store, task, "s3", coalesce=True) == "recorded"
+    # Occurrences that joined the claimed run, listed or only counted, stay received.
+    assert _record(store, task, "s2", coalesce=True) == "duplicate"
+    assert _record(store, task, "more29", coalesce=True) == "duplicate"
+
+
+def test_a_coalesced_run_stays_within_its_column(store: SqlAlchemyScheduledTaskStore) -> None:
+    task = _event_task(store, session_mode="continue")
+    wide = "x" * 4_000
+    key = event_trigger_key("omnigent", "first")
+    for index in range(5):
+        key = event_trigger_key("omnigent", f"wide{index}")
+        assert store.record_event_run(
+            task,
+            now=1_000,
+            trigger_key=key,
+            host_id=task.host_id,
+            event={"type": "turn.completed", "session_id": wide},
+            coalesce=True,
+            max_runs_per_minute=10,
+        ) in {"recorded", "coalesced"}
+    [pending] = store.list_pending_runs()
+    # Entries that would push the document past its bound are counted instead.
+    assert len(pending.event["events"]) == 2
+    assert pending.event["omitted"] == 3
+
+
+def test_an_oversized_trigger_is_refused(store: SqlAlchemyScheduledTaskStore) -> None:
+    with pytest.raises(ValueError, match="exceeds"):
+        _event_task(store, "big", trigger_config={"provider": "omnigent", "x": "y" * 13_000})
+
+
+def test_event_tasks_are_listed_in_id_pages(store: SqlAlchemyScheduledTaskStore) -> None:
+    tasks = sorted((_event_task(store, f"page{i}") for i in range(5)), key=lambda t: t.id)
+    store.create(_uid("scheduled"), "s", "p", "FREQ=HOURLY", None, _uid("agent"), "UTC")
+    first = store.list_event_triggered_tasks(limit=2)
+    second = store.list_event_triggered_tasks(after=first[-1].id, limit=2)
+    third = store.list_event_triggered_tasks(after=second[-1].id, limit=2)
+    assert [t.id for t in [*first, *second, *third]] == [t.id for t in tasks]
+
+
+def test_deleting_a_task_removes_its_receipts(store: SqlAlchemyScheduledTaskStore) -> None:
+    from sqlalchemy import func, select
+
+    from omnigent.db.db_models import SqlScheduledTaskEventReceipt
+
+    store._cleanup_batch_size = 2
+    task = _event_task(store, session_mode="continue")
+    for index in range(5):
+        _record(store, task, f"s{index}", coalesce=True)
+    assert store.delete(task.id)
+    with store._session("count_receipts") as session:
+        remaining = session.scalar(select(func.count()).select_from(SqlScheduledTaskEventReceipt))
+    assert remaining == 0
+    assert store.get(task.id) is None
+
+
+def test_old_receipts_expire_as_events_arrive(store: SqlAlchemyScheduledTaskStore) -> None:
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlScheduledTaskEventReceipt
+
+    task = _event_task(store)
+    assert _record(store, task, "old", now=1_000) == "recorded"
+    later = 1_000 + 8 * 24 * 3600
+    assert _record(store, task, "new", now=later) == "recorded"
+    with store._session("list_receipts") as session:
+        keys = session.scalars(select(SqlScheduledTaskEventReceipt.trigger_key)).all()
+    assert keys == [event_trigger_key("omnigent", "new")]
+    # The run keyed by the expired occurrence still drops a repeat.
+    assert _record(store, task, "old", now=later + 120) == "duplicate"
 
 
 def test_the_per_minute_cap_drops_events_and_records_one_skip(
