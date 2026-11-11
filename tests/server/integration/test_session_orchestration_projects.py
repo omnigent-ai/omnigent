@@ -609,7 +609,7 @@ async def test_organizing_tools_rename_pin_archive_and_manage_projects(
         "icon": "📊",
     }
     (project,) = (await auth_client.get("/v1/projects")).json()["data"]
-    assert project["name"] == "Reports" and project["config"] == {"icon": "📊"}
+    assert project["name"] == "Reports" and project["config"] == {"color": "omni", "icon": "📊"}
 
     # The calling session is mid-turn; archiving another session must not touch it.
     # (Listing reconciles live status against the stubbed runner, so set it here.)
@@ -677,7 +677,12 @@ async def test_organizing_tools_refuse_a_source_shared_with_edit_access(
     assert saved.title != "Hijacked" and saved.archived is not True
     assert not any(key.startswith("omnigent.pinned") for key in saved.labels)
     (project,) = (await auth_client.get("/v1/projects")).json()["data"]
-    assert project == {**project, "id": project_id, "name": "Shared folder", "config": {}}
+    assert project == {
+        **project,
+        "id": project_id,
+        "name": "Shared folder",
+        "config": {"color": "omni"},
+    }
 
 
 @_ONE_ENVIRONMENT
