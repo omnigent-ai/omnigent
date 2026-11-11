@@ -175,7 +175,7 @@ function renderPage(
   taskDetailsEnabled = false,
 ) {
   // Fresh client per render so cached queries never leak between tests.
-  return render(
+  const tree = (
     <QueryClientProvider client={queryClient}>
       <CapabilitiesProvider
         info={{ ...FALLBACK_SERVER_INFO, features: { automations_v2: taskDetailsEnabled } }}
@@ -187,8 +187,10 @@ function renderPage(
           </MemoryRouter>
         </SidebarDataProvider>
       </CapabilitiesProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  const result = render(tree);
+  return { ...result, rerenderPage: () => result.rerender(tree) };
 }
 
 let lastLocation = { pathname: "", search: "" };
@@ -225,7 +227,7 @@ function proactiveInboxStub(overrides: Record<string, unknown> = {}) {
     isFetchingNextPage: false,
     fetchNextPage: vi.fn(),
     refetch: vi.fn(),
-    update: vi.fn(),
+    update: vi.fn().mockResolvedValue(true),
     ...overrides,
   } as unknown as ReturnType<typeof proactiveInboxHook.useProactiveInbox>;
 }
@@ -1770,7 +1772,7 @@ describe("agent suggestions", () => {
   });
 
   it("marks a suggestion read on expand and shows its evidence", () => {
-    const update = vi.fn();
+    const update = vi.fn().mockResolvedValue(true);
     stub({ items: [suggestion()], unreadCount: 1, update });
     renderPage();
 
@@ -1848,7 +1850,7 @@ describe("agent suggestions", () => {
 
   it("keeps an expanded suggestion on the Unread tab after it is marked read", () => {
     const item = suggestion();
-    const update = vi.fn();
+    const update = vi.fn().mockResolvedValue(true);
     stub({ items: [item], unreadCount: 1, update });
     renderPage();
     selectTab("Unread");
@@ -1923,7 +1925,7 @@ describe("agent suggestions", () => {
   });
 
   it("takes an agent action and opens the composer with its prompt", () => {
-    const update = vi.fn();
+    const update = vi.fn().mockResolvedValue(true);
     stub({ items: [suggestion({ status: "read" })], update });
     renderPage();
 
@@ -1941,8 +1943,42 @@ describe("agent suggestions", () => {
     expect(peekNewSessionHandoff(token)).toEqual({ text: "Check the flag's metrics", files: [] });
   });
 
+  it("keeps an expanded suggestion pinned on Unread until the server accepts its dismissal", async () => {
+    window.localStorage.setItem("omnigent:inbox-filter", "unread");
+    const update = vi.fn().mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    stub({ items: [suggestion()], unreadCount: 1, update });
+    const page = renderPage();
+    // Expanding marks it read; the Unread list no longer lists it, so the pin shows it.
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+    stub({ items: [], unreadCount: 0, update });
+    page.rerenderPage();
+    expect(screen.getByTestId("inbox-suggestion")).toBeInTheDocument();
+
+    // The dismissal fails: the card stays, so the viewer can retry.
+    fireEvent.pointerDown(screen.getByRole("button", { name: /Dismiss/ }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Not now" }));
+    await waitFor(() => expect(update).toHaveBeenCalledWith("sug_1", { resolution: "not_now" }));
+    await act(async () => {});
+    page.rerenderPage();
+    expect(screen.getByTestId("inbox-suggestion")).toBeInTheDocument();
+
+    // The retry is accepted: the pin goes with it.
+    update.mockResolvedValueOnce(true);
+    fireEvent.pointerDown(screen.getByRole("button", { name: /Dismiss/ }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Not now" }));
+    await waitFor(() => expect(screen.queryByTestId("inbox-suggestion")).toBeNull());
+  });
+
   it("dismisses with a reason from the menu", async () => {
-    const update = vi.fn();
+    const update = vi.fn().mockResolvedValue(true);
     stub({ items: [suggestion({ status: "read" })], update });
     renderPage();
 

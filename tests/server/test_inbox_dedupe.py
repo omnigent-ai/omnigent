@@ -33,7 +33,13 @@ def test_pull_request_spellings_share_one_form(ref: str) -> None:
 
 
 def test_other_links() -> None:
-    assert canonical_link({"type": "session", "ref": "abc"}) == "session:abc"
+    session_id = "0123456789abcdef0123456789abcdef"
+    assert canonical_link({"type": "session", "ref": session_id}) == f"session:{session_id}"
+    # The dashed UUID spelling of the same conversation is the same link.
+    assert (
+        canonical_link({"type": "session", "ref": "01234567-89AB-CDEF-0123-456789abcdef"})
+        == f"session:{session_id}"
+    )
     assert (
         canonical_link({"type": "url", "ref": "https://Docs.Example.com/a/?x=1#top"})
         == "docs.example.com/a?x=1"
@@ -63,6 +69,7 @@ def test_other_links() -> None:
         {"type": "url", "ref": "https://user:secret@example.com/a"},
         {"type": "url", "ref": "ftp://example.test/a"},
         {"type": "session", "ref": "s" * 2048},
+        {"type": "session", "ref": "https://example.com/c/abc"},
     ],
     ids=[
         "unparseable",
@@ -73,6 +80,7 @@ def test_other_links() -> None:
         "credentials",
         "non-web-scheme",
         "too-long-once-canonical",
+        "session-not-an-id",
     ],
 )
 def test_links_the_server_cannot_store_are_rejected(link: dict[str, str]) -> None:

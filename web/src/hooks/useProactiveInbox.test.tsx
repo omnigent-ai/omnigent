@@ -107,7 +107,7 @@ it("does not let a poll that lands mid-update restore the old state", async () =
   const patch = deferred<SuggestionUpdateResult>();
   vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
 
-  act(() => result.current.update("sug", { resolution: "not_now" }));
+  act(() => void result.current.update("sug", { resolution: "not_now" }));
   expect(result.current.items).toEqual([]);
   expect(result.current.unreadCount).toBe(0);
 
@@ -145,8 +145,8 @@ it("keeps a suggestion resolved when an earlier read and a dismissal overlap", a
     .mockReturnValueOnce(dismiss.promise);
 
   // Expanding marks the item read; the viewer dismisses it before that settles.
-  act(() => result.current.update("sug", { status: "read" }));
-  act(() => result.current.update("sug", { resolution: "not_relevant" }));
+  act(() => void result.current.update("sug", { status: "read" }));
+  act(() => void result.current.update("sug", { resolution: "not_relevant" }));
   expect(result.current.items).toEqual([]);
   // The dismissal waits for the read, so the server sees them in order.
   await waitFor(() => expect(updateSuggestion).toHaveBeenCalledTimes(1));
@@ -177,8 +177,8 @@ it("ignores a read mark on a suggestion the viewer already resolved", async () =
   const dismiss = deferred<SuggestionUpdateResult>();
   vi.mocked(updateSuggestion).mockReturnValueOnce(dismiss.promise);
 
-  act(() => result.current.update("sug", { resolution: "already_done" }));
-  act(() => result.current.update("sug", { status: "read" }));
+  act(() => void result.current.update("sug", { resolution: "already_done" }));
+  act(() => void result.current.update("sug", { status: "read" }));
   vi.mocked(listSuggestions).mockResolvedValue(page([], 0));
   await act(async () =>
     dismiss.resolve(saved({ ...item, status: "done", resolution: "already_done" })),
@@ -194,7 +194,7 @@ it("reports a failed update and reloads the list", async () => {
   await waitFor(() => expect(result.current.items).toEqual([item]));
   vi.mocked(updateSuggestion).mockRejectedValueOnce(new Error("offline"));
 
-  act(() => result.current.update("sug", { resolution: "not_now" }));
+  act(() => void result.current.update("sug", { resolution: "not_now" }));
   expect(result.current.items).toEqual([]);
 
   await waitFor(() => expect(showToast).toHaveBeenCalledOnce());
@@ -209,7 +209,7 @@ it("keeps the item when the update and the recovery fetch both fail", async () =
   vi.mocked(updateSuggestion).mockRejectedValueOnce(new Error("offline"));
   vi.mocked(listSuggestions).mockRejectedValueOnce(new Error("offline"));
 
-  act(() => result.current.update("sug", { resolution: "not_now" }));
+  act(() => void result.current.update("sug", { resolution: "not_now" }));
   expect(result.current.items).toEqual([]);
 
   await waitFor(() => expect(showToast).toHaveBeenCalledOnce());
@@ -223,7 +223,7 @@ it("lists only the requested states after a read mark", async () => {
   const { result } = renderHook(() => useProactiveInbox(true, ["unread"]), { wrapper });
   await waitFor(() => expect(result.current.items).toEqual([item]));
 
-  act(() => result.current.update("sug", { status: "read" }));
+  act(() => void result.current.update("sug", { status: "read" }));
 
   expect(result.current.items).toEqual([]);
 });
@@ -236,7 +236,7 @@ it.each(["fails", "hangs"])(
     const patch = deferred<SuggestionUpdateResult>();
     vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
 
-    act(() => result.current.update("sug", { resolution: "not_now" }));
+    act(() => void result.current.update("sug", { resolution: "not_now" }));
     await waitFor(() => expect(updateSuggestion).toHaveBeenCalledOnce());
     // A poll that read the item before the server applied the dismissal lands
     // while the PATCH is still in flight.
@@ -264,7 +264,7 @@ it("drops a poll still in flight when the PATCH settles", async () => {
   await waitFor(() => expect(result.current.unreadCount).toBe(1));
   const patch = deferred<SuggestionUpdateResult>();
   vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
-  act(() => result.current.update("sug", { resolution: "not_now" }));
+  act(() => void result.current.update("sug", { resolution: "not_now" }));
   await waitFor(() => expect(updateSuggestion).toHaveBeenCalledOnce());
   const stalePoll = deferred<SuggestionPage>();
   vi.mocked(listSuggestions).mockReturnValueOnce(stalePoll.promise);
@@ -290,8 +290,8 @@ it("restores the last confirmed state when overlapping updates both fail", async
     .mockReturnValueOnce(dismiss.promise);
 
   // Expanding marks the item read; the viewer dismisses it before that settles.
-  act(() => result.current.update("sug", { status: "read" }));
-  act(() => result.current.update("sug", { resolution: "not_now" }));
+  act(() => void result.current.update("sug", { status: "read" }));
+  act(() => void result.current.update("sug", { resolution: "not_now" }));
   expect(result.current.items).toEqual([]);
 
   // Both PATCHes fail, and so does the recovery fetch: the server never saw either.
@@ -315,8 +315,8 @@ it("restores the state the server confirmed, not the one before it, when a later
     .mockReturnValueOnce(read.promise)
     .mockRejectedValueOnce(new Error("offline"));
 
-  act(() => result.current.update("sug", { status: "read" }));
-  act(() => result.current.update("sug", { resolution: "not_now" }));
+  act(() => void result.current.update("sug", { status: "read" }));
+  act(() => void result.current.update("sug", { resolution: "not_now" }));
   vi.mocked(listSuggestions).mockRejectedValue(new Error("offline"));
   await act(async () => read.resolve(saved({ ...item, status: "read" })));
   await waitFor(() => expect(showToast).toHaveBeenCalledOnce());
@@ -335,7 +335,7 @@ it("shows a pending update to every instance, so the sidebar badge agrees with t
   const patch = deferred<SuggestionUpdateResult>();
   vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
 
-  act(() => result.current.inbox.update("sug", { resolution: "not_now" }));
+  act(() => void result.current.inbox.update("sug", { resolution: "not_now" }));
   expect(result.current.sidebar.unreadCount).toBe(0);
   expect(result.current.sidebar.items).toEqual([]);
   await waitFor(() => expect(updateSuggestion).toHaveBeenCalledOnce());
@@ -371,7 +371,7 @@ it("subtracts a dismissal from the unread total once, in every instance, across 
   const patch = deferred<SuggestionUpdateResult>();
   vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
 
-  act(() => result.current.inbox.update("sug", { resolution: "not_now" }));
+  act(() => void result.current.inbox.update("sug", { resolution: "not_now" }));
   expect(result.current.inbox.unreadCount).toBe(2);
   expect(result.current.sidebar.unreadCount).toBe(2);
   expect(result.current.inbox.items).toEqual(others);
@@ -406,7 +406,7 @@ it("does not subtract again when a poll already reflects the committed change, a
   const patch = deferred<SuggestionUpdateResult>();
   vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
 
-  act(() => result.current.inbox.update("sug", { resolution: "not_now" }));
+  act(() => void result.current.inbox.update("sug", { resolution: "not_now" }));
   expect(result.current.inbox.unreadCount).toBe(2);
   await waitFor(() => expect(updateSuggestion).toHaveBeenCalledOnce());
 
@@ -443,7 +443,7 @@ it("settles a list first loaded before the server committed the dismissal on the
   await waitFor(() => expect(result.current.unreadCount).toBe(3));
   const patch = deferred<SuggestionUpdateResult>();
   vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
-  act(() => result.current.update("sug", { resolution: "not_now" }));
+  act(() => void result.current.update("sug", { resolution: "not_now" }));
   expect(result.current.unreadCount).toBe(2);
 
   vi.mocked(listSuggestions).mockResolvedValue({ ...page(others, 3), nextCursor: "2:two" });
@@ -470,7 +470,7 @@ it("trusts the total of a list first loaded while the dismissal is in flight", a
   await waitFor(() => expect(result.current.unreadCount).toBe(3));
   const patch = deferred<SuggestionUpdateResult>();
   vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
-  act(() => result.current.update("sug", { resolution: "not_now" }));
+  act(() => void result.current.update("sug", { resolution: "not_now" }));
   expect(result.current.unreadCount).toBe(2);
 
   // The Unread tab opens now; the server has applied the dismissal, so its
@@ -507,7 +507,7 @@ it.each(["succeeds", "fails"])(
     vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
 
     // Expanding the item on the Unread tab marks it read.
-    act(() => result.current.unread.update("sug", { status: "read" }));
+    act(() => void result.current.unread.update("sug", { status: "read" }));
     expect(result.current.unread.unreadCount).toBe(0);
     expect(result.current.all.unreadCount).toBe(0);
 
