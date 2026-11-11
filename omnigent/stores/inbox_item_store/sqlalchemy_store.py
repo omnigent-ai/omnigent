@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import SqlInboxItem, current_workspace_id
-from omnigent.db.enum_codecs import decode_inbox_item_state, encode_inbox_item_state
+from omnigent.db.enum_codecs import decode_inbox_item_status, encode_inbox_item_status
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -31,7 +31,7 @@ from omnigent.stores.inbox_item_store import (
     NewInboxItem,
 )
 
-_OPEN_STATE_CODES = frozenset(encode_inbox_item_state(state) for state in ("unread", "read"))
+_OPEN_STATUS_CODES = frozenset(encode_inbox_item_status(status) for status in ("unread", "read"))
 _T = TypeVar("_T")
 
 
@@ -75,7 +75,7 @@ def _to_entity(row: SqlInboxItem) -> InboxItem:
         primary_link=content["primary_link"],
         topic=content["topic"],
         dedupe_key=row.dedupe_key,
-        state=decode_inbox_item_state(row.state),
+        status=decode_inbox_item_status(row.status),
         resolution=reason,
         feedback_text=text,
         created_at=row.created_at,
@@ -126,7 +126,7 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
         """Load an item by primary key, treating another owner's item as missing.
 
         ``for_update`` locks the row, so concurrent updates apply one after the
-        other and each sees the state the previous one committed.
+        other and each sees the row the previous one committed.
         """
         row = session.get(
             SqlInboxItem, (current_workspace_id(), item_id), with_for_update=for_update
@@ -213,7 +213,7 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
                 agent_id=item.agent_id,
                 prompt_version=item.prompt_version,
                 dedupe_key=item.dedupe_key,
-                state=encode_inbox_item_state("unread"),
+                status=encode_inbox_item_status("unread"),
                 content={
                     "kind": item.kind,
                     "title": item.title,
@@ -238,22 +238,22 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
         session: Session,
         user_id: str,
         *,
-        state: str | None,
+        status: str | None,
         created_after: int | None,
         after: tuple[int, str] | None,
         limit: int,
     ) -> list[SqlInboxItem]:
-        """One newest-first page over the owner's items, optionally in one state.
+        """One newest-first page over the owner's items, optionally in one status.
 
-        With a state, the filter and order match ``ix_inbox_items_user_state_created``;
+        With a status, the filter and order match ``ix_inbox_items_user_status_created``;
         without, ``ix_inbox_items_user_created``. Either way the scan is O(limit).
         """
         stmt: Select[tuple[SqlInboxItem]] = select(SqlInboxItem).where(
             SqlInboxItem.workspace_id == current_workspace_id(),
             SqlInboxItem.user_id == user_id,
         )
-        if state is not None:
-            stmt = stmt.where(SqlInboxItem.state == encode_inbox_item_state(state))
+        if status is not None:
+            stmt = stmt.where(SqlInboxItem.status == encode_inbox_item_status(status))
         if created_after is not None:
             stmt = stmt.where(SqlInboxItem.created_at >= created_after)
         if after is not None:
@@ -279,27 +279,27 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
         self,
         user_id: str,
         *,
-        states: frozenset[str] | None = None,
+        statuses: frozenset[str] | None = None,
         created_after: int | None = None,
         after: tuple[int, str] | None = None,
         limit: int = 50,
     ) -> tuple[list[InboxItem], tuple[int, str] | None]:
         """See base class.
 
-        Several states are read as one bounded page per state, then merged.
+        Several statuses are read as one bounded page per status, then merged.
         """
-        page_states: list[str | None] = [*sorted(states)] if states else [None]
+        page_statuses: list[str | None] = [*sorted(statuses)] if statuses else [None]
         with self._session("list_inbox_items") as session:
             pages = [
                 self._page(
                     session,
                     user_id,
-                    state=state,
+                    status=status,
                     created_after=created_after,
                     after=after,
                     limit=limit + 1,
                 )
-                for state in page_states
+                for status in page_statuses
             ]
             merged = heapq.merge(*pages, key=lambda row: (row.created_at, row.id), reverse=True)
             rows = [row for _, row in zip(range(limit + 1), merged, strict=False)]
@@ -316,7 +316,7 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
             .where(
                 SqlInboxItem.workspace_id == current_workspace_id(),
                 SqlInboxItem.user_id == user_id,
-                SqlInboxItem.state == encode_inbox_item_state("unread"),
+                SqlInboxItem.status == encode_inbox_item_status("unread"),
             )
             .limit(limit)
             .subquery()
@@ -329,7 +329,7 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
         item_id: str,
         user_id: str,
         *,
-        state: str | None = None,
+        status: str | None = None,
         resolution: str | None = None,
         resolution_action: int | None = None,
         feedback_text: str | None = None,
@@ -344,9 +344,9 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
                 return None
             reason, action, text = _answer(row.resolution)
             # A read or unread mark never reopens a resolved item; only a
-            # resolution of "none" does, and it sets the state itself.
-            if state is not None and (resolution is not None or row.state in _OPEN_STATE_CODES):
-                row.state = encode_inbox_item_state(state)
+            # resolution of "none" does, and it sets the status itself.
+            if status is not None and (resolution is not None or row.status in _OPEN_STATUS_CODES):
+                row.status = encode_inbox_item_status(status)
             if resolution is not None:
                 reason, action = resolution, resolution_action
                 if resolution != "none":

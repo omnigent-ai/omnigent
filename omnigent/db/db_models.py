@@ -1810,14 +1810,16 @@ class SqlInboxItem(OmnigentBase):
     id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     # The reserved "local" user in single-user mode, so the unique index applies there too.
     user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # The session whose agent posted the item, and that agent.
     source_session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
     agent_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
-    # Content hash of the agent bundle that posted the item, for comparing prompts.
+    # Content hash of the agent bundle that posted the item, so acceptance can be
+    # compared across prompt revisions.
     prompt_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Versioned duplicate key: a hash of the kind, primary link, and topic.
     dedupe_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    # INBOX_ITEM_STATE code.
-    state: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    # INBOX_ITEM_STATUS code: unread, read, done, or dismissed.
+    status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     # What the agent posted, which a deployment may encrypt, as one storage
     # envelope: {"kind", "title", "body_md", "links", "actions", "topic",
     # "primary_link", "media"}. Always read and written together.
@@ -1835,7 +1837,7 @@ class SqlInboxItem(OmnigentBase):
     expires_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
-        CheckConstraint("state IN (1, 2, 3, 4)", name="ck_inbox_items_state"),
+        CheckConstraint("status IN (1, 2, 3, 4)", name="ck_inbox_items_status"),
         # SQLite enforces neither declared lengths nor types; these bound what it stores.
         CheckConstraint(
             "user_id IS NULL OR length(CAST(user_id AS BLOB)) <= 512",
@@ -1887,17 +1889,17 @@ class SqlInboxItem(OmnigentBase):
         ).ddl_if(callable_=_on_sqlite_family),
         # Newest-first list of all of an owner's items.
         Index("ix_inbox_items_user_created", "workspace_id", "user_id", "created_at", "id"),
-        # Newest-first list and bounded count of an owner's items in one state.
+        # Newest-first list and bounded count of an owner's items in one status.
         Index(
-            "ix_inbox_items_user_state_created",
+            "ix_inbox_items_user_status_created",
             "workspace_id",
             "user_id",
-            "state",
+            "status",
             "created_at",
             "id",
         ),
         # Bounded count of the items one session posted, for the per-session cap.
-        Index("ix_inbox_items_session", "workspace_id", "user_id", "source_session_id"),
+        Index("ix_inbox_items_session", "workspace_id", "user_id", "source_session_id", "id"),
         Index(
             "uq_inbox_items_user_dedupe_key",
             "workspace_id",

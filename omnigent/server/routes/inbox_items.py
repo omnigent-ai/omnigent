@@ -56,12 +56,12 @@ MAX_EPOCH = 2**63 - 1
 MAX_TOPIC_CHARS = 128
 
 InboxItemKind = Literal["followup", "info", "reminder"]
-InboxItemState = Literal["unread", "read", "done", "dismissed"]
+InboxItemStatus = Literal["unread", "read", "done", "dismissed"]
 InboxItemResolution = Literal[
     "none", "action_taken", "already_done", "useful", "not_relevant", "incorrect", "not_now"
 ]
-# The state each resolution moves an item to; "none" reopens it.
-_RESOLUTION_STATE: dict[str, str] = {
+# The status each resolution moves an item to; "none" reopens it.
+_RESOLUTION_STATUS: dict[str, str] = {
     "none": "read",
     "action_taken": "done",
     "already_done": "done",
@@ -109,22 +109,22 @@ class CreateInboxItemRequest(BaseModel):
 class UpdateInboxItemRequest(BaseModel):
     """Body for ``PATCH /v1/inbox/items/{item_id}``.
 
-    ``state`` marks an open item read or unread. ``resolution`` closes an item
-    (or reopens it with ``"none"``) and moves its state to match;
+    ``status`` marks an open item read or unread. ``resolution`` closes an item
+    (or reopens it with ``"none"``) and moves its status to match;
     ``"action_taken"`` also needs ``resolution_action``, the action's index.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    state: Literal["unread", "read"] | None = None
+    status: Literal["unread", "read"] | None = None
     resolution: InboxItemResolution | None = None
     resolution_action: int | None = Field(default=None, ge=0, lt=MAX_ACTIONS_PER_ITEM)
     feedback_text: str | None = Field(default=None, max_length=2000)
 
     @model_validator(mode="after")
     def _check_combination(self) -> UpdateInboxItemRequest:
-        if self.state is not None and self.resolution is not None:
-            raise ValueError("set state or resolution, not both")
+        if self.status is not None and self.resolution is not None:
+            raise ValueError("set status or resolution, not both")
         if (self.resolution == "action_taken") != (self.resolution_action is not None):
             raise ValueError("resolution_action goes only with resolution action_taken")
         return self
@@ -282,7 +282,7 @@ def create_inbox_items_router(
     @router.get("/inbox/items")
     async def list_inbox_items(
         request: Request,
-        state: Annotated[list[InboxItemState] | None, Query()] = None,
+        status: Annotated[list[InboxItemStatus] | None, Query()] = None,
         created_after: int | None = Query(default=None, ge=0, le=MAX_EPOCH),
         after: str | None = Query(default=None, max_length=64),
         limit: int = Query(default=50, ge=1, le=100),
@@ -293,7 +293,7 @@ def create_inbox_items_router(
         items, next_cursor = await asyncio.to_thread(
             lambda: store.list_for_user(
                 owner,
-                states=frozenset(state) if state else None,
+                statuses=frozenset(status) if status else None,
                 created_after=created_after,
                 after=cursor,
                 limit=limit,
@@ -321,13 +321,15 @@ def create_inbox_items_router(
             current = await asyncio.to_thread(store.get, item_id, owner)
             if current is not None and body.resolution_action >= len(current.actions):
                 raise OmnigentError("No such action on this item", code=ErrorCode.INVALID_INPUT)
-        state = _RESOLUTION_STATE[body.resolution] if body.resolution is not None else body.state
+        status = (
+            _RESOLUTION_STATUS[body.resolution] if body.resolution is not None else body.status
+        )
         try:
             item = await asyncio.to_thread(
                 lambda: store.update(
                     item_id,
                     owner,
-                    state=state,
+                    status=status,
                     resolution=body.resolution,
                     resolution_action=body.resolution_action,
                     feedback_text=body.feedback_text,

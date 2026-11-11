@@ -125,7 +125,7 @@ async def test_post_creates_an_item(client: httpx.AsyncClient, stores: SimpleNam
     assert item["prompt_version"] == _BUNDLE_HASH
     assert (item["primary_link"], item["topic"]) == ("github.com/acme/app/pull/7", "rampup-flag")
     assert item["actions"] == _body()["actions"]
-    assert (item["state"], item["resolution"]) == ("unread", "none")
+    assert (item["status"], item["resolution"]) == ("unread", "none")
 
 
 async def test_post_stores_a_chart_block(
@@ -335,19 +335,19 @@ async def test_list_and_resolve(client: httpx.AsyncClient, stores: SimpleNamespa
 
     taken = await client.patch(url, json={"resolution": "action_taken", "resolution_action": 0})
     assert taken.status_code == 200
-    assert (taken.json()["state"], taken.json()["resolution_action"]) == ("done", 0)
+    assert (taken.json()["status"], taken.json()["resolution_action"]) == ("done", 0)
     reopened = (await client.patch(url, json={"resolution": "none"})).json()
-    assert (reopened["state"], reopened["resolution"]) == ("read", "none")
+    assert (reopened["status"], reopened["resolution"]) == ("read", "none")
     dismissed = (await client.patch(url, json={"resolution": "not_now"})).json()
-    assert (dismissed["state"], dismissed["resolution"]) == ("dismissed", "not_now")
-    unread = (await client.get("/v1/inbox/items", params={"state": "unread"})).json()
+    assert (dismissed["status"], dismissed["resolution"]) == ("dismissed", "not_now")
+    unread = (await client.get("/v1/inbox/items", params={"status": "unread"})).json()
     assert (unread["data"], unread["unread_count"]) == ([], 0)
 
     assert (
         await client.patch(url, json={"resolution": "action_taken", "resolution_action": 2})
     ).status_code == 400
     assert (
-        await client.patch(url, json={"state": "read", "resolution": "useful"})
+        await client.patch(url, json={"status": "read", "resolution": "useful"})
     ).status_code == 422
     assert (await client.patch(f"/v1/inbox/items/{'0' * 32}", json={})).status_code == 404
     assert (await client.patch("/v1/inbox/items/not-an-id", json={})).status_code == 404
@@ -355,8 +355,8 @@ async def test_list_and_resolve(client: httpx.AsyncClient, stores: SimpleNamespa
         assert (await client.get("/v1/inbox/items", params={"after": cursor})).status_code == 400
     too_late = await client.get("/v1/inbox/items", params={"created_after": 2**63})
     assert too_late.status_code == 422
-    late_read = (await client.patch(url, json={"state": "read"})).json()
-    assert (late_read["state"], late_read["resolution"]) == ("dismissed", "not_now")
+    late_read = (await client.patch(url, json={"status": "read"})).json()
+    assert (late_read["status"], late_read["resolution"]) == ("dismissed", "not_now")
 
 
 async def test_authenticated_owners_see_only_their_items(
@@ -380,7 +380,7 @@ async def test_authenticated_owners_see_only_their_items(
         assert stolen.status_code == 403
         assert (await c.get("/v1/inbox/items", headers=bob)).json()["data"] == []
         assert (
-            await c.patch(f"/v1/inbox/items/{item_id}", json={"state": "read"}, headers=bob)
+            await c.patch(f"/v1/inbox/items/{item_id}", json={"status": "read"}, headers=bob)
         ).status_code == 404
         assert len((await c.get("/v1/inbox/items", headers=alice)).json()["data"]) == 1
 

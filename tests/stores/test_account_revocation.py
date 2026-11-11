@@ -979,7 +979,7 @@ def test_deleted_account_inbox_is_not_visible_after_reregistration(db_uri: str) 
     with account_authority_scope("alice", old.account_generation):
         for write in (
             lambda: inbox.create(_inbox_item("alice")),
-            lambda: inbox.update(item.id, "alice", state="read", now=1),
+            lambda: inbox.update(item.id, "alice", status="read", now=1),
         ):
             with pytest.raises(OmnigentError, match="revoked"):
                 write()

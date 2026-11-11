@@ -5,7 +5,7 @@ import { authenticatedFetch } from "@/lib/identity";
 import { apiErrorFromResponse } from "@/lib/sessionsApi";
 
 export type SuggestionKind = "followup" | "info" | "reminder";
-export type SuggestionState = "unread" | "read" | "done" | "dismissed";
+export type SuggestionStatus = "unread" | "read" | "done" | "dismissed";
 export type SuggestionResolution =
   "none" | "action_taken" | "already_done" | "useful" | "not_relevant" | "incorrect" | "not_now";
 
@@ -42,7 +42,7 @@ export interface Suggestion {
   /** Rich content drawn on the card, in order. */
   media: SuggestionMediaBlock[];
   sourceSessionId: string;
-  state: SuggestionState;
+  status: SuggestionStatus;
   resolution: SuggestionResolution;
   createdAt: number;
 }
@@ -56,7 +56,7 @@ interface SuggestionWire {
   actions?: SuggestionAction[];
   media?: unknown;
   source_session_id: string;
-  state: SuggestionState;
+  status: SuggestionStatus;
   resolution?: SuggestionResolution;
   created_at: number;
 }
@@ -70,7 +70,7 @@ export interface SuggestionPage {
 }
 
 /** States still waiting on the viewer; done and dismissed items leave the Inbox. */
-export const OPEN_SUGGESTION_STATES: readonly SuggestionState[] = ["unread", "read"];
+export const OPEN_SUGGESTION_STATUSES: readonly SuggestionStatus[] = ["unread", "read"];
 
 /** What the UI calls the proactive agent; the one place to change when it is renamed. */
 export const PROACTIVE_AGENT_DISPLAY_NAME = "Omni Advisor";
@@ -105,19 +105,19 @@ export function suggestionFromWire(wire: SuggestionWire): Suggestion {
         )
       : [],
     sourceSessionId: wire.source_session_id,
-    state: wire.state,
+    status: wire.status,
     resolution: wire.resolution ?? "none",
     createdAt: wire.created_at,
   };
 }
 
-/** One page of the viewer's suggestions in `states`, newest first. */
+/** One page of the viewer's suggestions in `statuses`, newest first. */
 export async function listSuggestions(
   after: string | null,
-  states: readonly SuggestionState[] = OPEN_SUGGESTION_STATES,
+  statuses: readonly SuggestionStatus[] = OPEN_SUGGESTION_STATUSES,
 ): Promise<SuggestionPage> {
   const params = new URLSearchParams({ limit: String(SUGGESTION_PAGE_SIZE) });
-  for (const state of states) params.append("state", state);
+  for (const status of statuses) params.append("status", status);
   if (after !== null) params.set("after", after);
   const res = await authenticatedFetch(`/v1/inbox/items?${params}`);
   if (!res.ok) throw await apiErrorFromResponse(res);
@@ -137,15 +137,15 @@ export async function listSuggestions(
 
 /** A PATCH body: mark read or unread, or close the item with a resolution. */
 export type SuggestionUpdate =
-  | { state: "read" | "unread" }
+  | { status: "read" | "unread" }
   | { resolution: "action_taken"; resolutionAction: number }
   | { resolution: Exclude<SuggestionResolution, "action_taken"> };
 
 /** Record the viewer's response to one suggestion. */
 export async function updateSuggestion(id: string, update: SuggestionUpdate): Promise<Suggestion> {
   const body =
-    "state" in update
-      ? { state: update.state }
+    "status" in update
+      ? { status: update.status }
       : update.resolution === "action_taken"
         ? { resolution: update.resolution, resolution_action: update.resolutionAction }
         : { resolution: update.resolution };
@@ -158,9 +158,9 @@ export async function updateSuggestion(id: string, update: SuggestionUpdate): Pr
   return suggestionFromWire((await res.json()) as SuggestionWire);
 }
 
-/** The state an update moves an item to, matching the server's rules. */
-export function stateAfterUpdate(update: SuggestionUpdate): SuggestionState {
-  if ("state" in update) return update.state;
+/** The status an update moves an item to, matching the server's rules. */
+export function statusAfterUpdate(update: SuggestionUpdate): SuggestionStatus {
+  if ("status" in update) return update.status;
   if (update.resolution === "none") return "read";
   return update.resolution === "action_taken" || update.resolution === "already_done"
     ? "done"
@@ -173,15 +173,15 @@ export function applySuggestionUpdate(
   id: string,
   update: SuggestionUpdate,
 ): SuggestionPage[] {
-  const nextState = stateAfterUpdate(update);
+  const nextStatus = statusAfterUpdate(update);
   let delta = 0;
   const updated = pages.map((page) => ({
     ...page,
     data: page.data.flatMap((item) => {
       if (item.id !== id) return [item];
-      if (item.state === "unread" && nextState !== "unread") delta -= 1;
-      if (item.state !== "unread" && nextState === "unread") delta += 1;
-      return OPEN_SUGGESTION_STATES.includes(nextState) ? [{ ...item, state: nextState }] : [];
+      if (item.status === "unread" && nextStatus !== "unread") delta -= 1;
+      if (item.status !== "unread" && nextStatus === "unread") delta += 1;
+      return OPEN_SUGGESTION_STATUSES.includes(nextStatus) ? [{ ...item, status: nextStatus }] : [];
     }),
   }));
   // Every page carries the same total; a capped total stays as the server sent it.
@@ -197,13 +197,13 @@ export function applySuggestionUpdate(
  * left for the next fetch to place.
  */
 export function reconcileSuggestion(pages: SuggestionPage[], saved: Suggestion): SuggestionPage[] {
-  const isOpen = OPEN_SUGGESTION_STATES.includes(saved.state);
+  const isOpen = OPEN_SUGGESTION_STATUSES.includes(saved.status);
   let delta = 0;
   const updated = pages.map((page) => ({
     ...page,
     data: page.data.flatMap((item) => {
       if (item.id !== saved.id) return [item];
-      delta += Number(saved.state === "unread") - Number(item.state === "unread");
+      delta += Number(saved.status === "unread") - Number(item.status === "unread");
       return isOpen ? [saved] : [];
     }),
   }));
