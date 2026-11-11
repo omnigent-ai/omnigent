@@ -10647,11 +10647,32 @@ async def _auto_create_grok_terminal(
     if grok_command is None:
         raise RuntimeError("grok CLI not found; install per `omnigent grok` guidance.")
     endpoint = build_grok_serve_endpoint()
+
+    # Policy bridge: a per-session plugin under ~/.grok/plugins (auto-trusted)
+    # carrying a PreToolUse command hook that consults the Omnigent policy +
+    # permission routes, so ALLOW/DENY/ASK gate every tool call.
+    from omnigent.harnesses.grok_native.hooks_config import write_grok_policy_plugin
+
+    plugin_dir = write_grok_policy_plugin(session_id)
+    runner_server_url = _required_runner_env("RUNNER_SERVER_URL").rstrip("/")
+    policy_env = {
+        GROK_NATIVE_BRIDGE_DIR_ENV_VAR: str(bridge_dir),
+        "OMNIGENT_POLICY_EVALUATE_URL": (
+            f"{runner_server_url}/v1/sessions/{session_id}/policies/evaluate"
+        ),
+        "OMNIGENT_PERMISSION_URL": (
+            f"{runner_server_url}/v1/sessions/{session_id}/hooks/permission-request"
+        ),
+    }
     argv = grok_serve_argv(
         grok_command,
         port=endpoint.port,
         secret=endpoint.secret,
-        extra_args=tuple(launch_config.terminal_launch_args or []),
+        extra_args=(
+            "--plugin-dir",
+            str(plugin_dir),
+            *tuple(launch_config.terminal_launch_args or []),
+        ),
     )
     agent_os_env = _agent_os_env_from_spec(agent_spec)
     terminal_view = await resource_registry.launch_required_terminal(
@@ -10668,7 +10689,7 @@ async def _auto_create_grok_terminal(
             ),
             command=argv[0],
             args=argv[1:],
-            env={GROK_NATIVE_BRIDGE_DIR_ENV_VAR: str(bridge_dir)},
+            env=policy_env,
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,

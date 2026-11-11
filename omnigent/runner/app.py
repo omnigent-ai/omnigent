@@ -1476,6 +1476,7 @@ def create_runner_app(
     _claude_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _antigravity_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _devin_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _grok_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     app.state.antigravity_terminal_ensure_locks = _antigravity_terminal_ensure_locks
     # Keyed by native agent key, which is also the pane's terminal name. Launch
     # and ensure paths take a session's lock here; so does the idle pane reaper.
@@ -1493,6 +1494,7 @@ def create_runner_app(
             "qwen": _qwen_terminal_ensure_locks,
             "kimi": _kimi_terminal_ensure_locks,
             "devin": _devin_terminal_ensure_locks,
+            "grok": _grok_terminal_ensure_locks,
         }
     )
     app.state.native_terminal_ensure_locks = _native_terminal_ensure_locks

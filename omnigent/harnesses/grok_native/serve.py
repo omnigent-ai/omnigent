@@ -67,7 +67,16 @@ def grok_serve_argv(
         secret,
     ]
     if extra_args:
-        argv.extend(extra_args)
+        # ``--plugin-dir`` and other ``agent``-level options precede ``serve``
+        # in clap's subcommand order; splicing after the subcommand would let
+        # them silently land on the wrong parser.
+        agent_opts, serve_opts = [], []
+        it = iter(extra_args)
+        for arg in it:
+            (agent_opts if arg == "--plugin-dir" else serve_opts).append(arg)
+            if arg == "--plugin-dir":
+                agent_opts.append(next(it, ""))
+        argv = [executable, "agent", *agent_opts, "serve", *argv[3:], *serve_opts]
     return argv
 
 
