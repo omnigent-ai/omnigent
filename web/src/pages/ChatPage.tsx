@@ -4091,7 +4091,7 @@ function ComposerImpl(
 
   // The workflow dialog sends straight to the chat and leaves the draft alone.
   const runWorkflow = (request: WorkflowRequest) => {
-    const message = workflowMessage(skillPrefix, request.goal, request.reviewPlanFirst);
+    const message = workflowMessage(skillPrefix, request.description, request.reviewPlanFirst);
     const skill = onSendSlashCommand
       ? matchSlashCommandInvocation(message, slashCommandNames)
       : null;

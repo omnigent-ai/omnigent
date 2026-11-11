@@ -15,8 +15,8 @@ import { Textarea } from "@/components/ui/textarea";
 
 /** What the user asked for in the "Run a workflow" dialog. */
 export interface WorkflowRequest {
-  /** The goal, trimmed, e.g. `"Add retries to the uploader"`. */
-  goal: string;
+  /** What the user wants done, trimmed, e.g. `"Add retries to the uploader"`. */
+  description: string;
   /** Whether the agent's plan starts with the user reviewing it. */
   reviewPlanFirst: boolean;
 }
@@ -26,41 +26,41 @@ export interface WorkflowDialogProps {
   onOpenChange: (open: boolean) => void;
   /** Sends the workflow; the dialog closes after. */
   onRunWorkflow: (request: WorkflowRequest) => void;
-  /** The goal the dialog opens with, e.g. the new-session composer's draft. */
-  initialGoal?: string;
+  /** The description the dialog opens with, e.g. the new-session composer's draft. */
+  initialDescription?: string;
   /** Why the workflow can't be sent right now; it disables Run. */
   blockedReason?: string | null;
 }
 
-/** Ask for a workflow's goal, and whether to review the plan before work starts. */
+/** Ask for a workflow's description, and whether to review the plan before work starts. */
 export function WorkflowDialog({
   open,
   onOpenChange,
   onRunWorkflow,
-  initialGoal = "",
+  initialDescription = "",
   blockedReason = null,
 }: WorkflowDialogProps) {
-  const [goal, setGoal] = useState(initialGoal);
+  const [description, setDescription] = useState(initialDescription);
   const [reviewPlanFirst, setReviewPlanFirst] = useState(true);
-  const goalId = useId();
+  const descriptionId = useId();
   const reviewId = useId();
-  const initialGoalRef = useRef(initialGoal);
-  initialGoalRef.current = initialGoal;
+  const initialDescriptionRef = useRef(initialDescription);
+  initialDescriptionRef.current = initialDescription;
 
-  // Each opening starts from the caller's goal, with the review checked.
+  // Each opening starts from the caller's description, with the review checked.
   useEffect(() => {
     if (!open) return;
-    setGoal(initialGoalRef.current);
+    setDescription(initialDescriptionRef.current);
     setReviewPlanFirst(true);
   }, [open]);
 
-  const canRun = goal.trim() !== "" && blockedReason === null;
+  const canRun = description.trim() !== "" && blockedReason === null;
   const submit = (event: FormEvent) => {
     event.preventDefault();
     // React bubbles a portal's submit to the composer's form, which would send the draft.
     event.stopPropagation();
     if (!canRun) return;
-    onRunWorkflow({ goal: goal.trim(), reviewPlanFirst });
+    onRunWorkflow({ description: description.trim(), reviewPlanFirst });
     onOpenChange(false);
   };
 
@@ -77,20 +77,21 @@ export function WorkflowDialog({
               <span>Run a workflow</span>
             </DialogTitle>
             <DialogDescription>
-              The agent turns your goal into a plan and works through it step by step. Follow along
-              in the Tasks tab.
+              The agent turns your description into a plan and works through it step by step. Follow
+              along in the Tasks tab.
             </DialogDescription>
           </DialogHeader>
 
-          <div className="min-h-0 space-y-4 overflow-y-auto">
+          {/* The room keeps the scroll area from clipping the fields' focus rings. */}
+          <div className="-mx-1 min-h-0 space-y-4 overflow-y-auto px-1">
             <div className="space-y-1.5">
-              <label className="text-sm font-medium text-muted-foreground" htmlFor={goalId}>
-                Goal
+              <label className="text-sm font-medium text-muted-foreground" htmlFor={descriptionId}>
+                Description
               </label>
               <Textarea
-                id={goalId}
-                value={goal}
-                onChange={(event) => setGoal(event.currentTarget.value)}
+                id={descriptionId}
+                value={description}
+                onChange={(event) => setDescription(event.currentTarget.value)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) submit(event);
                 }}
@@ -98,8 +99,8 @@ export function WorkflowDialog({
                 className="min-h-28 resize-y"
                 placeholder="Add retries to the uploader, with tests"
                 autoFocus
-                data-testid="workflow-dialog-goal"
-                componentId="workflow_dialog.goal"
+                data-testid="workflow-dialog-description"
+                componentId="workflow_dialog.description"
               />
             </div>
             <div className="space-y-1">

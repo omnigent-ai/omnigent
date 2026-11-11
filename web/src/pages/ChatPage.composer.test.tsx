@@ -6195,11 +6195,11 @@ describe("Composer workflow entry point", () => {
 
   const workflowSkills = [{ name: "workflow", description: "Plan and run a multi-step workflow" }];
 
-  async function runWorkflowFromMenu(goal: string, { reviewPlanFirst = true } = {}) {
+  async function runWorkflowFromMenu(description: string, { reviewPlanFirst = true } = {}) {
     fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
     fireEvent.click(screen.getByTestId("composer-workflow-action"));
-    fireEvent.change(await screen.findByTestId("workflow-dialog-goal"), {
-      target: { value: goal },
+    fireEvent.change(await screen.findByTestId("workflow-dialog-description"), {
+      target: { value: description },
     });
     if (!reviewPlanFirst) fireEvent.click(screen.getByTestId("workflow-dialog-review-plan"));
     fireEvent.click(screen.getByTestId("workflow-dialog-run"));
