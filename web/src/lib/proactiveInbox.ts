@@ -141,8 +141,18 @@ export type SuggestionUpdate =
   | { resolution: "action_taken"; resolutionAction: number }
   | { resolution: Exclude<SuggestionResolution, "action_taken"> };
 
+/** The server's reply to an update: the item, and the viewer's unread total after it. */
+export interface SuggestionUpdateResult {
+  item: Suggestion;
+  unreadCount: number;
+  unreadCountCapped: boolean;
+}
+
 /** Record the viewer's response to one suggestion. */
-export async function updateSuggestion(id: string, update: SuggestionUpdate): Promise<Suggestion> {
+export async function updateSuggestion(
+  id: string,
+  update: SuggestionUpdate,
+): Promise<SuggestionUpdateResult> {
   const body =
     "status" in update
       ? { status: update.status }
@@ -155,7 +165,15 @@ export async function updateSuggestion(id: string, update: SuggestionUpdate): Pr
     body: JSON.stringify(body),
   });
   if (!res.ok) throw await apiErrorFromResponse(res);
-  return suggestionFromWire((await res.json()) as SuggestionWire);
+  const reply = (await res.json()) as SuggestionWire & {
+    unread_count: number;
+    unread_count_capped?: boolean;
+  };
+  return {
+    item: suggestionFromWire(reply),
+    unreadCount: reply.unread_count,
+    unreadCountCapped: reply.unread_count_capped === true,
+  };
 }
 
 /** The status an update moves an item to, matching the server's rules. */
@@ -211,29 +229,24 @@ export function applySuggestionUpdate(
 }
 
 /**
- * Write the server's copy of one suggestion into cached pages after its update
- * succeeds: replace an open item, drop a resolved one, and move the unread count
- * by the difference from the cached copy. An item the cache no longer holds is
- * left for the next fetch to place.
+ * Write the server's reply to an update into cached pages: replace an open
+ * item, drop a resolved one, and set every page's unread total to the count
+ * the server reported after the change. An item the cache does not hold is
+ * left for the next fetch to place; the total still comes from the server.
  */
 export function reconcileSuggestion(
   pages: SuggestionPage[],
-  saved: Suggestion,
-  from?: SuggestionStatus,
+  saved: SuggestionUpdateResult,
 ): SuggestionPage[] {
-  const isOpen = OPEN_SUGGESTION_STATUSES.includes(saved.status);
-  let delta = 0;
-  let seen = false;
-  const updated = pages.map((page) => ({
+  const isOpen = OPEN_SUGGESTION_STATUSES.includes(saved.item.status);
+  return pages.map((page) => ({
     ...page,
-    data: page.data.flatMap((item) => {
-      if (item.id !== saved.id) return [item];
-      seen = true;
-      delta += unreadDelta(item.status, saved.status);
-      return isOpen ? [saved] : [];
-    }),
+    unreadCount: saved.unreadCount,
+    unreadCountCapped: saved.unreadCountCapped,
+    data: page.data.flatMap((item) =>
+      item.id !== saved.item.id ? [item] : isOpen ? [saved.item] : [],
+    ),
   }));
-  return adjustUnreadCount(updated, seen ? delta : unreadDelta(from, saved.status));
 }
 
 /** Where a suggestion sits in cached pages. */

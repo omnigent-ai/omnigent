@@ -11,6 +11,7 @@ import {
   updateSuggestion,
   type Suggestion,
   type SuggestionPage,
+  type SuggestionUpdateResult,
 } from "@/lib/proactiveInbox";
 import type * as ProactiveInboxModule from "@/lib/proactiveInbox";
 import { basenamedRouting, RoutingProvider } from "@/lib/routing";
@@ -53,6 +54,11 @@ const item: Suggestion = {
 
 function page(data: Suggestion[], unreadCount: number): SuggestionPage {
   return { data, nextCursor: null, unreadCount, unreadCountCapped: false };
+}
+
+/** The server's reply to a PATCH: the item, and the viewer's unread total after it. */
+function saved(suggestion: Suggestion, unreadCount = 0): SuggestionUpdateResult {
+  return { item: suggestion, unreadCount, unreadCountCapped: false };
 }
 
 function deferred<T>() {
@@ -98,7 +104,7 @@ it("does not let a poll that lands mid-update restore the old state", async () =
   const stalePoll = deferred<SuggestionPage>();
   vi.mocked(listSuggestions).mockReturnValueOnce(stalePoll.promise);
   void act(() => void result.current.refetch());
-  const patch = deferred<Suggestion>();
+  const patch = deferred<SuggestionUpdateResult>();
   vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
 
   act(() => result.current.update("sug", { resolution: "not_now" }));
@@ -109,7 +115,9 @@ it("does not let a poll that lands mid-update restore the old state", async () =
   expect(result.current.items).toEqual([]);
 
   vi.mocked(listSuggestions).mockResolvedValue(page([], 0));
-  await act(async () => patch.resolve({ ...item, status: "dismissed", resolution: "not_now" }));
+  await act(async () =>
+    patch.resolve(saved({ ...item, status: "dismissed", resolution: "not_now" })),
+  );
   await waitFor(() => expect(listSuggestions).toHaveBeenLastCalledWith(null, ["unread", "read"]));
   expect(result.current.items).toEqual([]);
 });
@@ -130,8 +138,8 @@ it("pages with the server cursor for the requested states", async () => {
 it("keeps a suggestion resolved when an earlier read and a dismissal overlap", async () => {
   const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
   await waitFor(() => expect(result.current.items).toEqual([item]));
-  const read = deferred<Suggestion>();
-  const dismiss = deferred<Suggestion>();
+  const read = deferred<SuggestionUpdateResult>();
+  const dismiss = deferred<SuggestionUpdateResult>();
   vi.mocked(updateSuggestion)
     .mockReturnValueOnce(read.promise)
     .mockReturnValueOnce(dismiss.promise);
@@ -146,7 +154,7 @@ it("keeps a suggestion resolved when an earlier read and a dismissal overlap", a
   expect(updateSuggestion).toHaveBeenCalledTimes(1);
 
   // The read's response says the item is open; it must not bring it back.
-  await act(async () => read.resolve({ ...item, status: "read" }));
+  await act(async () => read.resolve(saved({ ...item, status: "read" })));
   await waitFor(() => expect(updateSuggestion).toHaveBeenCalledTimes(2));
   expect(vi.mocked(updateSuggestion).mock.calls[1]).toEqual([
     "sug",
@@ -156,7 +164,7 @@ it("keeps a suggestion resolved when an earlier read and a dismissal overlap", a
 
   vi.mocked(listSuggestions).mockResolvedValue(page([], 0));
   await act(async () =>
-    dismiss.resolve({ ...item, status: "dismissed", resolution: "not_relevant" }),
+    dismiss.resolve(saved({ ...item, status: "dismissed", resolution: "not_relevant" })),
   );
   await waitFor(() => expect(listSuggestions).toHaveBeenCalledTimes(2));
   expect(result.current.items).toEqual([]);
@@ -166,13 +174,15 @@ it("keeps a suggestion resolved when an earlier read and a dismissal overlap", a
 it("ignores a read mark on a suggestion the viewer already resolved", async () => {
   const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
   await waitFor(() => expect(result.current.items).toEqual([item]));
-  const dismiss = deferred<Suggestion>();
+  const dismiss = deferred<SuggestionUpdateResult>();
   vi.mocked(updateSuggestion).mockReturnValueOnce(dismiss.promise);
 
   act(() => result.current.update("sug", { resolution: "already_done" }));
   act(() => result.current.update("sug", { status: "read" }));
   vi.mocked(listSuggestions).mockResolvedValue(page([], 0));
-  await act(async () => dismiss.resolve({ ...item, status: "done", resolution: "already_done" }));
+  await act(async () =>
+    dismiss.resolve(saved({ ...item, status: "done", resolution: "already_done" })),
+  );
 
   await waitFor(() => expect(listSuggestions).toHaveBeenCalledTimes(2));
   expect(updateSuggestion).toHaveBeenCalledTimes(1);
@@ -223,7 +233,7 @@ it.each(["fails", "hangs"])(
   async (refetchOutcome) => {
     const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
     await waitFor(() => expect(result.current.unreadCount).toBe(1));
-    const patch = deferred<Suggestion>();
+    const patch = deferred<SuggestionUpdateResult>();
     vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
 
     act(() => result.current.update("sug", { resolution: "not_now" }));
@@ -239,7 +249,9 @@ it.each(["fails", "hangs"])(
     } else {
       vi.mocked(listSuggestions).mockReturnValue(new Promise(() => {}));
     }
-    await act(async () => patch.resolve({ ...item, status: "dismissed", resolution: "not_now" }));
+    await act(async () =>
+      patch.resolve(saved({ ...item, status: "dismissed", resolution: "not_now" })),
+    );
     await waitFor(() => expect(listSuggestions).toHaveBeenCalledTimes(3));
 
     expect(result.current.items).toEqual([]);
@@ -250,7 +262,7 @@ it.each(["fails", "hangs"])(
 it("drops a poll still in flight when the PATCH settles", async () => {
   const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
   await waitFor(() => expect(result.current.unreadCount).toBe(1));
-  const patch = deferred<Suggestion>();
+  const patch = deferred<SuggestionUpdateResult>();
   vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
   act(() => result.current.update("sug", { resolution: "not_now" }));
   await waitFor(() => expect(updateSuggestion).toHaveBeenCalledOnce());
@@ -259,7 +271,9 @@ it("drops a poll still in flight when the PATCH settles", async () => {
   void act(() => void result.current.refetch());
 
   vi.mocked(listSuggestions).mockReturnValue(new Promise(() => {}));
-  await act(async () => patch.resolve({ ...item, status: "dismissed", resolution: "not_now" }));
+  await act(async () =>
+    patch.resolve(saved({ ...item, status: "dismissed", resolution: "not_now" })),
+  );
   await act(async () => stalePoll.resolve(page([item], 1)));
 
   expect(result.current.items).toEqual([]);
@@ -269,8 +283,8 @@ it("drops a poll still in flight when the PATCH settles", async () => {
 it("restores the last confirmed state when overlapping updates both fail", async () => {
   const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
   await waitFor(() => expect(result.current.items).toEqual([item]));
-  const read = deferred<Suggestion>();
-  const dismiss = deferred<Suggestion>();
+  const read = deferred<SuggestionUpdateResult>();
+  const dismiss = deferred<SuggestionUpdateResult>();
   vi.mocked(updateSuggestion)
     .mockReturnValueOnce(read.promise)
     .mockReturnValueOnce(dismiss.promise);
@@ -296,7 +310,7 @@ it("restores the last confirmed state when overlapping updates both fail", async
 it("restores the state the server confirmed, not the one before it, when a later update fails", async () => {
   const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
   await waitFor(() => expect(result.current.items).toEqual([item]));
-  const read = deferred<Suggestion>();
+  const read = deferred<SuggestionUpdateResult>();
   vi.mocked(updateSuggestion)
     .mockReturnValueOnce(read.promise)
     .mockRejectedValueOnce(new Error("offline"));
@@ -304,7 +318,7 @@ it("restores the state the server confirmed, not the one before it, when a later
   act(() => result.current.update("sug", { status: "read" }));
   act(() => result.current.update("sug", { resolution: "not_now" }));
   vi.mocked(listSuggestions).mockRejectedValue(new Error("offline"));
-  await act(async () => read.resolve({ ...item, status: "read" }));
+  await act(async () => read.resolve(saved({ ...item, status: "read" })));
   await waitFor(() => expect(showToast).toHaveBeenCalledOnce());
 
   // The read reached the server; only the dismissal is undone.
@@ -318,7 +332,7 @@ it("shows a pending update to every instance, so the sidebar badge agrees with t
     { wrapper },
   );
   await waitFor(() => expect(result.current.sidebar.unreadCount).toBe(1));
-  const patch = deferred<Suggestion>();
+  const patch = deferred<SuggestionUpdateResult>();
   vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
 
   act(() => result.current.inbox.update("sug", { resolution: "not_now" }));
@@ -334,7 +348,9 @@ it("shows a pending update to every instance, so the sidebar badge agrees with t
   expect(result.current.inbox.unreadCount).toBe(0);
 
   vi.mocked(listSuggestions).mockResolvedValue(page([], 0));
-  await act(async () => patch.resolve({ ...item, status: "dismissed", resolution: "not_now" }));
+  await act(async () =>
+    patch.resolve(saved({ ...item, status: "dismissed", resolution: "not_now" })),
+  );
   await waitFor(() => expect(result.current.sidebar.unreadCount).toBe(0));
   expect(result.current.inbox.items).toEqual([]);
 });
@@ -352,7 +368,7 @@ it("subtracts a dismissal from the unread total once, in every instance, across 
     { wrapper },
   );
   await waitFor(() => expect(result.current.sidebar.unreadCount).toBe(3));
-  const patch = deferred<Suggestion>();
+  const patch = deferred<SuggestionUpdateResult>();
   vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
 
   act(() => result.current.inbox.update("sug", { resolution: "not_now" }));
@@ -368,8 +384,48 @@ it("subtracts a dismissal from the unread total once, in every instance, across 
   expect(result.current.sidebar.unreadCount).toBe(2);
 
   vi.mocked(listSuggestions).mockResolvedValue(page(others, 2));
-  await act(async () => patch.resolve({ ...item, status: "dismissed", resolution: "not_now" }));
+  await act(async () =>
+    patch.resolve(saved({ ...item, status: "dismissed", resolution: "not_now" }, 2)),
+  );
   await waitFor(() => expect(result.current.inbox.unreadCount).toBe(2));
+  expect(result.current.sidebar.unreadCount).toBe(2);
+  expect(result.current.inbox.items).toEqual(others);
+});
+
+it("does not subtract again when a poll already reflects the committed change, and keeps the server's total if the final refetch fails", async () => {
+  const others = [
+    { ...item, id: "two", createdAt: 2 },
+    { ...item, id: "three", createdAt: 3 },
+  ];
+  vi.mocked(listSuggestions).mockResolvedValue(page([...others, item], 3));
+  const { result } = renderHook(
+    () => ({ inbox: useProactiveInbox(true), sidebar: useProactiveInbox(true, ["unread"]) }),
+    { wrapper },
+  );
+  await waitFor(() => expect(result.current.inbox.unreadCount).toBe(3));
+  const patch = deferred<SuggestionUpdateResult>();
+  vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
+
+  act(() => result.current.inbox.update("sug", { resolution: "not_now" }));
+  expect(result.current.inbox.unreadCount).toBe(2);
+  await waitFor(() => expect(updateSuggestion).toHaveBeenCalledOnce());
+
+  // The server committed the dismissal; a poll sees two remaining before the
+  // PATCH response arrives. Both lists must still show two, not one.
+  vi.mocked(listSuggestions).mockResolvedValue(page(others, 2));
+  await act(async () => void (await result.current.inbox.refetch()));
+  await act(async () => void (await result.current.sidebar.refetch()));
+  expect(result.current.inbox.unreadCount).toBe(2);
+  expect(result.current.sidebar.unreadCount).toBe(2);
+  expect(result.current.inbox.items).toEqual(others);
+
+  // The response lands, and the refetch it triggers fails: the server's total stays.
+  vi.mocked(listSuggestions).mockRejectedValue(new Error("offline"));
+  await act(async () =>
+    patch.resolve(saved({ ...item, status: "dismissed", resolution: "not_now" }, 2)),
+  );
+  await waitFor(() => expect(listSuggestions).toHaveBeenCalledTimes(6));
+  expect(result.current.inbox.unreadCount).toBe(2);
   expect(result.current.sidebar.unreadCount).toBe(2);
   expect(result.current.inbox.items).toEqual(others);
 });
@@ -389,7 +445,7 @@ it.each(["succeeds", "fails"])(
     );
     await waitFor(() => expect(result.current.unread.items).toEqual([item]));
     await waitFor(() => expect(result.current.all.unreadCount).toBe(1));
-    const patch = deferred<Suggestion>();
+    const patch = deferred<SuggestionUpdateResult>();
     vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
 
     // Expanding the item on the Unread tab marks it read.
@@ -399,7 +455,7 @@ it.each(["succeeds", "fails"])(
 
     vi.mocked(listSuggestions).mockImplementation(() => new Promise(() => {}));
     if (outcome === "succeeds") {
-      await act(async () => patch.resolve({ ...item, status: "read" }));
+      await act(async () => patch.resolve(saved({ ...item, status: "read" })));
       expect(result.current.all.unreadCount).toBe(0);
       expect(result.current.unread.unreadCount).toBe(0);
     } else {

@@ -415,8 +415,14 @@ export function InboxPage() {
       (automationInbox.items.length === 1
         ? "1 failed automation"
         : `${automationInbox.items.length} failed automations`),
-    proactiveInbox.unreadCount > 0 &&
-      `${unreadCountText(proactiveInbox.unreadCount, proactiveInbox.unreadCountCapped)} unread ${proactiveInbox.unreadCount === 1 && !proactiveInbox.unreadCountCapped ? "suggestion" : "suggestions"}`,
+    // Count what is listed, like the other entries; the unread total is the
+    // server's and can reach past the loaded pages.
+    proactiveInbox.items.length > 0 &&
+      `${proactiveInbox.items.length === 1 ? "1 suggestion" : `${proactiveInbox.items.length} suggestions`}${
+        proactiveInbox.unreadCount > 0
+          ? ` (${unreadCountText(proactiveInbox.unreadCount, proactiveInbox.unreadCountCapped)} unread)`
+          : ""
+      }`,
   ]
     .filter(Boolean)
     .join(" · ");
