@@ -5215,10 +5215,12 @@ def _publish_status(
     if (
         status == "idle"
         and persist_live_status
-        # A confirmed completion counts even after a previous turn's late failure.
         and (
             previous_status in ("running", "waiting")
-            or (turn_completed and previous_status == "failed")
+            # A confirmed completion counts after a previous turn's late failure,
+            # and when a short turn ended before its running edge was seen; its
+            # response ID keys it, so a replayed completion records nothing new.
+            or (turn_completed and (previous_status == "failed" or response_id is not None))
         )
     ):
         # Native harnesses settle turns only through these edges, never response events.

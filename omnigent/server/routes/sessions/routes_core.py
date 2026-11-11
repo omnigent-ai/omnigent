@@ -117,6 +117,7 @@ from omnigent.server.routes._errors import (
     agent_removed,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
+from omnigent.server.routes._host_launch import _deployment_is_sharded
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
     _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
@@ -264,6 +265,7 @@ from omnigent.stores.conversation_store import (
     runner_seen_is_fresh,
 )
 from omnigent.stores.file_store import FileStore
+from omnigent.stores.host_store import host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_client_surface
@@ -374,6 +376,46 @@ _CODEX_SETTINGS_RESTORED_MESSAGE = (
     "The terminal did not apply the model and reasoning effort changes. "
     "The previous selections have been restored."
 )
+
+
+async def _require_archive_teardown_replica(
+    request: Request,
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Reject an archive this replica cannot tear down, before the flag commits.
+
+    Archive stops the session's host-launched runner over the host's tunnel,
+    which only the replica holding that tunnel can reach. Committing the flag
+    on any other replica hides the session while its runner keeps running and
+    accepting turns, so a live host held elsewhere gets ``WRONG_REPLICA`` and
+    the client re-addresses with the host's slice key.
+
+    :param request: The PATCH request, for this replica's host registry/store.
+    :param session_id: Session being archived, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store to read the session's host binding from.
+    :raises OmnigentError: ``WRONG_REPLICA`` when the session's host is live
+        on another replica of a sharded deployment.
+    """
+    if not _deployment_is_sharded():
+        return
+    host_registry = getattr(request.app.state, "host_registry", None)
+    host_store = getattr(request.app.state, "host_store", None)
+    if host_registry is None or host_store is None:
+        return
+    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if conv is None or conv.host_id is None or conv.runner_id is None:
+        return
+    if host_registry.get(conv.host_id) is not None:
+        return
+    host = await asyncio.to_thread(host_store.get_host, conv.host_id)
+    # An offline host has no runner to stop; archiving it here loses nothing.
+    if host is not None and host_is_live(host):
+        raise OmnigentError(
+            "host is on another replica; retry with the host's slice key",
+            code=ErrorCode.WRONG_REPLICA,
+        )
 
 
 def _runner_reply_field(body: str, key: str) -> object:
@@ -3205,6 +3247,8 @@ def register_core_routes(
             await asyncio.to_thread(
                 require_archive_outside_source_lineage, request, session_id, conversation_store
             )
+        if body.archived is True:
+            await _require_archive_teardown_replica(request, session_id, conversation_store)
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store

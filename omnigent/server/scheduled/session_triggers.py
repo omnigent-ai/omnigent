@@ -249,6 +249,27 @@ def notify(
     return _submit(_record, event, conversation, readers)
 
 
+def observe_elicitation(conversation_id: str, event: dict[str, Any]) -> None:
+    """Report an approval or question request published on *conversation_id*'s stream.
+
+    A child's request is mirrored onto its ancestors' streams with the child as
+    ``params.target_session_id``; only the session that asked reports it.
+    """
+    elicitation_id = event.get("elicitation_id")
+    if event.get("type") != "response.elicitation_request" or not isinstance(elicitation_id, str):
+        return
+    params = event.get("params")
+    target = params.get("target_session_id") if isinstance(params, dict) else None
+    if target not in (None, conversation_id):
+        return
+    notify(
+        "input.requested",
+        conversation_id,
+        occurrence=elicitation_id,
+        elicitation_id=elicitation_id,
+    )
+
+
 def readers_of(conversation: Conversation, event_type: SessionEventType) -> frozenset[str] | None:
     """Owners of tasks listening for *event_type* who hold a grant on the session.
 

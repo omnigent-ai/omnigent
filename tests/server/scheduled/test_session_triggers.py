@@ -271,6 +271,12 @@ def test_status_edges_report_turn_ends_with_their_response(
     # A stop publishes idle without persisting it, which is no turn end.
     helpers._publish_status(session, "running", response_id="resp_3")
     helpers._publish_status(session, "idle", persist_live_status=False)
+    # A short turn can start and end between status polls: its confirmed completion
+    # still counts, and a replay of it repeats the same key, which records nothing.
+    helpers._publish_status(session, "idle", response_id="resp_5", turn_completed=True)
+    helpers._publish_status(session, "idle", response_id="resp_5", turn_completed=True)
+    # Without a response there is nothing to deduplicate by, so it is not reported.
+    helpers._publish_status(session, "idle", turn_completed=True)
     # A previous turn's late failure lands after the next turn started; that turn's
     # confirmed completion still counts.
     helpers._publish_status(session, "running", response_id="resp_4")
@@ -283,6 +289,8 @@ def test_status_edges_report_turn_ends_with_their_response(
             session,
             {"occurrence": "resp_2", "response_id": None, "error_code": "runner_error"},
         ),
+        ("turn.completed", session, {"occurrence": "resp_5", "response_id": "resp_5"}),
+        ("turn.completed", session, {"occurrence": "resp_5", "response_id": "resp_5"}),
         # The late failure carries no response of its own, so none is reported.
         (
             "turn.failed",
@@ -358,3 +366,31 @@ async def test_the_event_hold_checks_the_continued_sessions_activity(
     assert await busy(run) is True
     task.continues_session = False
     assert await busy(run) is False
+
+
+def test_a_mirrored_approval_is_reported_once_by_the_session_that_asked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[str, str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_triggers, "notify", lambda kind, sid, **kw: seen.append((kind, sid, kw))
+    )
+    request = {
+        "type": "response.elicitation_request",
+        "elicitation_id": "elic_1",
+        "params": {"target_session_id": "child"},
+    }
+    # The child's stream, then its parent's and grandparent's mirrored copies.
+    for stream in ("child", "parent", "root"):
+        session_triggers.observe_elicitation(stream, request)
+    # A request without a target belongs to its own stream; other events are ignored.
+    session_triggers.observe_elicitation(
+        "solo", {"type": "response.elicitation_request", "elicitation_id": "elic_2"}
+    )
+    session_triggers.observe_elicitation(
+        "solo", {"type": "response.elicitation_resolved", "elicitation_id": "elic_2"}
+    )
+    assert seen == [
+        ("input.requested", "child", {"occurrence": "elic_1", "elicitation_id": "elic_1"}),
+        ("input.requested", "solo", {"occurrence": "elic_2", "elicitation_id": "elic_2"}),
+    ]
