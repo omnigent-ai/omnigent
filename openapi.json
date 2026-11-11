@@ -6704,6 +6704,11 @@
             "title": "Session Fork Workspaces",
             "type": "boolean"
           },
+          "session_list_related_scopes": {
+            "default": true,
+            "title": "Session List Related Scopes",
+            "type": "boolean"
+          },
           "session_list_scoped_archives": {
             "default": true,
             "title": "Session List Scoped Archives",
@@ -17309,6 +17314,41 @@
               "pattern": "^(all|mine|shared|archived)$",
               "title": "Visibility",
               "type": "string"
+            }
+          },
+          {
+            "description": "Anchor session ID for `relation`; the caller needs read access to it. Pass both or neither.",
+            "in": "query",
+            "name": "related_to",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Related To"
+            }
+          },
+          {
+            "description": "Only sessions sharing the anchor's `\"project\"` (by project id, any owner; a legacy label folder only among the caller's own sessions) or sidebar `\"family\"`. `visibility` still decides ownership. An anchor without that value is a 409.",
+            "in": "query",
+            "name": "relation",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^(project|family)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Relation"
             }
           }
         ],

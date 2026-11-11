@@ -442,6 +442,42 @@ def _unsupported_model_detail(result: _RunnerForwardResult | None) -> str | None
     return detail if isinstance(detail, str) and detail else "This terminal cannot use that model."
 
 
+@dataclasses.dataclass(frozen=True)
+class _RelatedSessionFilter:
+    """``GET /v1/sessions`` filter values derived from a ``related_to`` anchor."""
+
+    project_id: str | None = None
+    family_id: str | None = None
+    # A legacy ``omni_project`` label folder, private to its owner's sessions.
+    project_label: str | None = None
+
+
+def _related_session_filter(anchor: Conversation, relation: str) -> _RelatedSessionFilter:
+    """
+    Derive the list filter for sessions related to *anchor*.
+
+    A first-class project matches by id, so members filed by any owner are
+    found; ``visibility`` alone decides ownership.
+
+    :param anchor: The ``related_to`` session.
+    :param relation: ``"project"`` or ``"family"``.
+    :returns: The filter values for :meth:`ConversationStore.list_conversations`.
+    :raises OmnigentError: 409 when the anchor has no such value.
+    """
+    if relation == "project":
+        if anchor.project_id is not None:
+            return _RelatedSessionFilter(project_id=anchor.project_id)
+        label = anchor.labels.get(PROJECT_LABEL_KEY)
+        if label:
+            return _RelatedSessionFilter(project_label=label)
+        missing = "This session is not in a project"
+    else:
+        if anchor.family_id is not None:
+            return _RelatedSessionFilter(family_id=anchor.family_id)
+        missing = "This session is not in a family"
+    raise OmnigentError(missing, code=ErrorCode.CONFLICT)
+
+
 def register_core_routes(
     router: APIRouter,
     *,
@@ -2112,6 +2148,8 @@ def register_core_routes(
         pinned: bool = Query(default=False),
         expand_families: bool = Query(default=False),
         visibility: str = Query(default="all", pattern="^(all|mine|shared|archived)$"),
+        related_to: str | None = Query(default=None),
+        relation: str | None = Query(default=None, pattern="^(project|family)$"),
     ) -> dict[str, Any]:
         """
         List sessions with cursor-based pagination.
@@ -2178,6 +2216,12 @@ def register_core_routes(
             ``"all"`` (default) returns all accessible non-archived
             sessions, matching the legacy behaviour. ``include_archived``
             adds archived rows to ``"mine"``, ``"shared"`` and ``"all"``.
+        :param related_to: Anchor session ID for ``relation``; the caller
+            needs read access to it. Pass both or neither.
+        :param relation: Only sessions sharing the anchor's ``"project"`` (by
+            project id, any owner; a legacy label folder only among the
+            caller's own sessions) or sidebar ``"family"``. ``visibility``
+            still decides ownership. An anchor without that value is a 409.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """
@@ -2194,6 +2238,45 @@ def register_core_routes(
         # disabled entirely — no auth_provider).
         user_id = _require_user(request, auth_provider)
         normalized_query = search_query if search_query else None
+        family_id_param: str | None = None
+        project_id_param: str | None = None
+        project_label: str | None = None
+        if (related_to is None) != (relation is None):
+            raise OmnigentError(
+                "related_to and relation must be passed together",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if related_to is not None and relation is not None:
+            if relation == "project" and project is not None:
+                raise OmnigentError(
+                    "Pass project or relation=project, not both",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            access = await _require_access_and_level(
+                user_id, related_to, LEVEL_READ, permission_store, conversation_store
+            )
+            anchor = access.conversation or await asyncio.to_thread(
+                conversation_store.get_conversation, related_to
+            )
+            if anchor is None:
+                raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+            if relation == "project" and anchor.parent_conversation_id is not None:
+                # A sub-agent is in its top-level session's project; it stores none itself.
+                anchor = (
+                    await asyncio.to_thread(
+                        conversation_store.get_conversation, anchor.root_conversation_id
+                    )
+                    or anchor
+                )
+            related = _related_session_filter(anchor, relation)
+            family_id_param = related.family_id
+            project_id_param = related.project_id
+            project_label = related.project_label
+            if project_label is not None:
+                if visibility == "shared" and user_id is not None:
+                    # A label folder holds only its owner's sessions.
+                    return PaginatedList(data=[]).model_dump() | {"page_boundary": None}
+                project = project_label
         # Map the visibility filter to store-level ACL params.
         # "mine": only sessions the caller owns — no accessible_by needed
         #   because owner-level implies access.
@@ -2269,6 +2352,8 @@ def register_core_routes(
             pinned=pinned,
             # Pins are per-user: filter to the caller's own pin key.
             pinned_owner=user_id,
+            family_id=family_id_param,
+            project_id=project_id_param,
         )
         # Side chats surface only as Workspace-rail tabs, so drop any
         # side-chat-labeled fork from the sidebar list (it is still a normal

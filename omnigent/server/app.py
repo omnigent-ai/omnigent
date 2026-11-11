@@ -293,6 +293,9 @@ class ServerInfoResponse(BaseModel):
     # GET /v1/sessions applies ``include_archived`` to ``visibility=mine`` and
     # ``shared``; older servers drop archived rows there.
     session_list_scoped_archives: bool = True
+    # GET /v1/sessions accepts ``related_to`` + ``relation``; older servers
+    # ignore them and list every session.
+    session_list_related_scopes: bool = True
     # Scheduled tasks accept ``session_mode`` and ``session_id``; older servers
     # reject them.
     scheduled_task_session_modes: bool = True
@@ -3729,6 +3732,7 @@ def create_app(
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
                 "session_list_scoped_archives": True,
+                "session_list_related_scopes": True,
                 "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,

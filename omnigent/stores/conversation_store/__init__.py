@@ -948,6 +948,8 @@ class ConversationStore(ABC):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        family_id: str | None = None,
+        project_id: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -1067,6 +1069,12 @@ class ConversationStore(ABC):
             Powers the ``(agent, title)`` child-session lookup in
             ``sys_session_send`` so the server can resolve the target
             in a single indexed query instead of fetching all children.
+        :param family_id: When set, only return sessions in this sidebar
+            family (``metadata.family_id``). ``None`` disables the filter.
+        :param project_id: When set, only return first-class members of this
+            project (``metadata.project_id``), whoever owns them; unlike
+            ``project`` it neither reads legacy labels nor resolves a name per
+            owner. ``None`` disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         :raises omnigent.errors.StaleCursorError: If the ``after``/``before``

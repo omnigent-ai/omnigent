@@ -374,6 +374,28 @@ def test_list_conversations_project_name_filter_crosses_dbs(
     assert labelled.id not in unfiled_ids
 
 
+def test_list_conversations_family_and_project_id_filters_cross_dbs(
+    store: SqlAlchemyConversationStore,
+    omnigent_db: Path,
+) -> None:
+    """Family and project ids live on the Omnigent DB's metadata, so the
+    filters resolve member ids there before narrowing the AP query."""
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+    work = SqlAlchemyProjectStore(f"sqlite:///{omnigent_db}").create("c" * 32, "Work", None)
+    source = store.create_conversation()
+    sibling = store.create_conversation()
+    store.add_new_sibling(source.id, sibling.id, user_id=None)
+    member = store.create_conversation()
+    store.set_conversation_project(member.id, work.id)
+
+    def listed(**filters: Any) -> set[str]:
+        return {c.id for c in store.list_conversations(**filters).data}
+
+    assert listed(family_id=source.id) == {source.id, sibling.id}
+    assert listed(project_id=work.id) == {member.id}
+
+
 # ── conversation items ─────────────────────────────────
 
 
