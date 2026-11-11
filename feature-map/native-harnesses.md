@@ -1181,6 +1181,10 @@ Cross-harness journeys:
   the session stays idle and the released reply never appears, then completes
   a follow-up. The harness bench does not register opencode-native, so its
   interrupt probe does not apply.
+- **opencode-native usage (component checks):**
+  `tests/test_opencode_native_forwarder.py::test_usage_dedupes_identical_posts`
+  checks that a rejected report can be retried at turn completion while
+  accepted totals remain deduplicated. It controls HTTP responses locally.
 - **opencode-native journeys (own environment, scripted model):** needs
   `@opencode/cli` 2.0.18–2.0.x and tmux on `PATH`, in e2e mock mode:
   `uv run --no-sync pytest tests/e2e/test_host_opencode_native_mock_e2e.py --reruns 0 -v`.
