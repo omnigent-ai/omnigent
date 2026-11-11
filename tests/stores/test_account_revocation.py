@@ -19,6 +19,7 @@ from omnigent.stores.host_store import HostStore
 from omnigent.stores.inbox_item_store import NewInboxItem
 from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 
@@ -983,3 +984,33 @@ def test_deleted_account_inbox_is_not_visible_after_reregistration(db_uri: str) 
         ):
             with pytest.raises(OmnigentError, match="revoked"):
                 write()
+
+
+def test_workspace_setting_write_rechecks_the_admin_under_its_lock(db_uri: str) -> None:
+    """A deleted or demoted admin's in-flight workspace write cannot land."""
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    settings = ProactiveAgentSettingsStore(db_uri)
+    # A second admin, so deleting the first one below is allowed.
+    accounts.create_user_with_password("root", "test-password-hash")
+    permissions.set_admin("root", True)
+    admin = accounts.create_user_with_password("admin", "test-password-hash")
+    permissions.set_admin("admin", True)
+    with account_authority_scope("admin", admin.account_generation):
+        settings.set_workspace_enabled(False, actor="admin", require_admin=True)
+    assert settings.read("alice") == (False, True)
+
+    # The route authorized the request while the actor was still an admin.
+    permissions.set_admin("admin", False)
+    with account_authority_scope("admin", admin.account_generation):
+        with pytest.raises(OmnigentError) as demoted:
+            settings.set_workspace_enabled(True, actor="admin", require_admin=True)
+    assert demoted.value.code == ErrorCode.FORBIDDEN
+    assert settings.read("alice") == (False, True)
+
+    permissions.set_admin("admin", True)
+    assert accounts.delete_user("admin") is True
+    with account_authority_scope("admin", admin.account_generation):
+        with pytest.raises(OmnigentError, match="revoked"):
+            settings.set_workspace_enabled(True, actor="admin", require_admin=True)
+    assert settings.read("alice") == (False, True)
