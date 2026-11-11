@@ -142,6 +142,36 @@ def test_fork_drops_the_automation_source_label(
     assert SCHEDULED_TASK_SOURCE_LABEL_KEY not in fork.labels
 
 
+@pytest.mark.parametrize("closed_by", ["label", "legacy_title"])
+def test_fork_of_a_closed_child_is_open(
+    conversation_store: SqlAlchemyConversationStore,
+    closed_by: str,
+) -> None:
+    """Forking a closed child (a stopped side chat, a closed sub-agent) is how
+    the user continues it, so the fork must not inherit the seal."""
+    from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, is_session_closed
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title="researcher:auth"
+    )
+    if closed_by == "label":
+        conversation_store.set_labels(child.id, {CLOSED_LABEL_KEY: "true", "kept": "yes"})
+    else:
+        conversation_store.set_labels(child.id, {"kept": "yes"})
+        conversation_store.update_conversation(
+            child.id, title=f"researcher:auth:closed:{child.id}"
+        )
+
+    fork = conversation_store.fork_conversation(child.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert not is_session_closed(fork.labels, fork.title)
+    assert fork.title == "Fork of researcher:auth"
+    saved = conversation_store.get_conversation(child.id)
+    assert saved is not None and is_session_closed(saved.labels, saved.title)
+
+
 def test_fork_drops_per_repo_sandbox_labels(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

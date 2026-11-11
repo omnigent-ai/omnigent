@@ -158,6 +158,31 @@ class SandboxProfileCatalog:
             for profile in profiles
         ]
 
+    def default_profile_ids(self, provider: str | None = None) -> dict[str, str]:
+        """Configured default profile per profile-managing provider, for client preselection."""
+        if self._deployment is None:
+            return {}
+        defaults = {}
+        for managed in self.managed_providers(provider):
+            entry = self._deployment.for_provider(managed)
+            if entry is not None and entry.default_profile_id is not None:
+                defaults[managed] = entry.default_profile_id
+        return defaults
+
+    def default_selection(
+        self, provider: str | None, *, user_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Resolve the provider's default for a new session that names no profile, if any."""
+        if self._deployment is None:
+            return None
+        provider = provider or self._deployment.default.provider
+        if provider not in self.managed_providers(provider):
+            return None
+        entry = self._deployment.for_provider(provider)
+        if entry is None or entry.default_profile_id is None:
+            return None
+        return self.resolve(entry.default_profile_id, provider=provider, user_id=user_id)
+
     def require_selection(self, provider: str | None, *, user_id: str | None = None) -> None:
         if self._deployment is None:
             return
@@ -248,10 +273,20 @@ class SandboxProfileCatalog:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     def get_session_snapshot(self, session_id: str) -> dict[str, Any] | None:
+        """The session's accepted profile, or ``None`` once its provider stops managing profiles.
+
+        Like :meth:`get_host_snapshot`, so a session saved under a provider that later
+        opts out keeps working as one without a profile. The saved labels are kept.
+        """
         try:
-            return self._store.get_session_snapshot(session_id)
+            snapshot = self._store.get_session_snapshot(session_id)
         except ValueError as exc:
             raise _invalid_reference(exc) from exc
+        if snapshot is None or snapshot["provider"] not in self.managed_providers(
+            snapshot["provider"]
+        ):
+            return None
+        return snapshot
 
     def admit_runner_connection(self, runner_id: str) -> bool:
         """Fence delegated reconnects against stale profiled-runner replacement."""
@@ -502,7 +537,7 @@ class SandboxProfileCatalog:
         sandbox_provider: str | None = None,
         user_id: str | None = None,
         allow_unprofiled_runner: bool = False,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         """After host ownership checks, inherit or match the host's accepted profile."""
         host = self._host_store.get_host(host_id) if self._host_store else None
         if host is not None:
@@ -537,7 +572,7 @@ class SandboxProfileCatalog:
                 status_code=409, detail="Session and host sandbox profiles do not match"
             )
         if not bind:
-            return
+            return session_snapshot or host_snapshot
         if session_snapshot is None and host_snapshot is not None:
             conversations = self._store.conversations
             binding = conversations.get_profile_host_binding(session_id)
@@ -555,3 +590,4 @@ class SandboxProfileCatalog:
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return session_snapshot or host_snapshot

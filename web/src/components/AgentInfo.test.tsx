@@ -254,8 +254,12 @@ describe("AgentInfoButton hover behavior", () => {
     mousePointerEnter(screen.getByTestId("agent-info-trigger"));
 
     // The panel is now open — the agent name proves the content mounted.
+    // The height cap + overflow keep a tall panel (many models in the usage
+    // breakdown) scrollable instead of clipped past the viewport bottom.
     expect(screen.getByTestId("agent-info-panel")).toHaveClass(
       "menu-surface",
+      "max-h-[var(--radix-popover-content-available-height)]",
+      "overflow-y-auto",
       "rounded-[12px]",
       "ring-0",
     );
