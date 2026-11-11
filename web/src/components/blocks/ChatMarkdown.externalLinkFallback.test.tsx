@@ -145,6 +145,24 @@ describe("external chat link clicks", () => {
     expect(followedLinks).toEqual([]);
   });
 
+  it.each([
+    ["a browser, which hands it to the OS", false],
+    ["the desktop shell, whose window-open policy opens the chat", true],
+  ])("leaves an Omnigent session link to %s", (_label, native) => {
+    nativeShell.native = native;
+    const sessionLink = "omnigent://127.0.0.1:53694/c/e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9";
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+
+    const link = renderExternalLink(sessionLink);
+    expect(link).toHaveAttribute("href", sessionLink);
+    expect(link).toHaveAttribute("target", "_blank");
+    const event = click(link);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(followedLinks).toEqual([]);
+  });
+
   it("leaves mail links to the browser without opening an empty tab", () => {
     const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
 

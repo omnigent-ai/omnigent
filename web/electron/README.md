@@ -418,7 +418,10 @@ dismisses.
   `ssh://`, …) launch an OS protocol handler with page-controlled
   arguments, so they prompt for consent first — showing the requesting
   origin and the full URL — with an optional persisted "always allow this
-  scheme from this server". Beyond that, each window is
+  scheme from this server". The exception is a plain
+  `omnigent://<host>/c/<id>` session link opened from the window's own
+  server, such as a link in a chat message: it goes straight to the
+  [deep-link](#deep-links) handler. Beyond that, each window is
   **pinned to the one server origin the user explicitly connected it to**,
   and that pin — not navigation — is the trust boundary:
   - Navigation is deliberately _not_ restricted: servers may sit behind
@@ -1239,6 +1242,12 @@ opens the original browser URL. A late desktop request is discarded when the
 listener has expired. Acknowledgment accepts responsibility for the request; it
 does not claim sign-in or page loading completed, and cancelling desktop consent
 does not open a browser. Ordinary links without the parameter work as before.
+
+A session link in a chat message (`omnigent://<host>/c/<id>`, with no query
+or fragment) opens through the same handler when clicked in a window that is
+on its own server, without the generic external-protocol prompt or a trip
+through the OS. Server-root and other `omnigent://` links clicked in a page
+still get that prompt.
 
 **Window handling** (the careful part):
 

@@ -17,6 +17,10 @@ type StreamdownHardenOptions = {
 type StreamdownHardenPlugin = StreamdownPluginTuple & {
   1: StreamdownHardenOptions;
 };
+type StreamdownSanitizeSchema = { protocols?: Record<string, string[] | undefined> };
+type StreamdownSanitizePlugin = StreamdownPluginTuple & {
+  1: StreamdownSanitizeSchema;
+};
 
 export const STREAMDOWN_PLUGINS = {
   cjk,
@@ -99,6 +103,48 @@ export function shortFileCitationLabel(text: string): string | null {
   const slash = path.lastIndexOf("/");
   if (slash < 0 || slash === path.length - 1) return null;
   return text.slice(slash + 1);
+}
+
+// An Omnigent session deep link, `omnigent://<host[:port]>/c/<session_id>`,
+// which the desktop app registers. No credentials, query or fragment.
+const OMNIGENT_SESSION_PATH = /^\/c\/[A-Za-z0-9_-]+\/?$/;
+
+/** Whether `href` is exactly an Omnigent session deep link. */
+export function isOmnigentSessionLink(href: string): boolean {
+  if (!/^omnigent:\/\//i.test(href)) return false;
+  let url: URL;
+  try {
+    url = new URL(href);
+  } catch {
+    return false;
+  }
+  return (
+    url.protocol === "omnigent:" &&
+    url.host !== "" &&
+    url.username === "" &&
+    url.password === "" &&
+    url.search === "" &&
+    url.hash === "" &&
+    !href.includes("?") &&
+    !href.includes("#") &&
+    OMNIGENT_SESSION_PATH.test(url.pathname)
+  );
+}
+
+/**
+ * Drops the href of every `omnigent:` link that is not a session deep link.
+ * Sanitize admits the whole scheme; harden then marks the rest " [blocked]".
+ */
+export function restrictOmnigentLinks() {
+  return (tree: HastElement) => {
+    visitElements(tree, (node) => {
+      const href = node.properties?.href;
+      if (node.tagName !== "a" || typeof href !== "string") return;
+      if (!/^\s*omnigent:/i.test(href) || isOmnigentSessionLink(href)) return;
+      const { href: _dropped, ...rest } = node.properties ?? {};
+      node.properties = rest;
+    });
+  };
 }
 
 // Where a file link's href is parked once the path moves to the data
@@ -312,6 +358,31 @@ function isStreamdownHardenPlugin(
   return Array.isArray(plugin) && plugin.length >= 2 && isHardenOptions(plugin[1]);
 }
 
+function isStreamdownSanitizePlugin(
+  plugin: StreamdownRehypePlugin,
+): plugin is StreamdownSanitizePlugin {
+  return Array.isArray(plugin) && plugin.length >= 2 && typeof plugin[1] === "object";
+}
+
+/** Sanitize with `omnigent:` hrefs admitted, narrowed to session links right after. */
+function withOmnigentSessionLinks(plugin: StreamdownRehypePlugin): StreamdownRehypePlugins {
+  if (!isStreamdownSanitizePlugin(plugin)) {
+    throw new Error("Streamdown sanitize plugin must be a [plugin, schema] tuple");
+  }
+  const schema = plugin[1];
+  const hrefProtocols = schema.protocols?.href ?? [];
+  return [
+    [
+      plugin[0],
+      {
+        ...schema,
+        protocols: { ...schema.protocols, href: [...hrefProtocols, "omnigent"] },
+      },
+    ] satisfies StreamdownPluginTuple,
+    restrictOmnigentLinks,
+  ];
+}
+
 function isHardenOptions(value: unknown): value is StreamdownHardenOptions {
   return (
     typeof value === "object" &&
@@ -336,6 +407,10 @@ function createStreamdownRehypePlugins(
       if (markFileLinks) plugins.push(rewriteFileUriLinks);
     }
 
+    if (key === "sanitize") {
+      plugins.push(...withOmnigentSessionLinks(plugin));
+      continue;
+    }
     if (key !== "harden") {
       plugins.push(plugin);
       continue;

@@ -195,6 +195,49 @@ describe("MessageResponse", () => {
     });
   });
 
+  describe("Omnigent session deep links", () => {
+    const sessionLink = "omnigent://127.0.0.1:53694/c/e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9";
+
+    it.each([
+      ["a markdown link", `[the worker chat](${sessionLink})`, "the worker chat"],
+      ["an autolink", `<${sessionLink}>`, sessionLink],
+      ["a raw HTML anchor", `<a href="${sessionLink}">worker</a>`, "worker"],
+    ])("keeps %s clickable", async (_case, markdown, name) => {
+      render(<MessageResponse>{markdown}</MessageResponse>);
+
+      const link = await screen.findByRole("link", { name });
+      expect(link).toHaveAttribute("href", sessionLink);
+      expect(screen.queryByText(/\[blocked\]/)).toBeNull();
+    });
+
+    it("keeps a session link clickable among file links", async () => {
+      render(<MessageResponse markFileLinks>{`[worker](${sessionLink})`}</MessageResponse>);
+
+      expect(await screen.findByRole("link", { name: "worker" })).toHaveAttribute(
+        "href",
+        sessionLink,
+      );
+    });
+
+    it.each([
+      ["another custom scheme", "vscode://file/tmp/x.py"],
+      ["another Omnigent path", "omnigent://127.0.0.1:53694/settings"],
+      ["the server root", "omnigent://127.0.0.1:53694/"],
+      ["a nested chat path", "omnigent://127.0.0.1:53694/c/abc/files"],
+      ["a query string", `${sessionLink}?desktop_ack=1:${"a".repeat(64)}`],
+      ["an empty query", `${sessionLink}?`],
+      ["a fragment", `${sessionLink}#x`],
+      ["credentials", "omnigent://user:secret@127.0.0.1:53694/c/abc"],
+      ["no host", "omnigent:///c/abc"],
+      ["an encoded id", "omnigent://127.0.0.1:53694/c/a%2Fb"],
+    ])("still blocks %s", async (_case, href) => {
+      render(<MessageResponse>{`[target](${href})`}</MessageResponse>);
+
+      expect(await screen.findByText(/\[blocked\]/)).toHaveTextContent("target [blocked]");
+      expect(screen.queryByRole("link", { name: "target" })).toBeNull();
+    });
+  });
+
   it("re-renders when rendering props change even if the text is unchanged", async () => {
     const { container, rerender } = render(
       <MessageResponse className="math-config-a">same text</MessageResponse>,

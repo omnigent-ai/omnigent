@@ -19,6 +19,8 @@
 
 "use strict";
 
+const { parseOmnigentDeepLink } = require("./deepLink");
+
 /**
  * Schemes that open externally with no confirmation: they land in the
  * user's browser / mail client, which apply their own safety UX. Anything
@@ -48,6 +50,21 @@ const OAUTH_POPUP_ORIGINS = new Set([
 const SIZE_FEATURE_RE = /(^|,)\s*(width|height)\s*=/i;
 
 /**
+ * Whether `url` is a plain Omnigent session deep link
+ * (`omnigent://<host[:port]>/c/<id>`): no credentials, query, or fragment, so
+ * a page cannot pass a CLI `desktop_ack` or anything beyond the chat to open.
+ *
+ * @param {URL} parsed
+ * @param {string} raw
+ * @returns {boolean}
+ */
+function isPageSessionDeepLink(parsed, raw) {
+  if (parsed.protocol !== "omnigent:" || parsed.username || parsed.password) return false;
+  if (raw.includes("?") || raw.includes("#")) return false;
+  return parseOmnigentDeepLink(raw)?.path.startsWith("/c/") ?? false;
+}
+
+/**
  * Decide what to do with a page-initiated window.open / target=_blank.
  *
  * @param {{url: string, disposition?: string, features?: string}} details
@@ -56,10 +73,12 @@ const SIZE_FEATURE_RE = /(^|,)\s*(width|height)\s*=/i;
  *   extraPopupOrigins?: unknown}} context The opener window's current
  *   top-level origin, its pinned origin, and the raw settings.json
  *   `popup_allowed_origins` value (unvalidated — non-arrays are ignored).
- * @returns {{kind: "popup"} | {kind: "external"}
+ * @returns {{kind: "popup"} | {kind: "external"} | {kind: "deep-link"}
  *   | {kind: "protocol-consent", scheme: string} | {kind: "ignore"}}
  *   popup → hardened child window; external → shell.openExternal;
- *   protocol-consent → consent dialog; ignore → unparseable URL.
+ *   deep-link → the shell's own deep-link handler, which asks before
+ *   connecting to an unknown server; protocol-consent → consent dialog;
+ *   ignore → unparseable URL.
  */
 function decideWindowOpen(details, context) {
   let parsed;
@@ -69,6 +88,13 @@ function decideWindowOpen(details, context) {
     return { kind: "ignore" };
   }
   if (!WEB_SCHEMES.has(parsed.protocol)) {
+    // A chat link to another session, clicked on the window's own server, opens
+    // in this app directly; from any other page it gets the generic prompt.
+    const { openerOrigin, pinnedOrigin } = context;
+    const onPinnedServer = pinnedOrigin !== null && openerOrigin === pinnedOrigin;
+    if (onPinnedServer && isPageSessionDeepLink(parsed, details.url)) {
+      return { kind: "deep-link" };
+    }
     return { kind: "protocol-consent", scheme: parsed.protocol };
   }
   const popupShaped =

@@ -157,6 +157,54 @@ describe("popupPolicy — everything else keeps leaving the shell", () => {
     assert.deepEqual(decision, { kind: "protocol-consent", scheme: "vscode:" });
   });
 
+  it("opens an Omnigent session link from the pinned server in the app", () => {
+    for (const url of [
+      "omnigent://127.0.0.1:53694/c/e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9",
+      "omnigent://omnigent.example.com/c/conv_abc/",
+    ]) {
+      const decision = decideWindowOpen(
+        { url, disposition: "foreground-tab", features: "" },
+        pinnedContext(),
+      );
+      assert.deepEqual(decision, { kind: "deep-link" }, `expected deep-link for ${url}`);
+    }
+  });
+
+  it("prompts for any other omnigent: link", () => {
+    for (const url of [
+      "omnigent://127.0.0.1:53694/",
+      "omnigent://127.0.0.1:53694/inbox",
+      `omnigent://127.0.0.1:53694/c/abc?desktop_ack=1:${"a".repeat(64)}`,
+      "omnigent://127.0.0.1:53694/c/abc?",
+      "omnigent://127.0.0.1:53694/c/abc#x",
+      "omnigent://user:secret@127.0.0.1:53694/c/abc",
+    ]) {
+      const decision = decideWindowOpen(
+        { url, disposition: "foreground-tab", features: "" },
+        pinnedContext(),
+      );
+      assert.deepEqual(
+        decision,
+        { kind: "protocol-consent", scheme: "omnigent:" },
+        `expected protocol-consent for ${url}`,
+      );
+    }
+  });
+
+  it("prompts for a session link opened from a page off the pinned server", () => {
+    const url = "omnigent://127.0.0.1:53694/c/abc";
+    for (const context of [
+      pinnedContext({ openerOrigin: "https://sso.example.com" }),
+      { openerOrigin: null, pinnedOrigin: null },
+    ]) {
+      const decision = decideWindowOpen(
+        { url, disposition: "foreground-tab", features: "" },
+        context,
+      );
+      assert.deepEqual(decision, { kind: "protocol-consent", scheme: "omnigent:" });
+    }
+  });
+
   it("ignores unparseable URLs (nothing safe to open)", () => {
     for (const url of ["", "not a url", "http://"]) {
       const decision = decideWindowOpen(
