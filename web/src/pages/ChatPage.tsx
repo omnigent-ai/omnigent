@@ -4148,8 +4148,12 @@ function ComposerImpl(
     // the harness's "[Attached: <path>]" wording (the vendor reads the on-disk
     // path; no upload), sessions as "[Session: …]". A tagged session also adds
     // one tool hint at the end.
-    const reviewPreamble =
-      localReviewComments.length > 0 ? `${formatLocalReviewComments(localReviewComments)}\n\n` : "";
+    const hasAuthoredText =
+      !!draft.text.trim() || draft.quotes.some((quote) => quote.before.trim());
+    const reviewContext =
+      localReviewComments.length > 0
+        ? formatLocalReviewComments(localReviewComments, { includeInstruction: !hasAuthoredText })
+        : "";
     const tagsSessions = liveMentions.some((m) => m.marker.startsWith("[Session: "));
     const expand = (text: string) => expandMentionTokens(text, liveMentions);
     // Sending while a prior response is streaming is fine — the
@@ -4160,18 +4164,25 @@ function ComposerImpl(
     const sendFiles = files.length > 0 ? files : undefined;
     if (draft.quotes.length > 0) {
       // Preserve authored whitespace and quote provenance, including mention markers.
-      const outgoing = {
-        ...draft,
-        text: withSessionMentionHint(expand(draft.text), tagsSessions),
-        quotes: draft.quotes.map((quote, index) => ({
-          ...quote,
-          before: (index === 0 ? reviewPreamble : "") + expand(quote.before),
-        })),
-      };
+      const outgoing = appendReplyDraft(
+        {
+          ...draft,
+          text: expand(draft.text),
+          quotes: draft.quotes.map((quote) => ({ ...quote, before: expand(quote.before) })),
+        },
+        { quotes: [], text: reviewContext },
+      );
+      outgoing.text = withSessionMentionHint(outgoing.text, tagsSessions);
       onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
     } else {
       const message = isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
-      onSend(reviewPreamble + withSessionMentionHint(expand(message), tagsSessions), sendFiles);
+      onSend(
+        withSessionMentionHint(
+          [expand(message), reviewContext].filter(Boolean).join("\n\n"),
+          tagsSessions,
+        ),
+        sendFiles,
+      );
     }
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);

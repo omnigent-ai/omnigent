@@ -2,7 +2,7 @@
 // fetch stubbed: edits post what the editor shows and settle to the host's answer,
 // a draft outlives the Summary tab unmounting, and pasted media upload into the draft.
 
-import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
+import { PullRequestCommentComposer, PullRequestCommentForm } from "./PullRequestCommentComposer";
 import { PullRequestReviewThread } from "./PullRequestReviewThread";
 import { PullRequestReviewBody } from "./PullRequestReviewBody";
 import { parsePatchFiles } from "@pierre/diffs";
@@ -11,6 +11,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { afterEach, expect, it, onTestFinished, vi } from "vitest";
 import type { PullRequestAttachment, PullRequestInfo } from "@/hooks/usePullRequests";
+import { MAX_PULL_REQUEST_COMMENT_CHARACTERS } from "@/hooks/usePullRequests";
 import {
   attachmentMarkdown,
   insertOnOwnLine,
@@ -600,6 +601,50 @@ function mountCommentComposer(client: QueryClient, prUrl = PR_URL) {
     </QueryClientProvider>,
   );
 }
+
+it.each(["MacIntel", "Linux x86_64"])(
+  "submits a review comment with the command shortcut on %s using Submit's validation",
+  (platform) => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
+    const modifier = platform === "MacIntel" ? { metaKey: true } : { ctrlKey: true };
+    const props = {
+      draft: { body: "Please check this", error: null, pending: false },
+      setBody: vi.fn(),
+      post: vi.fn(),
+      account: "reviewer",
+      inline: true,
+      newThread: true,
+    };
+    const view = render(<PullRequestCommentForm {...props} />);
+    const input = () => screen.getByRole("textbox", { name: "New review comment" });
+    for (const keys of [
+      {},
+      { ...modifier, shiftKey: true },
+      { ...modifier, altKey: true },
+      { ...modifier, isComposing: true },
+      { ...modifier, keyCode: 229 },
+      { ...modifier, repeat: true },
+    ]) {
+      fireEvent.keyDown(input(), { key: "Enter", ...keys });
+    }
+    expect(props.post).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Submit" }));
+    fireEvent.keyDown(input(), { key: "Enter", ...modifier });
+    expect(props.post).toHaveBeenCalledTimes(2);
+
+    for (const overrides of [
+      { draft: { ...props.draft, body: " " } },
+      { draft: { ...props.draft, body: "x".repeat(MAX_PULL_REQUEST_COMMENT_CHARACTERS + 1) } },
+      { draft: { ...props.draft, pending: true } },
+      { disabled: true },
+    ]) {
+      view.rerender(<PullRequestCommentForm {...props} {...overrides} />);
+      expect(screen.getByRole("button", { name: /^(Submit|Posting…)$/ })).toBeDisabled();
+      fireEvent.keyDown(input(), { key: "Enter", ...modifier });
+    }
+    expect(props.post).toHaveBeenCalledTimes(2);
+  },
+);
 
 function inlineReviewThread(): ReviewThread {
   return {

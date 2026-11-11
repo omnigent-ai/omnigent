@@ -4,6 +4,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { MessageResponse } from "@/components/ai-elements/message";
+import { hasCommandModifier } from "@/lib/hotkeys";
 import {
   MAX_PULL_REQUEST_COMMENT_CHARACTERS,
   pullRequestCommentTooLong,
@@ -62,6 +63,7 @@ export function PullRequestCommentForm({
   }, [compactReply, draft.pending, draft.error, draft.body]);
   const collapsed = compactReply && !replyExpanded && !draft.pending;
   const tooLong = pullRequestCommentTooLong(draft.body);
+  const canSubmit = !disabled && !collapsed && !draft.pending && !!draft.body.trim() && !tooLong;
   return (
     <form
       ref={formRef}
@@ -75,7 +77,22 @@ export function PullRequestCommentForm({
       }
       onSubmit={(event) => {
         event.preventDefault();
-        if (!disabled && !collapsed) post();
+        if (canSubmit) post();
+      }}
+      onKeyDown={(event) => {
+        if (
+          event.key !== "Enter" ||
+          !hasCommandModifier(event) ||
+          event.altKey ||
+          event.shiftKey ||
+          event.repeat ||
+          event.nativeEvent.isComposing ||
+          event.keyCode === 229
+        )
+          return;
+        event.preventDefault();
+        event.stopPropagation();
+        formRef.current?.requestSubmit();
       }}
     >
       {collapsed ? (
@@ -166,12 +183,7 @@ export function PullRequestCommentForm({
                 Cancel
               </Button>
             )}
-            <Button
-              type="submit"
-              size="sm"
-              className="shrink-0"
-              disabled={disabled || draft.pending || !draft.body.trim() || tooLong}
-            >
+            <Button type="submit" size="sm" className="shrink-0" disabled={!canSubmit}>
               {draft.pending
                 ? local
                   ? "Saving…"

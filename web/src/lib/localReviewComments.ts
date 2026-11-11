@@ -48,9 +48,12 @@ export function isLocalReviewComment(value: unknown): value is Comment {
 }
 
 /** Include snapshots as well as IDs so native agents need no comment-fetch tool. */
-export function formatLocalReviewComments(comments: Comment[]): string {
+export function formatLocalReviewComments(
+  comments: Comment[],
+  { includeInstruction = true }: { includeInstruction?: boolean } = {},
+): string {
   return [
-    "Please address these local review comments:",
+    ...(includeInstruction ? ["Please address these local review comments:"] : []),
     ...comments.map((comment) => {
       // Keep quoted attachment markers out of the chat's mention-rewriting pass.
       const snapshot = JSON.stringify(comment, null, 2).replaceAll("[Attached", "\\u005bAttached");

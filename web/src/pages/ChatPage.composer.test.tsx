@@ -6290,6 +6290,10 @@ describe("Composer reply quotes", () => {
     expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toContain("[Attached: src/example.ts]");
     const [sentText, , sentReply] = vi.mocked(props.onSend).mock.calls[0]!;
     expect(serializeReplyDraft(sentReply!)).toBe(sentText);
+    expect(sentText.indexOf("My instructions")).toBeLessThan(
+      sentText.indexOf("```local-review-comment"),
+    );
+    expect(sentText).not.toContain("Please address these local review comments:");
     expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument();
     act(() => requestLocalReviewContext(comment));
     act(() => ref.current?.appendReplyQuote("Keep this quote"));
@@ -6354,13 +6358,21 @@ describe("Composer reply quotes", () => {
     const send = screen.getByRole("button", { name: "Send" });
     expect(send).toBeEnabled();
     fireEvent.click(send);
-    expect(props.onSend).toHaveBeenNthCalledWith(
-      3,
-      `${formatLocalReviewComments(batch)}\n\n`,
-      undefined,
-    );
+    expect(props.onSend).toHaveBeenNthCalledWith(3, formatLocalReviewComments(batch), undefined);
     expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+
+    for (const quote of [false, true]) {
+      fireEvent.change(textarea(), { target: { value: "Only explain the changes" } });
+      if (quote) act(() => ref.current?.appendReplyQuote("Quoted context"));
+      act(() => requestLocalReviewContext(comment));
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      const [message, , reply] = vi.mocked(props.onSend).mock.lastCall!;
+      expect(message).toBe(
+        `Only explain the changes${quote ? "\n\n> Quoted context" : ""}\n\n${formatLocalReviewComments([comment], { includeInstruction: false })}`,
+      );
+      if (reply) expect(serializeReplyDraft(reply)).toBe(message);
+    }
   });
 
   it("keeps mention markers in the structured payload used to restore a failed send", () => {

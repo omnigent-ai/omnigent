@@ -41,29 +41,34 @@ const comment: Comment = {
 
 afterEach(clearSessionDrafts);
 
-it("preserves full snapshots and Markdown bodies inside review fences", () => {
-  const comments = [
-    comment,
-    {
-      ...comment,
-      id: "comment-2",
-      path: "src/a`name[1].tsx",
-      body: '**Check** <div>\n\n```json\n{"key": "value"}\n```\n\n- Keep `null` and `[Attached: example.ts]`.',
-      anchor_metadata: {
-        ...comment.anchor_metadata!,
-        side: "RIGHT" as const,
-        line: 10,
-        start_line: null,
+it.each([true, false])(
+  "preserves full snapshots and Markdown bodies inside review fences (instruction: %s)",
+  (includeInstruction) => {
+    const comments = [
+      comment,
+      {
+        ...comment,
+        id: "comment-2",
+        path: "src/a`name[1].tsx",
+        body: '**Check** <div>\n\n```json\n{"key": "value"}\n```\n\n- Keep `null` and `[Attached: example.ts]`.',
+        anchor_metadata: {
+          ...comment.anchor_metadata!,
+          side: "RIGHT" as const,
+          line: 10,
+          start_line: null,
+        },
       },
-    },
-  ];
-  const message = formatLocalReviewComments(comments);
-  expect(message).toMatch(/^Please address these local review comments:/);
-  const snapshots = [...message.matchAll(/```local-review-comment\n([\s\S]*?)\n```/g)].map(
-    (match) => parseLocalReviewComment(match[1]),
-  );
-  expect(snapshots).toEqual(comments);
-});
+    ];
+    const message = formatLocalReviewComments(comments, { includeInstruction });
+    expect(message.startsWith("Please address these local review comments:")).toBe(
+      includeInstruction,
+    );
+    const snapshots = [...message.matchAll(/```local-review-comment\n([\s\S]*?)\n```/g)].map(
+      (match) => parseLocalReviewComment(match[1]),
+    );
+    expect(snapshots).toEqual(comments);
+  },
+);
 
 it.each([
   "not JSON",

@@ -3547,6 +3547,7 @@ it.each(["capabilities", "selected_pr_url"] as const)(
 );
 
 it("saves a local comment as agent context and retains earlier revisions", async () => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
   const diffs = await vi.importActual<typeof DiffsModule>("@pierre/diffs");
   state.parsedFiles = diffs.parsePatchFiles(
     "diff --git a/hello.py b/hello.py\n--- a/hello.py\n+++ b/hello.py\n@@ -1 +1 @@\n-old\n+new\n",
@@ -3612,7 +3613,10 @@ it("saves a local comment as agent context and retains earlier revisions", async
     screen.getByRole("textbox", { name: "New review comment" }),
     "Handle empty input",
   );
-  await userEvent.click(screen.getByRole("button", { name: "Submit" }));
+  fireEvent.keyDown(screen.getByRole("textbox", { name: "New review comment" }), {
+    key: "Enter",
+    metaKey: true,
+  });
   await screen.findByRole("region", { name: "Local review comment" });
   expect(comments[0]?.anchor_metadata).toMatchObject({
     side: "RIGHT",
