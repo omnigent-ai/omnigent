@@ -113,6 +113,7 @@ _logger = logging.getLogger(__name__)
 # so misconfigurations surface as a single grep target.
 _ENV_MODEL = "HARNESS_CODEX_MODEL"
 _ENV_GATEWAY = "HARNESS_CODEX_GATEWAY"
+_ENV_BROKERED_GATEWAY = "HARNESS_CODEX_BROKERED_GATEWAY"
 _ENV_DATABRICKS_PROFILE = "HARNESS_CODEX_DATABRICKS_PROFILE"
 _ENV_MODEL_PROVIDER = "HARNESS_CODEX_MODEL_PROVIDER"
 _ENV_GATEWAY_HOST = "HARNESS_CODEX_GATEWAY_HOST"
@@ -401,6 +402,7 @@ def _build_codex_executor() -> Executor:
         model=os.environ.get(_ENV_MODEL),
         codex_path=resolve_harness_path("codex"),
         gateway=route.gateway,
+        brokered_gateway=_parse_truthy(_ENV_BROKERED_GATEWAY, default=False),
         databricks_profile=None
         if signer_launch_config is not None
         else os.environ.get(_ENV_DATABRICKS_PROFILE),

@@ -78,6 +78,7 @@ import type { Session, SessionFamily } from "@/lib/types";
 import type { SessionPullRequestSummary } from "@/hooks/useSessionPullRequests";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
+import { isSessionWorking } from "./useSessionState";
 
 export const CONNECTED_STREAM_REFETCH_INTERVAL_MS = 60_000;
 export const DISCONNECTED_STREAM_REFETCH_INTERVAL_MS = 45_000;
@@ -2832,6 +2833,10 @@ async function archiveAndUnfileConversation(id: string): Promise<Conversation> {
   return (await res.json()) as Conversation;
 }
 
+export type DeleteProjectResult =
+  | { status: "deleted"; succeeded: string[]; failed: string[] }
+  | { status: "needs_running_confirmation"; runningCount: number };
+
 /**
  * Delete a project: archive AND unfile every member session, then delete the
  * first-class `projects` row (when the folder has one). Sessions are never
@@ -2841,12 +2846,27 @@ async function archiveAndUnfileConversation(id: string): Promise<Conversation> {
  * `?project=`), `id` deletes the container (skipped for a label-only folder,
  * which has none). Throws a `BulkConversationMutationError` if any member
  * failed (e.g. a shared session the user can't modify), leaving those in place.
+ *
+ * Archiving a working member stops its agent, so unless `stopRunning` is set
+ * a project with working members is left untouched and the result reports how
+ * many are working, for the caller to confirm (as every other archive path
+ * does through `useArchivePrompt`).
  */
 export function useDeleteProject() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async ({ id, name }: ProjectSummary) => {
+    mutationFn: async ({
+      id,
+      name,
+      stopRunning = false,
+    }: Pick<ProjectSummary, "id" | "name"> & {
+      stopRunning?: boolean;
+    }): Promise<DeleteProjectResult> => {
       const members = await fetchAllProjectSessions(name);
+      if (!stopRunning) {
+        const runningCount = members.filter(isSessionWorking).length;
+        if (runningCount > 0) return { status: "needs_running_confirmation", runningCount };
+      }
       const ids = members.map((member) => member.id);
       const representatives = new Map(
         members
@@ -2891,9 +2911,11 @@ export function useDeleteProject() {
       // (A label-only folder has no row; clearing the labels above already
       // makes it vanish from the project list.)
       if (id !== null) await apiDeleteProject(id);
-      return { succeeded, failed };
+      return { status: "deleted", succeeded, failed };
     },
-    onSettled: () => {
+    onSettled: (result) => {
+      // Nothing was written while the caller is still confirming.
+      if (result?.status === "needs_running_confirmation") return;
       // Refresh regardless of partial failure so the sidebar reflects whatever
       // was actually archived.
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
