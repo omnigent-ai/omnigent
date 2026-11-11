@@ -843,6 +843,44 @@ def register_core_routes(
                 extra={"session_id": session_id},
             )
 
+    async def _recover_lapsed_move(request: Request, conv: Conversation) -> Conversation:
+        """
+        Take over a lapsed move's claim, settle what it held, then release the session.
+
+        The move stopped with its server. The claim is first replaced with this
+        request's own, so a concurrent recovery or a new move can't take the
+        session while its startup is settled: messages held for the lapsed move
+        are marked not sent and later ones are dispatched normally again.
+
+        :param request: The runner-update request recovering the session.
+        :param conv: The session as read, its runner the lapsed claim.
+        :returns: The session as released, with no runner.
+        :raises OmnigentError: 409 if another request changed the runner first.
+        """
+        from omnigent.server.managed_hosts import new_move_claim
+
+        takeover = new_move_claim()
+        try:
+            held = await asyncio.to_thread(
+                conversation_store.replace_runner_id, conv.id, takeover, expected_runner=conv
+            )
+        except ValueError as exc:
+            raise OmnigentError(
+                "The session's runner changed. Reload and try again.",
+                code=ErrorCode.CONFLICT,
+            ) from exc
+        startup = getattr(request.app.state, "startup_inputs", None)
+        if startup is not None:
+            await startup.release_held_inputs(
+                conv.id,
+                "The message wasn't sent: the session's move to a new sandbox didn't "
+                "finish. Send it again.",
+                move_claim=takeover,
+            )
+        return await asyncio.to_thread(
+            conversation_store.clear_runner_id, conv.id, expected_runner=held
+        )
+
     async def _check_requested_host_id(
         request: Request, requested_host_id: str, user_id: str | None
     ) -> None:
@@ -3696,17 +3734,10 @@ def register_core_routes(
                     "The session is moving to a new sandbox. Try again once the move finishes.",
                     code=ErrorCode.CONFLICT,
                 )
-            startup = getattr(request.app.state, "startup_inputs", None)
-            if is_move_claim(conv.runner_id) and startup is not None:
-                # A lapsed claim's move stopped with its server. Settle what it
-                # held while the claim still stands, so later messages aren't
-                # queued for a sandbox no launch will bring up.
-                await startup.release_held_inputs(
-                    session_id,
-                    "The message wasn't sent: the session's move to a new sandbox didn't "
-                    "finish. Send it again.",
-                    move_claim=conv.runner_id,
-                )
+            if is_move_claim(conv.runner_id):
+                conv = await _recover_lapsed_move(request, conv)
+                previous_runner_id = conv.runner_id
+                previous_runner_binding = conv
             # Empty string is the clear sentinel (None = leave unchanged);
             # used by /clear and /switch to move the runner between sessions.
             # Each write below requires the runner read above, so a move that

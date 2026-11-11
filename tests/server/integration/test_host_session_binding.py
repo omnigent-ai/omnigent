@@ -1800,6 +1800,7 @@ async def test_move_launch_queued_behind_a_refused_relaunch_still_starts(
 @pytest.mark.parametrize("runner_id", ["", "runner_other_tab"])
 async def test_runner_change_waits_for_a_move_to_release_its_claim(
     managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
     runner_id: str,
 ) -> None:
     """
@@ -1807,8 +1808,10 @@ async def test_runner_change_waits_for_a_move_to_release_its_claim(
     nothing takes the session while the move settles. A claim past its lease,
     left by a server that stopped mid-move, can be cleared; the startup its move
     left pending is settled with it, so messages are dispatched normally again
-    instead of queueing for a sandbox nothing will launch.
+    instead of queueing for a sandbox nothing will launch. The recovery holds the
+    session while it settles, so another recovery or a new move waits for it.
     """
+    import threading
     import time
 
     from starlette.datastructures import Headers
@@ -1847,8 +1850,28 @@ async def test_runner_change_waits_for_a_move_to_release_its_claim(
         data={"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
     )
     await startup.enqueue(session_id, event, user_id=None, headers=Headers({}), first=False)
-    cleared = await env.client.patch(f"/v1/sessions/{session_id}", json={"runner_id": ""})
+    # The recovery holds the session while it settles: a second recovery and a
+    # new move are both refused, so its settlement can't touch theirs.
+    settling, settled = threading.Event(), threading.Event()
+    list_pending_inputs = env.conv_store.list_pending_inputs
 
+    def settle_slowly(conversation_id: str) -> Any:
+        if not settling.is_set():
+            settling.set()
+            settled.wait(timeout=10)
+        return list_pending_inputs(conversation_id)
+
+    monkeypatch.setattr(env.conv_store, "list_pending_inputs", settle_slowly)
+    recovery = asyncio.create_task(
+        env.client.patch(f"/v1/sessions/{session_id}", json={"runner_id": ""})
+    )
+    assert await asyncio.to_thread(settling.wait, 10)
+    second = await env.client.patch(f"/v1/sessions/{session_id}", json={"runner_id": ""})
+    move = await env.client.post(f"/v1/sessions/{session_id}/managed-host", json={})
+    settled.set()
+    cleared = await recovery
+
+    assert (second.status_code, move.status_code) == (409, 409), (second.text, move.text)
     assert cleared.status_code == 200, cleared.text
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None
