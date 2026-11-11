@@ -33,6 +33,7 @@ from omnigent.server.schemas import CreateResponseRequest
     "receipt_kind",
     [
         "exact",
+        "late-exact",
         "native-failed",
         "old-cli-no-id",
         "same-text-other-id",
@@ -43,12 +44,14 @@ from omnigent.server.schemas import CreateResponseRequest
         "session-before-read",
         "thread-during-read",
         "socket-during-read",
+        "home-during-read",
         "read-failure",
         "read-timeout",
         "cancel-read",
         "no-server-id",
         "explicit-rejection",
         "reply-timeout-exact",
+        "reply-timeout-late-exact",
         "reply-timeout-other-id",
         "reply-timeout-session-replaced",
     ],
@@ -61,9 +64,15 @@ async def test_native_receipt_requires_exact_delivery_identity(
     ordering: list[str] = []
     read_waiting = asyncio.Event()
     receipt_file = tmp_path / "native-history.json"
-    confirmed = receipt_kind in {"exact", "native-failed", "reply-timeout-exact"} or (
-        receipt_kind == "different-turn" and method == "turn/start"
+    late_receipt = receipt_kind in {"late-exact", "reply-timeout-late-exact"}
+    confirmed = (
+        late_receipt
+        or receipt_kind in {"exact", "native-failed", "reply-timeout-exact"}
+        or (receipt_kind == "different-turn" and method == "turn/start")
     )
+    if not late_receipt:
+        monkeypatch.setattr(native_executor, "_DELIVERY_RECEIPT_TIMEOUT_SECONDS", 0.2)
+        monkeypatch.setattr(native_executor, "_DELIVERY_RECEIPT_POLL_SECONDS", 0.01, raising=False)
     reply_timeout = receipt_kind.startswith("reply-timeout-")
     if reply_timeout:
         monkeypatch.setattr(native_executor, "_DELIVERY_RPC_TIMEOUT_SECONDS", 0.1, raising=False)
@@ -144,6 +153,8 @@ async def test_native_receipt_requires_exact_delivery_identity(
             if rpc_method == "thread/read":
                 ordering.append("receipt_read")
                 read_waiting.set()
+                if late_receipt and requests.count("thread/read") == 1:
+                    result["thread"]["turns"] = []
                 if receipt_kind in {"read-timeout", "cancel-read"}:
                     await websocket.wait_closed()
                     return
@@ -156,6 +167,10 @@ async def test_native_receipt_requires_exact_delivery_identity(
                     write_bridge_state(tmp_path, replace(state, thread_id="thread_other"))
                 elif receipt_kind == "socket-during-read":
                     write_bridge_state(tmp_path, replace(state, socket_path="ws://127.0.0.1:9"))
+                elif receipt_kind == "home-during-read":
+                    write_bridge_state(
+                        tmp_path, replace(state, codex_home=str(tmp_path / "other"))
+                    )
             await websocket.send(json.dumps({"id": request["id"], "result": result}))
 
     async with serve(handle, "127.0.0.1", 0) as server:
@@ -208,11 +223,18 @@ async def test_native_receipt_requires_exact_delivery_identity(
         "explicit-rejection",
         "reply-timeout-session-replaced",
     }
-    assert requests.count("thread/read") == int(should_probe)
+    if late_receipt:
+        assert requests.count("thread/read") == 2
+    elif should_probe:
+        assert requests.count("thread/read") >= 1
+    else:
+        assert "thread/read" not in requests
     if receipt_kind not in {"explicit-rejection", "cancel-read"}:
         assert "turn/interrupt" not in requests
     if confirmed:
-        assert ordering == ["native_receipt_persisted", "rpc_reply_lost", "receipt_read"]
+        assert ordering == ["native_receipt_persisted", "rpc_reply_lost"] + ["receipt_read"] * (
+            2 if late_receipt else 1
+        )
     receipt = json.loads(receipt_file.read_text())
     if confirmed:
         assert receipt["thread"]["turns"][0]["items"][0]["clientId"] == "c" * 32

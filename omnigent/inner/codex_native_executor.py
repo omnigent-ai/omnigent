@@ -111,6 +111,7 @@ _BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
 _COMPACTION_WAIT_TIMEOUT_SECONDS = 60.0
 _DELIVERY_RPC_TIMEOUT_SECONDS = 30.0
 _DELIVERY_RECEIPT_TIMEOUT_SECONDS = 2.0
+_DELIVERY_RECEIPT_POLL_SECONDS = 0.25
 _MAX_CODEX_TEXT_INPUT_CHARS = 1 << 20
 _CODEX_COMPACTING_FAILURE = CodexStartupFailure(
     message="Codex is still compacting, so this message was not delivered.",
@@ -379,16 +380,11 @@ async def _read_native_delivery_receipt(
     client_message_id: str,
     requested_turn_id: str | None,
 ) -> str | None:
-    """Confirm input identity from native history without submitting or changing a turn."""
+    """Await exact input identity in native history without submitting or changing a turn."""
 
     def same_session() -> bool:
         current = read_bridge_state(bridge_dir)
-        return (
-            current is not None
-            and current.session_id == state.session_id
-            and current.thread_id == state.thread_id
-            and current.socket_path == state.socket_path
-        )
+        return current is not None and _codex_binding_matches(current, state)
 
     try:
         async with asyncio.timeout(_DELIVERY_RECEIPT_TIMEOUT_SECONDS):
@@ -396,40 +392,44 @@ async def _read_native_delivery_receipt(
                 return None
             await client.close()
             await client.connect()
-            response = await client.request(
-                "thread/read", {"threadId": state.thread_id, "includeTurns": True}
-            )
-            if not same_session():
-                return None
-            result = _json_object(response.get("result"))
-            thread = _json_object(result.get("thread")) if result is not None else None
-            if thread is None or thread.get("id") != state.thread_id:
-                return None
-            turns = thread.get("turns")
-            if not isinstance(turns, list):
-                return None
-            for value in turns:
-                turn = _json_object(value)
-                if turn is None:
-                    continue
-                turn_id = turn.get("id")
-                if not isinstance(turn_id, str) or not turn_id:
-                    continue
-                if requested_turn_id is not None and turn_id != requested_turn_id:
-                    continue
-                items = turn.get("items")
-                if not isinstance(items, list):
-                    continue
-                for value in items:
-                    item = _json_object(value)
-                    if (
-                        item is not None
-                        and item.get("type") == "userMessage"
-                        and item.get("clientId") == client_message_id
-                        and isinstance(item.get("id"), str)
-                        and item["id"]
-                    ):
-                        return turn_id
+            while same_session():
+                response = await client.request(
+                    "thread/read", {"threadId": state.thread_id, "includeTurns": True}
+                )
+                if not same_session():
+                    return None
+                result = _json_object(response.get("result"))
+                thread = _json_object(result.get("thread")) if result is not None else None
+                if thread is None or thread.get("id") != state.thread_id:
+                    return None
+                turns = thread.get("turns")
+                if not isinstance(turns, list):
+                    return None
+                for turn_value in turns:
+                    turn = _json_object(turn_value)
+                    if turn is None:
+                        continue
+                    turn_id = turn.get("id")
+                    if not isinstance(turn_id, str) or not turn_id:
+                        continue
+                    if requested_turn_id is not None and turn_id != requested_turn_id:
+                        continue
+                    items = turn.get("items")
+                    if not isinstance(items, list):
+                        continue
+                    for item_value in items:
+                        item = _json_object(item_value)
+                        if (
+                            item is not None
+                            and item.get("type") == "userMessage"
+                            and item.get("clientId") == client_message_id
+                            and isinstance(item.get("id"), str)
+                            and item["id"]
+                        ):
+                            return turn_id
+                # An accepted request can outlive its connection and appear in
+                # history after the first read. Keep the original recovery deadline.
+                await asyncio.sleep(_DELIVERY_RECEIPT_POLL_SECONDS)
     except (TimeoutError, OSError, RuntimeError, WebSocketException):
         # A missing/unreadable receipt leaves delivery uncertain; it never permits replay.
         _logger.debug("Codex delivery receipt unavailable", exc_info=True)
