@@ -2627,7 +2627,7 @@ def _build_initial_prompt(
         elif isinstance(raw_content, str):
             content = raw_content
         else:
-            content = json.dumps(raw_content, ensure_ascii=True)
+            content = json.dumps(raw_content, ensure_ascii=False)
         lines.append(f"{role}: {content}")
     lines.append("")
     lines.append("Respond to the latest user message, using the conversation above as context.")
