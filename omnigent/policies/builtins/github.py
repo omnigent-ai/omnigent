@@ -205,10 +205,11 @@ def _normalize_repo(value: str) -> str:
     bare_match = _REPO_BARE_PATTERN.match(value)
     if bare_match:
         return f"{bare_match.group(1)}/{bare_match.group(2)}".lower()
-    if value.lower().startswith("github.com/"):
-        # Without a scheme the URL parser sees no host, so supply the scheme here.
-        return _repo_from_url(f"https://{value}")
-    return _repo_from_url(value)
+    repo = _repo_from_url(value)
+    if repo or "://" in value or "@" in value:
+        return repo
+    # Without a scheme the URL parser sees no host; retry with one so the host check applies.
+    return _repo_from_url(f"https://{value}")
 
 
 def _repo_from_url(value: str, *, allow_subpath: bool = True) -> str:

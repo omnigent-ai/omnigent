@@ -1373,7 +1373,10 @@ def test_scheme_less_allowlist_entries_and_repo_arguments_are_honored() -> None:
         tc("mcp__github__create_issue", {"repository": "github.com/example/other"})
     )
     assert mcp_result is not None and mcp_result["result"] == "DENY"
-    assert policy(tc("mcp__github__create_issue", {"repository": "github.com/example/allowed"})) is None
+    assert (
+        policy(tc("mcp__github__create_issue", {"repository": "github.com/example/allowed"}))
+        is None
+    )
 
 
 def test_unparseable_allowlist_entry_is_dropped_with_warning(
@@ -1471,7 +1474,10 @@ def test_gh_api_repository_comes_from_the_endpoint(command: str, expected: str) 
         "gh -R example/allowed pr create -R example/other --base main",
         "gh pr create -R example/allowed -Rexample/other --base main",
         "gh pr create -R example/allowed --base main --base release",
-        "gh api -X POST repos/example/allowed/issues --hostname github.com --hostname other.example",
+        (
+            "gh api -X POST repos/example/allowed/issues"
+            " --hostname github.com --hostname other.example"
+        ),
     ],
 )
 def test_conflicting_gh_selectors_require_approval(command: str) -> None:

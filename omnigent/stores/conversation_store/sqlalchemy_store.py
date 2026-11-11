@@ -204,7 +204,7 @@ _SEARCH_CANDIDATE_WINDOW = 200
 _LIKE_ESCAPE = "/"
 
 
-def _binary_id_hex(value: object) -> str:
+def _binary_id_hex(value: bytes | memoryview | str) -> str:
     """
     Return the bare 32-char hex of a raw or Uuid16 conversation/item id.
 
