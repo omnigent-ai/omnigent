@@ -140,7 +140,7 @@ def test_search_prefetches_permissions_from_separate_database(tmp_path: Path) ->
     assert scoped == []
 
 
-def test_search_fts_join_probes_item_primary_key(tmp_path: Path) -> None:
+def test_search_item_lookups_probe_primary_key_without_sql_functions(tmp_path: Path) -> None:
     store = SqlAlchemyConversationStore(f"sqlite:///{tmp_path / 'plan.db'}")
     conversation = store.create_conversation(workspace=str(tmp_path))
     store.append(conversation.id, [_message("sapphire authorized")])
@@ -155,26 +155,33 @@ def test_search_fts_join_probes_item_primary_key(tmp_path: Path) -> None:
     captured: list[tuple[str, object]] = []
 
     def capture(conn, cursor, statement, parameters, context, executemany) -> None:
-        if "conversation_items_fts" in statement:
-            captured.append((statement, parameters))
+        captured.append((statement, parameters))
 
     event.listen(store._conv_engine, "before_cursor_execute", capture)
     try:
         store.search("sapphire", limit=1, accessible_by="caller@example.com")
     finally:
         event.remove(store._conv_engine, "before_cursor_execute", capture)
-    statement, parameters = captured[0]
-    with store._conv_session("test_search_acl") as session:
-        plan_rows = (
-            session.connection()
-            .exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters)
-            .all()
-        )
-    plan = " | ".join(str(row) for row in plan_rows)
 
-    # The item lookup must bind the full primary key, not only workspace_id.
-    assert "ci USING" in plan
-    assert "(workspace_id=? AND conversation_id=? AND id=?)" in plan
+    # SQLite-only function calls are avoided so older SQLite builds work.
+    assert all("unhex" not in statement.lower() for statement, _ in captured)
+    item_plans = []
+    with store._conv_session("test_search_acl") as session:
+        for statement, parameters in captured:
+            if (
+                statement.lstrip().upper().startswith("SELECT")
+                and "conversation_items" in statement
+            ):
+                rows = (
+                    session.connection()
+                    .exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters)
+                    .all()
+                )
+                item_plans.append(" | ".join(str(row) for row in rows))
+    # The item lookups must bind the full primary key rather than only workspace_id.
+    assert item_plans
+    assert all("SCAN conversation_items" not in plan for plan in item_plans)
+    assert any("(workspace_id=? AND conversation_id=? AND id=?)" in plan for plan in item_plans)
 
 
 def test_search_matches_dashed_and_legacy_fts_ids(tmp_path: Path) -> None:
