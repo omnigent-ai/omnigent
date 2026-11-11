@@ -18,8 +18,20 @@ from omnigent.terminals.program_status import (
 _logger = logging.getLogger(__name__)
 
 # How long an error report may stand before its turn is failed without the
-# StopFailure hook. The hook normally follows within about a second.
-ERROR_HOOK_GRACE_S = 5.0
+# StopFailure hook. Process startup and forwarding can delay its detailed error.
+ERROR_HOOK_GRACE_S = 10.0
+
+
+def _reports_failed_turn(report: ProgramStatus) -> bool:
+    """Whether a report describes a turn that already ended in an error.
+
+    Claude reports a turn that failed authentication as ``blocked`` with kind
+    ``auth`` until the user signs in again, so that report is not work in progress.
+
+    :param report: Current root report from the terminal's relay.
+    :returns: ``True`` for an error report or an authentication block.
+    """
+    return report.state == "error" or (report.state == "blocked" and report.kind == "auth")
 
 
 class ClaudeProgramStatusPoller:
@@ -39,11 +51,15 @@ class ClaudeProgramStatusPoller:
         turn_activity_epoch: Callable[[], int] | None = None,
         on_failure: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        background_agents_after_turn: Callable[[], bool] | None = None,
     ) -> None:
         self._reader = reader
         self._fallback = fallback
         self._on_status = on_status
         self._on_replay = on_replay or on_status
+        # Claude reports working for a background agent that outlives its turn.
+        self._background_agents_after_turn = background_agents_after_turn
+        self._holding_background_agents = False
         self._omnigent_session_id = omnigent_session_id
         self._terminal_instance_id = terminal_instance_id
         self._terminal_launch_id = terminal_launch_id
@@ -86,6 +102,15 @@ class ClaudeProgramStatusPoller:
             return None
         return blocked_reason(report) if report is not None else self._fallback.blocked_on
 
+    @property
+    def holding_background_agents(self) -> bool:
+        """Whether a working report reads as waiting on a turn's background agent."""
+        if self._retired:
+            return False
+        if self._using_osc:
+            return self._holding_background_agents
+        return self._fallback.holding_background_agents
+
     def tick(self) -> None:
         """Publish changed reports; never interpret silence as completion."""
         if self._retired:
@@ -96,7 +121,7 @@ class ClaudeProgramStatusPoller:
         report = self._reader.status
         if self._retired:
             return
-        is_error = report is not None and report.state == "error"
+        is_error = report is not None and _reports_failed_turn(report)
         # Resync must not turn a standing error into repeated observations.
         if is_error and not self._error_observed:
             _logger.info(
@@ -113,24 +138,35 @@ class ClaudeProgramStatusPoller:
         self._error_observed = is_error
         if report is not None:
             self._using_osc = True
-            changed = report != self._last
+            holding = (
+                report.state == "working"
+                and self._background_agents_after_turn is not None
+                and self._background_agents_after_turn()
+            )
+            changed = report != self._last or holding != self._holding_background_agents
             if changed:
                 self._observation_version += 1
             if changed or requested:
                 self._last = report
+                self._holding_background_agents = holding
                 # The StopFailure hook owns the failed edge and carries the API
                 # error text; an error report here would fail the turn first, bare.
-                if report.state != "error":
-                    status = "running" if report.state in {"working", "blocked"} else "idle"
+                if not is_error:
+                    working = report.state in {"working", "blocked"}
+                    status = "waiting" if holding else "running" if working else "idle"
                     publish = self._on_status if changed else self._on_replay
                     publish(status, blocked_reason(report))
             self._fail_if_hook_overdue(report)
+            # OSC reports ``done`` while a background shell still runs; only the
+            # file says ``shell``, so keep reading it for that one signal.
+            self._fallback.observe()
         else:
             if self._last is not None:
                 self._observation_version += 1
             if self._using_osc:
                 self._fallback.resync()
             self._using_osc = False
+            self._holding_background_agents = False
             self._last = None
             self._fail_if_hook_overdue(None)
             self._fallback.tick()
@@ -143,7 +179,7 @@ class ClaudeProgramStatusPoller:
         """
         if (
             report is None
-            or report.state != "error"
+            or not _reports_failed_turn(report)
             or self._turn_is_active is None
             or not self._turn_is_active()
         ):
