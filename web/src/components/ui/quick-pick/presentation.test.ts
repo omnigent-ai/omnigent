@@ -225,11 +225,70 @@ describe("navigateQuickPick", () => {
   });
   // ["# Sessions", new, archive, "# View", toggle, settings]
 
-  it("skips headings and wraps at both ends", () => {
+  it("skips headings and stops at both ends unless looping", () => {
     expect(navigateQuickPick(rows, 1, { type: "next" })).toBe(2);
     expect(navigateQuickPick(rows, 2, { type: "next" })).toBe(4);
-    expect(navigateQuickPick(rows, 5, { type: "next" })).toBe(1);
-    expect(navigateQuickPick(rows, 1, { type: "previous" })).toBe(5);
+    expect(navigateQuickPick(rows, 5, { type: "next" })).toBe(5);
+    expect(navigateQuickPick(rows, 1, { type: "previous" })).toBe(1);
+    expect(navigateQuickPick(rows, 5, { type: "next" }, { loop: true })).toBe(1);
+    expect(navigateQuickPick(rows, 1, { type: "previous" }, { loop: true })).toBe(5);
+  });
+
+  it("jumps to the first row of the next or previous group", () => {
+    expect(navigateQuickPick(rows, 1, { type: "nextGroup" })).toBe(4);
+    expect(navigateQuickPick(rows, 2, { type: "nextGroup" })).toBe(4);
+    expect(navigateQuickPick(rows, 5, { type: "previousGroup" })).toBe(1);
+    // With no group beyond, it moves one row, and stays at the ends.
+    expect(navigateQuickPick(rows, 4, { type: "nextGroup" })).toBe(5);
+    expect(navigateQuickPick(rows, 5, { type: "nextGroup" })).toBe(5);
+    expect(navigateQuickPick(rows, 2, { type: "previousGroup" })).toBe(1);
+  });
+
+  it("treats an ungrouped row after a group as outside it", () => {
+    const mixed = buildQuickPickRows({
+      segments: [
+        { sourceId: "early", ranking: "provider", items: [item("p1", { group: "Earlier" })] },
+        {
+          sourceId: "sessions",
+          ranking: "provider",
+          items: [item("a1", { group: "Sessions" }), item("a2", { group: "Sessions" })],
+        },
+        { sourceId: "loose", ranking: "provider", items: [item("u")] },
+        { sourceId: "actions", ranking: "provider", items: [item("z1", { group: "Actions" })] },
+      ],
+      query: "",
+    });
+    // ["# Earlier", p1, "# Sessions", a1, a2, u, "# Actions", z1]
+    const at = (id: string) => mixed.findIndex((row) => row.kind === "item" && row.item.id === id);
+    expect(navigateQuickPick(mixed, at("u"), { type: "previousGroup" })).toBe(at("a2"));
+    expect(navigateQuickPick(mixed, at("u"), { type: "nextGroup" })).toBe(at("z1"));
+    expect(navigateQuickPick(mixed, at("a1"), { type: "nextGroup" })).toBe(at("z1"));
+  });
+
+  it("does not count an ungrouped row as the first row of a disabled group", () => {
+    const rows = buildQuickPickRows({
+      segments: [
+        { sourceId: "sessions", ranking: "provider", items: [item("a1", { group: "Sessions" })] },
+        {
+          sourceId: "disabled",
+          ranking: "provider",
+          items: [item("d1", { group: "Disabled", disabledReason: "Not here" }), item("u")],
+        },
+        { sourceId: "actions", ranking: "provider", items: [item("z1", { group: "Actions" })] },
+      ],
+      query: "",
+    });
+    const at = (id: string) => rows.findIndex((row) => row.kind === "item" && row.item.id === id);
+    expect(navigateQuickPick(rows, at("a1"), { type: "nextGroup" })).toBe(at("z1"));
+  });
+
+  it("moves one row by group keys when rows have no headings", () => {
+    const flat = buildQuickPickRows({
+      segments: [{ sourceId: "s", ranking: "client", items: [item("a"), item("b")] }],
+      query: "",
+    });
+    expect(navigateQuickPick(flat, 0, { type: "nextGroup" })).toBe(1);
+    expect(navigateQuickPick(flat, 1, { type: "previousGroup" })).toBe(0);
   });
 
   it("pages without wrapping and jumps to the ends", () => {
@@ -242,6 +301,7 @@ describe("navigateQuickPick", () => {
 
   it("starts from the top when nothing is active and returns -1 for no items", () => {
     expect(navigateQuickPick(rows, -1, { type: "next" })).toBe(1);
+    expect(navigateQuickPick(rows, -1, { type: "previous" })).toBe(-1);
     expect(navigateQuickPick([], -1, { type: "next" })).toBe(-1);
   });
 
@@ -261,8 +321,9 @@ describe("navigateQuickPick", () => {
       query: "",
     });
     expect(navigateQuickPick(withDisabled, 1, { type: "next" })).toBe(4);
-    expect(navigateQuickPick(withDisabled, 4, { type: "next" })).toBe(1);
-    expect(navigateQuickPick(withDisabled, 1, { type: "previous" })).toBe(4);
+    expect(navigateQuickPick(withDisabled, 4, { type: "next" })).toBe(4);
+    expect(navigateQuickPick(withDisabled, 4, { type: "previous" })).toBe(1);
+    expect(navigateQuickPick(withDisabled, 1, { type: "nextGroup" })).toBe(4);
     expect(navigateQuickPick(withDisabled, 1, { type: "last" })).toBe(4);
     expect(navigateQuickPick(withDisabled, 4, { type: "pageDown", pageSize: 10 })).toBe(4);
   });
