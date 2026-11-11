@@ -182,7 +182,7 @@ export function AppShellWorkspacePanels({
             <TasksPanel
               conversationId={conversationId}
               active={tasksPanelOpen}
-              // Close the drawer so the composer it fills in shows.
+              // Close the drawer so the workflow dialog opens over the chat.
               onStartWorkflow={() => setTasksPanelOpen(false)}
             />
           </RenderErrorBoundary>
