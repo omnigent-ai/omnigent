@@ -406,7 +406,33 @@ async def managed_session_env(
     :param tmp_path: Per-test scratch dir for artifact/cache stores.
     :returns: The assembled environment.
     """
-    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app, host_store, conv_store = _managed_app(db_uri, tmp_path)
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        yield ManagedSessionEnv(
+            app=app,
+            client=client,
+            host_store=host_store,
+            conv_store=conv_store,
+        )
+
+
+def _managed_app(
+    db_uri: str, root: Path
+) -> tuple[FastAPI, HostStore, SqlAlchemyConversationStore]:
+    """
+    Build one server replica wired for managed-host sessions.
+
+    Replicas built on the same *db_uri* share storage but keep their own
+    in-memory host tunnels and launch tracker, like separate server pods.
+
+    :param db_uri: SQLite URI shared by every store in the app.
+    :param root: Scratch dir for this replica's artifact and cache stores.
+    :returns: The app and its host and conversation stores.
+    """
+    artifact_store = LocalArtifactStore(str(root / "artifacts"))
     host_store = HostStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
     app = create_app(
@@ -416,7 +442,7 @@ async def managed_session_env(
         artifact_store=artifact_store,
         agent_cache=AgentCache(
             artifact_store=artifact_store,
-            cache_dir=tmp_path / "cache",
+            cache_dir=root / "cache",
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=host_store,
@@ -431,16 +457,7 @@ async def managed_session_env(
             }
         ),
     )
-    async with AsyncClient(
-        transport=ASGITransport(app=app),
-        base_url="http://test",
-    ) as client:
-        yield ManagedSessionEnv(
-            app=app,
-            client=client,
-            host_store=host_store,
-            conv_store=conv_store,
-        )
+    return app, host_store, conv_store
 
 
 @dataclass
@@ -1698,6 +1715,73 @@ async def test_refused_sandbox_move_releases_its_claim_when_restoring_labels_fai
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None
     assert (conv.host_id, conv.runner_id) == (_LAPTOP_HOST_ID, None)
+
+
+async def test_message_on_another_replica_before_the_move_detaches_waits_for_the_sandbox(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """
+    A message reaching another replica after the move registered its launch but
+    before it detached the old host is held for the sandbox, even though that
+    replica has no launch tracker and the old host is offline: the pending
+    startup on a user-connected host is what marks the move, in shared storage.
+    """
+    env = managed_session_env
+    fake = FakeSandboxLauncher(fail_on_host_start=True)
+    install_fake_modal_launcher(monkeypatch, fake)
+    session_id = await _session_released_from_laptop(env, agent_name="move-replica-message-agent")
+    env.host_store.set_offline(_LAPTOP_HOST_ID)
+    other_app, _, _ = _managed_app(db_uri, tmp_path / "replica-a")
+    loop = asyncio.get_running_loop()
+    clear_host_binding = env.conv_store.clear_host_binding
+    responses: list[dict[str, Any]] = []
+
+    async def message_via_other_replica() -> dict[str, Any]:
+        async with AsyncClient(
+            transport=ASGITransport(app=other_app), base_url="http://test"
+        ) as other:
+            resp = await asyncio.wait_for(
+                other.post(
+                    f"/v1/sessions/{session_id}/events",
+                    json={
+                        "type": "message",
+                        "data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "hi"}],
+                        },
+                    },
+                ),
+                timeout=10,
+            )
+            assert resp.status_code == 202, resp.text
+            return resp.json()
+
+    def message_then_detach(conversation_id: str, **kwargs: Any) -> Conversation:
+        if kwargs.get("keep_runner"):
+            current = env.conv_store.get_conversation(conversation_id)
+            assert current is not None and current.host_id == _LAPTOP_HOST_ID
+            responses.append(
+                asyncio.run_coroutine_threadsafe(message_via_other_replica(), loop).result(
+                    timeout=15
+                )
+            )
+        return clear_host_binding(conversation_id, **kwargs)
+
+    monkeypatch.setattr(env.conv_store, "clear_host_binding", message_then_detach)
+
+    resp = await env.client.post(f"/v1/sessions/{session_id}/managed-host", json={})
+
+    assert resp.status_code == 202, resp.text
+    assert len(responses) == 1 and responses[0]["queued"] is True
+    assert responses[0].get("pending_id")
+    await poll_until_async(
+        lambda: (
+            [item.status for item in env.conv_store.list_pending_inputs(session_id)] == ["failed"]
+        )
+    )
 
 
 async def test_message_sent_as_the_move_detaches_waits_for_the_sandbox(

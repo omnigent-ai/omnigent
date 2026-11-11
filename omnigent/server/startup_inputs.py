@@ -302,6 +302,11 @@ class ManagedStartupInputs:
             if host_store is not None
             else None
         )
+        if host is not None and host.sandbox_provider is None:
+            # Only a move onto a new sandbox leaves a user-connected host bound
+            # with a pending startup, and it detaches that host next; on every
+            # replica, hold the message for the sandbox even if the host is gone.
+            return True
         return host is not None and host_is_live(host)
 
     async def has_undelivered(self, session_id: str) -> bool:

@@ -173,13 +173,14 @@ function SupportedSwitchHostDialog({
     if (info === "loading" || !moveSupported || sessionHostless) return [];
     if (!profilesEnabled) return sandboxProviderOptions(info);
     // Until it is known which providers use profiles, offering none keeps a
-    // pick from releasing the runner for a move the server would refuse.
-    if (profileCatalog === undefined) return [];
+    // pick from releasing the runner for a move the server would refuse. A
+    // failed refresh counts as unknown too: the cached catalog may be stale.
+    if (profileCatalog === undefined || profileCatalogFailed) return [];
     const profiled = new Set(profileCatalog.managed_providers);
     return sandboxProviderOptions(info).filter(
       (provider) => !profiled.has(provider ?? info.sandbox_provider ?? ""),
     );
-  }, [info, moveSupported, sessionHostless, profilesEnabled, profileCatalog]);
+  }, [info, moveSupported, sessionHostless, profilesEnabled, profileCatalog, profileCatalogFailed]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 
@@ -373,7 +374,8 @@ function SupportedSwitchHostDialog({
     hosts !== undefined && targetHosts.length === 0 && sandboxProviderRows.length === 0;
   // Sandboxes are withheld until it's known which providers use profiles; say
   // so instead of implying there is nowhere to move the session.
-  const sandboxesUnknown = profilesEnabled && !sessionHostless && profileCatalog === undefined;
+  const sandboxesUnknown =
+    profilesEnabled && !sessionHostless && (profileCatalog === undefined || profileCatalogFailed);
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>

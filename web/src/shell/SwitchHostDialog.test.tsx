@@ -11,7 +11,7 @@ import { useSession } from "@/hooks/useSession";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
-import { fetchSandboxProfiles } from "@/lib/sandboxProfilesApi";
+import { SANDBOX_PROFILES_QUERY_KEY, fetchSandboxProfiles } from "@/lib/sandboxProfilesApi";
 import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
 import { launchManagedHost, launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
@@ -517,6 +517,27 @@ describe("SwitchHostDialog", () => {
       fireEvent.click(screen.getByRole("button", { name: "Try again" }));
       expect(await screen.findByTestId("switch-host-sandbox-option-modal")).toBeInTheDocument();
       expect(screen.queryByTestId("switch-host-sandbox-option-profiled")).toBeNull();
+    });
+
+    it("offers no sandbox when refreshing a cached profile catalog fails", async () => {
+      onlyOriginHostOnline();
+      const client = renderDialog({
+        ...SANDBOX_SERVER,
+        sandbox_providers: ["modal", "profiled"],
+        features: { sandbox_profiles: true },
+      });
+      expect(await screen.findByTestId("switch-host-sandbox-option-modal")).toBeInTheDocument();
+
+      // The cached catalog may predate a provider starting to require profiles.
+      vi.mocked(fetchSandboxProfiles).mockRejectedValueOnce(new Error("profiles unavailable"));
+      await act(async () => {
+        await client.refetchQueries({ queryKey: [...SANDBOX_PROFILES_QUERY_KEY, null] });
+      });
+
+      expect(await screen.findByTestId("switch-host-sandboxes-unavailable")).toBeVisible();
+      expect(screen.queryByTestId("switch-host-sandbox-option-modal")).toBeNull();
+      expect(screen.queryByTestId("switch-host-button")).toBeNull();
+      expect(updateSessionMock).not.toHaveBeenCalled();
     });
 
     it("says it is checking the sandboxes while profile discovery runs", async () => {
