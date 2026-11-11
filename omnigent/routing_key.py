@@ -40,7 +40,7 @@ def _key_path() -> Path:
 def _load() -> str | None:
     try:
         stored = _key_path().read_text(encoding="utf-8").strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     return stored if _KEY_RE.match(stored) else None
 

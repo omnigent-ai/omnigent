@@ -242,9 +242,10 @@ export function modalHostId(): string | null {
 }
 
 /**
- * Slice key for the `/updates` stream and the project writes it reports. The
- * server delivers those events only within one replica, so they share the modal
- * host's replica, or this client's key when there is no modal host.
+ * Slice key for the `/updates` stream and the writes whose events it reports
+ * (project changes, a scheduled run's new session). The server delivers those
+ * events only within one replica, so they share the modal host's replica, or
+ * this client's key when there is no modal host.
  */
 export function updatesRoutingKey(): string {
   return _modalHostId ?? clientRoutingKey();

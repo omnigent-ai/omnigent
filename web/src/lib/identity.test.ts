@@ -549,6 +549,7 @@ describe("authenticatedFetch", () => {
       expect(firstHeaders.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_789");
       // Second call (retry) should NOT have the slice key
       const secondInit = fetchMock.mock.calls[1][1] as RequestInit;
+      expect(fetchMock.mock.calls[1][2]).toEqual({ unkeyed: true });
       const secondHeaders = new Headers(secondInit.headers);
       expect(secondHeaders.get("X-Databricks-Omnigent-Slice-Key")).toBeNull();
       expect(response.status).toBe(200);
@@ -636,7 +637,7 @@ describe("authenticatedFetch", () => {
       },
     );
 
-    it("keys project reads by the client key and project writes by the modal host", async () => {
+    it("keys project reads by the client key and discovery-publishing writes by the modal host", async () => {
       vi.doUnmock("./sessionHost");
       const { resolveModalHost, setSessionHost } = await import("./sessionHost");
       setSessionHost("session-a", "host_modal");
@@ -650,15 +651,16 @@ describe("authenticatedFetch", () => {
       const { authenticatedFetch } = await import("./identity");
       fetchMock.mockResolvedValue(mockJsonResponse({}));
 
-      // Project writes publish projects_changed on their replica, which only the
-      // updates stream keyed by the same modal host receives.
+      // These writes publish projects_changed / session_added on their replica,
+      // which only the updates stream keyed by the same modal host receives.
       await authenticatedFetch("/v1/sessions/projects");
       await authenticatedFetch("/v1/projects/proj_1", { method: "PATCH", body: "{}" });
+      await authenticatedFetch("/v1/scheduled-tasks/task_1/run", { method: "POST" });
 
       const keys = fetchMock.mock.calls.map(([, init]) =>
         new Headers((init as RequestInit).headers).get("X-Databricks-Omnigent-Slice-Key"),
       );
-      expect(keys).toEqual([CLIENT_KEY, "host_modal"]);
+      expect(keys).toEqual([CLIENT_KEY, "host_modal", "host_modal"]);
     });
 
     it("keys a session sub-path with an unknown host by the client key", async () => {

@@ -132,46 +132,72 @@ describe("managed first-message routing", () => {
   });
 
   it.each(["hostless", "failed"])(
-    "preserves the original error when refresh is %s",
+    "falls back to the unkeyed default replica when refresh is %s",
     async (mode) => {
       const { authenticatedFetch, resolve } = await setup();
       resolve.mockImplementation(async (_sessionId, options) => {
         if (mode === "failed" && options?.force) throw new Error("snapshot unavailable");
       });
-      const original = wrongReplica();
-      fetchMock.mockResolvedValue(original);
+      const success = Response.json({ queued: true });
+      fetchMock.mockResolvedValueOnce(wrongReplica()).mockResolvedValueOnce(success);
 
       const response = await authenticatedFetch(EVENTS_URL, { method: "POST", body: "{}" });
 
-      expect(response).toBe(original);
-      expect(await response.json()).toEqual({ error: { code: "wrong_replica" } });
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(response).toBe(success);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
       expect(resolve).toHaveBeenCalledTimes(2);
+      expect(requestHeaders(1).has(SLICE_KEY)).toBe(false);
+      expect(fetchMock.mock.calls[1][2]).toEqual({ unkeyed: true });
     },
   );
 
-  it("does not loop when the keyed retry also reports wrong_replica", async () => {
+  it("does not loop when every retry reports wrong_replica", async () => {
     const { authenticatedFetch, resolve } = await setup();
     fetchMock.mockImplementation(async () => wrongReplica());
 
     const response = await authenticatedFetch(EVENTS_URL, { method: "POST", body: "{}" });
 
     expect(response.status).toBe(400);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(resolve).toHaveBeenCalledTimes(2);
     expect(requestHeaders(1).get(SLICE_KEY)).toBe("new-host");
+    expect(requestHeaders(2).has(SLICE_KEY)).toBe(false);
   });
 
-  it("clears a stale keyless demotion before trying the newly resolved host", async () => {
-    const { authenticatedFetch, markHostKeyless, isHostKeyless } = await setup();
-    markHostKeyless("new-host");
-    fetchMock.mockResolvedValueOnce(wrongReplica()).mockResolvedValueOnce(Response.json({}));
+  it("marks a discovered host keyless when only the default replica reaches it", async () => {
+    const { authenticatedFetch, isHostKeyless } = await setup();
+    fetchMock
+      .mockResolvedValueOnce(wrongReplica())
+      .mockResolvedValueOnce(wrongReplica())
+      .mockResolvedValueOnce(Response.json({}));
 
-    await authenticatedFetch(EVENTS_URL);
+    expect((await authenticatedFetch(EVENTS_URL)).ok).toBe(true);
 
     expect(requestHeaders(1).get(SLICE_KEY)).toBe("new-host");
-    expect(isHostKeyless("new-host")).toBe(false);
+    expect(requestHeaders(2).has(SLICE_KEY)).toBe(false);
+    expect(isHostKeyless("new-host")).toBe(true);
   });
+
+  it.each([
+    [true, true],
+    [false, false],
+  ])(
+    "sends a demoted host's request unkeyed (default replica reaches it: %s)",
+    async (reached, stillKeyless) => {
+      const { authenticatedFetch, markHostKeyless, isHostKeyless } = await setup();
+      markHostKeyless("new-host");
+      fetchMock
+        .mockResolvedValueOnce(wrongReplica())
+        .mockResolvedValueOnce(reached ? Response.json({}) : wrongReplica());
+
+      await authenticatedFetch(EVENTS_URL);
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(requestHeaders(1).has(SLICE_KEY)).toBe(false);
+      // A miss on the default replica too shows the demotion is stale.
+      expect(isHostKeyless("new-host")).toBe(stillKeyless);
+    },
+  );
 
   it("deduplicates concurrent forced host refreshes", async () => {
     const { authenticatedFetch, resolve, setSessionHost, resolveSessionHost } = await setup();

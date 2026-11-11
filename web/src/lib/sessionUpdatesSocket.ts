@@ -65,7 +65,7 @@ export const HEALTHY_CONNECTION_MS = 5_000;
  * {@link updatesRoutingKey}: the modal host (the one backing most of the user's
  * sessions), or the client's stored key when there is none. Discovery events
  * (`hosts_changed`, `projects_changed`, `session_added`) reach only streams on
- * the replica that published them, so the user's streams and project writes
+ * the replica that published them, so the user's streams and the writes that publish them
  * share that replica, which also holds most of their sessions' tunnels.
  *
  * The modal host is resolved once and never changes for the page, so every

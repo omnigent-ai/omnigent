@@ -25,10 +25,11 @@ def test_key_is_created_once_and_reused_across_processes(key_dir: Path, monkeypa
     assert routing_key.client_routing_key() == key
 
 
-def test_invalid_stored_key_is_replaced(key_dir: Path) -> None:
-    (key_dir / "routing_key").write_text("not-a-key")
+@pytest.mark.parametrize("stored", [b"not-a-key", b"\xff\xfe"], ids=["text", "non-utf8"])
+def test_invalid_stored_key_is_replaced(key_dir: Path, stored: bytes) -> None:
+    (key_dir / "routing_key").write_bytes(stored)
     key = routing_key.client_routing_key()
-    assert key != "not-a-key" and (key_dir / "routing_key").read_text() == key
+    assert len(key) == 32 and (key_dir / "routing_key").read_text() == key
 
 
 def test_unwritable_data_dir_keeps_a_process_key(tmp_path: Path, monkeypatch) -> None:

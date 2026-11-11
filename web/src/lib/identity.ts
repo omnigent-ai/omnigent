@@ -303,12 +303,14 @@ function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined):
   return (typeof body === "string" || body instanceof FormData) && BODY_HOST_KEYED_RE.test(url);
 }
 
-const PROJECTS_RE = /\/v1\/projects(?:[/?#]|$)/;
+// Writes whose events (`projects_changed`, a run's `session_added`) reach only
+// updates streams on the replica that handled them.
+const DISCOVERY_PUBLISHING_WRITE_RE =
+  /\/v1\/(?:projects(?:[/?#]|$)|scheduled-tasks\/[^/?#]+\/run(?:[?#]|$))/;
 
-// A project create/update/delete/reorder, which publishes `projects_changed`.
-function isProjectWrite(url: string, method: string | undefined): boolean {
+function isDiscoveryPublishingWrite(url: string, method: string | undefined): boolean {
   const verb = (method ?? "GET").toUpperCase();
-  return verb !== "GET" && verb !== "HEAD" && PROJECTS_RE.test(url);
+  return verb !== "GET" && verb !== "HEAD" && DISCOVERY_PUBLISHING_WRITE_RE.test(url);
 }
 
 // Admin flag from the same `/v1/me` probe. Mode-agnostic (the shared
@@ -592,13 +594,8 @@ export async function authenticatedFetch(
   let unkeyed = false;
   const callerKeyed = headers.has(SLICE_KEY_HEADER);
   if (!callerKeyed && isHostRoutingEnabled()) {
-    // Key by the request's OWN host when it needs that host's replica: a
-    // host-scoped URL, or a create/import/fork naming its host in the body (see
-    // {@link isBodyHostKeyedRequest}). A host demoted to keyless goes unkeyed.
-    // Project writes share the `/updates` stream's replica, which delivers their
-    // change events. Everything else, including a host-scoped request whose host
-    // is unknown, carries this client's key; a wrong_replica miss then resolves
-    // the session's host and re-addresses.
+    // Prefer the destination host unless proven keyless. Writes that publish
+    // discovery events share the updates-stream key; the rest use the client key.
     const scope = hostScopeForUrl(url);
     if (isManagedForkRequest(url, init?.body)) {
       derivedHostId = hostIdFromBody(url, init?.body);
@@ -606,7 +603,7 @@ export async function authenticatedFetch(
       derivedHostId = scope.hostId;
     } else if (isBodyHostKeyedRequest(url, init?.body)) {
       derivedHostId = hostIdFromBody(url, init?.body);
-    } else if (isProjectWrite(url, init?.method)) {
+    } else if (isDiscoveryPublishingWrite(url, init?.method)) {
       headers.set(SLICE_KEY_HEADER, updatesRoutingKey());
     }
     // Skip keying a host we've already PROVEN routes keyless (its tunnels dialed
@@ -672,23 +669,32 @@ export async function authenticatedFetch(
     isDatabricksWorkspace() &&
     (await _isWrongReplica(res))
   ) {
-    // The first managed message can outlive provisioning and acquire a host.
-    // Refresh its original hostless lookup, then retry once on that host.
+    // A session request with an unknown host missed on the client key. The first
+    // managed message can outlive provisioning and acquire a host, so refresh the
+    // lookup and try that host's key, then the unkeyed default replica, which
+    // holds hosts whose tunnels connected without a key.
     const sessionId = sessionIdForHostResolve(url);
     if (sessionId !== null) {
       init?.signal?.throwIfAborted();
       await resolveSessionHost(sessionId, { force: true });
       init?.signal?.throwIfAborted();
       const hostId = getSessionHost(sessionId);
-      if (hostId !== null) {
-        clearHostKeyless(hostId);
+      const demoted = hostId !== null && isHostKeyless(hostId);
+      if (hostId !== null && !demoted) {
         const retryHeaders = new Headers(headers);
         retryHeaders.set(SLICE_KEY_HEADER, hostId);
-        res = await hostFetch(url, {
-          ...init,
-          headers: retryHeaders,
-          cache: "no-store",
-        });
+        res = await hostFetch(url, { ...init, headers: retryHeaders, cache: "no-store" });
+      }
+      if (await _isWrongReplica(res)) {
+        const retryHeaders = new Headers(headers);
+        retryHeaders.delete(SLICE_KEY_HEADER);
+        res = await hostFetch(
+          url,
+          { ...init, headers: retryHeaders, cache: "no-store" },
+          { unkeyed: true },
+        );
+        if (hostId !== null && res.ok) markHostKeyless(hostId);
+        else if (demoted && (await _isWrongReplica(res))) clearHostKeyless(hostId);
       }
     }
   } else if (
