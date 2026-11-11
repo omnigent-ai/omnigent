@@ -2060,8 +2060,15 @@
             "title": "Reasoning Effort"
           },
           "rrule": {
-            "title": "Rrule",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rrule"
           },
           "session_id": {
             "anyOf": [
@@ -2101,6 +2108,18 @@
             "title": "Timezone",
             "type": "string"
           },
+          "trigger_config": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger Config"
+          },
           "workspace": {
             "anyOf": [
               {
@@ -2117,7 +2136,6 @@
         "required": [
           "name",
           "prompt",
-          "rrule",
           "agent_id"
         ],
         "title": "CreateScheduledTaskRequest",
@@ -6655,6 +6673,11 @@
           "scheduled_task_session_modes": {
             "default": true,
             "title": "Scheduled Task Session Modes",
+            "type": "boolean"
+          },
+          "scheduled_task_session_triggers": {
+            "default": false,
+            "title": "Scheduled Task Session Triggers",
             "type": "boolean"
           },
           "scheduled_task_source_sessions": {
@@ -12845,6 +12868,18 @@
               }
             ],
             "title": "Timezone"
+          },
+          "trigger_config": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger Config"
           },
           "workspace": {
             "anyOf": [
