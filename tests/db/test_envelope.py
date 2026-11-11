@@ -122,6 +122,32 @@ def test_column_type_round_trips_and_bounds_the_stored_size() -> None:
     assert isinstance(caught.value.orig, ValueError)
 
 
+def test_differently_bounded_columns_keep_their_own_bound_on_one_engine() -> None:
+    engine = sa.create_engine("sqlite://")
+    metadata = sa.MetaData()
+    narrow = sa.Table(
+        "narrow",
+        metadata,
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("value", EnvelopedJSON(max_stored_bytes=64)),
+    )
+    wide = sa.Table(
+        "wide",
+        metadata,
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("value", EnvelopedJSON(max_stored_bytes=4096)),
+    )
+    metadata.create_all(engine)
+    noise = random.Random(1).randbytes(64).hex()
+    # The wide column takes the value first, so a shared cached bind
+    # processor would let the narrow column take it too.
+    with engine.begin() as conn:
+        conn.execute(wide.insert(), {"id": 1, "value": {"a": noise}})
+    with pytest.raises(sa.exc.StatementError) as caught, engine.begin() as conn:
+        conn.execute(narrow.insert(), {"id": 1, "value": {"a": noise}})
+    assert isinstance(caught.value.orig, ValueError)
+
+
 def test_values_readers_would_refuse_are_not_written() -> None:
     # The JSON text of {"a": "..."} is 8 bytes plus the string.
     at_limit = {"a": "x" * (envelope._MAX_DECODED_BYTES - 8)}

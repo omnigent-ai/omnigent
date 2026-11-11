@@ -3,12 +3,9 @@
 Agents re-read the same history on every run, so a suggestion would repeat
 until the user acts on it. The server builds a versioned key from an item's
 ``kind``, canonical primary link, and ``topic``, and :func:`find_duplicate` is
-the only place that decides whether a post repeats an existing item. Routes,
-tools, and the UI never inspect keys themselves, so the formula can change:
-add a new version to ``_KEY_FORMULAS``, backfill stored keys from the stored
-inputs, then move ``CURRENT_KEY_VERSION``. During the backfill,
-``LEGACY_KEY_VERSIONS`` keeps older keys matching. Each decision is logged with
-its key, so a candidate formula can be checked against past posts.
+the only place that decides whether a post repeats an existing item. Versioned
+keys support duplicate matching across formula migrations; each decision is
+logged with its key.
 """
 
 from __future__ import annotations

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.compression import encode
 from omnigent.db.db_models import SqlPreference
 from omnigent.db.utils import get_or_create_engine
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.proactive_agent_settings_store import (
     WORKSPACE_SETTINGS_USER,
     ProactiveAgentSettingsStore,
@@ -65,11 +66,19 @@ def test_a_corrupt_stored_value_reads_as_on(db_uri: str) -> None:
             update(table)
             .where(
                 table.c.user_id == WORKSPACE_SETTINGS_USER,
-                table.c.key == "proactive_agent.v1.enabled",
+                table.c.key == "proactive_agent.v1.workspace_enabled",
             )
             .values(value=literal(b"\x00\x01not a zstd frame", LargeBinary))
         ).rowcount
         assert updated == 1
         session.commit()
 
+    assert store.read("alice") == (True, True)
+
+
+def test_the_reserved_workspace_owner_cannot_be_set_as_a_user(db_uri: str) -> None:
+    store = ProactiveAgentSettingsStore(db_uri)
+    with pytest.raises(OmnigentError) as refused:
+        store.set_user_enabled(WORKSPACE_SETTINGS_USER, False)
+    assert refused.value.code == ErrorCode.FORBIDDEN
     assert store.read("alice") == (True, True)

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 
 import zstandard
-from sqlalchemy import LargeBinary, select, type_coerce
+from sqlalchemy import LargeBinary, and_, or_, select, type_coerce
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -29,7 +29,11 @@ from omnigent.errors import ErrorCode, OmnigentError
 
 # Reserved owner of workspace-wide rows; account user names start with a letter or digit.
 WORKSPACE_SETTINGS_USER = "__workspace_settings__"
-_ENABLED_KEY = "proactive_agent.v1.enabled"
+# The workspace row and user rows use different keys, so an external identity
+# that happens to equal the reserved owner cannot reach the workspace row
+# through the user-setting path; that path refuses the reserved name as well.
+_WORKSPACE_KEY = "proactive_agent.v1.workspace_enabled"
+_USER_KEY = "proactive_agent.v1.enabled"
 
 
 def _decode_enabled(raw: bytes | str | memoryview | None) -> bool:
@@ -65,16 +69,21 @@ class ProactiveAgentSettingsStore:
 
     def read(self, user_id: str) -> tuple[bool, bool]:
         """Return ``(workspace_enabled, user_enabled)`` for *user_id* in one query."""
-        stmt = select(SqlPreference.user_id, type_coerce(SqlPreference.value, LargeBinary)).where(
+        stmt = select(SqlPreference.key, type_coerce(SqlPreference.value, LargeBinary)).where(
             SqlPreference.workspace_id == current_workspace_id(),
-            SqlPreference.user_id.in_([WORKSPACE_SETTINGS_USER, user_id]),
-            SqlPreference.key == _ENABLED_KEY,
+            or_(
+                and_(
+                    SqlPreference.user_id == WORKSPACE_SETTINGS_USER,
+                    SqlPreference.key == _WORKSPACE_KEY,
+                ),
+                and_(SqlPreference.user_id == user_id, SqlPreference.key == _USER_KEY),
+            ),
         )
         with self._session("read_proactive_agent_settings") as session:
             values = dict(session.execute(stmt).tuples().all())
         return (
-            _decode_enabled(values.get(WORKSPACE_SETTINGS_USER)),
-            _decode_enabled(values.get(user_id)),
+            _decode_enabled(values.get(_WORKSPACE_KEY)),
+            _decode_enabled(values.get(_USER_KEY)),
         )
 
     def set_workspace_enabled(
@@ -99,7 +108,7 @@ class ProactiveAgentSettingsStore:
                         "Admin privileges required to change the workspace setting",
                         code=ErrorCode.FORBIDDEN,
                     )
-            self._write(session, WORKSPACE_SETTINGS_USER, enabled)
+            self._write(session, WORKSPACE_SETTINGS_USER, _WORKSPACE_KEY, enabled)
 
         run_write_transaction(
             self._session_immediate, "write_proactive_agent_workspace_setting", write
@@ -107,19 +116,21 @@ class ProactiveAgentSettingsStore:
 
     def set_user_enabled(self, user_id: str, enabled: bool) -> None:
         """Record *user_id*'s own choice."""
+        if user_id == WORKSPACE_SETTINGS_USER:
+            raise OmnigentError("reserved user id", code=ErrorCode.FORBIDDEN)
 
         def write(session: Session) -> None:
             require_active_account(session, user_id)
-            self._write(session, user_id, enabled)
+            self._write(session, user_id, _USER_KEY, enabled)
 
         run_write_transaction(self._session_immediate, "write_proactive_agent_user_setting", write)
 
-    def _write(self, session: Session, owner: str, enabled: bool) -> None:
+    def _write(self, session: Session, owner: str, key: str, enabled: bool) -> None:
         value = json.dumps(enabled)
         values = {
             "workspace_id": current_workspace_id(),
             "user_id": owner,
-            "key": _ENABLED_KEY,
+            "key": key,
             "value": value,
         }
         dialect = self._engine.dialect.name
