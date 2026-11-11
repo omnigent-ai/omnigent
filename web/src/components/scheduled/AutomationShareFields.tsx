@@ -65,6 +65,7 @@ export function AutomationShareFields({
   disabled = false,
 }: AutomationShareFieldsProps) {
   const info = useServerInfo();
+  const canShare = useAutomationSharingAvailable();
   const sharingMode = info === "loading" ? "on" : info.sharing_mode;
   const readOnly = sharingMode === "read_only" || sharingMode === "restricted_read_only";
   const [newUserId, setNewUserId] = useState("");
@@ -93,6 +94,44 @@ export function AutomationShareFields({
     setError(null);
     onChange([...value, { userId, level: Number(newLevel) }]);
     setNewUserId("");
+  }
+
+  if (!canShare) {
+    // The server refuses any saved list here, so the only change it accepts is none.
+    return (
+      <div className="flex min-w-0 flex-col gap-2" data-testid={`${idPrefix}-fields`}>
+        <p className="text-sm text-muted-foreground">
+          {value.length === 0
+            ? "Runs won't be shared after you save."
+            : "This server no longer shares automation runs, so runs skip these people and groups."}
+        </p>
+        {value.length > 0 && (
+          <>
+            <ul className="flex min-w-0 flex-col gap-1" data-testid={`${idPrefix}-list`}>
+              {value.map((share) => (
+                <li key={share.userId} className="flex min-w-0 items-center gap-2 text-ui">
+                  <span className="min-w-0 flex-1 truncate">{share.userId}</span>
+                  <span className="text-muted-foreground">
+                    {LEVEL_LABELS[share.level] ?? `Level ${share.level}`}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="self-start"
+              disabled={disabled}
+              onClick={() => onChange([])}
+              componentId="tasks.scheduled.share_clear"
+            >
+              Stop sharing runs
+            </Button>
+          </>
+        )}
+      </div>
+    );
   }
 
   const editShared = value.some((share) => share.level >= LEVEL_EDIT);

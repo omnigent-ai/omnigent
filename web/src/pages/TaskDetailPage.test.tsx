@@ -509,17 +509,31 @@ describe("sharing runs", () => {
   }
 
   it("hides sharing on servers without it, but keeps saved shares removable", () => {
+    const unsupported = () =>
+      render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_sharing: false }}
+        >
+          {pageTree()}
+        </CapabilitiesProvider>,
+      );
     setTask(task());
-    renderPage();
+    unsupported();
     expect(screen.queryByTestId("task-detail-share")).toBeNull();
     cleanup();
 
     setTask(task({ shareWith: [{ userId: "team.engineering", level: 1 }] }));
-    renderPage();
-    expect(screen.getByTestId("task-detail-share")).toBeTruthy();
+    unsupported();
     openConfiguration();
     expect(screen.getByTestId("task-detail-shared-with")).toHaveTextContent(
       "team.engineering (Read)",
+    );
+    fireEvent.click(screen.getByTestId("task-detail-share"));
+    fireEvent.click(screen.getByRole("button", { name: "Stop sharing runs" }));
+    fireEvent.click(screen.getByTestId("automation-share-save"));
+    expect(updateMutate).toHaveBeenCalledWith(
+      { id: "st_1", input: { shareWith: [] } },
+      expect.anything(),
     );
   });
 
@@ -543,6 +557,15 @@ describe("sharing runs", () => {
       { id: "st_1", input: { shareWith: [{ userId: "team.engineering", level: 1 }] } },
       expect.anything(),
     );
+
+    // A refused save keeps the dialog and its draft open with the server's reason.
+    const [, callbacks] = updateMutate.mock.calls[0];
+    act(() => callbacks.onError(new Error("Sharing is limited to read-only access.")));
+    expect(within(dialog).getByRole("alert")).toHaveTextContent(
+      "Sharing is limited to read-only access.",
+    );
+    expect(within(dialog).getByText("team.engineering")).toBeTruthy();
+    expect(save).not.toBeDisabled();
   });
 });
 

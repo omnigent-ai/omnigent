@@ -76,6 +76,20 @@ describe("AutomationShareFields", () => {
     expect(screen.queryByTestId("share-edit-note")).toBeNull();
   });
 
+  it.each([
+    ["sharing is off", { sharing_mode: "off" }],
+    ["the server cannot share runs", { scheduled_task_sharing: false }],
+  ] as const)("offers only to stop sharing when %s", (_, info) => {
+    const onValue = renderFields([{ userId: "team.engineering", level: 1 }], { info });
+    expect(screen.queryByLabelText("User or group")).toBeNull();
+    expect(screen.queryByLabelText("Permission for team.engineering")).toBeNull();
+    expect(screen.getByText("team.engineering")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop sharing runs" }));
+    expect(onValue).toHaveBeenLastCalledWith([]);
+    expect(screen.getByText("Runs won't be shared after you save.")).toBeTruthy();
+  });
+
   it("stops adding at the server's limit", () => {
     renderFields(
       Array.from({ length: MAX_AUTOMATION_SHARES }, (_, index) => ({

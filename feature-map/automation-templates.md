@@ -158,6 +158,13 @@ to customize.
   settings reveal their controls. Escape closes the active selector or folder browser
   without discarding the automation draft. The footer stays visible while the form scrolls.
   Gallery cards use two columns on desktop and one on narrow screens.
+- `share-runs`: below the schedule, **Share runs with (optional)** lists users or
+  groups (up to 10, with the host's user and group suggestions) that every session
+  a run creates is shared with, at Read or Edit; a continue-mode automation shares
+  its session when saved. Edit is hidden on read-only servers, and an Edit share
+  shows a note on what edit access allows. The section appears only when the
+  server advertises `scheduled_task_sharing` and sharing is not off. Saved shares
+  stay visible elsewhere, read-only, with **Stop sharing runs** to clear them.
 
 ## How to get to it (user POV)
 
@@ -170,11 +177,14 @@ to customize.
   and session instructions. Returning to Schedule restores the schedule draft.
   Choose Run on, Agent, and session mode above Repeat. Expand Advanced to change
   model, effort, permissions, or an ending; for an integration trigger it also has
-  **Start a new session for each match**. With `automations_v2` on a server
+  **Start a new session for each match**. Add people or groups under **Share runs
+  with**, then select **Add** for each. With `automations_v2` on a server
   supporting sub-hour schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
-  the same workspace and sandbox Repository controls apply. Unrelated edits
+  the same workspace, sandbox Repository and Share runs with controls apply. The
+  detail page's **Share automation runs** button (people icon) edits only the
+  shares; Configuration lists them under Shared with. Unrelated edits
   preserve a continued session when the repository is unchanged or a legacy
   directory pin is cleared. Selecting
   another repository unlocks model/permission settings for a new session;
@@ -265,5 +275,7 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   new-template polling from 10 to 240 minutes; they do not receive webhooks.
 - Templates remain available even if loading the user's automation list fails.
 - Selecting a template does not create an automation until the modal is submitted.
+- A name typed under Share runs with is not saved until **Add** is selected.
+  Removing someone affects later runs only; earlier sessions keep their grants.
 - The introduction's Example automations are read-only educational content and
   are separate from these actionable templates.
