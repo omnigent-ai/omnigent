@@ -1573,8 +1573,8 @@ describe("NewChatLandingScreen create flow", () => {
     typeMessage("Add retries");
     fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
     fireEvent.click(screen.getByTestId("composer-workflow-action"));
-    // The draft becomes the goal, since the workflow message replaces it.
-    expect(await screen.findByTestId("workflow-dialog-goal")).toHaveValue("Add retries");
+    // The draft becomes the description, since the workflow message replaces it.
+    expect(await screen.findByTestId("workflow-dialog-description")).toHaveValue("Add retries");
     fireEvent.click(screen.getByTestId("workflow-dialog-run"));
 
     const args = `Add retries\n\n${REVIEW_PLAN_FIRST}`;

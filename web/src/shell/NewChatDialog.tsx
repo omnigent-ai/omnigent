@@ -7394,10 +7394,10 @@ function NewChatLandingContent({
                         <WorkflowDialog
                           open={workflowDialogOpen}
                           onOpenChange={setWorkflowDialogOpen}
-                          // The draft becomes the goal, since the workflow replaces it.
-                          initialGoal={message}
-                          onRunWorkflow={({ goal, reviewPlanFirst }) => {
-                            const text = workflowMessage(skillPrefix, goal, reviewPlanFirst);
+                          // The draft becomes the description, since the workflow replaces it.
+                          initialDescription={message}
+                          onRunWorkflow={({ description, reviewPlanFirst }) => {
+                            const text = workflowMessage(skillPrefix, description, reviewPlanFirst);
                             setMessage(text);
                             setWorkflowToSend(text);
                           }}
