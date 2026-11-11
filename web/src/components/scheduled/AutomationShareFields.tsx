@@ -92,7 +92,7 @@ export function AutomationShareFields({
       return;
     }
     setError(null);
-    onChange([...value, { userId, level: Number(newLevel) }]);
+    onChange([...value, { userId, level: readOnly ? LEVEL_READ : Number(newLevel) }]);
     setNewUserId("");
   }
 

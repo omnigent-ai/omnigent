@@ -439,6 +439,29 @@ describe("sharing runs", () => {
     expect(mutateAsync.mock.calls[0][0]).toMatchObject({ shareWith: [team] });
   });
 
+  it("does not resend shares a refetch changed while the editor was open", async () => {
+    const { rerender } = render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ shareWith: [team] })}
+      />,
+      { info: SHARING },
+    );
+    // Someone removed the grantee elsewhere; the open editor receives the refreshed task.
+    rerender(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ shareWith: [] })}
+      />,
+    );
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("shareWith");
+  });
+
   it("sends shares on edit only when they change", async () => {
     const edit = () =>
       render(

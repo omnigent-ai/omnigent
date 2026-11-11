@@ -90,6 +90,21 @@ describe("AutomationShareFields", () => {
     expect(screen.getByText("Runs won't be shared after you save.")).toBeTruthy();
   });
 
+  it("changes a recipient's level, and adds only at Read on a read-only server", () => {
+    const onValue = renderFields([{ userId: "team.engineering", level: 1 }]);
+    fireEvent.click(screen.getByRole("combobox", { name: "Permission for team.engineering" }));
+    fireEvent.click(screen.getByRole("option", { name: "Edit" }));
+    expect(onValue).toHaveBeenLastCalledWith([{ userId: "team.engineering", level: 2 }]);
+    cleanup();
+
+    const readOnly = renderFields([], { info: { sharing_mode: "read_only" } });
+    fireEvent.click(screen.getByRole("combobox", { name: "Permission for new share" }));
+    expect(screen.queryByRole("option", { name: "Edit" })).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: "Read" }));
+    add("bob@example.com");
+    expect(readOnly).toHaveBeenLastCalledWith([{ userId: "bob@example.com", level: 1 }]);
+  });
+
   it("stops adding at the server's limit", () => {
     renderFields(
       Array.from({ length: MAX_AUTOMATION_SHARES }, (_, index) => ({

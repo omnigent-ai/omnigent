@@ -293,8 +293,12 @@ export function CreateScheduledTaskDialog({
   const updateMutation = useUpdateScheduledTask();
   const isEdit = editingTask !== null;
   const sharingAvailable = useAutomationSharingAvailable();
-  const savedShares = editingTask?.shareWith ?? [];
-  const [shares, setShares] = useState<ScheduledTaskShare[]>(savedShares);
+  // The saved list as the dialog opened: the baseline for whether shares changed,
+  // so a refetch while editing never resends shares the user did not touch.
+  const [openedShares, setOpenedShares] = useState<ScheduledTaskShare[]>(
+    editingTask?.shareWith ?? [],
+  );
+  const [shares, setShares] = useState<ScheduledTaskShare[]>(editingTask?.shareWith ?? []);
   // Runs start from a copy of a session: the one being copied on create, or the
   // saved session copy on edit. They use a schedule and start each run in a new
   // session.
@@ -568,6 +572,7 @@ export function CreateScheduledTaskDialog({
       setPrompt(parts.userPrompt);
       setSystemPrompt(parts.systemPrompt);
       setTimezone(editingTask?.timezone ?? localTimezone());
+      setOpenedShares(editingTask?.shareWith ?? []);
       setShares(editingTask?.shareWith ?? []);
       if (editingTask) {
         const parsedSchedule = savedSchedule;
@@ -1217,7 +1222,7 @@ export function CreateScheduledTaskDialog({
             // Only on a real switch: sending the unchanged agent is a server-side
             // no-op, but omitting it keeps the PATCH honest about what changed.
             ...(agentChanged && effectiveAgentId !== null ? { agentId: effectiveAgentId } : {}),
-            ...(!sameShares(shares, savedShares) ? { shareWith: shares } : {}),
+            ...(!sameShares(shares, openedShares) ? { shareWith: shares } : {}),
           },
         });
       } else {
@@ -2043,7 +2048,7 @@ export function CreateScheduledTaskDialog({
               </>
             )}
           </ScheduleFields>
-          {(sharingAvailable || savedShares.length > 0) && (
+          {(sharingAvailable || openedShares.length > 0) && (
             <div className="flex flex-col gap-1.5" data-testid="task-share-field">
               <Label>Share runs with (optional)</Label>
               <AutomationShareFields
