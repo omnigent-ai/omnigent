@@ -28,9 +28,10 @@ describe("contentSearchPattern", () => {
     }
   });
 
-  it("checks boundaries per code point, so astral letters count as word characters", () => {
+  it("leaves a non-ASCII edge, read per code point, for ripgrep to classify", () => {
+    // Ripgrep's Unicode tables, not the browser's, decide whether this needs a boundary.
     expect(contentSearchPattern({ query: "𝐀", regex: false, wholeWord: true }).pattern).toBe(
-      "\\b𝐀\\b",
+      "(?:\\b[\\x{1D400}&&\\w]\\b|[\\x{1D400}&&\\W])",
     );
     expect(contentSearchPattern({ query: "_x1", regex: false, wholeWord: true }).pattern).toBe(
       "\\b_x1\\b",
@@ -46,6 +47,22 @@ describe("fitsContentSearchLimit", () => {
     expect(wholeWordPattern("a".repeat(4092))).toHaveLength(CONTENT_SEARCH_QUERY_LIMIT);
     expect(fitsContentSearchLimit(wholeWordPattern("a".repeat(4092)))).toBe(true);
     expect(fitsContentSearchLimit(wholeWordPattern("a".repeat(4093)))).toBe(false);
+  });
+
+  it("counts the wrapper a regular expression gains", () => {
+    const wrapped = (query: string) =>
+      contentSearchPattern({ query, regex: true, wholeWord: true }).pattern;
+    expect(wrapped("a".repeat(4088))).toHaveLength(CONTENT_SEARCH_QUERY_LIMIT);
+    expect(fitsContentSearchLimit(wrapped("a".repeat(4088)))).toBe(true);
+    expect(fitsContentSearchLimit(wrapped("a".repeat(4089)))).toBe(false);
+  });
+
+  it("counts the classification a non-ASCII edge gains", () => {
+    // Everything but the middle: the two classified edges.
+    const edges = wholeWordPattern("éé").length;
+    const room = CONTENT_SEARCH_QUERY_LIMIT - edges;
+    expect(fitsContentSearchLimit(wholeWordPattern(`é${"a".repeat(room)}é`))).toBe(true);
+    expect(fitsContentSearchLimit(wholeWordPattern(`é${"a".repeat(room + 1)}é`))).toBe(false);
   });
 
   it("counts the escapes a literal gains", () => {

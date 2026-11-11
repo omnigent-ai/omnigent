@@ -23,7 +23,9 @@
     "x#y",
     "a~b",
     "a&b",
-    "[x]"
+    "[x]",
+    "\ud839\udec0",
+    "x«quote»y"
   ],
   "cases": [
     {
@@ -62,7 +64,7 @@
       "regex": false,
       "caseSensitive": true,
       "wholeWord": true,
-      "pattern": "\\bcafé\\b",
+      "pattern": "\\bcaf(?:[\\x{E9}&&\\w]\\b|[\\x{E9}&&\\W])",
       "sentRegex": true,
       "lines": [8]
     },
@@ -72,7 +74,7 @@
       "regex": false,
       "caseSensitive": true,
       "wholeWord": true,
-      "pattern": "\\bcafe\u0301\\b",
+      "pattern": "\\bcafe(?:[\\x{301}&&\\w]\\b|[\\x{301}&&\\W])",
       "sentRegex": true,
       "lines": [9]
     },
@@ -82,7 +84,7 @@
       "regex": false,
       "caseSensitive": true,
       "wholeWord": true,
-      "pattern": "\\bигла\\b",
+      "pattern": "(?:\\b[\\x{438}&&\\w]|[\\x{438}&&\\W])гл(?:[\\x{430}&&\\w]\\b|[\\x{430}&&\\W])",
       "sentRegex": true,
       "lines": [11]
     },
@@ -195,6 +197,26 @@
       "pattern": "\\[x\\]",
       "sentRegex": true,
       "lines": [24]
+    },
+    {
+      "name": "ripgrep classifies a non-ASCII edge, even where Unicode versions disagree",
+      "query": "\ud839\udec0",
+      "regex": false,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "(?:\\b[\\x{1E6C0}&&\\w]\\b|[\\x{1E6C0}&&\\W])",
+      "sentRegex": true,
+      "lines": [25]
+    },
+    {
+      "name": "non-ASCII punctuation edges match as typed",
+      "query": "«quote»",
+      "regex": false,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "(?:\\b[\\x{AB}&&\\w]|[\\x{AB}&&\\W])quote(?:[\\x{BB}&&\\w]\\b|[\\x{BB}&&\\W])",
+      "sentRegex": true,
+      "lines": [26]
     }
   ]
 }
