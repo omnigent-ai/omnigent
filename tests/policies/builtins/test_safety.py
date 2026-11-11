@@ -754,22 +754,11 @@ def test_reminder_approval_shows_the_resolved_time_whatever_the_raw_text() -> No
     assert shown not in other.get("reason", "")
 
 
-@pytest.mark.parametrize(
-    "timing,error",
-    [
-        ({}, "exactly one"),
-        ({"at": "tomorrow"}, "not an ISO-8601"),
-        ({"at": "2026-11-12T15:00:00"}, "UTC offset"),
-        ({"delay_seconds": 10}, "at least one minute"),
-        ({"delay_seconds": 10**400}, "at most 364 days"),
-    ],
-)
-def test_reminder_approval_denies_a_time_the_tool_would_reject(
-    timing: dict[str, object], error: str
-) -> None:
-    result = _reminder_review({"message": "ping", **timing})
+def test_reminder_approval_denies_a_time_the_tool_would_reject() -> None:
+    # The resolver's own tests cover each invalid time; one shows the policy denies.
+    result = _reminder_review({"message": "ping", "at": "tomorrow"})
     assert result["result"] == "DENY"
-    assert error in result["reason"]
+    assert "not an ISO-8601" in result["reason"]
 
 
 @pytest.mark.parametrize("message", [None, "", "   ", 5])

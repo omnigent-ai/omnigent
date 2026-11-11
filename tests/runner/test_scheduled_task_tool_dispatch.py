@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import jsonschema
 import pytest
 
@@ -727,8 +728,8 @@ async def test_reminder_is_refused_on_a_server_without_one_time_schedules(
     [
         ({"message": "ping", "delay_seconds": 600}, None, "requires a session"),
         ({"message": "  ", "delay_seconds": 600}, "conv_1", "non-empty string"),
+        # One timing error is enough here; the resolver's own tests cover the rest.
         ({"message": "ping"}, "conv_1", "exactly one"),
-        ({"message": "ping", "delay_seconds": 5}, "conv_1", "at least one minute"),
     ],
 )
 async def test_reminder_argument_errors_make_no_server_calls(
@@ -804,11 +805,22 @@ async def test_reminder_scheduled_for_another_time_is_deleted(next_run_at: str |
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_frozen_now")
-async def test_reminder_reports_a_wrong_schedule_it_could_not_delete() -> None:
+@pytest.mark.parametrize("delete_fails_with", ["status", "transport"])
+async def test_reminder_reports_a_wrong_schedule_it_could_not_delete(
+    delete_fails_with: str,
+) -> None:
     client = _ReminderClient(
         _Resp(body={"id": _TASK_ID, "next_run_at": "2027-11-10T23:01:00+00:00"})
     )
-    client.delete_response = _Resp(status_code=503, body={"error": "unavailable"})
+    if delete_fails_with == "status":
+        client.delete_response = _Resp(status_code=503, body={"error": "unavailable"})
+    else:
+
+        async def unreachable(url: str, *, timeout: object = None) -> _Resp:
+            client.calls.append(("DELETE", url, None))
+            raise httpx.ConnectError("server unreachable")
+
+        client.delete = unreachable  # type: ignore[method-assign]
     out = json.loads(
         await _execute_scheduled_task_tool(
             "sys_reminder_set",
@@ -818,4 +830,6 @@ async def test_reminder_reports_a_wrong_schedule_it_could_not_delete() -> None:
         )
     )
     assert "deleting it failed" in out["error"]
+    assert "was deleted" not in out["error"]
     assert out["scheduled_task_id"] == _TASK_ID
+    assert client.calls[-1] == ("DELETE", f"/v1/scheduled-tasks/{_TASK_ID}", None)
