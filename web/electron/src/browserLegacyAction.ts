@@ -1,18 +1,25 @@
-"use strict";
+import { buildBrowserActionScript } from "./browserActionScript.ts";
 
-const { buildBrowserActionScript } = require("./browserActionScript.mjs");
+type LegacyAction = "click" | "type";
+type LegacyParam = "selector" | "snapshot_id" | "text" | "ref";
+
+/** A legacy template, as the action plus the literal data it embeds. */
+export interface DecodedLegacyBrowserAction {
+  action: "snapshot" | LegacyAction;
+  params: Record<string, unknown>;
+}
 
 // v0.18's relay embeds JSON literals in fixed templates. Remove this adapter in v0.21.
 const JSON_STRING = String.raw`"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[\da-fA-F]{4}))*"`;
-const placeholders = {
+const placeholders: Record<string, LegacyParam | undefined> = {
   '"__legacy_selector__"': "selector",
   '"__legacy_snapshot_id__"': "snapshot_id",
   '"__legacy_text__"': "text",
   9007199254740991: "ref",
 };
 
-function legacyPattern(action, args) {
-  const seen = new Set();
+function legacyPattern(action: LegacyAction, args: Record<string, unknown>) {
+  const seen = new Set<LegacyParam>();
   const parts = buildBrowserActionScript(action, args).split(
     /("__legacy_selector__"|"__legacy_snapshot_id__"|"__legacy_text__"|9007199254740991)/,
   );
@@ -26,7 +33,7 @@ function legacyPattern(action, args) {
   return { action, pattern: new RegExp(`^${pattern.join("")}$`) };
 }
 
-const patterns = ["click", "type"].flatMap((action) =>
+const patterns = (["click", "type"] as const).flatMap((action) =>
   [
     { selector: "__legacy_selector__" },
     { ref: Number.MAX_SAFE_INTEGER },
@@ -36,7 +43,7 @@ const patterns = ["click", "type"].flatMap((action) =>
   ),
 );
 
-function decodeLegacyBrowserAction(script) {
+export function decodeLegacyBrowserAction(script: unknown): DecodedLegacyBrowserAction {
   if (typeof script === "string" && script.length <= 2_000_000) {
     if (script === buildBrowserActionScript("snapshot")) {
       return { action: "snapshot", params: {} };
@@ -45,7 +52,10 @@ function decodeLegacyBrowserAction(script) {
       const match = pattern.exec(script);
       if (!match) continue;
       const params = Object.fromEntries(
-        Object.entries(match.groups).map(([key, value]) => [key, JSON.parse(value)]),
+        Object.entries(match.groups ?? {}).map(([key, value]) => [
+          key,
+          JSON.parse(value) as unknown,
+        ]),
       );
       // Validate data limits and require the complete canonical template; never evaluate input.
       if (buildBrowserActionScript(action, params) === script) return { action, params };
@@ -53,5 +63,3 @@ function decodeLegacyBrowserAction(script) {
   }
   throw new Error("Unsupported legacy browser action; update the server UI");
 }
-
-module.exports = { decodeLegacyBrowserAction };

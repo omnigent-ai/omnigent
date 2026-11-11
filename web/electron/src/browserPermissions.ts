@@ -1,21 +1,87 @@
-"use strict";
+import { isLocalhostUrl } from "./localhost_cors.ts";
 
-const { isLocalhostUrl } = require("./localhost_cors.ts");
-
-const LOCAL_NETWORK_PERMISSIONS = new Set([
+const LOCAL_NETWORK_PERMISSIONS: ReadonlySet<string> = new Set([
   "local-network-access",
   "local-network",
   "loopback-network",
 ]);
 
-const sessionPolicies = new WeakMap();
+/** The parts of Electron's permission handler details this policy reads. */
+export interface PermissionDetails {
+  requestingUrl?: string;
+  embeddingOrigin?: string;
+  isMainFrame?: boolean;
+}
+
+type PermissionCallback = (granted: boolean) => void;
+
+/** Electron calls these with the requesting webContents, or null for a context-free check. */
+export type PermissionRequestHandler = (
+  contents: unknown,
+  permission: string,
+  callback: PermissionCallback,
+  details?: PermissionDetails,
+) => void;
+export type PermissionCheckHandler = (
+  contents: unknown,
+  permission: string,
+  requestingOrigin: string,
+  details?: PermissionDetails,
+) => boolean;
+
+/** The storage partition's session, which owns one handler of each kind. */
+export interface PermissionSession {
+  setPermissionRequestHandler: (handler: PermissionRequestHandler) => void;
+  setPermissionCheckHandler: (handler: PermissionCheckHandler) => void;
+}
+
+type NavigationStartListener = (
+  event: unknown,
+  url: string,
+  isInPlace: boolean,
+  isMainFrame: boolean,
+) => void;
+
+/** The browser view's webContents one policy attaches to. */
+export interface PermissionWebContents {
+  isDestroyed: () => boolean;
+  getURL: () => string;
+  reload: () => void;
+  on: ((event: "did-start-navigation", listener: NavigationStartListener) => unknown) &
+    ((event: "did-navigate", listener: (event: unknown, url: string) => void) => unknown) &
+    ((event: "render-process-gone", listener: () => void) => unknown);
+  once: (event: "destroyed", listener: () => void) => unknown;
+}
+
+interface TabPolicy {
+  request: (
+    contents: unknown,
+    permission: string,
+    callback: PermissionCallback,
+    details?: PermissionDetails,
+  ) => void;
+  check: (
+    contents: unknown,
+    permission: string,
+    requestingOrigin: string,
+    details?: PermissionDetails,
+  ) => boolean;
+  checkSaved: (
+    permission: string,
+    requestingOrigin: string,
+    details?: PermissionDetails,
+  ) => boolean;
+  canPrompt: () => boolean;
+}
+
+const sessionPolicies = new WeakMap<PermissionSession, Map<unknown, TabPolicy>>();
 
 // Electron installs handlers per storage partition, but consent and prompts
 // belong to the requesting tab, even when several tabs share that partition.
-function policiesForSession(session) {
+function policiesForSession(session: PermissionSession): Map<unknown, TabPolicy> {
   const existing = sessionPolicies.get(session);
   if (existing) return existing;
-  const policies = new Map();
+  const policies = new Map<unknown, TabPolicy>();
   session.setPermissionRequestHandler((contents, permission, callback, details) => {
     const policy = policies.get(contents);
     if (policy) policy.request(contents, permission, callback, details);
@@ -43,7 +109,9 @@ function policiesForSession(session) {
   return policies;
 }
 
-function permissionOrigin(value) {
+function permissionOrigin(value: string | undefined): string | null {
+  // `new URL(undefined)` throws, so a missing value has no origin.
+  if (value === undefined) return null;
   try {
     const url = new URL(value);
     return url.protocol === "https:" || isLocalhostUrl(value) ? url.origin : null;
@@ -52,12 +120,29 @@ function permissionOrigin(value) {
   }
 }
 
+export interface BrowserPermissionStoreDeps {
+  loadSettings: () => Record<string, unknown>;
+  saveSettings: (settings: Record<string, unknown>) => void;
+}
+
+/** Saved per-origin decisions, with a revision that changes on every save. */
+export interface BrowserPermissionStore {
+  get: (origin: string) => boolean | undefined;
+  revision: (origin: string) => number;
+  /** Save `decision`, or forget the saved one when it is undefined. */
+  set: (origin: string, decision: boolean | undefined) => void;
+}
+
 /** Saved site decisions apply across conversation browsers, not the shell. */
-function createBrowserPermissionStore({ loadSettings, saveSettings }) {
-  const revisions = new Map();
+export function createBrowserPermissionStore({
+  loadSettings,
+  saveSettings,
+}: BrowserPermissionStoreDeps): BrowserPermissionStore {
+  const revisions = new Map<string, number>();
   return {
     get(origin) {
-      const value = loadSettings().browser_local_network_permissions?.[origin];
+      const saved = loadSettings().browser_local_network_permissions;
+      const value = saved == null ? undefined : (saved as Record<string, unknown>)[origin];
       return typeof value === "boolean" ? value : undefined;
     },
     revision: (origin) => revisions.get(origin) ?? 0,
@@ -70,7 +155,9 @@ function createBrowserPermissionStore({ loadSettings, saveSettings }) {
       const saved = settings.browser_local_network_permissions;
       const entries =
         saved && typeof saved === "object" && !Array.isArray(saved) ? Object.entries(saved) : [];
-      const choices = Object.fromEntries(entries.filter(([key]) => key !== origin));
+      const choices: Record<string, unknown> = Object.fromEntries(
+        entries.filter(([key]) => key !== origin),
+      );
       if (decision !== undefined) choices[origin] = decision;
       settings.browser_local_network_permissions = choices;
       saveSettings(settings);
@@ -80,23 +167,61 @@ function createBrowserPermissionStore({ loadSettings, saveSettings }) {
   };
 }
 
-/** Install before constructing the view, then attach exactly once to its webContents. */
-function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
-  const policies = policiesForSession(session);
-  const visits = new Map();
-  let contents = null;
-  let generation = 0;
-  let dismissedGeneration = null;
-  let pending = null;
+/** What the consent prompt shows; `signal` aborts when the request goes stale. */
+export interface PermissionPromptRequest {
+  origin: string;
+  reload: boolean;
+  signal: AbortSignal;
+}
 
-  function decisionFor(origin) {
+export interface BrowserPermissionOptions<Contents extends PermissionWebContents> {
+  canPrompt: (contents: Contents | null) => boolean;
+  /** Resolves the user's choice; anything but a known choice counts as a dismissal. */
+  showPrompt: (request: PermissionPromptRequest) => Promise<string>;
+  store: BrowserPermissionStore;
+}
+
+export interface BrowserPermissionPolicy<Contents extends PermissionWebContents> {
+  attach: (webContents: Contents) => void;
+}
+
+interface PermissionContext<Contents> {
+  origin: string;
+  generation: number;
+  webContents: Contents;
+}
+
+interface PendingPrompt<Contents> extends PermissionContext<Contents> {
+  controller: AbortController;
+  storeRevision: number;
+  result: Promise<boolean>;
+}
+
+/** Install before constructing the view, then attach exactly once to its webContents. */
+export function registerBrowserPermissions<Contents extends PermissionWebContents>(
+  session: PermissionSession,
+  { canPrompt, showPrompt, store }: BrowserPermissionOptions<Contents>,
+): BrowserPermissionPolicy<Contents> {
+  const policies = policiesForSession(session);
+  const visits = new Map<string, { granted: boolean; revision: number }>();
+  let contents: Contents | null = null;
+  let generation = 0;
+  let dismissedGeneration: number | null = null;
+  let pending: PendingPrompt<Contents> | null = null;
+
+  function decisionFor(origin: string): boolean | undefined {
     const saved = store.get(origin);
     if (saved !== undefined) return saved;
     const visit = visits.get(origin);
     return visit?.revision === store.revision(origin) ? visit.granted : undefined;
   }
 
-  function context(webContents, requestingOrigin, details, check = false) {
+  function context(
+    webContents: unknown,
+    requestingOrigin: string | undefined,
+    details: PermissionDetails,
+    check = false,
+  ): PermissionContext<Contents> | null {
     const origin = permissionOrigin(requestingOrigin);
     if (!origin || !contents || contents.isDestroyed()) return null;
     if (origin !== permissionOrigin(contents.getURL())) return null;
@@ -112,8 +237,9 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
     return { origin, generation, webContents: contents };
   }
 
-  function isCurrent(ctx) {
+  function isCurrent(ctx: PermissionContext<Contents>): boolean {
     return (
+      contents !== null &&
       ctx.webContents === contents &&
       !contents.isDestroyed() &&
       ctx.generation === generation &&
@@ -121,7 +247,7 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
     );
   }
 
-  function ask(ctx, reload) {
+  function ask(ctx: PermissionContext<Contents> | null, reload: boolean): Promise<boolean> {
     if (!ctx || !isCurrent(ctx)) return Promise.resolve(false);
     const decision = decisionFor(ctx.origin);
     if (decision !== undefined) return Promise.resolve(decision);
@@ -134,33 +260,31 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
         : Promise.resolve(false);
     }
 
-    const request = {
-      ...ctx,
-      controller: new AbortController(),
-      storeRevision: store.revision(ctx.origin),
-    };
-    pending = request;
-    request.result = Promise.resolve()
-      .then(() => {
+    const controller = new AbortController();
+    const storeRevision = store.revision(ctx.origin);
+    // The chain starts on a later tick, after `pending` holds this request.
+    const result = Promise.resolve()
+      .then((): Promise<string> | string => {
         if (!isCurrent(ctx) || !canPrompt(contents)) return "dismiss";
-        return showPrompt({ origin: ctx.origin, reload, signal: request.controller.signal });
+        return showPrompt({ origin: ctx.origin, reload, signal: controller.signal });
       })
       .then((choice) => {
         if (!isCurrent(ctx) || !canPrompt(contents)) return false;
         // Another shell window may have saved a decision while this prompt was
         // open. Never let this stale answer overwrite that newer choice.
-        if (store.revision(ctx.origin) !== request.storeRevision) return false;
+        if (store.revision(ctx.origin) !== storeRevision) return false;
         if (choice === "always-allow" || choice === "deny") {
           store.set(ctx.origin, choice === "always-allow");
           visits.delete(ctx.origin);
         } else if (choice === "allow-once") {
-          visits.set(ctx.origin, { granted: true, revision: request.storeRevision });
+          visits.set(ctx.origin, { granted: true, revision: storeRevision });
         } else {
           dismissedGeneration = generation;
           return false;
         }
         const granted = choice !== "deny";
-        if (granted && reload) contents.reload();
+        // isCurrent(ctx) holds, so ctx.webContents is the attached contents.
+        if (granted && reload) ctx.webContents.reload();
         return granted;
       })
       .catch(() => {
@@ -170,10 +294,17 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
       .finally(() => {
         if (pending === request) pending = null;
       });
-    return request.result;
+    const request: PendingPrompt<Contents> = { ...ctx, controller, storeRevision, result };
+    pending = request;
+    return result;
   }
 
-  function handleRequest(webContents, permission, callback, details = {}) {
+  function handleRequest(
+    webContents: unknown,
+    permission: string,
+    callback: PermissionCallback,
+    details: PermissionDetails = {},
+  ): void {
     if (!LOCAL_NETWORK_PERMISSIONS.has(permission)) {
       callback(false);
       return;
@@ -188,7 +319,12 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
     });
   }
 
-  function handleCheck(webContents, permission, requestingOrigin, details = {}) {
+  function handleCheck(
+    webContents: unknown,
+    permission: string,
+    requestingOrigin: string,
+    details: PermissionDetails = {},
+  ): boolean {
     if (!LOCAL_NETWORK_PERMISSIONS.has(permission)) return false;
     const ctx = context(webContents, requestingOrigin, details, true);
     if (!ctx) return false;
@@ -200,7 +336,11 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
     return false;
   }
 
-  function checkSaved(permission, requestingOrigin, details = {}) {
+  function checkSaved(
+    permission: string,
+    requestingOrigin: string,
+    details: PermissionDetails = {},
+  ): boolean {
     if (!LOCAL_NETWORK_PERMISSIONS.has(permission)) return false;
     const ctx = context(null, requestingOrigin, details, true);
     return !!ctx && store.get(ctx.origin) === true;
@@ -209,20 +349,21 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
   return {
     attach(webContents) {
       if (contents) throw new Error("Browser permission policy is already attached");
-      contents = webContents;
-      policies.set(contents, {
+      const attached = webContents;
+      contents = attached;
+      policies.set(attached, {
         request: handleRequest,
         check: handleCheck,
         checkSaved,
         canPrompt: () => canPrompt(contents),
       });
-      contents.on("did-start-navigation", (_event, url, isInPlace, isMainFrame) => {
+      attached.on("did-start-navigation", (_event, url, isInPlace, isMainFrame) => {
         if (!isMainFrame || isInPlace) return;
         generation++;
         pending?.controller.abort();
-        if (permissionOrigin(url) !== permissionOrigin(contents.getURL())) visits.clear();
+        if (permissionOrigin(url) !== permissionOrigin(attached.getURL())) visits.clear();
       });
-      contents.on("did-navigate", (_event, url) => {
+      attached.on("did-navigate", (_event, url) => {
         for (const origin of visits.keys()) {
           if (origin !== permissionOrigin(url)) visits.delete(origin);
         }
@@ -232,13 +373,11 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
         pending?.controller.abort();
         visits.clear();
       };
-      contents.on("render-process-gone", invalidateVisit);
-      contents.once("destroyed", () => {
-        policies.delete(contents);
+      attached.on("render-process-gone", invalidateVisit);
+      attached.once("destroyed", () => {
+        policies.delete(attached);
         invalidateVisit();
       });
     },
   };
 }
-
-module.exports = { registerBrowserPermissions, createBrowserPermissionStore };

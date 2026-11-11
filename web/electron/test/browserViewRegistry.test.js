@@ -1,4 +1,4 @@
-// Tests for the per-conversation browser-view registry (src/browserViewRegistry.js),
+// Tests for the per-conversation browser-view registry (src/browserViewRegistry.ts),
 // run with `node --test` (no extra deps). The registry is a pure factory — all
 // Electron deps are injected — so we drive it with stub views + spies.
 //
@@ -12,8 +12,8 @@
 const { describe, it, beforeEach } = require("node:test");
 const assert = require("node:assert/strict");
 
-const { createBrowserViewRegistry, agentPartition } = require("../src/browserViewRegistry");
-const { createBrowserViewBoundsController } = require("../src/browserViewBounds");
+const { createBrowserViewRegistry, agentPartition } = require("../src/browserViewRegistry.ts");
+const { createBrowserViewBoundsController } = require("../src/browserViewBounds.ts");
 
 /** Build a registry with spy-backed injected deps. Returns the registry plus
  *  the recorded renderer sends / attach / detach calls for assertions. */

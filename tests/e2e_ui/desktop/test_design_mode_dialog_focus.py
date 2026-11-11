@@ -16,7 +16,7 @@ from playwright.sync_api import Page, expect
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _NONCE = "dialog-focus-e2e"
 _BUILD_ASSETS = """
-const { buildDesignModeScript } = require('./web/electron/src/designModeScript');
+const { buildDesignModeScript } = require('./web/electron/src/designModeScript.ts');
 const { NATIVE_DIALOG_PAGE } = require('./web/electron/e2e/desktopDesignPromptHarness');
 const { buildRadixFormFixture } = require('./web/electron/e2e/fixtures/designModalFixture');
 buildRadixFormFixture().then(radix => {
