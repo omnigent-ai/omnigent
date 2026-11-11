@@ -772,9 +772,11 @@ async def test_session_containment_failure_prevents_worker_spawn(
     assert session._codex_home_dir is None
 
 
+@pytest.mark.parametrize("brokered_gateway", [False, True])
 async def test_session_spawns_owned_launcher_and_releases_it(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    brokered_gateway: bool,
 ) -> None:
     worker = Mock(launch_path="/private/sandbox-launcher", sandboxed=True)
     process = Mock(
@@ -786,17 +788,23 @@ async def test_session_spawns_owned_launcher_and_releases_it(
     )
     process.wait = AsyncMock(return_value=0)
     spawn = AsyncMock(return_value=process)
-    monkeypatch.setattr(
-        "omnigent.inner.codex_executor.prepare_codex_worker",
-        Mock(return_value=worker),
-    )
+    prepare_worker = Mock(return_value=worker)
+    populate_home = Mock()
+    populate_skills = Mock()
+    monkeypatch.setattr("omnigent.inner.codex_executor.prepare_codex_worker", prepare_worker)
     monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", populate_home)
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.populate_codex_skills_from_bundle", populate_skills
+    )
+    worker_env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path / "host-home")}
+    if brokered_gateway:
+        worker_env[BROKERED_CODEX_ENV] = "1"
 
     session = _CodexAppServerSession(
         codex_path="/bin/echo",
         cwd=str(tmp_path),
-        env={},
+        env=worker_env,
         tool_executor=None,
         os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
     )
@@ -809,8 +817,32 @@ async def test_session_spawns_owned_launcher_and_releases_it(
     assert "/private/sandbox-launcher" in spawn.await_args.args
     assert spawn.await_args.kwargs["pass_fds"]
     assert session._containment_confirmed
+    assert populate_skills.call_args.kwargs["include_host_skills"] is not brokered_gateway
+    assert populate_home.call_args.kwargs["include_credentials"] is not brokered_gateway
+    assert populate_home.call_args.kwargs["require_native_tools_disabled"] is brokered_gateway
+    assert session._codex_home_dir is not None
+    private_home = session._codex_home_dir
+    prepared_env = prepare_worker.call_args.kwargs["worker_env"]
+    spawned_env = spawn.await_args.kwargs["env"]
+    assert spawned_env == prepared_env
+    assert spawned_env["CODEX_HOME"] == str(private_home)
+    if brokered_gateway:
+        assert populate_home.call_args.kwargs["minimal_config"] is True
+        assert populate_home.call_args.kwargs["extend_model_catalog"] is False
+        assert populate_home.call_args.kwargs["inject_hooks"] is False
+        assert populate_home.call_args.kwargs["required_brokered_probe"] == (
+            "/bin/echo",
+            tmp_path.resolve(),
+            session._os_env_spec,
+        )
+        for name in ("HOME", "CFFIXED_USER_HOME", "CODEX_SQLITE_HOME", "TMPDIR", "TMP", "TEMP"):
+            assert spawned_env[name] == str(private_home)
+        assert spawned_env[BROKERED_CODEX_ENV] == "1"
+    else:
+        assert spawned_env["HOME"] == worker_env["HOME"]
     await session.close()
     worker.close.assert_called_once_with()
+    assert not private_home.exists()
 
 
 async def test_spawn_failure_releases_launcher_and_private_home(

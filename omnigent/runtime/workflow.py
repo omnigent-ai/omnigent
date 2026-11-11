@@ -1583,6 +1583,8 @@ def _bind_codex_gateway_credential(env: dict[str, str], spec: AgentSpec) -> None
         )
     env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] = BROKERED_CODEX_AUTH_COMMAND
     env["HARNESS_CODEX_BROKERED_GATEWAY"] = "true"
+    env["HARNESS_CODEX_ENABLE_WEB_SEARCH"] = "false"
+    env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] = "true"
 
 
 def _build_codex_spawn_env(
@@ -1597,8 +1599,7 @@ def _build_codex_spawn_env(
     Maps spec.executor fields → the ``HARNESS_CODEX_*`` env vars
     defined in ``omnigent/inner/codex_harness.py``. Mirrors
     :func:`_build_claude_sdk_spawn_env` — same per-spawn env-var
-    pattern from §Step 5a. Explicit web search and native-tool settings
-    override the harness defaults for this launch.
+    pattern from §Step 5a.
 
     :param spec: The agent spec.
     :param workdir: The bundle's on-disk path (extracted by the
@@ -1621,18 +1622,6 @@ def _build_codex_spawn_env(
     # unchanged.
     provider = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
     _apply_codex_provider_env(env, spec, provider)
-    for config_key, env_key in (
-        ("web_search", "HARNESS_CODEX_ENABLE_WEB_SEARCH"),
-        ("disable_native_tools", "HARNESS_CODEX_DISABLE_NATIVE_TOOLS"),
-    ):
-        value = spec.executor.config.get(config_key)
-        if value is not None:
-            if not isinstance(value, bool):
-                raise OmnigentError(
-                    f"executor.config.{config_key} must be a boolean",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            env[env_key] = "true" if value else "false"
     # Skills bridge — same shape as the claude-sdk variant. Always
     # set so the harness wrap doesn't fall back to its ``"all"``
     # default and override an explicit ``skills: none`` spec.
