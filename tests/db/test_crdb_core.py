@@ -90,6 +90,7 @@ def test_crdb_pool_overrides_treat_blank_as_unset(
         "create_engine",
         lambda _uri, **kwargs: captured.update(kwargs) or MagicMock(),
     )
+    monkeypatch.setattr(utils, "install_transaction_aware_pool_reset", lambda engine: None)
 
     utils._create_engine("cockroachdb://root@localhost/defaultdb")
 
@@ -110,6 +111,7 @@ def test_crdb_pool_overrides_accept_sqlalchemy_ranges(
         "create_engine",
         lambda _uri, **kwargs: captured.update(kwargs) or MagicMock(),
     )
+    monkeypatch.setattr(utils, "install_transaction_aware_pool_reset", lambda engine: None)
 
     utils._create_engine("cockroachdb://root@localhost/defaultdb")
 

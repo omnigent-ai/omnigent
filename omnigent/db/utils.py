@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
 import os
 import random
+import re
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
@@ -22,6 +25,9 @@ from sqlalchemy.exc import DBAPIError, NoSuchModuleError
 
 if TYPE_CHECKING:
     from alembic.config import Config
+    from sqlalchemy.engine import Connection, ExceptionContext
+    from sqlalchemy.engine.interfaces import DBAPIConnection, DBAPICursor, ExecutionContext
+    from sqlalchemy.pool import ConnectionPoolEntry, PoolProxiedConnection, PoolResetState
 from sqlalchemy.orm import Session, sessionmaker
 
 from omnigent.db.cockroachdb import (
@@ -252,6 +258,208 @@ def _env_float(name: str, default: float, *, minimum: float) -> float:
     return value
 
 
+# ── Transaction terminators ────────────────────────────
+#
+# Each managed session should end its transaction with exactly one COMMIT or
+# ROLLBACK. Read-only sessions skip COMMIT (closing the session rolls back),
+# and engines from :func:`_create_engine` skip SQLAlchemy's rollback-on-return
+# when the connection's transaction is already known to have ended.
+
+# Connection-record ``info`` keys. Record info outlives a checkout, so both
+# are re-initialised on every checkout or transaction begin.
+_TRANSACTION_ENDED_KEY = "omnigent.transaction_ended"
+_TRANSACTION_WROTE_KEY = "omnigent.transaction_wrote"
+# ``Session.info`` key holding the connection of the session's transaction.
+_SESSION_CONNECTION_KEY = "omnigent.session_connection"
+# Execution option for per-session setup statements (SQLite PRAGMAs) whose
+# effect does not depend on the transaction committing.
+_SESSION_SETUP_OPTION = "omnigent_session_setup"
+
+_READ_ONLY_LEADING_KEYWORDS = frozenset({"select", "with", "show", "explain", "describe", "desc"})
+_LEADING_SQL_NOISE = re.compile(r"(?:\s+|--[^\n]*|/\*.*?\*/|\()*", re.DOTALL)
+_LEADING_SQL_KEYWORD = re.compile(r"[a-z]+", re.IGNORECASE)
+# Words that make a read-shaped statement write, lock, or have side effects
+# that only a COMMIT publishes: data-modifying CTEs, SELECT ... INTO,
+# SELECT ... FOR UPDATE, EXPLAIN ANALYZE, sequence and notify functions.
+_WRITE_SQL_KEYWORDS = re.compile(
+    r"\b(?:insert|update|delete|merge|upsert|replace|into|create|alter|drop|truncate"
+    r"|grant|revoke|lock|call|copy|notify|pg_notify|nextval|setval|analy[sz]e)\b",
+    re.IGNORECASE,
+)
+
+_transaction_listener_lock = threading.Lock()
+_engines_with_transaction_aware_reset: weakref.WeakSet[Engine] = weakref.WeakSet()
+
+
+@functools.lru_cache(maxsize=4096)
+def _is_read_only_statement(statement: str) -> bool:
+    """Return whether ``statement`` is certainly read-only.
+
+    Deliberately conservative: anything not recognised as a plain read counts
+    as a write, so the worst misclassification costs one extra COMMIT.
+    Functions with hidden side effects called from a plain SELECT are not
+    detected; such statements must be issued from a session that also writes.
+    """
+    noise = _LEADING_SQL_NOISE.match(statement)
+    body = statement[noise.end() :] if noise else statement
+    keyword = _LEADING_SQL_KEYWORD.match(body)
+    if keyword is None or keyword.group().lower() not in _READ_ONLY_LEADING_KEYWORDS:
+        return False
+    return _WRITE_SQL_KEYWORDS.search(body) is None
+
+
+def _reset_transaction_wrote(connection: Connection) -> None:
+    connection.info[_TRANSACTION_WROTE_KEY] = False
+
+
+def _record_transaction_write(
+    connection: Connection,
+    _cursor: DBAPICursor,
+    statement: str,
+    _parameters: object,
+    context: ExecutionContext | None,
+    _executemany: bool,
+) -> None:
+    info = connection.info
+    if info.get(_TRANSACTION_WROTE_KEY):
+        return
+    if context is not None and context.execution_options.get(_SESSION_SETUP_OPTION):
+        return
+    if not _is_read_only_statement(statement):
+        info[_TRANSACTION_WROTE_KEY] = True
+
+
+def _install_write_tracking(engine: Engine) -> None:
+    """Track per transaction whether any executed statement may have written."""
+    with _transaction_listener_lock:
+        if event.contains(engine, "before_cursor_execute", _record_transaction_write):
+            return
+        event.listen(engine, "begin", _reset_transaction_wrote)
+        event.listen(engine, "before_cursor_execute", _record_transaction_write)
+
+
+def _remember_session_connection(
+    session: Session, _transaction: object, connection: Connection
+) -> None:
+    session.info[_SESSION_CONNECTION_KEY] = connection
+
+
+def _session_may_have_written(session: Session) -> bool:
+    """Whether committing ``session``'s open transaction could persist anything.
+
+    Call after ``session.flush()``. Unknown state counts as a write.
+    """
+    if session.new or session.dirty or session.deleted:
+        return True
+    connection: Connection | None = session.info.get(_SESSION_CONNECTION_KEY)
+    if connection is None or connection.closed:
+        # The open transaction (if any) never acquired a connection.
+        return False
+    if connection.invalidated:
+        return True
+    return bool(connection.info.get(_TRANSACTION_WROTE_KEY, True))
+
+
+def _end_session_transaction(session: Session) -> None:
+    """Commit ``session`` only when it may have written.
+
+    A read-only transaction is left open so that closing the session ends it
+    with a single ROLLBACK instead of COMMIT plus the pool's ROLLBACK.
+    """
+    session.flush()
+    if session.in_transaction() and _session_may_have_written(session):
+        session.commit()
+
+
+def _mark_transaction_open_on_checkout(
+    _dbapi_connection: DBAPIConnection,
+    connection_record: ConnectionPoolEntry,
+    _connection_proxy: PoolProxiedConnection,
+) -> None:
+    connection_record.info[_TRANSACTION_ENDED_KEY] = False
+
+
+def _mark_transaction_open_on_invalidate(
+    _dbapi_connection: DBAPIConnection,
+    connection_record: ConnectionPoolEntry,
+    _exception: BaseException | None,
+) -> None:
+    connection_record.info[_TRANSACTION_ENDED_KEY] = False
+
+
+def _mark_transaction_open(connection: Connection, *_args: object) -> None:
+    connection.info[_TRANSACTION_ENDED_KEY] = False
+
+
+def _mark_transaction_ended(connection: Connection) -> None:
+    # ``commit``/``rollback`` fire just before the DBAPI call; if that call
+    # fails, ``handle_error`` below flips the state back to open.
+    connection.info[_TRANSACTION_ENDED_KEY] = not connection.invalidated
+
+
+def _mark_transaction_open_on_error(context: ExceptionContext) -> None:
+    connection = context.connection
+    if connection is None:
+        return
+    # A handle_error listener that raises would replace the original error.
+    try:
+        connection.info[_TRANSACTION_ENDED_KEY] = False
+    except Exception:
+        _logger.debug("could not record transaction state after an error", exc_info=True)
+
+
+def install_transaction_aware_pool_reset(engine: Engine) -> None:
+    """Roll back returned connections only when a transaction may be open.
+
+    SQLAlchemy's default ``pool_reset_on_return="rollback"`` issues a ROLLBACK
+    on every check-in, even right after a successful COMMIT or ROLLBACK, so
+    each transaction costs two terminators. This listener tracks per
+    connection whether the last transaction is known to have ended and rolls
+    back otherwise: on errors, invalidation, raw DBAPI work after checkout, or
+    unknown state.
+
+    ``engine`` must be created with ``pool_reset_on_return=None``; with the
+    default reset the pool still rolls back on every check-in. Engines built
+    by :func:`get_or_create_engine` and
+    :func:`get_or_create_conversation_engine` are already configured. Call
+    this for an externally constructed engine before registering it in the
+    engine cache. Repeated calls are no-ops.
+
+    :param engine: The engine whose pool resets should be transaction-aware.
+    """
+    with _transaction_listener_lock:
+        if engine in _engines_with_transaction_aware_reset:
+            return
+        dialect = engine.dialect
+
+        def _reset_unless_transaction_ended(
+            dbapi_connection: DBAPIConnection,
+            connection_record: ConnectionPoolEntry | None,
+            reset_state: PoolResetState,
+        ) -> None:
+            # Mirrors SQLAlchemy: no I/O from garbage-collector cleanup of
+            # async connections.
+            if not reset_state.asyncio_safe:
+                return
+            if connection_record is not None and connection_record.info.pop(
+                _TRANSACTION_ENDED_KEY, False
+            ):
+                return
+            # Dialects only call ``rollback()`` on the connection they are given.
+            dialect.do_rollback(dbapi_connection)  # type: ignore[bad-argument-type]
+
+        event.listen(engine, "checkout", _mark_transaction_open_on_checkout)
+        event.listen(engine, "invalidate", _mark_transaction_open_on_invalidate)
+        event.listen(engine, "soft_invalidate", _mark_transaction_open_on_invalidate)
+        event.listen(engine, "begin", _mark_transaction_open)
+        event.listen(engine, "before_cursor_execute", _mark_transaction_open)
+        event.listen(engine, "commit", _mark_transaction_ended)
+        event.listen(engine, "rollback", _mark_transaction_ended)
+        event.listen(engine, "handle_error", _mark_transaction_open_on_error, insert=True)
+        event.listen(engine, "reset", _reset_unless_transaction_ended)
+        _engines_with_transaction_aware_reset.add(engine)
+
+
 # ── Engine caching ─────────────────────────────────────
 
 _engine_cache: dict[str, Engine] = {}
@@ -278,6 +486,9 @@ def _create_engine(db_uri: str) -> Engine:
     the engine additionally re-mints its OAuth token per new connection and
     uses a shorter ``pool_recycle`` window; otherwise the static URI (and its
     baked-in password, if any) is used unchanged.
+
+    Every engine uses :func:`install_transaction_aware_pool_reset` instead of
+    SQLAlchemy's unconditional rollback-on-return.
 
     :param db_uri: SQLAlchemy database connection string, e.g.
         ``"sqlite:///mydb.db"`` or
@@ -308,7 +519,9 @@ def _create_engine(db_uri: str) -> Engine:
             pool_size=15,
             max_overflow=25,
             pool_timeout=10,
+            pool_reset_on_return=None,
         )
+        install_transaction_aware_pool_reset(engine)
 
         # Apply WAL + busy_timeout on every fresh DBAPI connection
         # so AsyncSession instances and any other consumer all
@@ -358,6 +571,9 @@ def _create_engine(db_uri: str) -> Engine:
         # blocking indefinitely; surfaces real saturation as an
         # error rather than a hang.
         "pool_timeout": _env_float("OMNIGENT_DB_POOL_TIMEOUT", 10.0, minimum=0.0),
+        # Replaced by install_transaction_aware_pool_reset, which skips the
+        # check-in ROLLBACK after a transaction has already ended.
+        "pool_reset_on_return": None,
     }
     if is_crdb:
         engine_kwargs["isolation_level"] = "READ COMMITTED"
@@ -391,6 +607,7 @@ def _create_engine(db_uri: str) -> Engine:
                 f"if needed)."
             ) from exc
         raise
+    install_transaction_aware_pool_reset(engine)
     if token_provider:
         _install_lakebase_token_refresh(engine, token_provider)
     return engine
@@ -876,7 +1093,9 @@ def shared_read_scope() -> Iterator[None]:
     Nesting reuses the outer scope. Write makers (``immediate=True``) never
     participate, so they keep their own ``BEGIN IMMEDIATE`` isolation even
     when nested here. Never hold this open across network I/O: it pins a
-    pooled connection for the scope's whole duration.
+    pooled connection for the scope's whole duration. On exit, sessions end
+    as in :func:`make_managed_session_maker`: COMMIT only if they may have
+    written, otherwise a single ROLLBACK.
     """
     if _shared_read_sessions.get() is not None:
         # Already inside a scope — the outer one owns the sessions.
@@ -887,7 +1106,7 @@ def shared_read_scope() -> Iterator[None]:
     try:
         yield
         for session in sessions.values():
-            session.commit()
+            _end_session_transaction(session)
     except BaseException:
         for session in sessions.values():
             session.rollback()
@@ -898,6 +1117,12 @@ def shared_read_scope() -> Iterator[None]:
         _shared_read_sessions.reset(token)
 
 
+def _configure_sqlite_session(session: Session) -> None:
+    setup = {_SESSION_SETUP_OPTION: True}
+    session.execute(text("PRAGMA foreign_keys = ON"), execution_options=setup)
+    session.execute(text("PRAGMA busy_timeout = 20000"), execution_options=setup)  # 20s
+
+
 def make_managed_session_maker(
     engine: Engine,
     *,
@@ -906,7 +1131,9 @@ def make_managed_session_maker(
     """
     Create a context-manager factory for database sessions.
 
-    Sessions auto-commit on success and auto-rollback on failure.
+    Sessions commit on success only if they may have written (see
+    :func:`_end_session_transaction`); read-only sessions end with the
+    ROLLBACK issued when the session closes. Sessions roll back on failure.
     When the underlying dialect is SQLite, each session additionally
     enables ``PRAGMA foreign_keys`` and sets a 20-second
     ``busy_timeout``.
@@ -927,6 +1154,8 @@ def make_managed_session_maker(
     # is short-lived and single-writer, so there is no cross-session stale
     # data concern.
     factory = sessionmaker(bind=engine, expire_on_commit=False)
+    event.listen(factory, "after_begin", _remember_session_connection)
+    _install_write_tracking(engine)
     is_sqlite = engine.dialect.name == "sqlite"
 
     @contextmanager
@@ -934,9 +1163,9 @@ def make_managed_session_maker(
         """
         Yield a managed :class:`~sqlalchemy.orm.Session`.
 
-        Commits on clean exit, rolls back on exception. For SQLite
-        backends, enables foreign key enforcement and sets a
-        busy timeout before yielding.
+        Commits on clean exit when the session may have written, rolls back
+        on exception. For SQLite backends, enables foreign key enforcement
+        and sets a busy timeout before yielding.
 
         Inside a :func:`shared_read_scope` (and only for read makers), the
         scope's per-engine session is reused instead of a fresh checkout;
@@ -954,8 +1183,7 @@ def make_managed_session_maker(
                     # session to close it (otherwise the connection would leak).
                     shared[key] = session
                     if is_sqlite:
-                        session.execute(text("PRAGMA foreign_keys = ON"))
-                        session.execute(text("PRAGMA busy_timeout = 20000"))  # 20s
+                        _configure_sqlite_session(session)
                 yield session
                 return
         with factory() as session:
@@ -964,14 +1192,13 @@ def make_managed_session_maker(
                     # PRAGMAs must run before BEGIN IMMEDIATE: foreign_keys is
                     # a no-op inside a transaction, and busy_timeout must be
                     # set before lock acquisition or it doesn't apply.
-                    session.execute(text("PRAGMA foreign_keys = ON"))
-                    session.execute(text("PRAGMA busy_timeout = 20000"))  # 20s
+                    _configure_sqlite_session(session)
                     if immediate:
                         # Acquire write lock before any read to prevent
                         # concurrent check-then-insert races on SQLite.
                         session.execute(text("BEGIN IMMEDIATE"))
                 yield session
-                session.commit()
+                _end_session_transaction(session)
             except Exception:
                 session.rollback()
                 raise
