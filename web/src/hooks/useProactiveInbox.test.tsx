@@ -430,6 +430,36 @@ it("does not subtract again when a poll already reflects the committed change, a
   expect(result.current.inbox.items).toEqual(others);
 });
 
+it("settles a list first loaded before the server committed the dismissal on the server's total", async () => {
+  // The Unread tab's page stops before the dismissed item, and the server has
+  // not applied the dismissal yet: the page counts three. The total stays at
+  // three only until the PATCH settles with the server's count.
+  const others = [
+    { ...item, id: "two", createdAt: 2 },
+    { ...item, id: "three", createdAt: 3 },
+  ];
+  vi.mocked(listSuggestions).mockResolvedValue(page([...others, item], 3));
+  const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
+  await waitFor(() => expect(result.current.unreadCount).toBe(3));
+  const patch = deferred<SuggestionUpdateResult>();
+  vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
+  act(() => result.current.update("sug", { resolution: "not_now" }));
+  expect(result.current.unreadCount).toBe(2);
+
+  vi.mocked(listSuggestions).mockResolvedValue({ ...page(others, 3), nextCursor: "2:two" });
+  const unread = renderHook(() => useProactiveInbox(true, ["unread"]), { wrapper });
+  await waitFor(() => expect(unread.result.current.items).toEqual(others));
+  expect(unread.result.current.unreadCount).toBe(3);
+
+  // The server commits; its reply carries the total, and so does any refetch.
+  vi.mocked(listSuggestions).mockResolvedValue({ ...page(others, 2), nextCursor: "2:two" });
+  await act(async () =>
+    patch.resolve(saved({ ...item, status: "dismissed", resolution: "not_now" }, 2)),
+  );
+  expect(unread.result.current.unreadCount).toBe(2);
+  expect(result.current.unreadCount).toBe(2);
+});
+
 it("trusts the total of a list first loaded while the dismissal is in flight", async () => {
   const others = [
     { ...item, id: "two", createdAt: 2 },
