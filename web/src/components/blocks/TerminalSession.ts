@@ -407,6 +407,12 @@ export function terminalBufferText(
   return newestFirst.reverse().join("\n");
 }
 
+/** Remove C0 and C1 control characters other than tab and line breaks. */
+export function stripPasteControlCharacters(text: string): string {
+  // oxlint-disable-next-line no-control-regex
+  return text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "");
+}
+
 /** Largest tmux selection accepted for a browser clipboard write. */
 export const TERMINAL_CLIPBOARD_MAX_BYTES = 1024 * 1024;
 /** A tmux copy notification must closely follow input on this attachment. */
@@ -1033,12 +1039,20 @@ export class TerminalSession {
     return terminalBufferText(this.term.buffer.active);
   }
 
+  /** Whether the program asked for bracketed paste, so pasted lines don't run on their own. */
+  pastesBracketed(): boolean {
+    return this.term.modes.bracketedPasteMode;
+  }
+
   /**
-   * Send text as a paste. xterm normalizes newlines and adds bracketed-paste
-   * markers when the program asked for them, then forwards it as input.
+   * Send clipboard text as a paste; false when the socket can't take input.
+   * Control characters are dropped so the text can't end bracketed paste early
+   * or send key sequences. xterm normalizes newlines and adds the paste markers.
    */
-  paste(text: string): void {
-    this.term.paste(text);
+  paste(text: string): boolean {
+    if (this.disposed || this.ws.readyState !== WebSocket.OPEN) return false;
+    this.term.paste(stripPasteControlCharacters(text));
+    return true;
   }
 
   /** Paste without Enter, waiting briefly for safe multiline input support. */

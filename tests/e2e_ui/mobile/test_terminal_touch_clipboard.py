@@ -14,6 +14,7 @@ browser clipboard can be checked directly.
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -94,17 +95,16 @@ def _open_sheet_when(
     timeout_ms: int = 15_000,
 ) -> Locator:
     """Reopen the copy sheet, a snapshot of the terminal, until ``shows`` its lines."""
-    remaining_ms = timeout_ms
+    deadline = time.monotonic() + timeout_ms / 1000
     while True:
         sheet = _open_copy_sheet(terminal_view, page)
         text = sheet.get_by_test_id("terminal-copy-text").inner_text()
         if shows(text.split("\n")):
             return sheet
-        if remaining_ms <= 0:
+        if time.monotonic() >= deadline:
             raise AssertionError(f"terminal never showed {expected}; it showed:\n{text}")
         _close_copy_sheet(page, sheet)
         page.wait_for_timeout(250)
-        remaining_ms -= 250
 
 
 def _open_sheet_showing_line(terminal_view: Locator, page: Page, line: str) -> Locator:

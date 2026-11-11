@@ -3,7 +3,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { queueTerminalClipboardWrite } from "@/lib/terminalClipboardWriter";
-import { TERMINAL_COPY_BLOCKED_MESSAGE, TerminalTouchClipboardBar } from "./TerminalTouchClipboard";
+import {
+  TERMINAL_COPY_BLOCKED_MESSAGE,
+  type TerminalPasteResult,
+  TerminalTouchClipboardBar,
+} from "./TerminalTouchClipboard";
 
 const clipboardMock = vi.hoisted(() => ({
   copyText: vi.fn<(text: string) => Promise<void>>(),
@@ -22,7 +26,7 @@ function renderBar(overrides: Partial<BarProps> = {}) {
     pasteEnabled: true,
     readText: vi.fn(() => TERMINAL_TEXT),
     isCopyBlocked: vi.fn(() => false),
-    onPaste: vi.fn<(text: string) => boolean>(() => true),
+    onPaste: vi.fn<(text: string, reviewed: boolean) => TerminalPasteResult>(() => "pasted"),
     ...overrides,
   };
   const view = (barProps: BarProps) => (
@@ -95,6 +99,20 @@ describe("TerminalTouchClipboardBar copy", () => {
     await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledWith(TERMINAL_TEXT));
   });
 
+  it("forgets a selection dragged out of the text", async () => {
+    renderBar();
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+    const text = await screen.findByTestId("terminal-copy-text");
+    selectText(text.firstChild!, 5, 14);
+    expect(screen.getByRole("button", { name: "Copy selection" })).toBeTruthy();
+
+    const closeLabel = screen.getByRole("button", { name: "Copy selection" }).lastChild!;
+    selectText(text.firstChild!, 5, 2, closeLabel);
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy all" }));
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledWith(TERMINAL_TEXT));
+  });
+
   it("keeps the sheet open and explains a failed copy", async () => {
     clipboardMock.copyText.mockRejectedValue(new Error("denied"));
     renderBar();
@@ -139,11 +157,38 @@ describe("TerminalTouchClipboardBar copy", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Copy" }));
     fireEvent.click(await screen.findByRole("button", { name: "Copy all" }));
-    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledWith(TERMINAL_TEXT));
-    finishFirst();
+    expect(clipboardMock.copyText.mock.calls).toEqual([["first"]]);
+    await act(async () => finishFirst());
 
     await waitFor(() => expect(screen.queryByTestId("terminal-copy-sheet")).toBeNull());
     expect(clipboardMock.copyText.mock.calls).toEqual([["first"], [TERMINAL_TEXT]]);
+  });
+
+  it("keeps a native copy from being overwritten by program copies", async () => {
+    let finishFirst!: () => void;
+    clipboardMock.copyText.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishFirst = resolve;
+        }),
+    );
+    queueTerminalClipboardWrite({ text: "first", isCurrent: () => true, onResult: () => {} });
+    queueTerminalClipboardWrite({ text: "queued", isCurrent: () => true, onResult: () => {} });
+    renderBar();
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+    const text = await screen.findByTestId("terminal-copy-text");
+    selectText(text.firstChild!, 5, 14);
+
+    const nativeCopy = new Event("copy", { bubbles: true, cancelable: true });
+    act(() => {
+      text.dispatchEvent(nativeCopy);
+    });
+    finishFirst();
+
+    expect(nativeCopy.defaultPrevented).toBe(false);
+    await waitFor(() =>
+      expect(clipboardMock.copyText.mock.calls).toEqual([["first"], ["alpha.txt"]]),
+    );
   });
 });
 
@@ -160,14 +205,14 @@ describe("TerminalTouchClipboardBar paste", () => {
 
   it("says so when the terminal disconnects before the clipboard is read", async () => {
     readText.mockResolvedValue("ls");
-    const { props } = renderBar({ onPaste: vi.fn(() => false) });
+    const { props } = renderBar({ onPaste: vi.fn((): TerminalPasteResult => "unavailable") });
 
     fireEvent.click(screen.getByRole("button", { name: "Paste" }));
 
     expect(
       await screen.findByText("The terminal isn't connected, so nothing was pasted."),
     ).toBeTruthy();
-    expect(props.onPaste).toHaveBeenCalledWith("ls");
+    expect(props.onPaste).toHaveBeenCalledWith("ls", false);
     expect(screen.queryByTestId("terminal-paste-box")).toBeNull();
   });
 
@@ -186,13 +231,13 @@ describe("TerminalTouchClipboardBar paste", () => {
     });
     fireEvent.click(send);
 
-    expect(props.onPaste).toHaveBeenCalledWith("make test");
+    expect(props.onPaste).toHaveBeenCalledWith("make test", true);
     await waitFor(() => expect(screen.queryByTestId("terminal-paste-box")).toBeNull());
   });
 
   it("keeps the paste box text when the terminal can't take it", async () => {
     readText.mockRejectedValue(new DOMException("denied", "NotAllowedError"));
-    renderBar({ onPaste: vi.fn(() => false) });
+    renderBar({ onPaste: vi.fn((): TerminalPasteResult => "unavailable") });
 
     const box = await openPasteBox();
     fireEvent.change(within(box).getByLabelText("Text to paste"), {
@@ -204,6 +249,43 @@ describe("TerminalTouchClipboardBar paste", () => {
       await screen.findByText("The terminal isn't connected, so nothing was pasted."),
     ).toBeTruthy();
     expect(within(box).getByLabelText("Text to paste")).toHaveValue("make test");
+  });
+
+  it("asks for a review before pasting lines that would each run", async () => {
+    readText.mockResolvedValue("make\nmake test");
+    const onPaste = vi.fn((_text: string, reviewed: boolean): TerminalPasteResult =>
+      reviewed ? "pasted" : "review",
+    );
+    renderBar({ onPaste });
+
+    const box = await openPasteBox();
+    expect(within(box).getByLabelText("Text to paste")).toHaveValue("make\nmake test");
+    expect(within(box).getByText(/each line may run as a command/)).toBeTruthy();
+    fireEvent.click(within(box).getByRole("button", { name: "Send to terminal" }));
+
+    expect(onPaste.mock.calls).toEqual([
+      ["make\nmake test", false],
+      ["make\nmake test", true],
+    ]);
+    await waitFor(() => expect(screen.queryByTestId("terminal-paste-box")).toBeNull());
+  });
+
+  it("ignores a clipboard read that finishes after the terminal turns read-only", async () => {
+    let refuseRead!: () => void;
+    readText.mockReturnValue(
+      new Promise<string>((_resolve, reject) => {
+        refuseRead = () => reject(new DOMException("denied", "NotAllowedError"));
+      }),
+    );
+    const { props, rerender } = renderBar();
+    fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+
+    rerender({ pasteAvailable: false });
+    await act(async () => refuseRead());
+    rerender({ pasteAvailable: true });
+
+    expect(screen.queryByTestId("terminal-paste-box")).toBeNull();
+    expect(props.onPaste).not.toHaveBeenCalled();
   });
 
   it("does not reopen the paste box after the terminal turns read-only", async () => {

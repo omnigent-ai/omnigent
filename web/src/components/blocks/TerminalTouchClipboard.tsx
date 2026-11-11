@@ -14,11 +14,24 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
-import { copyText } from "@/lib/clipboard";
-import { discardPendingTerminalClipboardWrite } from "@/lib/terminalClipboardWriter";
+import {
+  isTerminalClipboardWritePending,
+  writeExplicitTerminalClipboardText,
+} from "@/lib/terminalClipboardWriter";
 
 export const TERMINAL_COPY_BLOCKED_MESSAGE = "Copying from this terminal is blocked.";
 const PASTE_NOT_CONNECTED_MESSAGE = "The terminal isn't connected, so nothing was pasted.";
+
+/**
+ * What happened to pasted text: sent, refused because the terminal can't take
+ * input, or held back so the user can review multi-line text first.
+ */
+export type TerminalPasteResult = "pasted" | "unavailable" | "review";
+
+interface PasteBoxState {
+  text: string;
+  review: boolean;
+}
 
 interface TerminalTouchClipboardBarProps {
   /** Background behind the bar, matching the terminal surface. */
@@ -31,8 +44,8 @@ interface TerminalTouchClipboardBarProps {
   readText: () => string;
   /** Whether the user's terminal clipboard choice blocks copying. */
   isCopyBlocked: () => boolean;
-  /** Sends pasted text to the terminal as input; false when it can't take input. */
-  onPaste: (text: string) => boolean;
+  /** Sends pasted text to the terminal; `reviewed` skips the multi-line review. */
+  onPaste: (text: string, reviewed: boolean) => TerminalPasteResult;
 }
 
 export function TerminalTouchClipboardBar({
@@ -44,11 +57,20 @@ export function TerminalTouchClipboardBar({
   onPaste,
 }: TerminalTouchClipboardBarProps) {
   const [sheetText, setSheetText] = useState<string | null>(null);
-  const [pasteBoxOpen, setPasteBoxOpen] = useState(false);
+  const [pasteBox, setPasteBox] = useState<PasteBoxState | null>(null);
+  // A clipboard read can outlast the iOS paste prompt, so its result uses the latest props.
+  const latestRef = useRef({ pasteAvailable, onPaste, mounted: true });
+  latestRef.current = { ...latestRef.current, pasteAvailable, onPaste };
+  useEffect(() => {
+    latestRef.current.mounted = true;
+    return () => {
+      latestRef.current.mounted = false;
+    };
+  }, []);
 
   // A paste box left open must not reappear when a read-only terminal becomes writable.
   useEffect(() => {
-    if (!pasteAvailable) setPasteBoxOpen(false);
+    if (!pasteAvailable) setPasteBox(null);
   }, [pasteAvailable]);
 
   const openCopySheet = () => {
@@ -61,16 +83,24 @@ export function TerminalTouchClipboardBar({
 
   const paste = async () => {
     // Read inside the tap so the platform can show its own paste confirmation.
-    let text: string;
+    let text: string | null;
     try {
       text = await navigator.clipboard.readText();
     } catch {
-      // Refused or unsupported reads fall back to a paste box.
-      setPasteBoxOpen(true);
-      return;
+      text = null;
     }
-    if (!text) toast.info("The clipboard has no text to paste.");
-    else if (!onPaste(text)) toast.error(PASTE_NOT_CONNECTED_MESSAGE);
+    const latest = latestRef.current;
+    if (!latest.mounted || !latest.pasteAvailable) return;
+    // Refused or unsupported reads fall back to a paste box.
+    if (text === null) setPasteBox({ text: "", review: false });
+    else if (!text) toast.info("The clipboard has no text to paste.");
+    else showPasteResult(latest.onPaste(text, false), text);
+  };
+
+  const showPasteResult = (result: TerminalPasteResult, text: string) => {
+    if (result === "pasted") setPasteBox(null);
+    else if (result === "review") setPasteBox({ text, review: true });
+    else toast.error(PASTE_NOT_CONNECTED_MESSAGE);
   };
 
   return (
@@ -115,13 +145,10 @@ export function TerminalTouchClipboardBar({
       />
       {pasteAvailable && (
         <TerminalPasteBox
-          open={pasteBoxOpen}
+          state={pasteBox}
           enabled={pasteEnabled}
-          onSend={(text) => {
-            if (onPaste(text)) setPasteBoxOpen(false);
-            else toast.error(PASTE_NOT_CONNECTED_MESSAGE);
-          }}
-          onClose={() => setPasteBoxOpen(false)}
+          onSend={(text) => showPasteResult(onPaste(text, true), text)}
+          onClose={() => setPasteBox(null)}
         />
       )}
     </>
@@ -152,8 +179,12 @@ function TerminalCopySheet({
       const current = document.getSelection();
       const node = textRef.current;
       if (!current || !node || current.rangeCount === 0) return;
-      if (!node.contains(current.anchorNode) || !node.contains(current.focusNode)) return;
-      setSelection(current.toString());
+      if (node.contains(current.anchorNode) && node.contains(current.focusNode)) {
+        setSelection(current.toString());
+      } else if (!current.isCollapsed) {
+        // A selection dragged out of the text no longer matches the last one.
+        setSelection("");
+      }
     };
     document.addEventListener("selectionchange", onSelectionChange);
     return () => document.removeEventListener("selectionchange", onSelectionChange);
@@ -171,11 +202,7 @@ function TerminalCopySheet({
       toast.info(TERMINAL_COPY_BLOCKED_MESSAGE, { id: "terminal-clipboard-blocked" });
       return;
     }
-    // This explicit copy supersedes any program copy still waiting to be written.
-    discardPendingTerminalClipboardWrite();
-    try {
-      await copyText(selection || text);
-    } catch {
+    if (!(await writeExplicitTerminalClipboardText(selection || text))) {
       toast.error("Couldn't copy. Select the text and choose Copy from the menu.");
       return;
     }
@@ -184,9 +211,17 @@ function TerminalCopySheet({
   };
 
   const onNativeCopy = (event: ClipboardEvent<HTMLPreElement>) => {
-    if (!isCopyBlocked()) return;
-    event.preventDefault();
-    toast.info(TERMINAL_COPY_BLOCKED_MESSAGE, { id: "terminal-clipboard-blocked" });
+    if (isCopyBlocked()) {
+      event.preventDefault();
+      toast.info(TERMINAL_COPY_BLOCKED_MESSAGE, { id: "terminal-clipboard-blocked" });
+      return;
+    }
+    // The browser copies the selection now. A program copy still in flight could
+    // land after it, so write the selection again once that copy finishes.
+    const selected = document.getSelection()?.toString();
+    if (selected && isTerminalClipboardWritePending()) {
+      void writeExplicitTerminalClipboardText(selected);
+    }
   };
 
   return (
@@ -227,22 +262,24 @@ function TerminalCopySheet({
 }
 
 function TerminalPasteBox({
-  open,
+  state,
   enabled,
   onSend,
   onClose,
 }: {
-  open: boolean;
+  state: PasteBoxState | null;
   enabled: boolean;
   onSend: (text: string) => void;
   onClose: () => void;
 }) {
   const [value, setValue] = useState("");
   const descriptionId = useId();
+  const open = state !== null;
+  const initialText = state?.text ?? "";
 
   useEffect(() => {
-    if (!open) setValue("");
-  }, [open]);
+    setValue(open ? initialText : "");
+  }, [open, initialText]);
 
   return (
     <Dialog open={open} onOpenChange={(next) => !next && onClose()}>
@@ -250,7 +287,9 @@ function TerminalPasteBox({
         <DialogHeader>
           <DialogTitle>Paste into terminal</DialogTitle>
           <DialogDescription id={descriptionId}>
-            Paste your text here, then send it to the terminal.
+            {state?.review
+              ? "This text has more than one line, and each line may run as a command. Check it, then send it."
+              : "Paste your text here, then send it to the terminal."}
           </DialogDescription>
         </DialogHeader>
         <Textarea

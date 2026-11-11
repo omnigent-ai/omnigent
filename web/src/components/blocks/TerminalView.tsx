@@ -54,7 +54,7 @@ import {
   type TerminalClipboardDecision,
   type TerminalClipboardPromptReason,
 } from "./TerminalClipboardPrompt";
-import { TerminalTouchClipboardBar } from "./TerminalTouchClipboard";
+import { type TerminalPasteResult, TerminalTouchClipboardBar } from "./TerminalTouchClipboard";
 import {
   type ConnectionState,
   type TerminalActivityListener,
@@ -531,15 +531,24 @@ export function TerminalView({
     return clipboardConsentRef.current.decision === "block";
   }, [clipboardScope]);
   const pasteIntoTerminal = useCallback(
-    (text: string) => {
-      // The clipboard read can outlast the connection, so check it at send time.
+    (text: string, reviewed: boolean): TerminalPasteResult => {
+      // The clipboard read can outlast the connection or a switch to another terminal.
       const session = sessionRef.current;
-      if (readOnly || !session || stateRef.current.kind !== "connected") return false;
-      session.paste(text);
+      if (
+        readOnly ||
+        !session ||
+        clipboardScopeRef.current.scope !== clipboardScope ||
+        stateRef.current.kind !== "connected"
+      ) {
+        return "unavailable";
+      }
+      // Without bracketed paste, each pasted line runs as soon as it arrives.
+      if (!reviewed && /[\r\n]/.test(text) && !session.pastesBracketed()) return "review";
+      if (!session.paste(text)) return "unavailable";
       session.focus();
-      return true;
+      return "pasted";
     },
-    [readOnly],
+    [clipboardScope, readOnly],
   );
 
   const visibleClipboardPrompt =
@@ -905,6 +914,7 @@ export function TerminalView({
       </div>
       {isCoarsePointer && (
         <TerminalTouchClipboardBar
+          key={clipboardScope}
           backgroundColor={terminalBackground}
           pasteAvailable={!readOnly}
           pasteEnabled={state.kind === "connected"}

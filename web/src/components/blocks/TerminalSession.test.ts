@@ -1399,20 +1399,27 @@ describe("TerminalSession", () => {
   it("sends touch pastes as input, bracketed when the program asks", async () => {
     const { socket, session } = makeSession();
     const term = (session as unknown as { term: Terminal }).term;
-    socket.open();
     const inputs = () =>
       socket.sent.flatMap((frame) =>
         typeof frame === "string" ? [] : [new TextDecoder().decode(frame)],
       );
+    expect(session.paste("ls")).toBe(false);
+    socket.open();
 
-    session.paste("echo one\necho two\r\necho three");
+    expect(session.pastesBracketed()).toBe(false);
+    expect(session.paste("echo one\necho two\r\necho three")).toBe(true);
     expect(inputs()).toEqual(["echo one\recho two\recho three"]);
 
     await new Promise<void>((resolve) => {
       term.write("\x1b[?2004h", resolve);
     });
+    expect(session.pastesBracketed()).toBe(true);
     session.paste("ls");
     expect(inputs().at(-1)).toBe("\x1b[200~ls\x1b[201~");
+    // A pasted end marker must not close the bracket early and run what follows.
+    session.paste("a\x1b[201~rm -rf x\x07\tb");
+    expect(inputs().at(-1)).toBe("\x1b[200~a[201~rm -rf x\tb\x1b[201~");
     session.dispose();
+    expect(session.paste("ls")).toBe(false);
   });
 });

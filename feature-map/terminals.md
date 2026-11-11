@@ -22,6 +22,8 @@ reattach when the session moves to another host.
   terminal offers Copy and Paste. Copy opens a sheet of the terminal text for
   native selection, with Copy selection / Copy all. Paste sends the clipboard as
   terminal input, or opens a paste box when the clipboard can't be read.
+  Multi-line text opens the same box for review first unless the program takes
+  bracketed pastes; control characters are dropped from every paste.
   Read-only terminals show Copy only; a blocked terminal clipboard blocks Copy.
 - `reconnect`: after the terminal connection drops, the terminal shows that it
   is reconnecting and then reattaches without user action.
@@ -70,6 +72,13 @@ with their own terminal retain the switcher.
   ⌘/Ctrl+Alt+- splits down with the default shell, skipping the picker; the
   chords work only while those buttons show. ⌘/Ctrl+Alt+Shift+] / [ focus the
   next / previous pane. All of them work with focus inside a terminal.
+
+**Touch copy and paste** (any terminal on a touch device, including the iOS app):
+
+- Tap Copy in the bar under the terminal to open the copy sheet. Select text
+  natively and tap Copy selection, or tap Copy all.
+- Tap Paste in the same bar. If the clipboard can't be read, or the text has
+  more than one line and needs review, a paste box opens; tap Send to terminal.
 
 **User shells:**
 
@@ -143,8 +152,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `web/src/shell/TerminalSplitControls.test.tsx` and
   `web/src/shell/MainTerminalView.test.tsx` (`pnpm --dir web test`). Manually,
   in a Claude or Codex session with the composer focused: press ⌘/Ctrl+Alt+\
-  twice and expect Terminal view, then Chat view; press Control+` and
-  expect a new shell tab to open and take focus. With `splittable_terminal_view_ui`,
+  twice and expect Terminal view, then Chat view; press Control+`and
+expect a new shell tab to open and take focus. With`splittable_terminal_view_ui`,
   in Terminal view with the agent terminal focused, press ⌘/Ctrl+Alt+Shift+\
   and expect a default shell pane on the right that takes typing; press
   ⌘/Ctrl+Alt+Shift+] and expect typing to reach the agent pane again.
@@ -199,7 +208,7 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   (real Claude Code and tmux against a slow local Messages API; needs `claude`
   on `PATH`), with timing cases in `tests/runner/test_resource_registry.py`
   (`-k 'hidden_input_box or input_box_probe or queued_alert_delivery or
-  input_box_in_another_mode'`), the pane matrix in
+input_box_in_another_mode'`), the pane matrix in
   `tests/harnesses/claude_native/test_claude_native_bridge.py`
   (`-k input_box_shown`), and the labels in `web/src/pages/ChatPage.test.ts` and
   `web/src/components/SessionStateBadge.test.tsx`.
