@@ -72,7 +72,12 @@ export function useSetProactiveAgentSetting() {
           body: JSON.stringify({ enabled }),
         }),
       ),
-    onSuccess: (data) => {
+    // A settings GET in flight when the switch is flipped may carry the old
+    // value and land after the PUT; drop it before and after the request so
+    // the accepted setting is what the cache keeps.
+    onMutate: () => queryClient.cancelQueries({ queryKey }),
+    onSuccess: async (data) => {
+      await queryClient.cancelQueries({ queryKey });
       queryClient.setQueryData(queryKey, data);
       // Turning it off hides the suggestions; turning it on shows them again.
       void queryClient.invalidateQueries({ queryKey: ["proactive-inbox"] });

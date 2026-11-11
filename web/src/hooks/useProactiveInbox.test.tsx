@@ -338,3 +338,42 @@ it("shows a pending update to every instance, so the sidebar badge agrees with t
   await waitFor(() => expect(result.current.sidebar.unreadCount).toBe(0));
   expect(result.current.inbox.items).toEqual([]);
 });
+
+it.each(["succeeds", "fails"])(
+  "moves a list's unread total even when its loaded pages stop before the item, and the PATCH %s",
+  async (outcome) => {
+    // The All tab's first page holds a newer read item; the older unread one is
+    // behind it. The Unread tab's page holds the unread one.
+    const newer: Suggestion = { ...item, id: "newer", status: "read", createdAt: 2 };
+    vi.mocked(listSuggestions).mockImplementation(async (_cursor, statuses) =>
+      statuses.length === 1 ? page([item], 1) : { ...page([newer], 1), nextCursor: "1:sug" },
+    );
+    const { result } = renderHook(
+      () => ({ all: useProactiveInbox(true), unread: useProactiveInbox(true, ["unread"]) }),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.unread.items).toEqual([item]));
+    await waitFor(() => expect(result.current.all.unreadCount).toBe(1));
+    const patch = deferred<Suggestion>();
+    vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
+
+    // Expanding the item on the Unread tab marks it read.
+    act(() => result.current.unread.update("sug", { status: "read" }));
+    expect(result.current.unread.unreadCount).toBe(0);
+    expect(result.current.all.unreadCount).toBe(0);
+
+    vi.mocked(listSuggestions).mockImplementation(() => new Promise(() => {}));
+    if (outcome === "succeeds") {
+      await act(async () => patch.resolve({ ...item, status: "read" }));
+      expect(result.current.all.unreadCount).toBe(0);
+      expect(result.current.unread.unreadCount).toBe(0);
+    } else {
+      await act(async () => patch.reject(new Error("offline")));
+      await waitFor(() => expect(showToast).toHaveBeenCalledOnce());
+      // Both lists go back to one unread item, the one that never loaded included.
+      expect(result.current.all.unreadCount).toBe(1);
+      expect(result.current.unread.unreadCount).toBe(1);
+      expect(result.current.unread.items).toEqual([item]);
+    }
+  },
+);

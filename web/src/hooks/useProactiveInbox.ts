@@ -10,11 +10,14 @@ import { withBasePath } from "@/lib/basePath";
 import { getOmnigentHostGeneration, getOmnigentServerIdentity } from "@/lib/host";
 import {
   OPEN_SUGGESTION_STATUSES,
+  adjustUnreadCount,
   applySuggestionUpdate,
   listSuggestions,
   locateSuggestion,
   reconcileSuggestion,
   restoreSuggestion,
+  statusAfterUpdate,
+  unreadDelta,
   updateSuggestion,
   type SuggestionPlace,
   type Suggestion,
@@ -28,6 +31,14 @@ import { useViewerId } from "./useViewerId";
 
 type Pages = InfiniteData<SuggestionPage, string | null>;
 type Places = [readonly unknown[], SuggestionPlace][];
+
+/** What an item with a pending update is known to be, apart from any one cache. */
+interface TrackedStatus {
+  /** The status the server last agreed to. */
+  confirmed: SuggestionStatus;
+  /** The status after the pending updates, which the unread totals reflect. */
+  current: SuggestionStatus;
+}
 
 /**
  * In-flight update state for one query scope, shared by every instance of the
@@ -48,6 +59,11 @@ interface ScopeState {
    * optimistic one.
    */
   baselines: Map<string, Places>;
+  /**
+   * Each pending item's confirmed and optimistic status, so a list whose loaded
+   * pages do not reach the item still moves its unread total the same way.
+   */
+  statuses: Map<string, TrackedStatus>;
   /** Instances to re-render when the overlay changes. */
   listeners: Set<() => void>;
 }
@@ -68,6 +84,7 @@ function scopeState(queryClient: QueryClient, scopeKeyText: string): ScopeState 
       chains: new Map(),
       resolved: new Set(),
       baselines: new Map(),
+      statuses: new Map(),
       listeners: new Set(),
     };
     byKey.set(scopeKeyText, state);
@@ -147,10 +164,19 @@ export function useProactiveInbox(
       void queryClient.cancelQueries({ queryKey: key });
       // The first unconfirmed change on an item records where it stood; later
       // changes build on that, so a failure never restores an optimistic state.
-      if (!scope.baselines.has(id)) scope.baselines.set(id, placesOf(queryClient, key, id));
+      if (!scope.baselines.has(id)) {
+        const places = placesOf(queryClient, key, id);
+        scope.baselines.set(id, places);
+        const known = places[0]?.[1].item.status;
+        if (known) scope.statuses.set(id, { confirmed: known, current: known });
+      }
+      const tracked = scope.statuses.get(id);
       queryClient.setQueriesData<Pages>({ queryKey: key }, (data) =>
-        data ? { ...data, pages: applySuggestionUpdate(data.pages, id, change) } : data,
+        data
+          ? { ...data, pages: applySuggestionUpdate(data.pages, id, change, tracked?.current) }
+          : data,
       );
+      if (tracked) tracked.current = statusAfterUpdate(change);
       const previous = scope.chains.get(id) ?? Promise.resolve();
       const request = previous
         .then(async () => {
@@ -166,10 +192,23 @@ export function useProactiveInbox(
           // A fetch that started while the PATCH was in flight may carry the old
           // status; drop it, then write the server's copy before releasing the overlay.
           await queryClient.cancelQueries({ queryKey: key });
+          // A later change on the same item is still pending: the totals already
+          // reflect it, so only the confirmed state moves here.
+          const latest = scope.pending.get(id) === change;
+          const status = scope.statuses.get(id);
           if (saved) {
             const copy = saved;
             queryClient.setQueriesData<Pages>({ queryKey: key }, (data) =>
-              data ? { ...data, pages: reconcileSuggestion(data.pages, copy) } : data,
+              data
+                ? {
+                    ...data,
+                    pages: reconcileSuggestion(
+                      data.pages,
+                      copy,
+                      latest ? status?.current : undefined,
+                    ),
+                  }
+                : data,
             );
             // The confirmed state is the server's copy where the item stood; the
             // cache may already carry a later unconfirmed change on top of it.
@@ -182,11 +221,28 @@ export function useProactiveInbox(
                   ])
                 : [],
             );
+            if (status) {
+              status.confirmed = copy.status;
+              if (latest) status.current = copy.status;
+            }
           } else {
-            for (const [queryKey, place] of scope.baselines.get(id) ?? []) {
+            const places = scope.baselines.get(id) ?? [];
+            const placed = new Set(places.map(([queryKey]) => JSON.stringify(queryKey)));
+            for (const [queryKey, place] of places) {
               queryClient.setQueryData<Pages>(queryKey, (data) =>
                 data ? { ...data, pages: restoreSuggestion(data.pages, place) } : data,
               );
+            }
+            if (latest && status) {
+              // Lists that never held the item moved their totals by status alone.
+              const delta = unreadDelta(status.current, status.confirmed);
+              for (const [queryKey] of queryClient.getQueriesData<Pages>({ queryKey: key })) {
+                if (placed.has(JSON.stringify(queryKey))) continue;
+                queryClient.setQueryData<Pages>(queryKey, (data) =>
+                  data ? { ...data, pages: adjustUnreadCount(data.pages, delta) } : data,
+                );
+              }
+              status.current = status.confirmed;
             }
           }
         })
@@ -194,6 +250,7 @@ export function useProactiveInbox(
           if (scope.pending.get(id) === change) {
             scope.pending.delete(id);
             scope.baselines.delete(id);
+            scope.statuses.delete(id);
           }
           if (scope.chains.get(id) === request) scope.chains.delete(id);
           scope.inFlight -= 1;
@@ -206,7 +263,11 @@ export function useProactiveInbox(
   );
 
   let pages = query.data?.pages ?? [];
-  for (const [id, change] of state.pending) pages = applySuggestionUpdate(pages, id, change);
+  // Fetched pages carry the server's totals, so the overlay moves them from
+  // the confirmed status to the pending one.
+  for (const [id, change] of state.pending) {
+    pages = applySuggestionUpdate(pages, id, change, state.statuses.get(id)?.confirmed);
+  }
   const first = pages[0];
   const listedStatuses = new Set(statuses);
   return {
