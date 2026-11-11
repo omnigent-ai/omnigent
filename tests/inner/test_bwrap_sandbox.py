@@ -47,6 +47,8 @@ from omnigent.inner.bwrap_sandbox import (
     BwrapSandboxBackend,
     _bwrap_extra_seccomp_rules,
     _detect_host_sandbox_backend,
+    _resolve_grant,
+    _resolve_root,
     _should_bind_host_proc,
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -258,6 +260,34 @@ def _repo_root() -> Path:
 # ---------------------------------------------------------------------------
 # Resolver
 # ---------------------------------------------------------------------------
+
+
+def test_bwrap_grant_through_symlink_out_of_cwd_is_rejected(tmp_path: Path) -> None:
+    cwd = (tmp_path / "ws").resolve()
+    cwd.mkdir()
+    outside = (tmp_path / "outside").resolve()
+    outside.mkdir()
+    (cwd / "linked").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="outside its working directory"):
+        _resolve_grant(cwd, "linked/secret")
+
+
+def test_bwrap_mask_through_symlink_out_of_cwd_still_resolves(tmp_path: Path) -> None:
+    """Masks only deny access, so a symlink that leaves cwd must not fail resolution."""
+    cwd = (tmp_path / "ws").resolve()
+    cwd.mkdir()
+    outside = (tmp_path / "outside").resolve()
+    outside.mkdir()
+    (cwd / "linked").symlink_to(outside, target_is_directory=True)
+    assert _resolve_root(cwd, "linked/secret") == outside / "secret"
+
+
+def test_bwrap_grant_inside_cwd_resolves_through_contained_symlink(tmp_path: Path) -> None:
+    cwd = (tmp_path / "ws").resolve()
+    target = cwd / "target"
+    target.mkdir(parents=True)
+    (cwd / "linked").symlink_to(target, target_is_directory=True)
+    assert _resolve_grant(cwd, "linked/secret") == target / "secret"
 
 
 @pytestmark_bwrap

@@ -128,6 +128,7 @@ from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .sandbox import (
     SandboxBackend,
     SandboxPolicy,
+    _check_relative_grant_containment,
     register_backend,
 )
 
@@ -390,17 +391,17 @@ class SeatbeltSandboxBackend(SandboxBackend):
 
         read_roots: list[Path] | None = None
         if sandbox_spec.read_paths is not None:
-            read_roots = [_resolve_root(cwd, root) for root in sandbox_spec.read_paths]
+            read_roots = [_resolve_grant(cwd, root) for root in sandbox_spec.read_paths]
 
         # Seatbelt-specific default mirroring bwrap: cwd is RO unless
         # the spec opts in. Empty default honours the "no surprise
         # writes" contract — agents that need an editable project
         # tree opt in via ``write_paths: ["."]``.
-        write_roots = [_resolve_root(cwd, grant.path) for grant in sandbox_spec.write_path_specs]
+        write_roots = [_resolve_grant(cwd, grant.path) for grant in sandbox_spec.write_path_specs]
 
         write_files: list[Path] = []
         if sandbox_spec.write_files is not None:
-            write_files.extend(_resolve_root(cwd, path) for path in sandbox_spec.write_files)
+            write_files.extend(_resolve_grant(cwd, path) for path in sandbox_spec.write_files)
 
         cwd_allow_hidden = (
             list(sandbox_spec.cwd_allow_hidden)
@@ -1988,6 +1989,19 @@ def _resolve_root(cwd: Path, root: str) -> Path:
             root,
             str(resolved),
         )
+    return resolved
+
+
+def _resolve_grant(cwd: Path, root: str) -> Path:
+    """
+    Resolve a read or write grant against *cwd* and reject a relative
+    grant whose target leaves *cwd* through a symlink.
+
+    Mask paths use :func:`_resolve_root` directly: a mask only denies
+    access, so a symlink there must not block the launch.
+    """
+    resolved = _resolve_root(cwd, root)
+    _check_relative_grant_containment(cwd, root, resolved)
     return resolved
 
 

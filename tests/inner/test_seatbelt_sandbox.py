@@ -47,6 +47,7 @@ from omnigent.inner.seatbelt_sandbox import (
     _interpreter_install_root,
     _per_user_dyld_cache_subpath,
     _quote,
+    _resolve_grant,
     _resolve_root,
     _symlink_hop_literals,
 )
@@ -2689,3 +2690,37 @@ def test_run_launcher_spawn_wrap_private_tmpdir_boots_under_seatbelt(
         "Target ran but didn't reach the scratch-write marker; "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Grant containment (pure path resolution; runs on any platform)
+# ---------------------------------------------------------------------------
+
+
+def test_seatbelt_grant_through_symlink_out_of_cwd_is_rejected(tmp_path: Path) -> None:
+    cwd = (tmp_path / "ws").resolve()
+    cwd.mkdir()
+    outside = (tmp_path / "outside").resolve()
+    outside.mkdir()
+    (cwd / "linked").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="outside its working directory"):
+        _resolve_grant(cwd, "linked/secret")
+
+
+def test_seatbelt_mask_through_symlink_out_of_cwd_still_resolves(tmp_path: Path) -> None:
+    """Masks only deny access, so a symlink that leaves cwd must not fail resolution."""
+    cwd = (tmp_path / "ws").resolve()
+    cwd.mkdir()
+    outside = (tmp_path / "outside").resolve()
+    outside.mkdir()
+    (cwd / "linked").symlink_to(outside, target_is_directory=True)
+    assert _resolve_root(cwd, "linked/secret") == outside / "secret"
+
+
+def test_seatbelt_grant_inside_cwd_resolves_through_contained_symlink(tmp_path: Path) -> None:
+    cwd = (tmp_path / "ws").resolve()
+    target = cwd / "target"
+    target.mkdir(parents=True)
+    (cwd / "linked").symlink_to(target, target_is_directory=True)
+    assert _resolve_grant(cwd, "linked/secret") == target / "secret"
+

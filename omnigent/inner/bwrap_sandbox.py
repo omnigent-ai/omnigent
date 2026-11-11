@@ -315,18 +315,18 @@ class BwrapSandboxBackend(SandboxBackend):
 
         read_roots: list[Path] | None = None
         if sandbox_spec.read_paths is not None:
-            read_roots = [_resolve_root(cwd, root) for root in sandbox_spec.read_paths]
+            read_roots = [_resolve_grant(cwd, root) for root in sandbox_spec.read_paths]
 
         # Bwrap-specific default: cwd is RO unless the spec opts in.
         # Empty default honors the "no surprise writes" contract from
         # the design plan — agents that need an editable project tree
         # opt in via ``write_paths: ["."]``.
         write_grants = [
-            (_resolve_root(cwd, grant.path), grant.copy_on_write)
+            (_resolve_grant(cwd, grant.path), grant.copy_on_write)
             for grant in sandbox_spec.write_path_specs
         ]
         write_roots = [path for path, _ in write_grants]
-        write_files = [_resolve_root(cwd, path) for path in sandbox_spec.write_files or []]
+        write_files = [_resolve_grant(cwd, path) for path in sandbox_spec.write_files or []]
         copy_on_write_roots = sorted({path for path, disposable in write_grants if disposable})
         for root in copy_on_write_roots:
             if not root.is_dir():
@@ -874,7 +874,18 @@ def _resolve_root(cwd: Path, root: str) -> Path:
     path = Path(expanded)
     if not path.is_absolute():
         path = cwd / path
-    resolved = path.resolve(strict=False)
+    return path.resolve(strict=False)
+
+
+def _resolve_grant(cwd: Path, root: str) -> Path:
+    """
+    Resolve a read or write grant against *cwd* and reject a relative
+    grant whose target leaves *cwd* through a symlink.
+
+    Mask paths use :func:`_resolve_root` directly: a mask only denies
+    access, so a symlink there must not block the launch.
+    """
+    resolved = _resolve_root(cwd, root)
     _check_relative_grant_containment(cwd, root, resolved)
     return resolved
 
