@@ -1,6 +1,6 @@
 // A read-only "Keyboard shortcuts" overlay listing the shortcuts that already
-// exist in the chat surface. The rows come from `@/lib/shortcutCatalog`, which
-// mirrors the live behavior. Nothing here binds new behavior except the
+// exist in the chat surface. The rows come from `@/lib/shortcuts/shortcutPage`,
+// which builds them from the same registry the hotkeys match through. Nothing here binds new behavior except the
 // dialog's own opener (⌘/Ctrl + /), which this component registers.
 //
 // Self-contained: it owns its open state and listens for its opener directly
@@ -28,8 +28,8 @@ import {
   supportsBrowser,
   supportsDesktopCommands,
 } from "@/lib/nativeBridge";
-import { shortcutGroupsFor } from "@/lib/shortcutCatalog";
 import { matchesShortcut } from "@/lib/shortcuts/registry";
+import { shortcutPageGroups } from "@/lib/shortcuts/shortcutPage";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
 // account menu) can open it without threading state through the tree.
@@ -56,7 +56,7 @@ export function KeyboardShortcutsList({
   const isCoarsePointer = useIsCoarsePointer();
   const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
   const serverInfo = useServerInfo();
-  const groups = shortcutGroupsFor({
+  const groups = shortcutPageGroups({
     native: isNativeShell(),
     electron: isElectronShell(),
     browser: supportsBrowser(),
