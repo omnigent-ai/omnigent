@@ -111,9 +111,8 @@ def test_click_pinned_project_session_keeps_project_collapsed(
     # member).
     expect(_section(page, "Pinned").locator(f'a[href="/c/{session_a}"]')).to_be_visible()
 
-    # The project folder auto-expanded when the label was applied; collapse
-    # it manually — this is the state the reporter is in when they click the
-    # pinned row.
+    # Make sure the folder is collapsed — the state the reporter is in when
+    # they click the pinned row.
     folder_header = page.get_by_role("button", name=project, exact=True)
     expect(folder_header).to_be_visible()
     if folder_header.get_attribute("aria-expanded") == "true":
@@ -174,6 +173,10 @@ def test_collapsing_project_of_open_session_stays_collapsed(
 
     page: Page = request.getfixturevalue("page")
     page.goto(f"{base_url}/c/{member_id}")
+    # Arriving doesn't open the folder: it stays collapsed and holds the open session.
+    folder_header = page.get_by_role("button", name=project, exact=True)
+    expect(folder_header).to_have_attribute("aria-expanded", "false")
+    expect(_section(page, project).locator(f'a[href="/c/{member_id}"]')).to_have_count(1)
     pinned_row = _row(page, pinned_id)
     expect(pinned_row).to_be_visible()
     pinned_row.hover()
@@ -182,7 +185,8 @@ def test_collapsing_project_of_open_session_stays_collapsed(
     pinned_link.click()
     expect(page).to_have_url(re.compile(rf"/c/{pinned_id}$"))
 
-    folder_header = page.get_by_role("button", name=project, exact=True)
+    expect(_section(page, project).locator(f'a[href="/c/{member_id}"]')).to_have_count(0)
+    folder_header.click()
     expect(folder_header).to_have_attribute("aria-expanded", "true")
     _section(page, project).locator(f'a[href="/c/{member_id}"]').click()
     expect(page).to_have_url(re.compile(rf"/c/{member_id}$"))
@@ -192,8 +196,10 @@ def test_collapsing_project_of_open_session_stays_collapsed(
     with httpx.Client(base_url=base_url) as client:
         send_user_text(client, session_id=pinned_id, text=f"pinned-activity-{nonce}")
     poll_until(lambda: _reply_landed(base_url, pinned_id, reply), timeout_s=60, interval_s=0.25)
-    # The unread marker shows once the sidebar has applied the pinned session's update.
-    expect(pinned_link).to_contain_text("(unread)", timeout=30_000)
+    # Wait on a rename, not the unread dot: the dot compares whole seconds, so a
+    # fast reply can land in the same second the pinned session was last seen.
+    _set_title(base_url, pinned_id, f"pinned-renamed-{nonce}")
+    expect(pinned_link).to_contain_text(f"pinned-renamed-{nonce}", timeout=30_000)
 
     expect(folder_header).to_have_attribute("aria-expanded", "false")
     assert project not in json.loads(

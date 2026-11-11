@@ -2895,45 +2895,8 @@ function ConversationList({
     onExitSelectionMode,
   ]);
 
-  // The project the currently-selected session is filed under, if any. Derived
-  // as a primitive so the auto-expand effect below only fires when the
-  // selection (or its project) changes — not on every background list refetch,
-  // which would re-open a folder the user just collapsed.
-  const activeProjectName = useMemo(() => {
-    if (!displayedActiveId) return null;
-    const active = allConversations.find((c) => c.id === displayedActiveId);
-    if (!active) {
-      // A row loaded only by its folder's own query resolves to that folder.
-      for (const [name, folder] of folderConversations) {
-        if (folder.conversations.some((c) => c.id === displayedActiveId)) return name;
-      }
-      return null;
-    }
-    // Live views list an archived session outside its folder.
-    if (active.archived === true && activeTab !== "archived") return null;
-    return projects.find((p) => sessionBelongsToProject(active, p, viewerId))?.name ?? null;
-  }, [displayedActiveId, allConversations, folderConversations, activeTab, projects, viewerId]);
-  // Reveal the selected session's folder once per navigation and project, so a later
-  // pin, parent lookup or route commit can't re-open a folder the user collapsed.
-  // Pinned sessions are skipped (the Pinned section shows them) until unpinned.
-  const selectedRouteId = optimisticActiveId ?? activeId ?? null;
-  const autoExpanded = useRef<{ id: string | null; project: string | null }>({
-    id: null,
-    project: null,
-  });
-  useEffect(() => {
-    if (autoExpanded.current.id !== selectedRouteId) {
-      autoExpanded.current = { id: selectedRouteId, project: null };
-    }
-    if (!displayedActiveId || !activeProjectName) return;
-    if (pinnedSet.has(displayedActiveId)) {
-      autoExpanded.current.project = null;
-      return;
-    }
-    if (autoExpanded.current.project === activeProjectName) return;
-    autoExpanded.current.project = activeProjectName;
-    expandProject(activeProjectName);
-  }, [selectedRouteId, displayedActiveId, activeProjectName, pinnedSet, expandProject]);
+  // Navigating never opens a folder: a collapsed folder lists only the open
+  // session (its held row), so folders open and close only when the user says so.
   // A folder's rows in render order: those above "Show more" while expanded,
   // otherwise the open session it holds under its collapsed header.
   const folderListedRows = useCallback(
