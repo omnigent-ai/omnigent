@@ -2607,9 +2607,10 @@ class PiExecutor(Executor):
         The refresh runs in its own task, so a helper too slow for Pi's command
         deadline still finishes and serves later requests. A bridge request waits
         only as long as that deadline allows; a ``before_turn`` request waits for the
-        refresh itself. If time runs out, the previous token is served while its
-        ``exp`` claim leaves it valid. A helper that fails, or a token without an
-        expiry, still fails the request.
+        refresh itself. If time runs out, including a helper that outlives its own
+        budget, the previous token is served while its ``exp`` claim leaves it valid.
+        A helper that exits with an error, or a token without an expiry, still fails
+        the request.
         """
         try:
             async with asyncio.timeout(None if before_turn else _GATEWAY_AUTH_TIMEOUT_S):

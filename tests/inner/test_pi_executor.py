@@ -2519,26 +2519,47 @@ async def test_gateway_slow_refresh_reuses_only_an_unexpired_token(
         await executor.close()
 
 
-async def test_gateway_failed_refresh_never_reuses_the_cached_token(tmp_path):
-    # Only a slow refresh may fall back. A helper that fails (signed out, revoked) must fail
-    # the request even while the cached token has plenty of lifetime left.
-    token = _jwt_expiring_in(600)
-    fail_flag = tmp_path / "fail"
+@pytest.mark.parametrize(
+    ("broken_helper", "cached", "outcome"),
+    [
+        ("exit 1", "jwt", "command failed"),
+        ("sleep 30", "jwt", None),
+        ("sleep 30", "opaque", "timed out"),
+    ],
+    ids=["failing-helper", "hung-helper", "hung-helper-opaque-token"],
+)
+async def test_gateway_refresh_falls_back_only_for_a_slow_helper(
+    tmp_path, monkeypatch, broken_helper, cached, outcome
+):
+    # A helper that exits with an error (signed out, revoked) fails the request even while
+    # the cached token has plenty of lifetime left. One that outlives its own budget only
+    # ran slow, so an unexpired token still covers it, on both waiting paths.
+    from omnigent.inner import pi_executor
+
+    # The helper's budget ends before the bridge stops waiting, so both paths see it lapse.
+    monkeypatch.setattr(pi_executor, "_GATEWAY_TURN_AUTH_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 5)
+    token = _jwt_expiring_in(600) if cached == "jwt" else "opaque-token"
+    broken_flag = tmp_path / "broken"
     executor = PiExecutor(
         pi_path="/usr/bin/pi",
         gateway=True,
         gateway_host="https://example.test",
         gateway_auth_command=(
-            f"if [ -e {shlex.quote(str(fail_flag))} ]; then exit 1; fi; printf %s {token}"
+            f"if [ -e {shlex.quote(str(broken_flag))} ]; then {broken_helper}; fi; "
+            f"printf %s {token}"
         ),
         gateway_auth_refresh_interval_ms="0",
     )
     try:
         assert await executor._get_gateway_token(before_turn=True) == token
-        fail_flag.touch()
+        broken_flag.touch()
         for before_turn in (False, True):
-            with pytest.raises(OSError, match="command failed"):
-                await executor._get_gateway_token(before_turn=before_turn)
+            if outcome is None:
+                assert await executor._get_gateway_token(before_turn=before_turn) == token
+            else:
+                with pytest.raises(OSError, match=outcome):
+                    await executor._get_gateway_token(before_turn=before_turn)
     finally:
         await executor.close()
 
