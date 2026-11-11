@@ -21,12 +21,17 @@ import {
 
 export const TERMINAL_COPY_BLOCKED_MESSAGE = "Copying from this terminal is blocked.";
 const PASTE_NOT_CONNECTED_MESSAGE = "The terminal isn't connected, so nothing was pasted.";
+const PASTE_CHANGED_MESSAGE =
+  "The terminal changed while the clipboard was read, so nothing was pasted.";
 
 /**
  * What happened to pasted text: sent, refused because the terminal can't take
  * input, or held back so the user can review multi-line text first.
  */
 export type TerminalPasteResult = "pasted" | "unavailable" | "review";
+
+/** Whether the terminal a clipboard read started for can still take its text. */
+export type TerminalPasteTarget = "current" | "disconnected" | "changed";
 
 interface PasteBoxState {
   text: string;
@@ -44,6 +49,8 @@ interface TerminalTouchClipboardBarProps {
   readText: () => string;
   /** Whether the user's terminal clipboard choice blocks copying. */
   isCopyBlocked: () => boolean;
+  /** Called as a clipboard read starts; the returned check runs when it finishes. */
+  startPaste: () => () => TerminalPasteTarget;
   /** Sends pasted text to the terminal; `reviewed` skips the multi-line review. */
   onPaste: (text: string, reviewed: boolean) => TerminalPasteResult;
 }
@@ -54,6 +61,7 @@ export function TerminalTouchClipboardBar({
   pasteEnabled,
   readText,
   isCopyBlocked,
+  startPaste,
   onPaste,
 }: TerminalTouchClipboardBarProps) {
   const [sheetText, setSheetText] = useState<string | null>(null);
@@ -82,6 +90,7 @@ export function TerminalTouchClipboardBar({
   };
 
   const paste = async () => {
+    const target = startPaste();
     // Read inside the tap so the platform can show its own paste confirmation.
     let text: string | null;
     try {
@@ -91,6 +100,11 @@ export function TerminalTouchClipboardBar({
     }
     const latest = latestRef.current;
     if (!latest.mounted || !latest.pasteAvailable) return;
+    const current = target();
+    if (current !== "current") {
+      toast.error(current === "disconnected" ? PASTE_NOT_CONNECTED_MESSAGE : PASTE_CHANGED_MESSAGE);
+      return;
+    }
     // Refused or unsupported reads fall back to a paste box.
     if (text === null) setPasteBox({ text: "", review: false });
     else if (!text) toast.info("The clipboard has no text to paste.");
@@ -167,6 +181,9 @@ function TerminalCopySheet({
   const textRef = useRef<HTMLPreElement | null>(null);
   const [selection, setSelection] = useState("");
   const open = text !== null;
+  // Counts openings so a copy that finishes late can't close a reopened sheet.
+  const openingRef = useRef(0);
+  const isCopyAllowed = () => !isCopyBlocked();
 
   // Track the selection inside the sheet. Tapping the Copy button can collapse
   // it on touch devices, so keep the last one until a tap inside the text clears it.
@@ -175,6 +192,7 @@ function TerminalCopySheet({
       setSelection("");
       return;
     }
+    openingRef.current += 1;
     const onSelectionChange = () => {
       const current = document.getSelection();
       const node = textRef.current;
@@ -202,12 +220,13 @@ function TerminalCopySheet({
       toast.info(TERMINAL_COPY_BLOCKED_MESSAGE, { id: "terminal-clipboard-blocked" });
       return;
     }
-    if (!(await writeExplicitTerminalClipboardText(selection || text))) {
+    const opening = openingRef.current;
+    if (!(await writeExplicitTerminalClipboardText(selection || text, isCopyAllowed))) {
       toast.error("Couldn't copy. Select the text and choose Copy from the menu.");
       return;
     }
     toast.success(selection ? "Copied selection" : "Copied terminal text");
-    onClose();
+    if (openingRef.current === opening) onClose();
   };
 
   const onNativeCopy = (event: ClipboardEvent<HTMLPreElement>) => {
@@ -220,7 +239,7 @@ function TerminalCopySheet({
     // land after it, so write the selection again once that copy finishes.
     const selected = document.getSelection()?.toString();
     if (selected && isTerminalClipboardWritePending()) {
-      void writeExplicitTerminalClipboardText(selected);
+      void writeExplicitTerminalClipboardText(selected, isCopyAllowed);
     }
   };
 
@@ -288,7 +307,7 @@ function TerminalPasteBox({
           <DialogTitle>Paste into terminal</DialogTitle>
           <DialogDescription id={descriptionId}>
             {state?.review
-              ? "This text has more than one line, and each line may run as a command. Check it, then send it."
+              ? "Each line of this text may run as a command, and a tab may complete it. Check it, then send it."
               : "Paste your text here, then send it to the terminal."}
           </DialogDescription>
         </DialogHeader>

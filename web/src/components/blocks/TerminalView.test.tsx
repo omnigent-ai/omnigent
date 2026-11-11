@@ -1393,22 +1393,25 @@ describe("touch clipboard bar", () => {
     expect(screen.getByRole("button", { name: "Paste" })).toBeDisabled();
   });
 
-  it("asks for a review before sending lines a shell would run one by one", async () => {
-    setCoarsePointer(true);
-    const { terminal } = await renderTouchView();
-    act(() => terminal.onState({ kind: "connected" }));
-    terminal.pastesBracketed.mockReturnValue(false);
-    mockClipboardRead(async () => "cd /tmp\nrm -rf build");
+  it.each(["cd /tmp\nmake", "rm -rf bu\t"])(
+    "asks for a review before sending %j, which a shell would act on as it arrives",
+    async (text) => {
+      setCoarsePointer(true);
+      const { terminal } = await renderTouchView();
+      act(() => terminal.onState({ kind: "connected" }));
+      terminal.pastesBracketed.mockReturnValue(false);
+      mockClipboardRead(async () => text);
 
-    fireEvent.click(screen.getByRole("button", { name: "Paste" }));
-    const box = await screen.findByTestId("terminal-paste-box");
-    expect(terminal.paste).not.toHaveBeenCalled();
-    expect(within(box).getByLabelText("Text to paste")).toHaveValue("cd /tmp\nrm -rf build");
-    fireEvent.click(within(box).getByRole("button", { name: "Send to terminal" }));
+      fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+      const box = await screen.findByTestId("terminal-paste-box");
+      expect(terminal.paste).not.toHaveBeenCalled();
+      expect(within(box).getByLabelText("Text to paste")).toHaveValue(text);
+      fireEvent.click(within(box).getByRole("button", { name: "Send to terminal" }));
 
-    expect(terminal.paste).toHaveBeenCalledWith("cd /tmp\nrm -rf build");
-    await waitFor(() => expect(screen.queryByTestId("terminal-paste-box")).toBeNull());
-  });
+      expect(terminal.paste).toHaveBeenCalledWith(text);
+      await waitFor(() => expect(screen.queryByTestId("terminal-paste-box")).toBeNull());
+    },
+  );
 
   it("sends multi-line text directly when the program takes bracketed pastes", async () => {
     setCoarsePointer(true);
@@ -1419,6 +1422,72 @@ describe("touch clipboard bar", () => {
     fireEvent.click(screen.getByRole("button", { name: "Paste" }));
 
     await waitFor(() => expect(terminal.paste).toHaveBeenCalledWith("first\nsecond"));
+    expect(screen.queryByTestId("terminal-paste-box")).toBeNull();
+  });
+
+  it("drops a paste whose clipboard read outlasts the terminal being shown", async () => {
+    setCoarsePointer(true);
+    const { terminal, rerender } = await renderTouchView();
+    act(() => terminal.onState({ kind: "connected" }));
+    let finishRead!: (text: string) => void;
+    mockClipboardRead(
+      () =>
+        new Promise<string>((resolve) => {
+          finishRead = resolve;
+        }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+    rerender(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        readOnly={false}
+        active={false}
+      />,
+    );
+    await act(async () => finishRead("echo late"));
+
+    expect(terminal.paste).not.toHaveBeenCalled();
+    expect(terminal.focus).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("terminal-paste-box")).toBeNull();
+  });
+
+  it("drops a paste whose clipboard read outlasts a reconnect", async () => {
+    setCoarsePointer(true);
+    const { terminal, rerender } = await renderTouchView();
+    act(() => terminal.onState({ kind: "connected" }));
+    terminal.pastesBracketed.mockReturnValue(false);
+    let finishRead!: (text: string) => void;
+    mockClipboardRead(
+      () =>
+        new Promise<string>((resolve) => {
+          finishRead = resolve;
+        }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+    act(() => terminal.onState({ kind: "closed", reason: "network", code: 1006 }));
+    rerender(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        readOnly={false}
+        resumeGeneration={1}
+      />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    const nextTerminal = terminalSessionMock.instances[1];
+    act(() => nextTerminal.onState({ kind: "connected" }));
+    await act(async () => finishRead("echo late\n"));
+
+    expect(
+      await screen.findByText(
+        "The terminal changed while the clipboard was read, so nothing was pasted.",
+      ),
+    ).toBeInTheDocument();
+    expect(terminal.paste).not.toHaveBeenCalled();
+    expect(nextTerminal.paste).not.toHaveBeenCalled();
     expect(screen.queryByTestId("terminal-paste-box")).toBeNull();
   });
 

@@ -407,10 +407,13 @@ export function terminalBufferText(
   return newestFirst.reverse().join("\n");
 }
 
-/** Remove C0 and C1 control characters other than tab and line breaks. */
+/** C0 and C1 control characters other than tab and line feed, unsafe to paste. */
+// oxlint-disable-next-line no-control-regex
+const PASTE_CONTROL_CHARACTERS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
+
+/** Turn line breaks into LF and remove the other control characters. */
 export function stripPasteControlCharacters(text: string): string {
-  // oxlint-disable-next-line no-control-regex
-  return text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "");
+  return text.replace(/\r\n?/g, "\n").replace(PASTE_CONTROL_CHARACTERS, "");
 }
 
 /** Largest tmux selection accepted for a browser clipboard write. */
@@ -1058,10 +1061,7 @@ export class TerminalSession {
   /** Paste without Enter, waiting briefly for safe multiline input support. */
   pasteCommand(text: string, onResult: (error: string | null) => void): () => void {
     const command = text.replace(/\r\n/g, "\n").replace(/\n$/, "");
-    const hasControlCharacters = Array.from(command).some((char) => {
-      const code = char.charCodeAt(0);
-      return (code < 32 && code !== 9 && code !== 10) || (code >= 127 && code <= 159);
-    });
+    const hasControlCharacters = command.search(PASTE_CONTROL_CHARACTERS) !== -1;
     if (hasControlCharacters || this.disposed || this.ws.readyState !== WebSocket.OPEN) {
       onResult(
         hasControlCharacters

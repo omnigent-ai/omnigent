@@ -1419,6 +1419,8 @@ describe("TerminalSession", () => {
     // A pasted end marker must not close the bracket early and run what follows.
     session.paste("a\x1b[201~rm -rf x\x07\tb");
     expect(inputs().at(-1)).toBe("\x1b[200~a[201~rm -rf x\tb\x1b[201~");
+    session.paste("one\rtwo");
+    expect(inputs().at(-1)).toBe("\x1b[200~one\rtwo\x1b[201~");
     session.dispose();
     expect(session.paste("ls")).toBe(false);
   });

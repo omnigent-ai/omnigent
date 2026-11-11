@@ -22,8 +22,8 @@ reattach when the session moves to another host.
   terminal offers Copy and Paste. Copy opens a sheet of the terminal text for
   native selection, with Copy selection / Copy all. Paste sends the clipboard as
   terminal input, or opens a paste box when the clipboard can't be read.
-  Multi-line text opens the same box for review first unless the program takes
-  bracketed pastes; control characters are dropped from every paste.
+  Text with line breaks or tabs opens the same box for review first unless the
+  program takes bracketed pastes; control characters are dropped from every paste.
   Read-only terminals show Copy only; a blocked terminal clipboard blocks Copy.
 - `reconnect`: after the terminal connection drops, the terminal shows that it
   is reconnecting and then reattaches without user action.
@@ -78,7 +78,7 @@ with their own terminal retain the switcher.
 - Tap Copy in the bar under the terminal to open the copy sheet. Select text
   natively and tap Copy selection, or tap Copy all.
 - Tap Paste in the same bar. If the clipboard can't be read, or the text has
-  more than one line and needs review, a paste box opens; tap Send to terminal.
+  line breaks or tabs and needs review, a paste box opens; tap Send to terminal.
 
 **User shells:**
 
