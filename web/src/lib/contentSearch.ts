@@ -98,7 +98,7 @@ export function wholeWordRegexProblem(query: string): WholeWordRegexProblem | nu
       classStart = classStart && character === "^" && query[index - 1] === "[";
     } else if (character === "(") {
       // A flag group, `(?flags)` or `(?flags:…)`; the flags before any `-` are turned on.
-      const flags = /^\?([A-Za-z-]*)[):]/.exec(query.slice(index + 1));
+      const flags = query.slice(index + 1).match(/^\?([A-Za-z-]*)[):]/);
       if (flags?.[1].split("-")[0].includes("x")) return "verbose";
       groups += 1;
     } else if (character === ")") {
