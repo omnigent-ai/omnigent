@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: omnigent-substrate-config
+  namespace: omnigent
+data:
+  config.yaml: |
+    sandbox:
+      provider: substrate
+      server_url: https://omnigent.example.com
+      substrate:
+        endpoint: api.ate-system.svc:443
+        atespace: omnigent-runners
+        actor_template: omnigent-host-v1
+        api_ca_file: /var/run/substrate/serving-ca.pem
+        api_token_file: /var/run/substrate/api-token
+        router_url: https://atenet-router.ate-system.svc
+        router_ca_file: /var/run/substrate/serving-ca.pem
+        router_identity_file: /var/run/substrate/router-identity.pem
+        egress_policy_file: /etc/omnigent/substrate-egress.yaml
+  substrate-egress.yaml: |
+    rules:
+      - tlsPassthrough:
+          hostnames: [omnigent.example.com]
+          ports: {numbers: [443]}
+      - tlsPassthrough:
+          hostnames: [github.com]
+          ports: {numbers: [443]}

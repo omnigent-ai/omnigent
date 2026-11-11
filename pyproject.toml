@@ -215,6 +215,8 @@ workspace-api = ["connectrpc>=0.13,<0.14"]
 # package and imports the official client lazily, so only users of the
 # provider need this extra.
 kubernetes = ["kubernetes>=36,<38"]
+# Agent Substrate Control client; generated schema targets protobuf 6.33.
+substrate = ["grpcio>=1.68,<2", "protobuf>=6.33.5,<8"]
 # AWS Lambda MicroVMs launcher (server-managed `sandbox.provider:
 # lambda_microvm`). The launcher module ships in the base package and imports
 # boto3 lazily, so only users of the provider need this extra. Floor is the
@@ -360,6 +362,8 @@ test = [
     "hindsight-client>=0.4.0",
     "nimble-python>=1.2.0,<2",
     "connectrpc>=0.13,<0.14",
+    "grpcio>=1.68,<2",
+    "protobuf>=6.33.5,<8",
     "pytest-asyncio>=0.21",
     "pytest-xdist>=3.6",
     # Line coverage during the unit-test matrix. Each CI shard writes its
@@ -469,6 +473,8 @@ where = ["."]
 include = ["omnigent*"]
 
 [tool.setuptools.package-data]
+"omnigent.api.substrate" = ["README.md"]
+"omnigent.api.substrate.v1" = ["*.proto", "*.pyi"]
 "omnigent.db" = ["alembic.ini"]
 "omnigent.db.migrations" = ["script.py.mako"]
 "omnigent.resources.examples" = ["*.yaml", "*.sh", "debby/**/*", "polly/**/*"]

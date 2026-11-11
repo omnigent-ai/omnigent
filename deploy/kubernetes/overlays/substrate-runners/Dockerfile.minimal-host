@@ -1,0 +1,16 @@
+# SDK-based workloads without the standalone native-harness CLI image layers.
+# Supply the server image built from this checkout by immutable digest.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git tmux bubblewrap procps \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd -g 1000660000 sandbox \
+ && useradd -m -d /home/omnigent -u 1000660000 -g sandbox sandbox \
+ && install -d -m 700 -o sandbox -g sandbox /run/omnigent-bootstrap \
+ && echo 'export PATH="/opt/venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
+ENV HOME=/home/omnigent IS_SANDBOX=1
+WORKDIR /home/omnigent
+USER sandbox
+CMD ["python3", "-m", "omnigent.host.substrate_bootstrap"]

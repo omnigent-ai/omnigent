@@ -113,6 +113,7 @@ def test_available_providers_returns_builtins() -> None:
     assert "blaxel" in names
     assert "gensee" in names
     assert "kubernetes" in names
+    assert "substrate" in names
 
 
 def test_get_provider_metadata_known_provider() -> None:

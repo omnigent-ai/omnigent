@@ -334,6 +334,11 @@ omnigent run path/to/agent.yaml --server https://your-host
 
 ## Run hosts in cloud sandboxes
 
+For self-hosted Kubernetes deployments, the experimental
+[Substrate runner overlay](kubernetes/overlays/substrate-runners/README.md) runs
+managed hosts as Actors. See its runbook for the current lifecycle support and
+qualification limits.
+
 Don't want a laptop to be the host? Run the host in a cloud sandbox instead.
 
 **From the CLI (Modal, Daytona, Blaxel, Islo, or E2B).** Install the provider extra when needed (`pip install 'omnigent[modal]'`, `'omnigent[daytona]'`, `'omnigent[blaxel]'`, or `'omnigent[e2b]'`; Islo uses the built-in HTTP client). Authenticate with `modal token new`, `DAYTONA_API_KEY`, Blaxel's `BL_WORKSPACE` and `BL_API_KEY`, `ISLO_API_KEY`, or `E2B_API_KEY`. Then run:

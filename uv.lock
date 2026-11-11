@@ -3432,6 +3432,11 @@ s3 = [
 slack = [
     { name = "omnigent-slack" },
 ]
+substrate = [
+    { name = "grpcio" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
+    { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
+]
 tracing = [
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
@@ -3456,11 +3461,13 @@ dev = [
     { name = "build" },
     { name = "connectrpc" },
     { name = "filelock" },
+    { name = "grpcio" },
     { name = "grpcio-tools" },
     { name = "hindsight-client" },
     { name = "moto", extra = ["s3"], marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "nimble-python" },
     { name = "pre-commit" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
     { name = "protoc-gen-connectrpc" },
     { name = "pyrefly" },
     { name = "pytest" },
@@ -3488,9 +3495,12 @@ test = [
     { name = "build" },
     { name = "connectrpc" },
     { name = "filelock" },
+    { name = "grpcio" },
     { name = "hindsight-client" },
     { name = "moto", extra = ["s3"] },
     { name = "nimble-python" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
+    { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
@@ -3539,6 +3549,7 @@ requires-dist = [
     { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1,<2" },
     { name = "google-antigravity", marker = "extra == 'antigravity'", specifier = ">=0.1,<1" },
     { name = "google-auth", marker = "extra == 'vertex'", specifier = ">=2.0,<3" },
+    { name = "grpcio", marker = "extra == 'substrate'", specifier = ">=1.68,<2" },
     { name = "hindsight-client", marker = "extra == 'hindsight'", specifier = ">=0.4.0" },
     { name = "httpx", specifier = ">=0.27,<1" },
     { name = "hvac", marker = "extra == 'vault'", specifier = ">=2,<3" },
@@ -3581,6 +3592,7 @@ requires-dist = [
     { name = "prompt-toolkit", specifier = ">=3.0,<4" },
     { name = "protobuf", specifier = ">=6,<8" },
     { name = "protobuf", marker = "extra == 'antigravity'", specifier = ">=7,<8" },
+    { name = "protobuf", marker = "extra == 'substrate'", specifier = ">=6.33.5,<8" },
     { name = "psutil", specifier = ">=5.9,<8" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'cockroachdb'", specifier = ">=3.1,<4" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.1,<4" },
@@ -3603,7 +3615,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "cockroachdb", "all", "bedrock", "kms", "s3", "vertex", "modal", "daytona", "blaxel", "boxlite", "microsandbox", "cwsandbox", "e2b", "islo", "openshell", "workspace-api", "kubernetes", "lambda-microvm", "vault", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "nimble", "slack", "postgres", "databricks", "loadtest"]
+provides-extras = ["claude-sdk", "openai-agents", "cockroachdb", "all", "bedrock", "kms", "s3", "vertex", "modal", "daytona", "blaxel", "boxlite", "microsandbox", "cwsandbox", "e2b", "islo", "openshell", "workspace-api", "kubernetes", "substrate", "lambda-microvm", "vault", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "nimble", "slack", "postgres", "databricks", "loadtest"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -3611,11 +3623,13 @@ dev = [
     { name = "build", specifier = ">=1.2" },
     { name = "connectrpc", specifier = ">=0.13,<0.14" },
     { name = "filelock", specifier = ">=3.0" },
+    { name = "grpcio", specifier = ">=1.68,<2" },
     { name = "grpcio-tools", specifier = ">=1.68,<=1.81.1" },
     { name = "hindsight-client", specifier = ">=0.4.0" },
     { name = "moto", extras = ["s3"], specifier = ">=5,<6" },
     { name = "nimble-python", specifier = ">=1.2.0,<2" },
     { name = "pre-commit", specifier = ">=3.5" },
+    { name = "protobuf", specifier = ">=6.33.5,<8" },
     { name = "protoc-gen-connectrpc", specifier = ">=0.13,<0.14" },
     { name = "pyrefly", specifier = "==1.1.1" },
     { name = "pytest", specifier = ">=7.0" },
@@ -3643,9 +3657,11 @@ test = [
     { name = "build", specifier = ">=1.2" },
     { name = "connectrpc", specifier = ">=0.13,<0.14" },
     { name = "filelock", specifier = ">=3.0" },
+    { name = "grpcio", specifier = ">=1.68,<2" },
     { name = "hindsight-client", specifier = ">=0.4.0" },
     { name = "moto", extras = ["s3"], specifier = ">=5,<6" },
     { name = "nimble-python", specifier = ">=1.2.0,<2" },
+    { name = "protobuf", specifier = ">=6.33.5,<8" },
     { name = "pytest", specifier = ">=7.0" },
     { name = "pytest-asyncio", specifier = ">=0.21" },
     { name = "pytest-cov", specifier = ">=5" },
