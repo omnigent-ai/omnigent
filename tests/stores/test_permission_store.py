@@ -180,6 +180,32 @@ def test_grant_unless_higher_raises_but_never_lowers(
     assert store.get("erin@test.com", conv_id).level == 3  # type: ignore[union-attr]
 
 
+def test_grant_unless_higher_keeps_a_higher_grant_its_read_missed(
+    store: SqlAlchemyPermissionStore, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The conditional upsert alone keeps a grant inserted after the method's own read."""
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlSessionPermission
+
+    _ensure_user(store, "fay@test.com")
+    conv_id = _create_conversation(db_uri)
+    store.grant("fay@test.com", conv_id, level=3)
+    real_get = Session.get
+
+    def read_before_the_concurrent_insert(
+        self: Session, entity: object, ident: object, **kw: object
+    ):
+        if entity is SqlSessionPermission:
+            return None
+        return real_get(self, entity, ident, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Session, "get", read_before_the_concurrent_insert)
+    store.grant_unless_higher("fay@test.com", conv_id, level=1)
+    monkeypatch.undo()
+    assert store.get("fay@test.com", conv_id).level == 3  # type: ignore[union-attr]
+
+
 def test_grant_with_public_sentinel(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
     """``grant`` with the ``__public__`` sentinel user_id works like any other user.
 

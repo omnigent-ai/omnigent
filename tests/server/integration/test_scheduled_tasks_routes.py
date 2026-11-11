@@ -24,6 +24,7 @@ from fastapi import FastAPI
 
 from omnigent.automations_availability import AUTOMATIONS_HEADER
 from omnigent.db.utils import builtin_agent_id
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME, CODEX_NATIVE_AGENT_NAME
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
@@ -3106,7 +3107,7 @@ async def test_create_can_continue_a_session_the_owner_picked(
 
 
 async def test_share_with_round_trips_and_rejects_shares_the_owner_could_not_add(
-    auth_app: FastAPI, auth_client: httpx.AsyncClient
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     info = (await auth_client.get("/v1/info", headers=_headers())).json()
     assert info["scheduled_task_sharing"] is True
@@ -3132,6 +3133,25 @@ async def test_share_with_round_trips_and_rejects_shares_the_owner_could_not_add
         resp = await auth_client.patch(task_url, json={"share_with": shares}, headers=_headers())
         assert resp.status_code == status, (shares, resp.text)
         assert message in resp.json()["error"]["message"]
+
+    # A store that resolves principals refuses one it cannot find, leaving the task as saved.
+    def refuse_ghosts(self: object, user_id: str) -> None:
+        if user_id == "ghost-group":
+            raise OmnigentError(
+                "No user or group named 'ghost-group'", code=ErrorCode.INVALID_INPUT
+            )
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "validate_grantee", refuse_ghosts)
+    ghost = await auth_client.patch(
+        task_url,
+        json={"share_with": [team, {"user_id": "ghost-group", "level": 1}]},
+        headers=_headers(),
+    )
+    assert ghost.status_code == 400, ghost.text
+    assert (await auth_client.get(task_url, headers=_headers())).json()["share_with"] == [
+        team,
+        bob,
+    ]
     owner_level = await auth_client.patch(
         task_url,
         json={"share_with": [{"user_id": "bob@example.com", "level": 4}]},
@@ -3159,6 +3179,48 @@ async def test_share_with_round_trips_and_rejects_shares_the_owner_could_not_add
     assert cleared.json()["share_with"] == []
     stored = await auth_client.get(task_url, headers=_headers())
     assert stored.json()["share_with"] == []
+
+
+async def test_shares_saved_while_an_agent_retargets_never_reach_its_new_session(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An agent retarget validated against no shares fails if the owner shares meanwhile."""
+    from omnigent.entities import ScheduledTaskShare
+    from omnigent.server.scheduled import fire as fire_mod
+
+    first, second = _owned_session(db_uri), _owned_session(db_uri)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(session_mode="continue", session_id=first),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+    conversations = SqlAlchemyConversationStore(db_uri)
+    source = conversations.create_conversation()
+    SqlAlchemyPermissionStore(db_uri).grant("alice@example.com", source.id, 4)
+    conversations.set_runner_id(source.id, "stable-runner")
+    checking = fire_mod.continued_session_problem
+
+    async def owner_shares_during_the_check(task: Any, conv: Any, **kwargs: Any) -> Any:
+        # The owner's save commits while the agent's retarget is being validated.
+        SqlAlchemyScheduledTaskStore(db_uri).update(
+            task_id, share_with=(ScheduledTaskShare("team.engineering", 1),)
+        )
+        return await checking(task, conv, **kwargs)
+
+    monkeypatch.setattr(fire_mod, "continued_session_problem", owner_shares_during_the_check)
+    transport = httpx.ASGITransport(app=auth_app, client=("127.0.0.1", 12345))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as agent:
+        retarget = await agent.patch(
+            f"/v1/scheduled-tasks/{task_id}",
+            json={"session_id": second},
+            headers={**_headers(), ORCHESTRATION_SOURCE_HEADER: source.id},
+        )
+
+    assert retarget.status_code == 409, retarget.text
+    assert SqlAlchemyPermissionStore(db_uri).get("team.engineering", second) is None
+    assert SqlAlchemyScheduledTaskStore(db_uri).get(task_id).session_id == first  # type: ignore[union-attr]
 
 
 async def test_shares_reach_a_continued_session_without_lowering_access(
@@ -3720,6 +3782,15 @@ async def test_a_patch_that_picks_a_session_takes_no_agent_copy(
     monkeypatch.setattr(scheduled_tasks_routes, "agent_for_user", _copy)
     codex = builtin_agent_id(CODEX_NATIVE_AGENT_NAME)
     session_id = _owned_session(db_uri, agent_id=codex)
+
+    # An agent switch whose shares are refused copies nothing it would then leave behind.
+    refused = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"agent_id": codex, "share_with": [{"user_id": "alice@example.com", "level": 1}]},
+        headers=_headers(),
+    )
+    assert refused.status_code == 400, refused.text
+    assert copies == []
 
     patched = await auth_client.patch(
         f"/v1/scheduled-tasks/{created['id']}",

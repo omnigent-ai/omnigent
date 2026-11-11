@@ -2737,6 +2737,10 @@ async def test_fire_shares_the_run_with_the_tasks_grantees(
         return "/home/alice"
 
     monkeypatch.setattr(fire_mod, "_resolve_default_workspace", _home)
+    announced: list[str | None] = []
+    monkeypatch.setattr(
+        fire_mod, "_announce_session_added", lambda user_id, _session: announced.append(user_id)
+    )
     perm = FakePermissionStore(fail_grant_users={"broken@example.com"})
     task = _task(
         workspace=workspace,
@@ -2768,6 +2772,10 @@ async def test_fire_shares_the_run_with_the_tasks_grantees(
         (RESERVED_USER_LOCAL, session_id, LEVEL_OWNER),
         *([("team.engineering", session_id, LEVEL_READ)] if read_shared else []),
     ]
+    # Only the owner and the grantees actually shared with learn of the session.
+    assert [user for user in announced if user not in (None, RESERVED_USER_LOCAL)] == (
+        ["team.engineering"] if read_shared else []
+    )
     assert store.runs and store.runs[0]["status"] == "running"
 
 
