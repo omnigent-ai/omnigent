@@ -1,15 +1,44 @@
-"use strict";
+import { normalizeSavedServerUrl, databricksWorkspaceUiUrl } from "./url.ts";
 
-const { normalizeSavedServerUrl, databricksWorkspaceUiUrl } = require("./url.ts");
+export const IDENTITY_START = "__OMNIGENT_ARCA_IDENTITY_START__";
+export const IDENTITY_END = "__OMNIGENT_ARCA_IDENTITY_END__";
 
-const IDENTITY_START = "__OMNIGENT_ARCA_IDENTITY_START__";
-const IDENTITY_END = "__OMNIGENT_ARCA_IDENTITY_END__";
+/** The host daemon a connect run started, bound to the selected server target. */
+export interface ArcaIdentity {
+  serverUrl: string;
+  hostId: string;
+}
+
+/** A connect run's result, as far as the identity store reads it. */
+export interface ArcaIdentityRunResult {
+  ok: boolean;
+  identity?: ArcaIdentity | null | undefined;
+}
+
+/** A browser view's agent context, as far as the identity check reads it. */
+export interface ArcaAgentContext {
+  serverTarget?: string | null | undefined;
+  sourceHostId?: unknown;
+}
+
+/** Live gates for an agent context, re-read on every check. */
+export interface ArcaAgentContextGates {
+  enabled: unknown;
+  managed: unknown;
+  serverTarget: unknown;
+}
+
+/** Fields of parsed status JSON; reading one throws on null or undefined, as property access does. */
+function fieldsOf(value: unknown): Record<string, unknown> {
+  return value as Record<string, unknown>;
+}
 
 /** Canonical selected target, preserving mount and workspace selector. */
-function arcaTarget(raw) {
+export function arcaTarget(raw: unknown): string | null {
   try {
     const saved = normalizeSavedServerUrl(raw);
-    const url = new URL(databricksWorkspaceUiUrl(saved) ?? saved);
+    // The constructor stringifies any value itself; the cast only lets TypeScript pass it.
+    const url = new URL((databricksWorkspaceUiUrl(saved) ?? saved) as string);
     if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) return null;
     url.hash = "";
     url.pathname = url.pathname.replace(/\/+$/, "") || "/";
@@ -21,8 +50,12 @@ function arcaTarget(raw) {
 }
 
 /** Read only the bounded, machine-readable status from the Arca connect run. */
-function readArcaIdentity(output, serverUrl, onUnavailable = () => {}) {
-  const unavailable = (reason) => {
+export function readArcaIdentity(
+  output: string,
+  serverUrl: unknown,
+  onUnavailable: (reason: string) => void = () => {},
+): ArcaIdentity | null {
+  const unavailable = (reason: string): null => {
     onUnavailable(reason);
     return null;
   };
@@ -32,11 +65,11 @@ function readArcaIdentity(output, serverUrl, onUnavailable = () => {}) {
   if (!target) return unavailable("invalid selected target");
   if (start < 0 || end < 0) return unavailable("status markers missing");
   try {
-    const body = JSON.parse(output.slice(start + IDENTITY_START.length, end));
+    const body = fieldsOf(JSON.parse(output.slice(start + IDENTITY_START.length, end)));
     if (!Array.isArray(body.daemons) || body.daemons.length !== 1) {
       return unavailable("status must contain exactly one daemon");
     }
-    const daemon = body.daemons[0];
+    const daemon = fieldsOf(body.daemons[0]);
     // CLI status normalizes the UI mount to the API mount and drops ?o=.
     // The selected workspace remains bound by the command's --server argument.
     const expected = new URL(target);
@@ -76,13 +109,23 @@ function readArcaIdentity(output, serverUrl, onUnavailable = () => {}) {
   }
 }
 
+/** Ends a run begun with `begin`; returns the result it was given. */
+export type FinishArcaIdentityRun = <Result extends ArcaIdentityRunResult>(
+  result: Result,
+) => Result;
+
+export interface ArcaIdentityStore {
+  begin: (serverUrl: unknown) => FinishArcaIdentityRun;
+  get: (serverUrl: unknown) => ArcaIdentity | null;
+}
+
 /** Main-owned identity cache; new/failed/unrecognized runs revoke older identity. */
-function createArcaIdentityStore() {
-  const runs = new Map();
+export function createArcaIdentityStore(): ArcaIdentityStore {
+  const runs = new Map<string, { identity: ArcaIdentity | null }>();
   return {
     begin(serverUrl) {
       const target = arcaTarget(serverUrl);
-      const run = { identity: null };
+      const run: { identity: ArcaIdentity | null } = { identity: null };
       if (target) runs.set(target, run);
       return (result) => {
         if (target && runs.get(target) === run) {
@@ -93,12 +136,17 @@ function createArcaIdentityStore() {
       };
     },
     get(serverUrl) {
-      return runs.get(arcaTarget(serverUrl))?.identity ?? null;
+      const target = arcaTarget(serverUrl);
+      return (target === null ? undefined : runs.get(target))?.identity ?? null;
     },
   };
 }
 
-function isArcaAgentContext(identity, context, { enabled, managed, serverTarget }) {
+export function isArcaAgentContext(
+  identity: ArcaIdentity | null | undefined,
+  context: ArcaAgentContext | null | undefined,
+  { enabled, managed, serverTarget }: ArcaAgentContextGates,
+): boolean {
   return (
     enabled === true &&
     managed === true &&
@@ -110,12 +158,3 @@ function isArcaAgentContext(identity, context, { enabled, managed, serverTarget 
     context.sourceHostId === identity.hostId
   );
 }
-
-module.exports = {
-  arcaTarget,
-  readArcaIdentity,
-  createArcaIdentityStore,
-  isArcaAgentContext,
-  IDENTITY_START,
-  IDENTITY_END,
-};

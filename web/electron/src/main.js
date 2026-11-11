@@ -89,7 +89,7 @@ const { createBrowserViewRegistry } = withTestOverrides(
 );
 const { createBrowserViewBoundsController } = require("./browserViewBounds.ts");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc.ts");
-const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
+const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity.ts");
 const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity.ts");
 const { isDeveloperModeEnabled } = require("./developer_mode.ts");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences.ts");
@@ -105,8 +105,8 @@ const cliInstall = require("./cli_install.ts");
 const isaac = withTestOverrides("isaac", require("./isaac"));
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { createArcaAutoConnect } = require("./arca_autoconnect");
-const sshConnect = require("./ssh_connect");
-const { createSshConnectFlow } = require("./ssh_connect_window");
+const sshConnect = require("./ssh_connect.ts");
+const { createSshConnectFlow } = require("./ssh_connect_window.ts");
 const { registerSessionExpiryReload } = require("./session-expiry.ts");
 const { createDatabricksSession } = require("./databricks-session.ts");
 const { createDatabricksOAuth } = require("./databricks-oauth.ts");
@@ -404,7 +404,7 @@ const arcaConnectFlow = createArcaConnectFlow({
   log: (message) => console.log(`[omnigent] ${message}`),
 });
 
-/** Shell-owned flow for connecting a remote machine over SSH (ssh_connect.js). */
+/** Shell-owned flow for connecting a remote machine over SSH (ssh_connect.ts). */
 const sshConnectFlow = createSshConnectFlow({
   BrowserWindow,
   ipcMain,

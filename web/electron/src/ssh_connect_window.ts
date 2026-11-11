@@ -1,5 +1,3 @@
-"use strict";
-
 /**
  * The SSH connect console: a SHELL-OWNED modal window that asks consent with
  * the exact commands, then shows progress, ssh's prompts (password, passphrase,
@@ -12,23 +10,123 @@
  * All Electron surfaces are injected so the flow is unit-testable.
  */
 
-const CONFIRM_CHANNEL = "ssh-connect:confirm";
-const CANCEL_CHANNEL = "ssh-connect:cancel";
-const ANSWER_CHANNEL = "ssh-connect:answer";
-const RESIZE_CHANNEL = "ssh-connect:resize";
-const CONTENT_WIDTH = 720;
-const MIN_CONTENT_HEIGHT = 300;
-const RUNNING_CONTENT_HEIGHT = 500;
-const MAX_CONTENT_HEIGHT = 680;
+import type { BrowserWindowConstructorOptions } from "electron";
+
+import type { SshConnectResult, SshConnectStatus } from "./ipc/bridge.ts";
+import type { PushChannels } from "./ipc/contract.ts";
+import { on, push, type IpcMainOnPort, type PushTarget } from "./ipc/main.ts";
+
+export const CONFIRM_CHANNEL = "ssh-connect:confirm";
+export const CANCEL_CHANNEL = "ssh-connect:cancel";
+export const ANSWER_CHANNEL = "ssh-connect:answer";
+export const RESIZE_CHANNEL = "ssh-connect:resize";
+export const CONTENT_WIDTH = 720;
+export const MIN_CONTENT_HEIGHT = 300;
+export const RUNNING_CONTENT_HEIGHT = 500;
+export const MAX_CONTENT_HEIGHT = 680;
+
+/** Pushes this module sends to its console. */
+type SshConnectPushChannel = Extract<keyof PushChannels, `ssh-connect:${string}`>;
+
+/** A property of an untrusted value, read the way `value?.[key]` would. */
+function propertyOf(value: unknown, key: string): unknown {
+  return value == null ? undefined : (value as Record<string, unknown>)[key];
+}
+
+/** How a connect ended, as far as the console reads it. */
+export interface SshConnectRunResult {
+  ok: boolean;
+  error?: string | null | undefined;
+  canceled?: boolean | undefined;
+  alreadyRunning?: boolean | undefined;
+  identity?: { serverUrl: string; hostId: string } | null | undefined;
+}
+
+/** A question for the user; `signal` aborts when ssh stops waiting for the answer. */
+export interface SshConnectConsolePrompt {
+  kind: string;
+  text: string;
+  signal?: AbortSignal | undefined;
+}
+
+/** What the console gives a connect to show progress and ask questions. */
+export interface SshConnectConsoleHooks {
+  onOutput: (text: string) => void;
+  onStatus: (status: SshConnectStatus) => void;
+  /** Resolves with the answer, or null when the user cancels or the window closes. */
+  prompt: (request: SshConnectConsolePrompt) => Promise<string | null>;
+  askInstall: () => Promise<boolean>;
+}
+
+/** A connect in flight. */
+export interface SshConnectConsoleRun {
+  promise: Promise<SshConnectRunResult>;
+  cancel: () => void;
+}
+
+/** The parts of an IPC event the console's handlers read. */
+export interface SshConnectIpcEvent {
+  sender: { id: number };
+}
+
+/** The parts of the console's BrowserWindow this module drives. */
+export interface SshConnectConsoleWindow {
+  webContents: PushTarget & {
+    id: number;
+    once: (event: "did-finish-load", listener: () => void) => unknown;
+  };
+  isDestroyed: () => boolean;
+  show: () => void;
+  focus: () => void;
+  close: () => void;
+  setContentSize: (width: number, height: number, animate: boolean) => void;
+  loadFile: (filePath: string) => Promise<void>;
+  on: (event: "closed", listener: () => void) => unknown;
+  once: (event: "ready-to-show", listener: () => void) => unknown;
+}
+
+export type SshConnectWindowOptions<Parent> = Omit<BrowserWindowConstructorOptions, "parent"> & {
+  parent: Parent | undefined;
+};
+
+export interface SshConnectFlowDeps<Parent> {
+  BrowserWindow: new (options: SshConnectWindowOptions<Parent>) => SshConnectConsoleWindow;
+  ipcMain: IpcMainOnPort<SshConnectIpcEvent>;
+  pagePath: string;
+  preloadPath: string;
+  startConnect: (
+    serverUrl: string,
+    destination: string,
+    hooks: SshConnectConsoleHooks,
+  ) => SshConnectConsoleRun;
+  commandLines: (serverUrl: string, destination: string) => string[];
+  log?: ((message: string) => void) | undefined;
+}
+
+export interface SshConnectFlow<Parent> {
+  run: (
+    parentWin: Parent | null | undefined,
+    serverUrl: string,
+    destination: string,
+  ) => Promise<SshConnectResult>;
+}
+
+type ConsolePhase = "asking" | "running" | "done";
+
+/** One open console, keyed by its webContents id. */
+interface ConsoleState {
+  win: SshConnectConsoleWindow;
+  phase: () => ConsolePhase;
+  onConfirm: () => void;
+  onCancel: () => void;
+  onAnswer: (payload: unknown) => void;
+}
 
 /**
  * What the server's page learns about a finished connect: app-authored fields
  * only. Remote output, including error text, stays in the shell-owned window.
- *
- * @param {{ ok?: boolean, canceled?: boolean, alreadyRunning?: boolean, identity?: { serverUrl: string, hostId: string } | null }} result
- * @returns {object}
  */
-function pageResult(result) {
+function pageResult(result: SshConnectRunResult): SshConnectResult {
   if (result.ok === true) {
     const identity = result.identity
       ? { serverUrl: String(result.identity.serverUrl), hostId: String(result.identity.hostId) }
@@ -49,20 +147,7 @@ function pageResult(result) {
       };
 }
 
-/**
- * @param {{
- *   BrowserWindow: typeof import("electron").BrowserWindow,
- *   ipcMain: import("electron").IpcMain,
- *   pagePath: string,
- *   preloadPath: string,
- *   startConnect: (serverUrl: string, destination: string, hooks: object) =>
- *     { promise: Promise<object>, cancel: () => void },
- *   commandLines: (serverUrl: string, destination: string) => string[],
- *   log?: (message: string) => void,
- * }} deps
- * @returns {{ run: (parentWin: unknown, serverUrl: string, destination: string) => Promise<object> }}
- */
-function createSshConnectFlow({
+export function createSshConnectFlow<Parent>({
   BrowserWindow,
   ipcMain,
   pagePath,
@@ -70,18 +155,22 @@ function createSshConnectFlow({
   startConnect,
   commandLines,
   log = () => {},
-}) {
+}: SshConnectFlowDeps<Parent>): SshConnectFlow<Parent> {
   /** Keyed by the console's webContents id, for the window's whole life. */
-  const consoles = new Map();
+  const consoles = new Map<number, ConsoleState>();
   /** One connect at a time; a repeat for the same target re-focuses it. */
-  let activeRun = null;
+  let activeRun: {
+    key: string;
+    win: SshConnectConsoleWindow;
+    promise: Promise<SshConnectResult>;
+  } | null = null;
 
-  ipcMain.on(CONFIRM_CHANNEL, (event) => consoles.get(event.sender.id)?.onConfirm());
-  ipcMain.on(CANCEL_CHANNEL, (event) => consoles.get(event.sender.id)?.onCancel());
-  ipcMain.on(ANSWER_CHANNEL, (event, payload) => consoles.get(event.sender.id)?.onAnswer(payload));
-  ipcMain.on(RESIZE_CHANNEL, (event, payload) => {
+  on(ipcMain, CONFIRM_CHANNEL, (event) => consoles.get(event.sender.id)?.onConfirm());
+  on(ipcMain, CANCEL_CHANNEL, (event) => consoles.get(event.sender.id)?.onCancel());
+  on(ipcMain, ANSWER_CHANNEL, (event, payload) => consoles.get(event.sender.id)?.onAnswer(payload));
+  on(ipcMain, RESIZE_CHANNEL, (event, payload) => {
     const state = consoles.get(event.sender.id);
-    const measured = Number(payload?.height);
+    const measured = Number(propertyOf(payload, "height"));
     if (!state || !Number.isFinite(measured) || measured <= 0) return;
     const minimum = state.phase() === "asking" ? MIN_CONTENT_HEIGHT : RUNNING_CONTENT_HEIGHT;
     const height = Math.min(MAX_CONTENT_HEIGHT, Math.max(minimum, Math.ceil(measured)));
@@ -98,7 +187,11 @@ function createSshConnectFlow({
    * with the connect result. The window stays open afterwards so the user can
    * read the outcome.
    */
-  function run(parentWin, serverUrl, destination) {
+  function run(
+    parentWin: Parent | null | undefined,
+    serverUrl: string,
+    destination: string,
+  ): Promise<SshConnectResult> {
     const key = `${destination}\n${serverUrl}`;
     if (activeRun) {
       if (activeRun.key !== key) {
@@ -118,8 +211,9 @@ function createSshConnectFlow({
       return activeRun.promise;
     }
 
-    let resolveRun;
-    const promise = new Promise((resolve) => {
+    // Assigned by the executor below, which runs synchronously.
+    let resolveRun!: (result: SshConnectResult) => void;
+    const promise = new Promise<SshConnectResult>((resolve) => {
       resolveRun = resolve;
     });
     const win = new BrowserWindow({
@@ -142,28 +236,30 @@ function createSshConnectFlow({
       },
     });
     const consoleId = win.webContents.id;
-    let phase = "asking";
-    let connect = null;
+    let phase: ConsolePhase = "asking";
+    let connect: SshConnectConsoleRun | null = null;
     let settled = false;
     let nextPromptId = 1;
-    /** @type {Map<number, (answer: string | null) => void>} */
-    const pending = new Map();
+    const pending = new Map<number, (answer: string | null) => void>();
 
-    const send = (channel, payload) => {
+    const send = <Channel extends SshConnectPushChannel>(
+      channel: Channel,
+      ...args: PushChannels[Channel]["args"]
+    ) => {
       try {
-        if (!win.isDestroyed()) win.webContents.send(channel, payload);
+        if (!win.isDestroyed()) push(win.webContents, channel, ...args);
       } catch {
         // Window torn down mid-send; the close handler settles the flow.
       }
     };
-    const settle = (result) => {
+    const settle = (result: SshConnectResult) => {
       if (settled) return;
       settled = true;
       activeRun = null;
       resolveRun(result);
     };
-    const ask = (kind, text, signal) =>
-      new Promise((resolve) => {
+    const ask = (kind: string, text: string, signal?: AbortSignal) =>
+      new Promise<string | null>((resolve) => {
         const id = nextPromptId;
         nextPromptId += 1;
         pending.set(id, resolve);
@@ -180,7 +276,7 @@ function createSshConnectFlow({
       pending.clear();
     };
 
-    const hooks = {
+    const hooks: SshConnectConsoleHooks = {
       onOutput: (text) => send("ssh-connect:output", text),
       onStatus: (status) => send("ssh-connect:status", status),
       prompt: ({ kind, text, signal }) => ask(kind, text, signal),
@@ -220,12 +316,12 @@ function createSshConnectFlow({
         }
       },
       onAnswer: (payload) => {
-        const resolve = pending.get(Number(payload?.id));
+        const resolve = pending.get(Number(propertyOf(payload, "id")));
         if (!resolve) return;
-        pending.delete(Number(payload.id));
-        resolve(
-          payload?.cancel === true || typeof payload?.answer !== "string" ? null : payload.answer,
-        );
+        pending.delete(Number(propertyOf(payload, "id")));
+        const answer =
+          propertyOf(payload, "cancel") === true ? null : propertyOf(payload, "answer");
+        resolve(typeof answer !== "string" ? null : answer);
       },
     });
 
@@ -255,15 +351,3 @@ function createSshConnectFlow({
 
   return { run };
 }
-
-module.exports = {
-  ANSWER_CHANNEL,
-  CANCEL_CHANNEL,
-  CONFIRM_CHANNEL,
-  CONTENT_WIDTH,
-  MAX_CONTENT_HEIGHT,
-  MIN_CONTENT_HEIGHT,
-  RESIZE_CHANNEL,
-  RUNNING_CONTENT_HEIGHT,
-  createSshConnectFlow,
-};

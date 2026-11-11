@@ -23,7 +23,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { StringDecoder } = require("node:string_decoder");
-const { readArcaIdentity, IDENTITY_START, IDENTITY_END } = require("./arcaIdentity");
+const { readArcaIdentity, IDENTITY_START, IDENTITY_END } = require("./arcaIdentity.ts");
 
 /**
  * Connecting may cold-start the EC2 instance, which takes minutes — give the

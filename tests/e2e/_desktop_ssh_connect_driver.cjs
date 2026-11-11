@@ -8,7 +8,7 @@
 const net = require("node:net");
 const path = require("node:path");
 const { createSshSession, startSshConnect } = require(
-  path.join(__dirname, "..", "..", "web", "electron", "src", "ssh_connect.js"),
+  path.join(__dirname, "..", "..", "web", "electron", "src", "ssh_connect.ts"),
 );
 
 const [serverUrl, destination, sshConfig, busyPort, workspacePort] = process.argv.slice(2);

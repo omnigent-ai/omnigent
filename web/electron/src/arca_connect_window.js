@@ -24,7 +24,7 @@ const CONTENT_WIDTH = 720;
 const MIN_CONTENT_HEIGHT = 300;
 const RUNNING_CONTENT_HEIGHT = 500;
 const MAX_CONTENT_HEIGHT = 640;
-const { arcaTarget } = require("./arcaIdentity");
+const { arcaTarget } = require("./arcaIdentity.ts");
 
 /**
  * @param {{

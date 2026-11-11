@@ -1,5 +1,3 @@
-"use strict";
-
 /**
  * Connect a machine the user reaches over SSH as an Omnigent host.
  *
@@ -19,16 +17,25 @@
  * a real ssh.
  */
 
-const { spawn } = require("node:child_process");
-const fs = require("node:fs");
-const net = require("node:net");
-const os = require("node:os");
-const path = require("node:path");
-const { lastLine, SAFE_URL_RE } = require("./arca");
-const { isDatabricksOAuthServerUrl } = require("./url.ts");
-const { readArcaIdentity, IDENTITY_START, IDENTITY_END } = require("./arcaIdentity");
-const { UV_INSTALLER } = require("./cli_install.ts");
-const { createAskpass } = require("./ssh_askpass.ts");
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+
+// The remote-host module is still JavaScript; TypeScript reads these two
+// types from its JSDoc: `lastLine(text: string): string` and a `RegExp`.
+import { lastLine, SAFE_URL_RE } from "./arca.js";
+import {
+  readArcaIdentity,
+  IDENTITY_START,
+  IDENTITY_END,
+  type ArcaIdentity,
+} from "./arcaIdentity.ts";
+import { UV_INSTALLER } from "./cli_install.ts";
+import type { SshConnectStatus } from "./ipc/bridge.ts";
+import { createAskpass, type Askpass, type AskpassOptions } from "./ssh_askpass.ts";
+import { isDatabricksOAuthServerUrl } from "./url.ts";
 
 /** Includes time for the user to type a password or trust a new host. */
 const OPEN_TIMEOUT_MS = 5 * 60 * 1000;
@@ -40,8 +47,8 @@ const CLOSE_GRACE_MS = 2_000;
 const MAX_OUTPUT_BYTES = 256 * 1024;
 
 /** The Databricks CLI's sign-in listener range. */
-const SIGN_IN_FIRST_PORT = 8020;
-const SIGN_IN_LAST_PORT = 8040;
+export const SIGN_IN_FIRST_PORT = 8020;
+export const SIGN_IN_LAST_PORT = 8040;
 
 /** Target for ports held on the remote machine; nothing ever connects to them. */
 const HELD_PORT_TARGET = "127.0.0.1:9";
@@ -58,16 +65,46 @@ const ANSI_RE = /\u001b\[[0-9;?]*[A-Za-z]/g;
 /**
  * Error with a message fit to show the user as-is.
  */
-class SshConnectError extends Error {}
+export class SshConnectError extends Error {}
 
-const canceledResult = () => ({ ok: false, canceled: true, error: "Connecting was canceled." });
+/** A failed or canceled connect; `error` is fit to show the user. */
+export interface SshConnectFailure {
+  ok: false;
+  error: string;
+  canceled?: true;
+}
+
+export type SshConnectOutcome =
+  { ok: true; alreadyRunning: boolean; identity?: ArcaIdentity } | SshConnectFailure;
+
+/** `omnigent login`'s outcome; `missingCli` when the remote shell had no omnigent. */
+type SignInResult =
+  | { ok: true; missingCli?: undefined }
+  | { ok: false; missingCli: true }
+  | (SshConnectFailure & { missingCli?: undefined });
+
+const canceledResult = (): SshConnectFailure => ({
+  ok: false,
+  canceled: true,
+  error: "Connecting was canceled.",
+});
+
+/** A property of an untrusted value, read the way `value?.[key]` would. */
+function propertyOf(value: unknown, key: string): unknown {
+  return value == null ? undefined : (value as Record<string, unknown>)[key];
+}
+
+/** A child's exit code as Node reports it on `exit` and `close`. */
+function exitCodeOf(value: unknown): number | null {
+  // Node passes a number, or null after a signal; the cast keeps the value as is.
+  return value as number | null;
+}
 
 /**
- * @param {unknown} raw
- * @returns {string} The trimmed destination.
+ * @returns The trimmed destination.
  * @throws {SshConnectError} When it isn't a plain ssh destination.
  */
-function validateDestination(raw) {
+export function validateDestination(raw: unknown): string {
   const destination = typeof raw === "string" ? raw.trim() : "";
   if (!DESTINATION_RE.test(destination)) {
     throw new SshConnectError(
@@ -78,11 +115,10 @@ function validateDestination(raw) {
 }
 
 /**
- * @param {string} serverUrl
- * @returns {string} The URL, safe to embed in a remote shell command.
+ * @returns The URL, safe to embed in a remote shell command.
  * @throws {SshConnectError}
  */
-function safeServerUrl(serverUrl) {
+export function safeServerUrl(serverUrl: string): string {
   let url;
   try {
     url = new URL(serverUrl);
@@ -100,11 +136,8 @@ function safeServerUrl(serverUrl) {
 /**
  * Wrap a POSIX script so any login shell (bash, zsh, fish) passes it to sh
  * unchanged. The script must not contain single quotes or backslashes.
- *
- * @param {string} script
- * @returns {string}
  */
-function remoteCommand(script) {
+export function remoteCommand(script: string): string {
   if (/['\\]/.test(script)) throw new Error("remote script must not contain ' or \\");
   return `sh -c '${script}'`;
 }
@@ -112,11 +145,8 @@ function remoteCommand(script) {
 /** The installer puts omnigent in ~/.local/bin, which non-interactive shells often lack. */
 const REMOTE_PATH = 'PATH="$HOME/.local/bin:$PATH"; export PATH';
 
-/**
- * @param {string} serverUrl Already checked by {@link safeServerUrl}.
- * @returns {string}
- */
-function loginScript(serverUrl) {
+/** @param serverUrl Already checked by {@link safeServerUrl}. */
+export function loginScript(serverUrl: string): string {
   // The app holds stdin open; when the session ends it closes, and the
   // watchdog stops the login and its CLI instead of leaving them on the port.
   // setsid puts both in one process group to kill; pkill covers hosts without it (macOS).
@@ -133,10 +163,9 @@ function loginScript(serverUrl) {
 /**
  * Start the host, then print its status between markers for {@link readArcaIdentity}.
  *
- * @param {string} serverUrl Already checked by {@link safeServerUrl}.
- * @returns {string}
+ * @param serverUrl Already checked by {@link safeServerUrl}.
  */
-function hostScript(serverUrl) {
+export function hostScript(serverUrl: string): string {
   return [
     REMOTE_PATH,
     `omnigent host --server "${serverUrl}" --background --non-interactive && { echo; echo ${IDENTITY_START}; omnigent host status --server "${serverUrl}" --json; echo; echo ${IDENTITY_END}; }`,
@@ -144,7 +173,7 @@ function hostScript(serverUrl) {
 }
 
 /** Install uv if needed, then run the app's bundled installer, piped on stdin. */
-function installScript() {
+export function installScript(): string {
   return [
     'PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"; export PATH',
     `if ! command -v uv >/dev/null 2>&1; then ${UV_INSTALLER} || exit 1; fi`,
@@ -152,14 +181,8 @@ function installScript() {
   ].join("; ");
 }
 
-/**
- * The commands shown in the consent window.
- *
- * @param {string} serverUrl
- * @param {string} destination
- * @returns {string[]}
- */
-function describeCommands(serverUrl, destination) {
+/** The commands shown in the consent window. */
+export function describeCommands(serverUrl: string, destination: string): string[] {
   return [
     `ssh ${destination} omnigent login '${serverUrl}'`,
     `ssh ${destination} omnigent host --server '${serverUrl}' --background --non-interactive`,
@@ -167,18 +190,23 @@ function describeCommands(serverUrl, destination) {
 }
 
 /**
- * Find the sign-in link in one line of `omnigent login` output.
- *
- * @param {string} line
- * @returns {{ url: string, port: number | null, kind: "databricks" | "server" } | null}
- *   `port` is the loopback port the CLI waits on, for a Databricks sign-in; null
- *   for a server's own browser sign-in, which needs no forward.
+ * A sign-in link from `omnigent login` output. `port` is the loopback port the
+ * CLI waits on, for a Databricks sign-in; null for a server's own browser
+ * sign-in, which needs no forward.
  */
-function parseSignInLink(line) {
+export interface SignInLink {
+  url: string;
+  port: number | null;
+  kind: "databricks" | "server";
+}
+
+/** Find the sign-in link in one line of `omnigent login` output. */
+export function parseSignInLink(line: string): SignInLink | null {
   const clean = line.replace(ANSI_RE, "").trim();
   const start = clean.indexOf("https://");
   if (start >= 0 && clean.includes("/oidc/v1/authorize")) {
-    const url = clean.slice(start).split(/\s/)[0];
+    // split() always returns at least one element.
+    const url = clean.slice(start).split(/\s/)[0]!;
     try {
       const redirect = new URL(new URL(url).searchParams.get("redirect_uri") ?? "");
       const port = Number(redirect.port);
@@ -191,19 +219,16 @@ function parseSignInLink(line) {
     return { url, port: null, kind: "databricks" };
   }
   const own = /^Opening browser for login:\s+(https?:\/\/\S+)/.exec(clean);
-  return own ? { url: own[1], port: null, kind: "server" } : null;
+  // The pattern's one group always matches.
+  return own ? { url: own[1]!, port: null, kind: "server" } : null;
 }
 
 /**
  * Why not to open a sign-in link the remote machine printed, or null to open it.
  * The machine could be compromised, so its links are held to what the CLI prints:
  * the server's own page, or a workspace sign-in calling back to loopback on 8020 to 8040.
- *
- * @param {{ url: string, port: number | null, kind: "databricks" | "server" }} link
- * @param {string} serverUrl
- * @returns {string | null}
  */
-function signInLinkRefusal(link, serverUrl) {
+export function signInLinkRefusal(link: SignInLink, serverUrl: string): string | null {
   let origin;
   try {
     origin = new URL(link.url).origin;
@@ -228,12 +253,13 @@ function signInLinkRefusal(link, serverUrl) {
   return null;
 }
 
+export type SshPromptKind = "confirm" | "secret" | "text";
+
 /**
- * @param {string} prompt The text ssh shows.
- * @param {string} [hint] SSH_ASKPASS_PROMPT, "confirm" for yes/no questions.
- * @returns {"confirm" | "secret" | "text"}
+ * @param prompt The text ssh shows.
+ * @param hint SSH_ASKPASS_PROMPT, "confirm" for yes/no questions.
  */
-function classifyPrompt(prompt, hint = "") {
+export function classifyPrompt(prompt: string, hint = ""): SshPromptKind {
   if (hint === "confirm" || /continue connecting|\(yes\/no/i.test(prompt)) return "confirm";
   if (/pass(word|phrase|code)|\bPIN\b|verification code|one-time|\btoken\b|\bOTP\b/i.test(prompt)) {
     return "secret";
@@ -242,20 +268,22 @@ function classifyPrompt(prompt, hint = "") {
 }
 
 /**
- * @param {number} port
- * @returns {Promise<boolean>} Whether nothing on this computer holds <port> on
- *   either loopback address; a browser may try `::1` first for localhost.
+ * @returns Whether nothing on this computer holds <port> on either loopback
+ *   address; a browser may try `::1` first for localhost.
  */
-async function isPortFree(port) {
+export async function isPortFree(port: number): Promise<boolean> {
   return (await canListen(port, "127.0.0.1")) && (await canListen(port, "::1"));
 }
 
-function canListen(port, host) {
+/** Error codes that mean a computer has no IPv6 loopback, so nothing listens there. */
+const NO_LOOPBACK_CODES: readonly (string | undefined)[] = ["EADDRNOTAVAIL", "EAFNOSUPPORT"];
+
+function canListen(port: number, host: string): Promise<boolean> {
   return new Promise((resolve) => {
     const server = net.createServer();
-    server.once("error", (error) => {
+    server.once("error", (error: NodeJS.ErrnoException | undefined) => {
       // A computer without IPv6 loopback has nothing listening there.
-      resolve(host === "::1" && ["EADDRNOTAVAIL", "EAFNOSUPPORT"].includes(error?.code));
+      resolve(host === "::1" && NO_LOOPBACK_CODES.includes(error?.code));
     });
     server.listen({ port, host, exclusive: true }, () => {
       server.close(() => resolve(true));
@@ -263,15 +291,12 @@ function canListen(port, host) {
   });
 }
 
-/**
- * Turn an ssh failure into one sentence for the user.
- *
- * @param {number | null} code
- * @param {string} stderr
- * @param {string} destination
- * @returns {string}
- */
-function describeSshFailure(code, stderr, destination) {
+/** Turn an ssh failure into one sentence for the user. */
+export function describeSshFailure(
+  code: number | null,
+  stderr: string,
+  destination: string,
+): string {
   if (/REMOTE HOST IDENTIFICATION HAS CHANGED/i.test(stderr)) {
     return `${destination}'s host key changed since you last connected. Check with whoever manages it before trusting it again.`;
   }
@@ -298,10 +323,9 @@ function describeSshFailure(code, stderr, destination) {
  * `Error: ...` line, which generic hints may follow, with link queries cut
  * (sign-in links carry one-time values). Else the last line without a link.
  *
- * @param {string} text
- * @returns {string} e.g. "Could not reach https://ws.example/v1/me: timed out", or "".
+ * @returns e.g. "Could not reach https://ws.example/v1/me: timed out", or "".
  */
-function failureDetail(text) {
+function failureDetail(text: string): string {
   const lines = text
     .split(/\r?\n/)
     .map((line) => line.replace(ANSI_RE, "").trim())
@@ -311,15 +335,11 @@ function failureDetail(text) {
   return lines.findLast((line) => !/https?:\/\//.test(line)) ?? "";
 }
 
-/**
- * Split a stream into lines, calling `onLine` for each complete one.
- *
- * @param {(line: string) => void} onLine
- */
-function lineSplitter(onLine) {
+/** Split a stream into lines, calling `onLine` for each complete one. */
+function lineSplitter(onLine: (line: string) => void) {
   let pending = "";
   return {
-    push(text) {
+    push(text: string) {
       pending += text;
       let newline = pending.indexOf("\n");
       while (newline >= 0) {
@@ -335,22 +355,99 @@ function lineSplitter(onLine) {
   };
 }
 
-/**
- * One shared ssh connection to `destination`.
- *
- * @param {{
- *   destination: string,
- *   socketPath: string,
- *   env?: NodeJS.ProcessEnv,
- *   sshPath?: string,
- *   sshArgs?: string[],
- *   spawn?: typeof spawn,
- *   onOutput?: (text: string) => void,
- *   pathExists?: (p: string) => boolean,
- *   openTimeoutMs?: number,
- * }} options `sshArgs` go before every call (tests pass `-F <config>`).
- */
-function createSshSession(options) {
+/** An ssh child's output stream; chunks are strings once the encoding is set. */
+export interface SshChildOutput {
+  setEncoding?: (encoding: "utf8") => unknown;
+  on: (event: "data", listener: (chunk: unknown) => void) => unknown;
+  destroy?: () => unknown;
+}
+
+export interface SshChildInput {
+  on: (event: "error", listener: (error: unknown) => void) => unknown;
+  end: (data: string) => unknown;
+}
+
+/** The part of a spawned ssh `ChildProcess` a session uses. */
+export interface SshChild {
+  stdin?: SshChildInput | null;
+  stdout?: SshChildOutput | null;
+  stderr?: SshChildOutput | null;
+  kill: () => unknown;
+  // Node passes an `Error` for "error", and the exit code for "exit" and "close".
+  on: (event: "error" | "exit" | "close", listener: (value: unknown) => void) => unknown;
+  once: (event: "exit" | "close", listener: () => void) => unknown;
+}
+
+export interface SshSpawnOptions {
+  stdio: ["ignore" | "pipe", "ignore" | "pipe", "pipe"];
+  env: NodeJS.ProcessEnv;
+}
+
+/** `child_process.spawn`, injectable so tests need no real ssh. */
+export type SpawnSsh = (command: string, args: string[], options: SshSpawnOptions) => SshChild;
+
+/** How one ssh client over the shared connection ended. */
+export interface SshRunResult {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+}
+
+/** A running remote command. */
+export interface SshRun {
+  promise: Promise<SshRunResult>;
+  cancel: () => void;
+}
+
+/** `stdin` is written and closed; `holdStdin` keeps it open until the remote command ends. */
+export interface SshExecOptions {
+  stdin?: string | null | undefined;
+  holdStdin?: boolean | undefined;
+  timeoutMs?: number | undefined;
+  onStdout?: ((text: string) => void) | undefined;
+  onStderr?: ((text: string) => void) | undefined;
+}
+
+interface SshClientOptions extends SshExecOptions {
+  baseArgs?: string[] | undefined;
+}
+
+/** `sshArgs` go before every call (tests pass `-F <config>`). */
+export interface SshSessionOptions {
+  destination: string;
+  socketPath: string;
+  env?: NodeJS.ProcessEnv | undefined;
+  sshPath?: string | undefined;
+  sshArgs?: string[] | undefined;
+  spawn?: SpawnSsh | undefined;
+  onOutput?: ((text: string) => void) | undefined;
+  pathExists?: ((path: string) => boolean) | undefined;
+  openTimeoutMs?: number | undefined;
+}
+
+/** What a connect does over the shared connection. */
+export interface SshConnectSession {
+  /** Connect, letting the askpass helper in `env` handle any prompt. */
+  open: () => Promise<void>;
+  /** Run a POSIX script on the remote machine. */
+  exec: (script: string, opts?: SshExecOptions) => SshRun;
+  forwardLocal: (port: number) => Promise<SshRunResult>;
+  cancelLocal: (port: number) => Promise<SshRunResult>;
+  holdRemote: (port: number) => Promise<SshRunResult>;
+  releaseRemote: (port: number) => Promise<SshRunResult>;
+  /** End the shared connection, killing it if it doesn't exit in time. */
+  close: () => Promise<void>;
+}
+
+export interface SshSession extends SshConnectSession {
+  destination: string;
+  /** Kill every ssh process this session started, and start no more. */
+  abort: () => void;
+}
+
+/** One shared ssh connection to `destination`. */
+export function createSshSession(options: SshSessionOptions): SshSession {
   const {
     destination,
     socketPath,
@@ -361,9 +458,9 @@ function createSshSession(options) {
     pathExists = fs.existsSync,
     openTimeoutMs = OPEN_TIMEOUT_MS,
   } = options;
-  const spawnFn = options.spawn ?? spawn;
-  const children = new Set();
-  let master = null;
+  const spawnFn: SpawnSsh = options.spawn ?? spawn;
+  const children = new Set<SshChild>();
+  let master: SshChild | null = null;
   let masterExited = false;
   let aborted = false;
 
@@ -372,9 +469,16 @@ function createSshSession(options) {
    * closed; `holdStdin` keeps it open until the remote command ends.
    */
   function client(
-    args,
-    { stdin = null, holdStdin = false, timeoutMs, onStdout, onStderr, baseArgs = sshArgs } = {},
-  ) {
+    args: string[],
+    {
+      stdin = null,
+      holdStdin = false,
+      timeoutMs,
+      onStdout,
+      onStderr,
+      baseArgs = sshArgs,
+    }: SshClientOptions = {},
+  ): SshRun {
     // Nothing new starts after abort or once the master exits: with the master gone,
     // ssh would quietly open a fresh connection, maybe to another machine, and carry on.
     if (aborted || masterExited) {
@@ -383,45 +487,52 @@ function createSshSession(options) {
         : { code: 255, stdout: "", stderr: "the connection closed", timedOut: false };
       return { promise: Promise.resolve(result), cancel: () => {} };
     }
-    let child;
+    let child: SshChild | undefined;
     let timedOut = false;
     let stdout = "";
     let stderr = "";
-    const promise = new Promise((resolve) => {
+    const promise = new Promise<SshRunResult>((resolve) => {
       try {
         child = spawnFn(sshPath, [...baseArgs, "-S", socketPath, ...args], {
           stdio: [stdin === null && !holdStdin ? "ignore" : "pipe", "pipe", "pipe"],
           env,
         });
       } catch (error) {
-        resolve({ code: null, stdout: "", stderr: String(error?.message ?? error), timedOut });
+        resolve({
+          code: null,
+          stdout: "",
+          stderr: String(propertyOf(error, "message") ?? error),
+          timedOut,
+        });
         return;
       }
-      children.add(child);
+      const running = child;
+      children.add(running);
       const timer = setTimeout(() => {
         timedOut = true;
-        child.kill();
+        running.kill();
       }, timeoutMs ?? CONTROL_TIMEOUT_MS);
       if (typeof timer.unref === "function") timer.unref();
-      child.stdout?.setEncoding?.("utf8");
-      child.stderr?.setEncoding?.("utf8");
-      child.stdout?.on("data", (chunk) => {
-        stdout = (stdout + chunk).slice(-MAX_OUTPUT_BYTES);
+      running.stdout?.setEncoding?.("utf8");
+      running.stderr?.setEncoding?.("utf8");
+      // With the encoding set, chunks are strings; the casts keep the JS concatenation.
+      running.stdout?.on("data", (chunk) => {
+        stdout = (stdout + (chunk as string)).slice(-MAX_OUTPUT_BYTES);
         onStdout?.(String(chunk));
       });
-      child.stderr?.on("data", (chunk) => {
-        stderr = (stderr + chunk).slice(-MAX_OUTPUT_BYTES);
+      running.stderr?.on("data", (chunk) => {
+        stderr = (stderr + (chunk as string)).slice(-MAX_OUTPUT_BYTES);
         onStderr?.(String(chunk));
       });
-      child.stdin?.on("error", () => {});
-      if (stdin !== null) child.stdin?.end(stdin);
-      child.on("error", (error) => {
-        stderr += String(error?.message ?? error);
+      running.stdin?.on("error", () => {});
+      if (stdin !== null) running.stdin?.end(stdin);
+      running.on("error", (error) => {
+        stderr += String(propertyOf(error, "message") ?? error);
       });
-      child.on("close", (code) => {
+      running.on("close", (code) => {
         clearTimeout(timer);
-        children.delete(child);
-        resolve({ code, stdout, stderr, timedOut });
+        children.delete(running);
+        resolve({ code: exitCodeOf(code), stdout, stderr, timedOut });
       });
     });
     return { promise, cancel: () => child?.kill() };
@@ -430,7 +541,7 @@ function createSshSession(options) {
   // Control requests only talk to the master, so they skip the user's ssh
   // config: its forwards would ride along, and ClearAllForwardings there
   // would silently empty the ones asked for here.
-  const control = (op, spec) =>
+  const control = (op: string, spec?: string[]) =>
     client(["-O", op, ...(spec ? spec : []), destination], { baseArgs: ["-F", "/dev/null"] })
       .promise;
 
@@ -439,19 +550,20 @@ function createSshSession(options) {
 
     /** Connect, letting the askpass helper in `env` handle any prompt. */
     open() {
-      return new Promise((resolve, reject) => {
+      return new Promise<void>((resolve, reject) => {
         let stderr = "";
         let settled = false;
-        let timer = null;
-        const finish = (error) => {
+        let timer: NodeJS.Timeout | undefined;
+        const finish = (error?: SshConnectError) => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
           if (error) reject(error);
           else resolve();
         };
+        let started: SshChild;
         try {
-          master = spawnFn(
+          started = spawnFn(
             sshPath,
             [
               ...sshArgs,
@@ -473,37 +585,39 @@ function createSshSession(options) {
             ],
             { stdio: ["ignore", "ignore", "pipe"], env },
           );
+          master = started;
         } catch {
           finish(new SshConnectError("Couldn't find ssh on this computer."));
           return;
         }
-        children.add(master);
-        master.stderr?.setEncoding?.("utf8");
-        master.stderr?.on("data", (chunk) => {
-          stderr = (stderr + chunk).slice(-MAX_OUTPUT_BYTES);
+        children.add(started);
+        started.stderr?.setEncoding?.("utf8");
+        started.stderr?.on("data", (chunk) => {
+          stderr = (stderr + (chunk as string)).slice(-MAX_OUTPUT_BYTES);
           onOutput(String(chunk));
         });
-        master.on("error", (error) => {
+        started.on("error", (error) => {
           masterExited = true;
           finish(
             new SshConnectError(
-              error?.code === "ENOENT"
+              propertyOf(error, "code") === "ENOENT"
                 ? "Couldn't find ssh on this computer."
-                : `Couldn't run ssh: ${error?.message ?? error}`,
+                : `Couldn't run ssh: ${propertyOf(error, "message") ?? error}`,
             ),
           );
         });
         // `exit` comes first; `close` can wait on a ProxyCommand child holding stderr.
-        master.on("exit", () => {
+        started.on("exit", () => {
           masterExited = true;
         });
-        master.on("close", (code) => {
+        // Callbacks read `master` as it is when they run; it is never cleared once set.
+        started.on("close", (code) => {
           masterExited = true;
-          children.delete(master);
-          finish(new SshConnectError(describeSshFailure(code, stderr, destination)));
+          children.delete(master!);
+          finish(new SshConnectError(describeSshFailure(exitCodeOf(code), stderr, destination)));
         });
         timer = setTimeout(() => {
-          master.kill();
+          master!.kill();
           finish(new SshConnectError(`Connecting to ${destination} timed out.`));
         }, openTimeoutMs);
         if (typeof timer.unref === "function") timer.unref();
@@ -520,12 +634,7 @@ function createSshSession(options) {
       });
     },
 
-    /**
-     * Run a POSIX script on the remote machine.
-     *
-     * @param {string} script
-     * @param {{ stdin?: string | null, holdStdin?: boolean, timeoutMs?: number, onStdout?: (t: string) => void, onStderr?: (t: string) => void }} [opts]
-     */
+    /** Run a POSIX script on the remote machine. */
     exec(script, opts = {}) {
       // Use the master even when the config says ControlMaster yes or ask, which skip
       // it; don't re-request the config's forwards; and run the command even when the
@@ -558,17 +667,18 @@ function createSshSession(options) {
       if (!master) return;
       if (!masterExited) await control("exit");
       if (!masterExited) {
-        await new Promise((resolve) => {
+        await new Promise<void>((resolve) => {
+          // Checked above; `master` is never cleared once set.
           const timer = setTimeout(() => {
-            master.kill();
+            master!.kill();
             resolve();
           }, CLOSE_GRACE_MS);
           const done = () => {
             clearTimeout(timer);
             resolve();
           };
-          master.once("exit", done);
-          master.once("close", done);
+          master!.once("exit", done);
+          master!.once("close", done);
         });
       }
       // A ProxyCommand child can outlive ssh while holding its stderr open.
@@ -589,12 +699,34 @@ function createSshSession(options) {
   };
 }
 
-/**
- * Run `omnigent login` on the remote machine, forwarding its sign-in port.
- *
- * @returns {Promise<{ ok: true } | { ok: false, missingCli?: true, error?: string }>}
- */
-async function signIn(ctx) {
+/** Per-step limits, for tests; each defaults to the module's own. */
+export interface SshConnectTimeouts {
+  signIn?: number;
+  host?: number;
+  install?: number;
+}
+
+/** Everything one connect needs; see {@link runSshConnect}. */
+export interface SshConnectContext {
+  serverUrl: string;
+  destination: string;
+  session: SshConnectSession;
+  openExternal: (url: string) => Promise<void> | void;
+  onStatus: (status: SshConnectStatus) => void;
+  onOutput: (text: string) => void;
+  askInstall: () => Promise<boolean>;
+  readInstallScript: () => string | null;
+  isPortFree?: (port: number) => Promise<boolean>;
+  isCanceled?: () => boolean;
+  onIdentityUnavailable?: ((reason: string) => void) | undefined;
+  timeouts?: SshConnectTimeouts;
+}
+
+type SignInContext = SshConnectContext &
+  Required<Pick<SshConnectContext, "isPortFree" | "isCanceled">>;
+
+/** Run `omnigent login` on the remote machine, forwarding its sign-in port. */
+async function signIn(ctx: SignInContext): Promise<SignInResult> {
   const { session, serverUrl, destination, openExternal, onStatus, isPortFree: portFree } = ctx;
   const ports = Array.from(
     { length: SIGN_IN_LAST_PORT - SIGN_IN_FIRST_PORT + 1 },
@@ -607,7 +739,8 @@ async function signIn(ctx) {
   const busy = expected === null ? [] : ports.filter((_, index) => !free[index]);
   // A port the remote machine already uses can't be held, but the CLI skips it anyway.
   const holds = await Promise.all(busy.map((port) => session.holdRemote(port)));
-  const held = busy.filter((_, index) => holds[index].code === 0);
+  // One result per busy port, in order.
+  const held = busy.filter((_, index) => holds[index]!.code === 0);
   // Take the port the CLI should pick before it starts: tools that forward new
   // remote listeners to this computer (VS Code, for example) would grab it first.
   let forwarded =
@@ -615,19 +748,21 @@ async function signIn(ctx) {
   if (ctx.isCanceled()) return canceledResult();
 
   onStatus({ step: "signing-in" });
-  const notes = [];
+  const notes: string[] = [];
   let opened = false;
-  let problem = null;
+  let problem: string | null = null;
   let queue = Promise.resolve();
-  let run = null;
-  const handleLine = async (line) => {
+  // Assigned by session.exec below, before any output line is handled.
+  let run!: SshRun;
+  const handleLine = async (line: string) => {
     if (problem || ctx.isCanceled()) return;
     // The OIDC code and any error come after the link, so only the link stops counting.
     const link = opened ? null : parseSignInLink(line);
     if (!link) {
       const clean = line.replace(ANSI_RE, "").trim();
       const code = /^Confirm this code in the browser:\s*(\S+)/.exec(clean);
-      if (code) onStatus({ step: "confirm-code", code: code[1] });
+      // The pattern's one group always matches.
+      if (code) onStatus({ step: "confirm-code", code: code[1]! });
       // Kept only to explain a failure; failureDetail drops one-time link values.
       if (clean) notes.push(clean);
       return;
@@ -666,14 +801,14 @@ async function signIn(ctx) {
     await openExternal(link.url);
     onStatus({ step: "waiting-for-browser" });
   };
-  const enqueue = (line) => {
+  const enqueue = (line: string) => {
     queue = queue
       .then(() => handleLine(line))
-      .catch((error) => {
+      .catch((error: unknown) => {
         problem ??=
           error instanceof SshConnectError
             ? error.message
-            : `Sign-in failed: ${error?.message ?? error}`;
+            : `Sign-in failed: ${propertyOf(error, "message") ?? error}`;
         run.cancel();
       });
   };
@@ -719,27 +854,11 @@ async function signIn(ctx) {
 /**
  * The whole connect: sign in (installing omnigent first if the user agrees),
  * then start the host.
- *
- * @param {{
- *   serverUrl: string,
- *   destination: string,
- *   session: ReturnType<typeof createSshSession>,
- *   openExternal: (url: string) => Promise<void> | void,
- *   onStatus: (status: { step: string, code?: string }) => void,
- *   onOutput: (text: string) => void,
- *   askInstall: () => Promise<boolean>,
- *   readInstallScript: () => string | null,
- *   isPortFree?: (port: number) => Promise<boolean>,
- *   isCanceled?: () => boolean,
- *   onIdentityUnavailable?: (reason: string) => void,
- *   timeouts?: { signIn?: number, host?: number, install?: number },
- * }} ctx
- * @returns {Promise<{ ok: boolean, error?: string, canceled?: boolean, alreadyRunning?: boolean, identity?: { serverUrl: string, hostId: string } }>}
  */
-async function runSshConnect(ctx) {
+export async function runSshConnect(ctx: SshConnectContext): Promise<SshConnectOutcome> {
   const full = { isPortFree, isCanceled: () => false, ...ctx };
   const { session, serverUrl, destination, onStatus, onOutput } = full;
-  const openSafely = async (url) => {
+  const openSafely = async (url: string) => {
     const parsed = new URL(url);
     if (!["https:", "http:"].includes(parsed.protocol)) {
       throw new SshConnectError("The sign-in link isn't a web address.");
@@ -810,37 +929,54 @@ async function runSshConnect(ctx) {
   }
 }
 
-/**
- * Connect `destination` to `serverUrl`, with prompts routed through `hooks`.
- *
- * @param {string} serverUrl
- * @param {string} destination
- * @param {{
- *   hooks: {
- *     onOutput: (text: string) => void,
- *     onStatus: (status: { step: string, code?: string }) => void,
- *     prompt: (request: { kind: string, text: string }) => Promise<string | null>,
- *     askInstall: () => Promise<boolean>,
- *   },
- *   openExternal: (url: string) => Promise<void> | void,
- *   readInstallScript: () => string | null,
- *   log?: (message: string) => void,
- *   makeTempDir?: () => string,
- *   createAskpass?: typeof createAskpass,
- *   createSession?: typeof createSshSession,
- *   isPortFree?: (port: number) => Promise<boolean>,
- * }} deps
- * @returns {{ promise: Promise<object>, cancel: () => void }}
- */
-function startSshConnect(serverUrl, destination, deps) {
+/** A prompt for the user, from ssh through the askpass helper. */
+export interface SshPromptRequest {
+  kind: SshPromptKind;
+  text: string;
+  signal: AbortSignal;
+}
+
+/** Where a connect shows its progress and asks its questions. */
+export interface SshConnectHooks {
+  onOutput: (text: string) => void;
+  onStatus: (status: SshConnectStatus) => void;
+  /** Resolves with the answer, or null when the user cancels. */
+  prompt: (request: SshPromptRequest) => Promise<string | null>;
+  askInstall: () => Promise<boolean>;
+}
+
+export interface StartSshConnectDeps {
+  hooks: SshConnectHooks;
+  openExternal: (url: string) => Promise<void> | void;
+  readInstallScript: () => string | null;
+  log?: ((message: string) => void) | undefined;
+  makeTempDir?: (() => string) | undefined;
+  createAskpass?: ((options: AskpassOptions) => Promise<Askpass>) | undefined;
+  createSession?:
+    ((options: SshSessionOptions) => SshConnectSession & Pick<SshSession, "abort">) | undefined;
+  isPortFree?: ((port: number) => Promise<boolean>) | undefined;
+}
+
+/** A connect in flight; `cancel` kills its ssh processes. */
+export interface SshConnectRun {
+  promise: Promise<SshConnectOutcome>;
+  cancel: () => void;
+}
+
+/** Connect `destination` to `serverUrl`, with prompts routed through `hooks`. */
+export function startSshConnect(
+  serverUrl: string,
+  destination: string,
+  deps: StartSshConnectDeps,
+): SshConnectRun {
   const { hooks, log = () => {} } = deps;
   const makeTempDir =
     deps.makeTempDir ?? (() => fs.mkdtempSync(path.join(os.tmpdir(), "omni-ssh-")));
   let canceled = false;
-  let session = null;
-  const promise = (async () => {
-    let dir = null;
-    let askpass = null;
+  let session: (SshConnectSession & Pick<SshSession, "abort">) | null = null;
+  const promise = (async (): Promise<SshConnectOutcome> => {
+    let dir: string | null = null;
+    let askpass: Askpass | null = null;
     try {
       const url = safeServerUrl(serverUrl);
       const target = validateDestination(destination);
@@ -874,10 +1010,10 @@ function startSshConnect(serverUrl, destination, deps) {
     } catch (error) {
       if (canceled) return canceledResult();
       if (error instanceof SshConnectError) return { ok: false, error: error.message };
-      log(`ssh connect: unexpected failure: ${error?.stack ?? error}`);
+      log(`ssh connect: unexpected failure: ${propertyOf(error, "stack") ?? error}`);
       return {
         ok: false,
-        error: `Connecting to ${destination} failed: ${error?.message ?? error}`,
+        error: `Connecting to ${destination} failed: ${propertyOf(error, "message") ?? error}`,
       };
     } finally {
       askpass?.close();
@@ -892,24 +1028,3 @@ function startSshConnect(serverUrl, destination, deps) {
     },
   };
 }
-
-module.exports = {
-  SIGN_IN_FIRST_PORT,
-  SIGN_IN_LAST_PORT,
-  SshConnectError,
-  classifyPrompt,
-  createSshSession,
-  describeCommands,
-  describeSshFailure,
-  hostScript,
-  installScript,
-  isPortFree,
-  loginScript,
-  parseSignInLink,
-  signInLinkRefusal,
-  remoteCommand,
-  runSshConnect,
-  safeServerUrl,
-  startSshConnect,
-  validateDestination,
-};

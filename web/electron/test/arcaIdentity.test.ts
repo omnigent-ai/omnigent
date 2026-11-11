@@ -1,19 +1,21 @@
-"use strict";
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const {
+import {
   arcaTarget,
   readArcaIdentity,
   createArcaIdentityStore,
   isArcaAgentContext,
   IDENTITY_START,
   IDENTITY_END,
-} = require("../src/arcaIdentity");
+  type ArcaAgentContext,
+  type ArcaAgentContextGates,
+  type ArcaIdentity,
+} from "../src/arcaIdentity.ts";
 
 const SERVER = "https://account.databricks.com/omnigent?o=123";
 const HOST = "a".repeat(32);
-const identity = { serverUrl: arcaTarget(SERVER), hostId: HOST };
+const identity: ArcaIdentity = { serverUrl: arcaTarget(SERVER)!, hostId: HOST };
 const daemon = {
   target: "https://account.databricks.com/api/2.0/omnigent",
   server_url: "https://account.databricks.com/api/2.0/omnigent",
@@ -23,7 +25,7 @@ const daemon = {
   host_id: HOST,
   error: null,
 };
-const output = (rows) =>
+const output = (rows: unknown[]) =>
   `connect output\n${IDENTITY_START}\n${JSON.stringify({ daemons: rows })}\n${IDENTITY_END}\n`;
 
 describe("Arca daemon identity", () => {
@@ -48,7 +50,7 @@ describe("Arca daemon identity", () => {
   });
 
   it("accepts a daemon target with the requested or a sign-in-resolved ?o=, never another one", () => {
-    const withOrg = (org) => ({ ...daemon, target: `${daemon.target}?o=${org}` });
+    const withOrg = (org: string) => ({ ...daemon, target: `${daemon.target}?o=${org}` });
     assert.deepEqual(readArcaIdentity(output([withOrg("123")]), SERVER), identity);
     const unscoped = "https://account.databricks.com/omnigent";
     assert.deepEqual(readArcaIdentity(output([withOrg("999")]), unscoped), {
@@ -76,7 +78,7 @@ describe("Arca daemon identity", () => {
       [{ ...daemon, error: "not authenticated" }],
       [{ ...daemon, mode: "local" }],
       [{ ...daemon, host_id: "arca-looking-hostname" }],
-    ]) {
+    ] satisfies unknown[][]) {
       assert.equal(readArcaIdentity(output(rows), SERVER), null);
     }
     for (const text of [
@@ -95,8 +97,8 @@ describe("Arca daemon identity", () => {
       [`${IDENTITY_START}${privateText}${IDENTITY_END}`, "status could not be parsed"],
       [output([]), "status must contain exactly one daemon"],
       [output([{ ...daemon, error: privateText }]), "daemon status or target not eligible"],
-    ]) {
-      const reasons = [];
+    ] satisfies [string, string][]) {
+      const reasons: string[] = [];
       assert.equal(
         readArcaIdentity(text, SERVER, (r) => reasons.push(r)),
         null,
@@ -104,7 +106,7 @@ describe("Arca daemon identity", () => {
       assert.deepEqual(reasons, [reason]);
       assert.ok(reason.length < 80);
     }
-    const reasons = [];
+    const reasons: string[] = [];
     assert.deepEqual(
       readArcaIdentity(output([daemon]), SERVER, (r) => reasons.push(r)),
       identity,
@@ -164,7 +166,7 @@ describe("Arca daemon identity", () => {
       [identity, context, { ...gates, enabled: false }],
       [identity, context, { ...gates, managed: false }],
       [identity, context, { ...gates, serverTarget: SERVER.replace("123", "456") }],
-    ]) {
+    ] satisfies [ArcaIdentity | null, ArcaAgentContext | null, ArcaAgentContextGates][]) {
       assert.equal(isArcaAgentContext(id, ctx, gate), false);
     }
   });

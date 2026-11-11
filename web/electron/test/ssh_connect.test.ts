@@ -1,13 +1,14 @@
-"use strict";
+import { describe, it, type TestContext } from "node:test";
+import assert from "node:assert/strict";
+import { spawn as spawnProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
-const fs = require("node:fs");
-const net = require("node:net");
-const os = require("node:os");
-const path = require("node:path");
-const {
+import { IDENTITY_START, IDENTITY_END } from "../src/arcaIdentity.ts";
+import {
   SshConnectError,
   classifyPrompt,
   createSshSession,
@@ -23,11 +24,22 @@ const {
   safeServerUrl,
   startSshConnect,
   validateDestination,
-} = require("../src/ssh_connect");
-const { IDENTITY_START, IDENTITY_END } = require("../src/arcaIdentity");
+  type SpawnSsh,
+  type SshChild,
+  type SshConnectContext,
+  type SshConnectFailure,
+  type SshConnectOutcome,
+  type SshConnectSession,
+  type SshExecOptions,
+  type SshPromptRequest,
+  type SshRunResult,
+  type SshSession,
+  type StartSshConnectDeps,
+} from "../src/ssh_connect.ts";
+import type { AskpassOptions } from "../src/ssh_askpass.ts";
 
 const SERVER = "https://example.cloud.databricks.com/omnigent";
-const sleep = (ms) =>
+const sleep = (ms: number) =>
   new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
@@ -36,7 +48,22 @@ const tick = () =>
     setImmediate(resolve);
   });
 const HOST_ID = "a".repeat(32);
-const authorizeLink = (port) =>
+
+/** The test fails here when `value` is missing. */
+function present<Value>(value: Value | null | undefined): Value {
+  assert.ok(value !== null && value !== undefined);
+  return value;
+}
+
+/** The result as a failure; fails the test when the connect succeeded. */
+function failure(result: SshConnectOutcome): SshConnectFailure {
+  assert.ok(!result.ok);
+  return result;
+}
+
+const controlOk = (stderr = ""): SshRunResult => ({ code: 0, stdout: "", stderr, timedOut: false });
+
+const authorizeLink = (port: number) =>
   `https://example.cloud.databricks.com/oidc/v1/authorize?client_id=databricks-cli&redirect_uri=http%3A%2F%2Flocalhost%3A${port}&state=s1`;
 const statusOutput = (serverUrl = SERVER) =>
   `\n${IDENTITY_START}\n${JSON.stringify({
@@ -80,7 +107,7 @@ describe("remote scripts", () => {
 
 describe("loginScript on a real shell", () => {
   /** A fake `omnigent` in ~/.local/bin that starts a child, like the CLI it wraps. */
-  function fakeHome(t, body) {
+  function fakeHome(t: TestContext, body: string) {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "ssh-login-test-"));
     t.after(() => fs.rmSync(home, { recursive: true, force: true }));
     fs.mkdirSync(path.join(home, ".local", "bin"), { recursive: true });
@@ -88,14 +115,16 @@ describe("loginScript on a real shell", () => {
     fs.writeFileSync(script, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
     return home;
   }
-  function runLogin(home, pathDirs = "/usr/bin:/bin") {
-    const child = require("node:child_process").spawn("/bin/sh", ["-c", loginScript(SERVER)], {
+  function runLogin(home: string, pathDirs = "/usr/bin:/bin") {
+    const child = spawnProcess("/bin/sh", ["-c", loginScript(SERVER)], {
       env: { PATH: pathDirs, HOME: home },
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const exited = new Promise((resolve) => {
-      child.on("close", (code, signal) => resolve({ code, signal }));
-    });
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolve) => {
+        child.on("close", (code, signal) => resolve({ code, signal }));
+      },
+    );
     return { child, exited };
   }
 
@@ -130,14 +159,15 @@ describe("loginScript on a real shell", () => {
           pathDirs = bin;
         }
         const { child, exited } = runLogin(home, pathDirs);
-        const readPid = (name) => {
+        const readPid = (name: string) => {
           const file = path.join(home, name);
           return fs.existsSync(file) ? Number(fs.readFileSync(file, "utf8")) || null : null;
         };
         // Polling is sequential by design.
         // oxlint-disable-next-line no-await-in-loop
         while (readPid("child.pid") === null) await sleep(20);
-        const pids = [readPid("login.pid"), readPid("child.pid")];
+        // The login writes its pid before starting the child.
+        const pids = [present(readPid("login.pid")), present(readPid("child.pid"))];
         t.after(() => {
           for (const pid of pids) {
             try {
@@ -152,7 +182,7 @@ describe("loginScript on a real shell", () => {
 
         await exited;
         // An orphan stays a zombie until its new parent reaps it; that is still stopped.
-        const stopped = (pid) => {
+        const stopped = (pid: number) => {
           try {
             process.kill(pid, 0);
           } catch {
@@ -164,7 +194,7 @@ describe("loginScript on a real shell", () => {
             return / Z /.test(fs.readFileSync(stat, "utf8"));
           } catch (error) {
             // Reaped between the existence check and the read.
-            if (error.code === "ENOENT") return true;
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
             throw error;
           }
         };
@@ -216,11 +246,11 @@ describe("parseSignInLink", () => {
 
 describe("signInLinkRefusal", () => {
   // The remote machine prints these links, so a compromised one could print anything.
-  const databricksLink = (origin, port) =>
+  const databricksLink = (origin: string, port: number) =>
     `${origin}/oidc/v1/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A${port}`;
-  const withRedirect = (query) =>
+  const withRedirect = (query: string) =>
     `https://example.cloud.databricks.com/oidc/v1/authorize?client_id=databricks-cli${query}`;
-  const cases = {
+  const cases: Record<string, [line: string, refusal: RegExp | null, serverUrl?: string]> = {
     "the server's own page": [`Opening browser for login: ${SERVER}/auth/cli?t=1`, null],
     "a Databricks workspace calling back on 8020 to 8040": [authorizeLink(8040), null],
     "an Azure Databricks workspace": [
@@ -262,8 +292,8 @@ describe("signInLinkRefusal", () => {
   };
   for (const [label, [line, refusal, serverUrl = SERVER]] of Object.entries(cases)) {
     it(`${refusal ? "refuses" : "opens"} ${label}`, () => {
-      const result = signInLinkRefusal(parseSignInLink(line), serverUrl);
-      if (refusal) assert.match(result, refusal);
+      const result = signInLinkRefusal(present(parseSignInLink(line)), serverUrl);
+      if (refusal) assert.match(present(result), refusal);
       else assert.equal(result, null);
     });
   }
@@ -288,7 +318,7 @@ describe("classifyPrompt", () => {
 
 describe("describeSshFailure", () => {
   it("names the fix for each common ssh failure", () => {
-    const cases = [
+    const cases: [string, RegExp][] = [
       ["pat@my-ec2: Permission denied (publickey).", /didn't accept your sign-in/],
       ["Host key verification failed.", /wasn't trusted/],
       ["@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@", /host key changed/],
@@ -301,13 +331,34 @@ describe("describeSshFailure", () => {
   });
 });
 
+/** One `omnigent login` run: the lines it prints, then how it exits. */
+interface LoginStep {
+  lines?: string[];
+  code: number | null;
+  stderr?: string;
+}
+
+interface FakeSessionScript {
+  logins: LoginStep[];
+  host?: Omit<SshRunResult, "timedOut">;
+  install?: { code?: number | null; stderr?: string; timedOut?: boolean };
+}
+
+interface RecordedSession extends SshConnectSession, Pick<SshSession, "abort"> {
+  calls: string[];
+}
+
 /** Scripted stand-in for createSshSession that records every call in order. */
-function fakeSession({ logins, host = { code: 0, stdout: statusOutput(), stderr: "" }, install }) {
-  const calls = [];
+function fakeSession({
+  logins,
+  host = { code: 0, stdout: statusOutput(), stderr: "" },
+  install,
+}: FakeSessionScript): RecordedSession {
+  const calls: string[] = [];
   let loginRuns = 0;
-  const control = (name) => async (port) => {
+  const control = (name: string) => async (port: number) => {
     calls.push(`${name} ${port}`);
-    return { code: 0, stderr: "" };
+    return controlOk();
   };
   return {
     calls,
@@ -322,9 +373,9 @@ function fakeSession({ logins, host = { code: 0, stdout: statusOutput(), stderr:
     cancelLocal: control("cancelLocal"),
     holdRemote: control("holdRemote"),
     releaseRemote: control("releaseRemote"),
-    exec(script, opts = {}) {
-      let finish;
-      const promise = new Promise((resolve) => {
+    exec(script: string, opts: SshExecOptions = {}) {
+      let finish: (result: SshRunResult) => void = () => {};
+      const promise = new Promise<SshRunResult>((resolve) => {
         finish = resolve;
       });
       let canceled = false;
@@ -334,20 +385,22 @@ function fakeSession({ logins, host = { code: 0, stdout: statusOutput(), stderr:
         finish({ code: null, stdout: "", stderr: "", timedOut: false });
       };
       if (script.includes("omnigent login")) {
-        const step = logins[loginRuns];
+        const step = present(logins[loginRuns]);
         loginRuns += 1;
         calls.push("exec login");
         void (async () => {
           // One line per tick, like a CLI writing as it goes.
           /* oxlint-disable no-await-in-loop */
           for (const line of step.lines ?? []) {
-            opts.onStdout(`${line}\n`);
+            opts.onStdout?.(`${line}\n`);
             await tick();
           }
           /* oxlint-enable no-await-in-loop */
           // Let the queued link handling (forward, browser) run before the CLI exits.
           await sleep(10);
-          if (!canceled) finish({ code: step.code, stdout: "", stderr: step.stderr ?? "" });
+          if (!canceled) {
+            finish({ code: step.code, stdout: "", stderr: step.stderr ?? "", timedOut: false });
+          }
         })();
       } else if (script.includes("omnigent host")) {
         calls.push("exec host");
@@ -367,29 +420,29 @@ function fakeSession({ logins, host = { code: 0, stdout: statusOutput(), stderr:
   };
 }
 
-function connectContext(session, overrides = {}) {
-  const opened = [];
-  const statuses = [];
-  return {
-    opened,
-    statuses,
-    ctx: {
-      serverUrl: SERVER,
-      destination: "my-ec2",
-      session,
-      openExternal: async (url) => {
-        session.calls.push(`open-browser ${url}`);
-        opened.push(url);
-      },
-      onStatus: (status) =>
-        statuses.push(status.code ? `${status.step} ${status.code}` : status.step),
-      onOutput: () => {},
-      askInstall: async () => true,
-      readInstallScript: () => "INSTALLER",
-      isPortFree: async () => true,
-      ...overrides,
+function connectContext(
+  session: SshConnectSession & { calls?: string[] },
+  overrides: Partial<SshConnectContext> = {},
+) {
+  const opened: string[] = [];
+  const statuses: string[] = [];
+  const ctx: SshConnectContext = {
+    serverUrl: SERVER,
+    destination: "my-ec2",
+    session,
+    openExternal: async (url) => {
+      session.calls?.push(`open-browser ${url}`);
+      opened.push(url);
     },
+    onStatus: (status) =>
+      statuses.push(status.code ? `${status.step} ${status.code}` : status.step),
+    onOutput: () => {},
+    askInstall: async () => true,
+    readInstallScript: () => "INSTALLER",
+    isPortFree: async () => true,
+    ...overrides,
   };
+  return { opened, statuses, ctx };
 }
 
 describe("runSshConnect", () => {
@@ -486,7 +539,10 @@ describe("runSshConnect", () => {
   });
 
   // Each install outcome is reported plainly, and the connection still closes.
-  const installFailures = {
+  const installFailures: Record<
+    string,
+    [script: FakeSessionScript, overrides: Partial<SshConnectContext>, error: string]
+  > = {
     "this build has no bundled installer": [
       { logins: [{ lines: [], code: 127 }] },
       { readInstallScript: () => null },
@@ -529,7 +585,7 @@ describe("runSshConnect", () => {
 
   // Refused before any forward for the link's port (8021) or a browser; the port taken
   // up front (8020) is still released.
-  const unexpectedLinks = {
+  const unexpectedLinks: Record<string, [line: string, error: RegExp]> = {
     "a server sign-in on another site": [
       "Opening browser for login: https://evil.example/auth/cli",
       /goes to https:\/\/evil\.example, not this server/,
@@ -604,7 +660,7 @@ describe("runSshConnect", () => {
   });
 
   // Every callback port is busy here: only a sign-in that needs no callback port can work.
-  const allBusy = {
+  const allBusy: Record<string, [line: string, expected: SshConnectOutcome]> = {
     "a server's own sign-in, which needs no callback port, goes through": [
       `Opening browser for login: ${SERVER}/auth/cli?t=1`,
       { ok: true, alreadyRunning: false, identity: { serverUrl: SERVER, hostId: HOST_ID } },
@@ -643,7 +699,7 @@ describe("runSshConnect", () => {
   });
 
   // What the CLI printed, and what the failure says; link values never appear.
-  const failures = {
+  const failures: Record<string, [lines: string[], detail: string]> = {
     "the last plain output line, never a sign-in link": [
       ["Could not reach server", "https://x.example/secret?t=1"],
       "Could not reach server",
@@ -679,7 +735,7 @@ describe("runSshConnect", () => {
     });
     const { ctx } = connectContext(session);
 
-    assert.match((await runSshConnect(ctx)).error, /username and password/);
+    assert.match(failure(await runSshConnect(ctx)).error, /username and password/);
   });
 
   it("reports a host that didn't start", async () => {
@@ -690,17 +746,32 @@ describe("runSshConnect", () => {
     const { ctx } = connectContext(session);
 
     assert.equal(
-      (await runSshConnect(ctx)).error,
+      failure(await runSshConnect(ctx)).error,
       "Starting the Omnigent host on my-ec2 failed: not signed in",
     );
   });
 });
 
+type StartedSession = ReturnType<NonNullable<StartSshConnectDeps["createSession"]>>;
+
+/** A session that is only opened, closed or aborted; any other call fails the test. */
+function openOnlySession(parts: Pick<StartedSession, "open" | "close" | "abort">): StartedSession {
+  const unused = () => assert.fail("unexpected session call");
+  return {
+    exec: unused,
+    forwardLocal: unused,
+    cancelLocal: unused,
+    holdRemote: unused,
+    releaseRemote: unused,
+    ...parts,
+  };
+}
+
 describe("startSshConnect", () => {
   it("routes prompts through hooks, returns ssh's failure as a message, and removes its temp dir", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ssh-connect-test-"));
-    let onPrompt;
-    const prompts = [];
+    let onPrompt: AskpassOptions["onPrompt"] | undefined;
+    const prompts: SshPromptRequest[] = [];
     const asked = new AbortController();
     const { promise } = startSshConnect(SERVER, "my-ec2", {
       hooks: {
@@ -719,15 +790,16 @@ describe("startSshConnect", () => {
         onPrompt = options.onPrompt;
         return { env: { SSH_ASKPASS: "x" }, close: () => {} };
       },
-      createSession: () => ({
-        open: async () => {
-          const request = { prompt: "pat@my-ec2's password: ", hint: "", signal: asked.signal };
-          assert.equal(await onPrompt(request), "pw");
-          throw new SshConnectError(describeSshFailure(255, "Permission denied", "my-ec2"));
-        },
-        close: async () => {},
-        abort: () => {},
-      }),
+      createSession: () =>
+        openOnlySession({
+          open: async () => {
+            const request = { prompt: "pat@my-ec2's password: ", hint: "", signal: asked.signal };
+            assert.equal(await present(onPrompt)(request), "pw");
+            throw new SshConnectError(describeSshFailure(255, "Permission denied", "my-ec2"));
+          },
+          close: async () => {},
+          abort: () => {},
+        }),
     });
 
     const result = await promise;
@@ -735,7 +807,7 @@ describe("startSshConnect", () => {
     assert.deepEqual(prompts, [
       { kind: "secret", text: "pat@my-ec2's password: ", signal: asked.signal },
     ]);
-    assert.equal(prompts[0].signal, asked.signal);
+    assert.equal(present(prompts[0]).signal, asked.signal);
     assert.equal(result.ok, false);
     assert.match(result.error, /didn't accept your sign-in/);
     assert.equal(fs.existsSync(dir), false);
@@ -743,32 +815,38 @@ describe("startSshConnect", () => {
 
   it("stops a connect that is still opening and removes its temp dir", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ssh-connect-test-"));
-    let opening;
-    let rejectOpen;
-    const opened = new Promise((resolve) => {
+    let opening: () => void = () => {};
+    let rejectOpen: (error: Error) => void = () => {};
+    const opened = new Promise<void>((resolve) => {
       opening = resolve;
     });
     let aborted = false;
     const connect = startSshConnect(SERVER, "my-ec2", {
-      hooks: { onOutput: () => {}, onStatus: () => {}, prompt: async () => null },
+      hooks: {
+        onOutput: () => {},
+        onStatus: () => {},
+        prompt: async () => null,
+        askInstall: async () => false,
+      },
       openExternal: () => {},
       readInstallScript: () => null,
       makeTempDir: () => dir,
       createAskpass: async () => ({ env: {}, close: () => {} }),
-      createSession: () => ({
-        open: () => {
-          opening();
-          return new Promise((_, reject) => {
-            rejectOpen = reject;
-          });
-        },
-        close: async () => {},
-        abort: () => {
-          aborted = true;
-          // Killing the master ends open() with ssh's own failure.
-          rejectOpen(new SshConnectError("ssh exited"));
-        },
-      }),
+      createSession: () =>
+        openOnlySession({
+          open: () => {
+            opening();
+            return new Promise((_, reject) => {
+              rejectOpen = reject;
+            });
+          },
+          close: async () => {},
+          abort: () => {
+            aborted = true;
+            // Killing the master ends open() with ssh's own failure.
+            rejectOpen(new SshConnectError("ssh exited"));
+          },
+        }),
     });
 
     await opened;
@@ -786,18 +864,25 @@ describe("startSshConnect", () => {
   it("starts no sign-in and opens no browser once canceled after connecting", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ssh-connect-test-"));
     const session = fakeSession({ logins: [{ lines: [`${SERVER}/auth/cli?t=1`], code: 0 }] });
-    const opened = [];
-    let probing;
-    const probed = new Promise((resolve) => {
+    const opened: string[] = [];
+    let probing: () => void = () => {};
+    const probed = new Promise<void>((resolve) => {
       probing = resolve;
     });
-    let releaseProbe;
-    const probeGate = new Promise((resolve) => {
+    let releaseProbe: () => void = () => {};
+    const probeGate = new Promise<void>((resolve) => {
       releaseProbe = resolve;
     });
     const connect = startSshConnect(SERVER, "my-ec2", {
-      hooks: { onOutput: () => {}, onStatus: () => {}, prompt: async () => null },
-      openExternal: (url) => opened.push(url),
+      hooks: {
+        onOutput: () => {},
+        onStatus: () => {},
+        prompt: async () => null,
+        askInstall: async () => false,
+      },
+      openExternal: (url) => {
+        opened.push(url);
+      },
       readInstallScript: () => null,
       makeTempDir: () => dir,
       createAskpass: async () => ({ env: {}, close: () => {} }),
@@ -840,7 +925,9 @@ describe("isPortFree", () => {
         t.diagnostic(`${host} isn't available here`);
         continue;
       }
-      const { port } = server.address();
+      const address = server.address();
+      assert.ok(address !== null && typeof address === "object");
+      const { port } = address;
       // oxlint-disable-next-line no-await-in-loop
       assert.equal(await isPortFree(port), false, `held on ${host}`);
       // oxlint-disable-next-line no-await-in-loop
@@ -852,6 +939,15 @@ describe("isPortFree", () => {
     }
   });
 });
+
+/** A fake ssh process; `kill` ends it as a signal would unless a test replaces it. */
+class FakeChild extends EventEmitter implements SshChild {
+  stdout = new EventEmitter();
+  stderr = new EventEmitter();
+  kill = () => {
+    this.emit("close", null);
+  };
+}
 
 describe("createSshSession", () => {
   it("reports a missing ssh as a plain message", async () => {
@@ -870,22 +966,25 @@ describe("createSshSession", () => {
   });
 
   // Either way the master is gone, and ssh would otherwise quietly reconnect on its own.
-  const stops = {
+  const stops: Record<
+    string,
+    [
+      stop: (session: SshSession, master: FakeChild | undefined) => void,
+      refused: { code: number | null; stderr: string },
+    ]
+  > = {
     "it is aborted": [(session) => session.abort(), { code: null, stderr: "" }],
     "its connection exits after opening": [
-      (_session, master) => master.emit("exit", 255),
+      (_session, master) => present(master).emit("exit", 255),
       { code: 255, stderr: "the connection closed" },
     ],
   };
   for (const [label, [stop, refused]] of Object.entries(stops)) {
     it(`starts no ssh once ${label}`, async () => {
-      const spawned = [];
-      let master;
-      const spawn = (command, args) => {
-        const child = new EventEmitter();
-        child.stdout = new EventEmitter();
-        child.stderr = new EventEmitter();
-        child.kill = () => child.emit("close", null);
+      const spawned: string[] = [];
+      let master: FakeChild | undefined;
+      const spawn: SpawnSsh = (_command, args) => {
+        const child = new FakeChild();
         spawned.push(args.includes("-M") ? "master" : args.join(" "));
         if (args.includes("-M")) master = child;
         else setImmediate(() => child.emit("close", 0));
@@ -911,13 +1010,10 @@ describe("createSshSession", () => {
   }
 
   it("doesn't start the host when the connection drops right after sign-in", async () => {
-    const spawned = [];
-    let master;
-    const spawn = (command, args) => {
-      const child = new EventEmitter();
-      child.stdout = new EventEmitter();
-      child.stderr = new EventEmitter();
-      child.kill = () => child.emit("close", null);
+    const spawned: string[] = [];
+    let master: FakeChild | undefined;
+    const spawn: SpawnSsh = (_command, args) => {
+      const child = new FakeChild();
       const line = args.join(" ");
       spawned.push(line);
       if (args.includes("-M")) {
@@ -926,7 +1022,7 @@ describe("createSshSession", () => {
       }
       setImmediate(() => {
         // Sign-in succeeds, then the shared connection drops before the next step.
-        if (line.includes("omnigent login")) master.emit("exit", 255);
+        if (line.includes("omnigent login")) present(master).emit("exit", 255);
         child.emit("close", 0);
       });
       return child;
@@ -955,13 +1051,11 @@ describe("createSshSession", () => {
     "ignores the exit request, killing it after the grace period": false,
   })) {
     it(`closes a master that ${label}`, async (t) => {
-      const spawned = [];
-      let master;
+      const spawned: string[] = [];
+      let master: FakeChild | undefined;
       let kills = 0;
-      const spawn = (command, args) => {
-        const child = new EventEmitter();
-        child.stdout = new EventEmitter();
-        child.stderr = new EventEmitter();
+      const spawn: SpawnSsh = (_command, args) => {
+        const child = new FakeChild();
         const line = args.join(" ");
         spawned.push(line);
         if (args.includes("-M")) {
@@ -974,7 +1068,7 @@ describe("createSshSession", () => {
         }
         child.kill = () => child.emit("close", null);
         setImmediate(() => {
-          if (line.includes("-O exit") && exitsWhenAsked) master.emit("exit", 0);
+          if (line.includes("-O exit") && exitsWhenAsked) present(master).emit("exit", 0);
           child.emit("close", 0);
         });
         return child;
@@ -1009,12 +1103,9 @@ describe("createSshSession", () => {
   }
 
   it("opens one shared connection and sends forwards over it", async () => {
-    const spawned = [];
-    const spawn = (command, args) => {
-      const child = new EventEmitter();
-      child.stdout = new EventEmitter();
-      child.stderr = new EventEmitter();
-      child.kill = () => child.emit("close", null);
+    const spawned: string[][] = [];
+    const spawn: SpawnSsh = (command, args) => {
+      const child = new FakeChild();
       spawned.push([command, ...args]);
       // The master stays up; every client exits 0 straight away.
       if (!args.includes("-M")) setImmediate(() => child.emit("close", 0));

@@ -1,5 +1,5 @@
 // Renderer logic for the SSH connect console (see index.html for the page and
-// src/ssh_connect_window.js for the flow and trust model). Talks only to the
+// src/ssh_connect_window.ts for the flow and trust model). Talks only to the
 // narrow `window.sshConnect` bridge from ssh_connect_preload.js.
 "use strict";
 
