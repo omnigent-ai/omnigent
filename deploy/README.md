@@ -496,6 +496,16 @@ stored as `CODEX_ACCESS_TOKEN`. For gateway setups or other env vars beyond
 the standard set, add `OMNIGENT_RUNNER_ENV_PASSTHROUGH=NAME1,NAME2` to the
 secret to name the extra vars the host should forward to runners.
 
+A shared secret puts every user on one subscription. To let each user bring
+their own instead, set `OMNIGENT_CLAUDE_CONNECT_ENABLED=1` on a server with the
+credential store configured (`OMNIGENT_CREDENTIAL_KMS_KEY_ID` or the Vault
+key). Users then paste their `claude setup-token` output under **Settings →
+Sandbox Integrations**. A managed sandbox fetches its owner's token from the
+server when its host starts and exports it as `CLAUDE_CODE_OAUTH_TOKEN`,
+replacing any shared value. Connecting or disconnecting applies to sandboxes
+started afterwards. Disconnecting does not revoke the token with Anthropic, so
+a sandbox that already started keeps using it until the sandbox stops.
+
 **Private repositories.** Managed sessions can clone a repository as the
 session workspace; for private ones, store an HTTPS token as `GIT_TOKEN` in
 a Modal secret (GitLab: add `GIT_USERNAME=oauth2`). The host image's git

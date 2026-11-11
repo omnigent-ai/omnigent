@@ -73,6 +73,9 @@ const mocks = vi.hoisted(() => ({
   projectNames: [] as string[],
   hasNextPage: false,
   fetchNextPage: vi.fn(),
+  fetchClaudeStatus: vi.fn(),
+  saveClaudeToken: vi.fn(),
+  disconnectClaude: vi.fn(),
 }));
 
 vi.mock("next-themes", () => ({
@@ -102,6 +105,11 @@ vi.mock("@/components/SessionTitleInstructionsControl", () => ({
 }));
 vi.mock("@/shell/ImportSessionsPanel", () => ({
   ImportSessionsPanel: mocks.importSessionsPanel,
+}));
+vi.mock("@/lib/claudeIntegration", () => ({
+  fetchClaudeStatus: mocks.fetchClaudeStatus,
+  saveClaudeToken: mocks.saveClaudeToken,
+  disconnectClaude: mocks.disconnectClaude,
 }));
 vi.mock("@/lib/accountsApi", () => ({
   logout: vi.fn(),
@@ -329,6 +337,52 @@ describe("Import sessions", () => {
     expect(screen.getByRole("heading", { name: "Import from a machine" })).toBeTruthy();
     expect(mocks.importSessionsPanel).toHaveBeenCalled();
     expect(screen.queryByRole("heading", { name: "Harness imports" })).toBeNull();
+  });
+});
+
+describe("Claude subscription connection", () => {
+  const disconnected = { enabled: true, connected: false, connected_at: null };
+  const connected = { enabled: true, connected: true, connected_at: 1_700_000_000 };
+
+  beforeEach(() => {
+    mocks.enabledConnections = ["claude"];
+    mocks.fetchClaudeStatus.mockReset().mockResolvedValue(disconnected);
+    mocks.saveClaudeToken.mockReset();
+    mocks.disconnectClaude.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("saves a pasted setup token and then offers to disconnect", async () => {
+    mocks.saveClaudeToken.mockResolvedValue(connected);
+    renderPage("/settings/integrations");
+
+    const input = await screen.findByLabelText("Claude setup token");
+    expect(input).toHaveAttribute("type", "password");
+    fireEvent.change(input, { target: { value: "  sk-ant-oat01-example  " } });
+    fireEvent.click(screen.getByRole("button", { name: "Connect Claude" }));
+
+    expect(await screen.findByText(/Subscription connected\./)).toBeInTheDocument();
+    expect(mocks.saveClaudeToken).toHaveBeenCalledWith("sk-ant-oat01-example");
+    expect(screen.queryByLabelText("Claude setup token")).not.toBeInTheDocument();
+
+    mocks.fetchClaudeStatus.mockResolvedValue(disconnected);
+    fireEvent.click(screen.getByRole("button", { name: "Disconnect" }));
+    expect(await screen.findByLabelText("Claude setup token")).toBeInTheDocument();
+    expect(mocks.disconnectClaude).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows why a pasted value was rejected", async () => {
+    mocks.saveClaudeToken.mockRejectedValue(
+      new Error("Paste the token printed by `claude setup-token` (it starts with sk-ant-oat)."),
+    );
+    renderPage("/settings/integrations");
+
+    fireEvent.change(await screen.findByLabelText("Claude setup token"), {
+      target: { value: "sk-ant-api03-key" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Connect Claude" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("it starts with sk-ant-oat");
+    expect(screen.getByRole("button", { name: "Connect Claude" })).toBeEnabled();
   });
 });
 

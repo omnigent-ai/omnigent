@@ -6518,6 +6518,12 @@ def _serve_host_until_exit(
     from omnigent.host.databricks_credential import configure_host_databricks
 
     configure_host_databricks(server_url, identity.host_id)
+
+    # Executor-agnostic Claude setup: when the owner has connected a Claude
+    # subscription, export its token so Claude Code harnesses run as them.
+    from omnigent.host.claude_credential import configure_host_claude
+
+    configure_host_claude(server_url, identity.host_id)
     _generate_ucode_configs()
 
     if lifecycle_lock is None and daemon_target is not None:

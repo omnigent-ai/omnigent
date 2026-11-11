@@ -1,4 +1,4 @@
-"""Registry of per-user connection providers (GitHub, Databricks, ...).
+"""Registry of per-user connection providers (GitHub, Databricks, Claude, ...).
 
 Wiring a new provider into the server is a single entry here plus its
 :class:`~omnigent.server.routes.connections_base.ConnectionHooks` adapter —
@@ -51,6 +51,7 @@ def connection_providers() -> list[ConnectionProvider]:
     """
     from functools import partial
 
+    from omnigent.server.claude_connection import resolve_claude_credential
     from omnigent.server.databricks_app_client import DatabricksAppClient
     from omnigent.server.databricks_identity import (
         OWNER_IDENTITY_REFRESH_MARGIN_S,
@@ -58,6 +59,7 @@ def connection_providers() -> list[ConnectionProvider]:
     )
     from omnigent.server.github_app_client import GitHubAppClient
     from omnigent.server.github_identity import resolve_github_credential
+    from omnigent.server.routes.connections_claude import create_connections_claude_router
     from omnigent.server.routes.connections_databricks import (
         create_connections_databricks_router,
     )
@@ -82,7 +84,18 @@ def connection_providers() -> list[ConnectionProvider]:
                 refresh_margin_s=OWNER_IDENTITY_REFRESH_MARGIN_S,
             ),
         ),
+        ConnectionProvider(
+            name="claude",
+            client_factory=_no_client,
+            router_factory=create_connections_claude_router,
+            credential_resolver=resolve_claude_credential,
+        ),
     ]
+
+
+def _no_client(config: Any) -> None:
+    """Client factory for a provider that calls no provider API (a pasted token)."""
+    del config
 
 
 def blocking_owner_resolver(

@@ -5077,6 +5077,12 @@ def server(
 
             databricks_store = DatabricksConnectionStore(db_uri, dbx_cipher)
 
+    # Claude subscription connect (per-user `claude setup-token` tokens). Shares
+    # the credential store's cipher; inert unless OMNIGENT_CLAUDE_CONNECT_ENABLED is set.
+    from omnigent.server.claude_connection import claude_connect_from_env
+
+    claude_config, claude_store = claude_connect_from_env(db_uri)
+
     from omnigent.server.mcp_registry import build_mcp_registry_from_env
 
     mcp_registry = build_mcp_registry_from_env(db_uri)
@@ -5160,6 +5166,8 @@ def server(
         mcp_registry=mcp_registry,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
+        claude_config=claude_config,
+        claude_store=claude_store,
         server_config=server_config,
     )
 

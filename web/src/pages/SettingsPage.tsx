@@ -123,6 +123,12 @@ import {
   type DatabricksConnectionStatus,
 } from "@/lib/databricksIntegration";
 import {
+  disconnectClaude,
+  fetchClaudeStatus,
+  saveClaudeToken,
+  type ClaudeConnectionStatus,
+} from "@/lib/claudeIntegration";
+import {
   getCurrentIsAdmin,
   getCurrentAdminEligibility,
   resolveIdentity,
@@ -1437,6 +1443,7 @@ function GithubMark({ className }: { className?: string }) {
 const CONNECTION_PANELS: Record<string, ComponentType> = {
   github: GithubIntegrationControl,
   databricks: DatabricksIntegrationControl,
+  claude: ClaudeIntegrationControl,
 };
 
 /**
@@ -1776,6 +1783,128 @@ function DatabricksIntegrationControl() {
                 onClick={() => beginDatabricksConnect(workspace.trim(), returnTo)}
               >
                 Connect Databricks
+              </Button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Connect / disconnect a Claude subscription. The user pastes the token
+ * ``claude setup-token`` prints (Claude has no OAuth redirect for third-party
+ * servers); once saved, new managed sandboxes launched by this user run Claude
+ * Code on that subscription. The token is never shown again after saving.
+ */
+function ClaudeIntegrationControl() {
+  const [status, setStatus] = useState<ClaudeConnectionStatus | null | "loading">("loading");
+  const [busy, setBusy] = useState(false);
+  const [token, setToken] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setStatus(await fetchClaudeStatus());
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const onSave = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await saveClaudeToken(token.trim()));
+      setToken("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Couldn't save the token.");
+    } finally {
+      setBusy(false);
+    }
+  }, [token]);
+
+  const onDisconnect = useCallback(async () => {
+    setBusy(true);
+    try {
+      await disconnectClaude();
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  // Feature not configured on this server: render nothing (like a build without it).
+  if (status !== "loading" && status !== null && !status.enabled) {
+    return null;
+  }
+  if (status === "loading") {
+    return <p className="text-sm text-muted-foreground">Checking…</p>;
+  }
+  if (status === null) {
+    return <p className="text-sm text-muted-foreground">Claude status is unavailable.</p>;
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      {error && (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          {error}
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <SettingsLabel
+          label="Claude"
+          labelClassName="text-sm"
+          className="flex-1"
+          description={
+            status.connected
+              ? "Subscription connected. New sandboxes run Claude Code on your subscription."
+              : "Run `claude setup-token` and paste the token to use your Claude subscription in new sandboxes."
+          }
+        />
+        <div className="flex shrink-0 items-center gap-2">
+          {status.connected ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-9"
+              disabled={busy}
+              data-testid="claude-disconnect"
+              onClick={() => void onDisconnect()}
+            >
+              Disconnect
+            </Button>
+          ) : (
+            <>
+              <Input
+                type="password"
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="sk-ant-oat01-…"
+                aria-label="Claude setup token"
+                className="h-9 w-64"
+                value={token}
+                onChange={(e) => setToken(e.target.value)}
+                data-testid="claude-token"
+              />
+              <Button
+                size="sm"
+                className="h-9"
+                disabled={busy || token.trim() === ""}
+                data-testid="claude-connect"
+                onClick={() => void onSave()}
+              >
+                Connect Claude
               </Button>
             </>
           )}

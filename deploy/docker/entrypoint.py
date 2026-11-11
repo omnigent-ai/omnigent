@@ -461,6 +461,10 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
     mcp_registry = build_mcp_registry_from_env(database_url)
 
+    from omnigent.server.claude_connection import claude_connect_from_env
+
+    claude_config, claude_store = claude_connect_from_env(database_url)
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -489,6 +493,8 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         mcp_registry=mcp_registry,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
+        claude_config=claude_config,
+        claude_store=claude_store,
     )
 
     log_capabilities(sandbox_config, github_config, github_store)
