@@ -13,7 +13,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { sessionNumberAriaShortcut } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -265,6 +265,25 @@ describe("collapsing the project that holds the open session", () => {
     );
     fireEvent.click(screen.getByRole("link", { name: /pinned_x/ }));
     expect(screen.queryByRole("link", { name: /sibling_b/ })).not.toBeInTheDocument();
+  });
+
+  it("badges the collapsed header only for the rows it hides", () => {
+    const awaiting = (id: string) =>
+      ({ ...conv(id, "Repro 2506"), pending_elicitations_count: 1 }) as Conversation;
+    openFiledSession();
+    mockConversations([conv("pinned_x"), awaiting("sibling_b"), conv("sibling_c", "Repro 2506")]);
+    const { rerenderSidebar } = renderAt("/c/sibling_b");
+    fireEvent.click(screen.getByRole("button", { name: /^Repro 2506/ }));
+
+    const header = () => screen.getByRole("button", { name: /^Repro 2506/ });
+    expect(header()).toHaveAttribute("aria-expanded", "false");
+    expect(within(header()).queryByText("Needs response")).toBeNull();
+    expect(screen.getAllByText("Needs response")).toHaveLength(1);
+
+    mockConversations([conv("pinned_x"), awaiting("sibling_b"), awaiting("sibling_c")]);
+    act(() => rerenderSidebar());
+    expect(within(header()).getByText("Needs response")).toBeInTheDocument();
+    expect(screen.getAllByText("Needs response")).toHaveLength(2);
   });
 
   // The chat page suspends until released, holding the route commit as a loading chat does.

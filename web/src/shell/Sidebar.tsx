@@ -1772,7 +1772,15 @@ function ProjectFolder({
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
   );
-  const marker = projectMarkerState(conversations, errors, startingConversationId);
+  // A collapsed folder keeps showing the open session until you navigate away; that
+  // row owns its badge, so the header summarizes only the rows it hides.
+  const heldIndex = expanded ? -1 : conversations.findIndex((c) => c.id === activeConversationId);
+  const isHidden = (_row: unknown, index: number) => index !== heldIndex;
+  const marker = projectMarkerState(
+    conversations.filter(isHidden),
+    errors.filter(isHidden),
+    startingConversationId,
+  );
   // "Show more" carries the badge of the rows it hides, as a collapsed header does.
   const hiddenMarker =
     expanded && visibleCount < conversations.length
@@ -1893,9 +1901,8 @@ function ProjectFolder({
         active={active}
         marker={marker}
         conversations={display.rows}
-        // A collapsed folder keeps showing the open session until you navigate away.
         heldConversations={
-          expanded ? undefined : conversations.filter((c) => c.id === activeConversationId)
+          expanded ? undefined : conversations.filter((_row, index) => index === heldIndex)
         }
         listRef={listRef}
         activeConversationId={activeConversationId}
