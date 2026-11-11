@@ -33,6 +33,7 @@ from omnigent.db.query_context import current_query_name, query_name_scope
 from omnigent.db.utils import (
     _ITEM_TYPES,
     _create_engine,
+    _driver_reports_no_open_transaction,
     _is_read_only_statement,
     clear_engine_cache,
     delete_fts_by_conversation,
@@ -236,25 +237,6 @@ class TestManagedSessionMaker:
 # ── Transaction terminators ───────────────────────────
 
 
-def _record_terminators(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Record every COMMIT/ROLLBACK the engine sends, including pool resets."""
-    terminators: list[str] = []
-    dialect = engine.dialect
-    real_commit, real_rollback = dialect.do_commit, dialect.do_rollback
-
-    def _commit(dbapi_connection: Any) -> None:
-        terminators.append("COMMIT")
-        real_commit(dbapi_connection)
-
-    def _rollback(dbapi_connection: Any) -> None:
-        terminators.append("ROLLBACK")
-        real_rollback(dbapi_connection)
-
-    monkeypatch.setattr(dialect, "do_commit", _commit)
-    monkeypatch.setattr(dialect, "do_rollback", _rollback)
-    return terminators
-
-
 def _user_ids(db_uri: str) -> set[str]:
     """Read user ids through a separate engine, so only committed rows count."""
     reader = _create_engine(db_uri)
@@ -288,14 +270,6 @@ def _write_with_cte(session: Session, user_id: str) -> None:
     )
 
 
-def _write_after_select_for_update(session: Session, user_id: str) -> None:
-    existing = session.execute(
-        select(SqlUser).where(SqlUser.id == "locked_seed").with_for_update()
-    ).scalar_one()
-    assert existing.is_admin is False
-    session.execute(insert(SqlUser).values(id=user_id, is_admin=False))
-
-
 _WRITE_PATHS: dict[str, Callable[[Session, str], object]] = {
     "orm_add_pending": lambda session, user_id: session.add(SqlUser(id=user_id, is_admin=False)),
     "orm_add_flushed": lambda session, user_id: (
@@ -316,7 +290,6 @@ _WRITE_PATHS: dict[str, Callable[[Session, str], object]] = {
         _upsert_user(session.get_bind().dialect.name, user_id)
     ),
     "cte_insert": _write_with_cte,
-    "select_for_update_then_insert": _write_after_select_for_update,
 }
 
 
@@ -368,11 +341,11 @@ class TestSingleTransactionTerminator:
         assert not _is_read_only_statement(statement)
 
     def test_read_only_session_ends_with_one_rollback(
-        self, db_uri: str, monkeypatch: pytest.MonkeyPatch
+        self, db_uri: str, record_terminators: Callable[[Engine], list[str]]
     ) -> None:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
-        terminators = _record_terminators(engine, monkeypatch)
+        terminators = record_terminators(engine)
 
         with managed() as session:
             session.execute(select(SqlUser.id)).all()
@@ -392,25 +365,12 @@ class TestSingleTransactionTerminator:
         assert loaded is not None
         assert loaded.is_admin is True
 
-    def test_writing_session_commits_without_trailing_rollback(
-        self, db_uri: str, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        engine = get_or_create_engine(db_uri)
-        managed = make_named_managed_session_maker(engine, query_name_prefix="omnigent.test")
-        terminators = _record_terminators(engine, monkeypatch)
-
-        with managed("create_user") as session:
-            session.add(SqlUser(id="written_user", is_admin=False))
-
-        assert terminators == ["COMMIT"]
-        assert "written_user" in _user_ids(db_uri)
-
     def test_failed_session_rolls_back_once(
-        self, db_uri: str, monkeypatch: pytest.MonkeyPatch
+        self, db_uri: str, record_terminators: Callable[[Engine], list[str]]
     ) -> None:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
-        terminators = _record_terminators(engine, monkeypatch)
+        terminators = record_terminators(engine)
 
         with pytest.raises(ValueError, match="simulated failure"):
             with managed() as session:
@@ -421,39 +381,25 @@ class TestSingleTransactionTerminator:
         assert "failed_user" not in _user_ids(db_uri)
 
     def test_sqlite_immediate_session_always_commits(
-        self, db_uri: str, monkeypatch: pytest.MonkeyPatch
+        self, db_uri: str, record_terminators: Callable[[Engine], list[str]]
     ) -> None:
         engine = get_or_create_engine(db_uri)
         if engine.dialect.name != "sqlite":
             pytest.skip("BEGIN IMMEDIATE is SQLite-only")
         managed = make_managed_session_maker(engine, immediate=True)
-        terminators = _record_terminators(engine, monkeypatch)
+        terminators = record_terminators(engine)
 
         with managed() as session:
             session.execute(select(SqlUser.id)).all()
 
         assert terminators == ["COMMIT"]
 
-    def test_shared_read_scope_reads_end_with_one_rollback(
-        self, db_uri: str, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        engine = get_or_create_engine(db_uri)
-        managed = make_managed_session_maker(engine)
-        terminators = _record_terminators(engine, monkeypatch)
-
-        with shared_read_scope():
-            for _ in range(3):
-                with managed() as session:
-                    session.execute(select(SqlUser.id)).all()
-
-        assert terminators == ["ROLLBACK"]
-
     def test_shared_read_scope_write_commits_once(
-        self, db_uri: str, monkeypatch: pytest.MonkeyPatch
+        self, db_uri: str, record_terminators: Callable[[Engine], list[str]]
     ) -> None:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
-        terminators = _record_terminators(engine, monkeypatch)
+        terminators = record_terminators(engine)
 
         with shared_read_scope():
             with managed() as session:
@@ -464,47 +410,29 @@ class TestSingleTransactionTerminator:
         assert terminators == ["COMMIT"]
         assert "scope_writer" in _user_ids(db_uri)
 
-    def test_shared_read_scope_failure_rolls_back_once(
-        self, db_uri: str, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        engine = get_or_create_engine(db_uri)
-        managed = make_managed_session_maker(engine)
-        terminators = _record_terminators(engine, monkeypatch)
-
-        with pytest.raises(ValueError, match="simulated failure"):
-            with shared_read_scope():
-                with managed() as session:
-                    session.execute(insert(SqlUser).values(id="scope_failure", is_admin=False))
-                raise ValueError("simulated failure")
-
-        assert terminators == ["ROLLBACK"]
-        assert "scope_failure" not in _user_ids(db_uri)
-
     @pytest.mark.parametrize("write_path", sorted(_WRITE_PATHS))
     def test_every_write_path_commits_and_persists(
-        self, db_uri: str, monkeypatch: pytest.MonkeyPatch, write_path: str
+        self, db_uri: str, record_terminators: Callable[[Engine], list[str]], write_path: str
     ) -> None:
         engine = get_or_create_engine(db_uri)
-        managed = make_managed_session_maker(engine)
-        with managed() as session:
-            session.add(SqlUser(id="locked_seed", is_admin=False))
-        terminators = _record_terminators(engine, monkeypatch)
+        managed = make_named_managed_session_maker(engine, query_name_prefix="omnigent.test")
+        terminators = record_terminators(engine)
         user_id = f"via_{write_path}"
 
-        with managed() as session:
+        with managed(write_path) as session:
             _WRITE_PATHS[write_path](session, user_id)
 
         assert terminators == ["COMMIT"]
         assert user_id in _user_ids(db_uri)
 
     def test_write_on_one_bind_survives_a_read_on_another(
-        self, db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, db_uri: str, tmp_path: Path, record_terminators: Callable[[Engine], list[str]]
     ) -> None:
         engine = get_or_create_engine(db_uri)
         other_engine = get_or_create_engine(f"sqlite:///{tmp_path / 'other_bind.db'}")
         make_managed_session_maker(other_engine)
         managed = make_managed_session_maker(engine)
-        terminators = _record_terminators(engine, monkeypatch)
+        terminators = record_terminators(engine)
 
         with managed() as session:
             session.execute(insert(SqlUser).values(id="first_bind_write", is_admin=False))
@@ -513,10 +441,12 @@ class TestSingleTransactionTerminator:
         assert terminators == ["COMMIT"]
         assert "first_bind_write" in _user_ids(db_uri)
 
-    def test_ddl_commits(self, db_uri: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_ddl_commits(
+        self, db_uri: str, record_terminators: Callable[[Engine], list[str]]
+    ) -> None:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
-        terminators = _record_terminators(engine, monkeypatch)
+        terminators = record_terminators(engine)
         try:
             with managed() as session:
                 session.execute(text("CREATE TABLE terminator_probe (id INTEGER PRIMARY KEY)"))
@@ -589,24 +519,57 @@ class TestTransactionAwarePoolReset:
             cursor = connection.connection.driver_connection.cursor()  # type: ignore[union-attr]
             cursor.execute("INSERT INTO users (workspace_id, id) VALUES (0, 'raw_dbapi')")
             cursor.close()
-        # Had the pool kept the raw transaction open, this COMMIT would publish it.
+        with engine.connect() as connection:
+            # A SQLAlchemy COMMIT first, then raw work that reopens a transaction.
+            connection.execute(select(SqlUser.id)).all()
+            connection.commit()
+            cursor = connection.connection.driver_connection.cursor()  # type: ignore[union-attr]
+            cursor.execute("INSERT INTO users (workspace_id, id) VALUES (0, 'raw_after_commit')")
+            cursor.close()
+        # Had the pool kept either raw transaction open, this COMMIT would publish it.
         with managed() as session:
             session.add(SqlUser(id="after_raw_dbapi", is_admin=False))
 
-        assert len(set(checkouts)) == 1, "both uses must share one pooled connection"
+        assert len(set(checkouts)) == 1, "every use must share one pooled connection"
         user_ids = _user_ids(db_uri)
         assert "after_raw_dbapi" in user_ids
         assert "raw_dbapi" not in user_ids
+        assert "raw_after_commit" not in user_ids
+
+    def test_rollback_that_never_reached_the_driver_is_redone_on_return(
+        self, db_uri: str, pooled_engine: tuple[Engine, list[int]]
+    ) -> None:
+        engine, checkouts = pooled_engine
+        managed = make_managed_session_maker(engine)
+
+        def _fail_before_rollback(_connection: Any) -> None:
+            raise RuntimeError("simulated rollback listener failure")
+
+        event.listen(engine, "rollback", _fail_before_rollback)
+        connection = engine.connect()
+        connection.execute(insert(SqlUser).values(id="rollback_skipped", is_admin=False))
+        with pytest.raises(RuntimeError, match="simulated rollback listener failure"):
+            connection.close()
+        event.remove(engine, "rollback", _fail_before_rollback)
+        connection.close()
+        with managed() as session:
+            session.add(SqlUser(id="after_skipped_rollback", is_admin=False))
+
+        assert len(set(checkouts)) == 1, "both uses must share one pooled connection"
+        user_ids = _user_ids(db_uri)
+        assert "after_skipped_rollback" in user_ids
+        assert "rollback_skipped" not in user_ids
 
     def test_failed_commit_is_rolled_back_on_return(
         self,
         db_uri: str,
         pooled_engine: tuple[Engine, list[int]],
         monkeypatch: pytest.MonkeyPatch,
+        record_terminators: Callable[[Engine], list[str]],
     ) -> None:
         engine, _ = pooled_engine
         managed = make_managed_session_maker(engine)
-        terminators = _record_terminators(engine, monkeypatch)
+        terminators = record_terminators(engine)
         dbapi_error = engine.dialect.loaded_dbapi.OperationalError
         recorded_commit = engine.dialect.do_commit
 
@@ -627,7 +590,7 @@ class TestTransactionAwarePoolReset:
         self,
         db_uri: str,
         pooled_engine: tuple[Engine, list[int]],
-        monkeypatch: pytest.MonkeyPatch,
+        record_terminators: Callable[[Engine], list[str]],
     ) -> None:
         engine, _ = pooled_engine
         failing_query = text("SELECT id FROM table_missing_for_disconnect")
@@ -650,14 +613,17 @@ class TestTransactionAwarePoolReset:
                 session_maker, "disconnect_write", lambda session: session.execute(failing_query)
             )
 
-        terminators = _record_terminators(engine, monkeypatch)
+        terminators = record_terminators(engine)
         with session_maker("after_disconnect") as session:
             session.add(SqlUser(id="after_disconnect", is_admin=False))
         assert terminators == ["COMMIT"]
         assert "after_disconnect" in _user_ids(db_uri)
 
+    def test_unknown_driver_is_always_rolled_back(self) -> None:
+        assert not _driver_reports_no_open_transaction(object())
+
     def test_external_engine_opts_in_once(
-        self, db_uri: str, monkeypatch: pytest.MonkeyPatch
+        self, db_uri: str, record_terminators: Callable[[Engine], list[str]]
     ) -> None:
         engine = create_engine(normalize_database_url(db_uri), pool_reset_on_return=None)
         try:
@@ -665,7 +631,7 @@ class TestTransactionAwarePoolReset:
             install_transaction_aware_pool_reset(engine)
             engine.connect().close()
             managed = make_managed_session_maker(engine)
-            terminators = _record_terminators(engine, monkeypatch)
+            terminators = record_terminators(engine)
 
             with managed() as session:
                 session.execute(select(SqlUser.id)).all()

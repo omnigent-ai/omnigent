@@ -8,6 +8,7 @@ import logging
 import os
 import random
 import re
+import sqlite3
 import threading
 import time
 import uuid
@@ -287,6 +288,11 @@ _WRITE_SQL_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+# Driver transaction-state constants (PyMySQL ``SERVER_STATUS.SERVER_STATUS_IN_TRANS``;
+# psycopg ``pq.TransactionStatus.IDLE`` and psycopg2 ``TRANSACTION_STATUS_IDLE``).
+_MYSQL_SERVER_STATUS_IN_TRANS = 1
+_PSYCOPG_TRANSACTION_IDLE = 0
+
 _transaction_listener_lock = threading.Lock()
 _engines_with_transaction_aware_reset: weakref.WeakSet[Engine] = weakref.WeakSet()
 
@@ -351,12 +357,13 @@ def _remember_session_connection(
 def _session_may_have_written(session: Session) -> bool:
     """Whether committing ``session``'s open transaction could persist anything.
 
-    Call after ``session.flush()``. Unknown state counts as a write. Writes
-    that bypass SQLAlchemy's execution events (a raw DBAPI cursor from
-    ``session.connection().connection.cursor()``) and SELECTs with session
-    side effects (e.g. Postgres ``set_config``) look like reads and are not
-    committed; issue such work through ``session.execute`` or end the
-    transaction explicitly.
+    Call after ``session.flush()``. Unknown state counts as a write. Two
+    cases look like reads and are not committed: writes through a raw DBAPI
+    cursor (``session.connection().connection.cursor()``), which should go
+    through ``session.execute`` instead, and SELECTs with transactional side
+    effects (e.g. Postgres ``set_config(..., true)``), which stay classified as
+    reads even via ``session.execute`` and need an explicit
+    ``session.commit()``.
     """
     if session.new or session.dirty or session.deleted:
         return True
@@ -401,8 +408,9 @@ def _mark_transaction_open(connection: Connection, *_args: object) -> None:
 
 
 def _mark_transaction_ended(connection: Connection) -> None:
-    # ``commit``/``rollback`` fire just before the DBAPI call; if that call
-    # fails, ``handle_error`` below flips the state back to open.
+    # ``commit``/``rollback`` fire just before the DBAPI call, so this is not
+    # proof the call ran: ``handle_error`` covers DBAPI failures and
+    # :func:`_driver_reports_no_open_transaction` covers the rest.
     if connection.invalidated:
         # Reading ``info`` would try to reconnect; invalidation already
         # recorded the transaction as open.
@@ -421,15 +429,39 @@ def _mark_transaction_open_on_error(context: ExceptionContext) -> None:
         _logger.debug("could not record transaction state after an error", exc_info=True)
 
 
+def _driver_reports_no_open_transaction(dbapi_connection: DBAPIConnection) -> bool:
+    """Whether the DBAPI driver itself reports no open write transaction.
+
+    Unknown drivers return ``False`` so the pool rolls back. MySQL's
+    ``SERVER_STATUS_IN_TRANS`` stays clear for a transaction that has only
+    read, so a pinned REPEATABLE READ snapshot is not visible here; the
+    SQLAlchemy event state covers transactions SQLAlchemy began.
+    """
+    try:
+        if isinstance(dbapi_connection, sqlite3.Connection):
+            return not dbapi_connection.in_transaction
+        driver = type(dbapi_connection).__module__
+        if driver.startswith("pymysql"):
+            return not dbapi_connection.server_status & _MYSQL_SERVER_STATUS_IN_TRANS
+        if driver.startswith("psycopg2"):
+            return dbapi_connection.get_transaction_status() == _PSYCOPG_TRANSACTION_IDLE
+        if driver.startswith("psycopg"):
+            return dbapi_connection.info.transaction_status == _PSYCOPG_TRANSACTION_IDLE
+    except Exception:
+        _logger.debug("could not read driver transaction state", exc_info=True)
+    return False
+
+
 def install_transaction_aware_pool_reset(engine: Engine) -> None:
     """Roll back returned connections only when a transaction may be open.
 
     SQLAlchemy's default ``pool_reset_on_return="rollback"`` issues a ROLLBACK
     on every check-in, even right after a successful COMMIT or ROLLBACK, so
-    each transaction costs two terminators. This listener tracks per
-    connection whether the last transaction is known to have ended and rolls
-    back otherwise: on errors, invalidation, raw DBAPI work after checkout, or
-    unknown state.
+    each transaction costs two terminators. This listener skips that
+    ROLLBACK only when SQLAlchemy's events show the connection's last
+    transaction ended and the driver (sqlite3, PyMySQL, psycopg, psycopg2)
+    reports no open transaction. Errors, invalidation, raw DBAPI writes,
+    failed terminators and unknown drivers all still roll back.
 
     ``engine`` must be created with ``pool_reset_on_return=None``; with the
     default reset the pool still rolls back on every check-in. Engines built
@@ -455,9 +487,10 @@ def install_transaction_aware_pool_reset(engine: Engine) -> None:
             # async connections.
             if not reset_state.asyncio_safe:
                 return
-            if connection_record is not None and connection_record.info.pop(
+            ended = connection_record is not None and connection_record.info.pop(
                 _TRANSACTION_ENDED_KEY, False
-            ):
+            )
+            if ended and _driver_reports_no_open_transaction(dbapi_connection):
                 return
             # Dialects only call ``rollback()`` on the connection they are given.
             dialect.do_rollback(dbapi_connection)  # type: ignore[bad-argument-type]
@@ -542,8 +575,6 @@ def _create_engine(db_uri: str) -> Engine:
         # benefit — the per-session PRAGMA in
         # :func:`make_managed_session_maker` only fires for code
         # paths that go through that helper.
-        import sqlite3
-
         @event.listens_for(engine, "connect")
         def _set_sqlite_pragma(dbapi_conn: sqlite3.Connection, _conn_record: object) -> None:
             cur = dbapi_conn.cursor()

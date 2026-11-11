@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 from alembic import command
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import Engine, create_engine, event, insert, text
 
+from omnigent.db.db_models import SqlUser
 from omnigent.db.utils import (
     _LAKEBASE_POOL_RECYCLE_SECONDS,
     _SERVER_POOL_RECYCLE_SECONDS,
@@ -1172,17 +1174,22 @@ def test_shared_read_scope_reuses_one_session_per_engine(db_uri: str) -> None:
         assert a is not b, "without a scope each call opens its own session"
 
 
-def test_shared_read_scope_collapses_checkouts(db_uri: str) -> None:
-    """N back-to-back reads cost one pool checkout in a scope, N without."""
+def test_shared_read_scope_collapses_checkouts(
+    db_uri: str, record_terminators: Callable[[Engine], list[str]]
+) -> None:
+    """N back-to-back reads cost one pool checkout in a scope, N without, and
+    the scope ends its read transaction with a single ROLLBACK."""
     engine = get_or_create_engine(db_uri)
     maker = make_managed_session_maker(engine)
     count, detach = _count_checkouts(engine)
+    terminators = record_terminators(engine)
     try:
         with shared_read_scope():
             for _ in range(3):
                 with maker() as session:
                     session.execute(text("SELECT 1"))
         assert len(count) == 1, f"a scope must share one checkout, got {len(count)}"
+        assert terminators == ["ROLLBACK"]
 
         count.clear()
         for _ in range(3):
@@ -1235,10 +1242,14 @@ def test_shared_read_scope_distinct_engines_get_distinct_sessions(
             assert sa2 is sa, "same engine reuses within the scope"
 
 
-def test_shared_read_scope_cleans_up_on_error(db_uri: str) -> None:
-    """An exception rolls the scope back and always resets the context var."""
+def test_shared_read_scope_cleans_up_on_error(
+    db_uri: str, record_terminators: Callable[[Engine], list[str]]
+) -> None:
+    """An exception rolls the scope back once, discards its writes and always
+    resets the context var."""
     engine = get_or_create_engine(db_uri)
     maker = make_managed_session_maker(engine)
+    terminators = record_terminators(engine)
 
     # An explicit try/except (rather than pytest.raises) keeps the post-scope
     # assertions on a control-flow path static analysers can see as reachable.
@@ -1246,13 +1257,16 @@ def test_shared_read_scope_cleans_up_on_error(db_uri: str) -> None:
     try:
         with shared_read_scope():
             with maker() as session:
-                session.execute(text("SELECT 1"))
+                session.execute(insert(SqlUser).values(id="scope_failure", is_admin=False))
             raise RuntimeError("boom")
     except RuntimeError:
         raised = True
 
     assert raised, "the scope must propagate the exception"
     assert _shared_read_sessions.get() is None, "the scope must reset its context var"
+    assert terminators == ["ROLLBACK"]
+    with maker() as session:
+        assert session.get(SqlUser, (0, "scope_failure")) is None
 
 
 def test_shared_read_scope_nesting_reuses_outer(db_uri: str) -> None:
