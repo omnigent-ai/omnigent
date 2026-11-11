@@ -16,6 +16,10 @@ export interface Chord {
   code?: string;
   /** Matched against `KeyboardEvent.key`, ignoring case, for keys that follow the layout. */
   key?: string;
+  /** Compare `key` exactly, case included, for chords that always compared it exactly. */
+  exactKey?: boolean;
+  /** Also fires while AltGr is reported, as the chords that never checked for it always have. */
+  matchesAltGraph?: boolean;
 }
 
 /** The fields a chord is matched against. */
@@ -26,7 +30,7 @@ export interface KeyChordInput {
   ctrlKey: boolean;
   altKey: boolean;
   shiftKey: boolean;
-  /** AltGr, which reports as Ctrl+Alt on some layouts and must never match a chord. */
+  /** AltGr, which reports as Ctrl+Alt on some layouts; only a chord that opts in matches it. */
   altGraph?: boolean;
 }
 
@@ -50,11 +54,14 @@ export function chordMatches(
   mac: boolean = isMacPlatform(),
 ): boolean {
   const keys = "getModifierState" in input ? keyChordInput(input) : input;
-  if (keys.altGraph) return false;
+  if (keys.altGraph && !chord.matchesAltGraph) return false;
   const wantMeta = mac && !!chord.mod;
   const wantCtrl = !!chord.ctrl || (!mac && !!chord.mod);
   if (keys.metaKey !== wantMeta || keys.ctrlKey !== wantCtrl) return false;
   if (keys.altKey !== !!chord.alt || keys.shiftKey !== !!chord.shift) return false;
   if (chord.code !== undefined) return keys.code === chord.code;
-  return chord.key !== undefined && keys.key.toLowerCase() === chord.key.toLowerCase();
+  if (chord.key === undefined) return false;
+  return chord.exactKey
+    ? keys.key === chord.key
+    : keys.key.toLowerCase() === chord.key.toLowerCase();
 }
