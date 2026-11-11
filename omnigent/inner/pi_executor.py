@@ -2244,6 +2244,8 @@ class PiExecutor(Executor):
             raise ValueError("gateway_auth_refresh_interval_ms must be nonnegative")
         self._gateway_auth_refresh_interval_s = interval / 1000
         self._gateway_refresh_after = 0.0
+        self._gateway_renew_after = 0.0
+        self._gateway_renewal: asyncio.Task[None] | None = None
         self._gateway_auth_lock = asyncio.Lock()
         # Retry policy → Pi's .pi/settings.json before subprocess spawn.
         # See ``RetryPolicy.pi.settings()`` for the schema. Pi natively
@@ -2430,6 +2432,10 @@ class PiExecutor(Executor):
         keys = list(self._session_states.keys())
         for key in keys:
             await self.close_session(key)
+        renewal = self._gateway_renewal
+        if renewal is not None and not renewal.done():
+            renewal.cancel()
+            await asyncio.gather(renewal, return_exceptions=True)
         if self._tool_server is not None:
             await self._tool_server.stop()
             self._tool_server = None
@@ -2565,44 +2571,64 @@ class PiExecutor(Executor):
         """Refresh expired credentials under a lock; never fall back after failure.
 
         A ``before_turn`` refresh runs before Pi starts and takes the longer budget;
-        the default fits the bridge's answer to Pi inside Pi's command deadline.
+        the default fits the bridge's answer to Pi inside Pi's command deadline. A
+        token past half its cache lifetime is still served while it renews in the
+        background with the longer budget, so a slow helper need not block Pi.
         """
-        if before_turn:
-            helper_timeout_s = _GATEWAY_TURN_AUTH_TIMEOUT_S
-            refresh_timeout_s = _GATEWAY_TURN_AUTH_TIMEOUT_S + 1
-        else:
-            helper_timeout_s = _GATEWAY_AUTH_TIMEOUT_S
-            refresh_timeout_s = _GATEWAY_BRIDGE_TIMEOUT_S
+        now = time.monotonic()
+        if now < self._gateway_refresh_after:
+            if now >= self._gateway_renew_after:
+                self._gateway_renew_after = self._gateway_refresh_after
+                self._gateway_renewal = asyncio.create_task(self._renew_gateway_token())
+            return self._databricks_token
         async with self._gateway_auth_lock:
             if time.monotonic() < self._gateway_refresh_after:
                 return self._databricks_token
             self._gateway_refresh_after = 0.0
+            return await self._refresh_gateway_token(within_pi_deadline=not before_turn)
+
+    async def _renew_gateway_token(self) -> None:
+        """Replace a cached token early; on failure it still expires on schedule."""
+        async with self._gateway_auth_lock:
             try:
-                async with asyncio.timeout(refresh_timeout_s):
-                    if self._gateway_host_override is not None:
-                        assert self._gateway_auth_command is not None
-                        token = await _fetch_shell_command_token(
-                            self._gateway_auth_command, timeout_s=helper_timeout_s
-                        )
-                    else:
-                        creds = await run_sync_on_thread(
-                            _read_databrickscfg, self._databricks_profile
-                        )
-                        token = creds.token if creds is not None else None
-                        if creds is not None and not self._databricks_host:
-                            self._databricks_host = creds.host
-                    if not isinstance(token, str) or not token.strip():
-                        raise _GatewayAuthError("Pi gateway authentication returned no token")
-            except _GatewayAuthError:
-                raise
-            except TimeoutError:
-                raise _GatewayAuthError("Pi gateway credential refresh timed out") from None
-            except Exception:  # noqa: BLE001 — SDK/helper exceptions may contain credentials
-                raise _GatewayAuthError("Pi gateway credential refresh failed") from None
-            self._databricks_token = token
-            self._gateway_workspace_url = self._gateway_model_service_workspace_url()
-            self._gateway_refresh_after = time.monotonic() + self._gateway_auth_refresh_interval_s
-            return token
+                await self._refresh_gateway_token(within_pi_deadline=False)
+            except _GatewayAuthError as exc:
+                logger.warning("Pi gateway credential renewal failed: %s", exc)
+
+    async def _refresh_gateway_token(self, *, within_pi_deadline: bool) -> str:
+        """Fetch and cache a credential; the caller holds the refresh lock."""
+        if within_pi_deadline:
+            helper_timeout_s = _GATEWAY_AUTH_TIMEOUT_S
+            refresh_timeout_s = _GATEWAY_BRIDGE_TIMEOUT_S
+        else:
+            helper_timeout_s = _GATEWAY_TURN_AUTH_TIMEOUT_S
+            refresh_timeout_s = _GATEWAY_TURN_AUTH_TIMEOUT_S + 1
+        try:
+            async with asyncio.timeout(refresh_timeout_s):
+                if self._gateway_host_override is not None:
+                    assert self._gateway_auth_command is not None
+                    token = await _fetch_shell_command_token(
+                        self._gateway_auth_command, timeout_s=helper_timeout_s
+                    )
+                else:
+                    creds = await run_sync_on_thread(_read_databrickscfg, self._databricks_profile)
+                    token = creds.token if creds is not None else None
+                    if creds is not None and not self._databricks_host:
+                        self._databricks_host = creds.host
+                if not isinstance(token, str) or not token.strip():
+                    raise _GatewayAuthError("Pi gateway authentication returned no token")
+        except _GatewayAuthError:
+            raise
+        except TimeoutError:
+            raise _GatewayAuthError("Pi gateway credential refresh timed out") from None
+        except Exception:  # noqa: BLE001 — SDK/helper exceptions may contain credentials
+            raise _GatewayAuthError("Pi gateway credential refresh failed") from None
+        self._databricks_token = token
+        self._gateway_workspace_url = self._gateway_model_service_workspace_url()
+        now = time.monotonic()
+        self._gateway_refresh_after = now + self._gateway_auth_refresh_interval_s
+        self._gateway_renew_after = now + self._gateway_auth_refresh_interval_s / 2
+        return token
 
     async def _gate_native_tool(  # type: ignore[explicit-any]
         self,
