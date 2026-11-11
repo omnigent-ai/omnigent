@@ -255,6 +255,7 @@ describe("resolveServerInfo session_search_scope", () => {
 describe.each([
   "scheduled_task_projects",
   "scheduled_task_harness_settings",
+  "scheduled_task_approval_skipping_modes",
   "scheduled_task_subhour",
   "scheduled_task_sandbox_workspaces",
   "scheduled_task_inbox",
@@ -474,6 +475,14 @@ describe("custom agents settings capability", () => {
     async (stored) => {
       const parsed = await probe({ session_pull_requests: stored });
       expect(parsed.session_pull_requests).toBe(stored === true);
+    },
+  );
+
+  it.each([undefined, false, "true", true])(
+    "parses session_title_instructions strictly: %s",
+    async (stored) => {
+      const parsed = await probe({ session_title_instructions: stored });
+      expect(parsed.session_title_instructions).toBe(stored === true);
     },
   );
 

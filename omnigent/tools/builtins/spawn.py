@@ -512,9 +512,11 @@ class SysSessionListTool(Tool):
       ``sys_session_send`` continues rather than spawns) and to grab each
       child's ``conversation_id`` for ``sys_session_get_history`` /
       ``sys_session_get_info`` / ``sys_session_close``.
-    - ``sessions`` — a **global** view of every session the caller can
-      access (bounded by the server's per-user permission model), each
-      with its status and runner connectivity. An optional
+    - ``sessions`` — a **global** view of the caller's own sessions
+      (``visibility="mine"``, the UI sidebar's default), each with its
+      status and runner connectivity. ``visibility="shared"`` lists
+      sessions other users shared with the caller instead, and ``"all"``
+      lists both; those rows carry ``owner``. An optional
       ``agent_name`` filter narrows this list. This powers
       orchestration: discovering sessions to inspect
       (``sys_agent_get`` / ``sys_session_get_info``) or drive
@@ -538,10 +540,13 @@ class SysSessionListTool(Tool):
             "(agent, title) children under this conversation (and your "
             "parent/siblings) — use their conversation_id to read "
             "history, get info, or close. 'sessions': a global list of "
-            "every session "
-            "you can access, each with status, runner connectivity and "
+            "the sessions you own (visibility 'mine', the default), each "
+            "with status, runner connectivity and "
             "created_by_session_id (creation origin for independent workers). "
             "Match that field to your session ID to find workers you created. "
+            "Pass visibility 'shared' for sessions other users shared with you, "
+            "or 'all' for both; those rows carry owner, so check it before "
+            "treating a session as yours. "
             "Inspect via sys_agent_get / sys_session_get_info; use sys_session_send "
             "for children or sys_session_message for independent sessions. "
             "Pass agent_name to filter the global list to "
@@ -576,6 +581,16 @@ class SysSessionListTool(Tool):
                                 "list to sessions whose bound agent has "
                                 "this name, e.g. 'researcher'. Does not "
                                 "affect the 'sub_agents' view."
+                            ),
+                        },
+                        "visibility": {
+                            "type": "string",
+                            "enum": ["mine", "shared", "all"],
+                            "description": (
+                                "Optional: which sessions the global 'sessions' "
+                                "view covers. 'mine' (default): sessions you own. "
+                                "'shared': sessions other users shared with you. "
+                                "'all': both. Does not affect 'sub_agents'."
                             ),
                         },
                         "include_archived": {

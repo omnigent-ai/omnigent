@@ -12,6 +12,12 @@ MCP independent creation.
 
 - `message`: sender without edit-level sharing, same owner and workspace; shared destinations are
   allowed and their readers see the message. Normal queue/steering applies.
+- `sender-attribution`: a delivered message starts with `[Message from session <id>]`.
+  The destination's Chat drops that line from the user bubble and shows "From
+  @<sender>" as a session pill that opens the sender; the agent still receives
+  the prefix. The title comes from sessions the sidebar, the viewed session's
+  subagents or the session cache already hold, else one lookup; an unreadable
+  sender reads "From another session". The prefix is a label, not proof of origin.
 - `read-results`: the manager reads history/status; replies are not forwarded.
   Existing owner-authorized reads remain allowed when a session is shared.
 - `created-by`: independent workers record their creating session. The worker's
@@ -21,6 +27,12 @@ MCP independent creation.
   `created_by_session_id` so managers can identify their workers across restarts;
   `sys_session_list` with `include_archived` also lists archived workers, each
   marked `archived`.
+- `list-scope`: `sys_session_list`'s global `sessions` view lists only the
+  caller's own sessions by default, like the sidebar's My view. Sessions other
+  users shared with the caller appear only with `visibility: "shared"` (or
+  `"all"` for both), and those rows carry `owner`. `include_archived` applies to
+  every scope. Runner coverage: `tests/runner/test_discovery_list_pagination.py`;
+  the route's scopes: `tests/server/routes/test_sessions_shared_projects.py`.
 - `kill-switch`: an explicit disable refuses new peer sends and independent
   creates, even if an enable is also listed, and hides the Automations page's
   trigger templates (`/v1/info` reports `features.session_orchestration`). Restart every server replica to
@@ -61,6 +73,26 @@ MCP independent creation.
   automation can message the owner's other sessions or start workers. The
   Automations page's Jira/Slack/GitHub trigger templates rely on this: their
   kept session starts one worker per match (`docs/AUTOMATIONS.md`).
+- `projects`: `sys_project_list` pages the owner's projects oldest first and
+  their own sessions with each one's project, marking the calling session; a
+  legacy label folder shows only as a session's project.
+  `sys_session_update` files one of those sessions into a project by name,
+  creating a missing project only once the session can move, or unfiles it
+  with `""`, through the sidebar's move request; agents call it once per
+  session, and `project` is its only field. An open sidebar regroups without a
+  reload; a collapsed folder stays collapsed. Changing the project changes only
+  folder membership, so running sessions, including the caller, keep their
+  turn. Sub-agents follow their parent and a family follows its
+  representative; each refusal names the session to update instead. An
+  edit-shared caller cannot change a project or create one through the update,
+  while listing stays an ordinary owner read. A session shared with the caller
+  but owned by someone else is refused, even when it is already in the target
+  project. Updates refuse to run against a server that does not advertise
+  `session_move_source_checks` in `/v1/info`. `tool_groups.projects: false`
+  drops both tools. Covered by
+  `tests/server/integration/test_session_orchestration_projects.py::test_project_tools_list_and_file_running_sessions`
+  and the browser journeys in
+  `tests/e2e_ui/sessions/test_agent_files_sessions_into_projects.py`.
 - `refusal`: disabled orchestration, another owner, edit-shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid
@@ -72,7 +104,8 @@ MCP independent creation.
 - As an admin on desktop or mobile web, open Settings → Sharing → Agent
   messaging, or `/settings/sharing`, and toggle **Message other sessions**.
 - In an SDK session's Chat, ask the agent to send a task using
-  `sys_session_message`, then inspect the destination's history.
+  `sys_session_message`, then inspect the destination's history. Its new user
+  bubble shows "From @<sender>"; click the pill to open the sender.
 - In a native session's Chat or agent terminal, ask for the same operation;
   the native MCP relay supplies the tools.
 - In a session with creation tools enabled, ask for a worker with
@@ -80,6 +113,13 @@ MCP independent creation.
   Pass `sandbox_provider`, `sandbox_profile_id`, and `sandbox_profile_revision`
   to choose an authorized profile/revision from the
   [provider catalog](../docs/extending/provider_profiles.md).
+- In a session's Chat, ask the agent to list your projects and file some
+  sessions, including itself, into an existing or new project. The sidebar folders
+  update while the agent keeps running.
+- In a native Claude Code session's Chat or agent terminal, ask the same; the
+  relay exposes `mcp__omnigent__sys_project_list` and
+  `mcp__omnigent__sys_session_update`, and the session lands in its folder
+  mid-turn (`test_native_claude_files_itself_into_a_project`, nightly).
 - Use the existing Share dialog to share the sender or receiver, then repeat.
   A read-only share of the sender keeps both tools working; an edit share
   refuses them.
@@ -104,7 +144,7 @@ Preconditions: use an isolated test server with `OMNIGENT_FEATURES=sibling_sessi
 for nested creation journeys; peer messaging and standalone creation use the default settings.
 Own both sessions. Same-host creation requires a connected
 owned host/workspace. Managed creation requires a launch-capable provider in the
-server's sandbox configuration (for example, Modal or Daytona). Internal deployments
+server's sandbox configuration (for example, Modal or Daytona). Other deployments
 can supply their own provider through the existing launcher interface.
 
 For `created-by`, extend the creation journey below: open the worker, reload,
@@ -199,6 +239,9 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
 - A fresh managed sandbox is distinct from reusing an existing managed host.
   Even the most permissive setting offers only the clicked session's existing
   managed host; another family's managed host remains unavailable.
+- Project moves skip the source check in no-auth and single-user local mode,
+  where nobody else can hold an edit grant. A move only ever applies to the
+  owner's own sessions; the PATCH remains owner-gated per session and family member.
 - A receiver shared with edit access can continue working but cannot message
   back while shared that way. A read-only share does not stop it.
 - Privacy checks govern these tools. They do not confine arbitrary code holding

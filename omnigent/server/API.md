@@ -398,7 +398,10 @@ idle -> running -> idle
   for an external signal (background tools, sub-agent completion,
   client tool result). Surfaced as a `session.status` event with
   `status: "waiting"`. The loop resumes (back to `running`) when
-  the signal arrives.
+  the signal arrives. A claude-native session also reports `waiting`
+  when its turn has ended but a background agent it started is still
+  running. That edge names the agents in `background_agents`, and the
+  session takes a new message right away.
 - **failed**: An unrecoverable error occurred during processing.
   The session cannot accept new events.
 
@@ -445,7 +448,15 @@ Fields:
 
   status (string, required)
     Current lifecycle state: `"idle"`, `"running"`, `"waiting"`, or
-    `"failed"`.
+    `"failed"`. A live `waiting` reads `"running"` here, which headless
+    clients treat as unfinished.
+
+  background_agents (array, optional)
+    Background agents a claude-native turn left running after it ended,
+    while the session waits on them. `status` still reads `"running"`
+    then, so older clients keep waiting; clients that know this field
+    show the session as waiting, with its composer free. Each entry has
+    the same shape as a `background_tasks` entry. Omitted otherwise.
 
   created_at (integer, required)
     Unix timestamp (seconds) when the session was created.
@@ -1450,7 +1461,7 @@ stream and surface queue/interrupt semantics.
 
 | Event | Pydantic class | Wire shape (illustrative) |
 |---|---|---|
-| `session.status` | `SessionStatusEvent` | `{type, conversation_id, status: "running" \| "waiting" \| "idle" \| "failed"}` |
+| `session.status` | `SessionStatusEvent` | `{type, conversation_id, status: "running" \| "waiting" \| "idle" \| "failed", background_agents?: BackgroundTaskInfo[]}` |
 | `session.reasoning_effort` | `SessionReasoningEffortEvent` | `{type, conversation_id, reasoning_effort: string \| null}` |
 | `session.collaboration_mode` | `SessionCollaborationModeEvent` | `{type, conversation_id, mode: string}` |
 | `session.codex_approval_mode` | `SessionCodexApprovalModeEvent` | `{type, conversation_id, approval_mode: "ask-for-approval" \| "approve-for-me" \| "full-access" \| "read-only"}` |

@@ -21,6 +21,8 @@ _KINDS = {"permission", "question", "auth"}
 _VALUE = re.compile(r"[A-Za-z0-9_.,+/=-]*")
 _SEGMENT = re.compile(r"[A-Za-z0-9_.+-]{1,32}")
 _REPLY = b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\"
+# A child that stops reading its input cannot queue query replies without bound.
+_UNSENT_INPUT_LIMIT = 1 << 20
 
 
 @dataclass(frozen=True)
@@ -269,6 +271,7 @@ def relay(path: Path, app: str, command: list[str]) -> int:
     stopping_at: float | None = None
     exit_status: int | None = None
     stdin_open = True
+    unsent_input = bytearray()
 
     def save() -> None:
         temporary = path.with_suffix(".tmp")
@@ -311,7 +314,8 @@ def relay(path: Path, app: str, command: list[str]) -> int:
             save()
 
     def reply() -> None:
-        _write_all(master, _REPLY)
+        if len(unsent_input) < _UNSENT_INPUT_LIMIT:
+            unsent_input.extend(_REPLY)
 
     def resize(_signum: int, _frame: object) -> None:
         with contextlib.suppress(OSError):
@@ -326,6 +330,7 @@ def relay(path: Path, app: str, command: list[str]) -> int:
 
     parser = ProgramStatusParser(on_report=record, on_query=reply, on_reset=reset)
     try:
+        os.set_blocking(master, False)
         tty.setraw(0)
         signal.signal(signal.SIGWINCH, resize)
         for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
@@ -334,7 +339,9 @@ def relay(path: Path, app: str, command: list[str]) -> int:
         while True:
             if stopping_at is not None and time.monotonic() - stopping_at > 2:
                 break
-            readable, _, _ = select.select([0, master] if stdin_open else [master], [], [], 0.2)
+            # Queue input the child has not read instead of blocking on it.
+            readers = [0, master] if stdin_open and not unsent_input else [master]
+            readable, _, _ = select.select(readers, [master] if unsent_input else [], [], 0.2)
             if master in readable:
                 try:
                     data = os.read(master, 65536)
@@ -356,7 +363,10 @@ def relay(path: Path, app: str, command: list[str]) -> int:
                     stdin_open = False
                     stop(signal.SIGHUP, None)
                 else:
-                    _write_all(master, data)
+                    unsent_input.extend(data)
+            if unsent_input:
+                with contextlib.suppress(BlockingIOError):
+                    del unsent_input[: os.write(master, unsent_input)]
             if exit_status is None:
                 child, result = os.waitpid(pid, os.WNOHANG)
                 if child:
