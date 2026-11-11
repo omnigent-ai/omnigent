@@ -118,6 +118,19 @@ def test_reads_each_harness_and_drops_secrets(home: Path) -> None:
             }
         },
     )
+    _write_json(
+        home / ".gemini" / "config" / "mcp_config.json",
+        {
+            "mcpServers": {
+                "memory": _stdio(),
+                "remote": {
+                    "serverUrl": f"https://remote.example.com/mcp?token={_SECRET}",
+                    "headers": {"Authorization": f"Bearer {_SECRET}"},
+                },
+                "omnigent": _stdio(),
+            }
+        },
+    )
 
     servers = discover_mcp_servers()
 
@@ -163,6 +176,14 @@ def test_reads_each_harness_and_drops_secrets(home: Path) -> None:
             "transport": "http",
             "scope": "user",
             "url_host": "wiki.example.com",
+        },
+        {"name": "memory", "harness": "antigravity", "transport": "stdio", "scope": "user"},
+        {
+            "name": "remote",
+            "harness": "antigravity",
+            "transport": "http",
+            "scope": "user",
+            "url_host": "remote.example.com",
         },
     ]
     assert _SECRET not in json.dumps(servers)
@@ -210,6 +231,8 @@ def test_missing_and_malformed_configs_do_not_fail(
     (home / ".codex" / "config.toml").write_text("[mcp_servers\n")
     (home / ".pi" / "agent").mkdir(parents=True)
     (home / ".pi" / "agent" / "mcp.json").write_text("{not json")
+    (home / ".gemini" / "config").mkdir(parents=True)
+    (home / ".gemini" / "config" / "mcp_config.json").write_text("{not json")
     _write_json(
         home / ".cursor" / "mcp.json",
         {"mcpServers": {"ok": {"command": "x"}, "junk": "not a table", "bare": {}}},
@@ -218,7 +241,7 @@ def test_missing_and_malformed_configs_do_not_fail(
     assert discover_mcp_servers() == [
         {"name": "ok", "harness": "cursor", "transport": "stdio", "scope": "user"}
     ]
-    assert {"claude", "codex", "pi"} <= {
+    assert {"claude", "codex", "pi", "antigravity"} <= {
         word for record in caplog.records for word in record.getMessage().split()
     }
 

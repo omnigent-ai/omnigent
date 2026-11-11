@@ -77,6 +77,8 @@ def _summary(
     if not isinstance(config, Mapping) or config.get("enabled") is False:
         return None
     url = config.get("url")
+    if not isinstance(url, str) or not url:
+        url = config.get("serverUrl")
     kind = config.get("type")
     if isinstance(url, str) and url:
         transport = "http"
@@ -237,8 +239,19 @@ def _pi_servers(env: Mapping[str, str]) -> list[ConfiguredMcpServer]:
     ]
 
 
+def _antigravity_servers(home: Path) -> list[ConfiguredMcpServer]:
+    """Global ``~/.gemini/config/mcp_config.json``, shared by Antigravity and ``agy``."""
+    data = _read_config(home / ".gemini" / "config" / "mcp_config.json", "antigravity")
+    return [
+        ConfiguredMcpServer(summary, config)
+        for name, config in _servers_in(data).items()
+        if isinstance(config, Mapping)
+        and (summary := _summary(name, config, "antigravity")) is not None
+    ]
+
+
 def configured_mcp_servers() -> list[ConfiguredMcpServer]:
-    """List user-level MCP servers across Claude, Codex, Cursor, and Pi on this host.
+    """List user-level MCP servers across Claude, Codex, Cursor, Pi, and Antigravity on this host.
 
     Each harness is read independently, so a missing or broken config for one
     never hides another's servers.
@@ -249,6 +262,7 @@ def configured_mcp_servers() -> list[ConfiguredMcpServer]:
         ("codex", _codex_servers),
         ("cursor", lambda: _cursor_servers(home)),
         ("pi", lambda: _pi_servers(os.environ)),
+        ("antigravity", lambda: _antigravity_servers(home)),
     )
     out: list[ConfiguredMcpServer] = []
     for harness, read in readers:
