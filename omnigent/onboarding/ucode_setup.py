@@ -19,6 +19,7 @@ except ImportError:  # pragma: no cover - non-POSIX platforms have no flock
 import click
 
 from omnigent.onboarding.databricks_config import normalize_workspace_url
+from omnigent.onboarding.persistent_tool import persistent_tool_command
 from omnigent.onboarding.ucode_state import read_ucode_state
 
 _logger = logging.getLogger(__name__)
@@ -141,21 +142,16 @@ def ucode_workspace_exists(workspace_url: str) -> bool:
     return read_ucode_state(workspace_url) is not None
 
 
+@persistent_tool_command
 def find_ucode_command() -> list[str]:
-    """Return a command prefix that invokes ``ucode``.
+    """Return a command prefix for the pinned configuration helper.
 
-    Prefers an ephemeral ``uvx`` run pinned to a fixed ucode commit, so setup
-    uses a known-good ucode rather than whatever (possibly stale) ``ucode`` the
-    user installed long ago. A locally-installed binary is used only as a last
-    resort when ``uvx`` is unavailable. This ordering matters: an old
-    persistently-installed ``ucode`` predates options like
-    ``configure --workspaces`` and would otherwise win and break setup.
+    The wrapper installs the selected package revision persistently when
+    configuration runs, so generated auth survives disposable cache cleanup.
+    A locally installed binary is used only when the pinned runner is absent.
 
-    :returns: Command prefix, e.g.
-        ``["uvx", "--from",
-        "git+https://github.com/databricks/ucode@<sha>", "ucode"]`` or, when
-        ``uvx`` is absent, ``["/usr/bin/ucode"]``.
-    :raises click.ClickException: If neither ``uvx`` nor ``ucode`` is on PATH.
+    :returns: Setup wrapper command or the selected installed executable.
+    :raises click.ClickException: If no runner or helper is available.
     """
     uvx = shutil.which("uvx")
     if uvx is not None:
