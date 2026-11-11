@@ -4196,6 +4196,7 @@ def register_core_routes(
                 getattr(request.app.state, "host_registry", None),
                 delete_worktree=body.delete_worktree,
                 host_store=getattr(request.app.state, "host_store", None),
+                sandbox_config=getattr(request.app.state, "sandbox_config", None),
             )
         elif body.archived is False:
             # Cancel local teardown immediately; the deferred flag check handles

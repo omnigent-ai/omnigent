@@ -53,6 +53,9 @@ the header menu), and each place is a separate entry point.
   answer, which Settings → Git can change later. Archiving a session whose agent
   is still working, waiting on an approval, or running background work first
   asks to confirm, since archiving stops it; Cancel or Escape keeps the session.
+  A server with `sandbox.stop_on_archive` also stops the archived session's
+  managed sandbox, unless another unarchived session uses it; the next message
+  after an unarchive resumes it.
 - `row-quick-actions`: sidebar rows show hover Pin and Archive buttons beside the
   "…" menu. Settings → Appearance → Sidebar → Show Pin and Archive buttons on
   session rows (on by default) turns them off, leaving both actions in the row

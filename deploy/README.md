@@ -406,6 +406,15 @@ token cannot open a new connection. Renewal also extends the validity of any
 leaked copy of that token. This setting does not change sandbox lifetime or
 Mac/Arca user-login credentials.
 
+**Stopping archived sessions' sandboxes.** Set `sandbox.stop_on_archive: true`
+(deployment-wide, next to `provider` or `providers`; off by default) to stop a
+session's sandbox when the session is archived, after its runner is stopped.
+The sandbox is stopped, not deleted, so unarchiving the session and sending a
+message resumes the same sandbox. It applies only to providers that can resume
+a stopped sandbox (`capabilities.resume_stopped`). A sandbox that another
+unarchived session still uses keeps running, and so does a scheduled task
+run's sandbox. Deleting the session still terminates the sandbox.
+
 The optional reaper runs once for the whole `sandbox:` deployment, including
 multi-provider configurations. It queries managed host rows directly and
 detaches a sandbox generation only after its host has stayed offline past
