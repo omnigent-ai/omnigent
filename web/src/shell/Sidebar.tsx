@@ -354,6 +354,7 @@ import {
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
 import { getEmbedRoot } from "../lib/host";
+import { canCreateProject, projectsMatching } from "./projectChoices";
 import {
   ARCHIVE_SESSION_KEYS,
   CompactShortcutKeys,
@@ -7331,12 +7332,9 @@ function ProjectPickerMenu({
   const [search, setSearch] = useState("");
 
   const trimmed = search.trim();
-  const filtered = trimmed
-    ? projects.filter((p) => p.name.toLowerCase().includes(trimmed.toLowerCase()))
-    : projects;
+  const filtered = projectsMatching(projects, search);
   // Offer create only when the typed name isn't already an exact project.
-  const canCreate =
-    trimmed.length > 0 && !projects.some((p) => p.name.toLowerCase() === trimmed.toLowerCase());
+  const canCreate = canCreateProject(projects, search);
   const currentProjectIcon = projects.find((p) => p.name === currentProject)?.icon;
 
   // Keep keystrokes inside the inputs from reaching the menu's typeahead /
