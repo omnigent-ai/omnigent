@@ -1359,6 +1359,10 @@ describe("change-event prompts", () => {
     expect(prompt).toContain("however long ago they were opened");
     expect(prompt).toContain("split the time since then into shorter merged:<from>..<to> ranges");
     expect(prompt).toContain("oldest first by the time they were merged");
+    // GitHub can return a partial page set without erroring; it must not advance the check time.
+    expect(prompt).toContain(
+      "a search that errors, or whose response has incomplete_results set to true, counts as unread.",
+    );
     expect(prompt).toContain("If you can't read every page, start no sessions in this run");
     expect(prompt).toContain("Leave out pull requests merged after the time you noted");
     expect(prompt).toContain('title "GitHub <owner/repo>#<number> merged"');
