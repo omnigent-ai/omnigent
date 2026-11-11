@@ -73,11 +73,65 @@ def bridge_dir_from_env() -> Path:
     return Path(raw)
 
 
+def bridge_dir_for_session_id(session_id: str) -> Path:
+    """Return the per-session bridge dir under the Omnigent data dir."""
+    import tempfile
+
+    base = Path(tempfile.gettempdir()) / "omnigent-grok-native"
+    return base / session_id
+
+
+def prepare_bridge_dir(session_id: str) -> Path:
+    """Create and return the per-session bridge dir."""
+    bridge_dir = bridge_dir_for_session_id(session_id)
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    return bridge_dir
+
+
+def build_grok_native_spawn_env(
+    session_id: str,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+) -> dict[str, str]:
+    """Build the ``GROK_NATIVE_*`` env the harness executor reads.
+
+    grok owns its own auth and model selection, so ``provider``/``model`` are
+    accepted for signature parity and ignored — a ``/model`` pick is rejected
+    up front by the OWN_AUTH gate, matching the ACP rows.
+
+    :param session_id: The Omnigent session id (keys the bridge dir).
+    :returns: Env-var overrides for the harness spawn.
+    """
+    del provider, model
+    return {GROK_NATIVE_BRIDGE_DIR_ENV_VAR: str(bridge_dir_for_session_id(session_id))}
+
+
+def native_input_ready(session_id: str, instance: object) -> bool:
+    """Provider ``input_ready_probe``: the serve endpoint is dialable.
+
+    The runner-side launch writes bridge state once the serve port binds and
+    ``session/new`` returns, so a state file carrying a ``ws_url`` is the
+    readiness signal for web-originated prompts.
+
+    :param session_id: Omnigent conversation id (keys the bridge dir).
+    :param instance: The live terminal resource (unused; state is on disk).
+    :returns: Whether a usable serve endpoint is published.
+    """
+    del instance
+    state = read_bridge_state(bridge_dir_for_session_id(session_id))
+    return state is not None and bool(state.ws_url)
+
+
 __all__ = [
     "GROK_NATIVE_BRIDGE_DIR_ENV_VAR",
     "GrokBridgeState",
+    "bridge_dir_for_session_id",
     "bridge_dir_from_env",
     "bridge_state_path",
+    "build_grok_native_spawn_env",
+    "native_input_ready",
+    "prepare_bridge_dir",
     "read_bridge_state",
     "write_bridge_state",
 ]
