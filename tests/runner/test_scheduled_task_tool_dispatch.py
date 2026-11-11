@@ -867,3 +867,25 @@ async def test_reminder_needs_the_sessions_agent() -> None:
     )
     assert out["error"] == "sys_reminder_set: this session has no agent to remind"
     assert not [call for call in client.calls if call[0] == "POST"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+@pytest.mark.parametrize("task_id", [None, "../scheduled-tasks", "T1"])
+async def test_a_wrong_schedule_without_a_usable_id_is_reported_not_deleted(
+    task_id: str | None,
+) -> None:
+    body: dict[str, object] = {"next_run_at": "2027-11-10T23:01:00+00:00"}
+    if task_id is not None:
+        body["id"] = task_id
+    client = _ReminderClient(_Resp(body=body))
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_set",
+            json.dumps({"message": "ping", "delay_seconds": 2700}),
+            server_client=client,
+            conversation_id="conv_1",
+        )
+    )
+    assert "returned no task id to delete" in out["error"]
+    assert not [call for call in client.calls if call[0] == "DELETE"]

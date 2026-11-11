@@ -784,6 +784,42 @@ async def test_database_scheduler_accepts_a_one_time_rule(
 
 
 @pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
+async def test_the_reminder_tools_request_continues_its_session(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from datetime import UTC, datetime
+
+    from omnigent.tools.builtins.scheduled_tasks import reminder_name, reminder_prompt
+
+    session_id = _owned_session(db_uri)
+    rule, fire_at = _one_time_rule_in(hours=2)
+    when = datetime.fromtimestamp(fire_at, UTC)
+    # Exactly what sys_reminder_set sends: no host or workspace, the session's own
+    # agent, no permission override, and the first run pinned to the reminder's minute.
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json={
+            "name": reminder_name("Check CI"),
+            "prompt": reminder_prompt("Check CI", when),
+            "rrule": rule,
+            "timezone": "UTC",
+            "agent_id": builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+            "permission_mode": None,
+            "session_mode": "continue",
+            "session_id": session_id,
+            "first_run_at": fire_at,
+        },
+        headers={**_headers(), "x-omnigent-automation-source": "agent"},
+    )
+    assert resp.status_code == 200, resp.text
+    task = SqlAlchemyScheduledTaskStore(db_uri).get(resp.json()["id"])
+    assert task is not None
+    assert (task.session_mode, task.session_id) == ("continue", session_id)
+    assert task.agent_id == builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
+    assert (task.permission_mode, task.state, task.next_run_at) == (None, "active", fire_at)
+
+
+@pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
 async def test_late_create_refuses_a_one_time_rule_instead_of_moving_it_a_year(
     auth_app: FastAPI,
     auth_client: httpx.AsyncClient,
