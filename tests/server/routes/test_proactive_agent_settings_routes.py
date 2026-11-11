@@ -29,6 +29,12 @@ _BOB = {"X-Forwarded-Email": "bob@example.com"}
 _ADMIN = {"X-Forwarded-Email": "admin@example.com"}
 
 
+@pytest.fixture(autouse=True)
+def _multi_user_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The suite runs as a local single-user server by default; these routes gate on admins."""
+    monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
+
+
 @asynccontextmanager
 async def _client(
     db_uri: str,
@@ -36,6 +42,7 @@ async def _client(
     *,
     offered: bool = True,
     settings_store: bool = True,
+    local_single_user: bool = False,
     **extra: Any,
 ) -> AsyncIterator[httpx.AsyncClient]:
     conversations = SqlAlchemyConversationStore(db_uri)
@@ -52,7 +59,7 @@ async def _client(
         proactive_agent_settings_store=(
             ProactiveAgentSettingsStore(db_uri) if settings_store else None
         ),
-        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=local_single_user),
         permission_store=permissions,
         feature_flags=resolve_feature_flags(
             {"OMNIGENT_FEATURES": "proactive_agent" if offered else ""}
@@ -223,3 +230,18 @@ async def test_without_a_settings_store_the_agent_is_not_offered(
         settings = await client.get("/v1/proactive-agent/settings", headers=_ALICE)
         assert settings.status_code == 404
         assert (await client.get("/v1/inbox/items", headers=_ALICE)).status_code == 404
+
+
+async def test_the_local_single_user_manages_the_workspace_setting(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A local single-user server has a permission store too; its one user is in charge."""
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    async with _client(db_uri, tmp_path, local_single_user=True) as client:
+        settings = (await client.get("/v1/proactive-agent/settings")).json()
+        assert (settings["can_manage_workspace"], settings["workspace_enabled"]) == (True, True)
+        changed = await client.put(
+            "/v1/proactive-agent/settings/workspace", json={"enabled": False}
+        )
+        assert changed.status_code == 200
+        assert changed.json()["workspace_enabled"] is False

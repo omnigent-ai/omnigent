@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, local_single_user_enabled
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.stores import PermissionStore
 from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
@@ -55,8 +55,9 @@ def create_proactive_agent_settings_router(
     :param store: Where the settings are stored.
     :param offered: Whether the deployment offers the agent to this request's caller.
     :param auth_provider: Auth provider; ``None`` when auth is off.
-    :param permission_store: Permission store; ``None`` in single-user mode,
-        where the one user manages the workspace setting.
+    :param permission_store: Permission store, or ``None``. Without one, or
+        on a local single-user server, the one user manages the workspace
+        setting; otherwise administrators do.
     """
 
     def require_offered() -> None:
@@ -70,7 +71,9 @@ def create_proactive_agent_settings_router(
         return user_id if user_id is not None else RESERVED_USER_LOCAL
 
     async def _can_manage(user_id: str) -> bool:
-        if permission_store is None:
+        # The one local user manages the workspace, whether or not the server
+        # happens to have a permission store.
+        if permission_store is None or local_single_user_enabled():
             return True
         return await asyncio.to_thread(permission_store.is_admin, user_id)
 
