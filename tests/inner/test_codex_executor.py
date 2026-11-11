@@ -232,9 +232,11 @@ def test_brokered_native_tool_preflight_requires_disabled_shell(
         "code_mode",
     )
 
-    def _result(enabled: str | None = None) -> SimpleNamespace:
+    def _result(enabled: str | None = None, missing: str | None = None) -> SimpleNamespace:
         stdout = "".join(
-            f"{name} stable {'true' if name == enabled else 'false'}\n" for name in names
+            f"{name} stable {'true' if name == enabled else 'false'}\n"
+            for name in names
+            if name != missing
         )
         return SimpleNamespace(returncode=0, stdout=stdout.encode())
 
@@ -244,6 +246,9 @@ def test_brokered_native_tool_preflight_requires_disabled_shell(
     assert run.call_args.args[0][-2:] == ["features", "list"]
     assert "features.shell_tool=false" in run.call_args.args[0]
     run.return_value = _result("apps")
+    with pytest.raises(RuntimeError, match="disables native tools"):
+        verify_brokered_codex_native_tools_disabled("/bin/codex", tmp_path)
+    run.return_value = _result(missing="shell_tool")
     with pytest.raises(RuntimeError, match="disables native tools"):
         verify_brokered_codex_native_tools_disabled("/bin/codex", tmp_path)
     run.return_value = SimpleNamespace(returncode=1, stdout=b"shell_tool stable false\n")

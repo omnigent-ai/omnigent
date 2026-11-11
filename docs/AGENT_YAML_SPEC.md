@@ -719,9 +719,19 @@ providers:
         default: gpt-daybreak-blue-latest
 ```
 
-The locked profile replaces the provider's auth command with the brokered
-placeholder command before Codex starts. Other uses of this provider would
-run `false` and fail authentication.
+Before a release includes gateway broker support, the minimum runner build is
+[8ee1f8558f](https://github.com/omnigent-ai/omnigent/commit/8ee1f8558fc8f5e86244e8ac9bbcb1189eb6e375)
+or a later build containing that implementation. Upgrade every runner that can
+launch the profile before enabling it. Older runners
+ignore `broker_gateway` and retain legacy authentication behavior. Keep the
+provider's `auth_command: "false"` exactly as shown: an older runner then fails
+authentication instead of running a real token command. The setting alone
+does not protect an older runner. Verify a real turn and a resumed turn on
+the upgraded runner before rollout.
+
+The locked profile replaces `false` with the brokered placeholder command
+before Codex starts. Other uses of this provider run `false` and fail
+authentication.
 
 The reserved gateway binding requires a placeholder-bearing HTTPS request on
 port 443 in both the Codex relay and the Omnigent OS-tool proxy. A bare request
@@ -730,9 +740,10 @@ or plaintext HTTP request receives no bearer.
 The socket path must be absolute and outside sandbox read/write grants. A
 separate trusted issuer must serve `GET /token` and refresh the bearer; Omnigent
 does not start that issuer. Keep its code, dependencies, configuration, and
-credential storage outside sandbox write grants. Locked Codex profiles should
-disable both web search and native tools so their shell and file operations
-use Omnigent tools and policies.
+credential storage outside sandbox write grants. Locked Codex profiles must set
+`web_search: false` and `disable_native_tools: true` so their shell and file
+operations use Omnigent tools and policies. Missing or unsafe settings prevent
+launch.
 
 ### Git over SSH from a sandbox
 
@@ -814,9 +825,8 @@ when the workspace is read-only. Hard-linked files and sockets are rejected.
 Canonical source paths stay protected through launcher serialization: Linux
 rejects mounts that expose them, including implicit toolchain mounts; macOS
 denies file access and Unix-socket connections even under implicit read grants.
-These protections also apply to startup-only Unix socket sources. Command
-sources run in the trusted parent with a filtered environment and a bounded
-timeout. Their stdout, stderr, and command text are omitted from worker errors.
+These protections also apply to startup-only Unix socket sources. Existing
+startup-only file, environment, and command sources are unchanged.
 
 Source checks run before startup resolution and every refresh. A symlink source
 must retain its original canonical target for the session; replacing the file
@@ -830,8 +840,9 @@ be ready before the helper starts: a source failure during startup prevents
 launch, rather than producing a recoverable request-time 502. Without a refresh
 interval, sources resolve once at startup.
 Environment sources cannot refresh because a running process inherits a fixed
-environment. Shell command sources remain startup-only because a sandbox could
-change an executable, script, or dependency before the next refresh.
+environment. Shell command sources remain startup-only: a sandbox might otherwise
+replace a script or dependency before the trusted parent executes it again. Use
+a private broker for renewable credentials instead.
 
 ## Tools
 

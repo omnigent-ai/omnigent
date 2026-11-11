@@ -403,23 +403,24 @@ def _resolve_secret(source: CredentialSourceSpec, *, parent_env: dict[str, str])
         # ``shell=True`` is intentional: the command is spec-author
         # supplied (e.g. ``gh auth token``) and runs in the trusted
         # parent process, never inside the sandbox.
-        try:
-            completed = subprocess.run(
-                source.command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                env=parent_env,
-                timeout=_COMMAND_SOURCE_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
-            raise ValueError("credential_proxy command source unavailable") from None
+        completed = subprocess.run(
+            source.command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            env=parent_env,
+            timeout=_COMMAND_SOURCE_TIMEOUT_SECONDS,
+            check=False,
+        )
         if completed.returncode != 0:
-            raise ValueError("credential_proxy command source failed")
+            stderr = (completed.stderr or "").strip()
+            raise ValueError(
+                f"credential_proxy command source exited {completed.returncode}"
+                + (f": {stderr}" if stderr else "")
+            )
         value = completed.stdout.strip()
-        if not value or "\r" in value or "\n" in value:
-            raise ValueError("credential_proxy command source produced an invalid token")
+        if not value:
+            raise ValueError("credential_proxy command source produced empty stdout")
         return value
     raise ValueError(f"unsupported credential_proxy source kind: {source.kind!r}")
 

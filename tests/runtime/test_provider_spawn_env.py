@@ -403,6 +403,21 @@ def test_codex_gateway_binding_uses_only_placeholder_auth(config_home: Path) -> 
     assert env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] == "true"
     assert "/private/model-token.sock" not in env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"]
 
+    for key, unsafe_values in (
+        ("web_search", (None, True, "false", 0)),
+        ("disable_native_tools", (None, False, "true", 1)),
+    ):
+        safe_value = spec.executor.config.pop(key)
+        with pytest.raises(OmnigentError, match=r"requires executor\.config\.web_search: false"):
+            _build_codex_spawn_env(spec)
+        for value in unsafe_values:
+            spec.executor.config[key] = value
+            with pytest.raises(
+                OmnigentError, match=r"requires executor\.config\.web_search: false"
+            ):
+                _build_codex_spawn_env(spec)
+        spec.executor.config[key] = safe_value
+
     config = _openai_default_config()
     config["providers"]["vendor-openai"]["openai"]["base_url"] = (
         "https://openai.example.com:443/v1"
@@ -445,7 +460,7 @@ def test_locked_codex_gateway_requires_private_renewable_source_and_exact_route(
         credential_proxy=CredentialProxySpec(entries=[binding]),
     )
     spec = _make_spec(harness="codex", os_env=OSEnvSpec(sandbox=sandbox))
-    spec.executor.config.update(broker_gateway=True)
+    spec.executor.config.update(broker_gateway=True, web_search=False, disable_native_tools=True)
     assert _build_codex_spawn_env(spec)["HARNESS_CODEX_BROKERED_GATEWAY"] == "true"
 
     sandbox.credential_proxy = None

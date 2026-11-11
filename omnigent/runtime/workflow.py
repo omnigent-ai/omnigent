@@ -1535,6 +1535,15 @@ def _bind_codex_gateway_credential(env: dict[str, str], spec: AgentSpec) -> None
             "Codex gateway reserved binding requires executor.config.broker_gateway: true",
             code=ErrorCode.INVALID_INPUT,
         )
+    if (
+        spec.executor.config.get("web_search") is not False
+        or spec.executor.config.get("disable_native_tools") is not True
+    ):
+        raise OmnigentError(
+            "brokered Codex gateway requires executor.config.web_search: false "
+            "and executor.config.disable_native_tools: true",
+            code=ErrorCode.INVALID_INPUT,
+        )
     binding = reserved_bindings[0] if len(reserved_bindings) == 1 else None
     model_path = parsed.path.rstrip("/") + "/responses"
     try:
