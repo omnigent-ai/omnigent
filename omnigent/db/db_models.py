@@ -1800,6 +1800,9 @@ class SqlSessionJournalEntry(OmnigentBase):
     :param scheduled_task_run_id: The automation run the session was serving
         (relates to ``scheduled_task_runs.id``; no DB foreign key); ``None``
         outside automation runs.
+    :param workflow_id: The workflow the entry was written under, a UUID in the
+        session ID's format; ``None`` outside workflows. Nothing writes it yet:
+        it ships now so the phase that gives workflows IDs needs no migration.
     :param step: The plan step the entry is about, e.g. ``"propose"``; ``None``
         for entries about no step, such as plans.
     :param idempotency_key: Names the write that appended the entry, e.g.
@@ -1823,6 +1826,8 @@ class SqlSessionJournalEntry(OmnigentBase):
     # No CHECK, so adding a kind needs no migration.
     kind: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     scheduled_task_run_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # Unindexed until a query reads it.
+    workflow_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     step: Mapped[str | None] = mapped_column(String(64), nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)

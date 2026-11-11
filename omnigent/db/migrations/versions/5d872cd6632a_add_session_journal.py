@@ -18,7 +18,9 @@ database, keeps positions and idempotency keys unique, as the conversation
 lock does for conversation items. The payload is an envelope private to the
 journal store; a CHECK caps it at 16,383 stored bytes. ``kind`` has no CHECK,
 so adding a kind needs no migration. The tables have no database defaults:
-writes name the workspace.
+writes name the workspace. ``workflow_id`` is nullable and unindexed, and
+nothing writes it yet; it ships with the table so the phase that gives
+workflows IDs needs no migration.
 
 Deployment: apply this migration before a server that uses the tables.
 Servers that migrate at startup do so on their own. Processes already running
@@ -80,6 +82,7 @@ def upgrade() -> None:
         sa.Column("id", Uuid16(), nullable=False),
         sa.Column("kind", sa.SmallInteger(), nullable=False),
         sa.Column("scheduled_task_run_id", Uuid16(), nullable=True),
+        sa.Column("workflow_id", Uuid16(), nullable=True),
         sa.Column("step", sa.String(64), nullable=True),
         sa.Column("idempotency_key", sa.String(128), nullable=False),
         sa.Column("payload", sa.LargeBinary(), nullable=False),
