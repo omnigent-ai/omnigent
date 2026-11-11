@@ -14,23 +14,24 @@ import { parseVideoChapters } from "@/lib/videoChapters";
 vi.mock("@/lib/videoChapters", () => ({ parseVideoChapters: vi.fn() }));
 import {
   downloadWorkspaceFile,
-  fetchWorkspaceFileBlob,
+  fetchWorkspaceVideoBlob,
   useFileContent,
   workspaceFileMediaUrl,
 } from "@/hooks/useFileContent";
 
 vi.mock("@/hooks/useFileContent", () => ({
-  fetchWorkspaceFileBlob: vi.fn(),
+  fetchWorkspaceVideoBlob: vi.fn(),
   downloadWorkspaceFile: vi.fn(),
   useFileContent: vi.fn(),
   workspaceFileMediaUrl: vi.fn(),
 }));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
+import { VideoTooLargeError } from "@/lib/videoFetch";
 
 const render = (ui: Parameters<typeof renderComponent>[0]) =>
   renderComponent(ui, { wrapper: TooltipProvider });
 
-const fetchBlob = vi.mocked(fetchWorkspaceFileBlob);
+const fetchBlob = vi.mocked(fetchWorkspaceVideoBlob);
 const createUrl = vi.fn(() => "blob:recording");
 const revokeUrl = vi.fn();
 
@@ -273,12 +274,17 @@ describe("VideoPlayer", () => {
     fireEvent.click(screen.getByRole("button", { name: "Play video: Feature demo" }));
     await waitFor(() =>
       expect(screen.getByRole("status")).toHaveTextContent(
-        "Unable to play this video. Download it to watch locally.",
+        "This video couldn't be played. Download the file to open it in another app.",
       ),
     );
     vi.mocked(downloadWorkspaceFile).mockResolvedValueOnce();
     fireEvent.click(screen.getByRole("button", { name: "Download video: Feature demo" }));
     expect(downloadWorkspaceFile).toHaveBeenCalledWith("sess_1", "demo.webm");
+    // The failure state's own Download button downloads the same file.
+    vi.mocked(downloadWorkspaceFile).mockResolvedValueOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Download" }));
+    expect(downloadWorkspaceFile).toHaveBeenCalledTimes(2);
+    expect(downloadWorkspaceFile).toHaveBeenLastCalledWith("sess_1", "demo.webm");
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     fireEvent.click(screen.getByRole("button", { name: "Play video: Feature demo" }));
     await waitFor(() => expect(fetchBlob).toHaveBeenCalledTimes(2));
@@ -376,6 +382,22 @@ describe("VideoPlayer", () => {
     fireEvent.click(screen.getByRole("button", { name: "Play video: Next demo" }));
     expect(container.querySelector("video")).toHaveAttribute("src", "https://example.com/next.mp4");
     expect(fetchBlob).not.toHaveBeenCalled();
+  });
+
+  it("explains an over-limit video and offers only the download", async () => {
+    fetchBlob.mockRejectedValueOnce(new VideoTooLargeError());
+    render(<VideoPlayer {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: "Play video: Feature demo" }));
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "This video is larger than 200 MB, so it can't be played here. Download it to watch it in another app.",
+      ),
+    );
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    vi.mocked(downloadWorkspaceFile).mockResolvedValueOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Download" }));
+    expect(downloadWorkspaceFile).toHaveBeenCalledWith("sess_1", "demo.webm");
+    expect(createUrl).not.toHaveBeenCalled();
   });
 
   it("cancels unfinished fetches when the source changes or the player closes", async () => {
