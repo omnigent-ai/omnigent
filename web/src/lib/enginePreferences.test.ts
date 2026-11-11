@@ -6,6 +6,7 @@ import {
   DIFF_VIEWER_ENGINE,
   engineFor,
   FILE_VIEWER_ENGINE,
+  PULL_REQUESTS_PAGE_ENGINE,
   readEngine,
   useEngine,
 } from "./enginePreferences";
@@ -86,5 +87,13 @@ describe.each([
   it.each(["monaco", "codemirror", "pierre", ""])("runs Monaco with %j stored", (stored) => {
     localStorage.setItem(storageKey, stored);
     expect(readEngine(engineSwitch)).toBe("monaco");
+  });
+});
+
+describe("the Pull Requests page switch", () => {
+  it.each(["classic", "page", ""])("keeps the current page with %j stored", (stored) => {
+    expect(PULL_REQUESTS_PAGE_ENGINE.intent.storageKey).toBe("omnigent:pull-requests-page-engine");
+    localStorage.setItem(PULL_REQUESTS_PAGE_ENGINE.intent.storageKey, stored);
+    expect(readEngine(PULL_REQUESTS_PAGE_ENGINE)).toBe("classic");
   });
 });

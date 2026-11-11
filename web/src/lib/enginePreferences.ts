@@ -8,6 +8,9 @@ import { createStoredChoicePreference, type StoredPreference } from "@/lib/store
 /** The engines the file viewer and its diff view can run on. */
 export type ViewerEngine = "monaco";
 
+/** The pages the Pull Requests tab can show. */
+export type PullRequestsPageEngine = "classic";
+
 /** What the user chose. Nothing stored means Automatic. */
 export type EngineIntent<Engine extends string> = "automatic" | Engine;
 
@@ -77,5 +80,13 @@ export const DIFF_VIEWER_ENGINE = createEngineSwitch<ViewerEngine>({
   storageKey: "omnigent:diff-viewer-engine",
   engines: ["monaco"],
   automaticEngine: "monaco",
+  offered: false,
+});
+
+/** The Pull Requests tab's page: the session's pull requests, then the one picked. */
+export const PULL_REQUESTS_PAGE_ENGINE = createEngineSwitch<PullRequestsPageEngine>({
+  storageKey: "omnigent:pull-requests-page-engine",
+  engines: ["classic"],
+  automaticEngine: "classic",
   offered: false,
 });
