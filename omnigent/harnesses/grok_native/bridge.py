@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
 
 GROK_NATIVE_BRIDGE_DIR_ENV_VAR = "GROK_NATIVE_BRIDGE_DIR"
@@ -28,11 +29,15 @@ class GrokBridgeState:
         until the first session is created).
     :param pid: Serve process pid (informational; ownership stays with the
         runner resource).
+    :param server_url: Omnigent server base URL for hook/elicitation calls.
+    :param headers: Auth headers the runner carries, for those calls.
     """
 
     ws_url: str
     session_id: str = ""
     pid: int = 0
+    server_url: str = ""
+    headers: dict[str, str] = dataclass_field(default_factory=dict)
 
 
 def bridge_state_path(bridge_dir: Path) -> Path:
@@ -45,7 +50,15 @@ def write_bridge_state(bridge_dir: Path, state: GrokBridgeState) -> None:
     path = bridge_state_path(bridge_dir)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(
-        json.dumps({"ws_url": state.ws_url, "session_id": state.session_id, "pid": state.pid})
+        json.dumps(
+            {
+                "ws_url": state.ws_url,
+                "session_id": state.session_id,
+                "pid": state.pid,
+                "server_url": state.server_url,
+                "headers": state.headers,
+            }
+        )
     )
     tmp.replace(path)
 
@@ -58,10 +71,13 @@ def read_bridge_state(bridge_dir: Path) -> GrokBridgeState | None:
         return None
     if not isinstance(raw, dict) or not raw.get("ws_url"):
         return None
+    headers = raw.get("headers")
     return GrokBridgeState(
         ws_url=str(raw["ws_url"]),
         session_id=str(raw.get("session_id") or ""),
         pid=int(raw.get("pid") or 0),
+        server_url=str(raw.get("server_url") or ""),
+        headers={str(k): str(v) for k, v in headers.items()} if isinstance(headers, dict) else {},
     )
 
 

@@ -17,7 +17,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -45,6 +45,7 @@ class GrokAcpClient:
     _pending: dict[int, asyncio.Future] = field(default_factory=dict)
     _recv_task: asyncio.Task | None = None
     _update_handler: Callable[[dict[str, Any]], None] | None = None
+    _permission_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None = None
     capabilities: dict[str, Any] = field(default_factory=dict)
     meta: dict[str, Any] = field(default_factory=dict)
 
@@ -85,6 +86,18 @@ class GrokAcpClient:
     def set_update_handler(self, handler: Callable[[dict[str, Any]], None] | None) -> None:
         """Set the ``session/update`` notification sink (forwarder)."""
         self._update_handler = handler
+
+    def set_permission_handler(
+        self,
+        handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None,
+    ) -> None:
+        """Set the ``session/request_permission`` handler.
+
+        Called with the request params; returns the ACP outcome dict
+        (``{"outcome": {"selected": {"optionId": ...}}}``) or ``None`` to
+        answer ``{"outcome": {"cancelled": null}}``.
+        """
+        self._permission_handler = handler
 
     async def request(
         self, method: str, params: dict[str, Any] | None = None, *, timeout_s: float = 60.0
@@ -143,6 +156,19 @@ class GrokAcpClient:
         """Close a session (x.ai ``sessionCapabilities.close``)."""
         await self.request("session/close", {"sessionId": session_id})
 
+    async def _handle_permission_request(self, msg: dict[str, Any]) -> None:
+        """Answer a server-initiated ``session/request_permission`` call."""
+        req_id = msg["id"]
+        outcome: dict[str, Any] = {"outcome": {"cancelled": None}}
+        if self._permission_handler is not None:
+            try:
+                result = await self._permission_handler(msg.get("params") or {})
+                if result is not None:
+                    outcome = result
+            except Exception:
+                logger.exception("grok permission handler failed")
+        await self.ws.send(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": outcome}))
+
     async def close(self) -> None:
         """Tear the connection down."""
         if self._recv_task is not None:
@@ -173,6 +199,8 @@ class GrokAcpClient:
                         )
                     else:
                         fut.set_result(msg.get("result"))
+                elif msg.get("method") == "session/request_permission" and "id" in msg:
+                    await self._handle_permission_request(msg)
                 elif msg.get("method") in ("session/update", "_x.ai/session/update"):
                     if self._update_handler is not None:
                         try:

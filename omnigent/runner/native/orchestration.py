@@ -10732,6 +10732,8 @@ async def _auto_create_grok_terminal(
             ws_url=endpoint.ws_url,
             session_id=grok_session_id or "",
             pid=0,
+            server_url=(runner_server_url or ""),
+            headers=(dict(server_client.headers) if server_client is not None else {}),
         ),
     )
 
