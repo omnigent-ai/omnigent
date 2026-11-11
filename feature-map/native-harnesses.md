@@ -1229,6 +1229,8 @@ Cross-harness journeys:
   while its neighbor stays alive, a missing target, and a suspended background
   job staying paused during redraw. It uses a scripted TUI
   and real tmux; it does not establish browser or vendor-model compatibility.
+  `tests/runner/test_app_sessions_native_session_change_heal.py::test_live_claude_pane_readvertises_missing_tmux_target`
+  checks that a still-live pane restores its missing bridge target before web input.
 - **`disconnect`, Codex transport (plain `uv run pytest`, no vendor CLI):**
   `tests/e2e/test_codex_native_event_stream_disconnect_e2e.py` covers waiting
   consumers, buffered events, explicit close, and startup discovery without a

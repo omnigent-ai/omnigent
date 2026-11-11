@@ -1283,6 +1283,9 @@ def build_native_controls(
         # only job is to decide whether the readiness poll below runs at all.
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None and await instance.is_alive():
+            # The pane can outlive its bridge directory. The shared ensure path
+            # restores a missing or stale tmux target without recreating it.
+            await _ensure_native_terminal_for_turn(conv_id, "claude-native")
             return
         await _ensure_native_terminal_for_turn(conv_id, "claude-native")
         if terminal_registry.get(conv_id, terminal_name, "main") is None:

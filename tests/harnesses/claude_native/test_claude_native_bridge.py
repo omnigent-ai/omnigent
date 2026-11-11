@@ -5840,6 +5840,23 @@ def test_inject_user_message_raises_when_tmux_target_never_published(
         inject_user_message(tmp_path / "bridge", content="hi", timeout_s=0.0)
 
 
+def test_read_tmux_target_returns_only_a_complete_advertisement(tmp_path: Path) -> None:
+    """The one-shot reader exposes the same target that injection waits for."""
+    bridge_dir = tmp_path / "bridge"
+    assert claude_native_bridge.read_tmux_target(bridge_dir) is None
+
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="main",
+    )
+
+    assert claude_native_bridge.read_tmux_target(bridge_dir) == {
+        "socket_path": "/tmp/example/tmux.sock",
+        "tmux_target": "main",
+    }
+
+
 def test_inject_user_message_raises_on_tmux_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

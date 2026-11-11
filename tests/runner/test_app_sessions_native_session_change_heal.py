@@ -407,6 +407,54 @@ async def test_session_change_live_pane_does_not_recreate(
     )
 
 
+@pytest.mark.asyncio
+async def test_live_claude_pane_readvertises_missing_tmux_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A live pane must restore its missing injection target before input."""
+    conv_id = "d5e6f708192a3b4c5d6e7f8091a2b3c4"
+    auto_create_calls: list[str] = []
+    app, registry = await _open_claude_native_session(
+        monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls
+    )
+    auto_create_calls.clear()
+    bridge_dir = bridge_dir_for_conversation_id(conv_id)
+    _plant_live_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+    (bridge_dir / "tmux.json").unlink()
+
+    captured: list[tuple[str, dict[str, str] | None]] = []
+
+    def _capture_injection_target(
+        inject_bridge_dir: Path, *, command: str, **_kwargs: object
+    ) -> None:
+        captured.append((command, claude_native_bridge.read_tmux_target(inject_bridge_dir)))
+
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "inject_slash_command",
+        _capture_injection_target,
+    )
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "effort_change", "effort": "high"},
+        )
+
+    assert response.status_code == 204, response.text
+    assert auto_create_calls == [], "a live pane must not be recreated"
+    assert captured == [
+        (
+            "/effort high",
+            {
+                "socket_path": str(tmp_path / "omnigent-terminal-live" / "tmux.sock"),
+                "tmux_target": "main",
+            },
+        )
+    ]
+
+
 def _plant_live_claude_pane(
     registry: TerminalRegistry,
     conv_id: str,

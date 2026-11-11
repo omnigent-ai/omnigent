@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+    from omnigent.inner.terminal import TerminalInstance
     from omnigent.terminals.registry import TerminalListEntry, TerminalRegistry
 
 import httpx
@@ -645,6 +646,65 @@ def register_resource_routes(
             content=session_resource_view_to_dict(resource_view),
         )
 
+    async def _readvertise_live_claude_pane(
+        conv_id: str, instance: TerminalInstance, terminal_registry: TerminalRegistry
+    ) -> None:
+        """Restore a live Claude pane's missing or stale tmux target."""
+        from omnigent.harnesses.claude_native.bridge import (
+            bridge_dir_for_bridge_id,
+            read_tmux_target,
+            write_tmux_target,
+        )
+
+        binding = _session_comment_relays.get(conv_id)
+        if binding is not None:
+            bridge_dir = binding.bridge_dir
+        else:
+            try:
+                bridge_id = await _claude_native_bridge_id_for_session(
+                    server_client=server_client,
+                    session_id=conv_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _logger.warning(
+                    "could not resolve the Claude bridge for session %s",
+                    conv_id,
+                    exc_info=True,
+                    extra={"session_id": conv_id},
+                )
+                return
+            bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+
+        expected = {
+            "socket_path": str(instance.socket_path),
+            "tmux_target": instance.tmux_target,
+        }
+        if read_tmux_target(bridge_dir) == expected:
+            return
+        if terminal_registry.get(conv_id, instance.name, instance.session_key) is not instance:
+            return
+        try:
+            write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            )
+        except Exception:
+            _logger.warning(
+                "could not re-advertise the live Claude pane for session %s",
+                conv_id,
+                exc_info=True,
+                extra={"session_id": conv_id},
+            )
+            return
+        _logger.warning(
+            "restored the live Claude pane's tmux target for session %s",
+            conv_id,
+            extra={"session_id": conv_id},
+        )
+
     async def _ensure_native_terminal_for_turn(conv_id: str, harness_name: str | None) -> None:
         """Re-create a reaped native pane before forwarding a turn (self-heal).
 
@@ -676,6 +736,8 @@ def register_resource_routes(
             return
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None and await instance.is_alive():
+            if terminal_name == "claude":
+                await _readvertise_live_claude_pane(conv_id, instance, terminal_registry)
             if terminal_name != "codex":
                 return
             terminal_id = terminal_resource_id("codex", "main")
