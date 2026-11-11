@@ -49,12 +49,15 @@ interface ScopeState {
    */
   confirmed: Map<string, SuggestionStatus>;
   /**
-   * When each pending item's first change was made. A list whose data is
-   * older than that still shows the state before the change; a list fetched
-   * after it was served while the change was in flight or after it applied,
-   * and when the item is absent from it, its total already reflects the move.
+   * Each cached list's data version when a pending item's first change was
+   * made. A list still on that version shows the state before the change; one
+   * fetched since, or first loaded since, was served while the change was in
+   * flight or after it applied, and when the item is absent from it its total
+   * already reflects the move. A later page whose loaded pages never reach the
+   * item may still predate the server's commit; its total then stays one high
+   * until the PATCH settles and writes the server's count. Cards are unaffected.
    */
-  started: Map<string, number>;
+  started: Map<string, Map<string, number>>;
   /** Instances to re-render when the overlay changes. */
   listeners: Set<() => void>;
 }
@@ -81,6 +84,15 @@ function scopeState(queryClient: QueryClient, scopeKeyText: string): ScopeState 
     byKey.set(scopeKeyText, state);
   }
   return state;
+}
+
+/** Each cached list's data version, keyed by its query key. */
+function dataVersions(queryClient: QueryClient, key: readonly unknown[]): Map<string, number> {
+  const versions = new Map<string, number>();
+  for (const query of queryClient.getQueryCache().findAll({ queryKey: key })) {
+    versions.set(JSON.stringify(query.queryKey), query.state.dataUpdatedAt);
+  }
+  return versions;
 }
 
 /** The item's status in whichever cached list holds it, if any. */
@@ -160,11 +172,11 @@ export function useProactiveInbox(
       }
       const key = JSON.parse(scopeKeyText) as unknown[];
       // The first unconfirmed change on an item records what the server last
-      // agreed to and when the change was made; later changes build on that.
+      // agreed to and each list's data version; later changes build on that.
       if (!scope.started.has(id)) {
         const known = cachedStatus(queryClient, key, id);
         if (known) scope.confirmed.set(id, known);
-        scope.started.set(id, Date.now());
+        scope.started.set(id, dataVersions(queryClient, key));
       }
       scope.pending.set(id, change);
       scope.inFlight += 1;
@@ -212,15 +224,10 @@ export function useProactiveInbox(
   );
 
   let pages = query.data?.pages ?? [];
-  // Pages carry the server's totals, so the overlay moves them from the
-  // confirmed status to the pending one, once. Data older than the change
-  // predates it; data fetched since was cancelled at the change and so began
-  // after it, and when it lacks the item its total already reflects the move.
-  // A page fetched since the change whose loaded pages never reach the item
-  // may still predate the server's commit; its total then stays one high until
-  // the PATCH settles and writes the server's count. Cards are unaffected.
+  // Move each pending change onto the cached totals once; see ScopeState.started.
+  const ownKeyText = JSON.stringify([...scopeKey, [...statuses]]);
   for (const [id, change] of state.pending) {
-    const stale = query.dataUpdatedAt <= (state.started.get(id) ?? 0);
+    const stale = state.started.get(id)?.get(ownKeyText) === query.dataUpdatedAt;
     pages = applySuggestionUpdate(pages, id, change, stale ? state.confirmed.get(id) : undefined);
   }
   const first = pages[0];

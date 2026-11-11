@@ -1886,6 +1886,14 @@ describe("agent suggestions", () => {
     expect(refetch).toHaveBeenCalledOnce();
   });
 
+  it("does not show the Omni Advisor tab while the settings are unknown, unless it was selected", () => {
+    advisor.settings = undefined;
+    stub({ items: [], enabled: false });
+    renderPage();
+    expect(screen.queryByRole("tab", { name: "Omni Advisor" })).toBeNull();
+    expect(screen.getByText("Loading inbox…")).toBeInTheDocument();
+  });
+
   it("keeps loading while the Omni Advisor settings are unknown", () => {
     window.localStorage.setItem("omnigent:inbox-filter", "advisor");
     advisor.settings = undefined;
