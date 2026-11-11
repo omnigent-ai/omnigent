@@ -86,9 +86,18 @@ def require_session_runtime_support(
     agent = agent_store.get(conversation.agent_id)
     if agent is None:
         return
-    spec = agent_cache.load(
-        agent.id, agent.bundle_location, expand_env=agent.operator_authored
-    ).spec
+    try:
+        spec = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        ).spec
+    except OmnigentError:
+        raise
+    except Exception as exc:
+        raise OmnigentError(
+            "Cannot verify runtime support because this session's agent bundle could not "
+            "be loaded. Restore or replace the bundle and retry.",
+            code=ErrorCode.CONFLICT,
+        ) from exc
     from omnigent.mcp_selection import selected_mcp_spec
 
     require_registry_mcp_support(

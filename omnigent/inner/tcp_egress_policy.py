@@ -43,6 +43,13 @@ def is_blocked_tcp_address(
     )
 
 
+def is_public_tcp_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Site-local IPv6 needs an explicit grant despite ipaddress.is_global."""
+    return address.is_global and not (
+        isinstance(address, ipaddress.IPv6Address) and address.is_site_local
+    )
+
+
 def parse_tcp_egress(
     raw: object, *, egress_rules: Sequence[str] = ()
 ) -> list[TcpEgressRoute] | None:
@@ -118,7 +125,7 @@ def parse_tcp_egress(
             if networks:
                 allowed = any(address in ipaddress.ip_network(value) for value in networks)
             else:
-                allowed = address.is_global
+                allowed = is_public_tcp_address(address)
             if not allowed:
                 raise OmnigentError(f"{label}.host is outside its allowed addresses")
         names.add(name)

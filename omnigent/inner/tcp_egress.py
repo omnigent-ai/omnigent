@@ -24,7 +24,11 @@ from typing import Any, cast
 
 from . import tcp_egress_wire
 from .datamodel import TcpEgressRoute
-from .tcp_egress_policy import is_blocked_tcp_address, normalize_tcp_egress
+from .tcp_egress_policy import (
+    is_blocked_tcp_address,
+    is_public_tcp_address,
+    normalize_tcp_egress,
+)
 from .tcp_egress_wire import read_exact as _read_exact
 from .tcp_egress_wire import read_frame as _read_frame
 from .tcp_egress_wire import write_frame as _write_frame
@@ -67,7 +71,7 @@ def resolve_pinned_address(route: TcpEgressRoute) -> str:
         if networks:
             allowed = any(address in network for network in networks)
         else:
-            allowed = address.is_global
+            allowed = is_public_tcp_address(address)
         if not allowed:
             raise TcpEgressDenied("TCP egress destination resolved outside allowed addresses")
         if chosen is None:

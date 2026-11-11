@@ -18,6 +18,8 @@ from fastapi import FastAPI
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Agent, Conversation
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.frames import CAP_TCP_EGRESS
 from omnigent.runtime import get_artifact_store
 from omnigent.server.bundles import bundle_location
 from omnigent.server.child_session_recovery import RECOVERY_STORE_CONCURRENCY
@@ -418,6 +420,61 @@ async def test_failed_root_init_keeps_failure_but_does_not_block_other_tree(
         assert sessions._session_status_cache[failed.id] == "failed"
         assert sessions._session_status_cache[healthy.id] == "idle"
         assert set(requested) == {failed.id, healthy.id}
+
+
+@pytest.mark.parametrize("bundle_state", ["missing", "invalid"])
+async def test_unreadable_bundle_does_not_block_other_sessions_on_old_runner(
+    app: FastAPI,
+    agent: Agent,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    bundle_state: str,
+) -> None:
+    broken_id = generate_agent_id()
+    location = bundle_location(broken_id, b"invalid bundle")
+    if bundle_state == "invalid":
+        get_artifact_store().put(location, b"invalid bundle")
+    app.state.agent_store.create(broken_id, "broken", location)
+    failed = _create_session(app, broken_id)
+    healthy = _create_session(app, agent.id)
+    router = app.state.runner_router
+    store = router._conversation_store
+    list_bound = store.list_conversations_by_runner_id
+    monkeypatch.setattr(
+        store,
+        "list_conversations_by_runner_id",
+        lambda rid: sorted(list_bound(rid), key=lambda row: row.id != failed.id),
+    )
+    requested: list[str] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        requested.append(json.loads(request.content)["session_id"])
+        return httpx.Response(201)
+
+    async with _recover(app, monkeypatch, respond) as (relays, finished):
+        connection = app.state.tunnel_registry.get(_RUNNER_ID)
+        assert connection is not None and CAP_TCP_EGRESS not in connection.hello.capabilities
+        for lookup in (
+            lambda: router.client_for_conversation(
+                conversation_id=failed.id, harness="claude-sdk"
+            ),
+            lambda: router.client_for_session_resources(failed.id),
+            lambda: router.client_for_existing_conversation(failed.id),
+        ):
+            with pytest.raises(OmnigentError, match="bundle could not be loaded") as error:
+                lookup()
+            assert error.value.code == ErrorCode.CONFLICT
+            assert error.value.__cause__ is not None
+        await asyncio.wait_for(finished.wait(), budget(5))
+        assert relays == requested == [healthy.id]
+        assert sessions._session_status_cache[healthy.id] == "idle"
+        assert sessions._session_status_cache[failed.id] == "failed"
+        assert any(
+            "Failed to resolve runner client" in record.getMessage()
+            and record.exc_info is not None
+            and isinstance(record.exc_info[1], OmnigentError)
+            for record in caplog.records
+        )
 
 
 async def test_failed_binding_batch_does_not_strand_later_roots(

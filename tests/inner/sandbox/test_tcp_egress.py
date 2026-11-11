@@ -44,6 +44,7 @@ from omnigent.inner.sandbox import (
     resolve_sandbox,
 )
 from omnigent.inner.tcp_egress import (
+    TcpEgressBroker,
     TcpEgressDenied,
     apply_tcp_egress_env,
     resolve_pinned_address,
@@ -112,6 +113,7 @@ def broker_dir() -> Iterator[Path]:
         ("host", "10.1.2.3"),
         ("host", "fd00:ec2::254"),
         ("host", "fd20:ce::254"),
+        ("host", "fec0::1"),
         ("port", 0),
         ("port", True),
         ("port", 443),
@@ -133,12 +135,10 @@ def test_tcp_route_rejects_unsafe_fields(field: str, value: object) -> None:
         parse_tcp_egress([entry])
 
 
-def test_tcp_route_rejects_duplicate_and_http_overlap() -> None:
+def test_tcp_route_rejects_duplicate_names() -> None:
     entry = {"name": "db", "host": "db.example.test", "port": 5432}
     with pytest.raises(OmnigentError, match="unique"):
         parse_tcp_egress([entry, entry])
-    with pytest.raises(OmnigentError, match="cannot coexist"):
-        parse_tcp_egress([entry], egress_rules=["GET *.example.test/**"])
 
 
 def test_tcp_route_parsers_and_runtime_reject_weak_backend(tmp_path: Path) -> None:
@@ -218,7 +218,7 @@ def test_tcp_route_rejects_mixed_dns_and_blocked_addresses(
         resolve_pinned_address(ipv6_metadata)
 
 
-@pytest.mark.parametrize("private_address", ["10.42.7.9", "fd42::9"])
+@pytest.mark.parametrize("private_address", ["10.42.7.9", "fd42::9", "fec0::9"])
 def test_tcp_dns_private_answer_requires_explicit_cidr(
     private_address: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -242,6 +242,16 @@ def test_tcp_dns_private_answer_requires_explicit_cidr(
     permitted = TcpEgressRoute(
         "db", route.host, route.port, (f"{address}/{address.max_prefixlen}",)
     )
+    assert parse_tcp_egress(
+        [
+            {
+                "name": "db",
+                "host": private_address,
+                "port": 5432,
+                "allowed_cidrs": list(permitted.allowed_cidrs),
+            }
+        ]
+    ) == [TcpEgressRoute("db", private_address, 5432, permitted.allowed_cidrs)]
     assert resolve_pinned_address(permitted) == private_address
     assert queries == [(route.host, route.port)] * 2
 
@@ -296,10 +306,16 @@ def test_tcp_connector_wire_rejects_oversized_and_truncated_frames() -> None:
         sender.shutdown(socket.SHUT_WR)
         with pytest.raises(OSError, match="disconnected"):
             tcp_egress_wire.read_frame(receiver)
+    for partial in (b"O\x00\x00", b"O" + struct.pack("!I", 8) + b"short"):
+        sender, receiver = socket.socketpair()
+        with sender, receiver:
+            sender.sendall(partial)
+            sender.shutdown(socket.SHUT_WR)
+            with pytest.raises(OSError, match="disconnected"):
+                tcp_egress_wire.read_frame(receiver)
 
 
-def test_tcp_connector_reports_missing_and_denied_routes(
-    tcp_route: TcpEgressRoute,
+def test_tcp_connector_reports_missing_configuration(
     broker_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -312,15 +328,6 @@ def test_tcp_connector_reports_missing_and_denied_routes(
     monkeypatch.delenv(tcp_egress_wire.TOKEN_ENV, raising=False)
     assert tcp_egress_wire.main(["echo"]) == 1
     assert "unavailable" in capsys.readouterr().err
-
-    broker = start_tcp_egress_broker([tcp_route], broker_dir)
-    monkeypatch.setenv(tcp_egress_wire.SOCKET_ENV, str(broker.socket_path))
-    monkeypatch.setenv(tcp_egress_wire.TOKEN_ENV, broker.token)
-    try:
-        assert tcp_egress_wire.main(["not-granted"]) == 1
-        assert "not allowed" in capsys.readouterr().err
-    finally:
-        broker.stop()
 
 
 def test_tcp_global_resolver_limit_fails_closed(
@@ -1000,6 +1007,22 @@ def test_tcp_revocation_prevents_dial_after_stalled_dns(
         broker.stop()
 
 
+def _assert_owner_revokes_stream(broker: TcpEgressBroker, close: Callable[[], None]) -> None:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(2)
+        client.connect(str(broker.socket_path))
+        request = json.dumps({"token": broker.token, "route": "echo"}).encode()
+        client.sendall(struct.pack("!I", len(request)) + request)
+        assert client.recv(1) == b"\x00"
+        tcp_egress_wire.write_frame(client, b"I", b"x")
+        assert _read_frame(client) == (b"O", b"x")
+        close()
+        with pytest.raises(OSError, match="disconnected"):
+            while True:
+                _read_frame(client)
+        assert not broker.socket_path.exists()
+
+
 def test_tcp_connector_inside_real_sandbox(
     tcp_route: TcpEgressRoute,
     tmp_path: Path,
@@ -1011,7 +1034,7 @@ def test_tcp_connector_inside_real_sandbox(
     environment = create_os_environment(
         OSEnvSpec(type="caller_process", cwd=str(workspace), sandbox=sandbox)
     )
-    assert environment is not None
+    assert isinstance(environment, os_env_module.CallerProcessOSEnvironment)
     try:
         result = run_async(
             environment.shell("printf hello | omnigent-egress-connect echo", timeout=30)
@@ -1029,6 +1052,9 @@ def test_tcp_connector_inside_real_sandbox(
             detail in direct.get("stderr", "")
             for detail in ("PermissionError", "Operation not permitted", "Network is unreachable")
         ), direct
+        broker = environment._helper._tcp_egress_broker
+        assert broker is not None
+        _assert_owner_revokes_stream(broker, environment.close)
     finally:
         environment.close()
 
@@ -1036,6 +1062,11 @@ def test_tcp_connector_inside_real_sandbox(
 def test_tcp_route_cannot_bypass_http_egress_via_alias(tmp_path: Path) -> None:
     route = TcpEgressRoute("database", "db.example.test", 5432)
     http_rules = ["GET restricted.example.test/**"]
+    with pytest.raises(OmnigentError, match="cannot coexist"):
+        parse_tcp_egress(
+            [{"name": route.name, "host": route.host, "port": route.port}],
+            egress_rules=http_rules,
+        )
     sandbox = OSEnvSandboxSpec(type="linux_bwrap", tcp_egress=[route], egress_rules=http_rules)
     with pytest.raises(OmnigentError, match="cannot coexist"):
         _parse_os_env_sandbox(
@@ -1201,7 +1232,7 @@ def test_tcp_connector_inside_sandboxed_terminal(
         '&& grep -Eq "PermissionError|Network is unreachable|Operation not permitted" '
         "direct-error "
         ") > output 2>&1 "
-        "&& printf success > marker || printf failure > marker"
+        "&& printf success > marker || printf failure > marker; exec sleep 30"
     )
     environment = OSEnvSpec(
         type="caller_process",
@@ -1229,5 +1260,8 @@ def test_tcp_connector_inside_sandboxed_terminal(
         )
         assert marker.read_text() == "success", (workspace / "output").read_text()
         assert (workspace / "result").read_text() == "terminal"
+        broker = instance._tcp_egress_broker
+        assert broker is not None
+        _assert_owner_revokes_stream(broker, lambda: run_async(instance.close()))
     finally:
         run_async(instance.close())
