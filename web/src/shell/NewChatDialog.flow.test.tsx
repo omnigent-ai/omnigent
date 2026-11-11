@@ -16,6 +16,7 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
   })),
 }));
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { REVIEW_PLAN_FIRST } from "@/lib/workflow";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
 vi.mock("@/hooks/useSidebarData", () => ({
@@ -1555,6 +1556,32 @@ describe("NewChatLandingScreen create flow", () => {
       expect(setPendingInitialPromptMock).toHaveBeenCalledWith("conv_new", {
         text: "/review-pr 123 focus on auth",
         skill: { name: "review-pr", args: "123 focus on auth" },
+        files: [],
+      }),
+    );
+  });
+
+  it("runs a workflow from the + menu as the session's first message", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    setAgents([agent({ skills: [{ name: "workflow", description: "Plan and run a workflow" }] })]);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("Add retries");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
+    fireEvent.click(screen.getByTestId("composer-workflow-action"));
+    // The draft becomes the goal, since the workflow message replaces it.
+    expect(await screen.findByTestId("workflow-dialog-goal")).toHaveValue("Add retries");
+    fireEvent.click(screen.getByTestId("workflow-dialog-run"));
+
+    const args = `Add retries\n\n${REVIEW_PLAN_FIRST}`;
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith("conv_new", {
+        text: `/workflow ${args}`,
+        skill: { name: "workflow", args },
         files: [],
       }),
     );

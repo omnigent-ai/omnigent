@@ -337,6 +337,8 @@ import { isPermissionModeCycleKey, nextCycledPermissionMode } from "@/lib/permis
 import { getCliServerUrl } from "@/lib/host";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
 import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/components/goal";
+import { WorkflowDialog, type WorkflowRequest } from "@/components/composer/WorkflowDialog";
+import { offersWorkflow, workflowMessage } from "@/lib/workflow";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ConnectionIndicator } from "./ChatIndicators";
@@ -407,8 +409,6 @@ export function isSubagentRoutingEligible(
 
 /** How often `/mcp` re-reads the host inventory while a server waits on a sign-in. */
 const HOST_MCP_SIGN_IN_POLL_MS = 5_000;
-// The framework skill that plans and runs a described workflow.
-const WORKFLOW_SKILL = "workflow";
 
 /** Only an http(s) page is ever opened from a host's sign-in report. */
 const HOST_SIGN_IN_URL_RE = /^https?:\/\//i;
@@ -3103,22 +3103,15 @@ function ComposerImpl(
   // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
   const canStartSideChat = useCanStartSideChat(composerSessionId, permissionLevel);
   const showSide = supportsSideChat(sessionHarness, canStartSideChat);
-  // "Run a workflow" puts `/workflow ` into the composer, ready for a
-  // description. The "+" menu offers it, and so does the Tasks tab's empty
+  // "Run a workflow" opens a dialog that asks for the goal and sends the
+  // workflow. The "+" menu offers it, and so does the Tasks tab's empty
   // state, which reaches it through the registry below.
-  const canStartWorkflow = !isReadOnly && skills.some((skill) => skill.name === WORKFLOW_SKILL);
-  const startWorkflowRef = useRef<() => void>(() => undefined);
-  startWorkflowRef.current = () => {
-    setValue(`${skillPrefix}${WORKFLOW_SKILL} `);
-    setCommandError(null);
-    dirtyRef.current = true;
-  };
+  const canStartWorkflow = !isReadOnly && offersWorkflow(skills);
+  const [workflowDialogOpen, setWorkflowDialogOpen] = useState(false);
+  useEffect(() => setWorkflowDialogOpen(false), [conversationId]);
   useEffect(() => {
     if (!canStartWorkflow || composerSessionId === null) return;
-    return registerStartWorkflow(composerSessionId, () => {
-      startWorkflowRef.current();
-      requestAnimationFrame(() => textareaRef.current?.focus());
-    });
+    return registerStartWorkflow(composerSessionId, () => setWorkflowDialogOpen(true));
   }, [canStartWorkflow, composerSessionId]);
   const slashCommands = useMemo(
     () =>
@@ -4096,6 +4089,25 @@ function ComposerImpl(
     setMention(null);
   };
 
+  // The workflow dialog sends straight to the chat and leaves the draft alone.
+  const runWorkflow = (request: WorkflowRequest) => {
+    const message = workflowMessage(skillPrefix, request.goal, request.reviewPlanFirst);
+    const skill = onSendSlashCommand
+      ? matchSlashCommandInvocation(message, slashCommandNames)
+      : null;
+    setCommandError(null);
+    appendEntry(message);
+    if (skill !== null) onSendSlashCommand?.(skill.command.slice(1), skill.args);
+    else onSend(message);
+  };
+  const workflowBlockedReason = composerLockedByBtw
+    ? "Close the side question first."
+    : hasPendingElicitation
+      ? "Answer the agent's question first."
+      : unreachable
+        ? "The session is offline. Reconnect it to run a workflow."
+        : (sendDisabledReason ?? (disabled ? "This session can't take messages right now." : null));
+
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
     if (showInterruptButton) {
@@ -4627,7 +4639,7 @@ function ComposerImpl(
                       }
                     : undefined
                 }
-                onWorkflow={canStartWorkflow ? () => startWorkflowRef.current() : undefined}
+                onWorkflow={canStartWorkflow ? () => setWorkflowDialogOpen(true) : undefined}
               />
               {!subAgentLabel && composerSessionId && (
                 <MobileHeaderControlPortal sessionId={composerSessionId}>
@@ -4793,6 +4805,14 @@ function ComposerImpl(
             backendLabel={showClaudeGoalControl ? "Claude" : "Codex"}
           />
         )
+      )}
+      {canStartWorkflow && (
+        <WorkflowDialog
+          open={workflowDialogOpen}
+          onOpenChange={setWorkflowDialogOpen}
+          onRunWorkflow={runWorkflow}
+          blockedReason={workflowBlockedReason}
+        />
       )}
       <ComposerStatusLine />
     </form>

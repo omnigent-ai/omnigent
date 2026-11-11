@@ -68,8 +68,8 @@ export function ComposerAddMenu({
   /** Start a new side chat (a fork of this conversation opened as a rail tab).
    *  Absent when the session can't host one. */
   onSideChat?: () => void;
-  /** Start a workflow the agent plans from a description (`/workflow …`).
-   *  Absent when the session has no `workflow` skill. */
+  /** Open the "Run a workflow" dialog, once the menu has closed.
+   *  Absent when the agent has no `workflow` skill. */
   onWorkflow?: () => void;
   projects?: readonly { name: string }[];
   onProjectSelect?: (name: string) => void;
@@ -215,7 +215,9 @@ export function ComposerAddMenu({
                     <DropdownMenuItem
                       className="mobile-touch-target"
                       data-testid="composer-workflow-action"
-                      onSelect={onWorkflow}
+                      onSelect={() => {
+                        pendingActionRef.current = onWorkflow;
+                      }}
                     >
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <WorkflowIcon className="size-3.5" />

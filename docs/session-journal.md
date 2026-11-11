@@ -70,8 +70,12 @@ reconnects, returns the entry the first attempt wrote instead of adding another.
 
 ## Running a workflow from a session
 
-Type `/workflow` and a description in the composer, or pick **Run a workflow**
-from the composer's **+** menu, for example:
+Pick **Run a workflow** from the composer's **+** menu, in a session or when
+starting one, describe the goal, and choose **Run workflow**. The workflow goes
+straight to the chat. **Review the plan before work starts**, on by default,
+has the agent make its first step a review of the plan and wait for your
+approval before any other work. You can also type `/workflow` and a
+description in the composer, for example:
 
 ```
 /workflow Cut p95 latency of GET /orders 20%; one change per step; open a PR.
