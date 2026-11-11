@@ -77,19 +77,20 @@ def test_an_event_task_has_no_rule_and_no_next_run(store: SqlAlchemyScheduledTas
     # Persistent dispatch neither schedules nor completes it.
     assert (task.state, task.next_run_at) == ("active", None)
     assert store.list_uninitialized_tasks() == []
-    assert store.list_event_triggered_tasks() == [task]
-    # Stored with a marker no schedule reaches, which the due-task index finds by equality.
+    assert store.list_event_triggered_tasks(provider="omnigent") == [task]
+    # The provider is stored as the scalar that discovery seeks on; next_run_at stays NULL.
     from sqlalchemy import select
 
     from omnigent.db.db_models import SqlScheduledTask
-    from omnigent.server.scheduled.schedule import EVENT_TRIGGERED_NEXT_RUN_AT
 
-    with store._session("read_marker") as session:
-        stored = session.scalar(select(SqlScheduledTask.next_run_at))
-    assert stored == EVENT_TRIGGERED_NEXT_RUN_AT
-    assert store.list_due_tasks(EVENT_TRIGGERED_NEXT_RUN_AT - 1) == []
+    with store._session("read_provider") as session:
+        stored = session.execute(
+            select(SqlScheduledTask.trigger_provider, SqlScheduledTask.next_run_at)
+        ).one()
+    assert tuple(stored) == ("omnigent", None)
+    assert store.list_event_triggered_tasks(provider="jira") == []
     assert store.update(task.id, state="paused").state == "paused"
-    assert store.list_event_triggered_tasks() == []
+    assert store.list_event_triggered_tasks(provider="omnigent") == []
 
 
 def test_a_task_needs_exactly_one_of_rule_and_trigger(store: SqlAlchemyScheduledTaskStore) -> None:
@@ -148,12 +149,13 @@ def test_a_continued_task_coalesces_events_into_its_pending_run(
     [pending] = store.list_pending_runs()
     assert len(pending.event["events"]) == 20
     assert pending.event["omitted"] == 12
-    # Once claimed, the next event starts a new pending run.
+    # Once claimed, the next event starts a new pending run (after the minute's
+    # 32 accepted events no longer count toward the cap).
     assert store.claim_pending_run(pending, now=1_001, lease_seconds=120) is not None
-    assert _record(store, task, "s3", coalesce=True) == "recorded"
+    assert _record(store, task, "s3", now=1_061, coalesce=True) == "recorded"
     # Occurrences that joined the claimed run, listed or only counted, stay received.
-    assert _record(store, task, "s2", coalesce=True) == "duplicate"
-    assert _record(store, task, "more29", coalesce=True) == "duplicate"
+    assert _record(store, task, "s2", now=1_062, coalesce=True) == "duplicate"
+    assert _record(store, task, "more29", now=1_062, coalesce=True) == "duplicate"
 
 
 def test_a_coalesced_run_stays_within_its_column(store: SqlAlchemyScheduledTaskStore) -> None:
@@ -251,9 +253,9 @@ def test_an_oversized_trigger_is_refused(store: SqlAlchemyScheduledTaskStore) ->
 def test_event_tasks_are_listed_in_id_pages(store: SqlAlchemyScheduledTaskStore) -> None:
     tasks = sorted((_event_task(store, f"page{i}") for i in range(5)), key=lambda t: t.id)
     store.create(_uid("scheduled"), "s", "p", "FREQ=HOURLY", None, _uid("agent"), "UTC")
-    first = store.list_event_triggered_tasks(limit=2)
-    second = store.list_event_triggered_tasks(after=first[-1].id, limit=2)
-    third = store.list_event_triggered_tasks(after=second[-1].id, limit=2)
+    first = store.list_event_triggered_tasks(provider="omnigent", limit=2)
+    second = store.list_event_triggered_tasks(provider="omnigent", after=first[-1].id, limit=2)
+    third = store.list_event_triggered_tasks(provider="omnigent", after=second[-1].id, limit=2)
     assert [t.id for t in [*first, *second, *third]] == [t.id for t in tasks]
 
 
@@ -306,6 +308,28 @@ def test_the_per_minute_cap_drops_events_and_records_one_skip(
     ]
     # The window moves on, and the skip itself does not count.
     assert _record(store, task, "later", now=1_061, cap=2) == "recorded"
+
+
+def test_the_cap_counts_accepted_events_not_other_runs(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _event_task(store)
+    # Skipped runs and Run now requests in the window don't use the event cap.
+    for index in range(30):
+        store.create_run(uuid.uuid4().hex, task.id, "skipped", 1_000, finished_at=1_000)
+        store.request_manual_run(task, now=1_000, trigger_key=f"manual:{index}", host_id=None)
+    assert _record(store, task, "s1", cap=1) == "recorded"
+    assert _record(store, task, "s2", cap=1) == "rate_limited"
+
+
+def test_a_trigger_changed_since_it_was_listed_records_nothing(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    listed = _event_task(store)
+    store.update(listed.id, trigger_config={"provider": "omnigent", "events": ["comment.created"]})
+    # The worker matched the event against its cached copy of the old trigger.
+    assert _record(store, listed, "s1") == "inactive"
+    assert _record(store, store.get(listed.id), "s1") == "recorded"
 
 
 def test_an_inactive_task_records_nothing_and_its_pending_events_skip(

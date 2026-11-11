@@ -306,14 +306,14 @@ class ScheduledTaskStore(ABC):
         ...
 
     def list_event_triggered_tasks(
-        self, *, after: str | None = None, limit: int = 500
+        self, *, provider: str, after: str | None = None, limit: int = 500
     ) -> builtins.list[ScheduledTask]:
-        """One page of the current workspace's active event-triggered tasks, ordered by id.
+        """One page of the current workspace's active tasks for one trigger provider, by id.
 
         Pass the last task's id as ``after`` for the next page. Stores without
         event triggers return an empty list, so no event fires.
         """
-        del after, limit
+        del provider, after, limit
         return []
 
     def record_event_run(
@@ -332,12 +332,13 @@ class ScheduledTaskStore(ABC):
         The run waits for the host owner's scheduler to claim it, like a Run now
         request. ``trigger_key`` is the event's occurrence key; every accepted
         occurrence keeps a receipt, so a redelivered event is a ``"duplicate"``,
-        also after the run it joined was claimed. With ``coalesce``, an event for a task that
-        already has an unclaimed pending event run is added to that run instead.
-        Once the task's runs in the last minute reach ``max_runs_per_minute``,
-        the event is dropped as ``"rate_limited"``, and one ``skipped`` run per
-        minute records that. A task no longer active, or no longer event
-        triggered, records nothing.
+        also after the run it joined was claimed. With ``coalesce``, an event for
+        a task whose latest event run still waits for a claim is added to that run
+        instead. Once the task has accepted ``max_runs_per_minute`` events in the
+        last minute, a further event that would start a run is dropped as
+        ``"rate_limited"``, and one ``skipped`` run per minute records that. A task
+        no longer active, or whose trigger changed since *task* was read, records
+        nothing.
 
         :param task: The matched task, as listed.
         :param now: Unix epoch seconds the event is recorded at.
@@ -345,7 +346,7 @@ class ScheduledTaskStore(ABC):
         :param host_id: The run's host, as for any occurrence of the task.
         :param event: The event's JSON description, with IDs and metadata only.
         :param coalesce: Whether a pending run of this task can take the event.
-        :param max_runs_per_minute: The task's per-minute run cap.
+        :param max_runs_per_minute: The task's per-minute cap on accepted events.
         :returns: How the event was recorded. Stores without event triggers
             return ``"inactive"``.
         """

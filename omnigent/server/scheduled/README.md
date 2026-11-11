@@ -284,12 +284,12 @@ wrong:
 ## Event triggers
 
 A task with a `trigger_config` runs on events instead of a schedule. It has no
-`rrule`, and while active it saves `next_run_at` as a fixed marker that no
-schedule reaches (`EVENT_TRIGGERED_NEXT_RUN_AT`; the API reports `null`). So it
-never comes due, it is not a task waiting for a next run time, and the due-task
-index finds a workspace's event-triggered tasks with an equality seek. Legacy
-timers clear the marker and never arm such a task; the next poll of the
-database scheduler puts the marker back. The JSON names a `provider`;
+`rrule` and no `next_run_at`, and `trigger_provider` holds the provider its
+trigger names. `ix_scheduled_tasks_trigger` on `(state, trigger_provider,
+next_run_at, workspace_id, id)` finds a workspace's active tasks for one provider
+by equality, and lets the search for scheduled tasks without a next run time
+skip event-triggered ones. The scheduler never lists such a task as due or fills
+in its next run time, and legacy timers never arm it. The JSON names a `provider`;
 each provider validates its own shape. An event records a `scheduled` run with
 the event's IDs in the run's `event` column, keyed `event:<provider>:<occurrence>`
 in `trigger_key`. Every accepted occurrence also gets a row in
@@ -334,10 +334,11 @@ the server's own session events: `session.created`, `session.renamed`,
   checked through its root.
 - By default a task ignores the sessions it created or continues, and their
   sub-agents, so its own turns cannot trigger it again.
-- A task records at most 10 runs a minute. Further events that minute are
-  dropped, and one `skipped` run (`rate_limited`) per minute records the drop.
-- A task that continues one session adds new events to its unclaimed pending
-  run instead of recording another (up to 20 listed, the rest counted, and the
+- A task accepts at most 10 events a minute, counted from its receipts. A
+  further event that minute that would start a run is dropped, and one
+  `skipped` run (`rate_limited`) per minute records the drop.
+- A task that continues one session adds new events to the run its newest
+  receipt names while that run waits for a claim, instead of recording another (up to 20 listed, the rest counted, and the
   document kept under the column's size). The
   scheduler holds that run while the session is running or waiting on an
   approval, for at most 10 minutes, so a busy session gets one prompt.

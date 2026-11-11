@@ -52,7 +52,6 @@ from omnigent.server.scheduled.run_reconciler import (
 )
 from omnigent.server.scheduled.schedule import (
     EVENT_TRIGGER_KEY_PREFIX,
-    EVENT_TRIGGERED_NEXT_RUN_AT,
     continued_sandbox_host_id,
     is_event_trigger_key,
     is_trigger_automation,
@@ -98,8 +97,6 @@ _EVENT_RATE_WINDOW_SECONDS = 60
 _MAX_JSON_DOCUMENT_CHARS = 12_000
 # Room a coalesced document keeps for its ``"omitted": <count>`` field.
 _OMITTED_FIELD_RESERVE = 32
-# Every event key sorts in [EVENT_TRIGGER_KEY_PREFIX, this): ";" follows ":".
-_EVENT_TRIGGER_KEY_END = EVENT_TRIGGER_KEY_PREFIX[:-1] + ";"
 # How long an occurrence receipt keeps a repeated delivery from recording again.
 _EVENT_RECEIPT_RETENTION_SECONDS = 7 * 24 * 3600
 # Expired receipts removed per accepted event, so cleanup keeps pace with intake.
@@ -111,6 +108,16 @@ _RECEIPTS_PURGED_CURSOR = (-1, "0" * 32)
 def _dump_json(value: dict[str, Any] | None) -> str | None:
     """Encode a JSON column value compactly, keeping ``None`` as NULL."""
     return None if value is None else json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def _trigger_provider(trigger_config: dict[str, Any] | None) -> str | None:
+    """The provider an event trigger names, stored as its scalar discriminator."""
+    if trigger_config is None:
+        return None
+    provider = trigger_config.get("provider")
+    if not isinstance(provider, str) or not provider or len(provider) > 32:
+        raise ValueError("An event trigger needs a provider of at most 32 characters.")
+    return provider
 
 
 def _dump_bounded_json(value: dict[str, Any] | None) -> str | None:
@@ -210,7 +217,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         last_run_at=row.last_run_at,
         last_run_conversation_id=row.last_run_conversation_id,
         updated_at=row.updated_at,
-        next_run_at=None if row.next_run_at == EVENT_TRIGGERED_NEXT_RUN_AT else row.next_run_at,
+        next_run_at=row.next_run_at,
         project_id=row.project_id,
         delegation_ref=row.delegation_ref,
         trigger_config=_load_json(row.trigger_config),
@@ -354,6 +361,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 project_id=project_id,
                 delegation_ref=delegation_ref,
                 trigger_config=_dump_bounded_json(trigger_config),
+                trigger_provider=_trigger_provider(trigger_config),
                 state=encode_scheduled_task_state(state),
                 last_run_at=None,
                 last_run_conversation_id=None,
@@ -525,6 +533,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 encoded_trigger = _dump_bounded_json(trigger_config)
                 if row.trigger_config != encoded_trigger:
                     row.trigger_config = encoded_trigger
+                    row.trigger_provider = _trigger_provider(trigger_config)
                     changed = True
                 if trigger_config is not None and row.rrule is not None:
                     # An event-triggered task has no schedule.
@@ -1180,12 +1189,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         if row.state == encode_scheduled_task_state("completed"):
             # A schedule edit or resume re-evaluates a finished schedule.
             row.state = encode_scheduled_task_state("active")
-        if not self._dispatch_enabled:
-            row.next_run_at = None
-            return
-        if row.trigger_config is not None:
+        if not self._dispatch_enabled or row.trigger_config is not None:
             # Event-triggered tasks run only when an event records a pending run.
-            row.next_run_at = EVENT_TRIGGERED_NEXT_RUN_AT
+            row.next_run_at = None
             return
         task = _to_entity(row)
         row.next_run_at = next_scheduled_time(task, after)
@@ -1302,6 +1308,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 select(SqlScheduledTask)
                 .where(
                     SqlScheduledTask.state == encode_scheduled_task_state("active"),
+                    # Seeks the trigger index past event-triggered tasks, which never
+                    # get a next run time.
+                    SqlScheduledTask.trigger_provider.is_(None),
                     SqlScheduledTask.next_run_at.is_(None),
                 )
                 .order_by(
@@ -1523,12 +1532,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         return run_write_transaction(self._session_immediate, "request_manual_run", write)
 
     def list_event_triggered_tasks(
-        self, *, after: str | None = None, limit: int = 500
+        self, *, provider: str, after: str | None = None, limit: int = 500
     ) -> builtins.list[ScheduledTask]:
-        """One page of the current workspace's active event-triggered tasks, by id.
+        """One page of the current workspace's active tasks for *provider*, by id.
 
-        Such a task is active with the event-trigger next run time, so the page is an
-        equality seek on the due-task index ``(state, next_run_at, workspace_id, id)``.
+        An equality seek on ``ix_scheduled_tasks_trigger``: such tasks never have a
+        next run time.
         """
         if limit < 1:
             raise ValueError("The event-triggered task page size must be at least 1.")
@@ -1537,7 +1546,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 select(SqlScheduledTask)
                 .where(
                     SqlScheduledTask.state == encode_scheduled_task_state("active"),
-                    SqlScheduledTask.next_run_at == EVENT_TRIGGERED_NEXT_RUN_AT,
+                    SqlScheduledTask.trigger_provider == provider,
+                    SqlScheduledTask.next_run_at.is_(None),
                     SqlScheduledTask.workspace_id == current_workspace_id(),
                 )
                 .order_by(SqlScheduledTask.id)
@@ -1618,8 +1628,15 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 row is None
                 or row.state != encode_scheduled_task_state("active")
                 or row.trigger_config is None
+                # The task was matched against a cached copy; a changed trigger
+                # decides again on the next event.
+                or _load_json(row.trigger_config) != task.trigger_config
             ):
                 return "inactive"
+            receipts = (
+                SqlScheduledTaskEventReceipt.workspace_id == workspace_id,
+                SqlScheduledTaskEventReceipt.scheduled_task_id == task.id,
+            )
             received = session.scalar(
                 select(SqlScheduledTaskEventReceipt.id).where(
                     SqlScheduledTaskEventReceipt.workspace_id == workspace_id,
@@ -1639,20 +1656,29 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             ):
                 return "duplicate"
             if coalesce:
-                # A key range on the task-status index reaches only the task's
-                # pending event runs, of which coalescing leaves at most one.
-                pending = session.scalar(
-                    select(SqlScheduledTaskRun)
-                    .where(
-                        *task_runs,
-                        *_PENDING_RUN_FILTER,
-                        SqlScheduledTaskRun.trigger_key >= EVENT_TRIGGER_KEY_PREFIX,
-                        SqlScheduledTaskRun.trigger_key < _EVENT_TRIGGER_KEY_END,
+                # The newest receipt names the run the task's latest event went to;
+                # coalescing only ever adds to that run while it waits for a claim.
+                latest_run_id = session.scalar(
+                    select(SqlScheduledTaskEventReceipt.run_id)
+                    .where(*receipts)
+                    .order_by(
+                        SqlScheduledTaskEventReceipt.created_at.desc(),
+                        SqlScheduledTaskEventReceipt.id.desc(),
                     )
                     .limit(1)
-                    .with_for_update()
                 )
-                if pending is not None:
+                pending = (
+                    session.get(
+                        SqlScheduledTaskRun, (workspace_id, latest_run_id), with_for_update=True
+                    )
+                    if latest_run_id is not None
+                    else None
+                )
+                if (
+                    pending is not None
+                    and pending.status == encode_scheduled_task_run_status("scheduled")
+                    and pending.lease_expires_at is None
+                ):
                     document = _load_json(pending.event) or {}
                     events = document.get("events")
                     events = events if isinstance(events, list) else []
@@ -1668,13 +1694,13 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     pending.event = _dump_bounded_json(document)
                     receipt(session, pending.id)
                     return "coalesced"
-            # Reading at most the cap's worth of rows establishes saturation.
+            # Every receipt in the window counts, so reading at most the cap's worth
+            # of the age index establishes saturation.
             recent = session.scalars(
-                select(SqlScheduledTaskRun.id)
+                select(SqlScheduledTaskEventReceipt.id)
                 .where(
-                    *task_runs,
-                    SqlScheduledTaskRun.scheduled_at > now - _EVENT_RATE_WINDOW_SECONDS,
-                    SqlScheduledTaskRun.status != encode_scheduled_task_run_status("skipped"),
+                    *receipts,
+                    SqlScheduledTaskEventReceipt.created_at > now - _EVENT_RATE_WINDOW_SECONDS,
                 )
                 .limit(max_runs_per_minute)
             ).all()
@@ -1697,8 +1723,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                             finished_at=now,
                             trigger_key=limit_key,
                             error=(
-                                f"More than {max_runs_per_minute} events matched in a minute; "
-                                "later events in this minute were dropped."
+                                f"The automation accepted {max_runs_per_minute} events in a "
+                                "minute; later events in this minute were dropped."
                             ),
                             error_code="rate_limited",
                             event=_dump_bounded_json(first_document),
