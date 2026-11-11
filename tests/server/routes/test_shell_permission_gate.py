@@ -467,6 +467,7 @@ async def test_filesystem_allows_the_owner_outside_the_workspace(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scope", [None, "workspace"])
 @pytest.mark.parametrize(
     "caller,url,marked",
     [
@@ -500,14 +501,26 @@ async def test_filesystem_marks_reach_scope_for_the_owner_only(
     caller: str,
     url: str,
     marked: bool,
+    scope: str | None,
 ) -> None:
     """Only effective owners receive reach scope for relative reads, including
     ownership inherited through a parent; an absolute path needs no mark."""
-    resp = await client.get(url, headers={"X-Forwarded-Email": caller})
+    resp = await client.get(
+        url,
+        headers={"X-Forwarded-Email": caller},
+        params={"scope": scope} if scope is not None else None,
+    )
 
+    if scope == "workspace" and url == _FS_ABSOLUTE:
+        assert resp.status_code == 400, resp.text
+        assert runner_client.gets == []
+        return
     assert resp.status_code == 200, resp.text
     assert len(runner_client.gets) == 1
-    assert ("scope=reach" in runner_client.gets[0]) is marked
+    assert ("scope=reach" in runner_client.gets[0]) is (marked and scope is None)
+    assert resp.headers.get("X-Omnigent-File-Scope") == scope
+    if scope == "workspace":
+        assert "scope=workspace" in runner_client.gets[0]
 
 
 @pytest.mark.asyncio
