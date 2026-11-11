@@ -494,7 +494,11 @@ async def test_project_rename_refiles_members_that_belong_through_the_legacy_lab
     requests: list[httpx.Request] = []
     members = [
         {"id": PARENT, "labels": {"omni_project": "Q3"}},
-        {"id": FAMILY_MEMBER, "family": {"representative_id": PARENT}},
+        {
+            "id": FAMILY_MEMBER,
+            "labels": {"omni_project": "Q3"},
+            "family": {"representative_id": PARENT},
+        },
         {"id": SUB_AGENT, "project_id": PROJECT_ID},
     ]
     async with _client(_project_server(requests, pages=[members])) as client:
@@ -822,7 +826,7 @@ async def test_project_rename_reports_a_member_check_that_fails_after_the_rename
         )
     assert result == {
         "project": "Q4",
-        "status": "updated",
+        "status": "partial",
         "error": "project updated, but its sessions could not be checked: "
         "could not list the project's sessions: HTTP 503",
     }

@@ -787,7 +787,7 @@ async def execute_project_update(
         return json.dumps(
             {
                 "project": new_name or current_name,
-                "status": status,
+                "status": "partial",
                 "error": f"project updated, but its sessions could not be checked: {exc}",
             }
         )
