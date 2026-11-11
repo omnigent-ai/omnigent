@@ -130,6 +130,14 @@ class UpdateInboxItemRequest(BaseModel):
         return self
 
 
+def _sub_agent_spec(spec: Any, name: str) -> Any | None:
+    """Return the sub-agent of *spec* called *name*, or ``None``."""
+    for sub_agent in getattr(spec, "sub_agents", None) or []:
+        if getattr(sub_agent, "name", None) == name:
+            return sub_agent
+    return None
+
+
 def _item_json(item: InboxItem) -> dict[str, Any]:
     return dataclasses.asdict(item)
 
@@ -191,6 +199,10 @@ def create_inbox_items_router(
         spec = agent_cache.load(
             agent.id, agent.bundle_location, expand_env=agent.operator_authored
         ).spec
+        # A named child session runs its sub-agent's spec, whose tool groups
+        # are the ones the runner registered.
+        if conversation.sub_agent_name:
+            spec = _sub_agent_spec(spec, conversation.sub_agent_name) or spec
         if not spec.tool_groups.user_inbox:
             raise OmnigentError(
                 "Inbox posts require an agent with the user_inbox tool group",
