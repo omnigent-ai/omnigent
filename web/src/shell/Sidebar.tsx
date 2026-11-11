@@ -773,7 +773,8 @@ export function useMigrateLocalPinsToServer(
 function inboxBadgeLabel(count: number, incomplete: boolean, capped: boolean): string {
   const label = count === 1 ? "1 inbox item waiting" : `${count} inbox items waiting`;
   if (incomplete) return `${label}; more automations not yet checked`;
-  if (capped) return `More than ${label}`;
+  // The server stops counting at its limit, so the total is a floor, not an excess.
+  if (capped) return `At least ${label}`;
   return label;
 }
 

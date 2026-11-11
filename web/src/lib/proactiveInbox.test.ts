@@ -148,20 +148,31 @@ describe("applySuggestionUpdate", () => {
 });
 
 describe("reconcileSuggestion", () => {
-  it("replaces an open item and moves the unread count", () => {
+  const reply = (saved: Suggestion, unreadCount: number) => ({
+    item: saved,
+    unreadCount,
+    unreadCountCapped: false,
+  });
+
+  it("replaces an open item and takes the server's unread total", () => {
     const pages = [page([item({ id: "a" })])];
-    const next = reconcileSuggestion(pages, item({ id: "a", status: "read", title: "new" }));
+    const next = reconcileSuggestion(
+      pages,
+      reply(item({ id: "a", status: "read", title: "new" }), 0),
+    );
     expect(next[0].data[0]).toMatchObject({ status: "read", title: "new" });
     expect(next[0].unreadCount).toBe(0);
   });
 
-  it("drops a resolved item and ignores one the cache no longer holds", () => {
+  it("drops a resolved item, and sets the total even where the cache lacks the item", () => {
     const pages = [page([item({ id: "a" })])];
-    expect(reconcileSuggestion(pages, item({ id: "a", status: "dismissed" }))[0]).toMatchObject({
-      data: [],
-      unreadCount: 0,
-    });
-    expect(reconcileSuggestion(pages, item({ id: "z", status: "read" }))).toEqual(pages);
+    expect(
+      reconcileSuggestion(pages, reply(item({ id: "a", status: "dismissed" }), 0))[0],
+    ).toMatchObject({ data: [], unreadCount: 0 });
+    // The total is the viewer's, so a list whose pages stop before the item still moves.
+    expect(
+      reconcileSuggestion(pages, reply(item({ id: "z", status: "dismissed" }), 4))[0],
+    ).toMatchObject({ data: pages[0].data, unreadCount: 4 });
   });
 });
 

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import * as automationInboxHook from "@/hooks/useAutomationInbox";
+import * as proactiveInboxHook from "@/hooks/useProactiveInbox";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
@@ -1218,6 +1219,25 @@ describe("Sidebar session list", () => {
       }
     },
   );
+
+  it("calls a capped suggestion count a floor, since the server stopped counting at it", () => {
+    const proactiveInbox = vi.spyOn(proactiveInboxHook, "useProactiveInbox");
+    const base = proactiveInbox.getMockImplementation()?.(true);
+    proactiveInbox.mockReturnValue({
+      ...(base as ReturnType<typeof proactiveInboxHook.useProactiveInbox>),
+      items: [],
+      unreadCount: 100,
+      unreadCountCapped: true,
+    });
+    try {
+      mockConversations([]);
+      renderSidebar();
+      const inbox = within(screen.getByTestId("inbox-button"));
+      expect(inbox.getByLabelText("At least 100 inbox items waiting")).toHaveTextContent("100+");
+    } finally {
+      proactiveInbox.mockRestore();
+    }
+  });
 
   it("lets the active Inbox row show through the count badge", () => {
     // On /inbox the row itself paints the translucent --sidebar-active wash.

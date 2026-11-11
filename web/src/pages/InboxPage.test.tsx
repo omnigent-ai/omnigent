@@ -1757,6 +1757,18 @@ describe("agent suggestions", () => {
     vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(proactiveInboxStub(overrides));
   }
 
+  it("summarizes listed suggestions, so one read suggestion is counted like it is shown", () => {
+    stub({ items: [suggestion({ status: "read" })], unreadCount: 0 });
+    renderPage();
+    expect(screen.getByText(/1 suggestion\b/)).toBeInTheDocument();
+    expect(screen.queryByText(/unread/)).toBeNull();
+    cleanup();
+
+    stub({ items: [suggestion(), suggestion({ id: "sug_2" })], unreadCount: 2 });
+    renderPage();
+    expect(screen.getByText(/2 suggestions \(2 unread\)/)).toBeInTheDocument();
+  });
+
   it("marks a suggestion read on expand and shows its evidence", () => {
     const update = vi.fn();
     stub({ items: [suggestion()], unreadCount: 1, update });
