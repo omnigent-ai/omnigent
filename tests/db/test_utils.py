@@ -103,6 +103,38 @@ def test_non_sqlite_engine_has_pool_settings(
     assert captured_kwargs["pool_reset_on_return"] is None
 
 
+@pytest.mark.parametrize(
+    "db_uri",
+    [
+        "postgresql://localhost/testdb",
+        "cockroachdb://root@localhost/defaultdb",
+        "mysql+pymysql://localhost/testdb",
+    ],
+)
+def test_server_engines_install_transaction_aware_reset(
+    monkeypatch: pytest.MonkeyPatch, db_uri: str
+) -> None:
+    """Server engines disable the default reset only alongside the listener
+    that replaces it; otherwise returned connections would keep open
+    transactions."""
+    from omnigent.db import utils
+
+    captured_kwargs: dict[str, Any] = {}
+    created_engine = MagicMock()
+    installed_on: list[object] = []
+
+    def _capturing_create_engine(_uri: str, **kwargs: Any) -> MagicMock:
+        captured_kwargs.update(kwargs)
+        return created_engine
+
+    monkeypatch.setattr(utils, "create_engine", _capturing_create_engine)
+    monkeypatch.setattr(utils, "install_transaction_aware_pool_reset", installed_on.append)
+
+    assert utils._create_engine(db_uri) is created_engine
+    assert captured_kwargs["pool_reset_on_return"] is None
+    assert installed_on == [created_engine]
+
+
 def test_cockroachdb_dialect_helpers_and_url() -> None:
     assert normalize_database_url("cockroachdb://root@host/db") == (
         "cockroachdb+psycopg://root@host/db"

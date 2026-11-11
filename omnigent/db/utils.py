@@ -269,8 +269,8 @@ def _env_float(name: str, default: float, *, minimum: float) -> float:
 # are re-initialised on every checkout or transaction begin.
 _TRANSACTION_ENDED_KEY = "omnigent.transaction_ended"
 _TRANSACTION_WROTE_KEY = "omnigent.transaction_wrote"
-# ``Session.info`` key holding the connection of the session's transaction.
-_SESSION_CONNECTION_KEY = "omnigent.session_connection"
+# ``Session.info`` key listing the connections the session's transactions began on.
+_SESSION_CONNECTIONS_KEY = "omnigent.session_connections"
 # Execution option for per-session setup statements (SQLite PRAGMAs) whose
 # effect does not depend on the transaction committing.
 _SESSION_SETUP_OPTION = "omnigent_session_setup"
@@ -297,8 +297,9 @@ def _is_read_only_statement(statement: str) -> bool:
 
     Deliberately conservative: anything not recognised as a plain read counts
     as a write, so the worst misclassification costs one extra COMMIT.
-    Functions with hidden side effects called from a plain SELECT are not
-    detected; such statements must be issued from a session that also writes.
+    Functions with hidden or session-level side effects called from a plain
+    SELECT (e.g. Postgres ``set_config``) are not detected; such statements
+    must be issued from a session that also writes.
     """
     noise = _LEADING_SQL_NOISE.match(statement)
     body = statement[noise.end() :] if noise else statement
@@ -341,23 +342,31 @@ def _install_write_tracking(engine: Engine) -> None:
 def _remember_session_connection(
     session: Session, _transaction: object, connection: Connection
 ) -> None:
-    session.info[_SESSION_CONNECTION_KEY] = connection
+    connections: list[Connection] = session.info.setdefault(_SESSION_CONNECTIONS_KEY, [])
+    connections[:] = [known for known in connections if not known.closed]
+    if all(known is not connection for known in connections):
+        connections.append(connection)
 
 
 def _session_may_have_written(session: Session) -> bool:
     """Whether committing ``session``'s open transaction could persist anything.
 
-    Call after ``session.flush()``. Unknown state counts as a write.
+    Call after ``session.flush()``. Unknown state counts as a write. Writes
+    that bypass SQLAlchemy's execution events (a raw DBAPI cursor from
+    ``session.connection().connection.cursor()``) and SELECTs with session
+    side effects (e.g. Postgres ``set_config``) look like reads and are not
+    committed; issue such work through ``session.execute`` or end the
+    transaction explicitly.
     """
     if session.new or session.dirty or session.deleted:
         return True
-    connection: Connection | None = session.info.get(_SESSION_CONNECTION_KEY)
-    if connection is None or connection.closed:
-        # The open transaction (if any) never acquired a connection.
-        return False
-    if connection.invalidated:
-        return True
-    return bool(connection.info.get(_TRANSACTION_WROTE_KEY, True))
+    for connection in session.info.get(_SESSION_CONNECTIONS_KEY, ()):
+        if connection.closed:
+            # Ended by an explicit commit or rollback inside the session.
+            continue
+        if connection.invalidated or connection.info.get(_TRANSACTION_WROTE_KEY, True):
+            return True
+    return False
 
 
 def _end_session_transaction(session: Session) -> None:
@@ -394,7 +403,11 @@ def _mark_transaction_open(connection: Connection, *_args: object) -> None:
 def _mark_transaction_ended(connection: Connection) -> None:
     # ``commit``/``rollback`` fire just before the DBAPI call; if that call
     # fails, ``handle_error`` below flips the state back to open.
-    connection.info[_TRANSACTION_ENDED_KEY] = not connection.invalidated
+    if connection.invalidated:
+        # Reading ``info`` would try to reconnect; invalidation already
+        # recorded the transaction as open.
+        return
+    connection.info[_TRANSACTION_ENDED_KEY] = True
 
 
 def _mark_transaction_open_on_error(context: ExceptionContext) -> None:
@@ -423,7 +436,8 @@ def install_transaction_aware_pool_reset(engine: Engine) -> None:
     by :func:`get_or_create_engine` and
     :func:`get_or_create_conversation_engine` are already configured. Call
     this for an externally constructed engine before registering it in the
-    engine cache. Repeated calls are no-ops.
+    engine cache; without it they keep SQLAlchemy's default reset (a
+    ROLLBACK on every check-in). Repeated calls are no-ops.
 
     :param engine: The engine whose pool resets should be transaction-aware.
     """
@@ -1134,6 +1148,9 @@ def make_managed_session_maker(
     Sessions commit on success only if they may have written (see
     :func:`_end_session_transaction`); read-only sessions end with the
     ROLLBACK issued when the session closes. Sessions roll back on failure.
+    Raw DBAPI cursor writes and SELECTs with session-level side effects are
+    treated as reads and are not committed (see
+    :func:`_session_may_have_written`).
     When the underlying dialect is SQLite, each session additionally
     enables ``PRAGMA foreign_keys`` and sets a 20-second
     ``busy_timeout``.

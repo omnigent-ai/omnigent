@@ -25,7 +25,7 @@ from sqlalchemy import Engine, create_engine, event, insert, inspect, select, te
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlUser
@@ -49,6 +49,7 @@ from omnigent.db.utils import (
     normalize_database_url,
     now_epoch,
     now_epoch_us,
+    run_write_transaction,
     shared_read_scope,
     utc_day,
 )
@@ -496,6 +497,22 @@ class TestSingleTransactionTerminator:
         assert terminators == ["COMMIT"]
         assert user_id in _user_ids(db_uri)
 
+    def test_write_on_one_bind_survives_a_read_on_another(
+        self, db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        engine = get_or_create_engine(db_uri)
+        other_engine = get_or_create_engine(f"sqlite:///{tmp_path / 'other_bind.db'}")
+        make_managed_session_maker(other_engine)
+        managed = make_managed_session_maker(engine)
+        terminators = _record_terminators(engine, monkeypatch)
+
+        with managed() as session:
+            session.execute(insert(SqlUser).values(id="first_bind_write", is_admin=False))
+            session.execute(select(SqlUser.id), bind_arguments={"bind": other_engine}).all()
+
+        assert terminators == ["COMMIT"]
+        assert "first_bind_write" in _user_ids(db_uri)
+
     def test_ddl_commits(self, db_uri: str, monkeypatch: pytest.MonkeyPatch) -> None:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
@@ -605,6 +622,39 @@ class TestTransactionAwarePoolReset:
 
         assert terminators == ["COMMIT", "ROLLBACK"]
         assert "commit_failed" not in _user_ids(db_uri)
+
+    def test_disconnect_surfaces_the_original_database_error(
+        self,
+        db_uri: str,
+        pooled_engine: tuple[Engine, list[int]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        engine, _ = pooled_engine
+        failing_query = text("SELECT id FROM table_missing_for_disconnect")
+
+        def _treat_as_disconnect(context: Any) -> None:
+            if "table_missing_for_disconnect" in (context.statement or ""):
+                context.is_disconnect = True
+
+        event.listen(engine, "handle_error", _treat_as_disconnect)
+        session_maker = make_named_managed_session_maker(engine, query_name_prefix="omnigent.test")
+
+        with pytest.raises(DBAPIError):
+            with session_maker("disconnect") as session:
+                session.execute(failing_query)
+        with pytest.raises(DBAPIError):
+            with engine.connect() as connection:
+                connection.execute(failing_query)
+        with pytest.raises(DBAPIError):
+            run_write_transaction(
+                session_maker, "disconnect_write", lambda session: session.execute(failing_query)
+            )
+
+        terminators = _record_terminators(engine, monkeypatch)
+        with session_maker("after_disconnect") as session:
+            session.add(SqlUser(id="after_disconnect", is_admin=False))
+        assert terminators == ["COMMIT"]
+        assert "after_disconnect" in _user_ids(db_uri)
 
     def test_external_engine_opts_in_once(
         self, db_uri: str, monkeypatch: pytest.MonkeyPatch
