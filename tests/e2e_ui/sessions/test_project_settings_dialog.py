@@ -20,10 +20,21 @@ host-free path (the worktree toggle is a plain Switch, no host needed).
 
 from __future__ import annotations
 
+import json
+import os
+import re
 import uuid
+from pathlib import Path
 
 import httpx
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
+
+from tests.e2e_ui.conftest import fetch_with_retry
+
+_SANDBOX_HOST_CHOICE = "__sandbox__"
+_REPO_CATALOG = [
+    {"name": name, "url": f"https://github.com/example/{name}"} for name in ("app", "runtime")
+]
 
 
 def _create_project(base_url: str, name: str) -> str:
@@ -225,3 +236,68 @@ def test_project_settings_drops_base_branch_when_worktree_off(
     )
     page.get_by_test_id("project-settings-worktree").click()
     expect(page.get_by_test_id("project-settings-base-branch")).to_have_value("")
+
+
+def _offer_catalog_sandboxes(page: Page) -> None:
+    """Advertise a sandbox provider whose boxes check out a fixed repo catalog."""
+
+    def info(route: Route) -> None:
+        response = fetch_with_retry(route)
+        body = response.json()
+        body["managed_sandboxes_enabled"] = True
+        body["sandbox_provider"] = "box"
+        body["sandbox_provider_capabilities"] = {"box": {"repo_catalog": _REPO_CATALOG}}
+        route.fulfill(response=response, body=json.dumps(body))
+
+    page.route("**/v1/info", info)
+
+
+def _screenshot(page: Page, tmp_path: Path, name: str) -> None:
+    directory = Path(os.environ.get("OMNIGENT_E2E_SCREENSHOT_DIR", tmp_path))
+    directory.mkdir(parents=True, exist_ok=True)
+    page.screenshot(path=str(directory / f"{name}.png"))
+
+
+def test_project_settings_sandbox_repository_persists_and_prefills(
+    page: Page,
+    seeded_session: tuple[str, str],
+    tmp_path: Path,
+) -> None:
+    """A sandbox default saves its repository and pre-fills the composer's sandbox repo."""
+    base_url, session_id = seeded_session
+    project = f"Project {uuid.uuid4().hex[:6]}"
+    project_id = _create_project(base_url, project)
+    _offer_catalog_sandboxes(page)
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_project_settings(page, project)
+    page.get_by_test_id("project-settings-host").click()
+    page.get_by_role("option", name=re.compile("Sandbox")).click()
+
+    # A sandbox has no host path: the repository replaces the working directory.
+    expect(page.get_by_test_id("project-settings-workspace")).to_have_count(0)
+    repository = page.get_by_test_id("project-settings-sandbox-repository")
+    expect(repository).to_have_text("Provider default")
+    repository.click()
+    page.get_by_role("option", name="runtime", exact=True).click()
+    expect(repository).to_have_text("runtime")
+    _screenshot(page, tmp_path, "project-settings-sandbox-repository")
+
+    page.get_by_test_id("project-settings-save").click()
+    expect(page.get_by_test_id("project-settings-save")).to_have_count(0)
+    assert _get_project_config(base_url, project_id) == {
+        "host_id": _SANDBOX_HOST_CHOICE,
+        "sandbox_workspaces": [_REPO_CATALOG[1]["url"]],
+    }
+
+    # Reopening seeds the stored repository back.
+    _open_project_settings(page, project)
+    expect(page.get_by_test_id("project-settings-sandbox-repository")).to_have_text("runtime")
+    page.keyboard.press("Escape")
+
+    # A new session in the project starts on the sandbox with that repository.
+    page.goto(f"{base_url}/?project={project}")
+    expect(page.get_by_test_id("new-chat-landing-repo-chip")).to_have_attribute(
+        "aria-label", "Sandbox repositories: runtime"
+    )
+    _screenshot(page, tmp_path, "new-chat-project-sandbox-repository")
