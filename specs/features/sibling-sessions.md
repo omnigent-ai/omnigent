@@ -62,7 +62,8 @@ Additional requirements:
   is no new comment tier. Source restrictions include side-chat ancestry.
 - With nested agents enabled, immediate MCP creation produces a child or sibling.
   Omitted `placement` keeps its existing `child` default; `same_host` and `managed`
-  create siblings when enabled and standalone roots when disabled. Tools
+  create siblings when enabled and standalone roots when disabled. A create that
+  names another project than the source's makes a standalone root in that project. Tools
   expose family metadata and retain creator attribution. Scheduled roots and
   ordinary user-created sessions remain independent.
 - Automatic session cleanup must retain compute while any session is bound,
@@ -131,7 +132,8 @@ capability and server creation authorization. Enable it with
 `OMNIGENT_FEATURES=sibling_sessions`; embedded deployments may supply a
 per-request `FeatureFlags.enabled()` override backed by their rollout service.
 The UI hides creation and same-sandbox fork selection when disabled or absent.
-The server groups MCP independent creation when enabled and preserves standalone
+The server groups MCP independent creation when enabled, unless it names another
+project than the source's, and preserves standalone
 root creation when disabled. Both use the authenticated orchestration endpoint;
 the runner also supports older servers without the sibling capability. Explicit
 sibling requests still fail when disabled. Uncertain creates are never auto-retried.
