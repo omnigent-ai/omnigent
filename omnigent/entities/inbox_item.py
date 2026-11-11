@@ -33,9 +33,10 @@ class InboxItem:
     :param dedupe_key: Versioned duplicate-detection key; see
         :mod:`omnigent.server.inbox_dedupe`.
     :param status: ``"unread"``, ``"read"``, ``"done"``, or ``"dismissed"``.
-    :param resolution: How the owner closed the item: ``"none"`` while open,
-        ``"action_taken"``, or a Dismiss reason (``"already_done"``,
-        ``"useful"``, ``"not_relevant"``, ``"incorrect"``, ``"not_now"``).
+    :param resolution: How the owner closed the item: ``"none"`` while open;
+        ``"action_taken"`` or ``"already_done"``, which make the status
+        ``"done"``; or a Dismiss reason (``"useful"``, ``"not_relevant"``,
+        ``"incorrect"``, ``"not_now"``), which makes it ``"dismissed"``.
     :param feedback_text: The user's comment, or ``None``.
     :param created_at: Unix epoch seconds when the item was posted.
     :param resolved_at: Unix epoch seconds when the owner last resolved it
