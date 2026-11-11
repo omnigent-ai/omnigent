@@ -108,7 +108,14 @@ def create_proactive_agent_settings_router(
                 "Admin privileges required to change the workspace setting",
                 code=ErrorCode.FORBIDDEN,
             )
-        await asyncio.to_thread(store.set_workspace_enabled, body.enabled)
+        # The store re-checks the actor under its account lock as it writes.
+        await asyncio.to_thread(
+            lambda: store.set_workspace_enabled(
+                body.enabled,
+                actor=user_id,
+                require_admin=permission_store is not None and not local_single_user_enabled(),
+            )
+        )
         return await _settings(user_id)
 
     return router

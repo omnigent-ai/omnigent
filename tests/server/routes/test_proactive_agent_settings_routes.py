@@ -149,7 +149,8 @@ async def test_the_workspace_setting_overrides_every_user(db_uri: str, tmp_path:
 async def test_a_deployment_gate_that_is_off_wins_over_both_settings(
     db_uri: str, tmp_path: Path
 ) -> None:
-    async with _client(db_uri, tmp_path, offered=False, proactive_agent=lambda: False) as client:
+    # Offered, both settings on, but the explicit gate says no: the gate wins.
+    async with _client(db_uri, tmp_path, offered=True, proactive_agent=lambda: False) as client:
         assert (await client.get("/v1/inbox/items", headers=_ALICE)).status_code == 404
 
 
@@ -161,7 +162,7 @@ def test_an_unreadable_stored_value_reads_as_on(db_uri: str, raw: str) -> None:
     from omnigent.db.utils import get_or_create_engine
 
     store = ProactiveAgentSettingsStore(db_uri)
-    store.set_workspace_enabled(False)
+    store.set_workspace_enabled(False, actor=None)
     with Session(get_or_create_engine(db_uri)) as session:
         row = session.get(
             SqlPreference, (0, WORKSPACE_SETTINGS_USER, "proactive_agent.v1.enabled")
