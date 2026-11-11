@@ -4,7 +4,11 @@ import { Button } from "@/components/ui/button";
 import { ButtonGroup, ButtonGroupText } from "@/components/ui/button-group";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { copyText } from "@/lib/clipboard";
-import { isShellCodeClassName, useShellCommandRunner } from "@/lib/shellCommand";
+import {
+  isShellCodeClassName,
+  shellCommandKeystrokes,
+  useShellCommandRunner,
+} from "@/lib/shellCommand";
 import { getEmbedRoot } from "@/lib/host";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { cn } from "@/lib/utils";
@@ -679,7 +683,7 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   const canRunInShell =
     runShellCommand !== null &&
     !fenceOpen &&
-    code.trim() !== "" &&
+    shellCommandKeystrokes(code) !== "" &&
     isValidElement<{ className?: string }>(children) &&
     isShellCodeClassName(children.props.className);
 

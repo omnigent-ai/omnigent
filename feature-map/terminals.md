@@ -19,7 +19,8 @@ reattach when the session moves to another host.
 - `run-in-shell`: a `bash`/`sh`/`shell`/`shellscript`/`zsh` code block in a chat
   reply has a "Run in shell" button that opens a new shell and runs the block in
   it, each line followed by Enter. It is offered only to a session owner whose
-  agent has shells and whose host is reachable; `console` blocks don't get it.
+  agent has shells and whose host is reachable. `console` blocks and blocks
+  containing a tab (which a prompt would treat as completion) don't get it.
 - `scrollback`: scroll back with the mouse wheel (including programs that track
   the mouse), by touch on phones, and by keyboard.
 - `reconnect`: after the terminal connection drops, the terminal shows that it

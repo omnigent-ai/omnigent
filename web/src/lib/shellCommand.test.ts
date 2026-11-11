@@ -40,8 +40,16 @@ describe("shellCommandKeystrokes", () => {
     expect(shellCommandKeystrokes("echo safe\u0015\u0010\u001b[A\n")).toBe("echo safe[A\r");
   });
 
+  it.each([
+    ["a separator tab", "printf '<%s>\\n' A\tB"],
+    ["a quoted tab", "echo 'a\tb'"],
+    ["tab indentation", "if true; then\n\t\techo hi\nfi"],
+  ])("refuses a block with %s, which a prompt would complete", (_case, code) => {
+    expect(shellCommandKeystrokes(code)).toBe("");
+  });
+
   it("returns nothing for a blank block", () => {
-    expect(shellCommandKeystrokes(" \n\t\n")).toBe("");
+    expect(shellCommandKeystrokes(" \n  \n")).toBe("");
   });
 });
 

@@ -24,8 +24,8 @@ export function isShellCodeClassName(className: string | undefined): boolean {
     );
 }
 
-// Editing controls (all C0/C1 but tab and newline) would rewrite the line, so
-// the shell would run something other than the visible text.
+// Editing controls (C0/C1 but tab and newline) would rewrite the line, so the
+// shell would run something other than the visible text.
 // oxlint-disable-next-line no-control-regex
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
 
@@ -33,15 +33,18 @@ const CONTROL_CHARACTERS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
  * The keystrokes that run *code* at a shell prompt: each line followed by Enter.
  *
  * Only the block's trailing newlines are dropped, so trailing spaces that are
- * part of a command (an escaped space before the line end) are kept.
+ * part of a command (an escaped space before the line end) are kept. A block
+ * with a tab can't be run: typed at a prompt, Tab completes instead of
+ * inserting itself, so the shell would run a different command.
  *
  * :param code: The code block's text, e.g. ``"cd web\npnpm test\n"``.
  * :returns: The text with newlines sent as Enter, e.g. ``"cd web\rpnpm test\r"``,
- *     or ``""`` when the block is blank.
+ *     or ``""`` when the block is blank or contains a tab.
  */
 export function shellCommandKeystrokes(code: string): string {
   const lines = code.replace(/\r\n?/g, "\n").replace(CONTROL_CHARACTERS, "").replace(/\n+$/, "");
-  return lines.trim() === "" ? "" : `${lines.replace(/\n/g, "\r")}\r`;
+  if (lines.trim() === "" || lines.includes("\t")) return "";
+  return `${lines.replace(/\n/g, "\r")}\r`;
 }
 
 /** Runs a code block's text in a new shell; ``null`` where the viewer can't open one. */

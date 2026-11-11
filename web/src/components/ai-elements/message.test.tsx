@@ -616,6 +616,7 @@ describe("MessageResponse run in shell", () => {
   it.each([
     ["a non-shell block", "```python\nprint('hi')\n```"],
     ["a console transcript", "```console\n$ ls\nfile.txt\n```"],
+    ["a shell block with a tab", "```bash\nprintf '%s\\n' a\tb\n```"],
   ])("does not offer %s", async (_case, markdown) => {
     render(
       <ShellCommandRunnerContext.Provider value={() => {}}>
