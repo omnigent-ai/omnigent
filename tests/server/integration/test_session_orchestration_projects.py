@@ -13,6 +13,9 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
 from omnigent.server.managed_hosts import parse_sandbox_config
+from omnigent.server.routes import sessions as sessions_module
+from omnigent.server.routes._sessions import common as sessions_common
+from omnigent.server.routes._sessions import orchestration
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
@@ -369,7 +372,9 @@ async def test_project_update_refuses_a_source_shared_with_edit_access(auth_clie
 
 
 @_ONE_ENVIRONMENT
-async def test_organizing_tools_rename_pin_archive_and_manage_projects(auth_client, peers, db_uri):
+async def test_organizing_tools_rename_pin_archive_and_manage_projects(
+    auth_client, peers, db_uri, monkeypatch
+):
     source, target, _ = peers
     store = SqlAlchemyConversationStore(db_uri)
 
@@ -403,8 +408,28 @@ async def test_organizing_tools_rename_pin_archive_and_manage_projects(auth_clie
     # The calling session is mid-turn; archiving another session must not touch it.
     # (Listing reconciles live status against the stubbed runner, so set it here.)
     store.set_session_live_status(source["id"], "running")
+    target_child = store.create_conversation(
+        agent_id=source["agent_id"], parent_conversation_id=target["id"]
+    )
+    source_child = store.create_conversation(
+        agent_id=source["agent_id"], parent_conversation_id=source["id"]
+    )
+    running = (source["id"], source_child.id, target["id"], target_child.id)
+    stopped: list[str] = []
+
+    async def record_stop(session_id: str, _runner_router) -> bool:
+        stopped.append(session_id)
+        return True
+
+    monkeypatch.setattr(sessions_module, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0)
+    monkeypatch.setattr(orchestration, "_stop_session_via_runner", record_stop)
+    for session_id in running:
+        monkeypatch.setitem(sessions_common._session_status_cache, session_id, "running")
     archived = await tool("sys_session_update", session_id=target["id"], archived=True)
     assert archived["status"] == "updated"
+    await asyncio.gather(*list(orchestration._detached_stop_tasks))
+    # Teardown reaches the archived session and its sub-agent, never the caller's tree.
+    assert sorted(stopped) == sorted([target["id"], target_child.id])
     saved = store.get_conversation(target["id"])
     assert saved.archived is True and saved.project_id == project["id"]
     assert store.get_conversation(source["id"]).live_status == "running"
@@ -483,3 +508,70 @@ async def test_a_child_cannot_archive_its_rebound_parent(auth_client, peers, db_
     assert parent.archived is not True and parent.project_id is None
     projects = (await auth_client.get("/v1/projects")).json()["data"]
     assert [project["id"] for project in projects] == [existing_id]
+
+
+@_ONE_ENVIRONMENT
+async def test_project_update_promotes_a_label_only_folder(auth_client, peers, db_uri):
+    source, target, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    legacy = {"omni_project": "Legacy folder"}
+    archived_member = await _create_session_as(auth_client, "", "alice")
+    family_member = await _create_session_as(auth_client, "", "alice")
+    store.add_new_sibling(target["id"], family_member["id"], user_id="alice")
+    filed_elsewhere = await _create_session_as(auth_client, "", "alice")
+    others = await _create_session_as(auth_client, "", "bob")
+    other_project_id = await _project(auth_client, "Elsewhere")
+    await _file(auth_client, db_uri, filed_elsewhere["id"], other_project_id)
+    for session_id in (target["id"], archived_member["id"], filed_elsewhere["id"], others["id"]):
+        store.set_labels(session_id, legacy)
+    store.update_conversation(archived_member["id"], archived=True)
+
+    promoted = await _project_tool(
+        auth_client,
+        source,
+        "sys_project_update",
+        project="Legacy folder",
+        name="Field notes",
+        icon="📁",
+    )
+    assert promoted == {
+        "project": "Field notes",
+        "status": "updated",
+        "previous_name": "Legacy folder",
+        "icon": "📁",
+    }
+    projects = {p["name"]: p for p in (await auth_client.get("/v1/projects")).json()["data"]}
+    assert set(projects) == {"Elsewhere", "Field notes"}
+    new_id = projects["Field notes"]["id"]
+    assert projects["Field notes"]["config"] == {"icon": "📁"}
+    # Archived label members move too, and the family follows its representative.
+    for session_id in (target["id"], archived_member["id"], family_member["id"]):
+        saved = store.get_conversation(session_id)
+        assert saved.project_id == new_id, session_id
+        assert not saved.labels.get("omni_project"), session_id
+    # A session already filed in another project keeps it, and so does another user's.
+    elsewhere = store.get_conversation(filed_elsewhere["id"])
+    assert elsewhere.project_id == other_project_id
+    assert elsewhere.labels.get("omni_project") == "Legacy folder"
+    foreign = store.get_conversation(others["id"])
+    assert foreign.project_id is None and foreign.labels.get("omni_project") == "Legacy folder"
+
+    # Without a rename the folder keeps its name; only the icon is set.
+    inbox_member = await _create_session_as(auth_client, "", "alice")
+    store.set_labels(inbox_member["id"], {"omni_project": "Inbox"})
+    iconed = await _project_tool(
+        auth_client, source, "sys_project_update", project="Inbox", icon="📥"
+    )
+    assert iconed == {"project": "Inbox", "status": "updated", "icon": "📥"}
+    projects = {p["name"]: p for p in (await auth_client.get("/v1/projects")).json()["data"]}
+    assert projects["Inbox"]["config"] == {"icon": "📥"}
+    inbox = store.get_conversation(inbox_member["id"])
+    assert inbox.project_id == projects["Inbox"]["id"] and not inbox.labels.get("omni_project")
+
+    missing = await _project_tool(
+        auth_client, source, "sys_project_update", project="Nowhere", name="Somewhere"
+    )
+    assert missing["error"].startswith("no project named 'Nowhere'"), missing
+    assert "Somewhere" not in {
+        p["name"] for p in (await auth_client.get("/v1/projects")).json()["data"]
+    }
