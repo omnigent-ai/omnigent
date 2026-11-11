@@ -378,14 +378,14 @@ describe("HeaderConversationMenu", () => {
     expect(mocks.rename).toHaveBeenCalledWith({ id: "conv-1", title: "Roadmap planning" });
   });
 
-  it("runs archive and delete actions for the active session", async () => {
+  it("runs archive and delete actions for the active session", () => {
     const view = renderMenu();
 
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
     // A worktree session asks whether to delete the worktree first.
     expect(mocks.archive).not.toHaveBeenCalled();
-    fireEvent.click(await screen.findByRole("button", { name: "Yes, delete worktree" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, delete worktree" }));
     // The optimistic overlay lives in the hook, and the Undo toast fires
     // synchronously (navigating away unmounts this menu, so a mutate onSuccess
     // callback wouldn't fire).
@@ -892,13 +892,13 @@ describe("HeaderConversationMenu desktop menu commands", () => {
     { status: "running", worktreeChoice: "No, archive only", deleteWorktree: false },
   ] as const)(
     "archives a $status session through the menu item's prompts from Session → Archive",
-    async ({ status, worktreeChoice, deleteWorktree }) => {
+    ({ status, worktreeChoice, deleteWorktree }) => {
       renderMenu({ conversation: { ...CONVERSATION, status } });
       act(() => sendCommand({ command: "archive-session", browserViewId: null }));
       if (status === "running") fireEvent.click(screen.getByRole("button", { name: "Archive" }));
       else expect(screen.queryByTestId("archive-running-dialog")).toBeNull();
       expect(mocks.archive).not.toHaveBeenCalled();
-      fireEvent.click(await screen.findByRole("button", { name: worktreeChoice }));
+      fireEvent.click(screen.getByRole("button", { name: worktreeChoice }));
       expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: true, deleteWorktree });
     },
   );

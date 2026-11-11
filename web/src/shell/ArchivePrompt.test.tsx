@@ -7,12 +7,14 @@ import { conversation } from "@/test/sidebarMockHelpers";
 
 import { ArchiveWorktreeList, archiveWorktreeTargets } from "./ArchivePrompt";
 
-// Server `worktree_root_fingerprint("/repo/.worktrees/a")`.
+// Server `worktree_root_fingerprint` of "/repo/.worktrees/a" and "C:\\repo\\.worktrees\\a".
 const ROOT_A_FINGERPRINT = "1a1329852b078cc01f5b390143afdd4bffbbaf52772d4b7c36ff8a435bfcf287";
+const WINDOWS_ROOT_A_FINGERPRINT =
+  "80ecddbd344246011666ff6a111ee0be2278a0b1ca388463f48dda5983de1a61";
 
 describe("archiveWorktreeTargets", () => {
-  it("lists each worktree once in selection order and skips sessions without one", async () => {
-    const targets = await archiveWorktreeTargets([
+  it("lists each worktree once in selection order and skips sessions without one", () => {
+    const targets = archiveWorktreeTargets([
       conversation("a", { git_branch: "fix/b", workspace: "/repo/.worktrees/b" }),
       conversation("b", { workspace: "/repo" }),
       conversation("c", { git_branch: "feat/a", workspace: "/repo/.worktrees/a" }),
@@ -25,9 +27,9 @@ describe("archiveWorktreeTargets", () => {
     ]);
   });
 
-  it("names the recorded root of sessions in worktree subdirectories", async () => {
+  it("names the recorded root of sessions in worktree subdirectories", () => {
     const labels = { [WORKTREE_ROOT_LABEL_KEY]: ROOT_A_FINGERPRINT };
-    const targets = await archiveWorktreeTargets([
+    const targets = archiveWorktreeTargets([
       conversation("a", { git_branch: "feat/a", workspace: "/repo/.worktrees/a/web", labels }),
       conversation("b", { git_branch: "feat/a", workspace: "/repo/.worktrees/a/api", labels }),
       conversation("c", { git_branch: "feat/c", workspace: "/repo/elsewhere", labels }),
@@ -39,8 +41,8 @@ describe("archiveWorktreeTargets", () => {
     ]);
   });
 
-  it("groups rootless sessions by branch unless that branch has a known root", async () => {
-    const targets = await archiveWorktreeTargets([
+  it("groups rootless sessions by branch unless that branch has a known root", () => {
+    const targets = archiveWorktreeTargets([
       conversation("a", { git_branch: "feat/a", workspace: null }),
       conversation("b", { git_branch: "feat/a", workspace: "/repo/.worktrees/a" }),
       conversation("c", { git_branch: "feat/c", workspace: "  " }),
@@ -53,8 +55,22 @@ describe("archiveWorktreeTargets", () => {
     ]);
   });
 
-  it("keeps the same path on different hosts apart", async () => {
-    const targets = await archiveWorktreeTargets([
+  it("lists one worktree once however its Windows root is spelled", () => {
+    const labels = { [WORKTREE_ROOT_LABEL_KEY]: WINDOWS_ROOT_A_FINGERPRINT };
+    const targets = archiveWorktreeTargets([
+      conversation("a", { git_branch: "feat/a", workspace: "C:/repo/.worktrees/a/web", labels }),
+      conversation("b", {
+        git_branch: "feat/a",
+        workspace: "c:\\repo\\.worktrees\\a\\api",
+        labels,
+      }),
+    ]);
+
+    expect(targets).toEqual([{ hostId: null, path: "C:\\repo\\.worktrees\\a", branch: "feat/a" }]);
+  });
+
+  it("keeps the same path on different hosts apart", () => {
+    const targets = archiveWorktreeTargets([
       conversation("a", { host_id: "host_1", git_branch: "feat/a", workspace: "/repo/wt" }),
       conversation("b", { host_id: "host_2", git_branch: "feat/b", workspace: "/repo/wt" }),
       conversation("c", { host_id: "host_2", git_branch: "feat/a" }),
@@ -74,6 +90,15 @@ describe("ArchiveWorktreeList", () => {
     const { rerender } = render(
       <QueryClientProvider client={queryClient}>
         <ArchiveWorktreeList worktrees={[{ hostId: "host_1", path: "/repo/wt", branch: "a" }]} />
+      </QueryClientProvider>,
+    );
+    expect(screen.getByTestId("archive-worktree-name")).toHaveTextContent(/^wt$/);
+
+    rerender(
+      <QueryClientProvider client={queryClient}>
+        <ArchiveWorktreeList
+          worktrees={[{ hostId: null, path: "\\\\srv\\share\\wt", branch: "a" }]}
+        />
       </QueryClientProvider>,
     );
     expect(screen.getByTestId("archive-worktree-name")).toHaveTextContent(/^wt$/);

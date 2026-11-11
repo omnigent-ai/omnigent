@@ -1,5 +1,5 @@
 import { FolderIcon, GitBranchIcon, ServerIcon } from "lucide-react";
-import { useCallback, useId, useRef, useState, type ReactNode } from "react";
+import { useCallback, useId, useState, type ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -19,9 +19,12 @@ import {
   readDeleteWorktreesOnArchive,
   writeDeleteWorktreesOnArchive,
 } from "@/lib/archiveWorktreePreferences";
-import { recordedWorktreeRoot, WORKTREE_ROOT_LABEL_KEY } from "@/lib/worktreeRoot";
-
-import { basename } from "./WorkspacePicker";
+import {
+  recordedWorktreeRoot,
+  WORKTREE_ROOT_LABEL_KEY,
+  worktreeDirectoryName,
+  worktreeRootFingerprint,
+} from "@/lib/worktreeRoot";
 
 /** Called with the ids whose worktree should be removed (empty = archive only). */
 type ProceedFn = (deleteWorktreeIds: ReadonlySet<string>) => void;
@@ -42,36 +45,38 @@ interface PendingPrompt {
   choose: (deleteWorktrees: boolean) => void;
 }
 
-/** Directory archive cleanup would remove for the session, or null when unknown. */
-function sessionWorktreeRoot(conversation: Conversation): Promise<string | null> {
+/** Directory archive cleanup would remove for the session, or null when it removes none. */
+function sessionWorktreeRoot(conversation: Conversation): string | null {
   const workspace = conversation.workspace;
-  if (!workspace?.trim()) return Promise.resolve(null);
+  if (!workspace?.trim()) return null;
   return recordedWorktreeRoot(workspace, conversation.labels?.[WORKTREE_ROOT_LABEL_KEY]);
 }
 
+/** Host plus root fingerprint, so spellings of one Windows root match; branch when rootless. */
 function worktreeTargetKey({ hostId, path, branch }: ArchiveWorktreeTarget): string {
-  return JSON.stringify(path === null ? [hostId, "branch", branch] : [hostId, "path", path]);
+  return JSON.stringify(
+    path === null ? [hostId, "branch", branch] : [hostId, "root", worktreeRootFingerprint(path)],
+  );
 }
 
 /** Distinct worktrees of the sessions, in order; sessions without a root group by branch. */
-export async function archiveWorktreeTargets(
+export function archiveWorktreeTargets(
   conversations: readonly Conversation[],
-): Promise<ArchiveWorktreeTarget[]> {
-  const resolved = await Promise.all(
-    conversations.flatMap((conversation) => {
-      const branch = conversation.git_branch;
-      if (branch == null) return [];
-      const hostId = conversation.host_id ?? null;
-      return [sessionWorktreeRoot(conversation).then((path) => ({ hostId, path, branch }))];
-    }),
-  );
+): ArchiveWorktreeTarget[] {
   const targets = new Map<string, ArchiveWorktreeTarget>();
-  for (const target of resolved) {
+  for (const conversation of conversations) {
+    const branch = conversation.git_branch;
+    if (branch == null) continue;
+    const target = {
+      hostId: conversation.host_id ?? null,
+      path: sessionWorktreeRoot(conversation),
+      branch,
+    };
     const key = worktreeTargetKey(target);
     if (!targets.has(key)) targets.set(key, target);
   }
-  // Git checks a branch out in one worktree at a time, so a rootless entry
-  // whose branch has a known root on the same host names that worktree.
+  // A rootless session has no directory to remove; when a listed root on the
+  // same host has its branch, show that entry alone.
   const values = [...targets.values()];
   const branchesWithRoot = new Set(
     values
@@ -98,7 +103,6 @@ export function useArchivePrompt(): {
   dialog: ReactNode;
 } {
   const [pending, setPending] = useState<PendingPrompt | null>(null);
-  const latestWorktreeRequest = useRef(0);
   const [pendingRunning, setPendingRunning] = useState<PendingRunningPrompt | null>(null);
   const serverInfo = useServerInfo();
   const cleanupSupported = serverInfo !== "loading" && serverInfo.archive_worktree_cleanup === true;
@@ -116,14 +120,10 @@ export function useArchivePrompt(): {
         proceed(preference ? worktreeIds : new Set());
         return;
       }
-      const request = ++latestWorktreeRequest.current;
-      void archiveWorktreeTargets(worktreeSessions).then((worktrees) => {
-        if (request !== latestWorktreeRequest.current) return;
-        setPending({
-          worktreeCount: worktreeIds.size,
-          worktrees,
-          choose: (deleteWorktrees) => proceed(deleteWorktrees ? worktreeIds : new Set()),
-        });
+      setPending({
+        worktreeCount: worktreeIds.size,
+        worktrees: archiveWorktreeTargets(worktreeSessions),
+        choose: (deleteWorktrees) => proceed(deleteWorktrees ? worktreeIds : new Set()),
       });
     },
     [cleanupSupported],
@@ -360,7 +360,7 @@ export function ArchiveWorktreeList({
               <span className="flex min-w-0 items-center gap-1.5 text-ui font-medium">
                 <FolderIcon aria-hidden className="size-3.5 shrink-0" />
                 <span className="truncate" data-testid="archive-worktree-name">
-                  {basename(target.path)}
+                  {worktreeDirectoryName(target.path)}
                 </span>
               </span>
               <span className="break-all pl-5 font-mono text-xs text-muted-foreground">
