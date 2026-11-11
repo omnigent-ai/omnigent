@@ -155,7 +155,8 @@ export interface CreateScheduledTaskInput {
   templateId?: AutomationTemplateId;
   name: string;
   prompt: string;
-  rrule: string;
+  /** The schedule; required unless the server accepts an event trigger instead. */
+  rrule?: string;
   agentId: string;
   timezone?: string;
   modelOverride?: string | null;
@@ -363,14 +364,17 @@ function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
 
 /** List the caller's scheduled tasks (owner-scoped server-side). */
 export async function listScheduledTasks(): Promise<ScheduledTask[]> {
-  const res = await authenticatedFetch("/v1/scheduled-tasks");
+  // Ask for event-triggered tasks too; older clients don't see them.
+  const res = await authenticatedFetch("/v1/scheduled-tasks?event_triggers=1");
   const body = await readJsonOrThrow<{ scheduled_tasks: ScheduledTaskWire[] }>(res);
   return (body.scheduled_tasks ?? []).map(taskFromWire);
 }
 
 /** Fetch one of the caller's scheduled tasks (404 if not owned). */
 export async function getScheduledTask(id: string): Promise<ScheduledTask> {
-  const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`);
+  const res = await authenticatedFetch(
+    `/v1/scheduled-tasks/${encodeURIComponent(id)}?event_triggers=1`,
+  );
   return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
 }
 

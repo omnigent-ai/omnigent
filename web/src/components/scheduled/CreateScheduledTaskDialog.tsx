@@ -285,6 +285,8 @@ export function CreateScheduledTaskDialog({
   const createMutation = useCreateScheduledTask();
   const updateMutation = useUpdateScheduledTask();
   const isEdit = editingTask !== null;
+  // A task without a rule runs on events; this form has no fields for its trigger.
+  const editsEventTrigger = editingTask !== null && editingTask.rrule === null;
   // Runs start from a copy of a session: the one being copied on create, or the
   // saved session copy on edit. They use a schedule and start each run in a new
   // session.
@@ -901,10 +903,15 @@ export function CreateScheduledTaskDialog({
   const requiresAnchoredScheduling = schedule.preset === "custom" || schedule.end?.type === "count";
   const unsupportedByScheduler = !anchoredScheduling && requiresAnchoredScheduling;
   const scheduleInvalid =
-    scheduleUnsupported ||
-    unsupportedByScheduler ||
-    validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
-      null;
+    !editsEventTrigger &&
+    (scheduleUnsupported ||
+      unsupportedByScheduler ||
+      validateSchedule(schedule, {
+        allowPastEnd,
+        sessionMode,
+        subhourSupported,
+        executionTarget,
+      }) !== null);
   const renderedTemplatePrompt =
     trigger !== null && triggerFieldsComplete(triggerFields, trigger)
       ? renderTriggerPrompt(trigger, triggerFields, {
@@ -1158,7 +1165,8 @@ export function CreateScheduledTaskDialog({
       const input = {
         name: name.trim(),
         prompt: systemPrompt === null ? effectivePrompt.trim() : effectivePrompt,
-        rrule: buildRRule(schedule),
+        // An automation that runs on events keeps its trigger: this form edits only schedules.
+        ...(editsEventTrigger ? {} : { rrule: buildRRule(schedule) }),
         timezone,
         ...(executionTargetChanged ? { executionTarget } : {}),
         ...(worktreesSupported && baseBranch !== (editingTask?.baseBranch ?? null)
@@ -1628,7 +1636,16 @@ export function CreateScheduledTaskDialog({
                       </div>
                     )}
                 </div>
-                {!triggerMode && recurrenceFields}
+                {editsEventTrigger ? (
+                  <p
+                    className="text-sm text-muted-foreground"
+                    data-testid="task-event-trigger-note"
+                  >
+                    This automation runs on events. Saving keeps its trigger.
+                  </p>
+                ) : (
+                  !triggerMode && recurrenceFields
+                )}
                 {triggerMode && !scheduleInvalid && (
                   <p className="text-sm text-muted-foreground" data-testid="task-trigger-cadence">
                     Checks for new matches: {describeSchedule(buildRRule(schedule))}.{" "}
@@ -2024,7 +2041,7 @@ export function CreateScheduledTaskDialog({
                         </>
                       )}
                     </div>
-                    {!triggerMode && endingFields}
+                    {!triggerMode && !editsEventTrigger && endingFields}
                   </CollapsibleContent>
                 </Collapsible>
               </>

@@ -165,7 +165,7 @@ The transcript hides only the exact tagged unattended-run note appended by the s
 
 ## Running on session events
 
-An automation can run when something happens to an Omnigent session instead of on a schedule. Send `trigger_config` in place of `rrule` to `POST /v1/scheduled-tasks`; a task has exactly one of the two. This needs the database scheduler (`automations_v2`) and the `session_triggers` feature, and the server advertises `scheduled_task_session_triggers` in `/v1/info` when it accepts the field. Enable `session_triggers` only after every server on the database runs a version with it: an older server pauses an automation that has no `rrule`. To roll back to such a version, delete the session-triggered automations first.
+An automation can run when something happens to an Omnigent session instead of on a schedule. Send `trigger_config` in place of `rrule` to `POST /v1/scheduled-tasks`; a task has exactly one of the two. This needs the database scheduler (`automations_v2`) and the `session_triggers` feature, and the server advertises `scheduled_task_session_triggers` in `/v1/info` when it accepts the field. `GET /v1/scheduled-tasks` and `GET /v1/scheduled-tasks/{id}` return such an automation only with `?event_triggers=1`, because older clients expect every automation to have an `rrule`. Enable `session_triggers` only after every server on the database runs a version with it: an older server pauses an automation that has no `rrule`. To roll back to such a version, delete the session-triggered automations first.
 
 ```json
 {"provider": "omnigent", "events": ["turn.completed", "input.requested"],

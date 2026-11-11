@@ -52,6 +52,12 @@ def scheduled_trigger_key(scheduled_at: int) -> str:
     return f"schedule:{scheduled_at}"
 
 
+# The saved next run time of an active event-triggered task. Such a task never comes due,
+# and the due-task index on (state, next_run_at, workspace_id, id) finds every one in a
+# workspace with an equality seek, apart from tasks still waiting for a next run time.
+# Entities read it as ``None``.
+EVENT_TRIGGERED_NEXT_RUN_AT = 2**62
+
 # Event-triggered runs are keyed ``event:<provider>:<occurrence>``, unique per task, so a
 # redelivered event records no second run.
 EVENT_TRIGGER_KEY_PREFIX = "event:"

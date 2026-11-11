@@ -109,14 +109,43 @@ def test_a_matching_event_records_a_pending_run_with_ids_only(stores: _Stores) -
 
 def test_filters_narrow_the_sessions_that_fire(stores: _Stores) -> None:
     other_agent = uuid.uuid4().hex
+    project = uuid.uuid4().hex
     by_agent = stores.task(agent_id=other_agent)
     by_title = stores.task(title_contains="DEPLOY")
-    match = stores.session(agent_id=other_agent, title="Deploy staging")
+    by_project = stores.task(project_id=project)
+    match = stores.session(agent_id=other_agent, title="Deploy staging", project_id=project)
     miss = stores.session(title="Unrelated")
     for conv in (match, miss):
         _notify("turn.completed", conv.id, occurrence="r")
     assert [e["session_id"] for e in stores.events(by_agent)] == [match.id]
     assert [e["session_id"] for e in stores.events(by_title)] == [match.id]
+    assert [e["session_id"] for e in stores.events(by_project)] == [match.id]
+
+
+def test_events_without_an_occurrence_never_collide(
+    stores: _Stores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = stores.task(events=["session.renamed"])
+    conv = stores.session()
+    # Two renames in the same instant are still two events.
+    monkeypatch.setattr(session_triggers.time, "time", lambda: 1_800_000_000.0)
+    _notify("session.renamed", conv.id)
+    _notify("session.renamed", conv.id)
+    assert [e["type"] for e in stores.events(task)] == ["session.renamed"] * 2
+
+
+def test_long_ids_reach_the_run_as_hashes(stores: _Stores) -> None:
+    task = stores.task()
+    conv = stores.session()
+    _notify("turn.completed", conv.id, occurrence="r" * 400, response_id="r" * 400)
+    [event] = stores.events(task)
+    assert event["response_id"].startswith("sha256:")
+    assert len(event["response_id"]) == len("sha256:") + 64
+
+
+def test_a_full_queue_drops_new_events(monkeypatch: pytest.MonkeyPatch, stores: _Stores) -> None:
+    monkeypatch.setattr(session_triggers, "_MAX_QUEUED_EVENTS", 0)
+    assert session_triggers.notify("turn.completed", "conv") is None
 
 
 def test_a_task_ignores_the_sessions_it_created_or_continues(stores: _Stores) -> None:
