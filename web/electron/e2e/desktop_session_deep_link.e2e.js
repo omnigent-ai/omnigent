@@ -1,4 +1,4 @@
-// Clicking an `omnigent://<host>/c/<id>` link in a reply opens that chat in the same window.
+// Clicking an `omnigent://<host>/c/<id>` link to this server in a reply opens that chat in the same window.
 // Run: OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_session_deep_link.e2e.js
 // Env: OMNIGENT_PYTHON (backend), OMNIGENT_DESKTOP_RECORD_DIR (paced recording).
 
@@ -10,7 +10,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { desktopDepsAvailable, launchDesktop, saveRecording } = require("./desktopHarness");
-const { eventually, startDesignBackend } = require("./desktopDesignPromptHarness");
+const { eventually, jsonRequest, startDesignBackend } = require("./desktopDesignPromptHarness");
 
 const RECORD_DIR = process.env.OMNIGENT_DESKTOP_RECORD_DIR;
 const WORKER_REPLY = "Build finished: all 42 tests passed.";
@@ -31,22 +31,15 @@ function pause(ms = 1_500) {
   });
 }
 
-async function api(url, init = {}) {
-  const response = await fetch(url, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...init.headers },
-    signal: AbortSignal.timeout(30_000),
-  });
-  const body = await response.text();
-  assert.ok(response.ok, `${url}: HTTP ${response.status}: ${body}`);
-  return body ? JSON.parse(body) : null;
+function jsonBody(method, body) {
+  return { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
 }
 
 function setMockReply(mockUrl, text) {
-  return api(`${mockUrl}/mock/set_fallback`, {
-    method: "POST",
-    body: JSON.stringify({ key: "gpt-4o-mini", text, stream: true }),
-  });
+  return jsonRequest(
+    `${mockUrl}/mock/set_fallback`,
+    jsonBody("POST", { key: "gpt-4o-mini", text, stream: true }),
+  );
 }
 
 it(
@@ -61,26 +54,21 @@ it(
       backend = await startDesignBackend(tmpDir);
       const { serverUrl, mockUrl, sessionId, otherSessionId: workerId } = backend;
       const session = (id) => `${serverUrl}/v1/sessions/${id}`;
-      await api(session(workerId), {
-        method: "PATCH",
-        body: JSON.stringify({ title: "Build worker" }),
-      });
-      await api(session(sessionId), {
-        method: "PATCH",
-        body: JSON.stringify({ title: "Coordinator" }),
-      });
+      await jsonRequest(session(workerId), jsonBody("PATCH", { title: "Build worker" }));
+      await jsonRequest(session(sessionId), jsonBody("PATCH", { title: "Coordinator" }));
 
       // The worker chat already has a finished turn to land on.
       await setMockReply(mockUrl, WORKER_REPLY);
-      await api(`${session(workerId)}/events`, {
-        method: "POST",
-        body: JSON.stringify({
+      await jsonRequest(
+        `${session(workerId)}/events`,
+        jsonBody("POST", {
           type: "message",
           data: { role: "user", content: [{ type: "input_text", text: "Run the build." }] },
         }),
-      });
+      );
       await eventually(
-        async () => JSON.stringify(await api(`${session(workerId)}/items`)).includes(WORKER_REPLY),
+        async () =>
+          JSON.stringify(await jsonRequest(`${session(workerId)}/items`)).includes(WORKER_REPLY),
         "worker reply",
         60_000,
       );
@@ -110,7 +98,8 @@ it(
 
       const link = window.getByRole("link", { name: LINK_TEXT });
       await link.waitFor({ timeout: 60_000 });
-      assert.equal(await link.getAttribute("href"), deepLink);
+      // A link to this server is routed in the app rather than handed to the OS.
+      assert.equal(await link.getAttribute("href"), `/c/${workerId}`);
       assert.equal(await window.getByText("[blocked]").count(), 0);
       step("reply shows the session link");
       await link.hover();

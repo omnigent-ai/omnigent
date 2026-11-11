@@ -106,18 +106,20 @@ export function shortFileCitationLabel(text: string): string | null {
 }
 
 // An Omnigent session deep link, `omnigent://<host[:port]>/c/<session_id>`, which
-// the desktop app registers. Matched on the raw href: no credentials, query,
-// fragment, or dot segments.
-const OMNIGENT_SESSION_LINK = /^omnigent:\/\/[^/?#@\\\s]+\/c\/[A-Za-z0-9_-]+\/?$/;
+// the desktop app registers. Matched on the raw href, so there are no
+// credentials, query, fragment, or dot segments.
+const OMNIGENT_SESSION_LINK =
+  /^omnigent:\/\/((?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?)\/c\/([A-Za-z0-9_-]+)\/?$/;
+
+/** The server host (`host[:port]`) and session an Omnigent session link names, or null. */
+export function parseOmnigentSessionLink(href: string): { host: string; sessionId: string } | null {
+  const match = OMNIGENT_SESSION_LINK.exec(href);
+  return match ? { host: match[1].toLowerCase(), sessionId: match[2] } : null;
+}
 
 /** Whether `href` is exactly an Omnigent session deep link. */
 export function isOmnigentSessionLink(href: string): boolean {
-  if (!OMNIGENT_SESSION_LINK.test(href)) return false;
-  try {
-    return new URL(href).host !== "";
-  } catch {
-    return false;
-  }
+  return parseOmnigentSessionLink(href) !== null;
 }
 
 /**

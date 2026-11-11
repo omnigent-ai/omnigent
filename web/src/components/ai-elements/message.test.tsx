@@ -229,6 +229,7 @@ describe("MessageResponse", () => {
       ["a fragment", `${sessionLink}#x`],
       ["credentials", "omnigent://user:secret@127.0.0.1:53694/c/abc"],
       ["no host", "omnigent:///c/abc"],
+      ["a malformed host", "omnigent://%/c/abc"],
       ["an encoded id", "omnigent://127.0.0.1:53694/c/a%2Fb"],
       ["a dot segment", "omnigent://127.0.0.1:53694/settings/../c/abc"],
       ["an encoded dot segment", "omnigent://127.0.0.1:53694/x/%2e%2e/c/abc"],

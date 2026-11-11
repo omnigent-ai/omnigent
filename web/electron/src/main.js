@@ -2843,8 +2843,6 @@ function createWindow(targetUrl, opts = {}) {
     }
     if (decision.kind === "external") {
       void shell.openExternal(url);
-    } else if (decision.kind === "deep-link") {
-      enqueueDeepLink(url);
     } else if (decision.kind === "protocol-consent") {
       void confirmExternalProtocol(win, url, decision.scheme);
     }

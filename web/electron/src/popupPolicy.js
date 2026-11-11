@@ -19,8 +19,6 @@
 
 "use strict";
 
-const { parseOmnigentDeepLink } = require("./deepLink");
-
 /**
  * Schemes that open externally with no confirmation: they land in the
  * user's browser / mail client, which apply their own safety UX. Anything
@@ -49,20 +47,6 @@ const OAUTH_POPUP_ORIGINS = new Set([
 /** Popup-shaped features: an explicit width or height entry. */
 const SIZE_FEATURE_RE = /(^|,)\s*(width|height)\s*=/i;
 
-/** A plain session link: no credentials, query, fragment (so no CLI `desktop_ack`), or dot segments. */
-const SESSION_DEEP_LINK_RE = /^omnigent:\/\/[^/?#@\\\s]+\/c\/[A-Za-z0-9_-]+\/?$/;
-
-/**
- * Whether `raw` is a plain session deep link to the server at `origin`.
- *
- * @param {string} raw
- * @param {string} origin
- * @returns {boolean}
- */
-function isSessionDeepLinkTo(raw, origin) {
-  return SESSION_DEEP_LINK_RE.test(raw) && parseOmnigentDeepLink(raw)?.origin === origin;
-}
-
 /**
  * Decide what to do with a page-initiated window.open / target=_blank.
  *
@@ -72,12 +56,10 @@ function isSessionDeepLinkTo(raw, origin) {
  *   extraPopupOrigins?: unknown}} context The opener window's current
  *   top-level origin, its pinned origin, and the raw settings.json
  *   `popup_allowed_origins` value (unvalidated — non-arrays are ignored).
- * @returns {{kind: "popup"} | {kind: "external"} | {kind: "deep-link"}
+ * @returns {{kind: "popup"} | {kind: "external"}
  *   | {kind: "protocol-consent", scheme: string} | {kind: "ignore"}}
  *   popup → hardened child window; external → shell.openExternal;
- *   deep-link → the shell's own deep-link handler, which asks before
- *   connecting to an unknown server; protocol-consent → consent dialog;
- *   ignore → unparseable URL.
+ *   protocol-consent → consent dialog; ignore → unparseable URL.
  */
 function decideWindowOpen(details, context) {
   let parsed;
@@ -87,13 +69,6 @@ function decideWindowOpen(details, context) {
     return { kind: "ignore" };
   }
   if (!WEB_SCHEMES.has(parsed.protocol)) {
-    // A chat link to another session on the window's own server opens in this
-    // app directly; other pages and other servers get the generic prompt.
-    const { openerOrigin, pinnedOrigin } = context;
-    const onPinnedServer = pinnedOrigin !== null && openerOrigin === pinnedOrigin;
-    if (onPinnedServer && isSessionDeepLinkTo(details.url, pinnedOrigin)) {
-      return { kind: "deep-link" };
-    }
     return { kind: "protocol-consent", scheme: parsed.protocol };
   }
   const popupShaped =

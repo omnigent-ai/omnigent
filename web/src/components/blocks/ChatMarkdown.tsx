@@ -28,6 +28,7 @@ import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { MessageResponse } from "@/components/ai-elements/message";
 import {
+  parseOmnigentSessionLink,
   shortFileCitationLabel,
   splitWorkspaceFileCitation,
   WORKSPACE_FILE_LINK_ATTR,
@@ -293,6 +294,39 @@ function PullRequestLinkLabel({ children }: { children: React.ReactNode }) {
 }
 
 /**
+ * The in-app chat path for an `omnigent://<host>/c/<id>` link to the server this
+ * page is on, or null. Links to other servers keep their deep-link href.
+ */
+function sameServerSessionPath(href: unknown): string | null {
+  if (typeof href !== "string" || typeof window === "undefined") return null;
+  const link = parseOmnigentSessionLink(href);
+  if (!link || link.host !== window.location.host.toLowerCase()) return null;
+  return `/c/${link.sessionId}`;
+}
+
+/** A session link to this server, routed in the app like a session mention pill. */
+function ServerSessionLink({
+  path,
+  className,
+  children,
+  target: _target,
+  rel: _rel,
+  ...props
+}: React.ComponentPropsWithoutRef<"a"> & { path: string }) {
+  const linkClass = cn(STREAMDOWN_LINK_CLASS, className);
+  // Markdown also renders outside the router (stories, embeds); there the href navigates.
+  return useInRouterContext() ? (
+    <Link to={path} className={linkClass} data-streamdown="link" {...props}>
+      {children}
+    </Link>
+  ) : (
+    <a href={withBasePath(path)} className={linkClass} data-streamdown="link" {...props}>
+      {children}
+    </a>
+  );
+}
+
+/**
  * Anchor renderer for markdown links. A link to a workspace file, its href
  * parked on a fragment by `markWorkspaceFileLinks` and the real path moved to
  * `WORKSPACE_FILE_LINK_ATTR`, opens the FileViewer instead of navigating,
@@ -335,6 +369,14 @@ function WorkspaceFileLink({
           src={href}
           title={typeof children === "string" ? children : "Video recording"}
         />
+      );
+    }
+    const sessionPath = sameServerSessionPath(href);
+    if (sessionPath) {
+      return (
+        <ServerSessionLink path={sessionPath} className={className} title={title} {...props}>
+          {children}
+        </ServerSessionLink>
       );
     }
     // Rebase an app-internal link (e.g. an agent's `/clear` "the new chat"
