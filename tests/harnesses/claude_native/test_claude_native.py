@@ -3034,6 +3034,45 @@ async def test_terminal_ready_timeout_starts_when_the_runner_connects() -> None:
     assert terminal_polls["after_online"] > 0
 
 
+@pytest.mark.asyncio
+async def test_runner_failure_cancels_the_concurrent_terminal_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed runner wait cancels the terminal wait still waiting for it to connect."""
+    terminal_wait_cancelled = asyncio.Event()
+
+    async def fail_runner_wait(client: object, runner_id: str, *, timeout_s: float) -> None:
+        del client, timeout_s
+        raise click.ClickException(f"Runner {runner_id!r} failed to start: exited")
+
+    async def wait_for_terminal(
+        client: object,
+        session_id: str,
+        *,
+        timeout_s: float,
+        runner_online: asyncio.Event | None = None,
+    ) -> str:
+        del client, session_id, timeout_s
+        assert runner_online is not None
+        try:
+            await runner_online.wait()
+        except asyncio.CancelledError:
+            terminal_wait_cancelled.set()
+            raise
+        return claude_native.claude_terminal_resource_id()
+
+    monkeypatch.setattr(claude_native, "wait_for_runner_online", fail_runner_wait)
+    monkeypatch.setattr(claude_native, "_wait_for_claude_terminal_ready", wait_for_terminal)
+
+    async with httpx.AsyncClient(base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException, match="failed to start"):
+            await claude_native._wait_for_runner_and_claude_terminal(
+                client, "runner_abc", "conv_abc"
+            )
+
+    assert terminal_wait_cancelled.is_set()
+
+
 # ── same-machine tmux attach (Phase 4) ─────────────────────
 
 

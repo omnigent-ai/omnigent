@@ -4831,6 +4831,44 @@ async def _wait_for_runner_online_with_startup_event(
         runner_online.set()
 
 
+async def _wait_for_runner_and_claude_terminal(
+    client: httpx.AsyncClient,
+    runner_id: str,
+    session_id: str,
+) -> str:
+    """
+    Wait for the runner tunnel and its Claude terminal concurrently.
+
+    The terminal timeout starts once the runner is online. When either
+    wait fails, the other is cancelled before the error propagates.
+
+    :param client: Authenticated client for the server.
+    :param runner_id: Runner launched for the session.
+    :param session_id: Session whose terminal the runner auto-creates.
+    :returns: The Claude terminal id.
+    """
+    runner_online = asyncio.Event()
+    runner_wait = asyncio.create_task(
+        _wait_for_runner_online_with_startup_event(client, runner_id, runner_online=runner_online)
+    )
+    terminal_wait = asyncio.create_task(
+        _wait_for_claude_terminal_ready(
+            client,
+            session_id,
+            timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S,
+            runner_online=runner_online,
+        )
+    )
+    try:
+        _, terminal_id = await asyncio.gather(runner_wait, terminal_wait)
+    finally:
+        # gather leaves the sibling running when one wait fails.
+        runner_wait.cancel()
+        terminal_wait.cancel()
+        await asyncio.gather(runner_wait, terminal_wait, return_exceptions=True)
+    return terminal_id
+
+
 async def _ensure_claude_terminal_on_runner(
     client: httpx.AsyncClient,
     session_id: str,
@@ -5070,26 +5108,14 @@ async def _prepare_claude_terminal_via_daemon(
             # side but independent from the CLI's perspective — the terminal poll
             # returns None (404) until the runner creates it. Run both concurrently:
             # wait_for_runner_online provides the fail-fast dead-runner signal;
-            # _wait_for_claude_terminal_ready drives to completion. The gather
-            # propagates any runner failure immediately, cancelling the terminal wait.
+            # _wait_for_claude_terminal_ready drives to completion.
             _mark_startup_step(
                 startup_profiler,
                 "waiting for runner online and claude terminal ready",
                 startup_progress=startup_progress,
                 progress_message="Starting Claude terminal...",
             )
-            runner_online = asyncio.Event()
-            _, terminal_id = await asyncio.gather(
-                _wait_for_runner_online_with_startup_event(
-                    client, runner_id, runner_online=runner_online
-                ),
-                _wait_for_claude_terminal_ready(
-                    client,
-                    session_id,
-                    timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S,
-                    runner_online=runner_online,
-                ),
-            )
+            terminal_id = await _wait_for_runner_and_claude_terminal(client, runner_id, session_id)
         record_startup_event("terminal_available", session_id=session_id)
         _mark_startup_step(
             startup_profiler,
