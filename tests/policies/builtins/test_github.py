@@ -1470,6 +1470,29 @@ def test_conflicting_gh_selectors_require_approval(command: str) -> None:
 @pytest.mark.parametrize(
     "command",
     [
+        "gh pr merge https://github.com/example/other/pull/1 -R example/allowed",
+        "gh pr merge -R example/allowed https://github.com/example/other/pull/1",
+        "gh issue close https://github.com/example/other/issues/1 --repo example/allowed",
+    ],
+)
+def test_gh_url_argument_naming_another_repo_than_explicit_repo_asks(command: str) -> None:
+    assert _target_action(command) == "ASK"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr merge https://github.com/example/allowed/pull/1 -R example/allowed",
+        "gh pr merge -R example/allowed https://github.com/example/allowed/pull/1",
+    ],
+)
+def test_gh_url_argument_naming_explicit_repo_is_accepted(command: str) -> None:
+    assert _target_action(command) == "ALLOW"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "gh pr create -R example/allowed -R Example/Allowed --base main",
         "gh -R example/allowed pr create -R example/allowed --base main",
         "gh pr create -R example/allowed --base main --base main",
