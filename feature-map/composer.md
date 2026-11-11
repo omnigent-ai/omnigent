@@ -271,12 +271,6 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   each message once. If the sandbox never comes up, each saved message stays in
   the transcript marked **Not delivered**, live and after reload. **Copy message
   to new session** opens New Chat with its text and attachments.
-- `arclet-dbcert`: desktop Arclet launches check laptop credentials first. A
-  missing or expired dbcert preserves the draft and shows a yellow refresh
-  banner instead of provisioning. Skip continues the current launch without
-  waiting for the check. Refresh is explicit; launch needs another submit after
-  renewal. States: valid, invalid, checking, skipped, refreshing, failed, and
-  CLI not installed.
 - `launch-action-required`: while a managed launch needs the user to do
   something, such as a sandbox still waiting for its owner's credentials, the session's chat
   transcript shows a yellow banner with the deployment's instructions. Provisioning
@@ -385,12 +379,6 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   `tests/browser_ui/chat/test_prompt_url.py`; router and draft edge cases:
   `web/src/shell/NewChatDialog.test.tsx` (`prompt URL handoff`).
 
-- In the managed desktop app, choose **Arclet Sandbox** and submit a task with
-  missing or expired laptop credentials. Click **Refresh dbcert** in the yellow
-  banner, finish browser sign-in, then submit the preserved task again. Sending
-  alone must not open the browser, and renewal alone must not create a sandbox.
-  While **Checking laptop credentials…** is visible, **Skip** starts that launch
-  without waiting for verification or opening sign-in. Later launches check again.
 - On a deployment whose launches can report that the user needs to act, start a
   managed session whose launch needs you, e.g. a sandbox still waiting for its
   owner's credentials. The session's chat
@@ -934,16 +922,6 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/server/integration/test_managed_startup_inputs.py` checks native
   transcript ownership, bundle uploads, recovery, access revocation and deletion,
   plus failed inputs in the snapshot.
-- **`arclet-dbcert`, desktop new-session composer (own environment):**
-  `web/electron/e2e/desktop_dbcert_preflight.e2e.js` exercises the real desktop,
-  native bridge, CLI process, and local server with a fake dbcert executable and
-  machine policy. Follow `web/electron/e2e/README.md` for build and recording
-  prerequisites. It proves explicit refresh and launch, preserved input, skipping
-  a pending check, and skipped kubeconfig updates and host sync; macOS sign-in
-  needs a manual managed-desktop check. Component tests in
-  `web/src/shell/NewChatDialog.test.tsx` and
-  `web/src/components/DbcertBanner.test.tsx` cover leaving during a check, late
-  results after skipping, retry, dismissal, check errors, and older shells.
 - **`launch-action-required`, session chat transcript:**
   `tests/browser_ui/chat/test_status_indicators.py::test_action_banner_follows_the_launch`
   shows the snapshot's instructions in the banner and clears it when the stream
@@ -968,12 +946,6 @@ Other connection providers alone do not enable the managed MCP picker.
 - Test touch sizing with a real touch device or browser touch emulation; resizing
   a mouse browser alone does not enable it.
 
-- The Arclet dbcert preflight needs the updated desktop shell and web UI, with
-  managed features enabled on the server. Browsers, older shells, other sandbox
-  providers, and already-connected hosts skip this check. Refreshing a host's
-  credential from the session banner does not prove new-session gating works.
-  Skip bypasses only this launch's check; it does not renew credentials or
-  guarantee that sandbox authentication will succeed.
 - The launch action banner appears only on deployments whose launch code
   reports it; Omnigent's own sandbox providers never do. Its text comes from the
   deployment, so check the wording there rather than in the web UI.
