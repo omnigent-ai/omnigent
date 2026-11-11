@@ -3,10 +3,7 @@ export const WORKTREE_ROOT_LABEL_KEY = "omnigent.git.worktree_root_sha256";
 
 const WINDOWS_ABSOLUTE_PATH = /^(?:[a-zA-Z]:[\\/]|[\\/]{2}[^\\/]+[\\/]+[^\\/]+)/;
 
-/**
- * Hex SHA-256 the server records for a worktree root, e.g. for
- * `"/repo/.worktrees/login"`. Windows paths compare case- and separator-insensitively.
- */
+/** Hex SHA-256 the server records for a root; Windows paths ignore case and separators. */
 export async function worktreeRootFingerprint(path: string): Promise<string> {
   const normalized = WINDOWS_ABSOLUTE_PATH.test(path)
     ? path.replaceAll("\\", "/").toLowerCase()
@@ -29,11 +26,7 @@ function selfAndAncestors(path: string): string[] {
   return candidates;
 }
 
-/**
- * Worktree root the server removes for a session directory, which may be a
- * subdirectory of it. Mirrors the server's `recorded_worktree_root`: no
- * fingerprint means the directory is the root. Returns null when unresolvable.
- */
+/** Root the server's `recorded_worktree_root` removes for a session directory, or null. */
 export async function recordedWorktreeRoot(
   workspace: string,
   fingerprint: string | undefined,
