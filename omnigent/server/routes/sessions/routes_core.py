@@ -4413,7 +4413,9 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
 
-        reject_proactive_agent_id(body.agent_id)
+        # The fork keeps the source's agent unless the body names another, so
+        # check the agent the fork would actually bind.
+        reject_proactive_agent_id(body.agent_id if body.agent_id is not None else source.agent_id)
         source_agent = await asyncio.to_thread(agent_store.get, source.agent_id)
         target_agent_id = body.agent_id
         switching_agent = target_agent_id is not None and target_agent_id != source.agent_id

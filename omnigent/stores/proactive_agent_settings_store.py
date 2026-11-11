@@ -32,6 +32,8 @@ _PROMPT_KEY = "proactive_agent.v1.prompt"
 # Longest prompt override, in UTF-8 bytes, so the stored value stays under the
 # 16,383-byte cap for a database value even uncompressed.
 MAX_PROMPT_OVERRIDE_BYTES = 16_000
+# The stored JSON text may be longer than the prompt (escapes); readers stop here.
+_MAX_STORED_PROMPT_BYTES = 4 * MAX_PROMPT_OVERRIDE_BYTES
 
 
 def _decode_enabled(raw: bytes | str | memoryview | None) -> bool:
@@ -107,7 +109,7 @@ class ProactiveAgentSettingsStore:
         if raw is None:
             return None
         try:
-            prompt = json.loads(decode(raw, max_decoded_bytes=4 * MAX_PROMPT_OVERRIDE_BYTES) or "")
+            prompt = json.loads(decode(raw, max_decoded_bytes=_MAX_STORED_PROMPT_BYTES) or "")
         except (ValueError, TypeError):
             return None
         return prompt if isinstance(prompt, str) and prompt.strip() else None
@@ -116,10 +118,16 @@ class ProactiveAgentSettingsStore:
         """Replace the agent's built-in prompt for the workspace; ``None`` restores it.
 
         :raises ValueError: If *prompt* is longer than
-            :data:`MAX_PROMPT_OVERRIDE_BYTES` bytes of UTF-8.
+            :data:`MAX_PROMPT_OVERRIDE_BYTES` bytes of UTF-8, or its JSON text is
+            longer than readers accept.
         """
         if prompt is not None and len(prompt.encode("utf-8")) > MAX_PROMPT_OVERRIDE_BYTES:
             raise ValueError(f"the prompt is longer than {MAX_PROMPT_OVERRIDE_BYTES} bytes")
+        if (
+            prompt is not None
+            and len(json.dumps(prompt).encode("utf-8")) > _MAX_STORED_PROMPT_BYTES
+        ):
+            raise ValueError("the prompt has too many characters that need escaping")
 
         def write(session: Session) -> None:
             if prompt is None:

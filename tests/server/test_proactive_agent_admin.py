@@ -81,10 +81,16 @@ async def test_the_override_survives_a_restart_reseed(client: httpx.AsyncClient)
     assert _bundled_prompt(client) == "Post one item."
 
 
-async def test_an_overlong_prompt_is_rejected(client: httpx.AsyncClient) -> None:
-    resp = await client.put("/v1/proactive-agent/prompt", json={"prompt": "é" * 9000})
+@pytest.mark.parametrize(
+    "prompt",
+    ["é" * 9000, "\u0001" * 16_000],
+    ids=["utf-8-bytes", "json-escapes"],
+)
+async def test_an_overlong_prompt_is_rejected(client: httpx.AsyncClient, prompt: str) -> None:
+    resp = await client.put("/v1/proactive-agent/prompt", json={"prompt": prompt})
 
     assert resp.status_code == 400, resp.text
+    assert (await client.get("/v1/proactive-agent/prompt")).json()["overridden"] is False
 
 
 async def test_run_now_starts_named_users_tasks_and_reports_the_rest(

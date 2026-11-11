@@ -184,3 +184,11 @@ async def test_the_bundle_download_tells_the_runner_whether_to_offer_the_inbox_t
         assert (await client.get(url, headers=_ALICE)).headers[USER_INBOX_HEADER] == "0"
         # The owner's setting decides, whoever downloads the bundle.
         assert (await client.get(url, headers=_BOB)).headers[USER_INBOX_HEADER] == "0"
+        # A child session has no grant of its own; its root's owner decides.
+        child = SqlAlchemyConversationStore(db_uri).create_conversation(
+            agent_id=agent.id, parent_conversation_id=session_id
+        )
+        child_url = f"/v1/sessions/{child.id}/agent/contents"
+        assert (await client.get(child_url, headers=_ALICE)).headers[USER_INBOX_HEADER] == "0"
+        await client.put("/v1/proactive-agent/settings/me", json={"enabled": True}, headers=_ALICE)
+        assert (await client.get(child_url, headers=_ALICE)).headers[USER_INBOX_HEADER] == "1"

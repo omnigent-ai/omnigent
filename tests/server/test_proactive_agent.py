@@ -471,6 +471,24 @@ async def test_a_proactive_run_cannot_seed_an_automation(client: httpx.AsyncClie
     assert app.state.scheduled_task_store.list() == []
 
 
+async def test_a_client_cannot_fork_a_proactive_run_without_switching_agents(
+    db_uri: str, tmp_path: Path
+) -> None:
+    app = _app(db_uri, tmp_path, enabled=True)
+    app.state.seed_builtin_agents()
+    conversations: Any = app.state.test_conversations
+    run = conversations.create_conversation(agent_id=PROACTIVE_AGENT_ID)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        # An empty body keeps the source's agent, so the fork would run the agent.
+        resp = await client.post(f"/v1/sessions/{run.id}/fork", json={})
+
+    assert resp.status_code == 400, resp.text
+    assert "built-in schedule" in resp.text
+    assert [c.id for c in conversations.list_conversations(limit=10).data] == [run.id]
+
+
 @pytest.mark.parametrize("enabled", [True, False], ids=["gate-on", "gate-off"])
 @pytest.mark.parametrize(
     "agent_id",
