@@ -51,7 +51,26 @@ interface ShortcutBindingDefinition {
   chords: (environment: ShortcutEnvironment) => Chord[];
 }
 
+/** Sidebar slots in order: ⌘1–⌘9 pick the first nine and ⌘0 the tenth, as browser tabs do. */
+export const SESSION_NUMBER_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"] as const;
+
 const BINDINGS = {
+  "palette.commands": {
+    label: "Open command palette",
+    // Exactly k or K: case-folding would also take characters such as the Kelvin sign.
+    chords: () => [
+      { mod: true, key: "k", exactKey: true },
+      { mod: true, key: "K", exactKey: true },
+    ],
+  },
+  "palette.sessions": {
+    label: "Find a session by name",
+    chords: () => [{ mod: true, alt: true, code: "KeyS" }],
+  },
+  "shortcuts.show": {
+    label: "Show keyboard shortcuts",
+    chords: () => [{ mod: true, key: "/", exactKey: true, matchesAltGraph: true }],
+  },
   "session.new": {
     label: "Start a new session",
     // A browser keeps ⌘N for a new window. Match the key that types N or O, on any layout.
@@ -68,6 +87,33 @@ const BINDINGS = {
     // The desktop menu's Settings item owns ⌘, there; a browser keeps ⌘, for its own settings.
     chords: (environment) =>
       environment.desktopMenu ? [] : [{ mod: true, alt: true, code: "Comma" }],
+  },
+  "history.back": {
+    label: "Go back",
+    chords: () => [{ mod: true, code: "BracketLeft", matchesAltGraph: true }],
+  },
+  "history.forward": {
+    label: "Go forward",
+    chords: () => [{ mod: true, code: "BracketRight", matchesAltGraph: true }],
+  },
+  "sessions.recent": {
+    label: "Switch recent sessions",
+    // Shift steps backward through the list.
+    chords: () => [
+      { ctrl: true, key: "Tab", exactKey: true },
+      { ctrl: true, shift: true, key: "Tab", exactKey: true },
+    ],
+  },
+  "session.number": {
+    label: "Jump to a sidebar session (1–10)",
+    // A browser keeps ⌘-digit for its tabs, so there Alt joins it, matched by the
+    // physical key because Alt rewrites the digit on macOS.
+    chords: (environment) =>
+      SESSION_NUMBER_DIGITS.map((digit) =>
+        environment.native
+          ? { mod: true, key: digit, exactKey: true, matchesAltGraph: true }
+          : { mod: true, alt: true, code: `Digit${digit}` },
+      ),
   },
 } satisfies Record<string, ShortcutBindingDefinition>;
 
@@ -98,14 +144,23 @@ export function activeShortcutChords(
   return shortcutBinding(id).chords(currentShortcutEnvironment(environment));
 }
 
+/** The index of the first of `id`'s active chords that `input` presses, or -1. */
+export function matchedShortcutChordIndex(
+  input: KeyChordInput | globalThis.KeyboardEvent,
+  id: ShortcutId,
+  environment?: Partial<ShortcutEnvironment>,
+): number {
+  const resolved = currentShortcutEnvironment(environment);
+  return activeShortcutChords(id, resolved).findIndex((chord) =>
+    chordMatches(chord, input, resolved.mac),
+  );
+}
+
 /** True when `input` presses one of `id`'s active chords. */
 export function matchesShortcut(
   input: KeyChordInput | globalThis.KeyboardEvent,
   id: ShortcutId,
   environment?: Partial<ShortcutEnvironment>,
 ): boolean {
-  const resolved = currentShortcutEnvironment(environment);
-  return activeShortcutChords(id, resolved).some((chord) =>
-    chordMatches(chord, input, resolved.mac),
-  );
+  return matchedShortcutChordIndex(input, id, environment) !== -1;
 }
