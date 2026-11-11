@@ -250,7 +250,7 @@ def test_agy_cli_reports_invalid_credentials_without_crash_reporting(
     result = CliRunner().invoke(cli, ["agy"])
     assert result.exit_code == 1
     assert "Error:" in result.output
-    assert ("setup --no-internal-beta" if missing_key else "OpenAI Responses") in result.output
+    assert ("setup" if missing_key else "OpenAI Responses") in result.output
     assert "Traceback" not in result.output
     assert not isinstance(result.exception, OmnigentError)
 

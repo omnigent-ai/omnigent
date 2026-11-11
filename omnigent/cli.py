@@ -48,11 +48,8 @@ from omnigent.cli_common import (
 from omnigent.cli_config import (
     _adopt_ambient_credentials,
     _credential_label,
-    _isolated_databricks_cfg,
     _print_credentials_by_harness,
-    _run_configure_databricks,
     _run_configure_harnesses_interactive,
-    _warn_missing_harness_dependencies,
 )
 from omnigent.cli_diagnostics import printable as _printable
 from omnigent.cli_invocation import WRAPPER_COMMAND_ENV, cli_invocation
@@ -685,12 +682,6 @@ _ConfigValue: TypeAlias = (
     str | int | float | bool | list["_ConfigValue"] | dict[str, "_ConfigValue"] | None
 )
 
-_GLOBAL_AGENTS_DIR: Path = Path.home() / ".omnigent" / "agents"
-_INTERNAL_BETA_DEFAULT_AGENT_NAME: str = "databricks_coding_agent.yaml"
-_INTERNAL_BETA_BUNDLED_AGENTS: tuple[str, ...] = (
-    "databricks_coding_agent.yaml",
-    "knowledge_work_agent.yaml",
-)
 _HOST_DAEMON_STOP_GRACE_S = 5.0
 _HOST_SESSION_STOP_MAX_WORKERS = 8
 _HOST_SESSION_ACTIVE_STATUSES = frozenset({"running", "waiting"})
@@ -1166,7 +1157,7 @@ def _save_global_config(  # type: ignore[explicit-any]
     Creates the ``~/.omnigent/`` directory if it does not exist.
     Values may be plain strings, booleans, or nested mappings (the
     ``auth:`` block written by ``omnigent setup``, or a ``providers:``
-    block written by ``omnigent setup --no-internal-beta``).
+    block written by ``omnigent setup``).
 
     By default every key in *settings* **replaces** the existing value
     wholesale (a shallow ``dict.update``). For keys listed in
@@ -1205,53 +1196,6 @@ def _save_global_config(  # type: ignore[explicit-any]
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
-
-
-def _materialize_bundled_example(name: str) -> Path:
-    """
-    Copy a single bundled example YAML into the user config dir.
-
-    ``uv tool install`` installs package files, not the repository checkout, so the
-    top-level ``examples/<name>`` paths are not available to users. Materialize a
-    user-editable copy under ``~/.omnigent/agents`` and never overwrite an
-    existing file so local edits survive reinstalls and reruns.
-
-    :param name: Filename of the bundled example (e.g.
-        ``"databricks_coding_agent.yaml"``).
-    :returns: Absolute path to the materialized agent YAML.
-    """
-    agent_path = _GLOBAL_AGENTS_DIR / name
-    if agent_path.exists():
-        return agent_path
-
-    agent_path.parent.mkdir(parents=True, exist_ok=True)
-    resource = resources.files("omnigent.resources.examples").joinpath(name)
-    text = resource.read_text(encoding="utf-8")
-    executable_placeholder = "__OMNIGENT_PYTHON_EXECUTABLE__"
-    text = text.replace('"${OMNIGENT_HOME:-$PWD}/.venv/bin/python"', executable_placeholder)
-    text = text.replace("${OMNIGENT_HOME:-$PWD}/.venv/bin/python", executable_placeholder)
-    text = text.replace(".venv/bin/python", sys.executable)
-    text = text.replace(executable_placeholder, sys.executable)
-    agent_path.write_text(text, encoding="utf-8")
-    return agent_path
-
-
-def _materialize_internal_beta_agents() -> Path:
-    """
-    Materialize every bundled internal-beta example and return the default's path.
-
-    :returns: Absolute path to the default agent YAML
-        (:data:`_INTERNAL_BETA_DEFAULT_AGENT_NAME`).
-    """
-    default_path: Path | None = None
-    for name in _INTERNAL_BETA_BUNDLED_AGENTS:
-        path = _materialize_bundled_example(name)
-        if name == _INTERNAL_BETA_DEFAULT_AGENT_NAME:
-            default_path = path
-    assert default_path is not None, (
-        f"_INTERNAL_BETA_BUNDLED_AGENTS must include {_INTERNAL_BETA_DEFAULT_AGENT_NAME}"
-    )
-    return default_path
 
 
 def _save_local_config(
@@ -12243,22 +12187,14 @@ def config_unset(is_global: bool, keys: tuple[str, ...]) -> None:
 
 
 @cli.command("setup")
-@click.option(
-    "--internal-beta/--no-internal-beta",
-    default=False,
-    help="Run the standard model/credential setup (default): choose a "
-    "provider for each harness and set your defaults. Pass --internal-beta "
-    "to configure Databricks internal-beta defaults and authentication.",
-)
-def setup(internal_beta: bool) -> None:
+def setup() -> None:
     """
     Launch the Omnigent first-time setup flow.
 
     By default this runs the standard model/credential picker — choose a
     provider for each harness and set your defaults, then start a session
-    with ``omnigent run``. (List configured credentials with
-    ``omnigent config list``.) Pass ``--internal-beta`` to configure
-    Databricks internal-beta defaults and authentication instead.
+    with ``omnigent run``. List configured credentials with
+    ``omnigent config list``.
     """
     from omnigent.inner import ui
 
@@ -12271,70 +12207,9 @@ def setup(internal_beta: bool) -> None:
     else:
         ui.print_brandmark("setup")
 
-    if internal_beta:
-        # The --internal-beta defaults are not in every build. Fail loud with a
-        # clear message instead of an ImportError deep in the onboarding flow.
-        try:
-            import omnigent.onboarding.internal_beta  # type: ignore[import-not-found]  # noqa: F401
-        except ImportError:
-            raise click.ClickException(
-                "Databricks internal-beta setup is not available in this build. "
-                f"Run `{cli_invocation()} setup` for the standard model/credential setup."
-            ) from None
-        # Internal-beta routing mints workspace OAuth tokens via
-        # databricks-sdk at runtime, and the SDK ships in the `databricks`
-        # extra rather than the default install. Fail loud up front instead
-        # of completing the whole login flow and breaking on the first turn.
-        from omnigent.onboarding.databricks_config import (
-            DATABRICKS_EXTRA_INSTALL_HINT,
-            databricks_sdk_installed,
-        )
-
-        if not databricks_sdk_installed():
-            raise click.ClickException(
-                "Databricks internal-beta setup needs the databricks extra "
-                f"(databricks-sdk). Reinstall with:\n  {DATABRICKS_EXTRA_INSTALL_HINT}"
-            )
-        # Surface missing external tooling (Node, tmux) before the Databricks
-        # bootstrap so a fresh machine sees every gap at once.
-        _warn_missing_harness_dependencies()
-        from omnigent.onboarding.internal_beta import _INTERNAL_BETA_DEFAULT_SERVER
-        from omnigent.onboarding.sandboxes.lakebox import (  # type: ignore[import-not-found]
-            install_demo_databricks_cli,
-        )
-        from omnigent.onboarding.setup import run_onboarding
-
-        # Install the demo `databricks` CLI (with the `lakebox`
-        # subcommand) BEFORE profile onboarding — `run_onboarding`
-        # shells out to `databricks auth login`, and a fresh machine
-        # might not have the binary on PATH at all. Idempotent: skips
-        # the installer when the demo CLI is already present, but
-        # still persists ~/.local/bin in the user's shell rc files.
-        install_demo_databricks_cli()
-        with _isolated_databricks_cfg():
-            if not run_onboarding():
-                raise click.ClickException("onboarding did not complete; see output above.")
-            _run_configure_databricks()
-        agent_path = _materialize_internal_beta_agents()
-        _save_global_config(
-            {
-                "default_agent": str(agent_path),
-                "profile": "oss",
-                "server": _INTERNAL_BETA_DEFAULT_SERVER,
-                # auth: block provides the default executor credentials for
-                # agents that do not declare executor.auth themselves.
-                "auth": {"type": "databricks", "profile": "oss"},
-            }
-        )
-        click.echo(f"Set default_agent={agent_path} in {_GLOBAL_CONFIG_PATH}")
-        click.echo(
-            f"Type `{cli_invocation()} claude` to get started with Claude Code on omnigent."
-        )
-        return
-
-    # --no-internal-beta: validate existing providers before entering the
-    # picker so malformed user config is reported as an actionable CLI error,
-    # not an application crash from the picker's ambient-adoption step.
+    # Validate existing providers before entering the picker so malformed user
+    # config is reported as an actionable CLI error, not an application crash
+    # from the picker's ambient-adoption step.
     from omnigent.errors import ErrorCode, OmnigentError
     from omnigent.onboarding.provider_config import load_providers
 

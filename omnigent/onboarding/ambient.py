@@ -1,6 +1,6 @@
 """Detect AI credentials already present on the machine.
 
-For the ``omnigent setup --no-internal-beta`` first-run experience, this module
+For the ``omnigent setup`` first-run experience, this module
 discovers credentials a user already has — vendor API keys in the
 environment, a logged-in ``claude`` / ``codex`` CLI, or a local Ollama
 server — so the setup flow can offer them as one-tap choices instead of

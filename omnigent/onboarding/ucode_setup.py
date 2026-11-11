@@ -37,27 +37,6 @@ _UCODE_GIT_REF = "304e4a29c5ca73b3bfaaf1911e38d0080833fda4"
 _UCODE_UVX_SOURCE = f"git+https://github.com/databricks/ucode@{_UCODE_GIT_REF}"
 
 
-def model_gateway_workspace_urls() -> list[str]:
-    """Return the workspaces ucode should configure for model serving.
-
-    ucode's only job is wiring coding harnesses to the Unity Gateway,
-    so it only needs the gateway workspace(s) — the ``is_model_gateway``
-    profiles. MCP-only workspaces (e.g. Jira / Confluence) still get a
-    Databricks profile during onboarding for MCP auth, but passing them to
-    ``ucode configure`` would make ucode do wasted gateway-discovery work
-    (and extra per-workspace token fetches) against workspaces that serve
-    no models.
-
-    :returns: Gateway workspace URLs, each stripped of a trailing slash.
-    """
-    # Lazy import; this module is not present in every build.
-    import omnigent.onboarding.internal_beta as internal_beta  # type: ignore[import-not-found]
-
-    return [
-        spec.host.rstrip("/") for spec in internal_beta.DEFAULT_PROFILES if spec.is_model_gateway
-    ]
-
-
 def build_ucode_configure_command(
     ucode_command: Sequence[str],
     *,
@@ -96,11 +75,9 @@ def configure_ucode_for_workspace(
 ) -> None:
     """Run ``ucode configure`` against a single model-serving workspace.
 
-    This is the per-workspace counterpart to the legacy multi-workspace
-    setup flow: instead of configuring every bundled profile at once, it
-    wires the coding harnesses (Claude, Codex, Pi) to the Unity Gateway
+    This wires the coding harnesses (Claude, Codex, Pi) to the Unity Gateway
     of exactly the one workspace the user supplied when adding a
-    ``kind: databricks`` provider via ``omnigent setup --no-internal-beta``.
+    ``kind: databricks`` provider via ``omnigent setup``.
     ucode writes ``~/.ucode/state.json``, which Omnigent then reads for
     per-harness model defaults, base URLs, and the token-refresh command.
 

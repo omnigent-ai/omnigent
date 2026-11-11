@@ -5014,7 +5014,7 @@ def resolve_native_codex_launch(
         log_info_once(
             _logger,
             "native-codex routing: Codex CLI login (no provider configured for the Codex "
-            "harness, no Databricks profile). Run `omnigent setup --no-internal-beta` to route "
+            "harness, no Databricks profile). Run `omnigent setup` to route "
             "through a provider.",
         )
         return NativeCodexLaunch(

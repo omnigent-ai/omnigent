@@ -3091,7 +3091,7 @@ def _ucode_config_for_profile(
     if agent_state is None:
         raise click.ClickException(
             f"ucode state for profile {profile!r} does not include a Claude agent entry. "
-            f"Run `{cli_invocation()} setup --internal-beta` to refresh ucode configuration."
+            f"Run `{cli_invocation()} setup` to refresh this configuration."
         )
 
     base_url = agent_state.env.get(_UCODE_CLAUDE_BASE_URL_ENV) or agent_state.base_url
@@ -3101,12 +3101,12 @@ def _ucode_config_for_profile(
         raise click.ClickException(
             f"ucode state for profile {profile!r} is missing Claude base URL "
             f"({_UCODE_CLAUDE_BASE_URL_ENV} / base_url). "
-            f"Run `{cli_invocation()} setup --internal-beta` to refresh ucode configuration."
+            f"Run `{cli_invocation()} setup` to refresh this configuration."
         )
     if not agent_state.auth_command:
         raise click.ClickException(
             f"ucode state for profile {profile!r} is missing Claude auth_command. "
-            f"Run `{cli_invocation()} setup --internal-beta` to refresh ucode configuration."
+            f"Run `{cli_invocation()} setup` to refresh this configuration."
         )
 
     refresh_interval_ms = (
@@ -3832,7 +3832,7 @@ def resolve_native_claude_config(
     log_info_once(
         _logger,
         "native-claude routing: Claude CLI login (no provider configured for the Claude "
-        "harness, no Databricks profile). Run `omnigent setup --no-internal-beta` to route "
+        "harness, no Databricks profile). Run `omnigent setup` to route "
         "through a provider.",
     )
     return None

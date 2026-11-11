@@ -15,7 +15,7 @@ spawn: true
 # claude_code / codex / opencode / cursor / hermes / pi / agy sub-agents, doing only non-code authoring (docs /
 # Markdown / text edits, skills) itself. No model/profile is pinned, so the
 # brain runs on whatever Claude provider is configured as the default
-# (`omnigent setup --no-internal-beta`) — an Anthropic API key, a Claude
+# (`omnigent setup`) — an Anthropic API key, a Claude
 # subscription, an OpenAI-compatible gateway, or a Databricks workspace. With
 # no model named the claude-sdk harness resolves the configured provider's
 # default Claude model.

@@ -3,8 +3,7 @@
 Cover the onboarding helpers used by ``omnigent setup``: env-var hygiene
 (``detect_conflicting_env_vars``), profile-host discovery
 (``_existing_profile_hosts``), CLI lookup (``find_databricks_cli``), the
-``maybe_run_onboarding`` skip guards, and profile-name derivation in
-``login_databricks_workspace``.
+profile-name derivation and OAuth login in ``login_databricks_workspace``.
 """
 
 from __future__ import annotations
@@ -18,14 +17,12 @@ from click import ClickException
 
 from omnigent.onboarding import setup as setup_mod
 from omnigent.onboarding.setup import (
-    _CONFLICTING_ENV_VARS,
-    SKIP_ENV_VAR,
+    CONFLICTING_ENV_VARS,
     ProfileSpec,
     _existing_profile_hosts,
     detect_conflicting_env_vars,
     find_databricks_cli,
     login_databricks_workspace,
-    maybe_run_onboarding,
 )
 
 # ── env-var hygiene ────────────────────────────────────
@@ -35,7 +32,7 @@ def test_detect_returns_set_vars_in_catalog_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Catalog order is contract — the user-facing notice depends on it."""
-    for v in _CONFLICTING_ENV_VARS:
+    for v in CONFLICTING_ENV_VARS:
         monkeypatch.delenv(v, raising=False)
     monkeypatch.setenv("DATABRICKS_TOKEN", "stale")
     monkeypatch.setenv("DATABRICKS_HOST", "https://old")
@@ -44,7 +41,7 @@ def test_detect_returns_set_vars_in_catalog_order(
 
 def test_detect_ignores_empty_string(monkeypatch: pytest.MonkeyPatch) -> None:
     """Empty string is not "set" — some shells use it to unset."""
-    for v in _CONFLICTING_ENV_VARS:
+    for v in CONFLICTING_ENV_VARS:
         monkeypatch.delenv(v, raising=False)
     monkeypatch.setenv("DATABRICKS_TOKEN", "")
     assert detect_conflicting_env_vars() == []
@@ -112,33 +109,6 @@ def test_find_databricks_cli(monkeypatch: pytest.MonkeyPatch) -> None:
     """Trivial delegation to ``shutil.which`` — guard against regression."""
     monkeypatch.setattr(setup_mod.shutil, "which", lambda name: f"/fake/{name}")
     assert find_databricks_cli() == "/fake/databricks"
-
-
-# ── maybe_run_onboarding skip paths ────────────────────
-
-
-def test_maybe_run_skips_when_skip_env_set(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``OMNIGENT_SKIP_ONBOARD=1`` short-circuits before any side effects."""
-    monkeypatch.setenv(SKIP_ENV_VAR, "1")
-    monkeypatch.setattr(setup_mod.sys.stdin, "isatty", lambda: True)
-
-    def _explode() -> dict[str, str]:
-        raise AssertionError("CLI was consulted despite skip env var")
-
-    monkeypatch.setattr(setup_mod, "_existing_profile_hosts", _explode)
-    maybe_run_onboarding()  # must not raise
-
-
-def test_maybe_run_skips_when_no_tty(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Piped stdin → skip (can't safely launch interactive OAuth in CI)."""
-    monkeypatch.delenv(SKIP_ENV_VAR, raising=False)
-    monkeypatch.setattr(setup_mod.sys.stdin, "isatty", lambda: False)
-
-    def _explode() -> dict[str, str]:
-        raise AssertionError("CLI was consulted despite non-TTY stdin")
-
-    monkeypatch.setattr(setup_mod, "_existing_profile_hosts", _explode)
-    maybe_run_onboarding()
 
 
 # ── login_databricks_workspace ─────────────────────────

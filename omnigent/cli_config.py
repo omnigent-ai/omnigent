@@ -23,7 +23,6 @@ import json
 import os
 import shutil
 import subprocess
-import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -32,11 +31,6 @@ import click
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.inner import ui
-from omnigent.onboarding.ucode_setup import (
-    build_ucode_configure_command,
-    find_ucode_command,
-    model_gateway_workspace_urls,
-)
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
 
 if TYPE_CHECKING:
@@ -45,8 +39,6 @@ if TYPE_CHECKING:
     from omnigent.onboarding.openclaw_config import OpenClawDiscovery, SourceKind
     from omnigent.onboarding.provider_config import ProviderEntry
 
-# _INTERNAL_BETA_DEFAULT_SERVER lives in omnigent.onboarding.internal_beta;
-# the --internal-beta setup branch and the sandbox CLI import it from there.
 # Brand shown for an auto-configured CLI login in the credentials callout —
 # the product the login authenticates, not the CLI name (the codex CLI logs in
 # a ChatGPT subscription). Keyed by the ambient detection name; these are the
@@ -178,151 +170,6 @@ def _tmux_dependency_problem() -> str | None:
         f"tmux is too old (detected tmux {detected}) — native Claude/Codex need "
         f"tmux {MIN_TMUX_VERSION_HINT} or newer (macOS: `brew upgrade tmux`)."
     )
-
-
-@contextlib.contextmanager
-def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
-    """Run Databricks setup against a temp config containing only our three profiles.
-
-    The temp file starts with just the canonical profile
-    sections (see ``DEFAULT_PROFILES``) seeded from the original when they
-    exist, so there is exactly one section per workspace host and
-    ``databricks auth token --host X`` never hits the "multiple profiles
-    match" ambiguity error.
-
-    The user's real config is never modified while this context is active.
-    On normal exit the three sections are merged back into the original.
-    On SIGTERM / SIGINT the temp file is removed and the original is left
-    exactly as it was.  SIGKILL cannot be caught, but the original is
-    always safe because we never touch it.
-
-    Uses ``DATABRICKS_CONFIG_FILE`` so both subprocess CLI calls *and*
-    the direct configparser writes in ``omnigent.onboarding.setup``
-    (via ``_databrickscfg_path()``) all operate on the temp file. Also
-    strips every entry in ``CONFLICTING_ENV_VARS`` for the duration of
-    the context so a stale Databricks credential env var (see that list)
-    can't shadow ``--host`` inside ``databricks auth token``.
-    """
-    import configparser
-    import signal
-    import tempfile
-
-    import omnigent.onboarding.internal_beta as internal_beta  # type: ignore[import-not-found]
-    from omnigent.onboarding.setup import CONFLICTING_ENV_VARS
-
-    original_cfg = Path.home() / ".databrickscfg"
-    saved_env: dict[str, str | None] = {
-        "DATABRICKS_CONFIG_FILE": os.environ.get("DATABRICKS_CONFIG_FILE"),
-    }
-    for var in CONFLICTING_ENV_VARS:
-        saved_env[var] = os.environ.pop(var, None)
-
-    def _restore_env() -> None:
-        for var, prev in saved_env.items():
-            if prev is None:
-                os.environ.pop(var, None)
-            else:
-                os.environ[var] = prev
-
-    # Temp file contains only the canonical profile sections
-    # (see DEFAULT_PROFILES), seeded from the original when they already
-    # exist. Everything else is excluded so there is exactly one
-    # section per workspace host and `databricks auth token --host X`
-    # never hits the "multiple profiles match" ambiguity error.
-    orig_cfg = configparser.ConfigParser()
-    if original_cfg.exists():
-        orig_cfg.read(original_cfg)
-    cfg = configparser.ConfigParser()
-    for spec in internal_beta.DEFAULT_PROFILES:
-        if orig_cfg.has_section(spec.name):
-            cfg[spec.name] = dict(orig_cfg[spec.name])
-
-    omnigent_dir = Path.home() / ".omnigent"
-    omnigent_dir.mkdir(exist_ok=True)
-    tmp_fd, tmp_name = tempfile.mkstemp(
-        prefix="databrickscfg-setup-",
-        dir=omnigent_dir,
-        suffix=".tmp",
-    )
-    try:
-        with os.fdopen(tmp_fd, "w") as f:
-            cfg.write(f)
-    except Exception:
-        os.unlink(tmp_name)
-        raise
-    tmp_path = Path(tmp_name)
-
-    os.environ["DATABRICKS_CONFIG_FILE"] = tmp_name
-
-    def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
-        tmp_path.unlink(missing_ok=True)
-        _restore_env()
-        # Restore the original handler before re-raising so signal chaining
-        # (e.g. Click's Ctrl-C → Abort) is preserved rather than falling
-        # back to SIG_DFL which would kill the process through the OS.
-        signal.signal(signum, prev_sigterm if signum == signal.SIGTERM else prev_sigint)
-        signal.raise_signal(signum)
-
-    prev_sigterm = signal.signal(signal.SIGTERM, _on_signal)
-    prev_sigint = signal.signal(signal.SIGINT, _on_signal)
-
-    write_tmp: Path | None = None
-    try:
-        yield
-        # Merge canonical sections written by setup back into the real cfg.
-        tmp_cfg = configparser.ConfigParser()
-        tmp_cfg.read(tmp_path)
-        orig_cfg = configparser.ConfigParser()
-        if original_cfg.exists():
-            orig_cfg.read(original_cfg)
-        for spec in internal_beta.DEFAULT_PROFILES:
-            if tmp_cfg.has_section(spec.name):
-                orig_cfg[spec.name] = dict(tmp_cfg[spec.name])
-        write_tmp = original_cfg.with_suffix(".tmp")
-        with write_tmp.open("w") as f:
-            orig_cfg.write(f)
-        write_tmp.replace(original_cfg)
-        write_tmp = None
-    finally:
-        tmp_path.unlink(missing_ok=True)
-        if write_tmp is not None:
-            write_tmp.unlink(missing_ok=True)
-        signal.signal(signal.SIGTERM, prev_sigterm)
-        signal.signal(signal.SIGINT, prev_sigint)
-        _restore_env()
-
-
-def _run_configure_databricks() -> None:
-    """
-    Configure coding harnesses to use Databricks Unity Gateway.
-
-    Shells out to ``ucode configure`` to authenticate workspaces and set
-    up harnesses (Claude SDK, Codex, OpenAI Agents, Pi). After setup,
-    Omnigent reads ``~/.ucode/state.json`` to pick per-harness model
-    defaults and base URLs.
-
-    :returns: None.
-    :raises click.ClickException: If ucode command resolution,
-        configuration, or state verification fails.
-    """
-    ucode_command = find_ucode_command()
-    # ucode only configures the model-serving gateway, so it gets the
-    # gateway workspace(s) only — not the MCP-only profiles, which are
-    # authenticated during profile onboarding and have no ucode role.
-    workspace_urls = model_gateway_workspace_urls()
-    click.echo("Running `ucode configure --workspaces ...`...")
-
-    result = subprocess.run(
-        build_ucode_configure_command(ucode_command, workspace_urls=workspace_urls),
-        check=False,
-    )
-    if result.returncode != 0:
-        raise click.ClickException(
-            f"`ucode configure` exited with code {result.returncode}; "
-            "see the command output above for details."
-        )
-
-    click.echo("ucode configuration complete. Omnigent will use state.json for harness setup.")
 
 
 def _warn_missing_harness_dependencies() -> None:
@@ -3695,7 +3542,7 @@ def _repair_conflicting_provider_defaults() -> bool:
 def _run_configure_harnesses_interactive() -> None:
     """Run the interactive model/credential three-level picker.
 
-    Invoked by ``omnigent setup --no-internal-beta`` and the bare-``run``
+    Invoked by ``omnigent setup`` and the bare-``run``
     first-run path, so both drive the identical flow.
     Opening it backfills a legacy databricks ``auth:`` block into a real
     provider and adopts any ambient-detected credential — announcing the

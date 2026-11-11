@@ -123,8 +123,8 @@ def test_databricks_sdk_installed_true_in_dev_env() -> None:
     The dev/CI install carries ``databricks-sdk`` (via the ``all`` extra),
     so the helper must report it present. A failure means the helper probes
     the wrong module path (e.g. a typo'd ``find_spec`` target), which would
-    make the add-provider menu and ``setup --internal-beta`` claim the
-    Databricks extra is missing even on installs that have it.
+    make the add-provider menu claim the Databricks extra is missing even on
+    installs that have it.
     """
     assert databricks_sdk_installed() is True
 

@@ -40,8 +40,8 @@ def normalize_workspace_url(raw: str) -> str:
     return raw.strip().rstrip("/")
 
 
-# The install command surfaced wherever a Databricks flow is gated on the
-# `databricks` extra (the add-provider menu, `setup --internal-beta`).
+# The install command surfaced wherever the Databricks provider flow is gated
+# on the `databricks` extra.
 # Matches the README's canonical `uv tool install` path: install from the
 # package index, not git. Dev clones use `uv sync --extra databricks`
 # instead, but the tool install is the path end users actually took.
@@ -75,7 +75,7 @@ def databricks_sdk_installed() -> bool:
 def list_databricks_profiles() -> list[str]:
     """Return the profile section names declared in ``~/.databrickscfg``.
 
-    Used by ``omnigent setup --no-internal-beta`` to offer the user a pick-list
+    Used by ``omnigent setup`` to offer the user a pick-list
     when adding a ``kind: databricks`` provider, so they don't have to
     recall the exact profile name.
 
@@ -103,8 +103,7 @@ def get_workspace_url_for_profile(profile: str) -> str | None:
     """Return the workspace host for a ``~/.databrickscfg`` profile.
 
     Reads the INI-style ``~/.databrickscfg`` directly with
-    :mod:`configparser`, then falls back to Omnigent' built-in setup
-    profile metadata for legacy names.
+    :mod:`configparser`.
 
     :param profile: Profile section name, e.g. ``"<your-profile>"`` or
         ``"DEFAULT"``.
@@ -127,18 +126,5 @@ def get_workspace_url_for_profile(profile: str) -> str | None:
             elif profile.lower() == cfg.default_section.lower():
                 host = cfg.defaults().get("host")
             if host:
-                return host.rstrip("/")
-
-    try:
-        import omnigent.onboarding.internal_beta as internal_beta  # type: ignore[import-not-found]
-    except ModuleNotFoundError:
-        # The internal-beta catalog is intentionally absent from the OSS
-        # build; without it there are no bundled-profile fallbacks.
-        return None
-
-    for spec in internal_beta.DEFAULT_PROFILES:
-        if spec.name == profile:
-            host = spec.host
-            if isinstance(host, str):
                 return host.rstrip("/")
     return None
