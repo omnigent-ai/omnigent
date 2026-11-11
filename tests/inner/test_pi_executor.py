@@ -2519,6 +2519,37 @@ async def test_gateway_slow_refresh_reuses_only_an_unexpired_token(
         await executor.close()
 
 
+async def test_gateway_close_reaps_a_refresh_no_request_awaits(tmp_path, monkeypatch):
+    # Once a request reuses the old token, the slow helper runs on with nothing waiting
+    # for it; closing the executor must still kill it.
+    from omnigent.inner import pi_executor
+
+    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.2)
+    token = _jwt_expiring_in(600)
+    marker, pid_file = (shlex.quote(str(tmp_path / name)) for name in ("ran", "helper pid"))
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command=(
+            f"if [ -e {marker} ]; then echo $$ > {pid_file}; sleep 30 & wait; fi; "
+            f"touch {marker}; printf %s {token}"
+        ),
+        gateway_auth_refresh_interval_ms="0",
+    )
+    try:
+        assert await executor._get_gateway_token(before_turn=True) == token
+        assert await executor._get_gateway_token() == token
+        async with asyncio.timeout(3):
+            while not (tmp_path / "helper pid").exists():
+                await asyncio.sleep(0.01)
+        pid = int((tmp_path / "helper pid").read_text())
+    finally:
+        await asyncio.wait_for(executor.close(), 3)
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
 @pytest.mark.parametrize(("lifetime_s", "renew_after_s"), [(600, 300), (120, 30), (7200, 900)])
 async def test_gateway_renews_a_token_before_it_expires(monkeypatch, lifetime_s, renew_after_s):
     # The Databricks CLI renews a token only near its expiry, so a fixed cache interval
