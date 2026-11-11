@@ -379,6 +379,42 @@ async def test_get_client_spawns_and_serves(
         await manager.shutdown()
 
 
+async def test_get_client_recovers_after_runner_interpreter_is_removed(
+    short_tmp_parent: Path,
+    register_test_harness: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A retired fast-venv path cannot strand later harness spawns."""
+    base_executable = getattr(sys, "_base_executable", None)
+    if not base_executable or not os.access(base_executable, os.X_OK):
+        pytest.skip("Python base interpreter is unavailable")
+
+    retired = short_tmp_parent / "retired-venv" / "bin" / "python"
+    retired.parent.mkdir(parents=True)
+    retired.symlink_to(sys.executable)
+    monkeypatch.setattr(sys, "executable", str(retired))
+    retired.unlink()
+
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    await manager.start()
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runtime.harnesses.process_manager"):
+            client = await manager.get_client("conv_retired_python", _TEST_HARNESS_NAME)
+        await _ping_health(client)
+        [recovery] = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "harness_interpreter_recovered"
+        ]
+        assert recovery.attributes == {
+            "stale_python": str(retired),
+            "fallback_python": base_executable,
+        }
+    finally:
+        await manager.shutdown()
+
+
 async def test_get_client_emits_harness_started_event(
     manager: HarnessProcessManager,
     caplog: pytest.LogCaptureFixture,

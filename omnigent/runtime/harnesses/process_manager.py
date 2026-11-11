@@ -142,6 +142,34 @@ _DEFAULT_REAPER_INTERVAL_S = 60
 _HARNESS_IDLE_TIMEOUT_ENV = "OMNIGENT_HARNESS_IDLE_TIMEOUT_S"
 
 
+def _recoverable_base_python() -> str | None:
+    """Return the live base interpreter when this runner's venv was retired."""
+    base_executable = getattr(sys, "_base_executable", None)
+    if (
+        isinstance(base_executable, str)
+        and base_executable
+        and base_executable != sys.executable
+        and os.path.isfile(base_executable)
+        and os.access(base_executable, os.X_OK)
+    ):
+        return base_executable
+    return None
+
+
+def _base_python_spawn_env(effective_env: dict[str, str]) -> dict[str, str]:
+    """Keep the runner's installed packages importable from its base Python."""
+    env = dict(effective_env)
+    search_paths = [
+        entry for entry in sys.path if entry and os.path.isabs(entry) and os.path.exists(entry)
+    ]
+    inherited = env.get("PYTHONPATH")
+    if inherited:
+        search_paths.extend(entry for entry in inherited.split(os.pathsep) if entry)
+    if search_paths:
+        env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(search_paths))
+    return env
+
+
 def _resolve_harness_idle_timeout_s() -> float:
     """Resolve the harness idle-reap window in seconds.
 
@@ -1486,18 +1514,67 @@ class HarnessProcessManager:
                     "Harness zygote unavailable (%s); falling back to direct exec", exc
                 )
                 self._harness_zygote_disabled = True
-        return await asyncio.create_subprocess_exec(
-            sys.executable,
+
+        executable = sys.executable
+        spawn_env = effective_env
+        if not (os.path.isfile(executable) and os.access(executable, os.X_OK)):
+            fallback = _recoverable_base_python()
+            if fallback is not None:
+                executable = fallback
+                spawn_env = _base_python_spawn_env(effective_env)
+                _logger.warning(
+                    "Runner interpreter %r disappeared; starting the harness with %r",
+                    sys.executable,
+                    fallback,
+                    extra=debug_event(
+                        "harness_interpreter_recovered",
+                        stale_python=sys.executable,
+                        fallback_python=fallback,
+                    ),
+                )
+
+        argv = (
+            executable,
             # -P keeps the inherited workspace cwd off sys.path so it can't
             # shadow the installed omnigent the harness module comes from.
             "-P",
             "-m",
             "omnigent.runtime.harnesses._runner",
             *runner_argv,
-            stdout=None,
-            stderr=None,
-            env=effective_env,
         )
+        try:
+            return await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=None,
+                stderr=None,
+                env=spawn_env,
+            )
+        except FileNotFoundError as exc:
+            # The fast venv may be replaced between the check and exec.
+            fallback = _recoverable_base_python()
+            if (
+                executable != sys.executable
+                or fallback is None
+                or exc.filename not in (None, executable)
+            ):
+                raise
+            _logger.warning(
+                "Runner interpreter %r disappeared during harness spawn; retrying with %r",
+                sys.executable,
+                fallback,
+                extra=debug_event(
+                    "harness_interpreter_recovered",
+                    stale_python=sys.executable,
+                    fallback_python=fallback,
+                ),
+            )
+            return await asyncio.create_subprocess_exec(
+                fallback,
+                *argv[1:],
+                stdout=None,
+                stderr=None,
+                env=_base_python_spawn_env(effective_env),
+            )
 
     async def _close_entry(self, entry: _SubprocessEntry) -> None:
         """
