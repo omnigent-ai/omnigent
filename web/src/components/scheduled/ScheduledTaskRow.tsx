@@ -42,7 +42,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import { describeSchedule, formatNextRunAt } from "@/lib/scheduleText";
+import { formatNextRunAt } from "@/lib/scheduleText";
+import { describeTaskTrigger } from "@/lib/sessionTriggers";
 import { isTriggerPrompt } from "./triggerTemplates";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
@@ -80,7 +81,7 @@ export function ScheduledTaskRow({
   // (active tasks only — a paused task has null nextRunAt). We only format the
   // delta from the server value against the ticking `now`; we never recompute
   // WHICH instant is next on the client.
-  const scheduleSummary = useMemo(() => describeSchedule(task.rrule), [task.rrule]);
+  const scheduleSummary = describeTaskTrigger(task);
   const nextRun = useMemo(() => formatNextRunAt(task.nextRunAt, now), [task.nextRunAt, now]);
 
   // Navigate to the task's detail page from the card BODY. The ⋯ menu (trigger

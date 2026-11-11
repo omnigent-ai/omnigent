@@ -177,6 +177,7 @@ def log_task_created(
             "follow-up-monitor",
             "pr-sweep",
             "news-digest",
+            "session",
         }
         else "unknown"
     )

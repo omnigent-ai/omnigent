@@ -5811,3 +5811,87 @@ describe("creating an automation from a session", () => {
     expect(input).not.toHaveProperty("agentId");
   });
 });
+
+describe("session events trigger", () => {
+  function dialog(
+    props: Partial<React.ComponentProps<typeof CreateScheduledTaskDialog>> = {},
+    supported = true,
+  ) {
+    return (
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_session_modes: true,
+          scheduled_task_session_triggers: supported,
+          features: { automations_v2: true, session_orchestration: true },
+        }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} {...props} />
+      </CapabilitiesProvider>
+    );
+  }
+
+  async function choose(label: string) {
+    fireEvent.keyDown(screen.getByTestId("task-trigger-type"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: label }));
+  }
+
+  it("is offered only when the server accepts session triggers", async () => {
+    render(dialog({}, false));
+    fireEvent.keyDown(screen.getByTestId("task-trigger-type"), { key: "Enter" });
+    await screen.findByRole("option", { name: "Schedule" });
+    expect(screen.queryByRole("option", { name: "Session events" })).not.toBeInTheDocument();
+  });
+
+  it("creates an automation that runs on session events instead of a schedule", async () => {
+    render(dialog());
+    await choose("Session events");
+    expect(screen.queryByTestId("schedule-preset-trigger")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-session-trigger-fields")).toBeVisible();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Reviewer" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), {
+      target: { value: "Review the session that finished." },
+    });
+    // Every event cleared blocks saving.
+    fireEvent.click(screen.getByTestId("task-session-event-turn.completed"));
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("task-session-event-turn.failed"));
+    fireEvent.click(screen.getByTestId("task-session-event-turn.completed"));
+    fireEvent.change(screen.getByTestId("task-session-title-filter"), {
+      target: { value: "  deploy " },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    const input = mutateAsync.mock.calls[0][0];
+    expect(input).toMatchObject({
+      templateId: "session",
+      name: "Reviewer",
+      prompt: "Review the session that finished.",
+      sessionTrigger: {
+        events: ["turn.completed", "turn.failed"],
+        titleContains: "deploy",
+        includeOwnSessions: false,
+      },
+    });
+    expect(input).not.toHaveProperty("rrule");
+  });
+
+  it("edits a session-triggered automation's events", async () => {
+    render(
+      dialog({
+        editingTask: scheduledTask({
+          rrule: null,
+          sessionTrigger: { events: ["input.requested"], includeOwnSessions: false },
+        }),
+      }),
+    );
+    expect(screen.queryByTestId("schedule-preset-trigger")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-session-event-input.requested")).toBeChecked();
+    fireEvent.click(screen.getByTestId("task-session-event-comment.created"));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input.sessionTrigger.events).toEqual(["input.requested", "comment.created"]);
+    expect(input).not.toHaveProperty("rrule");
+  });
+});

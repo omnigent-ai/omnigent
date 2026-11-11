@@ -396,3 +396,85 @@ describe("random worktree setting", () => {
     expect(task.baseBranch).toBe(baseBranch);
   });
 });
+
+describe("session triggers", () => {
+  const TRIGGER_WIRE = {
+    ...TASK_WIRE,
+    rrule: null,
+    trigger_config: {
+      provider: "omnigent",
+      events: ["turn.completed"],
+      title_contains: "deploy",
+      include_own_sessions: false,
+    },
+  };
+
+  it("reads an omnigent trigger and ignores other providers", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(TRIGGER_WIRE));
+    const task = await getScheduledTask("st_1");
+    expect(task.rrule).toBeNull();
+    expect(task.sessionTrigger).toEqual({
+      events: ["turn.completed"],
+      agentId: null,
+      projectId: null,
+      titleContains: "deploy",
+      includeOwnSessions: false,
+    });
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ ...TRIGGER_WIRE, trigger_config: { provider: "jira" } }),
+    );
+    expect((await getScheduledTask("st_1")).sessionTrigger).toBeNull();
+    fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+    expect((await getScheduledTask("st_1")).sessionTrigger).toBeNull();
+  });
+
+  it("sends trigger_config instead of rrule on create, and on update", async () => {
+    fetchMock.mockResolvedValue(mockResponse(TRIGGER_WIRE));
+    await createScheduledTask({
+      name: "Reviewer",
+      prompt: "Review it.",
+      agentId: "ag_1",
+      sessionTrigger: { events: ["turn.failed"], titleContains: "", includeOwnSessions: true },
+    });
+    const created = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(created).not.toHaveProperty("rrule");
+    expect(created.trigger_config).toEqual({
+      provider: "omnigent",
+      events: ["turn.failed"],
+      include_own_sessions: true,
+    });
+    await updateScheduledTask("st_1", { sessionTrigger: { events: ["session.created"] } });
+    const updated = JSON.parse(fetchMock.mock.calls[1][1].body as string);
+    expect(updated).toEqual({
+      trigger_config: { provider: "omnigent", events: ["session.created"] },
+    });
+  });
+
+  it("reads the events a run was started by", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        runs: [
+          {
+            id: "r1",
+            scheduled_task_id: "st_1",
+            status: "scheduled",
+            scheduled_at: 1,
+            conversation_id: null,
+            fired_at: null,
+            finished_at: null,
+            error_code: null,
+            event: {
+              events: [{ type: "turn.completed", session_id: "s1", key: "k" }, { type: 3 }],
+            },
+            conversation_updated_at: null,
+            conversation_status: null,
+            viewer_last_seen: null,
+            viewer_unread: null,
+          },
+        ],
+      }),
+    );
+    const [run] = await listScheduledTaskRuns("st_1");
+    expect(run.events).toEqual([{ type: "turn.completed", sessionId: "s1" }]);
+  });
+});
