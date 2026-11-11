@@ -234,6 +234,7 @@ describe("ProjectSettingsDialog", () => {
   describe("sandbox default", () => {
     const APP_REPO = "https://github.com/example/app";
     const RUNTIME_REPO = "https://github.com/example/runtime";
+    const TOOLS_REPO = "https://github.com/example/tools";
     beforeEach(() => {
       serverInfoMock.mockReturnValue({
         managed_sandboxes_enabled: true,
@@ -243,6 +244,7 @@ describe("ProjectSettingsDialog", () => {
             repo_catalog: [
               { name: "app", url: APP_REPO },
               { name: "runtime", url: RUNTIME_REPO },
+              { name: "tools", url: TOOLS_REPO },
             ],
           },
         },
@@ -273,6 +275,62 @@ describe("ProjectSettingsDialog", () => {
           sandbox_workspaces: [RUNTIME_REPO],
         }),
       );
+    });
+
+    it("keeps a stored branch and other repositories the catalog field doesn't show", async () => {
+      getProjectMock.mockResolvedValue({
+        id: "p_1",
+        name: "Work",
+        config: { host_id: "__sandbox__", sandbox_workspaces: [`${APP_REPO}#dev`, RUNTIME_REPO] },
+      });
+      renderDialog();
+      await waitFor(() =>
+        expect(screen.getByTestId("project-settings-sandbox-repository")).toHaveTextContent("app"),
+      );
+      fireEvent.click(screen.getByTestId("project-settings-save"));
+      await waitFor(() =>
+        expect(updateMock).toHaveBeenCalledWith("p_1", {
+          host_id: "__sandbox__",
+          sandbox_workspaces: [`${APP_REPO}#dev`, RUNTIME_REPO],
+        }),
+      );
+
+      // Changing the first repository keeps the others, without duplicating one.
+      updateMock.mockClear();
+      await pickSelectOption("project-settings-sandbox-repository", "tools");
+      fireEvent.click(screen.getByTestId("project-settings-save"));
+      await waitFor(() =>
+        expect(updateMock).toHaveBeenCalledWith("p_1", {
+          host_id: "__sandbox__",
+          sandbox_workspaces: [TOOLS_REPO, RUNTIME_REPO],
+        }),
+      );
+    });
+
+    it("blocks saving while a typed repository URL hasn't been added", async () => {
+      // No catalog: the composer's repository picker takes a URL.
+      serverInfoMock.mockReturnValue({
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "box",
+        sandbox_provider_capabilities: { box: {} },
+        enabled_connections: [],
+      });
+      getProjectMock.mockResolvedValue({
+        id: "p_1",
+        name: "Work",
+        config: { host_id: "__sandbox__" },
+      });
+      renderDialog();
+      const url = await screen.findByPlaceholderText("https://github.com/org/repo");
+      const save = screen.getByTestId("project-settings-save");
+      await waitFor(() => expect(save).toBeEnabled());
+
+      fireEvent.change(url, { target: { value: APP_REPO } });
+      expect(save).toBeDisabled();
+      expect(screen.getByRole("alert")).toHaveTextContent(/add or clear the repository url/i);
+
+      fireEvent.change(url, { target: { value: "" } });
+      expect(save).toBeEnabled();
     });
 
     it("drops the stored repositories when the default moves to a host", async () => {
