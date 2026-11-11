@@ -905,6 +905,28 @@ async def test_a_lost_create_response_says_the_reminder_may_exist() -> None:
     assert "sys_scheduled_task_list" in out["error"]
 
 
+class _UnreadableResp(_Resp):
+    def json(self) -> object:
+        raise json.JSONDecodeError("Expecting value", "<truncated>", 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+async def test_an_unreadable_create_reply_says_the_reminder_may_exist() -> None:
+    client = _ReminderClient(_UnreadableResp(status_code=200))
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_set",
+            json.dumps({"message": "ping", "delay_seconds": 600}),
+            server_client=client,
+            conversation_id="conv_1",
+        )
+    )
+    assert "may still have been created" in out["error"]
+    assert "sys_scheduled_task_list" in out["error"]
+    assert not [call for call in client.calls if call[0] == "DELETE"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_frozen_now")
 async def test_a_failed_lookup_before_creating_makes_no_such_warning() -> None:

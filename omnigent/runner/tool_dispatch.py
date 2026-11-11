@@ -4949,6 +4949,16 @@ async def _project_id_for_name(server_client: httpx.AsyncClient, name: str) -> s
     return project_id
 
 
+def _reminder_may_exist(tool_name: str, problem: str) -> str:
+    """An error for a create that may have been saved, so a retry doesn't duplicate it."""
+    return json.dumps(
+        {
+            "error": f"{tool_name}: {problem}. It may still have been created: check "
+            "sys_scheduled_task_list for a 'Reminder: ...' automation before setting it again."
+        }
+    )
+
+
 _REMINDER_SESSION_PARAMS = {
     "include_items": "false",
     "include_usage": "false",
@@ -5081,18 +5091,16 @@ async def _execute_reminder_set(
         )
     except Exception as exc:  # noqa: BLE001
         # The server may have saved the reminder before its response was lost.
-        return json.dumps(
-            {
-                "error": f"{tool_name}: the request to create the reminder failed ({exc}). "
-                "It may still have been created: check sys_scheduled_task_list for a "
-                "'Reminder: ...' automation before setting it again."
-            }
-        )
+        return _reminder_may_exist(tool_name, f"the request to create the reminder failed ({exc})")
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"server returned {resp.status_code}", "details": resp.text[:1000]}
         )
-    task = _string_object_dict(resp.json()) or {}
+    try:
+        task = _string_object_dict(resp.json()) or {}
+    except ValueError:
+        # Accepted, but the body can't be read: the reminder likely exists.
+        return _reminder_may_exist(tool_name, "the server's reply to the create was unreadable")
     mismatch = await _reminder_schedule_mismatch(server_client, task, when)
     if mismatch is not None:
         return mismatch
