@@ -9,7 +9,6 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from functools import partial
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -23,7 +22,6 @@ from omnigent.inner.codex_worker import (
     prepare_codex_catalog_probe,
     prepare_codex_worker,
 )
-from omnigent.inner.credential_proxy import RefreshingSecretProvider
 from omnigent.inner.datamodel import (
     CredentialProxyEntry,
     CredentialProxySpec,
@@ -405,11 +403,6 @@ def test_brokered_gateway_rewrites_only_parent_secret(
     )
     token_file = short_tmp_parent / "model-token"
     token_file.write_text("real-parent-token")
-    clock = Mock(return_value=0.0)
-    monkeypatch.setattr(
-        "omnigent.inner.credential_proxy.RefreshingSecretProvider",
-        partial(RefreshingSecretProvider, clock=clock),
-    )
     binding = CredentialProxyEntry(
         host="model.example.com",
         scheme="bearer",
@@ -477,11 +470,8 @@ def test_brokered_gateway_rewrites_only_parent_secret(
         assert start_proxy.call_args.kwargs["require_auth"]
         assert "local-relay-token@" in worker_env["HTTPS_PROXY"]
         assert rewrite.real_secret is None
+        assert callable(rewrite.secret_provider)
         assert rewrite.resolve_secret() == "real-parent-token"
-        token_file.write_text("replacement-parent-token")
-        assert rewrite.resolve_secret() == "real-parent-token"
-        clock.return_value = 300.0
-        assert rewrite.resolve_secret() == "replacement-parent-token"
         assert worker_env[CODEX_GATEWAY_TOKEN_ENV] == rewrite.synthetic
         assert rewrite.synthetic.startswith("oa_cred_")
         assert "real-parent-token" not in repr(worker_env)

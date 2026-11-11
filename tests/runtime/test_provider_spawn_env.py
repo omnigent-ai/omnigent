@@ -414,6 +414,18 @@ def test_codex_gateway_binding_uses_only_placeholder_auth(config_home: Path) -> 
     assert env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] == "true"
     assert "/private/model-token.sock" not in env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"]
 
+    spec.executor.config.pop("broker_gateway")
+    with pytest.raises(OmnigentError, match=r"requires executor\.config\.broker_gateway: true"):
+        _build_codex_spawn_env(spec)
+    spec.executor.config["broker_gateway"] = False
+    with pytest.raises(OmnigentError, match=r"requires executor\.config\.broker_gateway: true"):
+        _build_codex_spawn_env(spec)
+    for value in (None, 0, 1, "true", "false"):
+        spec.executor.config["broker_gateway"] = value
+        with pytest.raises(OmnigentError, match="broker_gateway must be a boolean"):
+            _build_codex_spawn_env(spec)
+    spec.executor.config["broker_gateway"] = True
+
     for key, unsafe_values in (
         ("web_search", (None, True, "false", 0)),
         ("disable_native_tools", (None, False, "true", 1)),
