@@ -753,7 +753,8 @@ def harness_setup_hint(harness: str | None) -> str:
 
     UI-installable harnesses also name Settings › Harnesses, which installs
     through the host itself: ``omni setup`` run in a terminal can find a CLI
-    the host process can't, report it ready, and leave the host unfixed.
+    the host process can't, report it ready, and leave the host unfixed. The
+    host can't tell whether the server enables that setup, hence "if available".
 
     :param harness: An executor harness identifier, e.g. ``"cursor-native"``,
         ``"claude-native"``, or ``"codex"``; ``None`` falls back to the
@@ -792,7 +793,7 @@ def harness_setup_hint(harness: str | None) -> str:
             "the CLI and set a default credential"
         )
     if spec is not None and harness and ui_install_key(harness) is not None:
-        hint += f", or set up {spec.display} for that host in Settings › Harnesses"
+        hint += f", or set up {spec.display} for that host in Settings › Harnesses if available"
     return hint
 
 

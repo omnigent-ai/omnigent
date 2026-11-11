@@ -713,7 +713,9 @@ def test_setup_hint_for_ui_installable_cli_names_host_harness_settings(
     """A terminal-run ``omni setup`` can report a CLI ready that the host
     process can't find, so the hint also names the host-side Settings route."""
     hint = hi.harness_setup_hint(harness)
-    assert hint.endswith(f", or set up {display} for that host in Settings › Harnesses")
+    assert hint.endswith(
+        f", or set up {display} for that host in Settings › Harnesses if available"
+    )
 
 
 @pytest.mark.parametrize("harness", ["cursor-native", "kiro-native", "claude-sdk", None])

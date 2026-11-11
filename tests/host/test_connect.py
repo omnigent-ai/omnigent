@@ -1657,7 +1657,11 @@ async def test_handle_launch_bound_preflight_waits_only_the_readiness_probe_budg
             ("cursor.com/install", "cursor-agent login"),
             ("omni setup", "Settings › Harnesses"),
         ),
-        ("codex-native", ("omni setup", "set up Codex for that host in Settings › Harnesses"), ()),
+        (
+            "codex-native",
+            ("omni setup", "set up Codex for that host in Settings › Harnesses if available"),
+            (),
+        ),
     ],
 )
 async def test_handle_launch_native_refusal_names_the_harness_remedy(
