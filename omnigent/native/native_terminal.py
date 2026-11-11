@@ -14,7 +14,8 @@ from omnigent.host.daemon_launch import error_text
 from omnigent.util.http_retry import bounded_retry_after_seconds
 
 DAEMON_HOST_ONLINE_TIMEOUT_S = 30.0
-DAEMON_RUNNER_ONLINE_TIMEOUT_S = 60.0
+# Match the host's own never-connected deadline; slow tunnel handshakes retry well past 60s.
+DAEMON_RUNNER_ONLINE_TIMEOUT_S = 180.0
 DAEMON_TERMINAL_READY_TIMEOUT_S = 60.0
 _HTTP_429_RETRY_DELAYS_S = (0.5, 1.0, 2.0, 4.0)
 _HTTP_429_MAX_RETRY_AFTER_S = 10.0
