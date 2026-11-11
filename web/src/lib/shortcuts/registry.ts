@@ -3,7 +3,7 @@
 
 import { isMacPlatform } from "@/lib/hotkeys";
 import { isNativeShell, supportsDesktopCommands } from "@/lib/nativeBridge";
-import { type Chord, chordMatches, type KeyChordInput } from "@/lib/shortcuts/chord";
+import { type Chord, chordKeys, chordMatches, type KeyChordInput } from "@/lib/shortcuts/chord";
 
 /** What a binding's chords depend on. */
 export interface ShortcutEnvironment {
@@ -248,4 +248,11 @@ export function matchesShortcut(
   environment?: Partial<ShortcutEnvironment>,
 ): boolean {
   return matchedShortcutChordIndex(input, id, environment) !== -1;
+}
+
+/** Key caps for the first of `id`'s chords here, or none when it has no chord. */
+export function shortcutKeys(id: ShortcutId, environment?: Partial<ShortcutEnvironment>): string[] {
+  const resolved = currentShortcutEnvironment(environment);
+  const chord = activeShortcutChords(id, resolved)[0];
+  return chord ? chordKeys(chord, resolved.mac) : [];
 }
