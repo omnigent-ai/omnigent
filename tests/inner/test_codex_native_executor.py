@@ -2308,6 +2308,7 @@ def test_input_file_text_is_inlined_as_a_text_item(
         pytest.param(20, [1048577], id="one-large-file"),
         pytest.param(20, [600000, 600000], id="aggregate-files"),
         pytest.param(700000, [400000], id="prompt-and-file"),
+        pytest.param(950000, [100000], id="near-limit-prompt-and-small-file"),
     ],
 )
 def test_text_attachments_over_input_limit_are_referenced_without_losing_bytes(
@@ -2787,13 +2788,14 @@ def test_oversized_text_file_spills_under_its_own_name(tmp_path: Path) -> None:
     [(900_000, False), (900_001, True)],
     ids=["at-threshold", "past-threshold"],
 )
+@pytest.mark.parametrize("character", ["c", "é", "🦉"], ids=["ascii", "utf8", "non-bmp"])
 def test_text_spills_only_past_the_inline_threshold(
-    tmp_path: Path, chars: int, spilled: bool
+    tmp_path: Path, chars: int, spilled: bool, character: str
 ) -> None:
     """Text up to the threshold stays inline; one character more moves to a file."""
     from omnigent.inner.codex_native_executor import _content_to_input_items
 
-    text = "c" * chars
+    text = character * chars
 
     items = _content_to_input_items([_input_text(text)], tmp_path)
 
@@ -2846,7 +2848,10 @@ def test_small_text_and_text_files_are_sent_inline_unchanged(tmp_path: Path) -> 
     assert not pasted_text_cache_dir(tmp_path).exists()
 
 
-def test_turn_text_total_stays_under_the_limit_across_blocks(tmp_path: Path) -> None:
+@pytest.mark.parametrize("character", ["A", "🦉"], ids=["ascii", "non-bmp"])
+def test_turn_text_total_stays_under_the_limit_across_blocks(
+    tmp_path: Path, character: str
+) -> None:
     """
     Blocks that each fit still share one limit: the largest spill first.
 
@@ -2859,7 +2864,7 @@ def test_turn_text_total_stays_under_the_limit_across_blocks(tmp_path: Path) -> 
     items = _content_to_input_items(
         [
             _input_text(question),
-            _input_text("A" * 500_000),
+            _input_text(character * 500_000),
             _input_text("B" * 450_000),
             _input_text("C" * 400_000),
         ],
@@ -2868,7 +2873,7 @@ def test_turn_text_total_stays_under_the_limit_across_blocks(tmp_path: Path) -> 
 
     assert len(items) == 4
     assert items[0] == {"type": "text", "text": question}
-    assert _referenced_file(items[1]).read_text(encoding="utf-8") == "A" * 500_000
+    assert _referenced_file(items[1]).read_text(encoding="utf-8") == character * 500_000
     assert items[2] == {"type": "text", "text": "B" * 450_000}
     assert items[3] == {"type": "text", "text": "C" * 400_000}
     assert _text_chars(items) <= 900_000

@@ -1684,9 +1684,9 @@ def _content_to_input_items(
     URI inline as text would blow past the app-server's 1 MiB input
     limit. Files inline their decoded text when they are textual;
     binary files are materialized and referenced by path in a text
-    item so the model can open them with its tools. The same limit
-    caps the turn's total text, so past :data:`_MAX_INLINE_TEXT_CHARS`
-    the largest text moves to a file the same way.
+    item so the model can open them with its tools. Text uploads share
+    Codex's total text limit. Authored-only pastes use
+    :data:`_MAX_INLINE_TEXT_CHARS` as a lower spilling threshold.
 
     :param content: Message content, e.g. a string or a list of content
         blocks like ``{"type": "input_text", "text": "..."}`` and
@@ -1837,7 +1837,7 @@ def _spill_oversized_text(
     """
     total = sum(len(text) for item in items if isinstance(text := item.get("text"), str))
     has_upload = any(entry.kind == "file" for entry in inline.values())
-    inline_limit = 1_048_576 if has_upload else _MAX_INLINE_TEXT_CHARS
+    inline_limit = _MAX_CODEX_TEXT_INPUT_CHARS if has_upload else _MAX_INLINE_TEXT_CHARS
     if total <= inline_limit:
         return set()
     # Even a one-character file name makes a reference this long.
@@ -1847,7 +1847,7 @@ def _spill_oversized_text(
     for index in sorted(inline, key=lambda i: (inline[i].kind != "file", -len(inline[i].text))):
         entry = inline[index]
         if entry.kind == "text" and (
-            total <= _MAX_INLINE_TEXT_CHARS or len(entry.text) <= shortest_reference
+            total <= inline_limit or len(entry.text) <= shortest_reference
         ):
             break
         path = (
