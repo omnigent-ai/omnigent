@@ -853,6 +853,7 @@ async def test_late_create_refuses_a_one_time_rule_instead_of_moving_it_a_year(
     )
     assert resp.status_code == 400, resp.text
     assert "The task was not created." in resp.text
+    assert "client clock behind the server's" in resp.text
     assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
 
 

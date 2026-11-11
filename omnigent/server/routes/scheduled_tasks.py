@@ -994,7 +994,9 @@ def create_scheduled_tasks_router(
                 raise OmnigentError(
                     "The schedule's first run would be "
                     f"{actual}, not {datetime.fromtimestamp(exc.expected, UTC).isoformat()} "
-                    "as requested. The task was not created.",
+                    "as requested, because the server recorded the task after that time "
+                    "(a late request, or a client clock behind the server's). "
+                    "The task was not created.",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
             if isinstance(exc, RRuleSearchError):
