@@ -3101,7 +3101,6 @@ function AppShellImpl() {
           )}
           <AppShellOverlays
             isEmbedded={isEmbedded}
-            serverInfo={serverInfo}
             sessionSearch={sessionSearch}
             commandPaletteOpen={commandPaletteOpen}
             setCommandPaletteOpen={setCommandPaletteOpen}
