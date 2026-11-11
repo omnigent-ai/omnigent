@@ -38,11 +38,19 @@ _TOKEN = "runner-binding-token"
 
 
 class _AgentCacheStub:
-    """Loads a spec whose ``user_inbox`` group is on only for the Inbox agent."""
+    """Loads a spec whose ``user_inbox`` group is on only for the Inbox agent.
+
+    Each agent has one named sub-agent whose opt-in is the opposite of its own.
+    """
 
     def load(self, agent_id: str, bundle_location: str, **_: Any) -> SimpleNamespace:
-        groups = ToolGroupsConfig(user_inbox=agent_id == _INBOX_AGENT)
-        return SimpleNamespace(spec=SimpleNamespace(tool_groups=groups))
+        posts = agent_id == _INBOX_AGENT
+        child = SimpleNamespace(name="child", tool_groups=ToolGroupsConfig(user_inbox=not posts))
+        return SimpleNamespace(
+            spec=SimpleNamespace(
+                tool_groups=ToolGroupsConfig(user_inbox=posts), sub_agents=[child]
+            )
+        )
 
 
 @pytest.fixture()
@@ -90,9 +98,17 @@ async def client(stores: SimpleNamespace, tmp_path: Path) -> AsyncIterator[httpx
         yield c
 
 
-def _session(stores: SimpleNamespace, agent_id: str = _INBOX_AGENT, *, bound: bool = True) -> str:
+def _session(
+    stores: SimpleNamespace,
+    agent_id: str = _INBOX_AGENT,
+    *,
+    bound: bool = True,
+    sub_agent_name: str | None = None,
+) -> str:
     runner_id = token_bound_runner_id(_TOKEN) if bound else None
-    return stores.conversations.create_conversation(agent_id=agent_id, runner_id=runner_id).id
+    return stores.conversations.create_conversation(
+        agent_id=agent_id, runner_id=runner_id, sub_agent_name=sub_agent_name
+    ).id
 
 
 def _from(session_id: str, token: str = _TOKEN) -> dict[str, str]:
@@ -235,6 +251,22 @@ async def test_an_expired_item_is_replaced(
 
     assert again["duplicate"] is False
     assert again["item"]["id"] != first["item"]["id"]
+
+
+@pytest.mark.parametrize(
+    ("agent_id", "expected"),
+    [(_PLAIN_AGENT, 200), (_INBOX_AGENT, 403)],
+    ids=["child-opts-in", "child-opts-out"],
+)
+async def test_post_checks_the_named_sub_agents_opt_in(
+    client: httpx.AsyncClient, stores: SimpleNamespace, agent_id: str, expected: int
+) -> None:
+    """A named child session posts under its own spec's tool groups, not its root's."""
+    session_id = _session(stores, agent_id, sub_agent_name="child")
+
+    resp = await client.post("/v1/inbox/items", json=_body(), headers=_from(session_id))
+
+    assert resp.status_code == expected, resp.text
 
 
 @pytest.mark.parametrize(

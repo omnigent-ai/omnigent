@@ -4895,7 +4895,7 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "workspace",
     "host_id",
     "execution_target",
-    "state",
+    "status",
     "project_id",
 )
 _SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
@@ -5078,7 +5078,7 @@ _USER_INBOX_LIST_FIELDS = (
     "title",
     "topic",
     "links",
-    "state",
+    "status",
     "resolution",
     "resolution_action",
     "feedback_text",

@@ -205,6 +205,7 @@ function automationInboxStub(overrides: Record<string, unknown> = {}) {
 
 function proactiveInboxStub(overrides: Record<string, unknown> = {}) {
   return {
+    enabled: true,
     items: [],
     unreadCount: 0,
     unreadCountCapped: false,
@@ -1801,6 +1802,23 @@ describe("agent suggestions", () => {
 
     expect(screen.queryByRole("tab", { name: "Omni Advisor" })).toBeNull();
     expect(screen.getByRole("tab", { name: "All" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("drops an expanded suggestion once Omni Advisor is turned off", () => {
+    stub({ items: [suggestion()], unreadCount: 1 });
+    renderPage();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+    expect(screen.getByRole("region", { name: "Source" })).toBeInTheDocument();
+
+    // Another client turned the agent off; the next settings refresh disables the hook.
+    advisor.settings = { enabled: false };
+    stub({ items: [], enabled: false });
+    selectTab("Unread");
+    selectTab("All");
+
+    expect(screen.queryByText("Ramp up the flag")).toBeNull();
   });
 
   it("keeps an expanded suggestion on the Unread tab after it is marked read", () => {
