@@ -157,6 +157,7 @@ def run_grok_native(
     grok_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     auto_open_conversation: bool = False,
+    prompt: str | None = None,
 ) -> None:
     """
     Launch the Grok native session in an Omnigent terminal.
@@ -167,6 +168,9 @@ def run_grok_native(
     :param resume_picker: ``True`` runs the grok-native picker.
     :param auto_open_conversation: When ``True``, open the browser
         conversation URL after launch.
+    :param prompt: Optional initial prompt posted into the new session; when
+        set the launch skips the interactive TTY attach so headless callers
+        (e.g. ``omni run --harness grok-native -p ...``) can drive a turn.
     :returns: None after the terminal attach session ends.
     """
     grok_args = _normalize_extra_args(
@@ -187,6 +191,7 @@ def run_grok_native(
             resume_picker=resume_picker,
             grok_args=grok_args,
             auto_open_conversation=auto_open_conversation,
+            prompt=prompt,
         )
 
 
@@ -228,6 +233,7 @@ def _run_with_remote_server(
     resume_picker: bool,
     grok_args: tuple[str, ...],
     auto_open_conversation: bool = False,
+    prompt: str | None = None,
 ) -> None:
     """
     Launch Grok on an Omnigent server via a daemon-spawned runner.
@@ -279,6 +285,19 @@ def _run_with_remote_server(
             )
             if prepared.cold_resumed:
                 echo_native_cold_resume_hint(agent_label="Grok Build")
+            if prompt:
+                from omnigent.native.native_terminal import post_initial_prompt
+
+                await post_initial_prompt(
+                    base_url=base_url,
+                    headers=headers,
+                    session_id=prepared.session_id,
+                    prompt=prompt,
+                    auth=None,
+                    harness_name="Grok",
+                )
+                click.echo("Prompt submitted; watch the session in the web UI.", err=True)
+                return
             await _attach_terminal_resource(prepared)
             if resolved_session_id is None:
                 echo_native_resume_hint(

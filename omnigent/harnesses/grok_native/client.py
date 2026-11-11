@@ -173,7 +173,7 @@ class GrokAcpClient:
                         )
                     else:
                         fut.set_result(msg.get("result"))
-                elif msg.get("method") == "session/update":
+                elif msg.get("method") in ("session/update", "_x.ai/session/update"):
                     if self._update_handler is not None:
                         try:
                             self._update_handler(msg.get("params") or {})

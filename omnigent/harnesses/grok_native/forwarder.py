@@ -10,7 +10,10 @@ so the reply renders in the web UI. See docs/GROK_NATIVE_DESIGN.md.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -78,6 +81,8 @@ async def post_mirrored_item(
                 "response_id": item.response_id,
             },
         }
+    if not item.response_id:
+        body["data"].pop("response_id", None)
     resp = await client.post(url, headers=headers, json=body)
     resp.raise_for_status()
 
@@ -142,8 +147,139 @@ def make_update_sink(
     return _on_update, task
 
 
+def grok_updates_log_path(workspace: str, grok_session_id: str) -> Path:
+    """Return the ``updates.jsonl`` grok persists for one session.
+
+    Serve writes ``~/.grok/sessions/<percent-encoded cwd>/<session_id>/updates.jsonl``
+    with the same ``session/update`` payloads the WebSocket emits — so the
+    forwarder tails the file rather than racing a per-connection stream.
+    """
+    from urllib.parse import quote
+
+    slug = quote(str(Path(workspace).resolve()), safe="")
+    return Path.home() / ".grok" / "sessions" / slug / grok_session_id / "updates.jsonl"
+
+
+async def follow_updates_log(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    updates_path: Path,
+    offset_path: Path,
+    agent_name: str = _DEFAULT_AGENT_NAME,
+    poll_interval_s: float = 0.5,
+) -> None:
+    """Tail *updates_path* and mirror each ``session/update`` into Omnigent.
+
+    Resumes at the byte offset persisted in *offset_path* so a recreated serve
+    for the same Omnigent session does not re-mirror history; a fresh grok
+    session starts at 0. ``turn_completed`` drives ``external_session_status``
+    edges (the pane carries no PTY-activity watcher signal).
+    """
+    offset = 0
+    with contextlib.suppress(OSError, ValueError):
+        offset = int(offset_path.read_text().strip())
+    running = False
+    while True:
+        if not updates_path.exists():
+            await asyncio.sleep(poll_interval_s)
+            continue
+        try:
+            with updates_path.open("rb") as fh:
+                fh.seek(offset)
+                chunk = fh.read()
+                offset = fh.tell()
+        except OSError:
+            await asyncio.sleep(poll_interval_s)
+            continue
+        for line in chunk.splitlines():
+            try:
+                record = json.loads(line)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            params = record.get("params")
+            if not isinstance(params, dict):
+                continue
+            update = params.get("update") or {}
+            session_update = update.get("sessionUpdate")
+            if session_update == "turn_completed":
+                if running:
+                    running = False
+                    try:
+                        await post_status(
+                            client,
+                            base_url=base_url,
+                            headers=headers,
+                            session_id=session_id,
+                            status="idle",
+                        )
+                    except Exception:
+                        logger.exception("grok forwarder idle edge failed for %s", session_id)
+                continue
+            for item in session_update_to_items(params):
+                if not running:
+                    running = True
+                    try:
+                        await post_status(
+                            client,
+                            base_url=base_url,
+                            headers=headers,
+                            session_id=session_id,
+                            status="running",
+                        )
+                    except Exception:
+                        logger.exception("grok forwarder running edge failed for %s", session_id)
+                try:
+                    await post_mirrored_item(
+                        client,
+                        base_url=base_url,
+                        headers=headers,
+                        session_id=session_id,
+                        item=item,
+                        agent_name=agent_name,
+                    )
+                except Exception:
+                    logger.exception(
+                        "grok forwarder failed to mirror %s for %s", item.kind, session_id
+                    )
+        with contextlib.suppress(OSError):
+            offset_path.write_text(str(offset))
+        await asyncio.sleep(poll_interval_s)
+
+
+def start_updates_follower(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    workspace: str,
+    grok_session_id: str,
+    bridge_dir: Path,
+    agent_name: str = _DEFAULT_AGENT_NAME,
+) -> asyncio.Task[None]:
+    """Start the updates-log follower as a named background task."""
+    return asyncio.create_task(
+        follow_updates_log(
+            client,
+            base_url=base_url,
+            headers=headers,
+            session_id=session_id,
+            updates_path=grok_updates_log_path(workspace, grok_session_id),
+            offset_path=Path(bridge_dir) / "updates.offset",
+            agent_name=agent_name,
+        ),
+        name=f"grok-forwarder-{session_id}",
+    )
+
+
 __all__ = [
+    "follow_updates_log",
+    "grok_updates_log_path",
     "make_update_sink",
     "post_mirrored_item",
     "post_status",
+    "start_updates_follower",
 ]

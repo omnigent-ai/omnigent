@@ -10625,7 +10625,7 @@ async def _auto_create_grok_terminal(
     )
     from omnigent.harnesses.grok_native.client import GrokAcpClient, GrokAcpError
     from omnigent.harnesses.grok_native.credentials import resolve_grok_executable
-    from omnigent.harnesses.grok_native.forwarder import make_update_sink
+    from omnigent.harnesses.grok_native.forwarder import start_updates_follower
     from omnigent.harnesses.grok_native.serve import (
         build_grok_serve_endpoint,
         grok_serve_argv,
@@ -10735,16 +10735,19 @@ async def _auto_create_grok_terminal(
         ),
     )
 
-    # Forwarder: session/update notifications -> mirrored conversation items.
-    # ``server_client`` is already authenticated for the runner->server channel.
-    if server_client is not None:
-        sink, forwarder_task = make_update_sink(
+    # Forwarder: tail the session's persisted updates.jsonl -> mirrored items.
+    # ``session/update`` only reaches the prompting WS connection (verified),
+    # so the durable session log is the transport-independent mirror source.
+    if server_client is not None and grok_session_id:
+        forwarder_task = start_updates_follower(
             server_client,
             base_url=str(server_client.base_url).rstrip("/"),
             headers={},
             session_id=session_id,
+            workspace=workspace,
+            grok_session_id=grok_session_id,
+            bridge_dir=bridge_dir,
         )
-        client.set_update_handler(sink)
         _register_auto_forwarder_task(session_id, forwarder_task)
 
     publish_event(
