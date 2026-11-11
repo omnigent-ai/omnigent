@@ -13,7 +13,7 @@ import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import type { AnyBlock } from "@/lib/blocks";
 import { setEmbedRoot } from "@/lib/host";
-import { ShellCommandRunnerContext } from "@/lib/shellCommand";
+import { AssistantReplyTextContext, ShellCommandRunnerContext } from "@/lib/shellCommand";
 import { useChatStore } from "@/store/chatStore";
 import { MermaidPreview } from "@/shell/MermaidPreview";
 import { Reasoning, ReasoningContent } from "./reasoning";
@@ -603,7 +603,9 @@ describe("MessageResponse run in shell", () => {
     const ran: string[] = [];
     render(
       <ShellCommandRunnerContext.Provider value={(code) => ran.push(code)}>
-        <MessageResponse>{"```bash\nnpm install\nnpm test\n```"}</MessageResponse>
+        <AssistantReplyTextContext.Provider value>
+          <MessageResponse>{"```bash\nnpm install\nnpm test\n```"}</MessageResponse>
+        </AssistantReplyTextContext.Provider>
       </ShellCommandRunnerContext.Provider>,
     );
 
@@ -620,7 +622,22 @@ describe("MessageResponse run in shell", () => {
   ])("does not offer %s", async (_case, markdown) => {
     render(
       <ShellCommandRunnerContext.Provider value={() => {}}>
-        <MessageResponse>{markdown}</MessageResponse>
+        <AssistantReplyTextContext.Provider value>
+          <MessageResponse>{markdown}</MessageResponse>
+        </AssistantReplyTextContext.Provider>
+      </ShellCommandRunnerContext.Provider>,
+    );
+
+    await screen.findByRole("button", { name: "Copy Code" });
+    expect(screen.queryByRole("button", { name: "Run in shell" })).toBeNull();
+  });
+
+  it("does not offer shell code blocks outside assistant reply text", async () => {
+    // WHY: user messages and tool output can render a truncated preview of a
+    // block (a collapsed long message), which must not run.
+    render(
+      <ShellCommandRunnerContext.Provider value={() => {}}>
+        <MessageResponse>{"```bash\nls -la\n```"}</MessageResponse>
       </ShellCommandRunnerContext.Provider>,
     );
 
@@ -629,7 +646,11 @@ describe("MessageResponse run in shell", () => {
   });
 
   it("does not offer shell code blocks without a runner", async () => {
-    render(<MessageResponse>{"```bash\nls -la\n```"}</MessageResponse>);
+    render(
+      <AssistantReplyTextContext.Provider value>
+        <MessageResponse>{"```bash\nls -la\n```"}</MessageResponse>
+      </AssistantReplyTextContext.Provider>,
+    );
 
     await screen.findByRole("button", { name: "Copy Code" });
     expect(screen.queryByRole("button", { name: "Run in shell" })).toBeNull();

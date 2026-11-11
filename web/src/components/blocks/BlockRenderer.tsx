@@ -29,6 +29,7 @@ import type { SessionStatus } from "@/lib/types";
 import type { ActiveResponse } from "@/store/types";
 import { cn } from "@/lib/utils";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
+import { AssistantReplyTextContext } from "@/lib/shellCommand";
 import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
 import { SlashCommandCard } from "./SlashCommandCard";
@@ -890,14 +891,16 @@ function renderItem(
           data-testid="assistant-text-section"
           className={cn("min-w-0", followsText && "mt-2")}
         >
-          <FilePathAwareMessageResponse
-            className="chat-markdown text-message"
-            allowWorkspaceImages
-            mode={isTextStreaming || keepsStreamingMode(item) ? "streaming" : "static"}
-            isStreaming={isTextStreaming}
-          >
-            {item.text}
-          </FilePathAwareMessageResponse>
+          <AssistantReplyTextContext.Provider value>
+            <FilePathAwareMessageResponse
+              className="chat-markdown text-message"
+              allowWorkspaceImages
+              mode={isTextStreaming || keepsStreamingMode(item) ? "streaming" : "static"}
+              isStreaming={isTextStreaming}
+            >
+              {item.text}
+            </FilePathAwareMessageResponse>
+          </AssistantReplyTextContext.Provider>
           {item.previewInterrupted && item.itemId?.startsWith("live:") && (
             <div
               role="status"

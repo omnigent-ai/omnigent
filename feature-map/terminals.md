@@ -16,7 +16,7 @@ reattach when the session moves to another host.
   Automatic recovery runs once when opening Terminal. Leaving it open does not
   revive an idle-reaped pane. Failed recovery stays manual across view switches.
 - `user-shell`: open a shell, type into it, and close it.
-- `run-in-shell`: a `bash`/`sh`/`shell`/`shellscript`/`zsh` code block in a chat
+- `run-in-shell`: a `bash`/`sh`/`shell`/`shellscript`/`zsh` code block in an agent
   reply has a "Run in shell" button that opens a new shell and runs the block in
   it, each line followed by Enter. It is offered only to a session owner whose
   agent has shells and whose host is reachable. `console` blocks and blocks

@@ -2209,9 +2209,15 @@ function AppShellImpl() {
       const sessionId = conversationId;
       const fullScreen = keystrokes !== undefined && isMobileViewport();
       if (!fullScreen) markShellCreateStarted();
+      // The launcher reports a predicted id first and the server's id if it differs.
+      let queuedId: string | null = null;
       createTerminal.launch(name, {
         onOpen: (info) => {
-          if (keystrokes !== undefined) queueShellKeystrokes(sessionId, info.id, keystrokes);
+          if (keystrokes !== undefined) {
+            if (queuedId !== null && queuedId !== info.id) dropShellKeystrokes(sessionId, queuedId);
+            queueShellKeystrokes(sessionId, info.id, keystrokes);
+            queuedId = info.id;
+          }
           if (fullScreen) openTerminalsPanelRef.current(terminalTabKey(info));
           else openTerminalTab(terminalTabKey(info));
         },

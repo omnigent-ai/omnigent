@@ -327,7 +327,11 @@ const getSessionSlimMock = vi.mocked(getSessionSlim);
 
 import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
-import { takeShellKeystrokes, useShellCommandRunner } from "@/lib/shellCommand";
+import {
+  AssistantReplyTextContext,
+  takeShellKeystrokes,
+  useShellCommandRunner,
+} from "@/lib/shellCommand";
 import { useForkDialog } from "./ForkDialogContext";
 import { useChatStore } from "@/store/chatStore";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
@@ -6466,7 +6470,15 @@ describe("AppShell run in shell", () => {
       data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
     } as ReturnType<typeof useSessionAgent>);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(sessionShellTree(client, "/c/conv_sdk", <RunnerProbe />));
+    render(
+      sessionShellTree(
+        client,
+        "/c/conv_sdk",
+        <AssistantReplyTextContext.Provider value>
+          <RunnerProbe />
+        </AssistantReplyTextContext.Provider>,
+      ),
+    );
     return launches;
   }
 
@@ -6510,6 +6522,17 @@ describe("AppShell run in shell", () => {
     expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open");
     expect(screen.getByTestId("terminals-panel").getAttribute("data-initial-key")).toContain("zsh");
     expect(takeShellKeystrokes("conv_sdk", shell.id)).toBe("npm install\rnpm test\r");
+  });
+
+  it("moves the keystrokes to the id the server returns", () => {
+    const launches = renderRunnerProbe(4);
+
+    fireEvent.click(screen.getByRole("button", { name: "run command" }));
+    act(() => launches[0].callbacks.onOpen?.(shell));
+    act(() => launches[0].callbacks.onOpen?.({ ...shell, id: "terminal_zsh_u-run1b" }));
+
+    expect(takeShellKeystrokes("conv_sdk", shell.id)).toBeNull();
+    expect(takeShellKeystrokes("conv_sdk", "terminal_zsh_u-run1b")).toBe("npm install\rnpm test\r");
   });
 
   it("tells the user when the shell can't be created and drops the keystrokes", () => {

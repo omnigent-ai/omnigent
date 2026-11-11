@@ -52,8 +52,17 @@ export type ShellCommandRunner = (code: string) => void;
 
 export const ShellCommandRunnerContext = createContext<ShellCommandRunner | null>(null);
 
+/**
+ * True inside an assistant reply's text, the only place Run in shell is offered:
+ * it is for commands the agent suggests, and other Markdown (a collapsed user
+ * message, tool output) can be a truncated preview of the real block.
+ */
+export const AssistantReplyTextContext = createContext(false);
+
+/** The runner for this code block, or ``null`` outside assistant reply text. */
 export function useShellCommandRunner(): ShellCommandRunner | null {
-  return useContext(ShellCommandRunnerContext);
+  const runner = useContext(ShellCommandRunnerContext);
+  return useContext(AssistantReplyTextContext) ? runner : null;
 }
 
 // Keystrokes waiting for a just-created shell's terminal view to reach its
