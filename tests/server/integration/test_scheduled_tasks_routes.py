@@ -843,12 +843,17 @@ async def test_one_time_rules_wait_for_their_release_feature(
     info = (await auth_client.get("/v1/info", headers=_headers())).json()
     assert info["scheduled_task_one_time"] is False
     rule, fire_at = _one_time_rule_in(hours=2)
-    for body in (
-        _create_body(rrule=rule, timezone="UTC"),
-        _create_body(rrule=rule, timezone="UTC", first_run_at=fire_at),
-    ):
-        resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
-        assert resp.status_code == 400, resp.text
+    one_time = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(rrule=rule, timezone="UTC"), headers=_headers()
+    )
+    assert one_time.status_code == 400, one_time.text
+    assert "fires only once" in one_time.text
+    # A recurring rule passes RRULE validation, so this reaches the first_run_at gate.
+    guarded = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(first_run_at=fire_at), headers=_headers()
+    )
+    assert guarded.status_code == 400, guarded.text
+    assert "first_run_at needs one-time automations" in guarded.text
     assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
 
 
