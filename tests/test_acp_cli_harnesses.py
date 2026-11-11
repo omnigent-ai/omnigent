@@ -136,6 +136,16 @@ def test_jcode_connect_injects_gateway_env_and_passthrough(
     assert {"JCODE_DBX_TOKEN", "JCODE_HOME", "JCODE_RUNTIME_DIR"} <= names
 
 
+def test_grok_row_names_xai_api_key_for_passthrough() -> None:
+    """The grok row's documented XAI_API_KEY auth must reach the CLI.
+
+    The ACP wrap's child env is deny-by-default; without the row's
+    env_passthrough the key is stripped and grok starts unauthenticated.
+    """
+    env = _build_acp_cli_spawn_env(_spec("grok"), harness="grok")
+    assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == "XAI_API_KEY"
+
+
 def test_jcode_no_connect_is_a_noop(monkeypatch: pytest.MonkeyPatch) -> None:
     """Off a managed-connect host (connect_jcode_gateway_env returns None), the jcode row's
     spawn env carries no JCODE_* vars and no passthrough — laptop/non-connect untouched."""
