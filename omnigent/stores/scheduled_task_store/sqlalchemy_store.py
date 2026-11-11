@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import json
 import logging
 import uuid
 from collections.abc import Callable
@@ -49,7 +50,9 @@ from omnigent.server.scheduled.run_reconciler import (
     STALE_RUN_MAX_AGE_SECONDS,
 )
 from omnigent.server.scheduled.schedule import (
+    EVENT_TRIGGER_KEY_PREFIX,
     continued_sandbox_host_id,
+    is_event_trigger_key,
     is_trigger_automation,
     next_scheduled_time,
     occurrence_host_id,
@@ -59,6 +62,7 @@ from omnigent.stores.host_store import delete_unused_host_in_session
 from omnigent.stores.scheduled_task_store import (
     AdoptOutcome,
     AutomationFailure,
+    EventRunOutcome,
     ScheduledTaskStore,
 )
 from omnigent.stores.scheduled_task_store.dispatch import (
@@ -82,6 +86,29 @@ _PENDING_RUN_FILTER = (
     SqlScheduledTaskRun.lease_expires_at.is_(None),
     SqlScheduledTaskRun.trigger_key.is_not(None),
 )
+
+
+# A coalesced run lists at most this many events; later ones only raise its count.
+_MAX_COALESCED_EVENTS = 20
+# Runs in this window count toward an event-triggered task's per-minute cap.
+_EVENT_RATE_WINDOW_SECONDS = 60
+
+
+def _dump_json(value: dict[str, Any] | None) -> str | None:
+    """Encode a JSON column value compactly, keeping ``None`` as NULL."""
+    return None if value is None else json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def _load_json(raw: str | None) -> dict[str, Any] | None:
+    """Decode a JSON column value; an unreadable document reads as absent."""
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        _logger.warning("Ignoring a scheduled-task JSON column that is not valid JSON")
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _purge_finished_deleted_task(
@@ -149,6 +176,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         next_run_at=row.next_run_at,
         project_id=row.project_id,
         delegation_ref=row.delegation_ref,
+        trigger_config=_load_json(row.trigger_config),
     )
 
 
@@ -190,6 +218,7 @@ def _run_to_entity(row: SqlScheduledTaskRun) -> ScheduledTaskRun:
         trigger_key=row.trigger_key,
         host_id=row.host_id,
         lease_expires_at=row.lease_expires_at,
+        event=_load_json(row.event),
     )
 
 
@@ -237,7 +266,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         scheduled_task_id: str,
         name: str,
         prompt: str,
-        rrule: str,
+        rrule: str | None,
         user_id: str | None,
         agent_id: str,
         timezone: str,
@@ -256,8 +285,11 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         execution_target: str = "connected_host",
         state: str = "active",
         delegation_ref: str | None = None,
+        trigger_config: dict[str, Any] | None = None,
     ) -> ScheduledTask:
-        """Insert a new scheduled task with a required recurring ``rrule``."""
+        """Insert a new task that runs on a recurring ``rrule`` or a ``trigger_config``."""
+        if (rrule is None) == (trigger_config is None):
+            raise ValueError("A scheduled task needs exactly one of rrule and trigger_config.")
         created_at = now_epoch()
 
         def write(session: Session) -> ScheduledTask:
@@ -284,6 +316,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 host_id=host_id,
                 project_id=project_id,
                 delegation_ref=delegation_ref,
+                trigger_config=_dump_json(trigger_config),
                 state=encode_scheduled_task_state(state),
                 last_run_at=None,
                 last_run_conversation_id=None,
@@ -401,6 +434,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
         expected_schedule: ScheduledTask | None = None,
+        trigger_config: dict[str, Any] | None = _UNSET,
     ) -> ScheduledTask | None:
         """Update mutable fields.
 
@@ -429,7 +463,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 current = _to_entity(row)
                 if any(
                     getattr(current, field) != getattr(expected_schedule, field)
-                    for field in ("rrule", "session_mode", "execution_target")
+                    for field in ("rrule", "trigger_config", "session_mode", "execution_target")
                 ):
                     raise OmnigentError(
                         "The automation's schedule or execution settings changed. "
@@ -438,7 +472,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     )
             if state is not None and state != "deleted":
                 require_active_account(session, row.user_id, generation=row.account_generation)
-            schedule_before = (row.rrule, row.timezone, row.state)
+            schedule_before = (row.rrule, row.trigger_config, row.timezone, row.state)
             trigger_before = is_trigger_automation(_to_entity(row))
             changed = False
             if name is not None and row.name != name:
@@ -450,6 +484,17 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if rrule is not None and row.rrule != rrule:
                 row.rrule = rrule
                 changed = True
+            if trigger_config is not _UNSET:
+                encoded_trigger = _dump_json(trigger_config)
+                if row.trigger_config != encoded_trigger:
+                    row.trigger_config = encoded_trigger
+                    changed = True
+                if trigger_config is not None and row.rrule is not None:
+                    # An event-triggered task has no schedule.
+                    row.rrule = None
+                    changed = True
+            if row.rrule is None and row.trigger_config is None:
+                raise ValueError("Removing a task's event trigger requires an rrule.")
             if agent_id is not None and row.agent_id != agent_id:
                 row.agent_id = agent_id
                 changed = True
@@ -511,7 +556,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 self._trigger_poll_seconds is not None
                 and is_trigger_automation(_to_entity(row)) != trigger_before
             )
-            if (row.rrule, row.timezone, row.state) != schedule_before or trigger_changed:
+            schedule_after = (row.rrule, row.trigger_config, row.timezone, row.state)
+            if schedule_after != schedule_before or trigger_changed:
                 self._refresh_schedule(row, updated_at)
             if changed:
                 row.updated_at = updated_at
@@ -1078,7 +1124,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         if row.state == encode_scheduled_task_state("completed"):
             # A schedule edit or resume re-evaluates a finished schedule.
             row.state = encode_scheduled_task_state("active")
-        if not self._dispatch_enabled:
+        if not self._dispatch_enabled or row.trigger_config is not None:
+            # Event-triggered tasks run only when an event records a pending run.
             row.next_run_at = None
             return
         task = _to_entity(row)
@@ -1197,6 +1244,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 .where(
                     SqlScheduledTask.state == encode_scheduled_task_state("active"),
                     SqlScheduledTask.next_run_at.is_(None),
+                    # Event-triggered tasks never get a next run time.
+                    SqlScheduledTask.trigger_config.is_(None),
                 )
                 .order_by(
                     *(
@@ -1416,6 +1465,142 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         return run_write_transaction(self._session_immediate, "request_manual_run", write)
 
+    def list_event_triggered_tasks(self) -> builtins.list[ScheduledTask]:
+        """Active event-triggered tasks in the current workspace, oldest first.
+
+        Event-triggered tasks are active with no next run time, so this seeks the
+        due-task index on ``(state, next_run_at, workspace_id)``.
+        """
+        with self._session("list_event_triggered_tasks") as session:
+            stmt = (
+                select(SqlScheduledTask)
+                .where(
+                    SqlScheduledTask.state == encode_scheduled_task_state("active"),
+                    SqlScheduledTask.next_run_at.is_(None),
+                    SqlScheduledTask.workspace_id == current_workspace_id(),
+                    SqlScheduledTask.trigger_config.is_not(None),
+                )
+                .order_by(SqlScheduledTask.created_at, SqlScheduledTask.id)
+            )
+            return [_to_entity(row) for row in session.scalars(stmt)]
+
+    def record_event_run(
+        self,
+        task: ScheduledTask,
+        *,
+        now: int,
+        trigger_key: str,
+        host_id: str | None,
+        event: dict[str, Any],
+        coalesce: bool,
+        max_runs_per_minute: int,
+    ) -> EventRunOutcome:
+        """Insert or coalesce under the task lock, like :meth:`request_manual_run`."""
+        if task.workspace_id != current_workspace_id():
+            return "inactive"
+        if not is_event_trigger_key(trigger_key):
+            raise ValueError(
+                f"An event run's trigger key must start with {EVENT_TRIGGER_KEY_PREFIX!r}."
+            )
+        entry = {**event, "key": trigger_key}
+
+        def write(session: Session) -> EventRunOutcome:
+            row = session.get(SqlScheduledTask, (task.workspace_id, task.id), with_for_update=True)
+            if (
+                row is None
+                or row.state != encode_scheduled_task_state("active")
+                or row.trigger_config is None
+            ):
+                return "inactive"
+            task_runs = (
+                SqlScheduledTaskRun.workspace_id == task.workspace_id,
+                SqlScheduledTaskRun.scheduled_task_id == task.id,
+            )
+            existing = session.scalar(
+                select(SqlScheduledTaskRun.id).where(
+                    *task_runs, SqlScheduledTaskRun.trigger_key == trigger_key
+                )
+            )
+            if existing is not None:
+                return "duplicate"
+            if coalesce:
+                pending = session.scalar(
+                    select(SqlScheduledTaskRun)
+                    .where(
+                        *task_runs,
+                        *_PENDING_RUN_FILTER,
+                        SqlScheduledTaskRun.trigger_key.startswith(EVENT_TRIGGER_KEY_PREFIX),
+                    )
+                    .order_by(SqlScheduledTaskRun.scheduled_at, SqlScheduledTaskRun.id)
+                    .limit(1)
+                    .with_for_update()
+                )
+                if pending is not None:
+                    document = _load_json(pending.event) or {}
+                    events = document.get("events")
+                    events = events if isinstance(events, list) else []
+                    if any(isinstance(e, dict) and e.get("key") == trigger_key for e in events):
+                        return "duplicate"
+                    if len(events) < _MAX_COALESCED_EVENTS:
+                        events.append(entry)
+                    else:
+                        document["omitted"] = int(document.get("omitted") or 0) + 1
+                    document["events"] = events
+                    pending.event = _dump_json(document)
+                    return "coalesced"
+            recent = session.scalar(
+                select(func.count())
+                .select_from(SqlScheduledTaskRun)
+                .where(
+                    *task_runs,
+                    SqlScheduledTaskRun.scheduled_at > now - _EVENT_RATE_WINDOW_SECONDS,
+                    SqlScheduledTaskRun.status != encode_scheduled_task_run_status("skipped"),
+                )
+            )
+            if (recent or 0) >= max_runs_per_minute:
+                # One visible skip per minute, keyed so further drops add no rows.
+                minute = now // _EVENT_RATE_WINDOW_SECONDS
+                limit_key = f"rate_limited:{minute}"
+                recorded = session.scalar(
+                    select(SqlScheduledTaskRun.id).where(
+                        *task_runs, SqlScheduledTaskRun.trigger_key == limit_key
+                    )
+                )
+                if recorded is None:
+                    session.add(
+                        SqlScheduledTaskRun(
+                            workspace_id=task.workspace_id,
+                            id=uuid.uuid4().hex,
+                            scheduled_task_id=task.id,
+                            status=encode_scheduled_task_run_status("skipped"),
+                            scheduled_at=now,
+                            finished_at=now,
+                            trigger_key=limit_key,
+                            error=(
+                                f"More than {max_runs_per_minute} events matched in a minute; "
+                                "later events in this minute were dropped."
+                            ),
+                            error_code="rate_limited",
+                            event=_dump_json({"events": [entry]}),
+                        )
+                    )
+                return "rate_limited"
+            session.add(
+                SqlScheduledTaskRun(
+                    workspace_id=task.workspace_id,
+                    id=uuid.uuid4().hex,
+                    scheduled_task_id=task.id,
+                    status=encode_scheduled_task_run_status("scheduled"),
+                    scheduled_at=now,
+                    trigger_key=trigger_key,
+                    host_id=host_id,
+                    event=_dump_json({"events": [entry]}),
+                )
+            )
+            return "recorded"
+
+        return run_write_transaction(self._session_immediate, "record_event_run", write)
+
     def list_pending_runs(
         self, *, after: TaskCursor | None = None, limit: int = 100
     ) -> builtins.list[ScheduledTaskRun]:
@@ -1467,6 +1652,16 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 _purge_finished_deleted_task(session, task, row)
                 return None
             snapshot = _to_entity(task)
+            if is_event_trigger_key(row.trigger_key) and (
+                snapshot.state != "active" or snapshot.trigger_config is None
+            ):
+                # Unlike Run now, an event no longer starts a paused task or one
+                # whose event trigger was removed after the event was recorded.
+                row.status = encode_scheduled_task_run_status("skipped")
+                row.finished_at = now
+                row.error = "The automation was paused or changed before this event's run started."
+                row.error_code = "trigger_inactive"
+                return None
             host_id = occurrence_host_id(snapshot, row.trigger_key)
             if host_id != row.host_id:
                 # The task's target changed after the request; leave the run for

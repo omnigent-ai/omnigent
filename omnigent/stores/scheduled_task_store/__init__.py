@@ -22,6 +22,11 @@ _UNSET: Any = object()
 # the session, another session got there first, or the task changed under the run.
 AdoptOutcome = Literal["adopted", "taken", "stale"]
 
+# How :meth:`ScheduledTaskStore.record_event_run` resolved: a new pending run, the
+# event added to the task's unclaimed pending run, an occurrence already recorded,
+# the task's per-minute cap reached, or a task no longer active with that trigger.
+EventRunOutcome = Literal["recorded", "coalesced", "duplicate", "rate_limited", "inactive"]
+
 
 @dataclass(frozen=True)
 class AutomationFailure:
@@ -60,7 +65,7 @@ class ScheduledTaskStore(ABC):
         scheduled_task_id: str,
         name: str,
         prompt: str,
-        rrule: str,
+        rrule: str | None,
         user_id: str | None,
         agent_id: str,
         timezone: str,
@@ -79,6 +84,7 @@ class ScheduledTaskStore(ABC):
         execution_target: str = "connected_host",
         state: str = "active",
         delegation_ref: str | None = None,
+        trigger_config: dict[str, Any] | None = None,
     ) -> ScheduledTask:
         """
         Insert a new scheduled task.
@@ -86,8 +92,9 @@ class ScheduledTaskStore(ABC):
         :param scheduled_task_id: Pre-generated unique task id (a UUID string).
         :param name: Human-readable task name.
         :param prompt: The instruction dispatched to the agent on each firing.
-        :param rrule: The required RFC 5545 recurrence rule for the recurring
-            trigger, e.g. ``"FREQ=DAILY;BYHOUR=9;BYMINUTE=0"``.
+        :param rrule: The RFC 5545 recurrence rule for the recurring trigger,
+            e.g. ``"FREQ=DAILY;BYHOUR=9;BYMINUTE=0"``; ``None`` when
+            ``trigger_config`` is set.
         :param user_id: User the spawned session's ``LEVEL_OWNER`` grant
             is written for; ``None`` in single-user mode.
         :param agent_id: The agent bound to this task.
@@ -114,6 +121,8 @@ class ScheduledTaskStore(ABC):
             once a schedule has no remaining occurrences.
         :param delegation_ref: Names the authorization grant a deployment uses to
             act as the owner when the task fires; never a credential.
+        :param trigger_config: The event trigger the task runs on instead of a
+            schedule, already validated by its provider.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ValueError: If ``state`` is not a recognized value.
         """
@@ -204,6 +213,7 @@ class ScheduledTaskStore(ABC):
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
         expected_schedule: ScheduledTask | None = None,
+        trigger_config: dict[str, Any] | None = _UNSET,
     ) -> ScheduledTask | None:
         """
         Update mutable fields of a task.
@@ -218,7 +228,9 @@ class ScheduledTaskStore(ABC):
         binding or nulling out a deleted last-run conversation.
 
         Passing ``rrule`` updates the recurring trigger; ``None``
-        leaves it unchanged.
+        leaves it unchanged. Passing a ``trigger_config`` makes the task event
+        triggered and clears its rule; an explicit ``None`` removes the trigger,
+        so switching back to a schedule passes ``rrule`` with it.
 
         Passing ``agent_id`` rebinds the task to a different agent, which
         switches the harness its future firings run. The fire path reads
@@ -292,6 +304,48 @@ class ScheduledTaskStore(ABC):
         :returns: ``True`` if newly deleted; ``False`` if missing or already deleted.
         """
         ...
+
+    def list_event_triggered_tasks(self) -> builtins.list[ScheduledTask]:
+        """List the current workspace's active tasks that have a ``trigger_config``.
+
+        Stores without event triggers return an empty list, so no event fires.
+        """
+        return []
+
+    def record_event_run(
+        self,
+        task: ScheduledTask,
+        *,
+        now: int,
+        trigger_key: str,
+        host_id: str | None,
+        event: dict[str, Any],
+        coalesce: bool,
+        max_runs_per_minute: int,
+    ) -> EventRunOutcome:
+        """Record a pending run for one provider event, under the task lock.
+
+        The run waits for the host owner's scheduler to claim it, like a Run now
+        request. ``trigger_key`` is the event's occurrence key, so a redelivered
+        event is a ``"duplicate"``. With ``coalesce``, an event for a task that
+        already has an unclaimed pending event run is added to that run instead.
+        Once the task's runs in the last minute reach ``max_runs_per_minute``,
+        the event is dropped as ``"rate_limited"``, and one ``skipped`` run per
+        minute records that. A task no longer active, or no longer event
+        triggered, records nothing.
+
+        :param task: The matched task, as listed.
+        :param now: Unix epoch seconds the event is recorded at.
+        :param trigger_key: The event's occurrence key.
+        :param host_id: The run's host, as for any occurrence of the task.
+        :param event: The event's JSON description, with IDs and metadata only.
+        :param coalesce: Whether a pending run of this task can take the event.
+        :param max_runs_per_minute: The task's per-minute run cap.
+        :returns: How the event was recorded. Stores without event triggers
+            return ``"inactive"``.
+        """
+        del task, now, trigger_key, host_id, event, coalesce, max_runs_per_minute
+        return "inactive"
 
     # ── Runs ─────────────────────────────────────────────────────
 

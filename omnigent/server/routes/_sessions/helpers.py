@@ -267,6 +267,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     set_server_runner_router,
     user_session_stream,
 )
+from omnigent.server.scheduled import session_triggers
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
     ChildSessionSummary,
@@ -2619,6 +2620,7 @@ async def _persist_external_session_title(
         session_id,
         title=title,
     )
+    session_triggers.notify("session.renamed", session_id)
     event = SessionTitleEvent(
         type="session.title",
         conversation_id=session_id,
@@ -5210,6 +5212,20 @@ def _publish_status(
         # A turn can open or merge a PR while nobody watches; refresh what the server
         # stores. Stops and archives publish idle without persisting it, and skip this.
         session_pull_requests.notify_turn_end(session_id)
+        # Native harnesses settle turns only through these edges, never response events.
+        turn_id = response_id or _session_active_response_cache.get(session_id)
+        session_triggers.notify(
+            "turn.completed", session_id, occurrence=turn_id, response_id=turn_id
+        )
+    elif status == "failed" and previous_status != "failed" and persist_live_status:
+        turn_id = response_id or _session_active_response_cache.get(session_id)
+        session_triggers.notify(
+            "turn.failed",
+            session_id,
+            occurrence=turn_id,
+            response_id=turn_id,
+            error_code=error.code if error is not None else None,
+        )
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.

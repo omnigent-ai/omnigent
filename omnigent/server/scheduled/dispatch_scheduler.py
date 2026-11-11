@@ -21,6 +21,7 @@ from omnigent.server.scheduled.config import DEFAULT_SCHEDULER_CONFIG, Scheduled
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.schedule import (
     host_ownership_key,
+    is_event_trigger_key,
     is_trigger_automation,
     manual_trigger_key,
     next_scheduled_time,
@@ -362,6 +363,13 @@ PollInterval = Callable[[], float]
 # Given the current time, when a trigger automation's busy session should next be checked,
 # skipping this poll unrecorded; ``None`` polls now. Asked only for trigger automations.
 BusyUntil = Callable[[ScheduledTask, int], Awaitable[int | None]]
+# Whether an event's pending run should wait because the session its task continues is
+# busy, so later events join that run. Asked only for runs that events recorded.
+EventSessionBusy = Callable[[ScheduledTaskRun], Awaitable[bool]]
+
+# A pending event run waits for a busy continued session at most this long, so a stale
+# "running" status cannot hold it forever.
+EVENT_HOLD_MAX_SECONDS = 10 * 60
 
 # With a busy check, the server tries to poll a trigger automation this often instead of
 # following the trigger's saved schedule.
@@ -428,6 +436,7 @@ class PersistentTaskScheduler:
         dispatch_enabled: DispatchEnabled = _always_enabled,
         poll_interval: PollInterval | None = None,
         busy_until: BusyUntil | None = None,
+        event_session_busy: EventSessionBusy | None = None,
         now: Callable[[], float] = time.time,
         poll_seconds: float = DEFAULT_SCHEDULER_CONFIG.poll_seconds,
         renewal_seconds: float = DEFAULT_SCHEDULER_CONFIG.renewal_seconds,
@@ -454,6 +463,7 @@ class PersistentTaskScheduler:
         self._dispatch_enabled = dispatch_enabled
         self._poll_interval = poll_interval
         self._busy_until = busy_until
+        self._event_session_busy = event_session_busy
         self._now = now
         self._poll_seconds = config.poll_seconds
         self._renewal_seconds = config.renewal_seconds
@@ -601,7 +611,9 @@ class PersistentTaskScheduler:
                 return
             self._pending_cursor = (run.workspace_id, run.id)
             try:
-                if host_ownership_key(run.workspace_id, run.host_id) in owned:
+                if host_ownership_key(
+                    run.workspace_id, run.host_id
+                ) in owned and not await self._hold_event_run(run):
                     await self._start_pending(run)
             except Exception:
                 _logger.exception(
@@ -611,6 +623,25 @@ class PersistentTaskScheduler:
                 )
         if len(runs) < self._batch_size:
             self._pending_cursor = None
+
+    async def _hold_event_run(self, run: ScheduledTaskRun) -> bool:
+        """Whether an event's pending run waits for its continued session to be idle.
+
+        While it waits, later events for the task are added to it, so one prompt
+        carries them all. A failed check starts the run.
+        """
+        if self._event_session_busy is None or not is_event_trigger_key(run.trigger_key):
+            return False
+        if self._now() - run.scheduled_at >= EVENT_HOLD_MAX_SECONDS:
+            return False
+        try:
+            with workspace_scope(run.workspace_id):
+                return await self._event_session_busy(run)
+        except Exception:
+            _logger.exception(
+                "Could not check whether run %s's session is busy; starting it", run.id
+            )
+            return False
 
     async def _start_pending(self, run: ScheduledTaskRun) -> None:
         now = int(self._now())
@@ -718,6 +749,9 @@ class PersistentTaskScheduler:
         return True
 
     async def _validate_schedule(self, task: ScheduledTask) -> bool:
+        if task.rrule is None:
+            # An event-triggered task has no schedule to initialize.
+            return False
         try:
             await asyncio.to_thread(
                 validate_rrule,

@@ -380,6 +380,7 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile, saved_profile
+from omnigent.server.scheduled import session_triggers
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
     ChildSessionSummary,
@@ -10929,7 +10930,19 @@ def configure_subagent_block_notifier(
         wake_dispatch=_wake_dispatch,
         loop=loop,
     )
-    _pending_elicitations.set_elicitation_observer(notifier.observe)
+
+    def _observe(conversation_id: str, event: dict[str, Any]) -> None:
+        notifier.observe(conversation_id, event)
+        elicitation_id = event.get("elicitation_id")
+        if event.get("type") == "response.elicitation_request" and isinstance(elicitation_id, str):
+            session_triggers.notify(
+                "input.requested",
+                conversation_id,
+                occurrence=elicitation_id,
+                elicitation_id=elicitation_id,
+            )
+
+    _pending_elicitations.set_elicitation_observer(_observe)
 
     def _uninstall() -> None:
         """Remove the observer and cancel any outstanding wake futures."""

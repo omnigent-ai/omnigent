@@ -2674,3 +2674,67 @@ async def test_without_a_busy_check_a_trigger_keeps_its_saved_schedule(store) ->
     await _drain(scheduler)
     fire.assert_awaited_once()
     assert store.get(task.id).next_run_at == task.next_run_at + 600
+
+
+async def test_an_event_run_waits_while_its_continued_session_is_busy(store) -> None:
+    from omnigent.server.scheduled.dispatch_scheduler import EVENT_HOLD_MAX_SECONDS
+    from omnigent.server.scheduled.schedule import event_trigger_key
+
+    task = store.create(
+        uuid.uuid4().hex,
+        "watcher",
+        "prompt",
+        None,
+        None,
+        uuid.uuid4().hex,
+        "UTC",
+        session_mode="continue",
+        session_id=uuid.uuid4().hex,
+        trigger_config={"provider": "omnigent", "events": ["turn.completed"]},
+    )
+    clock = FakeClock(1_800_000_000)
+
+    def record(occurrence: str) -> str:
+        key = event_trigger_key("omnigent", occurrence)
+        return store.record_event_run(
+            task,
+            now=int(clock.now()),
+            trigger_key=key,
+            host_id=occurrence_host_id(task, key),
+            event={"type": "turn.completed", "session_id": occurrence},
+            coalesce=True,
+            max_runs_per_minute=10,
+        )
+
+    busy = True
+    checked = []
+
+    async def session_busy(run) -> bool:
+        checked.append(run.id)
+        return busy
+
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(), event_session_busy=session_busy, now=clock.now
+    )
+    assert record("first") == "recorded"
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    fire.assert_not_awaited()
+    # Events that arrive while the run waits join it.
+    assert record("second") == "coalesced"
+
+    busy = False
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    [(_, lease)] = [call.args for call in fire.await_args_list]
+    assert [e["session_id"] for e in lease.run.event["events"]] == ["first", "second"]
+    assert len(checked) == 2
+
+    # A session that stays busy holds a run no longer than the cap.
+    busy = True
+    assert record("third") == "recorded"
+    clock.advance(EVENT_HOLD_MAX_SECONDS)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert fire.await_count == 2

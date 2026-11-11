@@ -220,6 +220,7 @@ from omnigent.server.routes._sessions.orchestration import (
     ensure_runner_connected,
 )
 from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile
+from omnigent.server.scheduled import session_triggers
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
@@ -1393,6 +1394,7 @@ def register_core_routes(
             # create returns. Still pushed when the managed guard fails: the
             # owned row stays visible either way (see the grant above).
             _announce_session_added(user_id, resp.id)
+            session_triggers.notify("session.created", resp.id, occurrence="created")
 
         # Host launch: if a host is targeted (caller-supplied or
         # managed) and no runner is bound yet, authorize (caller must
@@ -1774,6 +1776,7 @@ def register_core_routes(
             request, result.session_id, parsed_metadata.initial_input, user_id
         )
         _announce_session_added(user_id, result.session_id)
+        session_triggers.notify("session.created", result.session_id, occurrence="created")
         # Managed bundle create: provision a sandbox host for the
         # just-uploaded session-scoped agent (same background launch as
         # the JSON path). The managed runner fetches the uploaded bundle
@@ -2980,6 +2983,7 @@ def register_core_routes(
         )
         if updated is None:
             return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
+        session_triggers.notify("session.renamed", session_id, conversation=updated)
         return AutomaticSessionRenameResponse(renamed=True, title=updated.title)
 
     @router.post(
@@ -3039,6 +3043,7 @@ def register_core_routes(
         )
         if updated is None:
             return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
+        session_triggers.notify("session.renamed", session_id, conversation=updated)
         return AutomaticSessionRenameResponse(renamed=True, title=updated.title)
 
     @router.post(
@@ -3484,6 +3489,8 @@ def register_core_routes(
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
             raise _session_not_found()
+        # Compared after the update, to report renames and archives to session triggers.
+        title_before, archived_before = conv.title, conv.archived
         previous_runner_id = conv.runner_id
         previous_runner_binding = conv
         profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
@@ -3852,6 +3859,8 @@ def register_core_routes(
         if update_result is None:
             raise _session_not_found()
         updated = update_result.conversation
+        if body.title is not None and updated.title != title_before:
+            session_triggers.notify("session.renamed", session_id, conversation=updated)
         effort_changed = update_result.reasoning_effort_changed
         saved = live_change.position() if live_change is not None else 0
         if body.silent:
@@ -4129,6 +4138,8 @@ def register_core_routes(
         # Archiving hides the session from the default view (and its unread
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
+        if body.archived is True and not archived_before:
+            session_triggers.notify("session.archived", session_id, occurrence="archived")
         if body.archived is True:
             _prune_session_read_state(session_id)
             # Stop asynchronously after the archive commits and Undo grace elapses.
@@ -4964,6 +4975,7 @@ def register_core_routes(
             # A continuation is announced once placed, with the source's sharing.
             if not body.side_chat and not continue_source:
                 _announce_session_added(user_id, new_conv.id)
+                session_triggers.notify("session.created", new_conv.id, occurrence="created")
         # Default-public grant only after the managed launch was accepted (see
         # the create paths). A side chat is a private scratch fork of the
         # caller's own view; a continuation takes its source's sharing instead.
@@ -5271,6 +5283,7 @@ def register_core_routes(
                     raise
                 # Placed and shared as the source is: now the owner's tabs list it.
                 _announce_session_added(user_id, fork.id)
+                session_triggers.notify("session.created", fork.id, occurrence="created")
 
                 # Best-effort, as for native supersession: the fork already holds the
                 # work, so a lost notice must not strand it unreturned.

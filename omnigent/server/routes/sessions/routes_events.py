@@ -296,6 +296,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _wait_for_host_reconnect,
     ensure_runner_connected,
 )
+from omnigent.server.scheduled import session_triggers
 from omnigent.server.scheduled.telemetry import start_fire_stage
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
@@ -4222,9 +4223,22 @@ def register_events_routes(
                 )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.pop(session_id, None)
+        # Grants go with the session, so read who could see it first.
+        readers = (
+            await asyncio.to_thread(session_triggers.readers_of, conv)
+            if session_triggers.enabled()
+            else None
+        )
         deleted = await conversation_store.delete_conversation(session_id)
         if not deleted:
             raise _session_not_found()
+        session_triggers.notify(
+            "session.deleted",
+            session_id,
+            occurrence="deleted",
+            conversation=conv,
+            readers=readers,
+        )
         # A relay still inside an offline runner's reconnect grace must not
         # fail the deleted turns when that grace expires.
         _cancel_runner_relays([session_id, *descendant_ids])

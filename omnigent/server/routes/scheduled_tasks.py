@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
@@ -58,12 +58,17 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
 from omnigent.server.routes.runner_tunnel import _expected_runner_id_from_headers
+from omnigent.server.scheduled import session_triggers
 from omnigent.server.scheduled.harness_settings import (
     validate_scheduled_permission_mode,
     validate_scheduled_permission_support,
 )
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
+from omnigent.server.scheduled.session_triggers import (
+    SESSION_TRIGGER_PROVIDER,
+    SessionTriggerConfig,
+)
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.session_orchestration import require_owned_session
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
@@ -81,6 +86,9 @@ _MANAGED_SANDBOX_WITH_HOST_MSG = (
     "a managed_sandbox task runs in a fresh sandbox each fire; do not set host_id"
 )
 _SESSION_ID_WITHOUT_CONTINUE_MSG = "session_id requires session_mode 'continue'"
+_RRULE_OR_TRIGGER_MSG = (
+    "An automation needs exactly one of rrule (a schedule) and trigger_config (events)"
+)
 _SOURCE_SESSION_CONTINUE_MSG = (
     "an automation with source_session_id starts each run in a new session; "
     "session_mode must be 'new'"
@@ -105,7 +113,10 @@ class CreateScheduledTaskRequest(BaseModel):
 
     name: str
     prompt: str
-    rrule: str
+    # Exactly one of ``rrule`` (a schedule) and ``trigger_config`` (events).
+    rrule: str | None = None
+    # An event trigger, e.g. {"provider": "omnigent", "events": ["turn.completed"]}.
+    trigger_config: dict[str, Any] | None = None
     agent_id: str
     timezone: str = "UTC"
     model_override: str | None = None
@@ -133,6 +144,8 @@ class CreateScheduledTaskRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_create(self) -> CreateScheduledTaskRequest:
+        if (self.rrule is None) == (self.trigger_config is None):
+            raise ValueError(_RRULE_OR_TRIGGER_MSG)
         if self.execution_target not in _VALID_EXECUTION_TARGETS:
             raise ValueError("execution_target must be 'connected_host' or 'managed_sandbox'")
         if self.execution_target == "managed_sandbox" and self.host_id is not None:
@@ -154,7 +167,10 @@ class UpdateScheduledTaskRequest(BaseModel):
 
     name: str | None = None
     prompt: str | None = None
+    # A rule on an event-triggered task switches it back to a schedule.
     rrule: str | None = None
+    # Switches the task to events; null switches it back to its ``rrule``.
+    trigger_config: dict[str, Any] | None = None
     # Rebinding the agent switches the harness the task fires with. The
     # per-agent settings below do not survive the switch — see the PATCH
     # handler, which clears any the caller does not resend.
@@ -189,6 +205,8 @@ class UpdateScheduledTaskRequest(BaseModel):
             raise ValueError(_MANAGED_SANDBOX_WITH_HOST_MSG)
         if "agent_id" in self.model_fields_set and self.agent_id is None:
             raise ValueError("agent_id cannot be null")
+        if self.rrule is not None and self.trigger_config is not None:
+            raise ValueError(_RRULE_OR_TRIGGER_MSG)
         return self
 
 
@@ -235,6 +253,7 @@ def _to_response(
         "name": task.name,
         "prompt": task.prompt,
         "rrule": task.rrule,
+        "trigger_config": task.trigger_config,
         # JSON key preserved for API/UI stability; the DB column + entity
         # attribute are now ``user_id``.
         "owner_user_id": task.user_id,
@@ -304,6 +323,8 @@ def _run_to_response(
         "fired_at": run.fired_at,
         "finished_at": run.finished_at,
         "error_code": run.error_code,
+        # IDs and metadata of the events an event-triggered run was recorded for.
+        "event": run.event,
         "conversation_updated_at": conversation_updated_at,
         "conversation_status": conversation_status,
         "viewer_last_seen": viewer_last_seen,
@@ -324,6 +345,42 @@ async def _validate_rrule_or_400(rrule: str, session_mode: str, execution_target
         )
     except RRuleValidationError as exc:
         raise OmnigentError(f"invalid rrule: {exc}", code=ErrorCode.INVALID_INPUT) from exc
+
+
+def _validate_trigger_or_400(
+    request: Request, trigger_config: dict[str, Any], *, session_mode: str, execution_target: str
+) -> dict[str, Any]:
+    """Validate an event trigger and return it as stored, or raise a 400."""
+    if execution_target == "managed_sandbox" and session_mode == "new":
+        # Schedules may start a new sandbox at most hourly; events have no such bound.
+        raise OmnigentError(
+            "An event-triggered automation on a managed sandbox must continue one session "
+            "(session_mode 'continue').",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if not getattr(request.app.state, "scheduled_task_dispatch_enabled", False):
+        raise OmnigentError(
+            "Event-triggered automations need the database scheduler (automations_v2).",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    provider = trigger_config.get("provider")
+    if provider != SESSION_TRIGGER_PROVIDER:
+        raise OmnigentError(
+            f"Unsupported trigger provider {provider!r}; this server supports "
+            f"{SESSION_TRIGGER_PROVIDER!r}.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    try:
+        config = SessionTriggerConfig.model_validate(trigger_config)
+    except ValidationError as exc:
+        details = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc']) or 'trigger_config'}: {error['msg']}"
+            for error in exc.errors()
+        )
+        raise OmnigentError(
+            f"invalid trigger_config: {details}", code=ErrorCode.INVALID_INPUT
+        ) from exc
+    return config.model_dump(exclude_none=True)
 
 
 def _validate_timezone_or_400(timezone: str) -> None:
@@ -847,7 +904,17 @@ def create_scheduled_tasks_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
-        await _validate_rrule_or_400(body.rrule, body.session_mode, body.execution_target)
+        trigger_config: dict[str, Any] | None = None
+        if body.rrule is not None:
+            await _validate_rrule_or_400(body.rrule, body.session_mode, body.execution_target)
+        else:
+            assert body.trigger_config is not None
+            trigger_config = _validate_trigger_or_400(
+                request,
+                body.trigger_config,
+                session_mode=body.session_mode,
+                execution_target=body.execution_target,
+            )
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_scheduled_permission_mode(body.permission_mode)
         agent, workspace, model_override, reasoning_effort = await _validate_launch_inputs(
@@ -940,6 +1007,7 @@ def create_scheduled_tasks_router(
                 host_id=host_id,
                 project_id=project_id,
                 execution_target=body.execution_target,
+                trigger_config=trigger_config,
             )
         except Exception as exc:
             if source_copy is not None:
@@ -958,6 +1026,7 @@ def create_scheduled_tasks_router(
 
             # Surface the copy in the owner's open sidebars, keyed as they subscribe.
             _announce_session_added(require_user(request, auth_provider), source_copy.id)
+        session_triggers.invalidate_tasks()
         log_task_created(
             task,
             owner=owner,
@@ -1234,12 +1303,37 @@ def create_scheduled_tasks_router(
             fields.pop("session_mode", None)
         target_session_mode = fields.get("session_mode", existing.session_mode)
         target_execution = fields.get("execution_target") or existing.execution_target
-        if body.rrule is not None or {"session_mode", "execution_target"}.intersection(fields):
-            await _validate_rrule_or_400(
-                body.rrule if body.rrule is not None else existing.rrule,
-                target_session_mode,
-                target_execution,
+        if fields.get("trigger_config") is not None or (
+            existing.trigger_config is not None
+            and "trigger_config" not in fields
+            and body.rrule is None
+            and {"session_mode", "execution_target"}.intersection(fields)
+        ):
+            fields["trigger_config"] = _validate_trigger_or_400(
+                request,
+                fields.get("trigger_config") or existing.trigger_config or {},
+                session_mode=target_session_mode,
+                execution_target=target_execution,
             )
+        elif "trigger_config" in fields or (
+            body.rrule is not None and existing.trigger_config is not None
+        ):
+            # A schedule replaces the event trigger, and removing the trigger needs one.
+            if body.rrule is None and existing.rrule is None:
+                raise OmnigentError(_RRULE_OR_TRIGGER_MSG, code=ErrorCode.INVALID_INPUT)
+            fields["trigger_config"] = None
+        target_rrule = (
+            None
+            if fields.get("trigger_config") is not None
+            else body.rrule
+            if body.rrule is not None
+            else existing.rrule
+        )
+        if target_rrule is not None and (
+            body.rrule is not None
+            or {"session_mode", "execution_target", "trigger_config"}.intersection(fields)
+        ):
+            await _validate_rrule_or_400(target_rrule, target_session_mode, target_execution)
         if target_session_mode == "new":
             if fields.get("session_id") is not None:
                 raise OmnigentError(_SESSION_ID_WITHOUT_CONTINUE_MSG, code=ErrorCode.INVALID_INPUT)
@@ -1404,6 +1498,7 @@ def create_scheduled_tasks_router(
             request.app.state, "scheduled_task_dispatch_enabled", False
         ):
             scheduler.update(updated)
+        session_triggers.invalidate_tasks()
         latest_status = store.list_latest_run_status_for_tasks([updated.id])
         return _to_response(
             updated,
@@ -1453,6 +1548,7 @@ def create_scheduled_tasks_router(
             request.app.state, "scheduled_task_dispatch_enabled", False
         ):
             scheduler.remove(scheduled_task_id)
+        session_triggers.invalidate_tasks()
         return {"deleted": True, "id": scheduled_task_id}
 
     return router

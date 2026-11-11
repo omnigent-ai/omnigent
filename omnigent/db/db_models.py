@@ -1506,9 +1506,11 @@ class SqlScheduledTask(OmnigentBase):
         surfaced as a bare 32-char hex string (no dashes).
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
-    :param rrule: The required RFC 5545 recurrence rule for the recurring
-        trigger, e.g. ``"FREQ=DAILY;BYHOUR=9;BYMINUTE=0"``. Evaluated in
-        ``timezone``.
+    :param rrule: The RFC 5545 recurrence rule for the recurring trigger,
+        e.g. ``"FREQ=DAILY;BYHOUR=9;BYMINUTE=0"``, evaluated in ``timezone``.
+        ``None`` for an event-triggered task.
+    :param trigger_config: JSON event-trigger definition, or ``None`` for a
+        scheduled task.
     :param user_id: User the spawned session's ``LEVEL_OWNER`` grant is
         written for — who the run belongs to, e.g. ``"alice@example.com"``.
         ``None`` in single-user / OSS mode; the fire path resolves it to the
@@ -1589,8 +1591,15 @@ class SqlScheduledTask(OmnigentBase):
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     # Opaque free text, never SQL-queried — stored compressed (CompressedText).
     prompt: Mapped[str] = mapped_column(CompressedText, nullable=False)
-    # RFC 5545 recurrence rule, e.g. "FREQ=DAILY;BYHOUR=9;BYMINUTE=0".
-    rrule: Mapped[str] = mapped_column(String(512), nullable=False)
+    # RFC 5545 recurrence rule, e.g. "FREQ=DAILY;BYHOUR=9;BYMINUTE=0". NULL for a
+    # task that runs on events (``trigger_config``) instead of a schedule.
+    rrule: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # JSON naming an event trigger's provider and its condition, shared by every
+    # provider, e.g. {"provider": "omnigent", "events": ["turn.completed"]}.
+    # NULL for a scheduled task. Read and written whole; SQL only tests IS NULL.
+    trigger_config: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=65_535), nullable=True
+    )
     # Session-owner identity: the spawned run's LEVEL_OWNER grant is written
     # for this user. Nullable — None in single-user/OSS mode (the fire path
     # resolves null to the reserved "local" user). String(128) to match
@@ -1735,6 +1744,12 @@ class SqlScheduledTaskRun(OmnigentBase):
     # "rate_limited") for future retry logic. Bounded plain string, not a blob;
     # no CHECK constraint (no code taxonomy defined yet).
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # JSON describing the event(s) an event-triggered run was recorded for,
+    # e.g. {"events": [{"type": "turn.completed", "session_id": "..."}]}. NULL for
+    # scheduled and Run now runs. Read and written whole, never filtered in SQL.
+    event: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=65_535), nullable=True
+    )
 
     __table_args__ = (
         CheckConstraint(

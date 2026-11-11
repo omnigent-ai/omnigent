@@ -281,6 +281,50 @@ wrong:
 - Teardown only applies to server-managed sandbox hosts, and is safe to repeat, so
   two replicas can recover the same run.
 
+## Event triggers
+
+A task with a `trigger_config` runs on events instead of a schedule. It has no
+`rrule` and no `next_run_at`: the scheduler never lists it as due or fills in
+its next run time, and legacy timers never arm it. The JSON names a `provider`;
+each provider validates its own shape. An event records a `scheduled` run with
+the event's IDs in the run's `event` column, keyed `event:<provider>:<occurrence>`
+in `trigger_key`, so a repeated event records nothing. The host owner claims it
+on a later poll like a Run now request, and the run sends the task's prompt
+followed by the events as JSON lines. A run whose task was paused, or lost its
+trigger, before the claim is recorded as `skipped` (`trigger_inactive`).
+
+Event triggers need the database scheduler; the API rejects them otherwise and
+advertises `scheduled_task_session_triggers` when it accepts them.
+
+### Session triggers
+
+The `omnigent` provider ([session_triggers.py](session_triggers.py)) fires on
+the server's own session events: `session.created`, `session.renamed`,
+`session.archived`, `session.deleted`, `turn.completed`, `turn.failed`,
+`input.requested` (an approval or a question) and `comment.created`.
+
+```json
+{"provider": "omnigent", "events": ["turn.completed"], "agent_id": "...",
+ "project_id": "...", "title_contains": "deploy", "include_own_sessions": false}
+```
+
+- The server queues each event where it happens; one background worker matches
+  it and records runs, so the request path does no extra database work. Native
+  Claude and Codex turns are seen through their `session.status` edges.
+- Only sessions the owner holds a grant on (their own, or shared with them)
+  fire; admin access and public sessions don't count. A sub-agent session is
+  checked through its root.
+- By default a task ignores the sessions it created or continues, and their
+  sub-agents, so its own turns cannot trigger it again.
+- A task records at most 10 runs a minute. Further events that minute are
+  dropped, and one `skipped` run (`rate_limited`) per minute records the drop.
+- A task that continues one session adds new events to its unclaimed pending
+  run instead of recording another (up to 20 listed, the rest counted). The
+  scheduler holds that run while the session is running or waiting on an
+  approval, for at most 10 minutes, so a busy session gets one prompt.
+- A run's event carries IDs and metadata (session, response, elicitation or
+  comment ID, agent, project, parent session), never titles or text.
+
 ## Run states and interruptions
 
 These diagrams cover the database scheduler with the built-in executor. They show
