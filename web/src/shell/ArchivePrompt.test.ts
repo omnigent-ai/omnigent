@@ -43,4 +43,17 @@ describe("archiveWorktreeTargets", () => {
       { path: null, branch: "feat/c" },
     ]);
   });
+
+  it("folds a pathless session into the worktree that has its branch", () => {
+    const targets = archiveWorktreeTargets([
+      session("a", { git_branch: "feat/a", workspace: null }),
+      session("b", { git_branch: "feat/a", workspace: "/repo/.worktrees/a" }),
+      session("c", { git_branch: "feat/c", workspace: null }),
+    ]);
+
+    expect(targets).toEqual([
+      { path: "/repo/.worktrees/a", branch: "feat/a" },
+      { path: null, branch: "feat/c" },
+    ]);
+  });
 });

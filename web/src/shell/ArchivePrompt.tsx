@@ -50,7 +50,13 @@ export function archiveWorktreeTargets(
     const key = path === null ? `branch:${branch}` : `path:${path}`;
     if (!targets.has(key)) targets.set(key, { path, branch });
   }
-  return [...targets.values()];
+  // Git checks a branch out in one worktree at a time, so a pathless entry
+  // whose branch has a known path names that same worktree.
+  const values = [...targets.values()];
+  const branchesWithPath = new Set(
+    values.filter((target) => target.path !== null).map((target) => target.branch),
+  );
+  return values.filter((target) => target.path !== null || !branchesWithPath.has(target.branch));
 }
 
 interface PendingRunningPrompt {
