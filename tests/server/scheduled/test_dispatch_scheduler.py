@@ -2026,11 +2026,14 @@ async def test_changed_session_is_logged_again(store, caplog):
     assert store.list_runs(task.id)[0][0].conversation_id == second
 
 
-async def test_finished_schedules_are_completed_and_not_rescanned(store, monkeypatch):
+# COUNT=1 is a one-time schedule such as a reminder, which the dispatcher's own
+# validation must not pause as "fires only once".
+@pytest.mark.parametrize("count", [1, 2])
+async def test_finished_schedules_are_completed_and_not_rescanned(store, monkeypatch, count):
     store.configure_dispatch(False)
     ended = _task(store, "ended", rrule="FREQ=HOURLY;UNTIL=20200101T000000Z")
     store.configure_dispatch(True)
-    counted = _task(store, "counted", rrule="FREQ=HOURLY;COUNT=2")
+    counted = _task(store, "counted", rrule=f"FREQ=HOURLY;COUNT={count}")
     clock = FakeClock(counted.next_run_at)
 
     async def fire(task, lease):
@@ -2045,7 +2048,7 @@ async def test_finished_schedules_are_completed_and_not_rescanned(store, monkeyp
         assert store.get(ended.id).state == "completed"
         assert store.list_runs(ended.id)[0] == []
         assert store.get(counted.id).state == "completed"
-        assert len(store.list_runs(counted.id)[0]) == 2
+        assert len(store.list_runs(counted.id)[0]) == count
         assert store.list_uninitialized_tasks() == []
     finally:
         await scheduler.stop()

@@ -70,7 +70,11 @@ from omnigent.server.session_orchestration import require_owned_session
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.project_store import ProjectStore
-from omnigent.stores.scheduled_task_store import AutomationFailure, ScheduledTaskStore
+from omnigent.stores.scheduled_task_store import (
+    AutomationFailure,
+    ScheduledTaskFirstRunMismatchError,
+    ScheduledTaskStore,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -131,6 +135,10 @@ class CreateScheduledTaskRequest(BaseModel):
     # A session the caller owns. Create copies it, and every run starts a new
     # session from that copy; responses carry the copy's id here.
     source_session_id: str | None = Field(default=None, min_length=1)
+    # Epoch seconds the first run must fall at, checked against the schedule the
+    # task gets at its actual creation. A one-time reminder sends it so a request
+    # that arrives late is refused instead of moving to the rule's next match.
+    first_run_at: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def _validate_create(self) -> CreateScheduledTaskRequest:
@@ -866,6 +874,12 @@ def create_scheduled_tasks_router(
             body.execution_target,
             allow_single_fire=one_time_schedules_supported(request),
         )
+        if body.first_run_at is not None and not one_time_schedules_supported(request):
+            # Only the database scheduler saves the next run the check compares.
+            raise OmnigentError(
+                "first_run_at needs the database scheduler, which this server does not run",
+                code=ErrorCode.INVALID_INPUT,
+            )
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_scheduled_permission_mode(body.permission_mode)
         agent, workspace, model_override, reasoning_effort = await _validate_launch_inputs(
@@ -958,12 +972,26 @@ def create_scheduled_tasks_router(
                 host_id=host_id,
                 project_id=project_id,
                 execution_target=body.execution_target,
+                # Passed only when set, so stores that predate it keep working.
+                **({"first_run_at": body.first_run_at} if body.first_run_at is not None else {}),
             )
         except Exception as exc:
             if source_copy is not None:
                 await _delete_session_quietly(source_copy.id)
             if bound.id != agent.id:
                 agent_store.delete(bound.id)
+            if isinstance(exc, ScheduledTaskFirstRunMismatchError):
+                actual = (
+                    datetime.fromtimestamp(exc.actual, UTC).isoformat()
+                    if exc.actual is not None
+                    else "never"
+                )
+                raise OmnigentError(
+                    "The schedule's first run would be "
+                    f"{actual}, not {datetime.fromtimestamp(exc.expected, UTC).isoformat()} "
+                    "as requested. The task was not created.",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
             if isinstance(exc, RRuleSearchError):
                 raise OmnigentError(
                     "Could not calculate the next run time for this schedule. "

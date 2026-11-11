@@ -748,30 +748,22 @@ def _one_time_rule_in(hours: int) -> tuple[str, int]:
 
 
 @pytest.mark.parametrize("auth_app", [True], indirect=True)
-async def test_database_scheduler_runs_a_one_time_rule_once(
+async def test_database_scheduler_accepts_a_one_time_rule(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    from omnigent.server.scheduled.schedule import next_scheduled_time
-
+    # Its single run and completion are covered by the dispatcher's exhaustion test.
     info = (await auth_client.get("/v1/info", headers=_headers())).json()
     assert info["scheduled_task_one_time"] is True
     rule, fire_at = _one_time_rule_in(hours=2)
     created = await auth_client.post(
-        "/v1/scheduled-tasks", json=_create_body(rrule=rule, timezone="UTC"), headers=_headers()
+        "/v1/scheduled-tasks",
+        json=_create_body(rrule=rule, timezone="UTC", first_run_at=fire_at),
+        headers=_headers(),
     )
     assert created.status_code == 200, created.text
-    store = SqlAlchemyScheduledTaskStore(db_uri)
-    task = store.get(created.json()["id"])
+    task = SqlAlchemyScheduledTaskStore(db_uri).get(created.json()["id"])
     assert task is not None
     assert (task.state, task.next_run_at) == ("active", fire_at)
-
-    # Its only occurrence is claimed with no next run, which completes the task.
-    assert next_scheduled_time(task, fire_at) is None
-    claimed = store.claim_scheduled_run(
-        task, now=fire_at, next_run_at=None, host_id=task.host_id, lease_seconds=120
-    )
-    assert claimed is not None
-    assert store.get(task.id).state == "completed"
 
     # An edit that keeps the rule is revalidated with the same allowance.
     renamed = await auth_client.patch(
@@ -780,6 +772,41 @@ async def test_database_scheduler_runs_a_one_time_rule_once(
         headers=_headers(),
     )
     assert renamed.status_code == 200, renamed.text
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+async def test_late_create_refuses_a_one_time_rule_instead_of_moving_it_a_year(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    rule, fire_at = _one_time_rule_in(hours=2)
+    # The request reaches the store a second after the requested minute, so the
+    # rule's next match would be the same minute a year later.
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: fire_at + 1)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(rrule=rule, timezone="UTC", first_run_at=fire_at),
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
+    assert "The task was not created." in resp.text
+    assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
+
+
+async def test_legacy_scheduler_refuses_first_run_at(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _rule, fire_at = _one_time_rule_in(hours=2)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(first_run_at=fire_at), headers=_headers()
+    )
+    assert resp.status_code == 400, resp.text
+    assert "first_run_at needs the database scheduler" in resp.text
+    assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
 
 
 async def test_legacy_scheduler_rejects_a_one_time_rule(

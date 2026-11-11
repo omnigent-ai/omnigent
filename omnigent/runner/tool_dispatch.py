@@ -4949,6 +4949,47 @@ async def _project_id_for_name(server_client: httpx.AsyncClient, name: str) -> s
     return project_id
 
 
+async def _reminder_schedule_mismatch(
+    server_client: httpx.AsyncClient, task: _JsonObject, when: datetime
+) -> str | None:
+    """
+    An error for a reminder the server scheduled at another time, or ``None``.
+
+    The server already refuses a mismatched ``first_run_at``; this guards against
+    one that ignored it. The wrong task is deleted, and its id is reported if the
+    delete fails, so a reminder never silently fires a year late.
+    """
+    raw_next = task.get("next_run_at")
+    try:
+        scheduled = datetime.fromisoformat(raw_next) if isinstance(raw_next, str) else None
+    except ValueError:
+        scheduled = None
+    if scheduled is not None and scheduled == when:
+        return None
+    task_id = task.get("id")
+    problem = (
+        f"sys_reminder_set: the server scheduled the reminder for {raw_next}, "
+        f"not {when.isoformat()}"
+    )
+    task_url = _scheduled_task_url(task_id)
+    if task_url is None:
+        return json.dumps({"error": f"{problem}; it returned no task id to delete"})
+    try:
+        deleted = await server_client.delete(task_url, timeout=30.0)
+        removed = deleted.status_code < 400
+    except Exception:  # noqa: BLE001
+        removed = False
+    if removed:
+        return json.dumps({"error": f"{problem}, so it was deleted; set it again"})
+    return json.dumps(
+        {
+            "error": f"{problem}, and deleting it failed; delete it with "
+            "sys_scheduled_task_delete",
+            "scheduled_task_id": task_id,
+        }
+    )
+
+
 async def _execute_reminder_set(
     args: _JsonObject,
     *,
@@ -5014,6 +5055,9 @@ async def _execute_reminder_set(
                 "permission_mode": None,
                 "session_mode": "continue",
                 "session_id": conversation_id,
+                # The server refuses the task unless its first run is this minute,
+                # so a request that arrives late can't move to next year's match.
+                "first_run_at": int(when.timestamp()),
             },
             timeout=30.0,
             headers={
@@ -5028,6 +5072,9 @@ async def _execute_reminder_set(
             {"error": f"server returned {resp.status_code}", "details": resp.text[:1000]}
         )
     task = _string_object_dict(resp.json()) or {}
+    mismatch = await _reminder_schedule_mismatch(server_client, task, when)
+    if mismatch is not None:
+        return mismatch
     return json.dumps(
         {
             "status": "scheduled",

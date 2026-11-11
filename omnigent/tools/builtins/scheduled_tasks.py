@@ -509,9 +509,10 @@ class SysReminderSetTool(Tool):
             "away, and at most 364 days. Write the message for your future self: "
             "say what to check or do. The reminder is listed as an automation; "
             "cancel it with sys_scheduled_task_delete and the returned "
-            "scheduled_task_id. Works in top-level sessions you own, not in "
-            "sub-agent sessions. For a short wait inside an active turn, "
-            "sys_timer_set (when enabled) is lighter."
+            "scheduled_task_id. Works in top-level sessions you own on a "
+            "connected host, not in sub-agent sessions or managed sandboxes. For "
+            "a short wait inside an active turn, sys_timer_set (when enabled) is "
+            "lighter."
         )
 
     def get_schema(self) -> dict[str, Any]:

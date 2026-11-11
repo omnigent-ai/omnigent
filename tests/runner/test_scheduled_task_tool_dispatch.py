@@ -635,12 +635,17 @@ class _ReminderClient(_RecordingClient):
             ),
         )
         self._session = session or _Resp(body={"id": "conv_1", "agent_id": "ag_1"})
+        self.delete_response = _Resp(body={"deleted": True})
 
     async def get(self, url: str, *, timeout: object = None) -> _Resp:
         self.calls.append(("GET", url, None))
         if url == "/v1/info":
             return self._info
         return self._session
+
+    async def delete(self, url: str, *, timeout: object = None) -> _Resp:
+        self.calls.append(("DELETE", url, None))
+        return self.delete_response
 
 
 @pytest.fixture()
@@ -681,6 +686,7 @@ async def test_reminder_creates_a_one_time_task_that_continues_this_session() ->
         "permission_mode": None,
         "session_mode": "continue",
         "session_id": "conv_1",
+        "first_run_at": 1794351660,  # 2026-11-10T23:01:00Z
     }
     assert client.headers[-1] == {
         ORCHESTRATION_SOURCE_HEADER: "conv_1",
@@ -771,3 +777,41 @@ async def test_reminder_passes_the_servers_refusal_to_the_agent() -> None:
     )
     assert out["error"] == "server returned 400"
     assert "sub-agent's session" in out["details"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+@pytest.mark.parametrize("next_run_at", ["2027-11-10T23:01:00+00:00", None])
+async def test_reminder_scheduled_for_another_time_is_deleted(next_run_at: str | None) -> None:
+    """A server that saved the reminder for another minute doesn't get to keep it."""
+    client = _ReminderClient(_Resp(body={"id": _TASK_ID, "next_run_at": next_run_at}))
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_set",
+            json.dumps({"message": "ping", "delay_seconds": 2700}),
+            server_client=client,
+            conversation_id="conv_1",
+        )
+    )
+    assert "it was deleted" in out["error"]
+    assert "status" not in out
+    assert client.calls[-1] == ("DELETE", f"/v1/scheduled-tasks/{_TASK_ID}", None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+async def test_reminder_reports_a_wrong_schedule_it_could_not_delete() -> None:
+    client = _ReminderClient(
+        _Resp(body={"id": _TASK_ID, "next_run_at": "2027-11-10T23:01:00+00:00"})
+    )
+    client.delete_response = _Resp(status_code=503, body={"error": "unavailable"})
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_set",
+            json.dumps({"message": "ping", "delay_seconds": 2700}),
+            server_client=client,
+            conversation_id="conv_1",
+        )
+    )
+    assert "deleting it failed" in out["error"]
+    assert out["scheduled_task_id"] == _TASK_ID

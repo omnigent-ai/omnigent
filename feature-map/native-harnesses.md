@@ -1376,6 +1376,17 @@ budget; it does not prove the default client can wait for a full approval day.
 With the default client deadline, cancellation must clear the approval without
 creating the automation. Record the client configuration with the evidence.
 
+Native sessions also get `sys_reminder_set`, which parks on the same approval
+gate with a shorter prompt: the reminder's time (`at ...` or `in N seconds`)
+and its full message, which arrives later as a new turn in the same session.
+`tests/policies/builtins/test_safety.py::test_ask_on_scheduled_task_change_asks_for_a_reminder`
+covers the prompt, and `::test_ask_on_scheduled_task_change_denies_a_reminder_without_message`
+covers the deny for an empty message. For a human check in an isolated instance,
+ask a native session to remind it in two minutes. Reject the approval and
+confirm no `Reminder: ...` automation appears. Ask again, approve, and confirm
+one appears, that the message arrives as a new turn about two minutes later,
+and that the automation is then `completed`.
+
 ## Gotchas
 
 - An enterprise `managed-mcp.json` applies to every Claude Code process on the

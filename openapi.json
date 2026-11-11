@@ -1982,6 +1982,19 @@
             "title": "Execution Target",
             "type": "string"
           },
+          "first_run_at": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Run At"
+          },
           "host_id": {
             "anyOf": [
               {
@@ -6640,6 +6653,11 @@
           "scheduled_task_inbox": {
             "default": false,
             "title": "Scheduled Task Inbox",
+            "type": "boolean"
+          },
+          "scheduled_task_one_time": {
+            "default": false,
+            "title": "Scheduled Task One Time",
             "type": "boolean"
           },
           "scheduled_task_projects": {

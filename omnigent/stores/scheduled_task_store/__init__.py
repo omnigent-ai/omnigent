@@ -35,6 +35,20 @@ class AutomationFailure:
     error_code: str | None
 
 
+class ScheduledTaskFirstRunMismatchError(ValueError):
+    """A new task's first run would not fall at the time its creator required.
+
+    Raised by :meth:`ScheduledTaskStore.create` before anything is saved, for
+    example when a one-time reminder is created after its minute has passed and
+    its rule would next match a year later.
+    """
+
+    def __init__(self, expected: int, actual: int | None) -> None:
+        self.expected = expected
+        self.actual = actual
+        super().__init__(f"first run would be at {actual}, not {expected}")
+
+
 class ScheduledTaskStore(ABC):
     """
     Abstract base for scheduled-task persistence.
@@ -79,6 +93,7 @@ class ScheduledTaskStore(ABC):
         execution_target: str = "connected_host",
         state: str = "active",
         delegation_ref: str | None = None,
+        first_run_at: int | None = None,
     ) -> ScheduledTask:
         """
         Insert a new scheduled task.
@@ -114,7 +129,12 @@ class ScheduledTaskStore(ABC):
             once a schedule has no remaining occurrences.
         :param delegation_ref: Names the authorization grant a deployment uses to
             act as the owner when the task fires; never a credential.
+        :param first_run_at: Epoch seconds the first run must fall at, checked
+            against the schedule computed from the task's actual creation time, in
+            the same write. ``None`` skips the check.
         :returns: The newly created :class:`ScheduledTask`.
+        :raises ScheduledTaskFirstRunMismatchError: If ``first_run_at`` is set and
+            the first run differs; nothing is saved.
         :raises ValueError: If ``state`` is not a recognized value.
         """
         ...

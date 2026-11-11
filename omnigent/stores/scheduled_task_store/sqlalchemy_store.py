@@ -59,6 +59,7 @@ from omnigent.stores.host_store import delete_unused_host_in_session
 from omnigent.stores.scheduled_task_store import (
     AdoptOutcome,
     AutomationFailure,
+    ScheduledTaskFirstRunMismatchError,
     ScheduledTaskStore,
 )
 from omnigent.stores.scheduled_task_store.dispatch import (
@@ -256,6 +257,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         execution_target: str = "connected_host",
         state: str = "active",
         delegation_ref: str | None = None,
+        first_run_at: int | None = None,
     ) -> ScheduledTask:
         """Insert a new scheduled task with a required recurring ``rrule``."""
         created_at = now_epoch()
@@ -291,6 +293,10 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 updated_at=None,
             )
             self._refresh_schedule(row, created_at)
+            if first_run_at is not None and row.next_run_at != first_run_at:
+                # Checked against the real creation time, so a request that arrives
+                # after the intended run cannot be saved for a later occurrence.
+                raise ScheduledTaskFirstRunMismatchError(first_run_at, row.next_run_at)
             session.add(row)
             session.flush()
             return _to_entity(row)
