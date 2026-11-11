@@ -178,6 +178,7 @@ def test_webfonts_is_a_frontend_visible_feature() -> None:
         "custom_agents_settings_ui",
         "peer_session_messaging",
         "session_orchestration",
+        "sibling_sessions",
         "sidebar_grouping_ui",
         "webfonts",
     )
