@@ -180,7 +180,7 @@ describe("TasksPanel", () => {
     expect(screen.getByText("1 failed")).toBeTruthy();
   });
 
-  it("marks every step that can start as ready, and links segments that wait on each other", () => {
+  it("marks every step that can start as ready, and shows on the strip what waits on what", () => {
     showJournal([
       journalPlan(
         0,
@@ -205,6 +205,18 @@ describe("TasksPanel", () => {
       false,
       true,
     ]);
+    // Hovering batch arcs it to profile, which it waits on, and ship, which waits on it.
+    fireEvent.pointerEnter(segments[1]);
+    expect(screen.getAllByTestId("tasks-progress-arc")).toHaveLength(2);
+    expect(segments.map((segment) => segment.dataset.dimmed === "true")).toEqual([
+      false,
+      false,
+      true,
+      false,
+    ]);
+    fireEvent.pointerLeave(screen.getByTestId("tasks-progress"));
+    expect(screen.queryAllByTestId("tasks-progress-arc")).toHaveLength(0);
+    expect(segments.some((segment) => segment.dataset.dimmed)).toBe(false);
   });
 
   it("says on hover which task a progress segment is and where it stands", async () => {

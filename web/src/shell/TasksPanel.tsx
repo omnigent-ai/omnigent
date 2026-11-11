@@ -516,11 +516,14 @@ function statusLine(item: StepProgress, pending: readonly string[]): ReactNode {
 
 /** Past this many tasks, the strip has no room for links between its segments. */
 const MAX_LINKED_TASKS = 40;
+/** How high a hover arc rises above the strip at most, in pixels. */
+const ARC_HEIGHT = 14;
 
 /**
  * One segment per task; hovering one says which task it is and where it stands.
  * A plan links neighboring segments when one task waits on the other, so a gap
- * means the two can run at the same time.
+ * means the two can run at the same time, and hovering one of its segments
+ * draws arcs to the tasks it waits on and the tasks that wait on it.
  */
 function ProgressStrip({
   progress,
@@ -541,16 +544,66 @@ function ProgressStrip({
       ? linkedToPrevious(progress.map((item) => item.step))
       : null;
   const roomy = progress.length <= 24;
+  const gap = roomy ? 6 : 4;
+  const [hovered, setHovered] = useState<number | null>(null);
+  const focusIndex = links && hovered !== null && hovered < progress.length ? hovered : null;
+  // The tasks the hovered one waits on, and the tasks that wait on it.
+  const related = new Set<number>();
+  if (focusIndex !== null) {
+    const focusStep = progress[focusIndex].step;
+    progress.forEach((item, index) => {
+      if (
+        focusStep.depends_on.includes(item.step.id) ||
+        item.step.depends_on.includes(focusStep.id)
+      ) {
+        related.add(index);
+      }
+    });
+  }
+  const lit = (index: number) => focusIndex === null || index === focusIndex || related.has(index);
+  // A segment's width, as CSS: the strip's width less its gaps, shared out.
+  const unit = `((100% - ${(progress.length - 1) * gap}px) / ${progress.length})`;
   return (
     <TooltipProvider delayDuration={100} skipDelayDuration={400} disableHoverableContent>
       <div
         className={cn(
-          "-my-[5px] flex h-4 items-center",
-          links ? (roomy ? "gap-1.5" : "gap-1") : progress.length > 16 ? "gap-px" : "gap-[3px]",
+          "relative flex h-4 items-center",
+          // A plan's strip keeps room above it for the hover arcs.
+          links ? "mt-px -mb-[5px]" : "-my-[5px]",
+          !links && (progress.length > 16 ? "gap-px" : "gap-[3px]"),
         )}
+        // In pixels, so the arcs' calc() lands on each segment's center.
+        style={links ? { columnGap: gap } : undefined}
         data-testid="tasks-progress"
         data-links={links ? "true" : undefined}
+        onPointerLeave={() => setHovered(null)}
       >
+        {focusIndex !== null && (
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-x-0 bottom-[11px]"
+            style={{ height: ARC_HEIGHT }}
+          >
+            {[...related].map((index) => {
+              const from = Math.min(index, focusIndex);
+              const span = Math.abs(index - focusIndex);
+              return (
+                <span
+                  key={index}
+                  className="absolute bottom-0 border-x-[1.5px] border-t-[1.5px] border-muted-foreground"
+                  style={{
+                    left: `calc(${from + 0.5} * ${unit} + ${from * gap}px)`,
+                    width: `calc(${span} * (${unit} + ${gap}px))`,
+                    height: Math.min(4 + span * 2, ARC_HEIGHT),
+                    borderTopLeftRadius: "50% 100%",
+                    borderTopRightRadius: "50% 100%",
+                  }}
+                  data-testid="tasks-progress-arc"
+                />
+              );
+            })}
+          </div>
+        )}
         {progress.map((item, index) => {
           const pending = item.step.depends_on
             .filter((id) => !done.has(id))
@@ -567,23 +620,29 @@ function ProgressStrip({
                   type="button"
                   aria-label={`Task ${index + 1}, ${item.step.name}: ${STATE_LABELS[item.state]}`}
                   onClick={() => onSelect(item.step.id)}
+                  onPointerEnter={() => setHovered(index)}
+                  onFocus={() => setHovered(index)}
+                  onBlur={() => setHovered(null)}
                   className="group relative flex h-full min-w-0 flex-1 cursor-pointer items-center focus-visible:outline-none"
                   data-testid="tasks-progress-segment"
                   data-linked={links?.[index] || undefined}
+                  data-dimmed={!lit(index) || undefined}
                 >
                   {links?.[index] && (
                     <span
                       aria-hidden
                       className={cn(
-                        "absolute top-1/2 right-full h-0.5 -translate-y-1/2 bg-border-strong",
-                        roomy ? "w-1.5" : "w-1",
+                        "absolute top-1/2 right-full h-0.5 -translate-y-1/2 bg-border-strong transition-opacity duration-150",
+                        !(lit(index) && lit(index - 1)) && "opacity-30",
                       )}
+                      style={{ width: gap }}
                     />
                   )}
                   <span
                     className={cn(
-                      "h-1.5 w-full rounded-full transition-[height] duration-150 group-hover:h-2 group-focus-visible:h-2 group-focus-visible:ring-2 group-focus-visible:ring-ring/50",
+                      "h-1.5 w-full rounded-full transition-[height,opacity] duration-150 group-hover:h-2 group-focus-visible:h-2 group-focus-visible:ring-2 group-focus-visible:ring-ring/50",
                       SEGMENT_COLORS[item.state],
+                      !lit(index) && "opacity-30",
                     )}
                   />
                 </button>
