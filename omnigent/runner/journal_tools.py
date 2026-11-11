@@ -1,10 +1,12 @@
-"""Runner-side handlers for the ``sys_journal_*`` tools.
+"""Runner-side handlers for the ``sys_journal_*`` tools and ``sys_workflow_request_input``.
 
 The runner has no journal store, so these tools call the server's
 ``/v1/sessions/{id}/journal`` routes. A write carries an idempotency key that
 its retries reuse, and once the server accepts it the runner publishes
 ``session.journal.appended`` on the session stream, the way it reports
 child-session updates. Reads come back as compact lines the model can scan.
+``sys_workflow_request_input`` has the server mark a task waiting and raise its
+questions, then waits for the answer like any other elicitation.
 """
 
 from __future__ import annotations
@@ -34,6 +36,8 @@ from omnigent.entities.session_journal import (
     normalize_status,
     normalize_step_id,
 )
+from omnigent.entities.workflow_questions import answers_from_content, normalize_questions
+from omnigent.runner import pending_approvals
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.tools.builtins.journal import JOURNAL_READ_PAGE_MAX, JOURNAL_TOOLS
 
@@ -204,6 +208,73 @@ async def _write(
     if entry.get("kind") == "plan":
         result["version"] = entry["payload"]["version"]
     return json.dumps(result)
+
+
+# ── Asking the user ───────────────────────────────────
+
+
+def _stream_publisher(publish_event: _Publisher | None) -> _Publisher:
+    if publish_event is not None:
+        return publish_event
+    from omnigent.runtime import session_stream
+
+    return session_stream.publish
+
+
+async def _request_input(
+    args: dict[str, Any],
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    call_id: str | None,
+    publish_event: _Publisher | None,
+) -> str:
+    """Mark a task waiting, raise its questions, and wait for the user's answers."""
+    tool_name = "sys_workflow_request_input"
+    try:
+        step = normalize_step_id(args.get("step"))
+        questions = normalize_questions(args.get("questions"))
+    except InvalidJournalEntryError as exc:
+        return _error(f"invalid_input: {exc}")
+    body = {"step": step, "questions": questions, "idempotency_key": _idempotency_key(call_id)}
+    url = f"{_journal_url(conversation_id)}/input-requests"
+    while True:
+        response = await _post_with_retries(server_client, url, body, conversation_id)
+        if isinstance(response, str):
+            return _error(f"{tool_name} failed: {response}")
+        if _is_unrouted(response):
+            return _error(f"{tool_name}: this Omnigent server can't ask questions for workflows")
+        if response.status_code == 404:
+            return _error("session_not_found", conversation_id=conversation_id)
+        if response.status_code >= 400:
+            return _error(_server_message(response))
+        requested = response.json()
+        _publish(publish_event, conversation_id, requested["entry"])
+        try:
+            verdict = await pending_approvals.wait_for_user_verdict(
+                elicitation_id=requested["elicitation_id"],
+                conversation_id=conversation_id,
+                publish_event=_stream_publisher(publish_event),
+                retry_on_server_reconnect=True,
+            )
+        except pending_approvals.ServerReconnected:
+            # The server may have lost the question; the same key raises it again.
+            continue
+        break
+    if not verdict.approved:
+        return json.dumps(
+            {
+                "answered": False,
+                "detail": (
+                    "No answer: the user dismissed the question, or it timed out. The "
+                    "task stays waiting for them; don't ask again this turn."
+                ),
+            }
+        )
+    return json.dumps(
+        {"answered": True, "answers": answers_from_content(questions, verdict.content)},
+        ensure_ascii=False,
+    )
 
 
 # ── Reads ─────────────────────────────────────────────
@@ -404,7 +475,7 @@ async def execute_journal_tool(
     call_id: str | None = None,
     publish_event: _Publisher | None = None,
 ) -> str:
-    """Run one ``sys_journal_*`` tool call for the session's agent.
+    """Run one journal tool call (``sys_journal_*``, ``sys_workflow_request_input``).
 
     :param tool_name: One of :data:`JOURNAL_TOOL_NAMES`.
     :param arguments: The call's JSON arguments.
@@ -426,6 +497,14 @@ async def execute_journal_tool(
         return _error(f"{tool_name}: arguments must be an object")
     if tool_name == "sys_journal_read":
         return await _read(args, server_client=server_client, conversation_id=conversation_id)
+    if tool_name == "sys_workflow_request_input":
+        return await _request_input(
+            args,
+            server_client=server_client,
+            conversation_id=conversation_id,
+            call_id=call_id,
+            publish_event=publish_event,
+        )
     return await _write(
         tool_name,
         args,

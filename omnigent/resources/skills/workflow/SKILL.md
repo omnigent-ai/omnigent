@@ -10,8 +10,8 @@ through the plan, recording where each step stands as you go. The user watches
 the plan's steps as tasks in the session's Tasks tab and can steer or stop you
 in chat at any time.
 
-You need the `sys_journal_*` tools. If you don't have them, tell the user this
-agent can't run workflows and stop.
+You need the `sys_journal_*` tools and `sys_workflow_request_input`. If you
+don't have them, tell the user this agent can't run workflows and stop.
 
 ## Plan
 
@@ -21,7 +21,9 @@ agent can't run workflows and stop.
    the plan for its goal in a few words ("Cut GET /orders p95 by 20%"). Give
    each step a short, stable ID (`profile`, `opt-pool`), a name, and its
    dependencies. A single goal is a one-step plan.
-3. Ask first only if the description is ambiguous. Otherwise start.
+3. Ask first only if the description is ambiguous: write the plan with what you
+   know, and ask with `sys_workflow_request_input` on its first step. Otherwise
+   start.
 
 ## Work through it
 
@@ -40,19 +42,20 @@ agent can't run workflows and stop.
   those, unless the user or your instructions say to stop sooner.
 - When a step needs the user (an approval or a decision), first finish the
   ready steps that don't depend on the answer, since asking pauses your turn.
-  Then write `needs_input` on the step saying what you need, such as "Approve
-  the deploy to prod?", and ask with your question tool (such as
-  AskUserQuestion or request_user_input), so the question reaches their Inbox;
-  if you have none, ask in your reply. Write `started` when you resume the step
-  after the answer.
+  Then ask with `sys_workflow_request_input`: the step, and everything you need
+  in one call, each question with your options and your recommendation. It
+  marks the step `needs_input`, puts the questions in the user's Inbox, and
+  waits for the answer. Use it, not your own question tool (such as
+  AskUserQuestion or request_user_input). Write `started` when you resume the
+  step after the answer.
 - If the user asks you to stop and wait for them, write `needs_input` on every
   ready step, with text like "Paused at your request", then ask once whether
-  to go on.
+  to go on, with `sys_workflow_request_input` on the next of them.
 - When something you can't clear yourself stops a step, such as CI being down
   or a review you're waiting on, the user decides how to go on. If it may clear
-  by itself, such as a flaky check, retry once first. Then write `needs_input`
-  on the step saying what's in the way, and ask, offering the ways forward you
-  see (retry later, a workaround, or dropping the step) with your
+  by itself, such as a flaky check, retry once first. Then ask with
+  `sys_workflow_request_input`, saying what's in the way and offering the ways
+  forward you see (retry later, a workaround, or dropping the step), with your
   recommendation.
 - In a run no one is watching, such as an automation's, don't ask: write
   `needs_input` with the options and your recommendation, in a note if they
@@ -70,9 +73,9 @@ agent can't run workflows and stop.
   goal stays the same, and change it when the goal changes.
 - Write a note with `sys_journal_write_note` before any external side effect
   (push, merge, tag, deploy), and look for those notes when you resume.
-- Make an approval a step of its own. Write `needs_input` on it with text like
-  "Approve the deploy to prod?", then ask. Write `done` if approved, or `failed`
-  if rejected.
+- Make an approval a step of its own, and ask for it with
+  `sys_workflow_request_input` ("Approve the deploy to prod?"). Write `done` if
+  approved, or `failed` if rejected.
 - Keep entries short, and point to files, PRs and sessions instead of pasting
   them.
 

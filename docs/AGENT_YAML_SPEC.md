@@ -994,7 +994,7 @@ tool_groups:
   comments: false         # list_comments / update_comment
   policies: false         # sys_add_policy / sys_policy_registry
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
-  journal: false          # sys_journal_read / _write_plan / _write_status / _write_note
+  journal: false          # sys_journal_read / _write_plan / _write_status / _write_note, sys_workflow_request_input
 ```
 
 Every group defaults to `true`, so omitting the block changes nothing. Values

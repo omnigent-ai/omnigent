@@ -8495,6 +8495,60 @@
         "title": "SessionJournalEntry",
         "type": "object"
       },
+      "SessionJournalInputRequest": {
+        "additionalProperties": false,
+        "description": "Body of `POST /v1/sessions/{id}/journal/input-requests`, sent by the session's runner.",
+        "properties": {
+          "idempotency_key": {
+            "description": "Names the request, e.g. `\"tool:<tool call ID>\"`; a retry with the same key reuses the first attempt's status and question.",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "questions": {
+            "description": "1 to 3 questions, each with a `question`, a short `header`, 2 to 4 `options` (`label`, optional `description`) and an optional `recommended` option label.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Questions",
+            "type": "array"
+          },
+          "step": {
+            "description": "The task in the current plan that waits for the answer, e.g. `\"deploy\"`.",
+            "title": "Step",
+            "type": "string"
+          }
+        },
+        "required": [
+          "step",
+          "questions",
+          "idempotency_key"
+        ],
+        "title": "SessionJournalInputRequest",
+        "type": "object"
+      },
+      "SessionJournalInputRequested": {
+        "description": "Response of `POST /v1/sessions/{id}/journal/input-requests`.",
+        "properties": {
+          "elicitation_id": {
+            "description": "The question's elicitation; the runner waits for its answer.",
+            "title": "Elicitation Id",
+            "type": "string"
+          },
+          "entry": {
+            "$ref": "#/components/schemas/SessionJournalEntry",
+            "description": "The task's `needs_input` status."
+          }
+        },
+        "required": [
+          "entry",
+          "elicitation_id"
+        ],
+        "title": "SessionJournalInputRequested",
+        "type": "object"
+      },
       "SessionJournalPage": {
         "description": "One page of a session's journal, for `GET /v1/sessions/{id}/journal`.",
         "properties": {
@@ -19028,6 +19082,59 @@
           }
         },
         "summary": "Append Session Journal Entry",
+        "tags": [
+          "session_journal"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/journal/input-requests": {
+      "post": {
+        "description": "Mark a task waiting for the user and ask them; only the session's runner calls this.\n\nThe task gets a `needs_input` status naming the first question, and the\nquestions go out as an elicitation with the web's question form. A retry\nwith the same idempotency key reuses the status and the elicitation ID.",
+        "operationId": "request_session_journal_input_v1_sessions__session_id__journal_input_requests_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionJournalInputRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionJournalInputRequested"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Request Session Journal Input",
         "tags": [
           "session_journal"
         ]

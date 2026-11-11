@@ -33,9 +33,9 @@ The newest status for a step is its current one:
 - `done`: the step achieved its goal. Only `done` lets later steps start.
 - `needs_input`: the step waits for the session's user: an approval, a
   decision, a go-ahead, or how to get past something the agent can't clear
-  itself, such as CI being down, with the ways forward it sees. The agent also
-  asks with its question tool, so the question reaches the user's Inbox. It
-  shows as Waiting for you, in pink.
+  itself, such as CI being down, with the ways forward it sees. The agent asks
+  with `sys_workflow_request_input`, which writes the status for it, so the
+  question reaches the user's Inbox. It shows as Waiting for you, in pink.
 - `failed`: the step's own work failed.
 
 The workflow skill keeps the agent working while any step is ready or started:
@@ -51,7 +51,7 @@ stored entry is at most 16,383 bytes after compression.
 
 ## Agent tools
 
-The four tools make up the `journal` tool group, which every agent has. An agent
+The five tools make up the `journal` tool group, which every agent has. An agent
 spec can drop it with `tool_groups.journal: false` (see
 [Tool groups](AGENT_YAML_SPEC.md#tool-groups)).
 
@@ -61,9 +61,12 @@ spec can drop it with `tool_groups.journal: false` (see
 | `sys_journal_write_plan(name, steps)`                               | Sets the session's plan: its name and the whole graph; returns `{id, position, version}`.                                                                                                                                                                                       |
 | `sys_journal_write_status(status, step?, text?)`                    | Records a step's status. `step` may be left out when the plan has one step. `started` and `done` need every step it depends on to be done first; otherwise the write fails with `step_not_ready`, naming them.                                                                  |
 | `sys_journal_write_note(body, step?)`                               | Adds a note.                                                                                                                                                                                                                                                                    |
+| `sys_workflow_request_input(step, questions)`                      | Asks the user about a task in the current plan and waits for the answer. It marks the task `needs_input` with the first question, raises the questions as an elicitation in the Inbox with the options as buttons, and returns `{answered, answers}`.                           |
 
 Errors come back as `{"error": …}`: `invalid_entry` (a field failed
-validation), `entry_too_large` (with the size and the limit),
+validation), `invalid_input` (a question or its task failed validation; a
+question needs a current plan that has its task), `entry_too_large` (with
+the size and the limit),
 `session_not_found` and `session_out_of_tree` (for reads of another session).
 A write's retry, for example while the runner's connection to the server
 reconnects, returns the entry the first attempt wrote instead of adding another.
@@ -144,6 +147,10 @@ tab fetches whatever it missed, and while the stream is down it checks every
 | ------ | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GET`  | `/v1/sessions/{id}/journal` | Read access. `limit` (1–1000), `order` (`asc` or `desc`), `after` and `before` (entry IDs, as for conversation items), `kind`, `step`. Returns a list page. `kind=plan&order=desc&limit=1` is the current plan. |
 | `POST` | `/v1/sessions/{id}/journal` | Written by the session's runner for its agent's tools; the call must carry `X-Omnigent-Orchestration-Source` naming the session.                                                                                |
+
+`POST /v1/sessions/{id}/journal/input-requests` asks the user for
+`sys_workflow_request_input`; like the append, only the session's runner calls
+it. A retry with the same idempotency key reuses the status and the question.
 
 Each new entry is also published as `session.journal.appended` on
 `GET /v1/sessions/{id}/stream`. `GET /v1/info` reports `session_journal: true` on
