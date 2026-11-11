@@ -24,9 +24,13 @@ a backfill:
 
 from __future__ import annotations
 
+from typing import Any
+
 import zstandard
 from sqlalchemy import LargeBinary
-from sqlalchemy.types import TypeDecorator
+from sqlalchemy.dialects import mysql
+from sqlalchemy.engine.interfaces import Dialect
+from sqlalchemy.types import TypeDecorator, TypeEngine
 
 # Leading byte marking a framed (post-migration) value. Legacy text never
 # begins with NUL, so its presence unambiguously distinguishes the two formats.
@@ -124,13 +128,27 @@ class CompressedText(TypeDecorator[str]):
     impl = LargeBinary
     cache_ok = True
 
-    def __init__(self, max_stored_bytes: int | None = None) -> None:
+    def __init__(
+        self, max_stored_bytes: int | None = None, *, mysql_varbinary: bool = False
+    ) -> None:
         """
         :param max_stored_bytes: Largest framed (compressed) value to write, e.g.
             ``65_535`` for a MySQL ``BLOB``; ``None`` leaves writes unbounded.
+        :param mysql_varbinary: Declare the column ``VARBINARY(max_stored_bytes)``
+            on MySQL instead of ``BLOB``. For new columns; existing columns keep
+            the type they were created with.
         """
+        if mysql_varbinary and max_stored_bytes is None:
+            raise ValueError("A VARBINARY column needs max_stored_bytes")
         super().__init__()
         self.max_stored_bytes = max_stored_bytes
+        self.mysql_varbinary = mysql_varbinary
+
+    def load_dialect_impl(self, dialect: Dialect) -> TypeEngine[Any]:
+        """Use the bounded MySQL binary type when asked; ``LargeBinary`` otherwise."""
+        if self.mysql_varbinary and dialect.name == "mysql":
+            return dialect.type_descriptor(mysql.VARBINARY(self.max_stored_bytes))
+        return dialect.type_descriptor(LargeBinary())
 
     def process_bind_param(self, value: str | None, dialect: object) -> bytes | None:
         """Compress on the way into the database, enforcing ``max_stored_bytes``."""
