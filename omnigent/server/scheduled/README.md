@@ -252,7 +252,7 @@ fires. If `fire_identity` is set, it enters that first:
 | When entering the identity… | Result |
 | --- | --- |
 | Raises `FireIdentityRevoked` | The run fails with `reauthorization_required`, and no session is created. If the owner was deleted, the task is disabled with `owner_deleted` instead. |
-| Raises any other error | Treated as temporary: the run fails with `owner_identity_unavailable`, and the next occurrence tries again. |
+| Raises any other error | Treated as temporary: the run fails with `owner_identity_unavailable`, and the next occurrence tries again. A one-time (`COUNT=1`) task has no next occurrence, so its error says to set it again. |
 
 Recovery enters the same identity before inspecting a session. A temporary error
 leaves the run for a later pass. `FireIdentityRevoked` records `failed` without

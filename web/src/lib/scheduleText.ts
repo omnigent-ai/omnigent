@@ -213,7 +213,8 @@ const RUN_FAILURES: Readonly<Record<string, RunFailure>> = {
   owner_deleted: { stage: "Owner", reason: "The owner's account was removed." },
   owner_identity_unavailable: {
     stage: "Owner",
-    reason: "Couldn't act as the owner. The next run tries again.",
+    // Recurrence-neutral: a one-time automation, such as a reminder, has no next run.
+    reason: "Couldn't act as the owner. A recurring automation tries again at its next run.",
   },
   reauthorization_required: {
     stage: "Owner",
