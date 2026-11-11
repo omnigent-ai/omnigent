@@ -777,15 +777,7 @@ def test_reminder_approval_denies_a_time_the_tool_would_reject() -> None:
 
 @pytest.mark.parametrize("message", [None, "", "   ", 5])
 def test_ask_on_scheduled_task_change_denies_a_reminder_without_message(message) -> None:
-    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
-
-    result = ask_on_scheduled_task_change(
-        {
-            "type": "tool_call",
-            "target": "sys_reminder_set",
-            "data": {"arguments": {"message": message, "delay_seconds": 60}},
-        }
-    )
+    result = _reminder_review({"message": message, "delay_seconds": 60})
     assert result["result"] == "DENY"
     assert "reminder message" in result["reason"]
 
