@@ -165,10 +165,12 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
             except IntegrityError as exc:
                 # Another item holds the key.
                 holder = self.get_by_dedupe_key(item.user_id, item.dedupe_key)
-                if holder is None or holder.id == retire_item_id or attempt == 1:
+                if holder is None or holder.id == retire_item_id:
                     raise
                 if not _expired(holder):
                     raise DuplicateInboxItemError(item.dedupe_key) from exc
+                if attempt == 1:
+                    raise
                 # The holder expired, so this post replaces it, even when it was
                 # inserted after the caller's duplicate check.
                 retire_item_id = holder.id

@@ -129,7 +129,7 @@ def _item(**overrides: Any) -> InboxItem:
         "primary_link": None,
         "topic": "digest",
         "dedupe_key": "",
-        "state": "unread",
+        "status": "unread",
         "resolution": "none",
         "feedback_text": None,
         "created_at": 1,
@@ -152,7 +152,7 @@ def test_a_live_item_matches_until_it_expires() -> None:
 
 
 def test_dismissed_items_still_suppress() -> None:
-    item = _item(state="dismissed", resolution="not_relevant")
+    item = _item(status="dismissed", resolution="not_relevant")
     lookup = _Lookup({dedupe_key(_INPUTS): item})
 
     assert find_duplicate(lookup, "alice", _INPUTS, now=1).existing == item  # type: ignore[arg-type]

@@ -107,7 +107,7 @@ async def test_list_pages_and_trims_items() -> None:
         "topic": "x",
         "body_md": "b" * 1000,
         "dedupe_key": "v1:secret-detail",
-        "state": "dismissed",
+        "status": "dismissed",
         "resolution": "already_done",
         "actions": [{"label": "Reply", "prompt": "long prompt"}],
     }
@@ -128,7 +128,7 @@ async def test_list_pages_and_trims_items() -> None:
     assert [entry["id"] for entry in out["items"]] == ["i1", "i2"]
     assert len(out["items"][0]["body_preview"]) == 300
     assert "dedupe_key" not in out["items"][0]
-    assert (out["items"][0]["state"], out["items"][0]["resolution"]) == (
+    assert (out["items"][0]["status"], out["items"][0]["resolution"]) == (
         "dismissed",
         "already_done",
     )

@@ -154,6 +154,34 @@ def test_create_refreshes_expired_collision_after_stale_preflight(
     assert retired.dedupe_key == f"v1:aaa#{winner.id}"
 
 
+def test_a_live_replacement_that_wins_the_retry_is_reported_as_a_duplicate(
+    store: SqlAlchemyInboxItemStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A competitor retires the expired holder and inserts first; the post sees its item."""
+    from sqlalchemy.exc import IntegrityError
+
+    expired = store.create(_new(expires_at=1))
+    real_insert = store._insert
+    calls = {"n": 0}
+
+    def lose_twice(item: NewInboxItem, retire: str | None) -> object:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # The post's duplicate check missed the expired item.
+            raise IntegrityError("INSERT", {}, Exception("duplicate key"))
+        if calls["n"] == 2:
+            # A competitor replaced the expired item between the attempts.
+            real_insert(_new(source_session_id="c" * 32), expired.id)
+            raise IntegrityError("INSERT", {}, Exception("duplicate key"))
+        return real_insert(item, retire)
+
+    monkeypatch.setattr(store, "_insert", lose_twice)
+
+    with pytest.raises(DuplicateInboxItemError):
+        store.create(_new(source_session_id="b" * 32))
+    assert calls["n"] == 2
+
+
 def test_retiring_an_expired_item_frees_its_key(store: SqlAlchemyInboxItemStore) -> None:
     expired = store.create(_new(expires_at=5))
 
