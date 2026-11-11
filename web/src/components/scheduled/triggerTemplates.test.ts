@@ -685,12 +685,20 @@ describe("compileGithubQuery", () => {
   });
 
   it("turns link-back off for merges unless the owner chose", () => {
-    const opened = fields({ event: "pr", scope: "acme/app", conditions: [] });
-    expect(withTriggerEvent("github", opened, "merged")).toMatchObject({
-      event: "merged",
+    const base = { field: "base", operator: "is", value: "main" } as const;
+    const review = fields({
+      event: "review",
+      scope: "acme/app",
+      conditions: [base],
+      target: "alice",
       linkBack: false,
     });
-    expect(withTriggerEvent("github", opened, "merged")).not.toHaveProperty("target");
+    const merged = withTriggerEvent("github", review, "merged");
+    expect(merged).toMatchObject({ event: "merged", linkBack: false, conditions: [base] });
+    // The review requester target has no meaning once a pull request is merged.
+    expect(merged).not.toHaveProperty("target");
+    const opened = fields({ event: "pr", scope: "acme/app", conditions: [] });
+    expect(withTriggerEvent("github", opened, "merged").linkBack).toBe(false);
     const chosen = { ...opened, linkBack: true, linkBackTouched: true };
     expect(withTriggerEvent("github", chosen, "merged").linkBack).toBe(true);
   });
