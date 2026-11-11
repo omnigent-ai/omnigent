@@ -156,13 +156,15 @@ class ScheduledTaskStore(ABC):
         check_generation: bool = False,
         after: tuple[int, str] | None = None,
         limit: int = 50,
+        include_event_triggered: bool = True,
     ) -> tuple[builtins.list[AutomationFailure], tuple[int, str] | None]:
         """Page owned tasks and return their latest failures without a session.
 
-        The cursor advances over examined tasks, including healthy/deleted tasks,
-        so an empty page can still have a continuation. Legacy stores return empty.
+        The cursor advances over examined tasks, including healthy/deleted tasks
+        and, without ``include_event_triggered``, event-triggered ones, so an
+        empty page can still have a continuation. Legacy stores return empty.
         """
-        del owner_user_id, generation, check_generation, after, limit
+        del owner_user_id, generation, check_generation, after, limit, include_event_triggered
         return [], None
 
     @abstractmethod

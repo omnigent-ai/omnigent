@@ -529,6 +529,8 @@ const AUTOMATION_INBOX_PAGE_SIZE = 50;
 export async function listAutomationFailures(after: string | null): Promise<AutomationFailurePage> {
   const params = new URLSearchParams({ limit: String(AUTOMATION_INBOX_PAGE_SIZE) });
   if (after !== null) params.set("after", after);
+  // Include event-triggered automations; older clients don't see them.
+  params.set("event_triggers", "1");
   const response = await authenticatedFetch(`/v1/scheduled-tasks/inbox?${params}`);
   const page = await readJsonOrThrow<{
     data: AutomationFailureWire[];
