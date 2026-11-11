@@ -334,11 +334,13 @@ the server's own session events: `session.created`, `session.renamed`,
   checked through its root.
 - By default a task ignores the sessions it created or continues, and their
   sub-agents, so its own turns cannot trigger it again.
-- A task accepts at most 10 events a minute, counted from its receipts. A
-  further event that minute that would start a run is dropped, and one
-  `skipped` run (`rate_limited`) per minute records the drop.
-- A task that continues one session adds new events to the run its newest
-  receipt names while that run waits for a claim, instead of recording another (up to 20 listed, the rest counted, and the
+- A task starts a new run only while its receipts show fewer than 10 accepted
+  events in the last minute; an event that would start a run past that is
+  dropped, and one `skipped` run (`rate_limited`) per minute records the drop.
+  Events that join a waiting run are always accepted and count toward the 10.
+- A task that continues one session adds new events to the run its
+  `pending_event_run_id` names while that run waits for a claim, instead of
+  recording another (up to 20 listed, the rest counted, and the
   document kept under the column's size). The
   scheduler holds that run while the session is running or waiting on an
   approval, for at most 10 minutes, so a busy session gets one prompt.

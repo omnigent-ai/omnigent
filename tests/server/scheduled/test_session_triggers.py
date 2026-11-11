@@ -281,12 +281,13 @@ def test_status_edges_report_turn_ends_with_their_response(
         (
             "turn.failed",
             session,
-            {"occurrence": "resp_2", "response_id": "resp_2", "error_code": "runner_error"},
+            {"occurrence": "resp_2", "response_id": None, "error_code": "runner_error"},
         ),
+        # The late failure carries no response of its own, so none is reported.
         (
             "turn.failed",
             session,
-            {"occurrence": "resp_4", "response_id": "resp_4", "error_code": None},
+            {"occurrence": "resp_4", "response_id": None, "error_code": None},
         ),
         ("turn.completed", session, {"occurrence": "resp_4", "response_id": "resp_4"}),
     ]

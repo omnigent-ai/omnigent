@@ -153,6 +153,14 @@ MCP independent creation.
 - As an admin, open Settings → Admin → General and change **Nested agent destinations**.
   Open **Add nested agent** from a session and inspect its host picker, then try the
   same disallowed destination through the API or MCP.
+- **Add nested agent** starts in the source checkout even when the project or user
+  defaults request new worktrees. Directory and worktree controls remain editable;
+  switching away and back restores the source directory. A manually created worktree
+  defaults to the selected checkout's actual branch, including `master`, with an
+  editable base branch. Browser
+  coverage: `tests/browser_ui/chat/test_nested_agent_workspace.py` (desktop/mobile,
+  mocked backend); default and explicit worktree payloads:
+  `web/src/shell/NewChatDialog.flow.test.tsx`.
 - Open an independent worker in Chat or Terminal and follow its "Created by"
   link. On mobile web, the same link is in the header. Ask the manager to list
   its sessions and match `created_by_session_id` to its own session ID.

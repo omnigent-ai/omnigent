@@ -369,6 +369,9 @@ async def test_project_name_is_sent_as_the_resolved_project_id(
 
     creates = [body for verb, url, body in client.calls if (verb, url) == ("POST", "/v1/projects")]
     assert creates == ([{"name": "triage"}] if created else [])
+    if tool_name == "sys_scheduled_task_update":
+        # The task check also finds an event-triggered task.
+        assert ("GET", f"/v1/scheduled-tasks/{_TASK_ID}?event_triggers=1", None) in client.calls
     _, url, body = client.calls[-1]
     assert url.startswith("/v1/scheduled-tasks")
     assert body is not None and body["project_id"] == filed_into

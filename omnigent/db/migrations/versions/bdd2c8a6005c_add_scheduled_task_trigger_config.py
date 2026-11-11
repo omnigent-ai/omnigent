@@ -11,6 +11,8 @@ adds a ``provider`` value and its JSON shapes, not columns:
   condition. A task with one runs on events instead of a schedule.
 * ``scheduled_tasks.rrule`` becomes nullable, since an event-triggered task has
   no recurrence rule.
+* ``scheduled_tasks.pending_event_run_id``: the event run that a task continuing
+  one session adds new events to while it waits for a claim, or NULL.
 * ``scheduled_tasks.trigger_provider``: the provider named in ``trigger_config``,
   or NULL for a scheduled task. It is the scalar that SQL filters on, through
   ``ix_scheduled_tasks_trigger`` on ``(state, trigger_provider, next_run_at,
@@ -24,7 +26,7 @@ adds a ``provider`` value and its JSON shapes, not columns:
   run is still recognized when it is delivered again.
 
 The JSON columns are read and written whole and never filtered in SQL, so they
-are stored compressed, at most 16,383 bytes each.
+are stored compressed, at most 16,383 bytes each (``VARBINARY(16383)`` on MySQL).
 
 Additive, with no backfill: existing tasks keep their rule. Deploy it before the
 application change that writes these columns. A server that predates that change
@@ -67,12 +69,13 @@ def upgrade() -> None:
         batch_op.add_column(
             sa.Column(
                 "trigger_config",
-                CompressedText(max_stored_bytes=_JSON_MAX_STORED_BYTES),
+                CompressedText(max_stored_bytes=_JSON_MAX_STORED_BYTES, mysql_varbinary=True),
                 nullable=True,
             )
         )
         batch_op.alter_column("rrule", existing_type=sa.String(512), nullable=True)
         batch_op.add_column(sa.Column("trigger_provider", sa.String(32), nullable=True))
+        batch_op.add_column(sa.Column("pending_event_run_id", Uuid16(), nullable=True))
         if op.get_bind().dialect.name in _SQLITE_FAMILY:
             # SQLite ignores VARCHAR lengths: 32 characters at up to four bytes each.
             batch_op.create_check_constraint(
@@ -87,7 +90,7 @@ def upgrade() -> None:
         batch_op.add_column(
             sa.Column(
                 "event",
-                CompressedText(max_stored_bytes=_JSON_MAX_STORED_BYTES),
+                CompressedText(max_stored_bytes=_JSON_MAX_STORED_BYTES, mysql_varbinary=True),
                 nullable=True,
             )
         )
@@ -144,6 +147,7 @@ def downgrade() -> None:
             # The rebuilt table would otherwise keep a CHECK on the dropped column.
             batch_op.drop_constraint(_PROVIDER_CHECK, type_="check")
         batch_op.drop_column("trigger_provider")
+        batch_op.drop_column("pending_event_run_id")
         batch_op.alter_column("rrule", existing_type=sa.String(512), nullable=False)
         batch_op.drop_column("trigger_config")
 

@@ -364,3 +364,16 @@ def test_a_scheduled_task_records_no_event_runs(store: SqlAlchemyScheduledTaskSt
             coalesce=False,
             max_runs_per_minute=1,
         )
+
+
+def test_events_in_one_second_join_the_waiting_run(store: SqlAlchemyScheduledTaskStore) -> None:
+    task = _event_task(store, session_mode="continue")
+    # A's run is claimed; B starts the next run; C, in the same second, joins B's run
+    # whichever receipt sorts last.
+    assert _record(store, task, "a", coalesce=True) == "recorded"
+    [first] = store.list_pending_runs()
+    assert store.claim_pending_run(first, now=1_000, lease_seconds=120) is not None
+    assert _record(store, task, "b", coalesce=True) == "recorded"
+    assert _record(store, task, "c", coalesce=True) == "coalesced"
+    [second] = store.list_pending_runs()
+    assert [e["session_id"] for e in second.event["events"]] == ["b", "c"]
