@@ -12,6 +12,8 @@ import {
   ArrowLeftIcon,
   BlocksIcon,
   BotIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
   DownloadIcon,
   GitBranchIcon,
   KeyboardIcon,
@@ -30,8 +32,10 @@ import { Button } from "@/components/ui/button";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { customAgentsSettingsEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
+import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
 export type SettingsSectionId =
@@ -241,7 +245,9 @@ export function useTrackSettingsReturn(): void {
 
 /**
  * Settings nav rendered inside the sidebar card, replacing the conversation
- * list on /settings. Its Back row matches the navigation rows below it.
+ * list on /settings. Its Back row matches the navigation rows below it. On
+ * phones the drawer is the settings menu itself, so it renders as grouped
+ * inset lists of disclosure rows under a large title.
  */
 export function SettingsSidebarBody({
   onNavClick,
@@ -259,6 +265,7 @@ export function SettingsSidebarBody({
     info !== "loading" && (info.enabled_connections ?? []).some((provider) => provider !== "mcp");
   const mcpEnabled = info !== "loading" && (info.enabled_connections ?? []).includes("mcp");
   const { section } = useSettingsRoute();
+  const isMobile = useIsMobileViewport();
   const groups = settingsNavGroups(
     hasAuthSession,
     isElectronShell(),
@@ -283,6 +290,7 @@ export function SettingsSidebarBody({
           className={cn(
             SIDEBAR_ROW,
             "w-fit justify-start border-0 font-normal text-muted-foreground",
+            isMobile && "mobile-touch-target",
           )}
         >
           {/* Returns to wherever the user was before entering settings (the
@@ -293,10 +301,15 @@ export function SettingsSidebarBody({
           closing onto the content behind it. On desktop onNavClick is a no-op
           (persistent card), so dropping it changes nothing there. */}
           <Link to={settingsReturnPath} componentId="settings.back_to_omnigent">
-            <ArrowLeftIcon className="ui-icon" />
+            {isMobile ? (
+              <ChevronLeftIcon className="ui-icon" />
+            ) : (
+              <ArrowLeftIcon className="ui-icon" />
+            )}
             Back
           </Link>
         </Button>
+        {isMobile && <h1 className="px-2 pt-2 text-2xl font-semibold tracking-tight">Settings</h1>}
       </div>
       <nav className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-3">
         {groups.map((group) => (
@@ -304,10 +317,19 @@ export function SettingsSidebarBody({
             <h2 className="flex h-7 items-center px-2 text-sm font-normal text-muted-foreground">
               {group.title}
             </h2>
-            <div className="mt-1 flex flex-col gap-px">
+            <div
+              className={cn(
+                "mt-1 flex flex-col",
+                isMobile
+                  ? cn(MOBILE_GLASS_SURFACE, "divide-y divide-border overflow-hidden rounded-xl")
+                  : "gap-px",
+              )}
+            >
               {group.items.map((item) => {
                 const Icon = item.icon;
-                const selected = section === item.id;
+                const current = section === item.id;
+                // The phone drawer is a menu over the page, so no row looks selected.
+                const selected = current && !isMobile;
                 return (
                   <Button
                     key={item.id}
@@ -319,6 +341,8 @@ export function SettingsSidebarBody({
                       selected &&
                         "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]",
                       item.hideOnMobile && "max-md:hidden",
+                      // Inset focus ring: the rounded group clips an outer one.
+                      isMobile && "mobile-touch-target rounded-none px-3 focus-visible:ring-inset",
                     )}
                   >
                     <Link
@@ -326,7 +350,7 @@ export function SettingsSidebarBody({
                       onClick={onNavClick}
                       data-testid={`settings-nav-${item.id}`}
                       componentId={`settings.nav.${item.id}`}
-                      aria-current={selected ? "page" : undefined}
+                      aria-current={current ? "page" : undefined}
                     >
                       <Icon
                         className={cn(
@@ -337,6 +361,12 @@ export function SettingsSidebarBody({
                         )}
                       />
                       {item.label}
+                      {isMobile && (
+                        <ChevronRightIcon
+                          aria-hidden
+                          className="ui-icon ml-auto text-muted-foreground"
+                        />
+                      )}
                     </Link>
                   </Button>
                 );

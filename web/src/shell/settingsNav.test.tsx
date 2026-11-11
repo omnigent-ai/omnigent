@@ -55,11 +55,11 @@ import {
   useTrackSettingsReturn,
 } from "./settingsNav";
 
-function renderBody(opts: { onNavClick?: () => void } = {}) {
+function renderBody(opts: { onNavClick?: () => void; route?: string } = {}) {
   const onNavClick = opts.onNavClick ?? vi.fn();
   render(
     <TooltipProvider>
-      <MemoryRouter initialEntries={["/settings/appearance"]}>
+      <MemoryRouter initialEntries={[opts.route ?? "/settings/appearance"]}>
         <SettingsSidebarBody onNavClick={onNavClick} />
       </MemoryRouter>
     </TooltipProvider>,
@@ -263,6 +263,10 @@ describe("SettingsSidebarBody", () => {
     expect(selected.querySelector("svg")).toHaveClass("text-[var(--sidebar-active-foreground)]");
     expect(selected.querySelector("svg")).not.toHaveClass("text-muted-foreground");
     expect(unselected.querySelector("svg")).toHaveClass("text-muted-foreground");
+    // Desktop keeps plain sidebar rows: no phone touch floor or disclosure chevron.
+    expect(unselected).not.toHaveClass("mobile-touch-target");
+    expect(unselected.querySelectorAll("svg")).toHaveLength(1);
+    expect(screen.queryByRole("heading", { level: 1 })).toBeNull();
   });
 
   it("renders group subtitles in sentence case at the text-sm tier", () => {
@@ -377,6 +381,47 @@ describe("SettingsSidebarBody", () => {
     expect(screen.queryByTestId("settings-nav-members")).toBeNull();
     expect(screen.queryByTestId("settings-nav-policies")).toBeNull();
   });
+});
+
+describe("SettingsSidebarBody on phones", () => {
+  beforeEach(() => {
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      matches: query.includes("max-width"),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }));
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("renders the menu as titled, grouped disclosure rows", () => {
+    renderBody({ route: "/settings/general" });
+    expect(screen.getByRole("heading", { level: 1, name: "Settings" })).toBeInTheDocument();
+    const back = screen.getByRole("link", { name: "Back" });
+    expect(back).toHaveClass("mobile-touch-target");
+    expect(back.querySelector("svg")).toHaveClass("lucide-chevron-left");
+    const general = screen.getByTestId("settings-nav-general");
+    expect(general).toHaveClass("mobile-touch-target", "rounded-none", "focus-visible:ring-inset");
+    expect(general.querySelectorAll("svg")).toHaveLength(2);
+    expect(general.parentElement).toHaveClass("divide-y", "rounded-xl", "overflow-hidden");
+    expect(general.parentElement).not.toHaveClass("gap-px");
+  });
+
+  // Bare /settings redirects to /settings/general, so the open section is always set.
+  it.each(["/settings/general", "/settings/appearance"])(
+    "shows no selected row at %s but keeps aria-current",
+    (route) => {
+      renderBody({ route });
+      const current = document.querySelector('[aria-current="page"]');
+      expect(current).toHaveAttribute("href", route);
+      for (const row of screen.getAllByRole("link")) {
+        expect(row).not.toHaveClass("bg-[var(--sidebar-active)]");
+        expect(row.querySelector("svg")).not.toHaveClass("text-[var(--sidebar-active-foreground)]");
+      }
+    },
+  );
 });
 
 describe("useSettingsRoute", () => {
