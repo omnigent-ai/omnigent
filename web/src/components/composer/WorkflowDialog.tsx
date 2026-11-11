@@ -96,7 +96,9 @@ export function WorkflowDialog({
                   if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) submit(event);
                 }}
                 maxLength={4000}
-                className="min-h-28 resize-y"
+                rows={5}
+                // The New automation dialog's prompt field: focus recolors the border, with no ring.
+                className="min-h-32 resize-y rounded-xl p-4 text-ui focus-visible:ring-0"
                 placeholder="Add retries to the uploader, with tests"
                 autoFocus
                 data-testid="workflow-dialog-description"
