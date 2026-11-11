@@ -6229,6 +6229,7 @@ def create_runner_app(
         conv_id: str,
         dispatch: TurnDispatch | None = None,
     ) -> Response:
+        stream_turn_epoch = _turn_bind_epoch.get(conv_id, 0)
         manager = cast(HarnessProcessManager, process_manager)
         harness_name = dispatch.harness if dispatch else cast(str | None, body.get("harness"))
         spawn_env = (
@@ -6507,6 +6508,15 @@ def create_runner_app(
             )
 
             turn_input_identity = _input_identity(body)
+            _response_id: str | None = None
+
+            def _owns_live_turn() -> bool:
+                return _turn_bind_epoch.get(conv_id, 0) == stream_turn_epoch and (
+                    _response_id is None or _live_response_id.get(conv_id) == _response_id
+                )
+
+            if not _owns_live_turn():
+                return
 
             if _eager_spec_error is not None:
                 _err_type, _err_msg = _eager_spec_error
@@ -6590,9 +6600,10 @@ def create_runner_app(
             _ds_sa = _session_sub_agent_names.get(conv_id)
             if _ds_sa and _session_sub_agent_resolved.get(conv_id) is False:
                 _warn_unresolved_sub_agent(conv_id, _ds_sa)
+            if not _owns_live_turn():
+                return
             event_body = _wrap_as_message_event(_instr_body)
             _inject_mcp_schemas(event_body, _mcp_schemas)
-            _response_id: str | None = None
             _response_data: _JsonObject = {}
             _terminal_response_type: str | None = None
             _dispatch_tasks: list[_asyncio.Task[object]] = []
@@ -6611,15 +6622,13 @@ def create_runner_app(
                 _publish_event(conv_id, _held_refusal)
                 _held_refusal = None
 
-            def _owns_live_turn() -> bool:
-                live = _live_response_id.get(conv_id)
-                return _response_id is None or live == _response_id
-
             async def _finish_harness_stream() -> _JsonObject | None:
                 """Settle the owned outcome after stream close and pending dispatches."""
                 nonlocal _held_refusal
                 if _dispatch_tasks:
                     await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
+                if not _owns_live_turn():
+                    return None
                 lifecycle_event: _JsonObject | None = None
                 lifecycle_error: _JsonObject | None = None
                 cancelled = _terminal_response_type == "response.cancelled"
@@ -6678,6 +6687,8 @@ def create_runner_app(
                     json=event_body,
                     timeout=None,
                 ) as harness_resp:
+                    if not _owns_live_turn():
+                        return
                     if harness_resp.status_code != 200:
                         _logger.error(
                             "harness rejected turn delivery for %s with status %d",
@@ -6733,8 +6744,12 @@ def create_runner_app(
                     # call, so a later compaction snapshot already covers them.
                     _text_acc_before_tool = 0
                     async for chunk in harness_resp.aiter_text():
+                        if not _owns_live_turn():
+                            return
                         _buffer += chunk
                         while "\n\n" in _buffer:
+                            if not _owns_live_turn():
+                                return
                             frame, _, _buffer = _buffer.partition("\n\n")
                             raw_sse_bytes = (frame + "\n\n").encode("utf-8")
 
@@ -7160,6 +7175,8 @@ def create_runner_app(
                     yield _encode_sse_event(terminal_event)
 
             except _ContextWindowOverflow as overflow:
+                if not _owns_live_turn():
+                    return
                 _report_held_refusal()
                 _error = {
                     "code": "context_length_exceeded",
@@ -7184,6 +7201,21 @@ def create_runner_app(
                 )
 
             except (httpx.HTTPError, RuntimeError) as exc:
+                if not _owns_live_turn():
+                    _logger.warning(
+                        "Retired harness stream failed for %s; preserving the newer turn",
+                        conv_id,
+                        exc_info=True,
+                        extra=debug_event(
+                            "retired_harness_stream_failed",
+                            session_id=conv_id,
+                            response_id=_response_id,
+                            turn_epoch=stream_turn_epoch,
+                            current_turn_epoch=_turn_bind_epoch.get(conv_id, 0),
+                            exception_type=type(exc).__name__,
+                        ),
+                    )
+                    return
                 if isinstance(exc, httpx.HTTPError) and _terminal_response_type is not None:
                     if terminal_event := await _finish_harness_stream():
                         yield _encode_sse_event(terminal_event)
