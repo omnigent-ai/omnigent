@@ -13845,23 +13845,24 @@ def _read_snapshot_items_and_agent(
     agent_reads: _RequestAgentReads | None,
     include_items: bool,
 ) -> list[ConversationItem]:
-    """Read the newest committed items and warm the agent memo in one checkout.
+    """Read the newest committed items, then warm the agent memo.
 
-    Returns the items chronologically; an agent read failure is left for the
-    snapshot's own agent lookup to retry and handle.
+    Returns the items chronologically. The agent read gets its own scope so a
+    failure there cannot fail the items read; the snapshot's own agent lookup
+    retries and degrades as before.
     """
-    with shared_read_scope():
-        items: list[ConversationItem] = []
-        if include_items:
-            items_page = conv_store.list_items(
-                conversation_id=session_id,
-                limit=100,
-                order="desc",
-            )
-            items = list(reversed(items_page.data))
-        if agent_reads is not None and conv.agent_id is not None:
-            with contextlib.suppress(Exception):
-                agent_reads.get(conv.agent_id)
+    items: list[ConversationItem] = []
+    if include_items:
+        items_page = conv_store.list_items(
+            conversation_id=session_id,
+            limit=100,
+            order="desc",
+        )
+        items = list(reversed(items_page.data))
+    if agent_reads is not None and conv.agent_id is not None:
+        # The agent row and its owning-session lookup share one checkout.
+        with contextlib.suppress(Exception), shared_read_scope():
+            agent_reads.get(conv.agent_id)
     return items
 
 

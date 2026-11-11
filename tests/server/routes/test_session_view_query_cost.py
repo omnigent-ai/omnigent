@@ -14,11 +14,12 @@ from typing import Any
 
 import httpx
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, text
 
 from omnigent.db.query_context import current_query_name
 from omnigent.db.utils import get_or_create_engine
 from omnigent.server.auth import LEVEL_MANAGE, LEVEL_READ, RESERVED_USER_PUBLIC
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.helpers import build_agent_bundle
@@ -27,6 +28,7 @@ pytestmark = pytest.mark.asyncio
 
 _OWNER = {"X-Forwarded-Email": "owner@example.com"}
 _VIEWER = {"X-Forwarded-Email": "viewer@example.com"}
+_ADMIN = {"X-Forwarded-Email": "admin@example.com"}
 # The web chat hydrates items and liveness through other routes.
 _WEB_VIEW_PARAMS = {"include_items": "false", "include_liveness": "false"}
 
@@ -121,6 +123,7 @@ async def _seed_sessions(client: httpx.AsyncClient, db_uri: str) -> _Sessions:
     store.update_conversation(archived, archived=True)
     permissions.grant(RESERVED_USER_PUBLIC, rich, LEVEL_READ)
     permissions.grant("viewer@example.com", plain, LEVEL_MANAGE)
+    permissions.ensure_user("admin@example.com", is_admin=True)
     return _Sessions(plain, rich, child, side_chat, archived)
 
 
@@ -150,6 +153,8 @@ async def test_session_view_reads_each_record_once(
 
     Before: 19 statements in 13 checkouts for the full view (the agent was read
     three times, labels and the owner grant separately), 13 in 10 for the web view.
+    The items read and the agent warm-up keep separate checkouts so an agent
+    failure cannot fail the items read.
     """
     sessions = await _seed_sessions(auth_client, db_uri)
     database_cost.reset()
@@ -165,7 +170,7 @@ async def test_session_view_reads_each_record_once(
         "omnigent.conversation_store.get_session_connectivity",
         *_USAGE_READ_NAMES,
     ]
-    assert database_cost.checkouts == 3
+    assert database_cost.checkouts == 4
 
     database_cost.reset()
     response = await auth_client.get(
@@ -211,6 +216,9 @@ async def test_session_view_response_matrix(
             },
         ),
         (sessions.rich, _VIEWER, {"permission_level": 1, "side_chat_allowed": False}),
+        # Admins skip the conversation read during authorization, so ownership
+        # falls back to a grant lookup on the root.
+        (sessions.rich, _ADMIN, {"permission_level": 4, "side_chat_allowed": False}),
         (
             sessions.child,
             _OWNER,
@@ -238,3 +246,34 @@ async def test_session_view_response_matrix(
         f"/v1/sessions/{sessions.archived}", params=params, headers=_VIEWER
     )
     assert response.status_code == 404
+
+
+@pytest.mark.parametrize("params", [{}, _WEB_VIEW_PARAMS], ids=["full", "web"])
+async def test_session_view_degrades_when_agent_read_fails(
+    db_uri: str,
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    params: dict[str, str],
+) -> None:
+    """A failing agent read still serves the view, with agent-derived fields omitted."""
+    sessions = await _seed_sessions(auth_client, db_uri)
+
+    def failing_get(store: SqlAlchemyAgentStore, _agent_id: str) -> None:
+        # Fail through the store's own session so the error hits a pooled connection.
+        with store._session("select_agent_by_id") as session:
+            session.execute(text("SELECT * FROM missing_agent_table"))
+
+    monkeypatch.setattr(SqlAlchemyAgentStore, "get", failing_get)
+
+    response = await auth_client.get(
+        f"/v1/sessions/{sessions.rich}", params=params, headers=_OWNER
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert {key: body[key] for key in ("agent_name", "harness", "llm_model", "title")} == {
+        "agent_name": None,
+        "harness": None,
+        "llm_model": None,
+        "title": "Rich",
+    }
