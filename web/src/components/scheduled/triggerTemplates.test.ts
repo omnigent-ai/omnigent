@@ -1358,6 +1358,9 @@ describe("change-event prompts", () => {
     );
     expect(prompt).toContain("however long ago they were opened");
     expect(prompt).toContain("split the time since then into shorter merged:<from>..<to> ranges");
+    expect(prompt).toContain(
+      "If a range one second long still reaches 1000, start no sessions in this run, keep the previous check time",
+    );
     expect(prompt).toContain("oldest first by the time they were merged");
     // GitHub can return a partial page set without erroring; it must not advance the check time.
     expect(prompt).toContain(
@@ -1658,6 +1661,28 @@ describe("one task session for every match", () => {
       'Comment "Omnigent session: https://omni.example.com/c/CONVERSATION_ID" on each pull request you sent to the task session.',
     );
     expect(review).not.toContain("start no sessions");
+
+    const merged = renderTriggerPrompt(
+      "github",
+      fields({ event: "merged", scope: "acme/app", conditions: [], linkBack: false }),
+      SHARED,
+    );
+    expect(merged).toContain(
+      `It starts with a line giving the pull request's title, "GitHub <owner/repo>#<number> merged",`,
+    );
+    expect(merged).toContain(
+      "skip any pull request that a task message from your session there names by its title.",
+    );
+    expect(merged).toContain(
+      "If you can't read every page, send no matches in this run and keep the previous check time.",
+    );
+    expect(merged).toContain(
+      "If a range one second long still reaches 1000, send no matches in this run",
+    );
+    expect(merged).toContain(
+      "the time the last pull request you handled (sent or skipped) before you stopped was merged",
+    );
+    expect(merged).not.toContain("start no sessions");
   });
 
   it("doesn't split a task session prompt on the per-item heading", () => {

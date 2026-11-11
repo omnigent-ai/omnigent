@@ -1392,7 +1392,7 @@ function sourceText(source: TriggerSource, fields: TriggerFields, shared: boolea
     return {
       watch: () => `Watch: merged GitHub pull requests matching: ${query}`,
       search: () =>
-        `Use the GitHub CLI or your GitHub tools to search for: ${search}, through every page (for example gh api -X GET search/issues -f q=${shellQuote(search)} -f per_page=100 --paginate). This finds pull requests merged since then, however long ago they were opened. GitHub's search returns at most 1000 results in all: if you reach that, split the time since then into shorter merged:<from>..<to> ranges and search each one until every range returns fewer.`,
+        `Use the GitHub CLI or your GitHub tools to search for: ${search}, through every page (for example gh api -X GET search/issues -f q=${shellQuote(search)} -f per_page=100 --paginate). This finds pull requests merged since then, however long ago they were opened. GitHub's search returns at most 1000 results in all: if you reach that, split the time since then into shorter merged:<from>..<to> ranges and search each one until every range returns fewer. If a range one second long still reaches 1000, ${startNone} in this run, keep the previous check time, and say in your reply that the conditions need narrowing.`,
       // Search can't sort by merge time, so a partial read can't checkpoint by its last result.
       readOrder: `Read every page of results; a search that errors, or whose response has incomplete_results set to true, counts as unread. Then work through them oldest first by the time they were merged (pull_request.merged_at in each search result). If you can't read every page, ${startNone} in this run and keep the previous check time.`,
       createdAt: "merged",
