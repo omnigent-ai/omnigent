@@ -262,6 +262,18 @@ describe("downloadWorkspaceFile", () => {
     );
   });
 
+  it("cancels the video body on an HTTP error", async () => {
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({ cancel });
+    fetchMock.mockResolvedValueOnce(
+      new Response(body, { status: 503, statusText: "Service Unavailable" }),
+    );
+    await expect(fetchWorkspaceVideoBlob("sess_123", "demo.webm")).rejects.toThrow(
+      "503 Service Unavailable",
+    );
+    await waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+  });
+
   it("clicks a link to the raw download URL so the browser streams it to disk", async () => {
     // A same-origin navigation shows in the browser's download UI at once and
     // never buffers the file in the page, unlike a fetch-then-Blob.

@@ -40,12 +40,15 @@ export class UnsupportedVideoTypeError extends Error {
 
 /**
  * The allowlisted video type for a response, or null. A missing or
- * octet-stream type falls back to the path's extension.
+ * octet-stream type falls back to the extension of the path's basename. The
+ * path is a literal filesystem path, so `?` and `#` are part of the name.
  */
 export function allowedVideoType(contentType: string | null, path: string): string | null {
   const type = contentType?.split(";")[0].trim().toLowerCase() ?? "";
   if (type && type !== "application/octet-stream") return VIDEO_TYPES.has(type) ? type : null;
-  const extension = path.split(/[?#]/)[0].split(".").pop()?.toLowerCase() ?? "";
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  const dot = name.lastIndexOf(".");
+  const extension = dot < 0 ? "" : name.slice(dot + 1).toLowerCase();
   return VIDEO_TYPE_BY_EXTENSION.get(extension) ?? null;
 }
 

@@ -280,6 +280,11 @@ describe("VideoPlayer", () => {
     vi.mocked(downloadWorkspaceFile).mockResolvedValueOnce();
     fireEvent.click(screen.getByRole("button", { name: "Download video: Feature demo" }));
     expect(downloadWorkspaceFile).toHaveBeenCalledWith("sess_1", "demo.webm");
+    // The failure state's own Download button downloads the same file.
+    vi.mocked(downloadWorkspaceFile).mockResolvedValueOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Download" }));
+    expect(downloadWorkspaceFile).toHaveBeenCalledTimes(2);
+    expect(downloadWorkspaceFile).toHaveBeenLastCalledWith("sess_1", "demo.webm");
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     fireEvent.click(screen.getByRole("button", { name: "Play video: Feature demo" }));
     await waitFor(() => expect(fetchBlob).toHaveBeenCalledTimes(2));
