@@ -97,6 +97,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeNativeHookInterpreterMismatchError,
     augment_claude_args,
     bridge_dir_for_bridge_id,
+    claude_terminal_relay_env,
     prepare_bridge_dir,
     read_active_session_id,
     resolve_launch_effort_level,
@@ -269,6 +270,9 @@ _CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBAC
 # tool's `tmux kill-session` or `kill-server` ends Claude itself.
 _CLAUDE_CODE_ENV_FILE_ENV = "CLAUDE_ENV_FILE"
 _CLAUDE_TOOL_ENV_SCRIPT = "claude_tool_env.sh"
+# Claude Code waits 10 minutes by default for response headers, so a request
+# whose connection died silently (e.g. across host sleep) stalls the turn.
+_CLAUDE_CODE_API_TIMEOUT_ENV = "API_TIMEOUT_MS"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
@@ -1675,7 +1679,9 @@ def build_native_claude_terminal_env(
     which a web-driven session cannot see or answer (see
     :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`). Custom Anthropic
     endpoints keep the selected model when it refuses, since their catalogs
-    may not serve Claude Code's canonical refusal-fallback target.
+    may not serve Claude Code's canonical refusal-fallback target. Model
+    requests default to :class:`RetryPolicy`'s per-request timeout so an
+    unanswered request is retried (see :data:`_CLAUDE_CODE_API_TIMEOUT_ENV`).
 
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
@@ -1714,6 +1720,13 @@ def build_native_claude_terminal_env(
         _CLAUDE_CODE_ENV_FILE_ENV
     ):
         terminal_env[_CLAUDE_CODE_ENV_FILE_ENV] = claude_tool_env_file()
+    if _CLAUDE_CODE_API_TIMEOUT_ENV not in terminal_env and not os.environ.get(
+        _CLAUDE_CODE_API_TIMEOUT_ENV
+    ):
+        from omnigent.spec.types import RetryPolicy
+
+        retry_env = RetryPolicy().claude_cli.env()
+        terminal_env[_CLAUDE_CODE_API_TIMEOUT_ENV] = retry_env[_CLAUDE_CODE_API_TIMEOUT_ENV]
     # A raw credential can override the helper or open Claude's API-key menu.
     for name in native_claude_auth_env_unset(claude_config):
         if name in terminal_env:
@@ -3381,7 +3394,7 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
 def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcodeConfig | None:
     """Build native Claude Code launch config for Bedrock-style gateways.
 
-    AWS Bedrock and Bedrock-compatible gateways (like corporate AI gateways)
+    AWS Bedrock and Bedrock-compatible gateways (like enterprise AI gateways)
     use a different set of environment variables than the standard Anthropic API:
     - ``ANTHROPIC_BEDROCK_BASE_URL`` instead of ``ANTHROPIC_BASE_URL``
     - ``AWS_BEARER_TOKEN_BEDROCK`` for the credential (a static ``api_key``
@@ -3876,8 +3889,8 @@ def _materialize_claude_agent_spec(tmpdir: Path) -> Path:
     return yaml_path
 
 
-def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
-    """Resolve raw author instructions from the wrapper's agent spec.
+def _wrapper_spec_startup_instructions(spec_path: Path) -> str:
+    """Compose author instructions and stable guidance for the wrapper's session.
 
     Reuses :func:`omnigent.spec.load` (the same loader
     :func:`~omnigent.cli._bundle` and the server use for both an agent-image
@@ -3888,23 +3901,21 @@ def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
 
     :param spec_path: The generated/current wrapper agent spec (a
         standalone YAML file or an agent-image directory).
-    :returns: The verbatim instructions text, or ``None`` if unresolvable
-        or absent/whitespace-only. Best-effort: a malformed spec must not
-        block the terminal launch, so load failures degrade to ``None``.
+    :returns: Startup instructions, with framework guidance if the spec fails.
     """
-    from omnigent.runtime.prompt import raw_author_instructions
+    from omnigent.runtime.prompt import build_native_startup_instructions
     from omnigent.spec import load as load_agent_spec
 
     try:
         spec = load_agent_spec(spec_path, expand_env=False)
     except Exception:
         _logger.warning(
-            "Could not resolve raw instructions from wrapper spec %s",
+            "Could not resolve instructions from wrapper spec %s",
             spec_path,
             exc_info=True,
         )
-        return None
-    return raw_author_instructions(spec)
+        return build_native_startup_instructions(None)
+    return build_native_startup_instructions(spec)
 
 
 def _run_with_local_server(
@@ -4006,7 +4017,7 @@ def _run_with_local_server(
                     claude_config=claude_config,
                     startup_profiler=startup_profiler,
                     startup_progress=progress,
-                    append_system_prompt=_wrapper_spec_raw_instructions(spec_path),
+                    append_system_prompt=_wrapper_spec_startup_instructions(spec_path),
                 )
             )
             _mark_startup_step(
@@ -5352,7 +5363,7 @@ async def _prepare_claude_terminal(
         marks. ``None`` disables output.
     :param startup_progress: Optional user-visible progress renderer,
         e.g. a handle from :func:`runner_startup_progress`.
-    :param append_system_prompt: Raw author instructions for
+    :param append_system_prompt: Session startup instructions for
         ``--append-system-prompt``, applied on fresh launch and cold
         resume only — the hot-reattach fast path below returns before
         this is used, so it never relaunches or duplicates the flag.
@@ -6808,9 +6819,8 @@ async def _launch_claude_terminal(
     :param bridge_dir: Bridge directory shared with Claude's MCP
         MCP server and the web-chat harness.
     :param claude_config: Optional ucode-derived Claude Code config.
-    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
-        (author-supplied, not framework-composed) for this fresh native
-        session.
+    :param append_system_prompt: Optional author instructions and stable
+        framework guidance for this fresh native session.
     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
         for this native session.
     :returns: Terminal resource id.
@@ -6987,9 +6997,8 @@ def _claude_terminal_request(
     :param ap_auth_headers: Auth headers for the
         ``PermissionRequest`` command hook.
     :param claude_config: Optional ucode-derived Claude Code config.
-    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
-        (author-supplied, not framework-composed) to append to Claude
-        Code's system prompt.
+    :param append_system_prompt: Optional author instructions and stable
+        framework guidance to append to Claude Code's system prompt.
     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
         for this native session.
     :returns: JSON body for ``POST /resources/terminals``.
@@ -7009,7 +7018,7 @@ def _claude_terminal_request(
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
     )
-    # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
+    # Let a registered launcher plugin (e.g. a wrapper such as isaac) rewrite the
     # command/args to wrap the same fully-augmented Claude launch. Identity by
     # default. See omnigent.claude_launcher.
     command, args = resolve_claude_launch(command, args)
@@ -7036,7 +7045,10 @@ def _claude_terminal_request(
         "scrollback": _CLAUDE_TERMINAL_SCROLLBACK_LINES,
     }
     # This wrapper is the CLI; don't trust a surface inherited from a session's shell.
-    spec["env"] = build_native_claude_terminal_env(claude_config, client_surface="cli")
+    spec["env"] = {
+        **build_native_claude_terminal_env(claude_config, client_surface="cli"),
+        **claude_terminal_relay_env(bridge_dir),
+    }
     if claude_config is not None:
         # The runner's terminal layer inherits the parent process env.
         # Remove credentials that override the selected auth and the
