@@ -8,6 +8,7 @@ faked. No live Codex is needed.
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -84,26 +85,57 @@ def _fork_started(
 
 
 # --------------------------------------------------------------------------- #
-# side_chat_question — /side detection on normalized turn input
+# side_chat_question_from_content — /side detection on typed message text
 # --------------------------------------------------------------------------- #
 def test_side_chat_question_extracts_question() -> None:
-    assert side_chat.side_chat_question(_text_items("/side why is the sky blue?")) == (
-        "why is the sky blue?"
+    assert side_chat.side_chat_question_from_content(
+        _text_items("/side why is the sky blue?")
+    ) == ("why is the sky blue?")
+    assert side_chat.side_chat_question_from_content("/side and as a string?") == (
+        "and as a string?"
     )
+    # Any text block, at any length: the reader the owner check relies on.
+    assert side_chat.side_chat_question_from_content(
+        [{"type": "input_text", "text": "/side " + " " * 4000 + "why?"}]
+    ) == (" " * 4000 + "why?")
 
 
 def test_side_chat_question_preserves_first_line_indentation() -> None:
-    assert side_chat.side_chat_question(_text_items("/side   - First\n  - Second")) == (
-        "  - First\n  - Second"
-    )
+    assert side_chat.side_chat_question_from_content(
+        _text_items("/side   - First\n  - Second")
+    ) == ("  - First\n  - Second")
 
 
 def test_side_chat_question_ignores_non_side_and_empty() -> None:
-    assert side_chat.side_chat_question(_text_items("hello")) is None
-    assert side_chat.side_chat_question(_text_items("/sidebar thing")) is None  # needs the space
-    assert side_chat.side_chat_question(_text_items("/side   ")) is None  # empty question
-    assert side_chat.side_chat_question([]) is None
-    assert side_chat.side_chat_question(_text_items("a") + _text_items("b")) is None  # multi-item
+    assert side_chat.side_chat_question_from_content(_text_items("hello")) is None
+    assert side_chat.side_chat_question_from_content(_text_items("/sidebar thing")) is None
+    assert side_chat.side_chat_question_from_content(_text_items("/side   ")) is None
+    assert side_chat.side_chat_question_from_content([]) is None
+    assert side_chat.side_chat_question_from_content(_text_items("a") + _text_items("b")) is None
+
+
+def test_an_attachment_never_reads_as_a_side_command() -> None:
+    attachment = {
+        "type": "input_file",
+        "filename": "note.txt",
+        # "/side why?"
+        "file_data": "data:text/plain;base64,L3NpZGUgd2h5Pw==",
+    }
+    assert side_chat.side_chat_question_from_content([attachment]) is None
+
+
+@pytest.mark.parametrize("attachment_type", ["input_file", "input_image", "image"])
+def test_side_command_rejects_attachments(attachment_type: str) -> None:
+    from omnigent.errors import OmnigentError
+
+    attachment = {"type": attachment_type, "file_id": "attached-file"}
+    with pytest.raises(OmnigentError, match="attachments") as error:
+        side_chat.side_chat_question_from_content([*_text_items("/side explain this"), attachment])
+    assert error.value.http_status == 400
+    assert (
+        side_chat.side_chat_question_from_content([*_text_items("explain this"), attachment])
+        is None
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -547,8 +579,15 @@ def test_peek_side_chat_requests_discards_corrupt_payloads(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filesystem_operation", "cancel_during_discard"),
+    [("glob", False), ("read_text", False), ("unlink", False), ("unlink", True)],
+)
 async def test_drive_side_chat_requests_forks_on_the_forwarder_client(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filesystem_operation: str,
+    cancel_during_discard: bool,
 ) -> None:
     """The drain loop must fork on the connection it was handed.
 
@@ -562,24 +601,95 @@ async def test_drive_side_chat_requests_forks_on_the_forwarder_client(
         }
     )
     side_chat.request_side_chat(tmp_path, "what does this repo do?")
+    request_dir = tmp_path / "side_chat_requests"
+    blocked_path = (
+        request_dir if filesystem_operation == "glob" else next(request_dir.glob("*.json"))
+    )
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    finished = asyncio.Event()
+    release = threading.Event()
+    original_operation = getattr(Path, filesystem_operation)
+
+    def stalled_operation(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path != blocked_path:
+            return original_operation(path, *args, **kwargs)
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            release.wait(timeout=5)
+            return original_operation(path, *args, **kwargs)
+        finally:
+            loop.call_soon_threadsafe(finished.set)
 
     async def _stop(_seconds: float) -> None:
         raise asyncio.CancelledError
 
     monkeypatch.setattr(fwd, "_sleep", _stop)
-    with pytest.raises(asyncio.CancelledError):
-        await fwd._drive_side_chat_requests(
+    monkeypatch.setattr(Path, filesystem_operation, stalled_operation)
+    drain = asyncio.create_task(
+        fwd._drive_side_chat_requests(
             client,
             ap_client=AsyncMock(),
             bridge_dir=tmp_path,
             target=SimpleNamespace(thread_id="thread_parent", session_id="conv_parent"),
         )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        assert not finished.is_set(), "Filesystem I/O blocked the event loop"
+        if cancel_during_discard:
+            drain.cancel()
+            await asyncio.sleep(0)
+            assert not drain.done(), "Forwarder exited before acknowledging the request"
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(drain, timeout=10)
+        await asyncio.wait_for(finished.wait(), timeout=10)
 
     assert [m for m, _ in client.calls] == ["thread/fork", "turn/start"]
     assert client.calls[0][1]["threadId"] == "thread_parent"
     assert client.calls[0][1]["ephemeral"] is True
     assert client.calls[1][1]["threadId"] == "thread_side"  # first turn on the fork
     assert side_chat.peek_side_chat_requests(tmp_path) == []  # request consumed after forking
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current_thread_id", [None, "thread_replacement"])
+async def test_drive_side_chat_requests_uses_the_parent_after_scanning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, current_thread_id: str | None
+) -> None:
+    client = _FakeCodexClient(
+        {
+            "thread/fork": {"result": {"thread": {"id": "thread_side"}}},
+            "turn/start": {"result": {"turn": {"id": "turn_1"}}},
+        }
+    )
+    side_chat.request_side_chat(tmp_path, "q")
+    target = SimpleNamespace(thread_id="thread_parent", session_id="conv_parent")
+    loop = asyncio.get_running_loop()
+    original_peek = side_chat.peek_side_chat_requests
+
+    def peek_during_rotation(bridge_dir: Path) -> list[side_chat.SideChatRequest]:
+        loop.call_soon_threadsafe(setattr, target, "thread_id", current_thread_id)
+        return original_peek(bridge_dir)
+
+    async def _stop(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(side_chat, "peek_side_chat_requests", peek_during_rotation)
+    monkeypatch.setattr(fwd, "_sleep", _stop)
+    with pytest.raises(asyncio.CancelledError):
+        await fwd._drive_side_chat_requests(
+            client, ap_client=AsyncMock(), bridge_dir=tmp_path, target=target
+        )
+
+    if current_thread_id is None:
+        assert client.calls == []
+        assert [request.question for request in original_peek(tmp_path)] == ["q"]
+    else:
+        assert client.calls[0][1]["threadId"] == current_thread_id
+        assert original_peek(tmp_path) == []
 
 
 @pytest.mark.asyncio
