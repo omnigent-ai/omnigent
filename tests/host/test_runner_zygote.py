@@ -562,24 +562,45 @@ def test_signal_targets_owned_live_runner(
 
 @pytest.mark.parametrize("operation", ["terminate", "kill"])
 @pytest.mark.parametrize(
-    "signal_error", [psutil.NoSuchProcess(123), psutil.AccessDenied(123), OSError()]
+    "signal_error", [None, psutil.NoSuchProcess(123), psutil.AccessDenied(123), OSError()]
 )
 def test_signal_handles_identity_loss_or_denial(
-    monkeypatch: pytest.MonkeyPatch, operation: str, signal_error: Exception
+    monkeypatch: pytest.MonkeyPatch, operation: str, signal_error: Exception | None
 ) -> None:
     original_process = Mock()
     original_process.is_running.return_value = True
     original_process.send_signal.side_effect = signal_error
     process_factory = Mock(return_value=original_process)
     monkeypatch.setattr("psutil.Process", process_factory)
-    proc = ZygoteRunnerProc(123, ZygoteManager())
+    manager = ZygoteManager()
+    proc = ZygoteRunnerProc(123, manager)
     process_factory.side_effect = AssertionError("must not recapture a recycled PID")
+    monkeypatch.setattr(manager, "_exchange", Mock(side_effect=AssertionError("control IPC")))
+    raw_signal = Mock()
+    monkeypatch.setattr(os, "kill", raw_signal)
 
     getattr(proc, operation)()
 
     original_process.send_signal.assert_called_once_with(
         signal.SIGTERM if operation == "terminate" else signal.SIGKILL
     )
+    raw_signal.assert_not_called()
+    assert proc.returncode is None
+
+
+@pytest.mark.parametrize("operation", ["terminate", "kill"])
+def test_signal_rejects_reused_process_identity(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    proc = ZygoteRunnerProc(os.getpid(), ZygoteManager())
+    assert proc._process is not None
+    proc._process._ident = (proc.pid, -1.0)
+    raw_signal = Mock()
+    monkeypatch.setattr(os, "kill", raw_signal)
+
+    getattr(proc, operation)()
+
+    raw_signal.assert_not_called()
     assert proc.returncode is None
 
 
