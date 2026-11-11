@@ -64,6 +64,11 @@ describe("hostFetch base path", () => {
     vi.resetModules();
     await freshHostFetch("/v1/sessions");
     expect(fetcher.mock.calls[0][0]).toBe("/v1/sessions");
+    // The installed fetcher marks a workspace, so the request names a replica.
+    const init = fetcher.mock.calls[0][1] as RequestInit;
+    expect(new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key")).toMatch(
+      /^[0-9a-f]{32}$/,
+    );
   });
 });
 
@@ -91,7 +96,11 @@ describe("routing key", () => {
   });
 
   it("adds the client key to a WebSocket path that carries none", async () => {
-    const { withRoutingKeyParam } = await routedHost();
+    const { withRoutingKeyParam, resolveWebSocketUrl: routedWebSocketUrl } = await routedHost();
+    expect(routedWebSocketUrl("/v1/dictation/stream")).toMatch(
+      /\/v1\/dictation\/stream\?omnigent_slice_key=[0-9a-f]{32}$/,
+    );
+    expect(routedWebSocketUrl("/v1/x", { unkeyed: true })).not.toContain("omnigent_slice_key");
     expect(withRoutingKeyParam("/v1/x?a=1")).toMatch(
       /^\/v1\/x\?a=1&omnigent_slice_key=[0-9a-f]{32}$/,
     );

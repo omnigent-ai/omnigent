@@ -152,7 +152,7 @@ async def test_wrong_replica_miss_is_resent_unkeyed_once(monkeypatch: pytest.Mon
     """A keyed miss re-sends once without a key, reaching hosts that connected unkeyed."""
     monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
-    mount = "https://acme.databricks.com/api/2.0/omnigent"
+    mount = "https://workspace.example.com/api/2.0/omnigent"
     auth = _DatabricksTokenAuth(server_url=mount, session_id="conv_unknown")
     keys: list[str | None] = []
 
@@ -171,6 +171,41 @@ async def test_wrong_replica_miss_is_resent_unkeyed_once(monkeypatch: pytest.Mon
                 assert (await client.sessions.get("conv_unknown")).id == "conv_unknown"
 
     assert keys == ["client_key", None]
+
+
+_WRONG_REPLICA = {"error": {"code": "wrong_replica"}}
+
+
+@pytest.mark.parametrize(
+    ("replies", "expected_keys", "status"),
+    [
+        ([_WRONG_REPLICA, None], ["client_key", None], 200),
+        ([{"error": {"code": "invalid_argument"}}], ["client_key"], 400),
+        ([_WRONG_REPLICA, _WRONG_REPLICA, None], ["client_key", None], 400),
+    ],
+    ids=["recovers", "other-400", "single-replay"],
+)
+def test_sync_client_resends_only_a_wrong_replica_miss_once(
+    monkeypatch: pytest.MonkeyPatch,
+    replies: list[dict[str, object] | None],
+    expected_keys: list[str | None],
+    status: int,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+    mount = "https://workspace.example.com/api/2.0/omnigent"
+    keys: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        keys.append(request.headers.get(OMNIGENT_SLICE_KEY_HEADER))
+        reply = replies[len(keys) - 1]
+        return httpx.Response(200, json={}) if reply is None else httpx.Response(400, json=reply)
+
+    auth = _DatabricksTokenAuth(server_url=mount, session_id="conv_unknown")
+    with httpx.Client(auth=auth, transport=httpx.MockTransport(handler)) as client:
+        assert client.get(f"{mount}/v1/sessions/conv_unknown").status_code == status
+
+    assert keys == expected_keys
 
 
 @pytest.mark.asyncio
