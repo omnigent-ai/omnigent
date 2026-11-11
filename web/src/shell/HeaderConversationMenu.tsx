@@ -89,7 +89,7 @@ import { useNavigate } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
-import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
+import { useArchivePrompt } from "./ArchivePrompt";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
@@ -147,7 +147,7 @@ export function HeaderConversationMenu({
   const rename = useRenameConversation();
   const moveToProject = useMoveToProject();
   const archive = useArchiveConversation();
-  const archiveWorktreePrompt = useArchiveWorktreePrompt();
+  const archivePrompt = useArchivePrompt();
   const deleteConversation = useStopAndDeleteConversation();
   const [menuOpen, setMenuOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
@@ -281,7 +281,7 @@ export function HeaderConversationMenu({
       archive.mutate({ id: conversation.id, archived: false });
       return;
     }
-    archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
+    archivePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
       archiveNow(deleteWorktreeIds.has(conversation.id)),
     );
   };
@@ -555,7 +555,7 @@ export function HeaderConversationMenu({
         </DropdownMenuContent>
       </DropdownMenu>
 
-      {archiveWorktreePrompt.dialog}
+      {archivePrompt.dialog}
       {automationOpen && (
         <CreateAutomationFromSessionDialog
           conversation={conversation}

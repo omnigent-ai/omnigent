@@ -74,6 +74,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 // handoff. The host list, agent catalog, conflict hooks, navigation and HTTP
 // layers are stubbed so the test isolates that wiring.
 const navigateMock = vi.fn();
+const replaceSearchParamsMock = vi.fn();
 const setPendingInitialPromptMock = vi.fn();
 const beginLocalConversationMock = vi.fn();
 const hasPendingLocalMessageMock = vi.fn();
@@ -96,6 +97,7 @@ const SEEDED_WORKSPACE = "/Users/corey/universe/src/foo";
 // flow's navigate() lands on our spy regardless of router/provider setup.
 vi.mock("@/lib/routing", () => ({
   useLocation: () => ({ hash: "", state: null }),
+  useReplaceSearchParams: () => replaceSearchParamsMock,
   useNavigate: () => navigateMock,
   useSearchParams: () => [searchParams, vi.fn()],
 }));

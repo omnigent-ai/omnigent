@@ -633,6 +633,43 @@ function isElAtBottom(el: HTMLElement): boolean {
   return el.scrollHeight - el.clientHeight - el.scrollTop <= BOTTOM_EPSILON_PX;
 }
 
+/**
+ * Re-apply `pin` every frame while row heights settle, for the restore budget or until
+ * the reader scrolls, taps, or types. Returns a function that stops it early.
+ */
+export function pinUntilSettled(
+  scrollEl: HTMLElement,
+  pin: () => void,
+  isCurrent: () => boolean,
+  onFinish: () => void,
+): () => void {
+  const deadline = performance.now() + SCROLL_RESTORE_BUDGET_MS;
+  let frame = 0;
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    cancelAnimationFrame(frame);
+    for (const type of RESTORE_CANCEL_EVENTS) scrollEl.removeEventListener(type, finish);
+    onFinish();
+  };
+  const tick = () => {
+    if (done || !isCurrent()) return;
+    if (performance.now() >= deadline) {
+      finish();
+      return;
+    }
+    pin();
+    frame = requestAnimationFrame(tick);
+  };
+  for (const type of RESTORE_CANCEL_EVENTS) {
+    scrollEl.addEventListener(type, finish, { passive: true });
+  }
+  pin();
+  frame = requestAnimationFrame(tick);
+  return finish;
+}
+
 export function VirtualBubbleList({
   bubbles,
   scrollEl,
@@ -925,6 +962,11 @@ export function VirtualBubbleList({
   bubblesRef.current = bubbles;
   const virtualizerRef = useRef(virtualizer);
   virtualizerRef.current = virtualizer;
+  // Where a row's top sits, by key, as the virtualizer currently measures it.
+  const anchorStart = useCallback((key: string): number | undefined => {
+    const index = bubblesRef.current.findIndex((bubble) => bubbleKey(bubble) === key);
+    return index < 0 ? undefined : virtualizerRef.current.getOffsetForIndex(index, "start")?.[0];
+  }, []);
 
   // Persist the item crossing the viewport top, not only a raw scrollTop.
   // Virtual row estimates can change while a conversation is hidden; the key
@@ -977,9 +1019,6 @@ export function VirtualBubbleList({
       done = true;
       if (restoringRef.current === conversationId) restoringRef.current = null;
       cancelAnimationFrame(frame);
-      for (const type of RESTORE_CANCEL_EVENTS) {
-        scrollEl.removeEventListener(type, finish);
-      }
     };
 
     if (!saved || saved.atBottom) {
@@ -1003,31 +1042,15 @@ export function VirtualBubbleList({
     }
 
     c.stopScroll();
-    const deadline = performance.now() + SCROLL_RESTORE_BUDGET_MS;
-    const pinAnchor = () => {
-      scrollEl.scrollTop = resolveTranscriptViewOffset(saved, (key) => {
-        const index = bubblesRef.current.findIndex((bubble) => bubbleKey(bubble) === key);
-        return index < 0
-          ? undefined
-          : virtualizerRef.current.getOffsetForIndex(index, "start")?.[0];
-      });
-    };
-    const tick = () => {
-      if (done || restoringRef.current !== conversationId) return;
-      if (performance.now() >= deadline) {
-        finish();
-        return;
-      }
-      pinAnchor();
-      frame = requestAnimationFrame(tick);
-    };
-    for (const type of RESTORE_CANCEL_EVENTS) {
-      scrollEl.addEventListener(type, finish, { passive: true });
-    }
-    pinAnchor();
-    frame = requestAnimationFrame(tick);
-    return finish;
-  }, [conversationId, scrollEl, messageId]);
+    return pinUntilSettled(
+      scrollEl,
+      () => {
+        scrollEl.scrollTop = resolveTranscriptViewOffset(saved, anchorStart);
+      },
+      () => restoringRef.current === conversationId,
+      finish,
+    );
+  }, [conversationId, scrollEl, messageId, anchorStart]);
 
   const scrollToItem = useCallback((itemId: string): boolean => {
     const index = bubblesRef.current.findIndex(

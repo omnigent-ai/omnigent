@@ -291,6 +291,9 @@ class ServerInfoResponse(BaseModel):
     archive_worktree_cleanup: bool = True
     # GET /v1/sessions accepts ``search_scope``; older servers ignore it.
     session_search_scope: bool = True
+    # GET /v1/sessions applies ``include_archived`` to ``visibility=mine`` and
+    # ``shared``; older servers drop archived rows there.
+    session_list_scoped_archives: bool = True
     # Scheduled tasks accept ``session_mode`` and ``session_id``; older servers
     # reject them.
     scheduled_task_session_modes: bool = True
@@ -345,6 +348,15 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_projects: bool = False
     # Bounded latest-failure feed for the Inbox.
     scheduled_task_inbox: bool = False
+    # Session PATCH and project create check the agent tool's calling session;
+    # absent on older servers, where moves must not run.
+    session_move_source_checks: bool = False
+    # Every other agent-tool organizing write checks it too: session title, pin
+    # and archive, and project rename, icon and delete.
+    session_organize_source_checks: bool = False
+    # An agent's create that names a project other than its source's project makes a
+    # standalone session; older servers refuse it while sibling sessions are on.
+    sibling_other_project_standalone: bool = False
     branding: BrandingInfo
     picker: PickerInfo = PickerInfo()
 
@@ -3720,6 +3732,7 @@ def create_app(
                 "scheduled_task_worktrees": True,
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
+                "session_list_scoped_archives": True,
                 "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
@@ -3740,6 +3753,9 @@ def create_app(
                 },
                 "scheduled_task_projects": project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
+                "session_move_source_checks": True,
+                "session_organize_source_checks": True,
+                "sibling_other_project_standalone": True,
                 "automations_enabled": automations_enabled,
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),
@@ -4081,6 +4097,8 @@ def create_app(
             create_projects_router(
                 project_store=project_store,
                 auth_provider=auth_provider,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
             ),
             prefix="/v1",
             tags=["projects"],

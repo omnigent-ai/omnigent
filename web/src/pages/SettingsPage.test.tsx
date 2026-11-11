@@ -1200,6 +1200,7 @@ describe("SettingsPage", () => {
       target: { value: "3" },
     });
     fireEvent.click(screen.getByTestId("project-folder-collapse-toggle"));
+    fireEvent.click(screen.getByTestId("session-row-quick-actions-toggle"));
     const folderPagination = renderHook(() => [
       useProjectFolderCollapse(),
       useProjectFolderPageSize(),
@@ -1231,6 +1232,11 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("fold-assistant-narration-toggle")).toHaveAttribute(
       "aria-checked",
       "true",
+    );
+    expect(localStorage.getItem("omnigent:session-row-quick-actions")).toBe("false");
+    expect(screen.getByTestId("session-row-quick-actions-toggle")).toHaveAttribute(
+      "aria-checked",
+      "false",
     );
 
     // Open the confirmation dialog and confirm the reset.
@@ -1287,6 +1293,11 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:project-folder-collapse")).toBeNull();
     expect(localStorage.getItem("omnigent:project-folder-page-size")).toBeNull();
     expect(folderPagination.result.current).toEqual([true, 5]);
+    expect(localStorage.getItem("omnigent:session-row-quick-actions")).toBeNull();
+    expect(screen.getByTestId("session-row-quick-actions-toggle")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
     expect(localStorage.getItem("omnigent:hidden-picker-agents")).toBeNull();
   });
 
