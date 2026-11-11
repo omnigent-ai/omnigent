@@ -360,6 +360,8 @@ export function PdfViewer({
             onLoadError={() => setErrored(true)}
             loading={centered("Loading PDF…")}
             error={centered("Unable to render PDF.", "error")}
+            // Web links must not navigate the app window away from the session.
+            externalLinkTarget="_blank"
             className="flex flex-col items-center gap-4"
           >
             {Array.from({ length: numPages }, (_, i) => {

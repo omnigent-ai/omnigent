@@ -8,7 +8,8 @@ A file the server classifies as ``application/pdf`` (via
 The new toolbar behaviour is also asserted here (it is user-facing and specific
 to PDFs): the diff (Δ) button is hidden because a rendered PDF has no text
 surface to diff against. Comments are supported via the pdf.js text layer.
-percentage doubles as the reset control.
+percentage doubles as the reset control. A web link inside the PDF opens in a
+new page while the app stays on its session; the linked site is a routed stub.
 
 The fixture seeds a minimal but valid PDF. It is pure ASCII, so it round-trips
 through the filesystem PUT endpoint's text-only path (``str.encode(encoding)``)
@@ -23,7 +24,7 @@ from collections.abc import Iterator
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
 
 # ---------------------------------------------------------------------------
 # Test constants
@@ -31,20 +32,26 @@ from playwright.sync_api import Page, expect
 
 _PDF_FILE_PATH = "sample.pdf"
 
-# A minimal, valid single-page PDF drawing the text "Hello PDF". Kept ASCII so
-# it survives the filesystem PUT endpoint's UTF-8 text path (binary/base64 can't
-# be seeded there). pdf.js renders the text into the selectable text layer,
-# which is what the test asserts on.
-_PDF_CONTENT = """\
+_PDF_LINK_URL = "https://review.external.example/pulls/1"
+
+# A minimal, valid single-page PDF drawing the text "Hello PDF" and an "Open pull
+# request" URI link annotation. Kept ASCII so it survives the filesystem PUT
+# endpoint's UTF-8 text path (binary/base64 can't be seeded there). pdf.js
+# renders the text into the selectable text layer, which is what the test
+# asserts on.
+_PDF_CONTENT = f"""\
 %PDF-1.4
 1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
 2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj
 3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]
-/Resources<</Font<</F1 4 0 R>>>>/Contents 5 0 R>>endobj
+/Resources<</Font<</F1 4 0 R>>>>/Contents 5 0 R/Annots[6 0 R]>>endobj
 4 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj
-5 0 obj<</Length 44>>stream
+5 0 obj<</Length 90>>stream
 BT /F1 24 Tf 72 700 Td (Hello PDF) Tj ET
+BT /F1 18 Tf 72 650 Td (Open pull request) Tj ET
 endstream endobj
+6 0 obj<</Type/Annot/Subtype/Link/Rect[66 640 240 672]/Border[0 0 0]
+/A<</S/URI/URI({_PDF_LINK_URL})>>>>endobj
 trailer<</Root 1 0 R>>
 %%EOF
 """
@@ -78,17 +85,26 @@ def seeded_pdf_session(
     yield (base_url, session_id, _PDF_FILE_PATH)
 
 
+def _fulfill_linked_page(route: Route) -> None:
+    route.fulfill(
+        status=200,
+        content_type="text/html",
+        body="<title>Pull request</title><h1>Pull request</h1>",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
 
-def test_pdf_preview_toolbar_and_zoom(
-    page: Page,
+def test_pdf_preview_toolbar_zoom_and_web_link(
     seeded_pdf_session: tuple[str, str, str],
+    page: Page,
 ) -> None:
-    """Render a PDF, check its toolbar, then zoom and reset the same preview."""
+    """Render a PDF, check its toolbar and zoom, then follow its web link."""
     base_url, session_id, _file_path = seeded_pdf_session
+    page.context.route("https://review.external.example/**", _fulfill_linked_page)
     page.goto(f"{base_url}/c/{session_id}?view=explore")
 
     file_button = page.get_by_role("button", name=re.compile(rf"^{re.escape(_PDF_FILE_PATH)}\b"))
@@ -132,3 +148,15 @@ def test_pdf_preview_toolbar_and_zoom(
     reset.click()
     expect(reset).to_have_text("100%")
     expect(reset).to_be_disabled()
+
+    pdf_link = file_viewer.locator(f'.annotationLayer a[href="{_PDF_LINK_URL}"]')
+    expect(pdf_link).to_be_attached(timeout=10_000)
+    with page.context.expect_page(timeout=10_000) as new_page_info:
+        pdf_link.click()
+    new_page = new_page_info.value
+    new_page.wait_for_load_state()
+    expect(new_page).to_have_url(_PDF_LINK_URL)
+    expect(new_page.get_by_role("heading", name="Pull request")).to_be_visible()
+
+    expect(page).to_have_url(re.compile(rf"/c/{session_id}"))
+    expect(file_viewer.get_by_text("Hello PDF")).to_be_visible()
