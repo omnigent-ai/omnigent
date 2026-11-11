@@ -498,14 +498,18 @@ describe("loading / not-found states", () => {
 });
 
 describe("sharing runs", () => {
-  function renderWithSharing() {
-    return render(
+  function sharingTree() {
+    return (
       <CapabilitiesProvider
         info={{ ...SERVER_INFO_OFFLINE_FALLBACK, sharing_mode: "on", scheduled_task_sharing: true }}
       >
         {pageTree()}
-      </CapabilitiesProvider>,
+      </CapabilitiesProvider>
     );
+  }
+
+  function renderWithSharing() {
+    return render(sharingTree());
   }
 
   it("hides sharing on servers without it, but keeps saved shares removable", () => {
@@ -539,9 +543,11 @@ describe("sharing runs", () => {
 
   it("saves who later runs are shared with from the Share dialog", () => {
     setTask(task());
-    renderWithSharing();
+    const { rerender } = renderWithSharing();
     openConfiguration();
-    expect(screen.getByTestId("task-detail-shared-with")).toHaveTextContent("Only you");
+    expect(screen.getByTestId("task-detail-shared-with")).toHaveTextContent(
+      "Not shared automatically",
+    );
 
     fireEvent.click(screen.getByTestId("task-detail-share"));
     const dialog = screen.getByTestId("automation-share-dialog");
@@ -566,6 +572,19 @@ describe("sharing runs", () => {
     );
     expect(within(dialog).getByText("team.engineering")).toBeTruthy();
     expect(save).not.toBeDisabled();
+
+    // Retrying succeeds and closes the dialog; reopening starts from the saved list.
+    fireEvent.click(save);
+    const [, retry] = updateMutate.mock.calls[1];
+    act(() => retry.onSuccess());
+    expect(screen.queryByTestId("automation-share-dialog")).toBeNull();
+    setTask(task({ shareWith: [{ userId: "team.engineering", level: 1 }] }));
+    rerender(sharingTree());
+    fireEvent.click(screen.getByTestId("task-detail-share"));
+    const reopened = screen.getByTestId("automation-share-dialog");
+    expect(within(reopened).queryByRole("alert")).toBeNull();
+    expect(within(reopened).getByText("team.engineering")).toBeTruthy();
+    expect(screen.getByTestId("automation-share-save")).toBeDisabled();
   });
 });
 

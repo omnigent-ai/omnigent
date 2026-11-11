@@ -572,7 +572,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
                 label="Shared with"
                 value={
                   shares.length === 0
-                    ? "Only you"
+                    ? "Not shared automatically"
                     : shares
                         .map(
                           (share) =>
