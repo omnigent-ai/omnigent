@@ -158,7 +158,7 @@ to customize.
   settings reveal their controls. Escape closes the active selector or folder browser
   without discarding the automation draft. The footer stays visible while the form scrolls.
   Gallery cards use two columns on desktop and one on narrow screens.
-- `share-runs`: below the schedule, **Share runs with (optional)** lists users or
+- `share-runs`: under Advanced, **Share runs with** lists users or
   groups (up to 10, with the host's user and group suggestions) that every session
   a run creates is shared with, at Read or Edit; a continue-mode automation shares
   its session when saved. Edit is hidden on read-only servers, and an Edit share
@@ -177,8 +177,9 @@ to customize.
   and session instructions. Returning to Schedule restores the schedule draft.
   Choose Run on, Agent, and session mode above Repeat. Expand Advanced to change
   model, effort, permissions, or an ending; for an integration trigger it also has
-  **Start a new session for each match**. Add people or groups under **Share runs
-  with**, then select **Add** for each. With `automations_v2` on a server
+  **Start a new session for each match**. Add people or groups under Advanced →
+  **Share runs with**, then select **Add** for each; collapsed, Advanced shows
+  **Shared with N**. With `automations_v2` on a server
   supporting sub-hour schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
 - **Editing:** open Edit automation from a row menu or a task's detail page;

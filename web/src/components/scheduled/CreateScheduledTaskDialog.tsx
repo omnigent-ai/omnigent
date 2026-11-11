@@ -995,6 +995,7 @@ export function CreateScheduledTaskDialog({
       summaryPermission,
     !triggerMode && schedule.end ? "End limit" : null,
     trigger !== null && triggerTaskSessionMode === "continue" ? "One task session" : null,
+    shares.length > 0 ? `Shared with ${shares.length}` : null,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -2043,23 +2044,23 @@ export function CreateScheduledTaskDialog({
                       )}
                     </div>
                     {!triggerMode && endingFields}
+                    {(sharingAvailable || openedShares.length > 0) && (
+                      <div className="flex flex-col gap-1.5" data-testid="task-share-field">
+                        <Label>Share runs with</Label>
+                        <AutomationShareFields
+                          idPrefix="task-share"
+                          value={shares}
+                          onChange={setShares}
+                          ownerId={editingTask ? editingTask.ownerUserId : getCurrentUserId()}
+                          disabled={submitting}
+                        />
+                      </div>
+                    )}
                   </CollapsibleContent>
                 </Collapsible>
               </>
             )}
           </ScheduleFields>
-          {(sharingAvailable || openedShares.length > 0) && (
-            <div className="flex flex-col gap-1.5" data-testid="task-share-field">
-              <Label>Share runs with (optional)</Label>
-              <AutomationShareFields
-                idPrefix="task-share"
-                value={shares}
-                onChange={setShares}
-                ownerId={editingTask ? editingTask.ownerUserId : getCurrentUserId()}
-                disabled={submitting}
-              />
-            </div>
-          )}
           {error && (
             <div
               role="alert"

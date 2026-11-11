@@ -426,6 +426,24 @@ describe("sharing runs", () => {
     expect(screen.queryByTestId("task-share-field")).toBeNull();
   });
 
+  it("keeps shares under Advanced and summarizes them while it is collapsed", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ shareWith: [team] })}
+      />,
+      { info: SHARING, expandAdvanced: false },
+    );
+    expect(screen.queryByTestId("task-share-field")).toBeNull();
+    const advanced = screen.getByRole("button", { name: "Advanced" });
+    expect(advanced).toHaveTextContent("Shared with 1");
+    fireEvent.click(advanced);
+    expect(
+      within(screen.getByTestId("task-advanced-fields")).getByTestId("task-share-field"),
+    ).toBeInTheDocument();
+  });
+
   it("creates the automation with the people or groups its runs are shared with", async () => {
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, { info: SHARING });
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Morning review" } });
