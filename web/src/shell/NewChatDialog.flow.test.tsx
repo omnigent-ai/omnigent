@@ -296,7 +296,6 @@ function renderLanding(
     single_user: false,
     login_url: null,
     needs_setup: false,
-    databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
     enabled_connections: [],

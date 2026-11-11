@@ -115,8 +115,7 @@ the git credential helper via the GitHub broker).
 - `create_app`: `databricks_config`/`databricks_store`/`databricks_client` in
   `app.state`, a `databricks_enabled` gate, mount `create_host_databricks_router`
   + `create_integrations_databricks_router`, and a **new** ServerInfo field
-  `databricks_app_enabled` (distinct from the existing `databricks_features`
-  deploy-mode hint). `cli.py` constructs `DatabricksConfig.from_env()` +
+  `databricks_app_enabled`. `cli.py` constructs `DatabricksConfig.from_env()` +
   `DatabricksConnectionStore(db_uri, build_secret_cipher())` next to the GitHub
   block (same KMS cipher instance).
 - Frontend: `web/src/lib/databricksIntegration.ts` + a `DatabricksIntegration

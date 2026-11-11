@@ -39,7 +39,6 @@ def appearance_url(
             "single_user": True,
             "login_url": None,
             "needs_setup": False,
-            "databricks_features": False,
             "managed_sandboxes_enabled": False,
             "sandbox_provider": None,
             "sandbox_providers": [],

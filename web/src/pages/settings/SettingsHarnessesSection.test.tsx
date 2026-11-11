@@ -161,10 +161,8 @@ vi.mock("@/hooks/useHarnessInventory", async (importActual) => ({
 // The "Set up" button is gated on the harness_install feature (like New Chat),
 // so drive that flag through the server-info mock.
 let harnessInstall = true;
-let databricksFeatures = true;
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
-    databricks_features: databricksFeatures,
     features: { harness_install: harnessInstall },
     installable_harnesses: [
       "claude-native",
@@ -271,7 +269,6 @@ afterEach(() => {
   hosts = [];
   inventory = INVENTORY;
   harnessInstall = true;
-  databricksFeatures = true;
   fixDialogProps.mockReset();
   startupCalls.mockClear();
   accountRefreshCalls.mockClear();
@@ -533,17 +530,6 @@ describe("Harness details", () => {
     for (const arg of STARTUP.args ?? []) expect(screen.getAllByText(arg)).toHaveLength(1);
     expect(screen.getByText(/Sessions and workspaces may override/)).toBeTruthy();
     expect(screen.getByText(/harness.claude-native in ~\/.omnigent\/config.yaml/)).toBeTruthy();
-  });
-
-  it("keeps the Isaac label when databricks_features is false", () => {
-    databricksFeatures = false;
-    hosts = [{ ...ONLINE, gateway_inference: { "claude-native": true } }];
-    renderHarnesses();
-
-    expect(within(card("claude-native")).getByText("· Isaac")).toBeTruthy();
-    fireEvent.click(screen.getByTestId("harness-settings-claude-native"));
-    expect(screen.getByText("Isaac")).toBeTruthy();
-    expect(screen.getByText("Databricks-managed credential via the Unity Gateway")).toBeTruthy();
   });
 
   it("keeps tool discovery lazy and shows host-reported details", () => {

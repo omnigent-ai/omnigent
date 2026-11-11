@@ -13,7 +13,6 @@ vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn().mockResolvedValue(undefined) }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
-    databricks_features: false,
     features: { harness_install: true },
     installable_harnesses: [
       "claude-native",

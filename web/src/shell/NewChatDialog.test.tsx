@@ -1504,7 +1504,6 @@ function landingInfo(infoOverrides: Partial<ServerInfo>): ServerInfo {
     single_user: false,
     login_url: null,
     needs_setup: false,
-    databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
     enabled_connections: [],
@@ -6758,9 +6757,9 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("quotes server URLs in host and Lakebox connect commands", () => {
+  it("quotes server URLs in host connect commands", () => {
     setOmnigentHostConfig({ cliServerUrlSuffix: "/api?profile=dev&glob=*" });
-    renderLanding({ databricks_features: true });
+    renderLanding();
     // Radix dropdowns open on pointerdown (a bare click doesn't in jsdom).
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-connect-host"));
@@ -6768,13 +6767,6 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("connect-host-dialog")).toBeTruthy();
     expect(screen.getByTestId("connect-host-command")).toHaveTextContent(
       `omni host --server '${window.location.origin}/api?profile=dev&glob=*'`,
-    );
-
-    const lakeboxTab = screen.getByRole("tab", { name: "Databricks Lakebox" });
-    fireEvent.mouseDown(lakeboxTab);
-    fireEvent.click(lakeboxTab);
-    expect(screen.getByTestId("connect-lakebox-connect-command")).toHaveTextContent(
-      `omni sandbox connect --provider lakebox --sandbox-id <id> --server '${window.location.origin}/api?profile=dev&glob=*'`,
     );
   });
 

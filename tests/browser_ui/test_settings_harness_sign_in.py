@@ -46,7 +46,6 @@ def test_expired_codex_account_recovers_on_selected_machine(
                 "single_user": True,
                 "features": {"harness_install": True},
                 "installable_harnesses": ["codex-native"],
-                "databricks_features": False,
             },
         )
         contract.json("/v1/harnesses", {"data": [], "setup_steps": {}})

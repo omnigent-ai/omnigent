@@ -101,7 +101,6 @@ async def _drive_launch(
                 enabled_connections=["mcp"],
                 managed_sandboxes_enabled=managed,
                 sandbox_provider="agent_sandbox" if managed else None,
-                databricks_features=False,
                 sandbox_provider_capabilities={"agent_sandbox": {"inference_models": True}},
             )
             if not managed:

@@ -107,12 +107,6 @@ export interface ServerInfo {
    */
   needs_setup: boolean;
   /**
-   * True when the server has the lakebox CLI. Gates the Lakebox-specific UI
-   * hints, such as the connect tab in the CLI command snippets. False in
-   * builds that exclude those modules, which show provider-agnostic hints.
-   */
-  databricks_features: boolean;
-  /**
    * True when the server can provision cloud-sandbox hosts for
    * ``host_type: "managed"`` session creates (a ``sandbox:`` config with a
    * launch-capable provider is wired). Gates the sandbox option in
@@ -430,7 +424,6 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   single_user: false,
   login_url: null,
   needs_setup: false,
-  databricks_features: false,
   managed_sandboxes_enabled: false,
   sandbox_provider: null,
   sandbox_providers: [],
@@ -584,7 +577,6 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           single_user: data.single_user === true,
           login_url: typeof data.login_url === "string" ? data.login_url : null,
           needs_setup: data.needs_setup === true,
-          databricks_features: data.databricks_features === true,
           managed_sandboxes_enabled: data.managed_sandboxes_enabled === true,
           durable_initial_input: data.durable_initial_input === true,
           sandbox_provider:
