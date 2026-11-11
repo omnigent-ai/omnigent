@@ -10662,6 +10662,9 @@ async def _auto_create_grok_terminal(
         "OMNIGENT_PERMISSION_URL": (
             f"{runner_server_url}/v1/sessions/{session_id}/hooks/permission-request"
         ),
+        "OMNIGENT_AGENT_CONTENTS_URL": (
+            f"{runner_server_url}/v1/sessions/{session_id}/agent/contents"
+        ),
     }
     argv = grok_serve_argv(
         grok_command,

@@ -105,6 +105,48 @@ if __name__ == "__main__":
     raise SystemExit(main())
 '''
 
+_SESSIONSTART_FILENAME = "omnigent_sessionstart_hook.py"
+
+# Stdlib-only SessionStart hook: fetch the authored Omnigent instructions and
+# print them as additionalContext so the model receives them at startup.
+_SESSIONSTART_SCRIPT = '''#!/usr/bin/env python3
+"""Omnigent instruction-delivery hook for grok-native (generated; stdlib only)."""
+
+import json
+import os
+import sys
+import urllib.request
+
+
+def main() -> int:
+    env = os.environ
+    url = env.get("OMNIGENT_AGENT_CONTENTS_URL")
+    if not url:
+        return 0
+    try:
+        headers = json.loads(env.get("OMNIGENT_HOOK_HEADERS") or "{}")
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15.0) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return 0
+    text = data.get("prompt") or data.get("instructions") or ""
+    if isinstance(text, dict):
+        text = text.get("text") or ""
+    text = str(text).strip()
+    if not text:
+        return 0
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": "Omnigent session instructions:\n" + text,
+    }}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
 
 def write_grok_policy_plugin(session_id: str) -> Path:
     """Write the per-session policy plugin; return the ``--plugin-dir`` path.
@@ -133,6 +175,9 @@ def write_grok_policy_plugin(session_id: str) -> Path:
     script_path = plugin_dir / _HOOK_FILENAME
     script_path.write_text(_HOOK_SCRIPT)
     script_path.chmod(0o755)
+    sessionstart_path = plugin_dir / _SESSIONSTART_FILENAME
+    sessionstart_path.write_text(_SESSIONSTART_SCRIPT)
+    sessionstart_path.chmod(0o755)
     (hooks_dir / "hooks.json").write_text(
         json.dumps(
             {
@@ -147,7 +192,18 @@ def write_grok_policy_plugin(session_id: str) -> Path:
                             }
                         ],
                     }
-                ]
+                ],
+                "SessionStart": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f"python3 {sessionstart_path}",
+                                "timeout": 30,
+                            }
+                        ],
+                    }
+                ],
             },
             indent=2,
         )
