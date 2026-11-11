@@ -44,6 +44,29 @@ describe("rankGoToFileResults", () => {
       "src/jsonParser.ts",
       "src/xparser.ts",
     ]);
+    // A digit or punctuation before an uppercase letter isn't a case change.
+    expect(rankedPaths(["1Parser.ts", "xParser.ts"], "parser")).toEqual([
+      "xParser.ts",
+      "1Parser.ts",
+    ]);
+    // Supplementary-plane letters are compared as whole characters, not surrogates.
+    expect(rankedPaths(["a\u{10428}.ts", "x\u{10400}.ts"], "\u{10428}")).toEqual([
+      "x\u{10400}.ts",
+      "a\u{10428}.ts",
+    ]);
+  });
+
+  it("keeps the lower tiers ahead of shorter or shallower paths", () => {
+    // Inside the name beats a folder prefix, even when the path is longer and deeper.
+    expect(rankedPaths(["parser/i.ts", "src/deep/longer/xparser.ts"], "parser")).toEqual([
+      "src/deep/longer/xparser.ts",
+      "parser/i.ts",
+    ]);
+    // A folder prefix beats a match elsewhere in the path, even when deeper.
+    expect(rankedPaths(["x/myparser.d/n.ts", "parser/a/b/index.ts"], "parser")).toEqual([
+      "parser/a/b/index.ts",
+      "x/myparser.d/n.ts",
+    ]);
   });
 
   it("matches case-insensitively", () => {

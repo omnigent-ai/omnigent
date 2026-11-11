@@ -110,13 +110,36 @@ function matchRanges(
   };
 }
 
+/** The whole character (code point) ending at source offset `index` of `text`. */
+function characterBefore(text: string, index: number): string {
+  const low = text.charCodeAt(index - 1);
+  if (index >= 2 && low >= 0xdc00 && low <= 0xdfff) {
+    const high = text.charCodeAt(index - 2);
+    if (high >= 0xd800 && high <= 0xdbff) return text.slice(index - 2, index);
+  }
+  return text[index - 1];
+}
+
+/** The whole character (code point) starting at source offset `index` of `text`. */
+function characterAt(text: string, index: number): string {
+  return String.fromCodePoint(text.codePointAt(index) ?? 0);
+}
+
+/** A cased lowercase character; digits and punctuation are neither case. */
+function isLowercase(character: string): boolean {
+  return character.toLowerCase() === character && character.toUpperCase() !== character;
+}
+
+function isUppercase(character: string): boolean {
+  return character.toUpperCase() === character && character.toLowerCase() !== character;
+}
+
 /** Whether a word starts at source offset `index` of `text`. */
 function isWordStart(text: string, index: number): boolean {
   if (index === 0) return true;
-  const before = text[index - 1];
-  const at = text[index];
+  const before = characterBefore(text, index);
   if ("-_. ".includes(before)) return true;
-  return before.toLowerCase() === before && at.toUpperCase() === at && at.toLowerCase() !== at;
+  return isLowercase(before) && isUppercase(characterAt(text, index));
 }
 
 /** Lower is better. */
