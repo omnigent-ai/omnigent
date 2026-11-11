@@ -11,6 +11,7 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, TypeVar
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms._responses_to_chat import (
     chat_response_to_response,
     chat_stream_to_response_events,
@@ -36,6 +37,28 @@ from omnigent.util.reasoning_effort import OPENAI_EFFORTS, validate_effort_or_ll
 _logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+
+
+def _output_limit_kwargs(kwargs: dict[str, Any], *, native_responses: bool) -> dict[str, Any]:
+    """Translate the output budget without changing an explicit caller limit."""
+    result = dict(kwargs)
+    names = ("max_output_tokens", "max_tokens", "max_completion_tokens")
+    supplied = [name for name in names if result.get(name) is not None]
+    if not supplied:
+        return result
+    limit = result[supplied[0]]
+    if any(result[name] != limit for name in supplied[1:]):
+        raise OmnigentError("Conflicting output token limits", code=ErrorCode.INVALID_INPUT)
+    if native_responses:
+        target = "max_output_tokens"
+    elif "max_output_tokens" in supplied:
+        target = "max_completion_tokens" if "max_completion_tokens" in supplied else "max_tokens"
+    else:
+        return result
+    for name in names:
+        result.pop(name, None)
+    result[target] = limit
+    return result
 
 
 def _emit_usage_from_response(response: Response) -> None:
@@ -114,7 +137,9 @@ class _ResponsesNamespace:
             client-level retries. Useful for standalone calls
             outside the workflow engine.
         :param kwargs: Additional provider-specific kwargs (e.g.
-            ``temperature``, ``max_tokens``).
+            ``temperature``). ``max_output_tokens`` sets the output budget
+            across providers; legacy ``max_tokens`` and
+            ``max_completion_tokens`` are also accepted.
         :returns: A :class:`Response` when ``stream=False``, or
             an async iterator of :data:`ResponseStreamEvent`
             when ``stream=True``.
@@ -180,6 +205,7 @@ class _ResponsesNamespace:
         """
         routed = parse_model_string(model)
         adapter = get_adapter(routed.provider)
+        kwargs = _output_limit_kwargs(kwargs, native_responses=isinstance(adapter, OpenAIAdapter))
 
         # OpenAI supports the Responses API natively — use it
         # directly so reasoning token events flow through
