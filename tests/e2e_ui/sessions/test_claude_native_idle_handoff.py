@@ -191,6 +191,11 @@ def test_completed_claude_child_survives_stale_status_handoff(
             page.locator('[data-role="assistant"]', has_text=_PARENT_RESULT).first
         ).to_be_visible(timeout=90_000)
 
+        _poll_until(
+            lambda: len(_get(client, f"/v1/sessions/{parent_id}/child_sessions")["data"]) == 1,
+            timeout=30,
+            what="the independent child forwarder to register the real Claude child",
+        )
         children = _get(client, f"/v1/sessions/{parent_id}/child_sessions")["data"]
         assert len(children) == 1, children
         child_id = children[0]["id"]

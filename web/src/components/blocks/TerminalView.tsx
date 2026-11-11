@@ -7,7 +7,14 @@
 // returned cleanup).
 
 import { Loader2Icon } from "lucide-react";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
@@ -29,13 +36,16 @@ import {
   type TerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
-import {
-  claimPendingShellInput,
-  hasPendingShellInput,
-  subscribePendingShellInput,
-} from "@/lib/shellCommand";
+import { takeShellKeystrokes } from "@/lib/shellCommand";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
-import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
+import {
+  isTerminalLaunching,
+  resolveInitialAttachUrl,
+  subscribeTerminalLaunches,
+  terminalLaunchMode,
+  watchDirectUpgrade,
+  withAttachParams,
+} from "@/lib/terminals";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
 import {
   TerminalClipboardPrompt,
@@ -44,7 +54,6 @@ import {
 } from "./TerminalClipboardPrompt";
 import {
   type ConnectionState,
-  type ShellPasteRefusal,
   type TerminalActivityListener,
   type TerminalInputListener,
   applyTerminalCopy,
@@ -91,66 +100,8 @@ export const RECONNECT_BACKOFF_MS = [
  */
 export const RECONNECT_STABLE_MS = 30_000;
 
-/** Toast text for a chat command that was not pasted into the shell. */
-export function shellPasteRefusalMessage(reason: ShellPasteRefusal): {
-  title: string;
-  description: string;
-} {
-  const copyHint = "Copy it from the chat instead.";
-  switch (reason) {
-    case "interrupted":
-      return {
-        title: "Command may not have been pasted",
-        description: `The connection to the shell dropped. Check the prompt before pressing Enter, or ${copyHint.toLowerCase()}`,
-      };
-    case "not-ready":
-      return {
-        title: "Command not pasted",
-        description: `The shell didn't reach an empty prompt in time. ${copyHint}`,
-      };
-    case "busy":
-      return {
-        title: "Command not pasted",
-        description: `Another command is still being pasted into this shell. ${copyHint}`,
-      };
-    case "too-large":
-      return {
-        title: "Command not pasted",
-        description: `The command is too long to paste. ${copyHint}`,
-      };
-    case "read-only":
-      return {
-        title: "Command not pasted",
-        description: `This shell is attached read-only. ${copyHint}`,
-      };
-    case "unsupported":
-      return {
-        title: "Command not pasted",
-        description: `This host's runner can't paste into a shell yet; update Omnigent there. ${copyHint}`,
-      };
-    case "late":
-      return {
-        title: "Command pasted after all",
-        description:
-          "The shell answered late and pasted it. Check the prompt before pressing Enter.",
-      };
-    case "empty":
-      return {
-        title: "Command not pasted",
-        description: "Nothing was left to paste after removing control characters.",
-      };
-    case "failed":
-      return {
-        title: "Command not pasted",
-        description: `The shell couldn't paste this command. ${copyHint}`,
-      };
-    case "unsafe":
-      return {
-        title: "Command not pasted",
-        description: `The shell couldn't take this command without running it. ${copyHint}`,
-      };
-  }
-}
+/** Closes an attach can get when it arrives before its shell exists. */
+const LAUNCH_REFUSAL_CODES: ReadonlySet<number> = new Set([4404, 4500]);
 
 function isReconnectableTerminalClose(code: number): boolean {
   return (
@@ -335,6 +286,9 @@ export function TerminalView({
   // Consecutive re-dial attempts in the current outage. A ref, not
   // state: it only feeds the scheduling effect, never the render.
   const reconnectAttemptsRef = useRef(0);
+  // Whether the current attach was dialed while its shell's create was in
+  // flight (``await_launch``); such an attach gets one re-dial on 4404.
+  const dialedDuringLaunchRef = useRef(false);
   // Epoch ms when the current connection opened, or null while down.
   // Lets the close handler tell "stable connection finally dropped"
   // (reset the budget) from "re-dial died straight away" (burn it).
@@ -367,8 +321,6 @@ export function TerminalView({
   // superseded — a ref callback can re-run for the *same* node, which
   // leaves no other way to retire the previous attempt's async work.
   const attachGenerationRef = useRef(0);
-  // The session, terminal and access mode of the latest attach.
-  const attachTargetRef = useRef<string | null>(null);
   // Abort handle for the outgoing attach's direct-upgrade probe, which
   // otherwise holds a loopback socket open for its full timeout.
   const upgradeCtlRef = useRef<AbortController | null>(null);
@@ -388,27 +340,26 @@ export function TerminalView({
     onStateChangeRef.current?.(next);
   }, []);
 
+  const runTargetRef = useRef({ sessionId, terminalId, readOnly });
+  runTargetRef.current = { sessionId, terminalId, readOnly };
+
   const notifyActivity = useCallback(() => {
+    // Terminal output: the attach reached a live shell, so a later close is
+    // not a launch refusal.
+    dialedDuringLaunchRef.current = false;
+    // The shell is up, so a chat code block's "Run in shell" keystrokes
+    // queued for this new terminal can go in now.
+    const target = runTargetRef.current;
+    if (!target.readOnly) {
+      const keystrokes = takeShellKeystrokes(target.sessionId, target.terminalId);
+      if (keystrokes !== null) sessionRef.current?.sendText(keystrokes);
+    }
     onActivityRef.current?.();
   }, []);
 
   const notifyInput = useCallback(() => {
     onInputRef.current?.();
   }, []);
-
-  // Hand a command queued by the chat's "Open in shell" to this view's session.
-  const offerPendingShellInput = useCallback(() => {
-    const session = sessionRef.current;
-    if (session === null || readOnly || !hasPendingShellInput(sessionId, terminalId)) return;
-    session.pasteWhenShellReady(
-      () => claimPendingShellInput(sessionId, terminalId),
-      (_text, reason) => {
-        const { title, description } = shellPasteRefusalMessage(reason);
-        toast.info(title, { description });
-      },
-    );
-  }, [sessionId, terminalId, readOnly]);
-  useEffect(() => subscribePendingShellInput(offerPendingShellInput), [offerPendingShellInput]);
 
   const queueSessionClipboardCopy = useCallback(
     (request: TerminalClipboardRequest & { kind: "automatic" | "user" }) => {
@@ -606,6 +557,13 @@ export function TerminalView({
     }
   }, [onResume, disposeActiveSession, resumeTarget, resumeGeneration]);
 
+  // A new shell whose create may be waking the runner opens its tab at once
+  // but attaches only once the create returns.
+  const launchMode = useSyncExternalStore(subscribeTerminalLaunches, () =>
+    terminalLaunchMode(terminalId),
+  );
+  const waitingForCreate = launchMode === "wait";
+
   const attachSession = useCallback(
     (node: HTMLDivElement | null) => {
       if (node === null) return;
@@ -618,22 +576,14 @@ export function TerminalView({
       // on top of the session that replaced it.
       const generation = (attachGenerationRef.current += 1);
       upgradeCtlRef.current?.abort();
-      const target = JSON.stringify([sessionId, terminalId, readOnly]);
-      const outgoing = sessionRef.current;
-      // A new advert for the same terminal mid-paste waits for the paste:
-      // the chat already handed this session the command, so cutting it off
-      // would lose it. Any other change retires the session at once.
-      const retireAfterPaste =
-        outgoing !== null && attachTargetRef.current === target && outgoing.hasShellPasteInFlight();
-      attachTargetRef.current = target;
-      const retireOutgoing = () => {
-        disposeActiveSession();
-        node.replaceChildren();
-        // A stale overlay must not flash during the handshake; the session's
-        // WS ``open`` handler moves on to ``connected``.
-        notifyState({ kind: "connecting" });
-      };
-      if (!retireAfterPaste) retireOutgoing();
+      disposeActiveSession();
+      node.replaceChildren();
+      // Reset to ``connecting`` for every fresh attach so a stale
+      // overlay from a previous mount doesn't flash during the
+      // handshake. The session's WS ``open`` handler transitions us
+      // to ``connected``.
+      notifyState({ kind: "connecting" });
+      if (waitingForCreate) return;
 
       // Defer the actual session construction by one microtask so
       // React 19 StrictMode's synchronous attach → cleanup → attach
@@ -658,11 +608,6 @@ export function TerminalView({
         // behavior queueMicrotask provided; the URL resolution (when a
         // direct URL exists) adds real async time, so re-check after
         // every await.
-        if (retireAfterPaste) {
-          await outgoing.whenShellPasteIdle();
-          if (superseded()) return;
-          retireOutgoing();
-        }
         await Promise.resolve();
         if (superseded()) return;
         // Browser WebSockets carry the host ID in the query string so they
@@ -674,7 +619,15 @@ export function TerminalView({
           const h = getSessionHost(sessionId);
           return h && (!isDatabricksWorkspace() || !isHostKeyless(h)) ? h : undefined;
         })();
-        const relayUrl = buildAttachUrl(sessionId, terminalId, readOnly, computedHostId);
+        const awaitLaunch = isTerminalLaunching(terminalId);
+        dialedDuringLaunchRef.current = awaitLaunch;
+        const relayUrl = buildAttachUrl(
+          sessionId,
+          terminalId,
+          readOnly,
+          computedHostId,
+          awaitLaunch,
+        );
         const directUrl = directAttachUrl ? withAttachParams(directAttachUrl, readOnly) : undefined;
         // Never keep the user waiting on the direct path: this resolves
         // direct only when the loopback listener is already known
@@ -695,7 +648,6 @@ export function TerminalView({
           notifyFileLink,
         );
         sessionRef.current = terminalSession;
-        offerPendingShellInput();
         // Relay-connected with a direct URL on offer: negotiate the
         // loopback upgrade in the background. In Chrome this is what
         // raises the Local Network Access prompt; the probe socket
@@ -705,9 +657,6 @@ export function TerminalView({
         if (directUrl !== undefined && url === relayUrl) {
           const upgraded = await watchDirectUpgrade(directUrl, upgradeCtl.signal);
           if (superseded() || !upgraded) return;
-          // Re-dialing mid-paste would drop a command the chat already handed over.
-          await terminalSession.whenShellPasteIdle();
-          if (superseded()) return;
           disposeActiveSession();
           setConnectAttempt((attempt) => attempt + 1);
         }
@@ -730,8 +679,8 @@ export function TerminalView({
       notifyInput,
       notifyClipboardRequest,
       notifyFileLink,
-      offerPendingShellInput,
       disposeActiveSession,
+      waitingForCreate,
     ],
   );
 
@@ -746,6 +695,20 @@ export function TerminalView({
 
   const stateRef = useRef(state);
   stateRef.current = state;
+
+  // An early attach can be refused before its shell exists (4404 before
+  // registration, 4500 while the runner is being rebound). After the create
+  // succeeds, retry once without ``await_launch``. Deliberate closes (e.g.
+  // 4405 detached) and closes after the shell produced output are left alone.
+  const closedByOwnLaunch = state.kind === "closed" && LAUNCH_REFUSAL_CODES.has(state.code);
+  useEffect(() => {
+    if (!dialedDuringLaunchRef.current || launchMode !== null || !closedByOwnLaunch) return;
+    dialedDuringLaunchRef.current = false;
+    reconnectAttemptsRef.current = 0;
+    disposeActiveSession();
+    setConnectAttempt((attempt) => attempt + 1);
+  }, [launchMode, closedByOwnLaunch, disposeActiveSession]);
+  const refusedDuringLaunch = launchMode === "attach" && closedByOwnLaunch;
   const previousResumeGeneration = useRef(resumeGeneration);
   useEffect(() => {
     if (previousResumeGeneration.current === resumeGeneration) return;
@@ -897,7 +860,8 @@ export function TerminalView({
         <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
         {state.kind !== "connected" && (
           <StatusOverlay
-            state={state}
+            state={refusedDuringLaunch ? { kind: "connecting" } : state}
+            startingShell={waitingForCreate || refusedDuringLaunch}
             reconnectPending={reconnectPending}
             onResume={onResume ? handleResume : undefined}
             resumeTarget={resumeTarget}
@@ -912,6 +876,7 @@ export function TerminalView({
 
 function StatusOverlay({
   state,
+  startingShell,
   reconnectPending,
   onResume,
   resumeTarget,
@@ -919,6 +884,8 @@ function StatusOverlay({
   resumeError,
 }: {
   state: ConnectionState;
+  /** True while a new shell waits for its create before attaching. */
+  startingShell: boolean;
   /** True while an automatic re-dial is scheduled for a closed bridge. */
   reconnectPending: boolean;
   onResume?: () => void | Promise<void>;
@@ -933,7 +900,7 @@ function StatusOverlay({
       {state.kind === "connecting" && (
         <span className="flex items-center gap-2">
           <Loader2Icon className="size-4 animate-spin" />
-          Connecting…
+          {startingShell ? "Starting shell…" : "Connecting…"}
         </span>
       )}
       {state.kind === "closed" && reconnectPending && (
@@ -992,6 +959,9 @@ function resumeErrorText(error: unknown, target: string): string {
  *     e.g. ``"terminal_bash_s1"``.
  * :param readOnly: If true, requests a read-only attach. Forwarded
  *     to the server as ``?read_only=true``.
+ * :param hostId: The session's host_id, forwarded as ``?omnigent_slice_key=``.
+ * :param awaitLaunch: If true, the terminal's create request is still in
+ *     flight; ``?await_launch=true`` asks the server to wait for it.
  * :returns: The path-and-query portion of the WS URL, e.g.
  *     ``"/v1/sessions/.../resources/terminals/.../attach"``.
  */
@@ -1000,6 +970,7 @@ export function buildAttachPath(
   terminalId: string,
   readOnly: boolean,
   hostId?: string,
+  awaitLaunch = false,
 ): string {
   const path =
     `/v1/sessions/${encodeURIComponent(sessionId)}` +
@@ -1013,6 +984,7 @@ export function buildAttachPath(
   const params = new URLSearchParams();
   if (readOnly) params.set("read_only", "true");
   if (hostId) params.set("omnigent_slice_key", hostId);
+  if (awaitLaunch) params.set("await_launch", "true");
   const qs = params.toString();
   return qs ? `${path}?${qs}` : path;
 }
@@ -1029,6 +1001,7 @@ export function buildAttachPath(
  * :param readOnly: If true, requests a read-only attach.
  * :param hostId: The session's host_id, forwarded as the routing key
  *     ``?omnigent_slice_key=``.
+ * :param awaitLaunch: Wait for a terminal whose create is still in flight.
  * :returns: The fully-qualified ``ws(s)://`` URL.
  */
 function buildAttachUrl(
@@ -1036,8 +1009,9 @@ function buildAttachUrl(
   terminalId: string,
   readOnly: boolean,
   hostId?: string,
+  awaitLaunch = false,
 ): string {
   // Delegates origin/prefix resolution to the embed host when present
   // (standalone falls back to the current page's origin).
-  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly, hostId));
+  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly, hostId, awaitLaunch));
 }

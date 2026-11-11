@@ -141,13 +141,23 @@ export function openTerminalLink(
     const target = withBasePath(sameOriginSessionPath);
     const currentPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
     if (target !== currentPath) {
-      window.history.pushState(null, "", target);
+      window.history.pushState(nextRouterHistoryState(), "", target);
       window.dispatchEvent(new PopStateEvent("popstate", { state: window.history.state }));
     }
     return;
   }
   if (!parseHttpUrl(uri)) return;
   window.open(uri, "_blank", "noopener,noreferrer");
+}
+
+/**
+ * A history entry in React Router's format, one past the current one, so the router
+ * (and Back's first-entry boundary) still know where this entry sits.
+ */
+function nextRouterHistoryState(): { usr: null; key: string; idx: number } | null {
+  const index = (window.history.state as { idx?: unknown } | null)?.idx;
+  if (typeof index !== "number") return null;
+  return { usr: null, key: Math.random().toString(36).slice(2, 10), idx: index + 1 };
 }
 
 function sameOriginSessionLink(uri: string): string | null {
@@ -620,91 +630,6 @@ export function touchScrollPayload(
 }
 
 /**
- * How long the bridge gets to acknowledge a ``paste`` frame before the browser
- * gives up as ``unsupported``. Runners that predate the frame ignore it; a
- * current bridge sends ``paste-accepted`` at once and then waits for the prompt.
- */
-export const SHELL_PASTE_ACK_TIMEOUT_MS = 10_000;
-
-/** Refusal reasons a bridge ``paste-result`` frame can carry. */
-const BRIDGE_PASTE_REFUSALS = [
-  "read-only",
-  "too-large",
-  "empty",
-  "busy",
-  "not-ready",
-  "failed",
-  "unsafe",
-] as const;
-
-/**
- * Why a command was not pasted: a bridge reason, ``unsupported`` (the runner
- * never acknowledged the frame), ``interrupted`` (the socket closed before the
- * answer), or ``late`` (the bridge pasted after the browser gave up).
- */
-export type ShellPasteRefusal =
-  (typeof BRIDGE_PASTE_REFUSALS)[number] | "unsupported" | "interrupted" | "late";
-
-/**
- * How long after giving up the browser still heeds a slow bridge's answer. A
- * current bridge gives up on the prompt well within this.
- */
-export const SHELL_PASTE_LATE_RESULT_MS = 30_000;
-
-/**
- * Called with a command that was not pasted and why, or that may be at the
- * prompt despite an earlier answer (``late``, ``interrupted``).
- */
-export type ShellPasteRefusedHandler = (text: string, reason: ShellPasteRefusal) => void;
-
-/** A command waiting to be pasted; see {@link TerminalSession.pasteWhenShellReady}. */
-interface PendingShellPaste {
-  claim: () => string | null;
-  onRefused?: ShellPasteRefusedHandler;
-}
-
-/** A ``paste`` frame the bridge has not answered yet. */
-interface InFlightShellPaste {
-  id: number;
-  text: string;
-  onRefused?: ShellPasteRefusedHandler;
-  /** Cleared once the bridge acknowledges the frame. */
-  ackTimer: ReturnType<typeof setTimeout> | null;
-}
-
-/** A paste the browser gave up on that a slow bridge may still answer. */
-interface AbandonedShellPaste {
-  text: string;
-  onRefused?: ShellPasteRefusedHandler;
-  expiry: ReturnType<typeof setTimeout>;
-}
-
-/** A bridge answer to a ``paste`` frame. */
-export type TerminalPasteFrame =
-  | { kind: "accepted"; id: unknown }
-  | { kind: "result"; id: unknown; pasted: boolean; reason: ShellPasteRefusal };
-
-/** Parse the bridge's ``paste-accepted`` and ``paste-result`` frames. */
-export function parseTerminalPasteFrame(message: string): TerminalPasteFrame | null {
-  let value: unknown;
-  try {
-    value = JSON.parse(message);
-  } catch {
-    return null;
-  }
-  if (typeof value !== "object" || value === null) return null;
-  const frame = value as { type?: unknown; id?: unknown; pasted?: unknown; reason?: unknown };
-  if (frame.type === "paste-accepted") return { kind: "accepted", id: frame.id };
-  if (frame.type !== "paste-result") return null;
-  return {
-    kind: "result",
-    id: frame.id,
-    pasted: frame.pasted === true,
-    reason: BRIDGE_PASTE_REFUSALS.find((reason) => reason === frame.reason) ?? "failed",
-  };
-}
-
-/**
  * One xterm ↔ tmux WebSocket bridge tied to a single DOM container.
  *
  * The constructor performs all the setup synchronously — open the
@@ -760,14 +685,6 @@ export class TerminalSession {
   private touchLastY = 0;
   /** Fractional touch lines carried across moves (see {@link touchScrollPayload}). */
   private touchPartialLines = 0;
-  /** A command to send once the WebSocket is open, or null. */
-  private pendingPaste: PendingShellPaste | null = null;
-  /** The ``paste`` frame awaiting the bridge's answer, or null. */
-  private inFlightPaste: InFlightShellPaste | null = null;
-  /** Pastes the bridge didn't acknowledge in time, by id, until it answers. */
-  private readonly abandonedPastes = new Map<number, AbandonedShellPaste>();
-  private pasteIdleWaiters: (() => void)[] = [];
-  private nextPasteId = 1;
 
   /**
    * Construct, attach to the DOM, and open the WebSocket.
@@ -879,7 +796,6 @@ export class TerminalSession {
         this.sendResize();
         if (this.focusOnConnect) this.term.focus();
         onState({ kind: "connected" });
-        this.sendPendingPaste();
       },
       { signal },
     );
@@ -906,8 +822,6 @@ export class TerminalSession {
             this.queryReplies?.dispose();
             this.queryReplies = suppressRepliesTmuxSends(this.term, tmuxAnswers);
           }
-          const pasteFrame = parseTerminalPasteFrame(ev.data);
-          if (pasteFrame !== null) this.settleInFlightPaste(pasteFrame);
           // Unknown text frames stay ignored for protocol forward compatibility.
         }
       },
@@ -917,8 +831,6 @@ export class TerminalSession {
     this.ws.addEventListener(
       "close",
       (ev) => {
-        // An unanswered paste may already be in the pane; never repeat it.
-        this.interruptUnsettledPastes(true);
         onState({ kind: "closed", reason: ev.reason || `code ${ev.code}`, code: ev.code });
       },
       { signal },
@@ -1088,6 +1000,17 @@ export class TerminalSession {
   }
 
   /**
+   * Send *text* to the shell as if the user typed it. Dropped while the
+   * socket is down, like a keystroke.
+   *
+   * :param text: Keystrokes, e.g. ``"ls -la\r"`` to run ``ls -la``.
+   */
+  sendText(text: string): void {
+    if (this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(INPUT_ENCODER.encode(text));
+  }
+
+  /**
    * Update the terminal's code font without reconnecting —
    * mirrors {@link setTheme}, mutating options in place. A new glyph size
    * changes the character-cell dimensions, so this re-fits the grid to the
@@ -1102,136 +1025,6 @@ export class TerminalSession {
   }
 
   /**
-   * Paste a command at the shell's prompt without running it.
-   *
-   * The bridge pastes once the prompt is ready, or refuses. A runner that
-   * doesn't acknowledge within {@link SHELL_PASTE_ACK_TIMEOUT_MS} is refused
-   * as ``unsupported``: the browser can't tell what is reading the pane.
-   *
-   * @param claim Takes the command; null means another view already pasted it.
-   *   Called once, when the WebSocket is open.
-   * @param onRefused Called with a command that was not pasted, or that may
-   *   not have been because the socket closed first.
-   */
-  pasteWhenShellReady(claim: () => string | null, onRefused?: ShellPasteRefusedHandler): void {
-    if (this.disposed) return;
-    this.pendingPaste = { claim, onRefused };
-    this.sendPendingPaste();
-  }
-
-  private sendPendingPaste(): void {
-    const pending = this.pendingPaste;
-    if (pending === null || this.inFlightPaste !== null) return;
-    if (this.disposed || this.ws.readyState !== WebSocket.OPEN) return;
-    this.pendingPaste = null;
-    const text = pending.claim();
-    if (text === null || text === "") return;
-    const id = this.nextPasteId++;
-    this.ws.send(JSON.stringify({ type: "paste", id, text }));
-    this.inFlightPaste = {
-      id,
-      text,
-      onRefused: pending.onRefused,
-      ackTimer: setTimeout(() => this.abandonUnacknowledgedPaste(id), SHELL_PASTE_ACK_TIMEOUT_MS),
-    };
-  }
-
-  private settleInFlightPaste(frame: TerminalPasteFrame): void {
-    const abandoned = typeof frame.id === "number" ? this.abandonedPastes.get(frame.id) : undefined;
-    if (abandoned !== undefined && frame.kind === "result") {
-      this.forgetAbandonedPaste(frame.id as number);
-      if (frame.pasted) abandoned.onRefused?.(abandoned.text, "late");
-      return;
-    }
-    const inFlight = this.inFlightPaste;
-    if (inFlight === null || frame.id !== inFlight.id) return;
-    if (frame.kind === "accepted") {
-      if (inFlight.ackTimer !== null) clearTimeout(inFlight.ackTimer);
-      inFlight.ackTimer = null;
-      return;
-    }
-    this.dropInFlightPaste();
-    if (!frame.pasted) inFlight.onRefused?.(inFlight.text, frame.reason);
-    this.sendPendingPaste();
-    this.resolvePasteIdleWaiters();
-  }
-
-  private abandonUnacknowledgedPaste(id: number): void {
-    const inFlight = this.inFlightPaste;
-    if (inFlight === null || inFlight.id !== id) return;
-    this.dropInFlightPaste();
-    if (this.ws.readyState !== WebSocket.OPEN) {
-      // Closing: the bridge may still have pasted, and no close event follows
-      // for this paste any more.
-      inFlight.onRefused?.(inFlight.text, "interrupted");
-    } else {
-      // Typing it through xterm could reach an editor or a startup question,
-      // so refuse; a slow current bridge is told to stop too.
-      this.ws.send(JSON.stringify({ type: "paste-cancel", id }));
-      inFlight.onRefused?.(inFlight.text, "unsupported");
-      this.abandonedPastes.set(id, {
-        text: inFlight.text,
-        onRefused: inFlight.onRefused,
-        expiry: setTimeout(() => this.forgetAbandonedPaste(id), SHELL_PASTE_LATE_RESULT_MS),
-      });
-      this.sendPendingPaste();
-    }
-    this.resolvePasteIdleWaiters();
-  }
-
-  private forgetAbandonedPaste(id: number): void {
-    const abandoned = this.abandonedPastes.get(id);
-    if (abandoned === undefined) return;
-    clearTimeout(abandoned.expiry);
-    this.abandonedPastes.delete(id);
-  }
-
-  /**
-   * Report every paste whose outcome the socket's end leaves unknown.
-   *
-   * @param reportAbandoned Whether the connection dropped, so a slow bridge's
-   *   answer to an abandoned paste is lost; a planned teardown forgets them.
-   */
-  private interruptUnsettledPastes(reportAbandoned: boolean): void {
-    const inFlight = this.inFlightPaste;
-    this.dropInFlightPaste();
-    inFlight?.onRefused?.(inFlight.text, "interrupted");
-    for (const [id, abandoned] of this.abandonedPastes) {
-      this.forgetAbandonedPaste(id);
-      if (reportAbandoned) abandoned.onRefused?.(abandoned.text, "interrupted");
-    }
-    this.resolvePasteIdleWaiters();
-  }
-
-  private dropInFlightPaste(): void {
-    if (this.inFlightPaste === null) return;
-    if (this.inFlightPaste.ackTimer !== null) clearTimeout(this.inFlightPaste.ackTimer);
-    this.inFlightPaste = null;
-  }
-
-  // Called after any next paste has been sent, so a waiter never resumes to
-  // find a new paste already in flight.
-  private resolvePasteIdleWaiters(): void {
-    if (this.inFlightPaste !== null) return;
-    const waiters = this.pasteIdleWaiters;
-    this.pasteIdleWaiters = [];
-    for (const resolve of waiters) resolve();
-  }
-
-  /** Whether a paste awaits the bridge's answer. */
-  hasShellPasteInFlight(): boolean {
-    return this.inFlightPaste !== null;
-  }
-
-  /** Resolves once no paste awaits the bridge's answer, so a re-dial can't cut one off. */
-  whenShellPasteIdle(): Promise<void> {
-    if (this.inFlightPaste === null) return Promise.resolve();
-    return new Promise((resolve) => {
-      this.pasteIdleWaiters.push(resolve);
-    });
-  }
-
-  /**
    * Tear down the bridge. Order matters: abort listeners FIRST so
    * the cleanup's ``ws.close()`` can't fire a stale ``close``
    * event into the next mount.
@@ -1243,9 +1036,6 @@ export class TerminalSession {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    // The close listener is aborted below, so report the pastes here.
-    this.pendingPaste = null;
-    this.interruptUnsettledPastes(false);
     this.listenerCtl.abort();
     this.resizeObserver.disconnect();
     this.dataDispose.dispose();
