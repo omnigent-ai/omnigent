@@ -5054,6 +5054,9 @@ async def _execute_reminder_set(
         agent_id = snapshot.get("agent_id")
         if not isinstance(agent_id, str) or not agent_id:
             return json.dumps({"error": f"{tool_name}: this session has no agent to remind"})
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+    try:
         resp = await server_client.post(
             "/v1/scheduled-tasks",
             json={
@@ -5077,7 +5080,14 @@ async def _execute_reminder_set(
             },
         )
     except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+        # The server may have saved the reminder before its response was lost.
+        return json.dumps(
+            {
+                "error": f"{tool_name}: the request to create the reminder failed ({exc}). "
+                "It may still have been created: check sys_scheduled_task_list for a "
+                "'Reminder: ...' automation before setting it again."
+            }
+        )
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"server returned {resp.status_code}", "details": resp.text[:1000]}

@@ -889,3 +889,46 @@ async def test_a_wrong_schedule_without_a_usable_id_is_reported_not_deleted(
     )
     assert "returned no task id to delete" in out["error"]
     assert not [call for call in client.calls if call[0] == "DELETE"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+async def test_a_lost_create_response_says_the_reminder_may_exist() -> None:
+    client = _ReminderClient()
+
+    async def lost(url: str, **kwargs: object) -> _Resp:
+        client.calls.append(("POST", url, kwargs.get("json")))  # type: ignore[arg-type]
+        raise httpx.ReadTimeout("response lost")
+
+    client.post = lost  # type: ignore[method-assign]
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_set",
+            json.dumps({"message": "ping", "delay_seconds": 600}),
+            server_client=client,
+            conversation_id="conv_1",
+        )
+    )
+    assert "may still have been created" in out["error"]
+    assert "sys_scheduled_task_list" in out["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+async def test_a_failed_lookup_before_creating_makes_no_such_warning() -> None:
+    client = _ReminderClient()
+
+    async def unreachable(url: str, **kwargs: object) -> _Resp:
+        raise httpx.ConnectError("server unreachable")
+
+    client.get = unreachable  # type: ignore[method-assign]
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_set",
+            json.dumps({"message": "ping", "delay_seconds": 600}),
+            server_client=client,
+            conversation_id="conv_1",
+        )
+    )
+    assert out["error"].startswith("sys_reminder_set failed:")
+    assert "may still have been created" not in out["error"]

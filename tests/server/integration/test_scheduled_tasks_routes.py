@@ -820,15 +820,23 @@ async def test_the_reminder_tools_request_continues_its_session(
 
 
 @pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
+@pytest.mark.parametrize("exhausted", [False, True], ids=["next_year", "no_run_left"])
 async def test_late_create_refuses_a_one_time_rule_instead_of_moving_it_a_year(
     auth_app: FastAPI,
     auth_client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    exhausted: bool,
 ) -> None:
+    from datetime import UTC, datetime
+
     from omnigent.stores.scheduled_task_store import sqlalchemy_store
 
     rule, fire_at = _one_time_rule_in(hours=2)
+    if exhausted:
+        # Ends at the requested minute, so a late create leaves no run at all.
+        cutoff = datetime.fromtimestamp(fire_at, UTC).strftime("%Y%m%dT%H%M%SZ")
+        rule = rule.replace(";COUNT=1", f";UNTIL={cutoff}")
     # The request reaches the store a second after the requested minute, so the
     # rule's next match would be the same minute a year later.
     monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: fire_at + 1)
