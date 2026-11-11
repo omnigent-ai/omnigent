@@ -754,6 +754,36 @@ def test_load_default_policy_specs_skips_url_type(db_uri: str) -> None:
     assert specs[0].name == "python_default"
 
 
+def test_load_default_policy_specs_skips_unregistered_handler(db_uri: str) -> None:
+    """A default row whose handler is no longer registered is skipped, not raised.
+
+    Engine construction runs for every session, so one stale default row must not
+    break it.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    store = SqlAlchemyPolicyStore(db_uri)
+    store.create_default(
+        policy_id="3c9f1e7a0b2d4f86a1c5e9d7b3f0a2e4",
+        name="stale_default",
+        type="python",
+        handler="example_org.policies.removed_gate",
+        enabled=True,
+    )
+    store.create_default(
+        policy_id="7d2a6b4e9c1f48a0b5d3e8f2a6c9b1d7",
+        name="python_default",
+        type="python",
+        handler="myorg.policies.allow_all",
+        enabled=True,
+    )
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+
+    specs = _load_default_policy_specs(store)
+
+    assert [spec.name for spec in specs] == ["python_default"]
+
+
 def test_load_default_policy_specs_filters_disabled(db_uri: str) -> None:
     """Disabled default policies are excluded from the loaded specs.
 
