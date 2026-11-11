@@ -5229,12 +5229,12 @@ def _publish_status(
             "turn.completed", session_id, occurrence=turn_id, response_id=turn_id
         )
     elif status == "failed" and previous_status != "failed" and persist_live_status:
-        # A late failure of an earlier turn can arrive while the next one runs, so
-        # the active response identifies the occurrence but is not reported.
+        # A failure without a response may belong to an earlier turn, so it gets an
+        # identity of its own rather than the active response's.
         session_triggers.notify(
             "turn.failed",
             session_id,
-            occurrence=response_id or _session_active_response_cache.get(session_id),
+            occurrence=response_id,
             response_id=response_id,
             error_code=error.code if error is not None else None,
         )
