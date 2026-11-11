@@ -59,8 +59,9 @@ async def test_an_undo_ends_the_wait_without_teardown():
 
 @pytest.mark.parametrize("read", [_row("running"), RuntimeError("database unavailable")])
 async def test_a_turn_that_never_ends_is_torn_down_at_the_deadline(monkeypatch, read):
-    monkeypatch.setattr(orchestration, "_SELF_ARCHIVE_TURN_POLL_S", 0.01)
-    monkeypatch.setattr(orchestration, "_SELF_ARCHIVE_TURN_WAIT_S", 0.05)
+    # A spent deadline ends the wait after the read that found the turn running
+    # (or failed), without depending on how fast the reads run.
+    monkeypatch.setattr(orchestration, "_SELF_ARCHIVE_TURN_WAIT_S", 0)
     rows = _Rows(read)
     assert await orchestration._await_archived_turn_end(SESSION, rows) is True
-    assert rows.count > 1
+    assert rows.count == 1
