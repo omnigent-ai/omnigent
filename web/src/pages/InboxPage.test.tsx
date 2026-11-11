@@ -174,8 +174,9 @@ function renderPage(
   queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
   taskDetailsEnabled = false,
 ) {
-  // Fresh client per render so cached queries never leak between tests.
-  const tree = (
+  // Fresh client per render so cached queries never leak between tests. A
+  // fresh element per render too: React skips an identical element object.
+  const tree = () => (
     <QueryClientProvider client={queryClient}>
       <CapabilitiesProvider
         info={{ ...FALLBACK_SERVER_INFO, features: { automations_v2: taskDetailsEnabled } }}
@@ -189,8 +190,8 @@ function renderPage(
       </CapabilitiesProvider>
     </QueryClientProvider>
   );
-  const result = render(tree);
-  return { ...result, rerenderPage: () => result.rerender(tree) };
+  const result = render(tree());
+  return { ...result, rerenderPage: () => result.rerender(tree()) };
 }
 
 let lastLocation = { pathname: "", search: "" };
@@ -1975,6 +1976,26 @@ describe("agent suggestions", () => {
     });
     fireEvent.click(await screen.findByRole("menuitem", { name: "Not now" }));
     await waitFor(() => expect(screen.queryByTestId("inbox-suggestion")).toBeNull());
+  });
+
+  it("hides a dismissed suggestion at once outside Unread, where no pin holds it", async () => {
+    window.localStorage.setItem("omnigent:inbox-filter", "all");
+    const update = vi.fn().mockReturnValue(new Promise<boolean>(() => {}));
+    stub({ items: [suggestion()], unreadCount: 1, update });
+    const page = renderPage();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: /Dismiss/ }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Not now" }));
+
+    // The hook drops the card from its list while the PATCH is in flight.
+    stub({ items: [], unreadCount: 0, update });
+    page.rerenderPage();
+    expect(screen.queryByTestId("inbox-suggestion")).toBeNull();
   });
 
   it("dismisses with a reason from the menu", async () => {

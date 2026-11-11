@@ -390,13 +390,14 @@ export function InboxPage() {
   const visibleUnread = showUnread ? unreadItems : [];
   const visibleAutomations = showUnread ? automationInbox.items : [];
   const listedSuggestionIds = new Set(proactiveInbox.items.map((item) => item.id));
-  const visibleSuggestions =
-    showSuggestions && proactiveInbox.enabled
-      ? [
-          ...proactiveInbox.items,
-          ...Object.values(pinnedSuggestions).filter((item) => !listedSuggestionIds.has(item.id)),
-        ]
+  // Only the Unread list drops a suggestion once it is read; elsewhere a
+  // dismissal or action hides the card at once.
+  const pinned =
+    filter === "unread"
+      ? Object.values(pinnedSuggestions).filter((item) => !listedSuggestionIds.has(item.id))
       : [];
+  const visibleSuggestions =
+    showSuggestions && proactiveInbox.enabled ? [...proactiveInbox.items, ...pinned] : [];
   const visibleCount =
     visibleApprovals.length +
     visibleComments.length +
@@ -582,10 +583,8 @@ export function InboxPage() {
     if (entry.kind === "suggestion") {
       const { item } = entry;
       const unpin = () => setPinnedSuggestions(({ [item.id]: _pinned, ...rest }) => rest);
-      // The pin keeps an expanded, read suggestion on the Unread tab. A
-      // dismissal or action hides the card at once through the hook; the pin
-      // goes only once the server accepts, so a failed PATCH brings the card
-      // back where it was.
+      // Keep expanded read suggestions visible on Unread until the server
+      // accepts their resolution.
       const resolve = (change: SuggestionUpdate) =>
         void proactiveInbox.update(item.id, change).then((accepted) => {
           if (accepted) unpin();
