@@ -100,6 +100,11 @@ preparatory flushes; `status_post` covers the status-post operation. Exceptions
 after that operation returns do not emit this warning. Existing HTTP rejection
 diagnostics remain separate.
 
+If a preparatory flush raises, the forwarder still attempts the known terminal
+status in the same handler before re-raising the original error. Cancellation
+skips that attempt. A `before_status` warning alone therefore does not establish
+that the terminal status was lost; check the following status-post observations.
+
 These events add metadata, without terminal text or exception messages, and do
 not require stderr capture. A local terminal completion does not establish that
 its status reached the server. Conversely, a failed post may have reached the
@@ -397,6 +402,10 @@ The disconnect grace task rechecks the local tunnel after loading bound
 sessions. A reconnect during that read logs `reconnected during offline
 lookup; skipping offline-marking`; an older database snapshot must not turn
 the live runner's sessions into disconnect failures.
+The per-session sweep also checks the final ownership read for a fresh heartbeat
+newer than its conversation snapshot. When another replica renewed that runner,
+the departing replica drops its stale local status and leaves the turn alone.
+An unchanged or expired heartbeat does not establish a takeover.
 
 Join the runner's and server's rows for one socket on
 `attributes['connection_id']`. A `runner_connected` row with `reconnect =

@@ -3110,7 +3110,7 @@ function AppShellImpl() {
         AgentInfoButton popover, opened from the header's three-dot menu. */}
           {hasAgentInfo && (
             <Dialog open={agentInfoOpen} onOpenChange={setAgentInfoOpen}>
-              <DialogContent>
+              <DialogContent className="max-h-[85vh] overflow-y-auto">
                 <DialogHeader>
                   <DialogTitle>Agent</DialogTitle>
                   <DialogDescription className="sr-only">

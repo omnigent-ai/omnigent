@@ -302,6 +302,7 @@ import {
   sessionsListAcceptsDrop,
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
+import { isRowFullyVisible } from "./sidebarRowVisibility";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { useHarnessLabels } from "@/lib/agentLabels";
 import {
@@ -5367,17 +5368,6 @@ function SessionTooltipContent({
 // Browsers pair clicks within ~500ms; the margin absorbs event-loop delay.
 const DOUBLE_CLICK_PAIR_WINDOW_MS = 750;
 
-// Whether the row lies entirely inside its nearest scrolling ancestor (or the viewport).
-function isRowFullyVisible(row: HTMLElement): boolean {
-  let scroller = row.parentElement;
-  while (scroller && !/auto|scroll/.test(getComputedStyle(scroller).overflowY)) {
-    scroller = scroller.parentElement;
-  }
-  const bounds = scroller?.getBoundingClientRect() ?? { top: 0, bottom: window.innerHeight };
-  const rect = row.getBoundingClientRect();
-  return rect.top >= bounds.top && rect.bottom <= bounds.bottom;
-}
-
 function ConversationRowImpl({
   conversation,
   familyIndented = false,
@@ -6898,6 +6888,8 @@ function useProjectFolderMenu(
 ): { actions: ProjectFolderMenuActions; dialogs: ReactNode } {
   const [menuOpen, setMenuOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  // Set once the first Delete click finds members whose agents are working.
+  const [deleteRunningCount, setDeleteRunningCount] = useState<number | null>(null);
   const [renameOpen, setRenameOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
@@ -6944,6 +6936,7 @@ function useProjectFolderMenu(
       },
       openDelete: () => {
         menuOpenedDialogRef.current = true;
+        setDeleteRunningCount(null);
         setDeleteOpen(true);
       },
       onMenuOpen: () => {
@@ -7164,14 +7157,26 @@ function useProjectFolderMenu(
         <DialogContent onClick={(e) => e.stopPropagation()}>
           <DialogHeader>
             <DialogTitle>Delete project?</DialogTitle>
-            <DialogDescription>
-              This deletes the project{" "}
-              <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em] break-all">
-                {projectName}
-              </span>{" "}
-              and archives <span className="font-medium">all of its sessions</span>. Their history
-              is kept. You can find and restore them anytime from Settings.
-            </DialogDescription>
+            {deleteRunningCount === null ? (
+              <DialogDescription>
+                This deletes the project{" "}
+                <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em] break-all">
+                  {projectName}
+                </span>{" "}
+                and archives <span className="font-medium">all of its sessions</span>. Their history
+                is kept. You can find and restore them anytime from Settings.
+              </DialogDescription>
+            ) : (
+              <DialogDescription data-testid="delete-project-running-warning">
+                {deleteRunningCount === 1 ? "1 session in " : `${deleteRunningCount} sessions in `}
+                <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em] break-all">
+                  {projectName}
+                </span>{" "}
+                {deleteRunningCount === 1
+                  ? "has an agent still working. Deleting the project archives it, which stops its agent."
+                  : "have agents still working. Deleting the project archives them, which stops their agents."}
+              </DialogDescription>
+            )}
           </DialogHeader>
           {deleteProject.isError && (
             <p className="text-ui text-destructive" role="alert">
@@ -7193,9 +7198,15 @@ function useProjectFolderMenu(
               loading={deleteProject.isPending}
               onClick={() => {
                 deleteProject.mutate(
-                  { id: projectId, name: projectName },
+                  deleteRunningCount === null
+                    ? { id: projectId, name: projectName }
+                    : { id: projectId, name: projectName, stopRunning: true },
                   {
-                    onSuccess: () => {
+                    onSuccess: (result) => {
+                      if (result.status === "needs_running_confirmation") {
+                        setDeleteRunningCount(result.runningCount);
+                        return;
+                      }
                       setDeleteOpen(false);
                       setMenuOpen(false);
                     },
@@ -7203,7 +7214,7 @@ function useProjectFolderMenu(
                 );
               }}
             >
-              Delete project
+              {deleteRunningCount === null ? "Delete project" : "Delete anyway"}
             </Button>
           </DialogFooter>
         </DialogContent>
