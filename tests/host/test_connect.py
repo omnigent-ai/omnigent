@@ -11433,6 +11433,10 @@ def test_github_commit_ops_are_served_on_host(
             author = {"name": "Ada", "date": "2026-11-01T10:00:00Z"}
             entries = [{"sha": commit, "commit": {"message": "Fix", "author": author}}]
             return 0, json.dumps([entries]), ""
+        if "/compare/" in argv[-1]:
+            if "Accept: application/vnd.github.diff" in argv:
+                return 0, "compare-patch", ""
+            return 0, json.dumps({"files": []}), ""
         return 0, "commit-patch", ""
 
     monkeypatch.setattr(github_resource, "_gh", gh)
@@ -11459,11 +11463,22 @@ def test_github_commit_ops_are_served_on_host(
                 params={"pr_url": url, "commit_sha": commit},
             )
         )
+        compared = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="compare-diff",
+                op="github_compare_diff",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "head_sha": head, "from_sha": commit},
+            )
+        )
     finally:
         _cleanup_host(host)
 
     assert listed.status == "ok", listed
     assert [entry["sha"] for entry in listed.payload["data"]] == [commit]
+    assert compared.status == "ok", compared
+    assert compared.payload["patch"] == "compare-patch"
     assert patch.status == "ok", patch
     assert patch.payload == {"object": "session.github.pr_diff", "patch": "commit-patch"}
 

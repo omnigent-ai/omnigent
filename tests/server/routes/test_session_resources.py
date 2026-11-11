@@ -3911,6 +3911,25 @@ async def test_github_commit_diff_forwards_the_commit_to_the_runner(
 
 
 @pytest.mark.asyncio
+async def test_github_compare_diff_forwards_both_commits_to_the_runner(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /resources/github/compare-diff proxies the head and the picked commit."""
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/compare-diff"
+    payload = {"object": "session.github.pr_compare", "patch": "since\n", "files": []}
+    fake_runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    head, start = "a" * 40, "c" * 40
+
+    resp = await client.get(path, params={"head_sha": head, "from_sha": start})
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert {"head_sha": head, "from_sha": start} in fake_runner.get_params
+    assert ("GET", path) in fake_runner.calls
+
+
+@pytest.mark.asyncio
 async def test_github_commit_diff_on_a_runner_without_the_route_is_not_a_whole_pr_patch(
     client: httpx.AsyncClient,
 ) -> None:

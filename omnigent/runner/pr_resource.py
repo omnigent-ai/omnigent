@@ -1279,6 +1279,28 @@ def pr_commit_diff(
     return facet.commit_diff(root, reference, commit_sha=_commit_sha(commit_sha, "commit_sha"))
 
 
+def pr_compare_diff(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    head_sha: object = None,
+    from_sha: object = None,
+) -> dict[str, Any]:
+    """Return the selected PR's changes since one of its commits.
+
+    :raises ValueError: Without a selected tracked PR, when its provider cannot list
+        commits, or when either commit is not a full commit id.
+    """
+    facet, reference = _commits_target(session_id, pr_url)
+    return facet.compare_diff(
+        root,
+        reference,
+        head_sha=_commit_sha(head_sha, "head_sha"),
+        from_sha=_commit_sha(from_sha, "from_sha"),
+    )
+
+
 def pr_file_diff(
     root: str,
     base: str,
