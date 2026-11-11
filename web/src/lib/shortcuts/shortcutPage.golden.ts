@@ -1,5 +1,5 @@
-// Golden Keyboard shortcuts output, recorded from the hand-written shortcut catalog
-// (lib/shortcutCatalog.ts) on macOS and other platforms in all 1,024 runtime contexts.
+// Golden Keyboard shortcuts output, recorded from the hand-written shortcut catalog that
+// the registry replaced, on macOS and other platforms in all 1,024 runtime contexts.
 // It pins the page's rows independently of the registry that now builds them.
 
 /** A recorded row: keys as space-separated caps on macOS, then on other platforms. */
