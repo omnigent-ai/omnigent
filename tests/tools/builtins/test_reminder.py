@@ -52,6 +52,13 @@ def test_at_is_converted_to_utc() -> None:
         ({"at": "2026-11-10T22:00:00Z"}, "at least one minute"),
         ({"delay_seconds": MAX_REMINDER_DELAY.total_seconds() + 1}, "at most 364 days"),
         ({"at": "2027-11-10T22:15:00Z"}, "at most 364 days"),
+        # Values that would overflow a float or a timedelta before the range check.
+        ({"delay_seconds": 10**400}, "at most 364 days"),
+        ({"delay_seconds": -(10**400)}, "at least one minute"),
+        ({"delay_seconds": -1e300}, "at least one minute"),
+        ({"delay_seconds": 1e300}, "at most 364 days"),
+        ({"at": "0001-01-01T00:00:00+05:00"}, "outside the supported date range"),
+        ({"at": "9999-12-31T23:59:59-05:00"}, "outside the supported date range"),
     ],
 )
 def test_invalid_times_are_rejected(args: dict[str, object], error: str) -> None:

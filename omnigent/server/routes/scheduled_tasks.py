@@ -103,6 +103,10 @@ class AutomationFailurePage(BaseModel):
     next_cursor: str | None
 
 
+# 9999-12-31T23:59:59Z, the last second ``datetime`` can format.
+_MAX_FIRST_RUN_AT = 253402300799
+
+
 class CreateScheduledTaskRequest(BaseModel):
     """Body for ``POST /v1/scheduled-tasks``."""
 
@@ -138,7 +142,7 @@ class CreateScheduledTaskRequest(BaseModel):
     # Epoch seconds the first run must fall at, checked against the schedule the
     # task gets at its actual creation. A one-time reminder sends it so a request
     # that arrives late is refused instead of moving to the rule's next match.
-    first_run_at: int | None = Field(default=None, gt=0)
+    first_run_at: int | None = Field(default=None, gt=0, le=_MAX_FIRST_RUN_AT)
 
     @model_validator(mode="after")
     def _validate_create(self) -> CreateScheduledTaskRequest:
@@ -972,8 +976,7 @@ def create_scheduled_tasks_router(
                 host_id=host_id,
                 project_id=project_id,
                 execution_target=body.execution_target,
-                # Passed only when set, so stores that predate it keep working.
-                **({"first_run_at": body.first_run_at} if body.first_run_at is not None else {}),
+                first_run_at=body.first_run_at,
             )
         except Exception as exc:
             if source_copy is not None:

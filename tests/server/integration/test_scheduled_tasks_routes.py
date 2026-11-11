@@ -797,6 +797,22 @@ async def test_late_create_refuses_a_one_time_rule_instead_of_moving_it_a_year(
     assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
 
 
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+@pytest.mark.parametrize("first_run_at", [0, 253402300800, 9223372036854775807])
+async def test_out_of_range_first_run_at_is_rejected(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, first_run_at: int
+) -> None:
+    rule, _fire_at = _one_time_rule_in(hours=2)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(rrule=rule, timezone="UTC", first_run_at=first_run_at),
+        headers=_headers(),
+    )
+    # Rejected by request validation, before any datetime formatting can overflow.
+    assert resp.status_code == 422, resp.text
+    assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
+
+
 async def test_legacy_scheduler_refuses_first_run_at(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:

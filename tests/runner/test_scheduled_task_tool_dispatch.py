@@ -625,14 +625,15 @@ class _ReminderClient(_RecordingClient):
         self,
         response: _Resp | None = None,
         *,
-        one_time: bool = True,
+        one_time: bool | None = True,
         session: _Resp | None = None,
     ) -> None:
+        info: dict[str, object] = {"scheduled_task_session_modes": True}
+        if one_time is not None:  # None: an older server that omits the field
+            info["scheduled_task_one_time"] = one_time
         super().__init__(
             response or _Resp(body={"id": _TASK_ID, "next_run_at": "2026-11-10T23:01:00+00:00"}),
-            info=_Resp(
-                body={"scheduled_task_session_modes": True, "scheduled_task_one_time": one_time}
-            ),
+            info=_Resp(body=info),
         )
         self._session = session or _Resp(body={"id": "conv_1", "agent_id": "ag_1"})
         self.delete_response = _Resp(body={"deleted": True})
@@ -704,8 +705,11 @@ async def test_reminder_creates_a_one_time_task_that_continues_this_session() ->
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_frozen_now")
-async def test_reminder_is_refused_on_a_server_without_one_time_schedules() -> None:
-    client = _ReminderClient(one_time=False)
+@pytest.mark.parametrize("one_time", [False, None])
+async def test_reminder_is_refused_on_a_server_without_one_time_schedules(
+    one_time: bool | None,
+) -> None:
+    client = _ReminderClient(one_time=one_time)
     out = await _execute_scheduled_task_tool(
         "sys_reminder_set",
         json.dumps({"message": "ping", "delay_seconds": 600}),

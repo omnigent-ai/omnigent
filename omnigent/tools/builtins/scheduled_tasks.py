@@ -444,12 +444,20 @@ def resolve_reminder_time(args: dict[str, Any], now: datetime) -> datetime | str
         # bool is an int subclass; reject it like sys_timer_set does.
         if not isinstance(delay, (int, float)) or isinstance(delay, bool):
             return "'delay_seconds' must be a number."
-        if not math.isfinite(delay):
+        # Bound the value before any conversion: a huge int overflows float(), and
+        # timedelta() overflows well inside the finite float range.
+        if isinstance(delay, float) and not math.isfinite(delay):
             return "'delay_seconds' must be a finite number."
         if delay > MAX_REMINDER_DELAY.total_seconds():
             return f"A reminder can be at most {MAX_REMINDER_DELAY.days} days away."
+        if delay < 0:
+            return "A reminder must be at least one minute in the future."
         when = now + timedelta(seconds=delay)
-    when = when.astimezone(UTC)
+    try:
+        when = when.astimezone(UTC)
+    except OverflowError:
+        # Only an 'at' near the ends of the datetime range gets here.
+        return "'at' is outside the supported date range."
     if when.second or when.microsecond:
         when = when.replace(second=0, microsecond=0) + timedelta(minutes=1)
     if when < now + MIN_REMINDER_DELAY:

@@ -1987,6 +1987,7 @@
               {
                 "exclusiveMinimum": 0.0,
                 "format": "int64",
+                "maximum": 253402300799.0,
                 "type": "integer"
               },
               {

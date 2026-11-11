@@ -219,7 +219,7 @@ The scheduler is the timing engine only, and its behavior is deliberately simple
 
 ## Scheduler compatibility and rollback
 
-One-time (`COUNT=1`) automations, including reminders, need the database scheduler. Before switching a server back to the legacy timer, delete them: the legacy timer refuses to arm them.
+One-time (`COUNT=1`) automations, including reminders, need the database scheduler, and every scheduler process that polls the shared database must be on a release that accepts them before any server advertises `scheduled_task_one_time`. Each process advertises only its own support, while an older database scheduler validates `COUNT=1` as "fires only once" and pauses the task, clearing its next run. Upgrade every scheduler first. Before downgrading a binary, or switching a server back to the legacy timer, delete pending one-time automations: an older database scheduler pauses them, and the legacy timer refuses to arm them.
 
 After upgrading, an existing automation with an unresolved harness or an incompatible
 saved permission override fails before creating a session; older schedulers could
