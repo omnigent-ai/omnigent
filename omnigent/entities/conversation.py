@@ -344,6 +344,14 @@ class Conversation:
 # ── Conversation item data types ───────────────────────
 
 
+class StartupRunnerWait(BaseModel):
+    """One accepted input's runner and absolute startup deadline, retained across restarts."""
+
+    runner_id: str = Field(min_length=1)
+    deadline: float = Field(gt=0, allow_inf_nan=False)
+    connected: bool = False
+
+
 class StartupInputOptions(BaseModel):
     """Request options retained only while a startup input awaits delivery."""
 
@@ -351,6 +359,7 @@ class StartupInputOptions(BaseModel):
     tools: list[dict[str, Any]] | None = None
     background_titles_enabled: bool = False
     scheduled_run: ScheduledRunLogContext | None = None
+    runner_wait: StartupRunnerWait | None = None
 
 
 # Longest harness message phase kept, e.g. Codex ``"partial_answer"``.
