@@ -55,7 +55,8 @@ the header menu), and each place is a separate entry point.
   asks to confirm, since archiving stops it; Cancel or Escape keeps the session.
   When the session's sandbox provider has `stop_on_archive` on (or its launcher
   decides so), archiving also stops the managed sandbox, unless another
-  unarchived session uses it; the next message after an unarchive resumes it.
+  unarchived session uses it; the next message after an unarchive resumes it,
+  unless the managed sandbox reaper has terminated it by then.
 - `row-quick-actions`: sidebar rows show hover Pin and Archive buttons beside the
   "…" menu. Settings → Appearance → Sidebar → Show Pin and Archive buttons on
   session rows (on by default) turns them off, leaving both actions in the row

@@ -114,6 +114,22 @@ async def test_an_unarchive_while_the_launcher_decides_keeps_the_sandbox(db_uri,
     assert fake.stopped == []
 
 
+async def test_a_sibling_unarchived_while_the_launcher_decides_keeps_the_sandbox(
+    db_uri, monkeypatch
+):
+    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
+    sibling = conversations.create_conversation(host_id=conv.host_id, workspace="/workspace")
+    conversations.update_conversation(sibling.id, archived=True)
+
+    def stop_when_archived(**_kwargs: object) -> bool:
+        conversations.update_conversation(sibling.id, archived=False)
+        return True
+
+    monkeypatch.setattr(fake, "stop_when_archived", stop_when_archived)
+    assert await _stop(fake, host_store, conversations, conv) is False
+    assert fake.stopped == []
+
+
 async def test_a_failing_launcher_decision_leaves_the_sandbox_running(db_uri, monkeypatch):
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
 
@@ -153,11 +169,14 @@ async def test_keeps_a_scheduled_task_runs_sandbox(db_uri):
     assert fake.stopped == []
 
 
+@pytest.mark.parametrize("missing", ["host-listing", "archived-states"])
 async def test_keeps_the_sandbox_when_the_store_cannot_list_the_hosts_sessions(
-    db_uri, monkeypatch
+    db_uri, monkeypatch, missing
 ):
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
-    monkeypatch.setattr(conversations, "list_host_conversation_ids", lambda *a, **k: [])
+    # The base store's defaults for both reads: nothing, read as unknown.
+    method = "list_host_conversation_ids" if missing == "host-listing" else "get_archived_states"
+    monkeypatch.setattr(conversations, method, lambda *a, **k: {} if "states" in method else [])
     assert await _stop(fake, host_store, conversations, conv) is False
     assert fake.stopped == []
 
@@ -214,6 +233,48 @@ async def test_the_archive_teardown_stops_the_sandbox_last(db_uri, monkeypatch):
         sandbox_config=_deployment(fake),
     )
     assert calls == ["runner", "worktree", "sandbox"]
+
+
+class _SecondProviderLauncher(FakeSandboxLauncher):
+    provider = "e2b"
+
+
+@pytest.mark.parametrize("second_stops", [True, False], ids=["second-on", "second-off"])
+async def test_uses_the_setting_of_the_provider_that_launched_the_host(db_uri, second_stops):
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+
+    def register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    first = FakeSandboxLauncher(on_host_start=register, can_resume=True)
+    second = _SecondProviderLauncher(on_host_start=register, can_resume=True)
+    deployment = ManagedSandboxDeployment(
+        configs=tuple(
+            ManagedSandboxConfig(
+                server_url="https://srv.example.com",
+                launcher_factory=lambda fake=fake: fake,
+                token_ttl_s=3600,
+                provider=fake.provider,
+                stop_on_archive=stops,
+            )
+            for fake, stops in ((first, not second_stops), (second, second_stops))
+        )
+    )
+    launched = await launch_managed_host(
+        config=deployment, owner=_OWNER, host_store=host_store, provider="e2b"
+    )
+    conv = conversations.create_conversation(host_id=launched.host_id, workspace="/workspace")
+    conversations.update_conversation(conv.id, archived=True)
+
+    stopped = await stop_archived_session_sandbox(
+        conversations.get_conversation(conv.id), host_store, conversations, deployment
+    )
+    assert stopped is second_stops
+    assert first.stopped == []
+    assert len(second.stopped) == (1 if second_stops else 0)
 
 
 def _stop_settings(raw: dict) -> dict[str | None, bool]:

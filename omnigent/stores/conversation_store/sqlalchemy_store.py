@@ -2707,6 +2707,20 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._session("list_host_conversations") as session:
             return list(session.scalars(query.order_by(SqlConversationMetadata.id).limit(limit)))
 
+    def get_archived_states(self, conversation_ids: list[str]) -> dict[str, bool]:
+        if len(conversation_ids) > 1000:
+            raise ValueError("at most 1000 conversation ids per call")
+        if not conversation_ids:
+            return {}
+        with self._conv_session("get_archived_states") as session:
+            rows = session.execute(
+                select(SqlConversation.id, SqlConversation.archived).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id.in_(set(conversation_ids)),
+                )
+            )
+            return {conversation_id: bool(archived) for conversation_id, archived in rows}
+
     def list_pending_inputs_page(
         self,
         conversation_id: str,

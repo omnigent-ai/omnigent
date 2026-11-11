@@ -414,7 +414,9 @@ The sandbox is stopped, not deleted, so unarchiving the session and sending a
 message resumes the same sandbox. It applies only to providers that can resume
 a stopped sandbox (`capabilities.resume_stopped`). A sandbox that another
 unarchived session still uses keeps running, and so does a scheduled task
-run's sandbox. Deleting the session still terminates the sandbox.
+run's sandbox. Deleting the session still terminates the sandbox, and so does
+the reaper below once a stopped sandbox's host passes its offline limit; the
+next message then starts a fresh sandbox instead.
 
 The optional reaper runs once for the whole `sandbox:` deployment, including
 multi-provider configurations. It queries managed host rows directly and

@@ -532,6 +532,20 @@ class ConversationStore(ABC):
         """Page the sessions assigned to a host, including not-yet-launched sessions."""
         return []
 
+    def get_archived_states(self, conversation_ids: list[str]) -> dict[str, bool]:  # noqa: ARG002
+        """
+        Read only the archived flag of a bounded batch of sessions.
+
+        Unlike :meth:`get_conversations`, this loads no labels or metadata, so
+        its cost is bounded by the number of ids. A store that doesn't implement
+        it returns ``{}``, which callers must treat as unknown.
+
+        :param conversation_ids: At most 1000 session ids, e.g.
+            ``["conv_abc123"]``.
+        :returns: ``{conversation_id: archived}`` for the ids that resolve.
+        """
+        return {}
+
     def __init__(
         self, storage_location: str, conversation_storage_location: str | None = None
     ) -> None:

@@ -5104,15 +5104,17 @@ _ARCHIVE_STOP_HOST_SESSION_PAGES = 5
 _ARCHIVE_STOP_HOST_SESSION_PAGE_SIZE = 100
 
 
-async def _host_has_other_unarchived_session(
+async def _host_may_be_in_use(
     host_id: str, session_id: str, conversation_store: ConversationStore
 ) -> bool:
     """
-    Whether a session other than *session_id* still uses *host_id*.
+    Whether any session on *host_id*, *session_id* included, may still use it.
 
-    Fails closed: a store that cannot list the host's sessions (the archived
-    session itself is missing from the listing), or a listing longer than the
-    page cap, counts as in use.
+    True when a session on the host is unarchived, which also covers
+    *session_id* having been unarchived since its teardown began. Fails closed:
+    a session whose archived state can't be read, a listing that omits
+    *session_id* (a store that can't list a host's sessions), or a listing
+    longer than the page cap counts as in use.
     """
     seen_self = False
     after: str | None = None
@@ -5123,11 +5125,10 @@ async def _host_has_other_unarchived_session(
             after=after,
             limit=_ARCHIVE_STOP_HOST_SESSION_PAGE_SIZE,
         )
-        others = [other_id for other_id in ids if other_id != session_id]
-        seen_self = seen_self or len(others) < len(ids)
-        found = await asyncio.to_thread(conversation_store.get_conversations, others)
-        if any(not other.archived for other in found.values()):
+        archived = await asyncio.to_thread(conversation_store.get_archived_states, ids)
+        if any(archived.get(conversation_id) is not True for conversation_id in ids):
             return True
+        seen_self = seen_self or session_id in ids
         if len(ids) < _ARCHIVE_STOP_HOST_SESSION_PAGE_SIZE:
             return not seen_self
         after = ids[-1]
@@ -5148,10 +5149,11 @@ async def stop_archived_session_sandbox(
     launcher's ``stop_when_archived`` hook, which returns it unless the provider
     overrides it. The sandbox is only stopped, never deleted, and only when its
     provider can resume it, so an unarchived session's next message wakes it
-    through :func:`resume_managed_host`. A sandbox another unarchived
-    session is bound to (a ``/clear`` continuation, for example) keeps running,
-    as does a scheduled task run's, whose sandbox the task's own lifecycle
-    manages. Best-effort: a failure leaves the sandbox running.
+    through :func:`resume_managed_host` (unless the reaper has terminated it
+    since). A sandbox another unarchived session is bound to (a ``/clear``
+    continuation, for example) keeps running, as does this session's if it was
+    unarchived meanwhile, and a scheduled task run's, whose sandbox the task's
+    own lifecycle manages. Best-effort: a failure leaves the sandbox running.
 
     :param conv: The archived session, as re-read by the teardown.
     :param host_store: Store holding the session's host row.
@@ -5173,8 +5175,6 @@ async def stop_archived_session_sandbox(
         launcher = _launcher_for_teardown(host, config)
         if launcher is None or not launcher.capabilities.resume_stopped:
             return False
-        if await _host_has_other_unarchived_session(host.host_id, conv.id, conversation_store):
-            return False
         configured = config.recorded(host.sandbox_provider).stop_on_archive
         # getattr: embedding deployments may inject duck-typed launchers.
         decide = getattr(launcher, "stop_when_archived", None)
@@ -5185,12 +5185,9 @@ async def stop_archived_session_sandbox(
         )
         if not wanted:
             return False
-        # An unarchive no longer cancels this teardown once it has started, and
-        # the checks above can take a while (the hook may call a flag service),
-        # so re-read the session just before stopping. A message sent in the
-        # remaining window finds the sandbox stopped and resumes it.
-        current = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
-        if current is None or not current.archived:
+        # After the hook, which may be slow: an unarchive can't cancel a started
+        # teardown. A wake that lands during the stop call can still race it.
+        if await _host_may_be_in_use(host.host_id, conv.id, conversation_store):
             return False
         await asyncio.to_thread(launcher.stop, host.sandbox_id)
     except SandboxCapabilityError:
