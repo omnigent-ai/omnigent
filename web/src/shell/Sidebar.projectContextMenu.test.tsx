@@ -262,6 +262,35 @@ describe("project folder header context menu", () => {
     expect(screen.getByRole("button", { name: "Delete project" })).toBeInTheDocument();
   });
 
+  it("drops the working-agent warning when Delete is cancelled and reopened", () => {
+    mocks.deleteProject.mutate.mockImplementationOnce(
+      (_vars: unknown, opts: { onSuccess?: (result: unknown) => void }) =>
+        opts.onSuccess?.({ status: "needs_running_confirmation", runningCount: 1 }),
+    );
+    renderSidebar();
+
+    fireEvent.contextMenu(folderHeader());
+    fireEvent.click(screen.getByTestId("delete-project"));
+    fireEvent.click(screen.getByRole("button", { name: "Delete project" }));
+    expect(screen.getByTestId("delete-project-running-warning")).toHaveTextContent(
+      `1 session in ${PROJECT_NAME} has an agent still working.`,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    fireEvent.contextMenu(folderHeader());
+    fireEvent.click(screen.getByTestId("delete-project"));
+    expect(screen.queryByTestId("delete-project-running-warning")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Delete project" }));
+
+    expect(mocks.deleteProject.mutate).toHaveBeenCalledTimes(2);
+    expect(mocks.deleteProject.mutate).toHaveBeenLastCalledWith(
+      { id: PROJECT_ID, name: PROJECT_NAME },
+      expect.anything(),
+    );
+  });
+
   it("keeps New session reachable when a touch opens the menu on hover-capable hardware", () => {
     renderSidebar();
 
