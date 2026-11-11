@@ -5,7 +5,7 @@ Several low-cardinality closed-set columns (``conversations.kind``,
 ``account_tokens.kind``, ``policies.type``, ``policies.scope``,
 ``hosts.status``, ``agents.kind``, ``scheduled_tasks.state``,
 ``scheduled_tasks.execution_target``,
-``scheduled_task_runs.status``, ``inbox_items.kind``/``state``/``resolution``)
+``scheduled_task_runs.status``, ``inbox_items.status``)
 are stored as integer codes rather than their string names — smaller rows
 and a tighter ``CHECK`` than a free ``VARCHAR``. The string names remain the
 contract for entities, the HTTP API, the web client, and the SDKs; the
