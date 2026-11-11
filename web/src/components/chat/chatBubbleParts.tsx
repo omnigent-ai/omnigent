@@ -22,6 +22,7 @@ import {
   FileTextIcon,
   Link2Icon,
   Loader2Icon,
+  PencilIcon,
   SplitIcon,
   XIcon,
 } from "lucide-react";
@@ -75,7 +76,7 @@ import {
   keyedAttachments,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
-import { getCurrentAuthorId } from "@/lib/identity";
+import { getCurrentAuthorId, getCurrentUserId } from "@/lib/identity";
 import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
@@ -94,6 +95,7 @@ import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/components/SessionImage";
 import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNotice";
+import { EditSentMessageContext } from "@/components/chat/editSentMessage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
 import { copyMarkdown } from "@/lib/copyMarkdown";
@@ -230,6 +232,7 @@ export function buildPendingBubbles(
       pending: true,
       ...(p.sentMidTurn ? { awaitingAgent: true } : {}),
       ...(p.stillSending && p.posted !== true ? { stillSending: true } : {}),
+      ...(p.posted === true ? { accepted: true } : {}),
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
@@ -996,6 +999,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useScopedConversationId();
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
+  const editSentMessage = useContext(EditSentMessageContext);
   // - input_image: `imagePreview` picks the variant — an uploaded file, an
   //   imported inline data URI, an in-flight upload chip, or a placeholder
   //   for a block carrying neither.
@@ -1040,6 +1044,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Badge OTHER contributors' messages only (never your own).
   const author = bubble.createdBy;
   const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
+  // Edit copies the text of a message you sent, shared session or not; single-user
+  // messages carry no author. A pending message counts once the server has it.
+  const canEdit =
+    editSentMessage !== null &&
+    (!bubble.pending || bubble.accepted === true) &&
+    (author === undefined || author === getCurrentUserId()) &&
+    text.trim().length > 0;
 
   return (
     <Message
@@ -1244,6 +1255,21 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 componentId="chat.message.copy_user"
               >
                 {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+              </MessageAction>
+            )}
+            {canEdit && (
+              <MessageAction
+                tooltip="Edit and resend"
+                size="icon-xxs"
+                className="[@media(pointer:coarse)]:size-8"
+                onClick={() =>
+                  editSentMessage({
+                    text: isShellCommand ? text : userMessageBody(bubble.content),
+                  })
+                }
+                componentId="chat.message.edit_user"
+              >
+                <PencilIcon size={14} />
               </MessageAction>
             )}
             <MessageAction

@@ -4398,6 +4398,17 @@ async def _mark_runner_sessions_offline_once(
             continue
         if binding is None or binding[0] != conv.runner_id:
             continue
+        if _runner_stamp_is_live_elsewhere(
+            stamp=binding[1], reference_stamp=conv.runner_last_seen
+        ):
+            _relinquish_session_live_state(conv.id)
+            _logger.info(
+                "Runner %s renewed liveness for session %s during offline sweep; "
+                "leaving the session to its adopting replica",
+                conv.runner_id,
+                conv.id,
+            )
+            continue
         _publish_status(
             conv.id,
             "failed",

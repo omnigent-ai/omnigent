@@ -96,7 +96,10 @@ from omnigent.runtime.harnesses._executor_adapter import (
 )
 from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultEvent
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+from omnigent.runtime.prompt import (
+    EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+    WORKSPACE_IMAGE_INSTRUCTION,
+)
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
@@ -12615,7 +12618,9 @@ _CONTRACT_CALLER_INSTRUCTIONS = "Caller-supplied instructions."
 
 def _contract_composed_instructions(*parts: str) -> str:
     """Compose expected author/request text with framework guidance."""
-    return "\n\n".join((*parts, EMBEDDED_BROWSER_PRIORITY_INSTRUCTION))
+    return "\n\n".join(
+        (*parts, EMBEDDED_BROWSER_PRIORITY_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION)
+    )
 
 
 async def _contract_run_no_harness(
