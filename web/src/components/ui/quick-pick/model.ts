@@ -11,6 +11,8 @@ export interface QuickPickItem<Value = unknown> {
   /** Stable across loads; used for selection and React keys. */
   id: string;
   readonly label: string;
+  /** Quiet line under the label, such as where a session lives. */
+  context?: ReactNode;
   /** Muted second line, such as where a search matched. */
   readonly description?: string;
   /** Hidden terms that also match the query, such as synonyms. */
