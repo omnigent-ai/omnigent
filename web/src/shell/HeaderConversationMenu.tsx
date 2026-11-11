@@ -265,7 +265,7 @@ export function HeaderConversationMenu({
     try {
       const jsonl = await exportSessionTranscript(conversation.id);
       triggerBrowserDownload(
-        new Blob([jsonl], { type: "application/x-ndjson" }),
+        new Blob([jsonl], { type: "application/jsonl" }),
         `${conversation.id}.jsonl`,
       );
     } catch {

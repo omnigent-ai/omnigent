@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.entities import MessageData, NewConversationItem
 from omnigent.export import TRANSCRIPT_SCHEMA, item_from_entry, read_transcript
 from omnigent.server.routes.sessions import routes_items
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -124,6 +125,30 @@ async def test_export_entries_rebuild_the_stored_items(client: httpx.AsyncClient
         # top of it, which is what the readable entry alone would have lost.
         assert seeded["data"].items() <= item["data"].items(), (seeded, item)
     assert rebuilt[0]["data"]["user_authored"] is True
+
+
+async def test_export_names_who_wrote_each_item(client: httpx.AsyncClient, db_uri: str) -> None:
+    """A shared session's file tells collaborators apart, outside the imported payload."""
+    session_id = await _seed_session(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.append(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=f"resp_{author}",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+                created_by=author,
+            )
+            for author, text in (("alice@example.com", "add Q3"), ("bob@example.com", "and Q4"))
+        ],
+    )
+
+    resp = await client.get(f"/v1/sessions/{session_id}/export")
+
+    entries = read_transcript(resp.text.splitlines(keepends=True)).entries
+    assert [e.created_by for e in entries[-2:]] == ["alice@example.com", "bob@example.com"]
+    assert all("created_by" not in (e.raw or {}) for e in entries)
 
 
 async def test_export_numbers_across_item_pages(

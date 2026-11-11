@@ -138,6 +138,17 @@ def test_every_entry_carries_the_stored_payload_without_the_envelope() -> None:
     assert not {"id", "type", "status", "response_id", "created_at"} & line["raw"].keys()
 
 
+def test_entry_names_who_wrote_it_outside_raw() -> None:
+    """A shared session's file tells collaborators apart; ``raw`` stays the payload."""
+    item = {**_user("hi"), "created_by": "alice@example.com"}
+    line = json.loads(entry_from_item(item, turn=1, seq=1).to_line())
+
+    assert line["created_by"] == "alice@example.com"
+    assert "created_by" not in line["raw"]
+    # Import attributes the copy to the importing user, so the rebuild drops it.
+    assert "created_by" not in item_from_entry(_entry(**line))["data"]
+
+
 def test_tool_call_parses_json_arguments() -> None:
     item = _item(
         "function_call",
@@ -581,6 +592,58 @@ def test_rebuild_refuses_raw_that_reads_as_another_kind() -> None:
 
     with pytest.raises(TranscriptSchemaError, match="user message"):
         item_from_entry(entry)
+
+
+@pytest.mark.parametrize(
+    ("item", "edit", "field"),
+    [
+        (_user("delete the staging database"), {"text": "list the staging tables"}, "text"),
+        (
+            _item("function_call", name="sql", arguments='{"q": "drop table x"}', call_id="c1"),
+            {"tool_input": {"q": "select 1"}},
+            "tool_input",
+        ),
+        (
+            _item("function_call_output", call_id="c1", output="3 rows deleted"),
+            {"tool_output": "ok"},
+            "tool_output",
+        ),
+        (
+            _item("reasoning", summary=[], encrypted_content="gAAAA"),
+            {"sealed": False, "sealed_reason": None},
+            "sealed",
+        ),
+        (
+            _item(
+                "message",
+                role="user",
+                content=[{"type": "input_text", "text": "ctx"}],
+                is_meta=True,
+            ),
+            {"meta": False},
+            "meta",
+        ),
+    ],
+    ids=["text", "tool-input", "tool-output", "sealed-flag", "omitted-meta-flag"],
+)
+def test_rebuild_refuses_a_reading_that_disagrees_with_raw(
+    item: dict[str, Any], edit: dict[str, Any], field: str
+) -> None:
+    """Reviewing the file and importing it must give the same conversation."""
+    line = {**json.loads(entry_from_item(item, turn=1, seq=1).to_line()), **edit}
+    line = {key: value for key, value in line.items() if value is not None}
+
+    with pytest.raises(TranscriptSchemaError, match=f"{field}.* does not match its raw"):
+        item_from_entry(_entry(**line))
+
+
+def test_rebuild_accepts_an_entry_that_omits_a_reading() -> None:
+    """An omitted reading hides nothing: the reader sees less, the import is the same."""
+    item = _assistant("West churns most.")
+    line = json.loads(entry_from_item(item, turn=1, seq=1).to_line())
+    del line["text"], line["agent"]
+
+    assert item_from_entry(_entry(**line)) == _expected_payload(item)
 
 
 def test_text_only_message_rebuilds_a_text_block() -> None:

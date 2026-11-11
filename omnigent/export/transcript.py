@@ -119,6 +119,9 @@ class TranscriptEntry(BaseModel):
     :param role: Who produced it.
     :param kind: The neutral entry kind.
     :param id: The exporting server's item id.
+    :param created_by: Who wrote the item on the exporting server, e.g.
+        ``"alice@example.com"``; tells collaborators apart in a shared
+        session. An import re-attributes items to the importing user.
     :param origin_type: The producer's own item type (``"message"``,
         ``"native_tool"``, ...). Readers may ignore it; a re-import uses it
         with ``raw`` to rebuild the exact item.
@@ -163,6 +166,7 @@ class TranscriptEntry(BaseModel):
     role: EntryRole
     kind: EntryKind
     id: str | None = None
+    created_by: str | None = None
     origin_type: str | None = None
     raw: dict[str, Any] | None = None
     text: str | None = None
@@ -202,7 +206,7 @@ class TranscriptEntry(BaseModel):
     def to_line(self) -> str:
         """Serialize as one JSON line (unset optionals and false flags omitted)."""
         payload = self.model_dump(exclude_none=True)
-        for flag in ("sealed", "meta", "interrupted"):
+        for flag in _FLAG_FIELDS:
             if payload.get(flag) is False:
                 del payload[flag]
         return json.dumps(payload)
@@ -210,8 +214,15 @@ class TranscriptEntry(BaseModel):
 
 #: Fields every entry may carry.
 _COMMON_FIELDS: frozenset[str] = frozenset(
-    {"turn", "seq", "time", "role", "kind", "id", "origin_type", "raw"}
+    {"turn", "seq", "time", "role", "kind", "id", "created_by", "origin_type", "raw"}
 )
+
+#: Fields that say where an entry sits rather than what it says; every other
+#: field is a reading of ``raw`` and must agree with it.
+_PLACEMENT_FIELDS: frozenset[str] = _COMMON_FIELDS | {"content"}
+
+#: Readings serialized only when true, so an omitted flag states false.
+_FLAG_FIELDS: frozenset[str] = frozenset({"sealed", "meta", "interrupted"})
 
 #: Fields that belong to each kind; anything else on that kind is a malformed line.
 _KIND_FIELDS: dict[str, frozenset[str]] = {
@@ -371,6 +382,7 @@ def entry_from_item(item: Mapping[str, Any], *, turn: int, seq: int) -> Transcri
         "seq": seq,
         "time": _iso(item.get("created_at")),
         "id": item.get("id"),
+        "created_by": item.get("created_by"),
         "origin_type": item_type,
         "raw": payload,
     }
@@ -713,13 +725,17 @@ def item_from_entry(entry: TranscriptEntry) -> dict[str, Any]:
 
 
 def _require_raw_matches_entry(entry: TranscriptEntry, origin: str, raw: dict[str, Any]) -> None:
-    """Refuse an entry whose ``raw`` payload would import as a different kind or role.
+    """Refuse an entry whose readable fields don't describe its ``raw`` payload.
 
-    ``raw`` is what gets imported, so the readable ``kind`` and ``role`` must
-    describe it; otherwise an edited line could read as one thing and
+    ``raw`` is what gets imported, so the entry must read as ``raw`` would
+    export: the same kind and role, and every reading it states (text, tool
+    input, output, ...) equal to the one ``raw`` gives. A reading it omits
+    hides nothing, but the flags are always compared, since an omitted flag
+    reads as false. Otherwise an edited line could read as one thing and
     rebuild as another.
 
-    :raises TranscriptSchemaError: If ``raw`` maps to another kind or role.
+    :raises TranscriptSchemaError: If ``raw`` maps to another kind or role,
+        or to different readable fields.
     """
     try:
         expected = entry_from_item({**raw, "type": origin}, turn=entry.turn, seq=entry.seq)
@@ -731,6 +747,18 @@ def _require_raw_matches_entry(entry: TranscriptEntry, origin: str, raw: dict[st
         raise TranscriptSchemaError(
             f"entry {entry.seq}: raw {origin!r} payload is a {expected.role} "
             f"{expected.kind}, but the entry reads as a {entry.role} {entry.kind}"
+        )
+    readings = set(TranscriptEntry.model_fields) - _PLACEMENT_FIELDS
+    differing = sorted(
+        name
+        for name in readings
+        if (getattr(entry, name) is not None or name in _FLAG_FIELDS)
+        and getattr(entry, name) != getattr(expected, name)
+    )
+    if differing:
+        raise TranscriptSchemaError(
+            f"entry {entry.seq}: {', '.join(differing)} does not match its raw "
+            f"{origin!r} payload, so the file reads differently from what it imports"
         )
 
 
