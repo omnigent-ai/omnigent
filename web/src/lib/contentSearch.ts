@@ -64,6 +64,40 @@ export function contentSearchPattern({ query, regex, wholeWord }: ContentSearchP
   return { pattern: `${first}${middle}${last}`, regex: true };
 }
 
+/**
+ * Whether a ripgrep regular expression closes a group it never opened, as in
+ * `foo)|(bar`. Ripgrep accepts that, so wrapping it in `\b(?:…)\b` would let it
+ * close the wrapper and leave an alternative without its boundary. Escapes and
+ * (nested) character classes are skipped, as ripgrep reads them. Verbose `(?x)`
+ * mode can only make this refuse more: ignored whitespace may end a class here
+ * sooner, and a `#` comment swallows the wrapper's `)`, which ripgrep rejects.
+ */
+export function closesUnopenedGroup(query: string): boolean {
+  let groups = 0;
+  let classes = 0;
+  // Just after `[` or `[^`, where a `]` is a literal rather than the end of the class.
+  let classStart = false;
+  for (let index = 0; index < query.length; index += 1) {
+    const character = query[index];
+    if (character === "\\") {
+      index += 1;
+      classStart = false;
+    } else if (character === "[") {
+      classes += 1;
+      classStart = true;
+    } else if (classes > 0) {
+      if (character === "]" && !classStart) classes -= 1;
+      classStart = classStart && character === "^" && query[index - 1] === "[";
+    } else if (character === "(") {
+      groups += 1;
+    } else if (character === ")") {
+      groups -= 1;
+      if (groups < 0) return true;
+    }
+  }
+  return false;
+}
+
 /** Whether `pattern` fits the server's limit, counting code points as the server does. */
 export function fitsContentSearchLimit(pattern: string): boolean {
   return Array.from(pattern).length <= CONTENT_SEARCH_QUERY_LIMIT;

@@ -294,3 +294,31 @@ it("refuses a whole-word search that outgrows the server's limit without sending
   expect(url.searchParams.get("q")).toBe("a".repeat(4096));
   expect(url.searchParams.get("regex")).toBe("false");
 });
+
+it("refuses a whole-word expression that closes a group it never opened", async () => {
+  vi.mocked(authenticatedFetch).mockImplementation(
+    async () => new Response(JSON.stringify({ matches: [], truncated: false, warning: null })),
+  );
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <ContentSearchPanel conversationId="session-one" onFileSelect={vi.fn()} />
+    </QueryClientProvider>,
+  );
+  fireEvent.change(screen.getByRole("searchbox"), { target: { value: "foo)|(bar" } });
+  fireEvent.click(screen.getByLabelText("Regular expression"));
+  fireEvent.click(screen.getByLabelText("Whole word"));
+  expect(screen.getByRole("alert")).toHaveTextContent(
+    "This expression closes a group it never opened, so it can’t match whole words.",
+  );
+  expect(screen.getByRole("button", { name: "Search" })).toBeDisabled();
+  fireEvent.submit(screen.getByRole("searchbox").closest("form")!);
+  expect(authenticatedFetch).not.toHaveBeenCalled();
+  // With Whole word off the expression goes to ripgrep unchanged, as before.
+  fireEvent.click(screen.getByLabelText("Whole word"));
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  fireEvent.submit(screen.getByRole("searchbox").closest("form")!);
+  await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+  const url = new URL(String(vi.mocked(authenticatedFetch).mock.calls[0][0]), "http://test");
+  expect(url.searchParams.get("q")).toBe("foo)|(bar");
+  expect(url.searchParams.get("regex")).toBe("true");
+});

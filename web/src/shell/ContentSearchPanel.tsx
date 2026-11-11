@@ -1,7 +1,11 @@
 import { type RefObject, useEffect, useId, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { FileIcon, FilterIcon, SearchIcon } from "lucide-react";
-import { contentSearchPattern, fitsContentSearchLimit } from "@/lib/contentSearch";
+import {
+  closesUnopenedGroup,
+  contentSearchPattern,
+  fitsContentSearchLimit,
+} from "@/lib/contentSearch";
 import { authenticatedFetch } from "@/lib/identity";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -65,7 +69,9 @@ export function ContentSearchPanel({
   // Whole word is sent as a regular expression, which can outgrow the server's query limit.
   const sent = contentSearchPattern({ query, regex, wholeWord });
   const tooLong = wholeWord && !fitsContentSearchLimit(sent.pattern);
-  const canSearch = query.trim() !== "" && !tooLong;
+  // Such an expression would close the Whole word wrapper and escape its boundaries.
+  const unopenedGroup = wholeWord && regex && closesUnopenedGroup(query);
+  const canSearch = query.trim() !== "" && !tooLong && !unopenedGroup;
   useEffect(() => {
     queryClient.setQueryData(["content-search-input", conversationId], input);
   }, [conversationId, input, queryClient]);
@@ -173,6 +179,12 @@ export function ContentSearchPanel({
         {tooLong && (
           <p role="alert" className="text-xs text-destructive">
             This search is too long to match whole words. Shorten it, or turn off Whole word.
+          </p>
+        )}
+        {unopenedGroup && (
+          <p role="alert" className="text-xs text-destructive">
+            This expression closes a group it never opened, so it can’t match whole words. Balance
+            its parentheses, or turn off Whole word.
           </p>
         )}
         <div id={filtersId} hidden={!showFilters} className="space-y-2 text-xs">

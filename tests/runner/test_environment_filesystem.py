@@ -2159,7 +2159,11 @@ async def test_content_search_whole_word_reports_the_word_itself(
     response = await client.get(endpoint, params={"q": r"\bneedle\b", "regex": "true"})
     match = response.json()["matches"][0]
     assert (match["match_start"], match["match_end"]) == (2, 8)
-    response = await client.get(endpoint, params={"q": "\\bcafe\u0301\\b", "regex": "true"})
+    # The panel's own pattern classifies the accent in ripgrep; it must consume only the accent.
+    decomposed = next(
+        case for case in _WHOLE_WORD_FIXTURE["cases"] if case["name"] == "decomposed accent"
+    )
+    response = await client.get(endpoint, params={"q": decomposed["pattern"], "regex": "true"})
     match = response.json()["matches"][0]
     # Offsets are UTF-16 units: the combining accent is one more unit after "cafe".
     assert (match["match_start"], match["match_end"]) == (0, 5)

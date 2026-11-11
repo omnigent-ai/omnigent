@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import wholeWordCases from "@/lib/__fixtures__/contentSearchWholeWord.json";
 import {
   CONTENT_SEARCH_QUERY_LIMIT,
+  closesUnopenedGroup,
   contentSearchPattern,
   fitsContentSearchLimit,
 } from "@/lib/contentSearch";
@@ -36,6 +37,38 @@ describe("contentSearchPattern", () => {
     expect(contentSearchPattern({ query: "_x1", regex: false, wholeWord: true }).pattern).toBe(
       "\\b_x1\\b",
     );
+  });
+});
+
+describe("closesUnopenedGroup", () => {
+  it("finds a group closed before it is opened, which would escape the wrapper", () => {
+    // `\b(?:foo)|(bar)\b` would match inside `foobar`, `xbar` and `foox`.
+    expect(closesUnopenedGroup("foo)|(bar")).toBe(true);
+    expect(closesUnopenedGroup("foo))|((bar")).toBe(true);
+    expect(closesUnopenedGroup("(a)b)")).toBe(true);
+  });
+
+  it("accepts balanced groups and parentheses ripgrep reads as literals", () => {
+    for (const query of [
+      "needle|pin",
+      "(?i)foo",
+      "(a|b)(c)",
+      "a\\)b",
+      "[)]",
+      "[]x)]",
+      "[^]x)]",
+      "[[)]a]",
+      "[[:alpha:])]",
+      "(unclosed",
+    ]) {
+      expect(closesUnopenedGroup(query)).toBe(false);
+    }
+  });
+
+  it("does not treat a literal `]` at the start of a class as its end", () => {
+    expect(closesUnopenedGroup("[])]")).toBe(false);
+    expect(closesUnopenedGroup("[^])]")).toBe(false);
+    expect(closesUnopenedGroup("[^^])")).toBe(true);
   });
 });
 
