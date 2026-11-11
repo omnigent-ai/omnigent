@@ -2555,6 +2555,7 @@ def _planner_with_model_usage(
     thinking_tokens: str = "40",
     response_tokens: str = "60",
     cache_read_tokens: str = "200",
+    cache_creation_tokens: str | None = None,
     model_enum: str = "MODEL_PLACEHOLDER_M20",
     with_requested_model: bool = True,
 ) -> dict[str, Any]:
@@ -2566,7 +2567,7 @@ def _planner_with_model_usage(
     step = copy.deepcopy(_load("planner_response_text"))
     step["status"] = "CORTEX_STEP_STATUS_DONE"
     metadata = cast(dict[str, Any], step["metadata"])
-    metadata["modelUsage"] = {
+    model_usage: dict[str, Any] = {
         "model": model_enum,
         "inputTokens": input_tokens,
         "outputTokens": output_tokens,
@@ -2574,6 +2575,9 @@ def _planner_with_model_usage(
         "responseOutputTokens": response_tokens,
         "cacheReadTokens": cache_read_tokens,
     }
+    if cache_creation_tokens is not None:
+        model_usage["cacheCreationTokens"] = cache_creation_tokens
+    metadata["modelUsage"] = model_usage
     metadata["sourceTrajectoryStepInfo"]["stepIndex"] = step_index
     if with_requested_model:
         metadata.setdefault("requestedModel", {})["model"] = model_enum
@@ -2631,6 +2635,36 @@ def _user_input_real_wire(
     return step
 
 
+_FAKE_PROVIDER_CATALOG: dict[str, dict[str, Any]] = {
+    "gemini": {
+        "schema_version": "1.0",
+        "models": {
+            "gemini/gemini-2.5-flash": {
+                "mode": "chat",
+                "context_window": {"max_input": 1_048_576, "max_output": 65_536},
+            },
+            "gemini/gemini-2.5-pro": {
+                "mode": "chat",
+                "context_window": {"max_input": 1_048_576, "max_output": 65_536},
+            },
+            "gemini/gemini-3.1-pro-preview": {
+                "mode": "chat",
+                "context_window": {"max_input": 1_048_576, "max_output": 65_536},
+            },
+        },
+    },
+    "anthropic": {
+        "schema_version": "1.0",
+        "models": {
+            "claude-sonnet-4-5": {
+                "mode": "chat",
+                "context_window": {"max_input": 200_000, "max_output": 64_000},
+            },
+        },
+    },
+}
+
+
 async def _run_with_telemetry(
     *,
     bridge_dir: Path,
@@ -2642,7 +2676,15 @@ async def _run_with_telemetry(
     catalog: dict[str, object] | None = None,
 ) -> None:
     """Drive ``supervise_reader`` in STREAM mode with a fake model catalog."""
+    from omnigent.onboarding import providers as providers_mod
+
     fake_catalog = catalog if catalog is not None else _FAKE_CATALOG
+    monkeypatch.delenv("AP_CONTEXT_WINDOW_OVERRIDE", raising=False)
+    monkeypatch.setattr(
+        providers_mod,
+        "_fetch_provider_catalog",
+        lambda provider: _FAKE_PROVIDER_CATALOG.get(provider, {}),
+    )
     monkeypatch.setattr(reader, "stream_agent_state_updates", stream)
     monkeypatch.setattr(reader, "get_trajectory_steps", poll_steps)
     monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
@@ -2684,6 +2726,8 @@ async def test_planner_done_emits_session_usage(
     - cumulative_input_tokens = inputTokens (int)
     - cumulative_output_tokens = outputTokens (int)
     - cumulative_cache_read_input_tokens = cacheReadTokens (int)
+    - context_tokens = inputTokens + cacheReadTokens (per-call prompt fill)
+    - context_window = resolved context window for the active model
     - model = the displayName from the catalog (not the raw enum)
     """
     planner = _planner_with_model_usage(
@@ -2710,6 +2754,8 @@ async def test_planner_done_emits_session_usage(
     assert usage_data["cumulative_input_tokens"] == 1000
     assert usage_data["cumulative_output_tokens"] == 100
     assert usage_data["cumulative_cache_read_input_tokens"] == 200
+    assert usage_data["context_tokens"] == 1200
+    assert usage_data["context_window"] == 1_048_576
     assert usage_data["model"] == "Gemini 2.5 Flash"
 
 
@@ -2980,10 +3026,163 @@ async def test_two_turn_usage_is_cumulative(
     assert usage_events[0][1]["cumulative_input_tokens"] == 1000
     assert usage_events[0][1]["cumulative_output_tokens"] == 50
     assert usage_events[0][1]["cumulative_cache_read_input_tokens"] == 100
-    # Turn 2: RUNNING total (2000 input, not 1000 again).
+    assert usage_events[0][1]["context_tokens"] == 1100
+    # Turn 2: RUNNING total (2000 input), while context_tokens reflects current fill (1100).
     assert usage_events[1][1]["cumulative_input_tokens"] == 2000
     assert usage_events[1][1]["cumulative_output_tokens"] == 100
     assert usage_events[1][1]["cumulative_cache_read_input_tokens"] == 200
+    assert usage_events[1][1]["context_tokens"] == 1100
+
+
+@pytest.mark.asyncio
+async def test_usage_context_occupancy_tracks_per_call_prompt_and_model_switches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """context_tokens tracks active call prompt occupancy and updates window on model switch."""
+    catalog: dict[str, object] = {
+        "models": {
+            "m20": {
+                "model": "MODEL_PLACEHOLDER_M20",
+                "displayName": "Gemini 2.5 Flash",
+            },
+            "m26": {
+                "model": "MODEL_PLACEHOLDER_M26",
+                "displayName": "Claude Sonnet 4.5 (Thinking)",
+            },
+        }
+    }
+    step1 = _planner_with_model_usage(
+        step_index=2,
+        input_tokens="17161",
+        output_tokens="65",
+        cache_read_tokens="0",
+        model_enum="MODEL_PLACEHOLDER_M20",
+    )
+    # Subsequent call hits prompt cache: small inputTokens + large cacheReadTokens.
+    step2 = _planner_with_model_usage(
+        step_index=5,
+        input_tokens="1031",
+        output_tokens="418",
+        cache_read_tokens="16267",
+        model_enum="MODEL_PLACEHOLDER_M20",
+    )
+    step3 = _planner_with_model_usage(
+        step_index=9,
+        input_tokens="500",
+        output_tokens="120",
+        cache_read_tokens="18000",
+        cache_creation_tokens="400",
+        model_enum="MODEL_PLACEHOLDER_M26",
+    )
+    frames = [_frame([step1]), _frame([step1, step2]), _frame([step1, step2, step3])]
+    sink = _PostSink()
+
+    await _run_with_telemetry(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+        catalog=catalog,
+    )
+
+    usage_events = [d for et, d in sink.posts if et == "external_session_usage"]
+    assert len(usage_events) == 3
+
+    assert usage_events[0]["context_tokens"] == 17161
+    assert usage_events[0]["context_window"] == 1_048_576
+    assert usage_events[0]["cumulative_input_tokens"] == 17161
+
+    assert usage_events[1]["context_tokens"] == 17298
+    assert usage_events[1]["context_window"] == 1_048_576
+    assert usage_events[1]["cumulative_input_tokens"] == 18192
+    assert usage_events[1]["cumulative_cache_read_input_tokens"] == 16267
+
+    assert usage_events[2]["context_tokens"] == 18900
+    assert usage_events[2]["context_window"] == 200_000
+    assert usage_events[2]["model"] == "Claude Sonnet 4.5 (Thinking)"
+
+
+@pytest.mark.asyncio
+async def test_usage_context_window_resolution_variants_and_unknown_omission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Resolve tiered/preview displayNames and explicit limits; omit window when unknown."""
+    catalog: dict[str, object] = {
+        "models": {
+            "m132": {
+                "model": "MODEL_PLACEHOLDER_M132",
+                "displayName": "Gemini 3.1 Pro (High)",
+            },
+            "m_custom": {
+                "model": "MODEL_PLACEHOLDER_CUSTOM",
+                "displayName": "Custom Workspace Model",
+                "maxContextTokens": 512_000,
+            },
+        }
+    }
+    preview_step = _planner_with_model_usage(
+        step_index=2,
+        input_tokens="800",
+        cache_read_tokens="200",
+        model_enum="MODEL_PLACEHOLDER_M132",
+    )
+    explicit_limit_step = _planner_with_model_usage(
+        step_index=4,
+        input_tokens="900",
+        cache_read_tokens="100",
+        model_enum="MODEL_PLACEHOLDER_CUSTOM",
+    )
+    direct_id_step = _planner_with_model_usage(
+        step_index=6,
+        input_tokens="1100",
+        cache_read_tokens="0",
+        model_enum="gemini-2.5-pro",
+    )
+    unknown_step = _planner_with_model_usage(
+        step_index=8,
+        input_tokens="1200",
+        cache_read_tokens="300",
+        model_enum="MODEL_PLACEHOLDER_UNKNOWN_999",
+    )
+    frames = [
+        _frame([preview_step]),
+        _frame([preview_step, explicit_limit_step]),
+        _frame([preview_step, explicit_limit_step, direct_id_step]),
+        _frame([preview_step, explicit_limit_step, direct_id_step, unknown_step]),
+    ]
+    sink = _PostSink()
+
+    await _run_with_telemetry(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+        catalog=catalog,
+    )
+
+    usage_events = [d for et, d in sink.posts if et == "external_session_usage"]
+    assert len(usage_events) == 4
+
+    assert usage_events[0]["context_tokens"] == 1000
+    assert usage_events[0]["context_window"] == 1_048_576
+
+    assert usage_events[1]["context_tokens"] == 1000
+    assert usage_events[1]["context_window"] == 512_000
+
+    assert usage_events[2]["context_tokens"] == 1100
+    assert usage_events[2]["context_window"] == 1_048_576
+
+    assert usage_events[3]["context_tokens"] == 1500
+    assert usage_events[3]["model"] == "MODEL_PLACEHOLDER_UNKNOWN_999"
+    assert "context_window" not in usage_events[3]
 
 
 # ---------------------------------------------------------------------------
