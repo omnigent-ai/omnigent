@@ -139,34 +139,33 @@ function fixturePolicy({ appRoot, arcaPath, serverUrl }) {
   });
   cli.localServerHealthy = async () => null;
   cli.resolveCliPath = () => null;
-  require(path.join(src, "isaac")).resolveIsaacPath = () => null;
-  const arca = require(path.join(src, "arca"));
-  arca.resolveArcaPath = () => arcaPath;
-  arca.resolveArcaPathAsync = async () => arcaPath;
-  const startConnect = arca.startArcaConnect;
-  arca.startArcaConnect = (url, deps = {}) =>
-    startConnect(url, {
-      ...deps,
-      resolveArcaPath: () => arcaPath,
-      timeoutMs: 30_000,
-      killGraceMs: 250,
-    });
-  const readStatus = arca.readArcaStatus;
-  arca.readArcaStatus = (deps = {}) =>
-    readStatus({
-      ...deps,
-      resolveArcaPath: () => arcaPath,
-      timeoutMs: 2000,
-    });
-  const onboarding = require(path.join(src, "arca_onboarding"));
-  const startSetup = onboarding.startArcaSetup;
-  onboarding.startArcaSetup = (url, deps = {}) =>
-    startSetup(url, {
-      ...deps,
-      resolveArcaPath: () => arcaPath,
-      timeoutMs: 30_000,
-      killGraceMs: 250,
-    });
+  registerTestOverride("isaac", () => ({ resolveIsaacPath: () => null }));
+  registerTestOverride("arca", ({ startArcaConnect, readArcaStatus }) => ({
+    resolveArcaPath: () => arcaPath,
+    resolveArcaPathAsync: async () => arcaPath,
+    startArcaConnect: (url, deps = {}) =>
+      startArcaConnect(url, {
+        ...deps,
+        resolveArcaPath: () => arcaPath,
+        timeoutMs: 30_000,
+        killGraceMs: 250,
+      }),
+    readArcaStatus: (deps = {}) =>
+      readArcaStatus({
+        ...deps,
+        resolveArcaPath: () => arcaPath,
+        timeoutMs: 2000,
+      }),
+  }));
+  registerTestOverride("arca_onboarding", ({ startArcaSetup }) => ({
+    startArcaSetup: (url, deps = {}) =>
+      startArcaSetup(url, {
+        ...deps,
+        resolveArcaPath: () => arcaPath,
+        timeoutMs: 30_000,
+        killGraceMs: 250,
+      }),
+  }));
 }
 /* oxlint-enable no-shadow */
 

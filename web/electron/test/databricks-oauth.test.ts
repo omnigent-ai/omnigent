@@ -1,42 +1,50 @@
 // Unit tests for the Databricks token store + refresh lifecycle
-// (src/databricks-oauth.js), run with `node --test` (no extra deps).
+// (src/databricks-oauth.ts), run with `node --test` (no extra deps).
 //
 // Covers the parts the session-expiry and rotation logic depend on: the
 // workspace-keyed token store round-trip, silent refresh endpoint selection
 // (workspace-direct vs account/SPOG), single-use refresh-token rotation +
 // persistence, concurrent-refresh dedupe, and dead-grant (invalid_grant)
-// cleanup. Electron is stubbed so the module loads outside a packaged app.
+// cleanup. safeStorage and the system browser are injected fakes.
 
-"use strict";
+import { describe, it, beforeEach, afterEach, mock, type TestContext } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import http from "node:http";
 
-const { describe, it, beforeEach, afterEach, mock } = require("node:test");
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
-const Module = require("node:module");
-const http = require("node:http");
+import {
+  createDatabricksOAuth,
+  isTrustedDatabricksOrigin,
+  type InteractiveLoginResult,
+  type TokenEndpointError,
+} from "../src/databricks-oauth.ts";
+import { diagnostics } from "../src/diagnostics.ts";
 
-// Stub `require("electron")` before loading the module under test. This file
-// runs in its own node:test process, so the override doesn't leak elsewhere.
-const electronStub = {
-  shell: { openExternal: async () => {} },
-  // Force the plaintext store path so the round-trip exercises real fs without
-  // needing OS keychain encryption in CI.
-  safeStorage: { isEncryptionAvailable: () => false },
-  net: {},
+const shell = { openExternal: async (_url: string): Promise<unknown> => undefined };
+// Force the plaintext store path so the round-trip exercises real fs without
+// needing OS keychain encryption in CI.
+const safeStorage = {
+  isEncryptionAvailable: () => false,
+  encryptString: (): Buffer => {
+    throw new Error("encryption is unavailable");
+  },
+  decryptString: (): string => {
+    throw new Error("encryption is unavailable");
+  },
 };
-// Bracket-access `_load` so no-underscore-dangle doesn't flag the Node API name.
-const origLoad = Module["_load"];
-Module["_load"] = function (request, ...rest) {
-  if (request === "electron") return electronStub;
-  return origLoad.call(this, request, ...rest);
-};
+// One instance for the file, as main creates one per process.
+const oauth = createDatabricksOAuth({
+  safeStorage,
+  openExternal: (url) => shell.openExternal(url),
+});
 
-const oauth = require("../src/databricks-oauth");
+/** A stored entry, read as the record the tests saved. */
+const stored = (origin: string) => oauth.loadTokens(origin) as Record<string, unknown>;
 
 // Point the token store at a throwaway HOME per test.
-let tmpHome;
+let tmpHome: string;
 beforeEach(() => {
   tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "omni-oauth-"));
   mock.method(os, "homedir", () => tmpHome);
@@ -51,19 +59,34 @@ const ACCT = { origin: "https://accounts.cloud.databricks.com", id: "acc-123" };
 const future = () => Math.floor(Date.now() / 1000) + 3600;
 const past = () => Math.floor(Date.now() / 1000) - 10;
 
+interface FetchCall {
+  url: string;
+  body: string;
+  redirect: RequestInit["redirect"];
+}
+
 /** A fetch stub that records calls and returns a scripted token response. */
-function mockTokenFetch(responder) {
-  const calls = [];
-  mock.method(globalThis, "fetch", async (url, init) => {
-    calls.push({ url, body: init?.body, redirect: init?.redirect });
+function mockTokenFetch(
+  responder: (url: string, init: RequestInit | undefined, count: number) => unknown,
+) {
+  const calls: FetchCall[] = [];
+  mock.method(globalThis, "fetch", async (url: string, init?: RequestInit) => {
+    calls.push({ url, body: init?.body as string, redirect: init?.redirect });
     return responder(url, init, calls.length);
   });
   return calls;
 }
-const ok = (obj) => ({ ok: true, status: 200, text: async () => JSON.stringify(obj) });
-const httpErr = (status, obj) => ({ ok: false, status, text: async () => JSON.stringify(obj) });
+const ok = (obj: unknown) => ({ ok: true, status: 200, text: async () => JSON.stringify(obj) });
+const httpErr = (status: number, obj: unknown) => ({
+  ok: false,
+  status,
+  text: async () => JSON.stringify(obj),
+});
 
-function loopbackConfig(t) {
+/** The authorize URL's parameter, which every browser launch carries. */
+const param = (url: URL, name: string) => url.searchParams.get(name) ?? "";
+
+function loopbackConfig(t: TestContext) {
   const previous = process.env.OMNIGENT_DATABRICKS_OAUTH_REDIRECT;
   process.env.OMNIGENT_DATABRICKS_OAUTH_REDIRECT = "http://127.0.0.1";
   t.after(() => {
@@ -74,38 +97,43 @@ function loopbackConfig(t) {
 }
 
 /** Drive one real loopback callback and return its HTTP response plus the login result. */
-async function runLoopbackCallback(t, buildCallback) {
+async function runLoopbackCallback(
+  t: TestContext,
+  buildCallback: (callback: URL, state: string) => void,
+) {
   loopbackConfig(t);
-  let opened;
-  const browserOpened = new Promise((resolve) => {
+  let opened!: (url: URL) => void;
+  const browserOpened = new Promise<URL>((resolve) => {
     opened = resolve;
   });
-  mock.method(electronStub.shell, "openExternal", async (url) => opened(new URL(url)));
+  mock.method(shell, "openExternal", async (url: string) => opened(new URL(url)));
   const calls = mockTokenFetch((_url, init) =>
     init?.method === "POST"
       ? ok({ access_token: "exchanged", expires_in: 3600 })
       : { status: 302, type: "basic" },
   );
   const login = oauth.runInteractiveLogin(WS);
-  const settled = login.then(
+  const settled: Promise<{ value?: InteractiveLoginResult; error?: Error }> = login.then(
     (value) => ({ value }),
-    (error) => ({ error }),
+    (error: Error) => ({ error }),
   );
   const authorize = await browserOpened;
-  const callback = new URL(authorize.searchParams.get("redirect_uri"));
-  buildCallback(callback, authorize.searchParams.get("state"));
-  const response = await new Promise((resolve, reject) => {
-    http
-      .get(callback, { agent: false }, (res) => {
-        let body = "";
-        res.setEncoding("utf8");
-        res.on("data", (chunk) => {
-          body += chunk;
-        });
-        res.on("end", () => resolve({ status: res.statusCode, body }));
-      })
-      .on("error", reject);
-  });
+  const callback = new URL(param(authorize, "redirect_uri"));
+  buildCallback(callback, param(authorize, "state"));
+  const response = await new Promise<{ status: number | undefined; body: string }>(
+    (resolve, reject) => {
+      http
+        .get(callback, { agent: false }, (res) => {
+          let body = "";
+          res.setEncoding("utf8");
+          res.on("data", (chunk) => {
+            body += chunk;
+          });
+          res.on("end", () => resolve({ status: res.statusCode, body }));
+        })
+        .on("error", reject);
+    },
+  );
   return { response, result: await settled, authorize, calls };
 }
 
@@ -124,11 +152,11 @@ describe("loopback callback response", () => {
       assert.equal(response.status, 200);
       assert.doesNotMatch(response.body, /Signed in/i);
       assert.match(response.body, /Return to Omnigent/i);
-      assert.equal(result.value.tokens.access_token, "exchanged");
+      assert.equal(result.value?.tokens.access_token, "exchanged");
       // The browser flow and its preflight must agree on the one fixed redirect.
-      assert.equal(new URL(calls[0].url).pathname, "/oidc/v1/authorize");
-      const probed = new URL(calls[0].url).searchParams.get("redirect_uri");
-      const used = new URL(authorize.searchParams.get("redirect_uri"));
+      assert.equal(new URL(calls[0]!.url).pathname, "/oidc/v1/authorize");
+      const probed = new URL(calls[0]!.url).searchParams.get("redirect_uri");
+      const used = new URL(param(authorize, "redirect_uri"));
       assert.equal(probed, "http://localhost");
       assert.equal(used.hostname, "localhost");
       assert.equal(used.pathname, "/");
@@ -144,12 +172,12 @@ describe("loopback callback response", () => {
       callback.searchParams.set("state", state);
       callback.searchParams.set("code", "local-test-code");
     });
-    const used = new URL(authorize.searchParams.get("redirect_uri"));
+    const used = new URL(param(authorize, "redirect_uri"));
     assert.equal(used.hostname, "localhost");
     assert.equal(used.pathname, "/");
     assert.notEqual(used.port, "8765");
-    assert.equal(new URL(calls[0].url).searchParams.get("redirect_uri"), "http://localhost");
-    assert.equal(result.value.tokens.access_token, "exchanged");
+    assert.equal(new URL(calls[0]!.url).searchParams.get("redirect_uri"), "http://localhost");
+    assert.equal(result.value?.tokens.access_token, "exchanged");
   });
 
   it("reports an authorization error instead of a success page", { timeout: 5000 }, async (t) => {
@@ -160,7 +188,7 @@ describe("loopback callback response", () => {
     });
     assert.equal(response.status, 400);
     assert.doesNotMatch(response.body, /Signed in|received/i);
-    assert.match(result.error.message, /access_denied/);
+    assert.match(String(result.error?.message), /access_denied/);
   });
 
   it("reports a callback with no code instead of a success page", { timeout: 5000 }, async (t) => {
@@ -169,7 +197,7 @@ describe("loopback callback response", () => {
     });
     assert.equal(response.status, 400);
     assert.doesNotMatch(response.body, /Signed in|received/i);
-    assert.match(result.error.message, /no code in callback/);
+    assert.match(String(result.error?.message), /no code in callback/);
   });
 });
 
@@ -180,10 +208,10 @@ describe("interactive OAuth cancellation", () => {
     const fetchMock = mock.method(globalThis, "fetch", async () => {
       throw new Error("unexpected fetch");
     });
-    const browser = mock.method(electronStub.shell, "openExternal", async () => {});
+    const browser = mock.method(shell, "openExternal", async () => {});
     await assert.rejects(
       oauth.runInteractiveLogin(WS, { signal: controller.signal }),
-      (error) => error.name === "AbortError",
+      (error: Error) => error.name === "AbortError",
     );
     assert.equal(fetchMock.mock.callCount(), 0);
     assert.equal(browser.mock.callCount(), 0);
@@ -193,22 +221,22 @@ describe("interactive OAuth cancellation", () => {
     loopbackConfig(t);
     const controller = new AbortController();
     t.after(() => controller.abort());
-    let requestSignal;
+    let requestSignal: AbortSignal | undefined;
     mock.method(
       globalThis,
       "fetch",
-      (_url, { signal }) =>
+      (_url: string, { signal }: { signal: AbortSignal }) =>
         new Promise((_resolve, reject) => {
           requestSignal = signal;
           signal.addEventListener("abort", () => reject(signal.reason), { once: true });
         }),
     );
-    const browser = mock.method(electronStub.shell, "openExternal", async () => {});
+    const browser = mock.method(shell, "openExternal", async () => {});
     const login = oauth.runInteractiveLogin(WS, { signal: controller.signal });
-    const rejected = assert.rejects(login, (error) => error.name === "AbortError");
+    const rejected = assert.rejects(login, (error: Error) => error.name === "AbortError");
     controller.abort();
     await rejected;
-    assert.equal(requestSignal.aborted, true);
+    assert.equal(requestSignal?.aborted, true);
     assert.equal(browser.mock.callCount(), 0);
   });
 
@@ -220,29 +248,29 @@ describe("interactive OAuth cancellation", () => {
       const controller = new AbortController();
       t.after(() => controller.abort());
       mock.method(globalThis, "fetch", async () => ({ status: 302, type: "basic" }));
-      let server;
-      const createServer = http.createServer;
-      mock.method(http, "createServer", (...args) => {
+      let server!: http.Server;
+      const createServer = http.createServer as (...args: unknown[]) => http.Server;
+      mock.method(http, "createServer", (...args: unknown[]) => {
         server = createServer(...args);
         return server;
       });
-      let opened;
-      const browserOpened = new Promise((resolve) => {
+      let opened!: () => void;
+      const browserOpened = new Promise<void>((resolve) => {
         opened = resolve;
       });
-      mock.method(electronStub.shell, "openExternal", async () => {
+      mock.method(shell, "openExternal", async () => {
         opened();
       });
       const login = oauth.runInteractiveLogin(WS, { signal: controller.signal });
-      const rejected = assert.rejects(login, (error) => error.name === "AbortError");
+      const rejected = assert.rejects(login, (error: Error) => error.name === "AbortError");
       await browserOpened;
       assert.equal(server.listening, true);
-      let ignoredStatus;
+      let ignoredStatus: number | undefined;
       server.emit(
         "request",
         { url: "/?state=previous-login" },
         {
-          writeHead: (status) => {
+          writeHead: (status: number) => {
             ignoredStatus = status;
           },
           end() {},
@@ -264,31 +292,35 @@ describe("interactive OAuth cancellation", () => {
       loopbackConfig(t);
       const controller = new AbortController();
       t.after(() => controller.abort());
-      let opened;
-      const browserOpened = new Promise((resolve) => {
+      let opened!: (url: URL) => void;
+      const browserOpened = new Promise<URL>((resolve) => {
         opened = resolve;
       });
-      mock.method(electronStub.shell, "openExternal", async (url) => {
+      mock.method(shell, "openExternal", async (url: string) => {
         opened(new URL(url));
       });
-      let postStarted;
-      const posting = new Promise((resolve) => {
+      let postStarted!: () => void;
+      const posting = new Promise<void>((resolve) => {
         postStarted = resolve;
       });
-      let postSignal;
-      mock.method(globalThis, "fetch", async (_url, init) => {
-        if (init.method !== "POST") return { status: 302, type: "basic" };
-        postSignal = init.signal;
-        postStarted();
-        return new Promise((_resolve, reject) => {
-          init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
-        });
-      });
+      let postSignal: AbortSignal | undefined;
+      mock.method(
+        globalThis,
+        "fetch",
+        async (_url: string, init: RequestInit & { signal: AbortSignal }) => {
+          if (init.method !== "POST") return { status: 302, type: "basic" };
+          postSignal = init.signal;
+          postStarted();
+          return new Promise((_resolve, reject) => {
+            init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+          });
+        },
+      );
       const login = oauth.runInteractiveLogin(WS, { signal: controller.signal });
-      const rejected = assert.rejects(login, (error) => error.name === "AbortError");
+      const rejected = assert.rejects(login, (error: Error) => error.name === "AbortError");
       const authorize = await browserOpened;
-      const callback = new URL(authorize.searchParams.get("redirect_uri"));
-      callback.searchParams.set("state", authorize.searchParams.get("state"));
+      const callback = new URL(param(authorize, "redirect_uri"));
+      callback.searchParams.set("state", param(authorize, "state"));
       callback.searchParams.set("code", "local-test-code");
       await new Promise((resolve, reject) => {
         http
@@ -301,7 +333,7 @@ describe("interactive OAuth cancellation", () => {
       await posting;
       controller.abort();
       await rejected;
-      assert.equal(postSignal.aborted, true);
+      assert.equal(postSignal?.aborted, true);
       assert.equal(oauth.loadTokens(WS), null);
     },
   );
@@ -309,15 +341,15 @@ describe("interactive OAuth cancellation", () => {
 
 describe("isTrustedDatabricksOrigin", () => {
   it("accepts https workspace and account hosts", () => {
-    assert.equal(oauth.isTrustedDatabricksOrigin("https://ws.cloud.databricks.com"), true);
-    assert.equal(oauth.isTrustedDatabricksOrigin("https://accounts.cloud.databricks.com"), true);
-    assert.equal(oauth.isTrustedDatabricksOrigin("https://x.azuredatabricks.net"), true);
+    assert.equal(isTrustedDatabricksOrigin("https://ws.cloud.databricks.com"), true);
+    assert.equal(isTrustedDatabricksOrigin("https://accounts.cloud.databricks.com"), true);
+    assert.equal(isTrustedDatabricksOrigin("https://x.azuredatabricks.net"), true);
   });
   it("rejects look-alikes, http, and junk", () => {
-    assert.equal(oauth.isTrustedDatabricksOrigin("https://evil-databricks.com"), false);
-    assert.equal(oauth.isTrustedDatabricksOrigin("https://databricks.com.attacker.net"), false);
-    assert.equal(oauth.isTrustedDatabricksOrigin("http://ws.cloud.databricks.com"), false);
-    assert.equal(oauth.isTrustedDatabricksOrigin("not a url"), false);
+    assert.equal(isTrustedDatabricksOrigin("https://evil-databricks.com"), false);
+    assert.equal(isTrustedDatabricksOrigin("https://databricks.com.attacker.net"), false);
+    assert.equal(isTrustedDatabricksOrigin("http://ws.cloud.databricks.com"), false);
+    assert.equal(isTrustedDatabricksOrigin("not a url"), false);
   });
 });
 
@@ -328,7 +360,7 @@ describe("token store round-trip (saveWorkspaceToken / loadTokens)", () => {
       { access_token: "a", refresh_token: "r", expires_at: future() },
       ACCT,
     );
-    const entry = oauth.loadTokens(WS);
+    const entry = stored(WS);
     assert.equal(entry.access_token, "a");
     assert.equal(entry.refresh_token, "r");
     assert.deepEqual(entry.account, ACCT);
@@ -341,7 +373,7 @@ describe("token store round-trip (saveWorkspaceToken / loadTokens)", () => {
       { access_token: "a", refresh_token: "r", expires_at: future() },
       null,
     );
-    assert.equal(oauth.loadTokens(WS).account, undefined);
+    assert.equal(stored(WS).account, undefined);
   });
 });
 
@@ -370,10 +402,10 @@ describe("access-token expiry simulation", () => {
       expires_at: 0,
       account: ACCT,
     });
-    assert.equal(oauth.loadTokens(sibling).expires_at, expiresAt);
+    assert.equal(stored(sibling).expires_at, expiresAt);
     assert.equal(await oauth.getValidStoredToken(WS), "new");
     assert.equal(calls.length, 1);
-    assert.equal(new URLSearchParams(calls[0].body).get("refresh_token"), "r");
+    assert.equal(new URLSearchParams(calls[0]?.body).get("refresh_token"), "r");
   });
   it("does not invent a token when there is no stored login", () => {
     assert.equal(oauth.expireStoredAccessToken(WS), false);
@@ -404,7 +436,7 @@ describe("refresh-token invalidation", () => {
       expires_at: expiresAt,
       account: ACCT,
     });
-    assert.equal(oauth.loadTokens(sibling).refresh_token, "other-r");
+    assert.equal(stored(sibling).refresh_token, "other-r");
     assert.equal(await oauth.getValidStoredToken(WS), "a");
     assert.equal(calls.length, 0);
     oauth.expireStoredAccessToken(WS);
@@ -419,7 +451,7 @@ describe("refresh-token invalidation", () => {
     assert.equal(oauth.loadTokens(WS), null);
     oauth.saveWorkspaceToken(WS, { access_token: "a", expires_at: future() }, null);
     assert.equal(oauth.removeStoredRefreshToken(WS), false);
-    assert.equal(oauth.loadTokens(WS).access_token, "a");
+    assert.equal(stored(WS).access_token, "a");
   });
 });
 
@@ -445,14 +477,14 @@ describe("token endpoint redirects", () => {
           "x-databricks-request-id": `redirect-${status}`,
         }),
       }));
-      await assert.rejects(oauth.getValidStoredToken(WS), (error) => {
+      await assert.rejects(oauth.getValidStoredToken(WS), (error: TokenEndpointError) => {
         assert.equal(error.status, status);
         assert.equal(error.requestId, `redirect-${status}`);
         assert.match(error.message, new RegExp(`token endpoint ${status}`));
         return true;
       });
       assert.equal(calls.length, 1);
-      assert.equal(calls[0].redirect, "manual");
+      assert.equal(calls[0]?.redirect, "manual");
       assert.deepEqual(oauth.loadTokens(WS), before);
     });
   }
@@ -465,7 +497,7 @@ describe("whenRefreshSettled", () => {
       { access_token: "old", refresh_token: "r1", expires_at: past() },
       null,
     );
-    let respond;
+    let respond!: (response: unknown) => void;
     mock.method(
       globalThis,
       "fetch",
@@ -486,7 +518,7 @@ describe("whenRefreshSettled", () => {
     respond(ok({ access_token: "new", refresh_token: "r2", expires_in: 3600 }));
     await refreshing;
     await waiting;
-    assert.equal(oauth.loadTokens(WS).refresh_token, "r2");
+    assert.equal(stored(WS).refresh_token, "r2");
 
     oauth.saveWorkspaceToken(
       WS,
@@ -528,7 +560,7 @@ describe("getValidStoredToken", () => {
       ok({ access_token: "new", refresh_token: "r1", expires_in: 3600 }),
     );
     assert.equal(await oauth.getValidStoredToken(WS), "new");
-    assert.equal(calls[0].url, `${WS}/oidc/v1/token`);
+    assert.equal(calls[0]?.url, `${WS}/oidc/v1/token`);
   });
 
   it("SPOG: refreshes at the account token endpoint with the account id in the path", async () => {
@@ -541,7 +573,7 @@ describe("getValidStoredToken", () => {
       ok({ access_token: "new", refresh_token: "r1", expires_in: 3600 }),
     );
     await oauth.getValidStoredToken(WS);
-    assert.equal(calls[0].url, `${ACCT.origin}/oidc/accounts/${ACCT.id}/v1/token`);
+    assert.equal(calls[0]?.url, `${ACCT.origin}/oidc/accounts/${ACCT.id}/v1/token`);
   });
 
   it("persists the rotated (single-use) refresh token", async () => {
@@ -552,7 +584,7 @@ describe("getValidStoredToken", () => {
     );
     mockTokenFetch(() => ok({ access_token: "new", refresh_token: "r1", expires_in: 3600 }));
     await oauth.getValidStoredToken(WS);
-    assert.equal(oauth.loadTokens(WS).refresh_token, "r1");
+    assert.equal(stored(WS).refresh_token, "r1");
   });
 
   it("keeps the old refresh token when the server does not rotate", async () => {
@@ -563,7 +595,7 @@ describe("getValidStoredToken", () => {
     );
     mockTokenFetch(() => ok({ access_token: "new", expires_in: 3600 })); // no refresh_token
     await oauth.getValidStoredToken(WS);
-    assert.equal(oauth.loadTokens(WS).refresh_token, "r0");
+    assert.equal(stored(WS).refresh_token, "r0");
   });
 
   it("dedupes concurrent refreshes into a single request (single-use safety)", async () => {
@@ -599,13 +631,11 @@ describe("getValidStoredToken", () => {
   });
 
   it("logs token request metadata without credentials or raw error responses", async () => {
-    const logs = [];
-    const events = [];
-    mock.method(require("../src/diagnostics.ts").diagnostics, "record", (...args) =>
-      events.push(args),
-    );
-    mock.method(console, "log", (...args) => logs.push(args));
-    mock.method(console, "warn", (...args) => logs.push(args));
+    const logs: unknown[][] = [];
+    const events: unknown[][] = [];
+    mock.method(diagnostics, "record", (...args: unknown[]) => events.push(args));
+    mock.method(console, "log", (...args: unknown[]) => logs.push(args));
+    mock.method(console, "warn", (...args: unknown[]) => logs.push(args));
     oauth.saveWorkspaceToken(
       WS,
       {
@@ -622,7 +652,7 @@ describe("getValidStoredToken", () => {
       }),
       headers: new Headers({ "x-databricks-request-id": "trace-test" }),
     }));
-    await assert.rejects(oauth.getValidStoredToken(WS), (error) => {
+    await assert.rejects(oauth.getValidStoredToken(WS), (error: TokenEndpointError) => {
       assert.equal(error.status, 403);
       assert.equal(error.errorCode, "invalid_scope");
       assert.equal(error.requestId, "trace-test");

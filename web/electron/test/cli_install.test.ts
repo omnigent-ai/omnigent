@@ -1,21 +1,32 @@
-"use strict";
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
-const { installCli, ensureUv } = require("../src/cli_install");
+import {
+  installCli,
+  ensureUv,
+  type InstallerSpawnOptions,
+  type SpawnInstaller,
+} from "../src/cli_install.ts";
+
+interface SpawnCall {
+  command: string;
+  args: string[];
+  opts: InstallerSpawnOptions;
+}
 
 /** A fake child: an EventEmitter with stdout/stderr stream stubs. */
 function fakeChild() {
-  const child = new EventEmitter();
-  child.stdout = new EventEmitter();
-  child.stderr = new EventEmitter();
-  child.kill = () => {};
-  return child;
+  return Object.assign(new EventEmitter(), {
+    pid: undefined as number | undefined,
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    kill: () => {},
+  });
 }
 
 /** A spawn stub that records argv/opts and exits each child with `codes.shift()`. */
-function spawnStub(codes, calls) {
+function spawnStub(codes: number[], calls: SpawnCall[]): SpawnInstaller {
   return (command, args, opts) => {
     calls.push({ command, args, opts });
     const child = fakeChild();
@@ -38,8 +49,8 @@ describe("installCli", () => {
   });
 
   it("rejects a relative path or a wrong basename (never spawns)", async () => {
-    const calls = [];
-    const tryBad = (bad) =>
+    const calls: SpawnCall[] = [];
+    const tryBad = (bad: string) =>
       installCli({
         platform: "darwin",
         resolveInstallScript: () => bad,
@@ -57,7 +68,7 @@ describe("installCli", () => {
   });
 
   it("runs the script (uv already present) and reports success", async () => {
-    const calls = [];
+    const calls: SpawnCall[] = [];
     const res = await installCli({
       platform: "darwin",
       resolveInstallScript: () => "/res/install_oss.sh",
@@ -65,12 +76,12 @@ describe("installCli", () => {
       spawn: spawnStub([0], calls),
     });
     assert.equal(res.ok, true);
-    assert.equal(calls[0].command, "sh");
-    assert.deepEqual(calls[0].args, ["/res/install_oss.sh", "--non-interactive"]);
+    assert.equal(calls[0]?.command, "sh");
+    assert.deepEqual(calls[0]?.args, ["/res/install_oss.sh", "--non-interactive"]);
   });
 
   it("stops when uv can't be ensured", async () => {
-    const calls = [];
+    const calls: SpawnCall[] = [];
     const res = await installCli({
       platform: "darwin",
       resolveInstallScript: () => "/res/install_oss.sh",
@@ -111,7 +122,7 @@ describe("ensureUv", () => {
   it("installs uv when missing, then succeeds once it appears", async () => {
     const seen = [false, true]; // absent before install, present after
     const res = await ensureUv({
-      hasUv: () => seen.shift(),
+      hasUv: () => seen.shift() === true,
       spawn: spawnStub([0], []),
     });
     assert.equal(res.ok, true);
@@ -127,19 +138,19 @@ describe("ensureUv", () => {
   });
 
   it("re-checks with ~/.local/bin added to PATH after installing uv", async () => {
-    const paths = [];
+    const paths: (string | undefined)[] = [];
     const res = await ensureUv({
       home: "/home/tester",
       env: { PATH: "/usr/bin" },
       // uv only resolves once ~/.local/bin is on PATH (the fresh-install case).
       hasUv: (env) => {
         paths.push(env.PATH);
-        return env.PATH.includes("/home/tester/.local/bin");
+        return env.PATH?.includes("/home/tester/.local/bin") ?? false;
       },
       spawn: spawnStub([0], []),
     });
     assert.equal(res.ok, true);
-    assert.match(res.env.PATH, /\/home\/tester\/\.local\/bin/);
+    assert.match(String(res.ok && res.env?.PATH), /\/home\/tester\/\.local\/bin/);
     // First check saw the bare PATH (miss), post-install check saw the augmented one.
     assert.equal(paths[0], "/usr/bin");
   });
@@ -147,9 +158,12 @@ describe("ensureUv", () => {
 
 describe("runStreaming timeout", () => {
   it("kills the process group and settles even if the child never exits", async () => {
-    const signals = [];
+    const signals: { pid: number; sig: string | number | undefined }[] = [];
     const originalKill = process.kill;
-    process.kill = (pid, sig) => signals.push({ pid, sig });
+    process.kill = (pid, sig) => {
+      signals.push({ pid, sig });
+      return true;
+    };
     try {
       // A child that ignores signals and never emits exit.
       const stubborn = fakeChild();

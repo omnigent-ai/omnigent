@@ -208,23 +208,27 @@ function loadMainHarness({
     },
     "./workspace-chrome.ts": { registerWorkspaceChromeHide: () => {} },
     "./workspace-root-bounce.ts": { registerWorkspaceRootBounce: () => {} },
-    // databricks-session (transitively) requires electron's `net`, unresolvable
-    // under the sandbox's real require; behavior is covered in databricks-*.test.js.
-    "./databricks-session": {
-      ensureDatabricksSession: async (_ses, origin) => {
-        calls.authRequests.push(origin);
-        return origin;
-      },
+    // The real modules reach the network and the token store; their behavior is
+    // covered in databricks-*.test.ts.
+    "./databricks-session.ts": {
+      createDatabricksSession: () => ({
+        ensureDatabricksSession: async (_ses, origin) => {
+          calls.authRequests.push(origin);
+          return origin;
+        },
+      }),
     },
-    "./databricks-oauth": {
-      expireStoredAccessToken: (origin) => {
-        calls.expiredAccess.push(origin);
-        return true;
-      },
-      removeStoredRefreshToken: (origin) => {
-        calls.removedRefresh.push(origin);
-        return true;
-      },
+    "./databricks-oauth.ts": {
+      createDatabricksOAuth: () => ({
+        expireStoredAccessToken: (origin) => {
+          calls.expiredAccess.push(origin);
+          return true;
+        },
+        removeStoredRefreshToken: (origin) => {
+          calls.removedRefresh.push(origin);
+          return true;
+        },
+      }),
     },
     "./omnigent_cli": {
       isExecutableFile: () => false,

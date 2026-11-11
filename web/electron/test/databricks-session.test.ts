@@ -1,13 +1,20 @@
-"use strict";
+import { afterEach, describe, it, mock } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { Writable } from "node:stream";
+import fs from "node:fs";
+import path from "node:path";
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
-const { Writable } = require("node:stream");
-const fs = require("node:fs");
-const path = require("node:path");
-const vm = require("node:vm");
-const { createRequire } = require("node:module");
+import {
+  createDatabricksSession,
+  type BridgeNet,
+  type BridgeRequest,
+  type BridgeRequestOptions,
+  type DatabricksBridgeSession,
+  type EnsureSessionOptions,
+  type SessionCookie,
+} from "../src/databricks-session.ts";
+import type { DatabricksTokens } from "../src/databricks-oauth.ts";
 
 const ORIGIN = "https://workspace.cloud.databricks.com";
 // Shape of the workspace IP access list rejection seen off the corporate VPN.
@@ -26,53 +33,90 @@ const COOKIE = {
   value: "new",
 };
 
-function harness({ respond, follow, oldCookie = false, stored } = {}) {
-  const requests = [];
-  const logs = [];
-  const calls = { browser: 0, stored: 0, storedOrigins: [] };
-  let jar = oldCookie ? [{ ...COOKIE, value: "old" }] : [];
+afterEach(() => mock.restoreAll());
+
+/** A fake `net.request` result: a real Writable plus what the test inspects. */
+type FakeRequest = Writable & {
+  options: BridgeRequestOptions;
+  events: string[];
+  aborted: boolean;
+  followed: number;
+};
+
+type Respond = (request: FakeRequest, response: RespondWith) => void;
+type RespondWith = (
+  request: FakeRequest,
+  status?: number,
+  writeCookie?: boolean,
+  options?: { body?: string; headers?: Record<string, string> },
+) => void;
+
+/** The fields a bridge or sign-in failure carries. */
+type BridgeError = Error & {
+  phase?: string;
+  status?: number;
+  errorCode?: string;
+  requestId?: string;
+  storedOrigin?: string;
+};
+
+interface HarnessOptions {
+  respond?: Respond;
+  follow?: Respond;
+  oldCookie?: boolean;
+  stored?: (origin: string) => string;
+}
+
+function harness({ respond, follow, oldCookie = false, stored }: HarnessOptions = {}) {
+  const requests: FakeRequest[] = [];
+  const logs: unknown[][] = [];
+  const calls = { browser: 0, stored: 0, storedOrigins: [] as string[] };
+  let jar: SessionCookie[] = oldCookie ? [{ ...COOKIE, value: "old" }] : [];
   const cookies = Object.assign(new EventEmitter(), { get: async () => jar });
-  const ses = { cookies };
-  function response(request, status = 200, writeCookie = true, { body = "", headers = {} } = {}) {
+  const ses = { cookies } satisfies DatabricksBridgeSession;
+  const response: RespondWith = (
+    request,
+    status = 200,
+    writeCookie = true,
+    { body = "", headers = {} } = {},
+  ) => {
     if (writeCookie) {
       jar = [COOKIE];
       cookies.emit("changed", {}, COOKIE, "explicit", false);
     }
-    const res = new EventEmitter();
-    res.statusCode = status;
-    res.headers = headers;
+    const res = Object.assign(new EventEmitter(), { statusCode: status, headers });
     request.emit("response", res);
     if (body) res.emit("data", body);
     res.emit("end");
     res.emit("close");
-  }
-  const net = {
+  };
+  const net: BridgeNet = {
     request: (options) => {
       // Electron closes its Writable after end(), before the network response arrives.
-      const req = Object.assign(
+      const req: FakeRequest = Object.assign(
         new Writable({
           autoDestroy: true,
           final(callback) {
             callback();
             setImmediate(() => {
-              if (this.aborted) return;
-              if (respond) respond(this, response);
-              else this.emit("redirect", 302, "GET", `${ORIGIN}/omnigent`, {});
+              if (req.aborted) return;
+              if (respond) respond(req, response);
+              else req.emit("redirect", 302, "GET", `${ORIGIN}/omnigent`, {});
             });
           },
         }),
         {
           options,
-          events: [],
+          events: [] as string[],
           aborted: false,
           followed: 0,
           setHeader() {},
-          abort() {
+          abort(this: FakeRequest) {
             this.aborted = true;
             this.emit("abort");
             this.destroy();
           },
-          followRedirect() {
+          followRedirect(this: FakeRequest) {
             this.followed++;
             if (follow) follow(this, response);
             else response(this);
@@ -83,43 +127,33 @@ function harness({ respond, follow, oldCookie = false, stored } = {}) {
         req.on(event, () => req.events.push(event));
       }
       requests.push(req);
-      return req;
+      // The fake emits the request events the bridge listens for.
+      return req as FakeRequest & BridgeRequest;
     },
   };
-  const file = path.join(__dirname, "../src/databricks-session.js");
-  const realRequire = createRequire(file);
-  const module = { exports: {} };
-  vm.runInNewContext(
-    fs.readFileSync(file, "utf8"),
-    {
-      module,
-      URL,
-      console: { log: (...args) => logs.push(args), warn: (...args) => logs.push(args) },
-      setTimeout,
-      clearTimeout,
-      require: (specifier) => {
-        if (specifier === "electron") return { net };
-        if (specifier === "./databricks-oauth")
-          return {
-            isTrustedDatabricksOrigin: realRequire("./url.ts").isDatabricksOAuthServerUrl,
-            runInteractiveLogin: async () => {
-              calls.browser++;
-              return { tokens: { access_token: "token" }, issuerOrigin: ORIGIN };
-            },
-            getValidStoredToken: async (origin) => {
-              calls.stored++;
-              calls.storedOrigins.push(origin);
-              return stored ? stored(origin) : "token";
-            },
-            saveWorkspaceToken() {},
-          };
-        if (specifier === "./databricks-account") return { parseAccountFromToken: () => null };
-        return realRequire(specifier);
+  mock.method(console, "log", (...args: unknown[]) => logs.push(args));
+  mock.method(console, "warn", (...args: unknown[]) => logs.push(args));
+  const session = createDatabricksSession({
+    net,
+    oauth: {
+      runInteractiveLogin: async () => {
+        calls.browser++;
+        // Only `access_token` is read on this path.
+        return { tokens: { access_token: "token" } as DatabricksTokens, issuerOrigin: ORIGIN };
       },
+      getValidStoredToken: async (origin) => {
+        calls.stored++;
+        calls.storedOrigins.push(origin);
+        return stored ? stored(origin) : "token";
+      },
+      saveWorkspaceToken() {},
     },
-    { filename: file },
-  );
-  return { ...module.exports, requests, ses, calls, logs };
+    accountWorkspaces: {
+      parseAccountFromToken: () => null,
+      listRunningWorkspaces: async () => assert.fail("no account lookup expected"),
+    },
+  });
+  return { ...session, requests, ses, calls, logs };
 }
 
 describe("Databricks session preparation", () => {
@@ -140,13 +174,22 @@ describe("Databricks session preparation", () => {
     assert.equal(h.calls.stored, 0);
     assert.equal(h.requests.length, 0);
   });
-  const throws = (message, props) => () => {
+  const throws = (message: string, props: object) => (): never => {
     throw Object.assign(new Error(message), props);
   };
   const noToken = throws("no stored Databricks token", { errorCode: "NO_STORED_TOKEN" });
   const account = "https://accounts.cloud.databricks.com";
   let redirects = 0;
-  for (const [label, options, expected] of [
+  const cases: [
+    label: string,
+    options: HarnessOptions & { origin?: string; connect?: EnsureSessionOptions },
+    expected: {
+      stored: string[];
+      browser: number;
+      resolves?: string;
+      rejects?: RegExp | ((error: BridgeError) => boolean);
+    },
+  ][] = [
     ["connects with stored credentials", {}, { stored: [ORIGIN], browser: 0 }],
     [
       "skips stored credentials when a browser sign-in is required",
@@ -162,7 +205,7 @@ describe("Databricks session preparation", () => {
     [
       "signs in when the stored credentials' session is sent to login",
       {
-        respond: (req) =>
+        respond: (req: FakeRequest) =>
           req.emit(
             "redirect",
             302,
@@ -174,7 +217,7 @@ describe("Databricks session preparation", () => {
     ],
     [
       "signs in to an account URL since tokens are stored per workspace",
-      { origin: account, stored: (origin) => (origin === ORIGIN ? "token" : noToken()) },
+      { origin: account, stored: (origin: string) => (origin === ORIGIN ? "token" : noToken()) },
       { stored: [account], browser: 1 },
     ],
     [
@@ -189,7 +232,7 @@ describe("Databricks session preparation", () => {
     ],
     [
       "reports an unreachable workspace without opening the browser",
-      { respond: (req) => req.emit("error", new Error("net::ERR_NAME_NOT_RESOLVED")) },
+      { respond: (req: FakeRequest) => req.emit("error", new Error("net::ERR_NAME_NOT_RESOLVED")) },
       { rejects: /ERR_NAME_NOT_RESOLVED/, stored: [ORIGIN], browser: 0 },
     ],
     [
@@ -197,15 +240,16 @@ describe("Databricks session preparation", () => {
       {
         origin: account,
         connect: { storedOrigin: ORIGIN },
-        respond: (req) => req.emit("error", new Error("net::ERR_NAME_NOT_RESOLVED")),
+        respond: (req: FakeRequest) => req.emit("error", new Error("net::ERR_NAME_NOT_RESOLVED")),
       },
       {
-        rejects: (error) => error.storedOrigin === ORIGIN,
+        rejects: (error: BridgeError) => error.storedOrigin === ORIGIN,
         stored: [ORIGIN],
         browser: 0,
       },
     ],
-  ]) {
+  ];
+  for (const [label, options, expected] of cases) {
     it(`on connect, ${label}`, async () => {
       const h = harness(options);
       const connect = h.ensureDatabricksSession(h.ses, options.origin ?? ORIGIN, options.connect);
@@ -226,7 +270,7 @@ describe("Databricks session preparation", () => {
     });
     await assert.rejects(
       h.ensureDatabricksSession(h.ses, ORIGIN, { signal: controller.signal }),
-      (error) => error.name === "AbortError",
+      (error: Error) => error.name === "AbortError",
     );
     assert.equal(h.calls.browser, 0);
   });
@@ -242,21 +286,21 @@ describe("Databricks cookie minting", () => {
   it("follows the intended same-origin app redirect and confirms the cookie", async () => {
     const h = harness();
     await h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent");
-    assert.equal(h.requests[0].options.redirect, "manual");
-    assert.equal(h.requests[0].options.useSessionCookies, true);
-    assert.equal(h.requests[0].followed, 1);
+    assert.equal(h.requests[0]!.options.redirect, "manual");
+    assert.equal(h.requests[0]!.options.useSessionCookies, true);
+    assert.equal(h.requests[0]!.followed, 1);
     assert.equal(h.ses.cookies.listenerCount("changed"), 0);
   });
   it("waits for the response when the request writable closes before the redirect", async () => {
     const h = harness();
     await h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent");
-    assert.deepEqual(h.requests[0].events, ["close", "redirect", "response"]);
+    assert.deepEqual(h.requests[0]!.events, ["close", "redirect", "response"]);
     assert.equal(h.ses.cookies.listenerCount("changed"), 0);
   });
   it("rejects login redirects instead of performing embedded session authentication", async () => {
     const h = harness({
       oldCookie: true,
-      respond(req) {
+      respond(req: FakeRequest) {
         req.emit("redirect", 303, "GET", `${ORIGIN}/login/sso`, {});
       },
     });
@@ -264,8 +308,8 @@ describe("Databricks cookie minting", () => {
       h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent"),
       /unexpected destination/,
     );
-    assert.equal(h.requests[0].followed, 0);
-    assert.equal(h.requests[0].aborted, true);
+    assert.equal(h.requests[0]!.followed, 0);
+    assert.equal(h.requests[0]!.aborted, true);
   });
   it("rejects an unchanged stale cookie even after a 200 response", async () => {
     const h = harness({ oldCookie: true, respond: (req, response) => response(req, 200, false) });
@@ -291,7 +335,7 @@ describe("Databricks cookie minting", () => {
     });
     await assert.rejects(
       h.mintSessionCookie(h.ses, ORIGIN, "private-access-token", "/omnigent"),
-      (error) => {
+      (error: BridgeError) => {
         assert.equal(error.phase, "session-create");
         assert.equal(error.status, 403);
         assert.equal(error.errorCode, "PERMISSION_DENIED");
@@ -310,28 +354,34 @@ describe("Databricks cookie minting", () => {
   });
   it("labels a session-create 403 from the workspace IP access list without logging the address", async () => {
     const h = harness({ respond: (req, response) => response(req, 403, false, IP_ACL_RESPONSE) });
-    await assert.rejects(h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent"), (error) => {
-      assert.equal(error.status, 403);
-      assert.equal(error.errorCode, "IP_ACL_BLOCKED");
-      assert.doesNotMatch(error.message, /203\.0\.113\.7|IP ACL/);
-      return true;
-    });
+    await assert.rejects(
+      h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent"),
+      (error: BridgeError) => {
+        assert.equal(error.status, 403);
+        assert.equal(error.errorCode, "IP_ACL_BLOCKED");
+        assert.doesNotMatch(error.message, /203\.0\.113\.7|IP ACL/);
+        return true;
+      },
+    );
     const output = JSON.stringify(h.logs);
     assert.match(output, /IP_ACL_BLOCKED/);
     assert.doesNotMatch(output, /203\.0\.113\.7|IP ACL/);
   });
   it("distinguishes a landing-page 403 from a session-create 403", async () => {
     const h = harness({ follow: (req, response) => response(req, 403) });
-    await assert.rejects(h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent"), (error) => {
-      assert.equal(error.phase, "workspace landing");
-      assert.match(error.message, /landing after.*redirect/);
-      assert.equal(error.status, 403);
-      return true;
-    });
+    await assert.rejects(
+      h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent"),
+      (error: BridgeError) => {
+        assert.equal(error.phase, "workspace landing");
+        assert.match(error.message, /landing after.*redirect/);
+        assert.equal(error.status, 403);
+        return true;
+      },
+    );
   });
   it("logs redirect destinations without their authorization query parameters", async () => {
     const h = harness({
-      respond(req) {
+      respond(req: FakeRequest) {
         req.emit(
           "redirect",
           302,
@@ -353,14 +403,14 @@ describe("Databricks cookie minting", () => {
     const minting = h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent", {
       signal: controller.signal,
     });
-    const rejected = assert.rejects(minting, (error) => error.name === "AbortError");
+    const rejected = assert.rejects(minting, (error: Error) => error.name === "AbortError");
     await new Promise((resolve) => {
       setImmediate(resolve);
     });
     assert.equal(h.requests.length, 1);
     controller.abort();
     await rejected;
-    assert.equal(h.requests[0].aborted, true);
+    assert.equal(h.requests[0]!.aborted, true);
     assert.equal(h.ses.cookies.listenerCount("changed"), 0);
   });
   it("does not start cookie minting after cancellation", async () => {
@@ -369,15 +419,15 @@ describe("Databricks cookie minting", () => {
     controller.abort();
     await assert.rejects(
       h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent", { signal: controller.signal }),
-      (error) => error.name === "AbortError",
+      (error: Error) => error.name === "AbortError",
     );
     assert.equal(h.requests.length, 0);
   });
   it("settles on timeout even when abort emits no error", async () => {
     const h = harness({ respond() {} });
-    let timeout;
-    let started;
-    const timerReady = new Promise((resolve) => {
+    let timeout: (() => void) | undefined;
+    let started!: () => void;
+    const timerReady = new Promise<void>((resolve) => {
       started = resolve;
     });
     const promise = h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent", {
@@ -396,16 +446,18 @@ describe("Databricks cookie minting", () => {
     await new Promise((resolve) => {
       setImmediate(resolve);
     });
-    assert.deepEqual(h.requests[0].events, ["close"]);
-    timeout();
+    assert.deepEqual(h.requests[0]!.events, ["close"]);
+    timeout?.();
     await rejected;
-    assert.equal(h.requests[0].aborted, true);
+    assert.equal(h.requests[0]!.aborted, true);
     assert.equal(h.ses.cookies.listenerCount("changed"), 0);
   });
   it("rejects request errors and aborts after the writable stream has closed", async () => {
     await Promise.all(
       ["error", "abort"].map((event) => {
-        const h = harness({ respond: (req) => req.emit(event, new Error("network failed")) });
+        const h = harness({
+          respond: (req: FakeRequest) => req.emit(event, new Error("network failed")),
+        });
         return assert.rejects(
           h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent"),
           /network failed|request aborted/,
@@ -415,30 +467,37 @@ describe("Databricks cookie minting", () => {
   });
   it("rejects a response that errors, aborts, or closes before end", async () => {
     await Promise.all(
-      [
-        ["error", undefined],
-        ["aborted", "SESSION_TRANSPORT"],
-        ["close", "SESSION_TRANSPORT"],
-      ].map(([event, errorCode]) => {
+      (
+        [
+          ["error", undefined],
+          ["aborted", "SESSION_TRANSPORT"],
+          ["close", "SESSION_TRANSPORT"],
+        ] as const
+      ).map(([event, errorCode]) => {
         const h = harness({
-          respond(req) {
+          respond(req: FakeRequest) {
             const res = new EventEmitter();
             req.emit("response", res);
             res.emit(event, new Error("response failed"));
           },
         });
-        return assert.rejects(h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent"), (error) => {
-          assert.match(error.message, /response failed|response aborted|response closed/);
-          assert.equal(error.errorCode, errorCode);
-          return true;
-        });
+        return assert.rejects(
+          h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent"),
+          (error: BridgeError) => {
+            assert.match(error.message, /response failed|response aborted|response closed/);
+            assert.equal(error.errorCode, errorCode);
+            return true;
+          },
+        );
       }),
     );
   });
   it("ships the workspace picker HTML and script", () => {
-    const packageJson = require("../package.json");
+    const packageJson = JSON.parse(
+      fs.readFileSync(path.join(import.meta.dirname, "../package.json"), "utf8"),
+    ) as { build: { files: string[] } };
     assert.ok(packageJson.build.files.includes("workspace-picker/**/*"));
-    assert.ok(fs.existsSync(path.join(__dirname, "../workspace-picker/index.html")));
-    assert.ok(fs.existsSync(path.join(__dirname, "../workspace-picker/picker.js")));
+    assert.ok(fs.existsSync(path.join(import.meta.dirname, "../workspace-picker/index.html")));
+    assert.ok(fs.existsSync(path.join(import.meta.dirname, "../workspace-picker/picker.js")));
   });
 });

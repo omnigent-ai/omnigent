@@ -1,7 +1,12 @@
 "use strict";
 
 const { spawn } = require("node:child_process");
-const { buildConnectArgs, describeConnectFailure, resolveArcaPath } = require("./arca");
+const { withTestOverrides } = require("./testOverrides");
+
+const { buildConnectArgs, describeConnectFailure, resolveArcaPath } = withTestOverrides(
+  "arca",
+  require("./arca"),
+);
 
 // Allows time for the first start and both browser sign-ins.
 const SETUP_TIMEOUT_MS = 15 * 60 * 1000;
