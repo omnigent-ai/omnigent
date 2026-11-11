@@ -5689,9 +5689,8 @@ def create_runner_app(
                 raise
             except asyncio.CancelledError as exc:
                 owns_active_turn = owns_turn()
-                _logger.log(
-                    logging.ERROR if owns_active_turn else logging.WARNING,
-                    "turn setup cancelled for %s: %s",
+                _logger.error(
+                    "turn cancelled for %s: %s",
                     conv,
                     exc,
                     exc_info=True,

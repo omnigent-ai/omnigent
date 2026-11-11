@@ -2442,9 +2442,13 @@ async def test_background_setup_failure_preserves_replacement_turn(
                 assert manager.cleared_in_flight == expected_clears
                 assert session_id in app.state.interrupted_sessions
                 assert not events
+                diagnostic_level = logging.ERROR if outcome == "cancelled" else logging.WARNING
+                diagnostic_message = (
+                    "turn cancelled" if outcome == "cancelled" else "turn setup failed"
+                )
                 assert any(
-                    record.levelno == logging.WARNING
-                    and "setup" in record.message
+                    record.levelno == diagnostic_level
+                    and diagnostic_message in record.message
                     and record.exc_info is not None
                     for record in caplog.records
                 )
