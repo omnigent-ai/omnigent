@@ -7,28 +7,115 @@
 // `rootDir`, `nowMs`) so tests drive it without Chrome, a Keychain or Electron.
 // See `web/electron/README.md` for the user-facing behaviour.
 
-"use strict";
-
-const crypto = require("node:crypto");
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
-const { execFile } = require("node:child_process");
-const { promisify } = require("node:util");
+import { execFile } from "node:child_process";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
+/** Runs a system binary; `execFile` promisified. Its stdout is untrusted. */
+export type RunCommand = (
+  file: string,
+  args: string[],
+  options?: { timeout: number },
+) => Promise<{ stdout: unknown }>;
+
+/** The file operations that snapshot a cookie database. */
+export interface SnapshotFs {
+  promises: {
+    mkdtemp: (prefix: string) => Promise<string>;
+    copyFile: (source: string, destination: string) => Promise<void>;
+    rm: (target: string, options: { recursive: boolean; force: boolean }) => Promise<void>;
+  };
+}
+
+/** The file operations that discover Chrome profiles. */
+export interface ProfileFs {
+  promises: {
+    readFile: (file: string, encoding: "utf8") => Promise<string>;
+    readdir: (
+      directory: string,
+      options: { withFileTypes: true },
+    ) => Promise<{ name: string; isDirectory: () => boolean }[]>;
+  };
+  existsSync: (file: string) => boolean;
+}
+
+export type ChromeFs = SnapshotFs & ProfileFs;
+
+/** Electron's cookie `sameSite` values. */
+export type CookieSameSite = "unspecified" | "no_restriction" | "lax" | "strict";
+
+/** A Chrome `cookies` row after `normalizeRow`. */
+export interface CookieRow {
+  hostKey: string;
+  name: string;
+  path: string;
+  value: string;
+  encryptedValue: Buffer;
+  expiresUtc: number;
+  secure: boolean;
+  httpOnly: boolean;
+  sameSite: number;
+  partitionKey: string;
+}
+
+/** The row fields `decodeCookieValue` reads. */
+export interface EncryptedCookieFields {
+  hostKey: string;
+  value?: string;
+  encryptedValue?: Buffer;
+}
+
+/** The row fields `toElectronCookie` reads. */
+export interface ElectronCookieFields {
+  hostKey: string;
+  name: string;
+  path?: string;
+  secure?: boolean;
+  httpOnly?: boolean;
+  sameSite?: number;
+  expiresUtc?: number;
+}
+
+/** A `session.cookies.set` payload. */
+export interface ElectronCookie {
+  url: string;
+  name: string;
+  value: string;
+  path: string;
+  secure: boolean;
+  domain?: string;
+  httpOnly?: boolean;
+  sameSite?: CookieSameSite;
+  expirationDate?: number;
+}
+
+export interface ChromeProfile {
+  id: string;
+  name: string;
+  cookieDbPath: string;
+}
+
+/** A property of a JSON value, read the way `value?.[key]` would. */
+function propertyOf(value: unknown, key: string): unknown {
+  return value == null ? undefined : (value as Record<string, unknown>)[key];
+}
+
 /** Chrome's encryption key lives under this Keychain generic password. */
-const SAFE_STORAGE_SERVICE = "Chrome Safe Storage";
+export const SAFE_STORAGE_SERVICE = "Chrome Safe Storage";
 
 // Absolute paths: a GUI-launched shell has a minimal PATH, and a PATH lookup
 // would let a planted binary stand in for the one that reads Chrome's key.
 const SQLITE3_BINARY = "/usr/bin/sqlite3";
 const SECURITY_BINARY = "/usr/bin/security";
 /** Chrome's PBKDF2 parameters for the "v10" AES key (unchanged since 2013). */
-const KEY_SALT = "saltysalt";
-const KEY_ITERATIONS = 1003;
-const KEY_LENGTH = 16;
+export const KEY_SALT = "saltysalt";
+export const KEY_ITERATIONS = 1003;
+export const KEY_LENGTH = 16;
 /** The Keychain read blocks on a system approval dialog the first time. */
 const KEYCHAIN_TIMEOUT_MS = 120_000;
 /** Seconds between the Windows/Chrome epoch (1601-01-01) and the Unix epoch. */
@@ -50,7 +137,7 @@ const COLUMN_SETS = [
   `${COOKIE_COLUMNS}, expires_utc, secure, httponly`,
 ];
 
-const SAME_SITE_BY_CODE = {
+const SAME_SITE_BY_CODE: Record<string, CookieSameSite | undefined> = {
   "-1": "unspecified",
   0: "no_restriction",
   1: "lax",
@@ -58,21 +145,22 @@ const SAME_SITE_BY_CODE = {
 };
 
 /** Chrome's per-user profile root on macOS. */
-function defaultChromeRoot() {
+export function defaultChromeRoot(): string {
   return path.join(os.homedir(), "Library", "Application Support", "Google", "Chrome");
 }
 
-function messageOf(err) {
+function messageOf(err: unknown): string {
   if (!err) return "unknown error";
   if (typeof err === "string") return err;
-  return err.message ? String(err.message) : String(err);
+  const message = propertyOf(err, "message");
+  return message ? String(message) : String(err);
 }
 
-function escapeSqlLiteral(value) {
+function escapeSqlLiteral(value: string): string {
   return String(value).replace(/'/g, "''");
 }
 
-function numberFlag(value) {
+function numberFlag(value: unknown): boolean {
   if (value === true || value === "1") return true;
   return Number(value) === 1;
 }
@@ -82,10 +170,9 @@ function numberFlag(value) {
  * trailing dot, no IPv6 brackets. Throws on anything that isn't a hostname so a
  * malformed host can never reach the SQL literal.
  *
- * @param {string} host
- * @returns {string}
+ * @param host A URL hostname, possibly from the renderer.
  */
-function normalizeHost(host) {
+export function normalizeHost(host: unknown): string {
   const raw = String(host ?? "")
     .trim()
     .toLowerCase();
@@ -103,10 +190,8 @@ function normalizeHost(host) {
  * `mail.google.com`, `google.com`). A bare TLD never hosts cookies, and an IP
  * literal has no parent domain.
  *
- * @param {string} host
- * @returns {string[]}
  */
-function cookieScopeCandidates(host) {
+export function cookieScopeCandidates(host: unknown): string[] {
   const normalized = normalizeHost(host);
   const labels = normalized.split(".");
   const isIpv6 = normalized.includes(":");
@@ -123,11 +208,8 @@ function cookieScopeCandidates(host) {
  * travel upwards, so `accounts.google.com` belongs to `google.com` but
  * `mail.google.com` does not belong to `accounts.google.com`.
  *
- * @param {string} hostKey
- * @param {string} scope
- * @returns {boolean}
  */
-function cookieAppliesToScope(hostKey, scope) {
+export function cookieAppliesToScope(hostKey: string | null | undefined, scope: string): boolean {
   const key = String(hostKey ?? "").replace(/^\./, "");
   if (!key || !scope) return false;
   return key === scope || key.endsWith(`.${scope}`);
@@ -137,12 +219,10 @@ function cookieAppliesToScope(hostKey, scope) {
  * Dotted domain keys that apply down to `scope` from above (`.google.com` for
  * `mail.google.com`). Host-only cookies are excluded: they never travel down.
  *
- * @param {string} scope
- * @returns {string[]}
  */
-function cookieAncestorDomains(scope) {
+function cookieAncestorDomains(scope: string): string[] {
   const labels = scope.split(".");
-  const ancestors = [];
+  const ancestors: string[] = [];
   for (let i = 1; i < labels.length - 1; i += 1) ancestors.push(`.${labels.slice(i).join(".")}`);
   return ancestors;
 }
@@ -151,29 +231,26 @@ function cookieAncestorDomains(scope) {
  * Whether a row belongs to `scope`: anywhere in its tree, or inherited from an
  * ancestor's domain cookie. Chosen so widening the scope only adds cookies.
  *
- * @param {string} hostKey
- * @param {string} scope
- * @returns {boolean}
  */
-function cookieInScope(hostKey, scope) {
+export function cookieInScope(hostKey: string | null | undefined, scope: string): boolean {
   if (cookieAppliesToScope(hostKey, scope)) return true;
   const key = String(hostKey ?? "");
   return key.startsWith(".") && cookieAppliesToScope(scope, key.slice(1));
 }
 
 /** Escape a value for a SQLite `LIKE ... ESCAPE '\\'` pattern. */
-function escapeLike(value) {
+function escapeLike(value: string): string {
   return String(value).replace(/[\\%_]/g, (char) => `\\${char}`);
 }
 
-function chromeExpirySeconds(expiresUtc) {
+export function chromeExpirySeconds(expiresUtc: unknown): number | undefined {
   const micros = Number(expiresUtc);
   if (!Number.isFinite(micros) || micros <= 0) return undefined;
   const seconds = micros / 1e6 - CHROME_EPOCH_OFFSET_SECONDS;
   return seconds > 0 ? seconds : undefined;
 }
 
-function sameSiteValue(code) {
+function sameSiteValue(code: number | null | undefined): CookieSameSite | undefined {
   const key = code == null ? "-1" : String(code);
   return SAME_SITE_BY_CODE[key];
 }
@@ -182,11 +259,13 @@ function sameSiteValue(code) {
  * Drop cookies outside the scope's tree or already expired. Session cookies (no
  * expiry) are kept.
  *
- * @param {object[]} rows normalized rows from `readCookieRows`
- * @param {string} scope
- * @param {number} nowMs
+ * @param rows normalized rows from `readCookieRows`
  */
-function selectCookiesForScope(rows, scope, nowMs = Date.now()) {
+export function selectCookiesForScope<Row extends { hostKey: string; expiresUtc?: number }>(
+  rows: readonly Row[] | null | undefined,
+  scope: string,
+  nowMs: number = Date.now(),
+): Row[] {
   const normalized = normalizeHost(scope);
   const nowSeconds = nowMs / 1000;
   return (rows ?? []).filter((row) => {
@@ -197,7 +276,7 @@ function selectCookiesForScope(rows, scope, nowMs = Date.now()) {
 }
 
 /** AES-128-CBC key Chrome derives from the Keychain password. */
-function deriveMacKey(password) {
+export function deriveMacKey(password: string): Buffer {
   return crypto.pbkdf2Sync(String(password), KEY_SALT, KEY_ITERATIONS, KEY_LENGTH, "sha1");
 }
 
@@ -205,11 +284,8 @@ function deriveMacKey(password) {
  * Decrypt a Chrome `encrypted_value` (the `v10`/`v11` AES-128-CBC envelope,
  * IV = 16 spaces). Returns raw bytes; see `decodeCookieValue` for the plaintext.
  *
- * @param {Buffer} encryptedValue
- * @param {Buffer} key
- * @returns {Buffer}
  */
-function decryptChromeValue(encryptedValue, key) {
+export function decryptChromeValue(encryptedValue: Buffer | null | undefined, key: Buffer): Buffer {
   if (!encryptedValue || encryptedValue.length === 0) {
     throw new Error("empty encrypted value");
   }
@@ -229,7 +305,7 @@ function decryptChromeValue(encryptedValue, key) {
  * Chrome 130+ binds a value to its host by prefixing SHA-256(host_key); strip it
  * when it matches so the cookie value itself comes back intact.
  */
-function stripDomainHash(plaintext, hostKey) {
+function stripDomainHash(plaintext: Buffer, hostKey: string): Buffer {
   // No length guard: an empty value is exactly the prefix, and a shorter buffer
   // fails the comparison anyway.
   const expected = crypto.createHash("sha256").update(hostKey, "utf8").digest();
@@ -242,11 +318,8 @@ function stripDomainHash(plaintext, hostKey) {
  * The cookie's plaintext value. Chrome stores unencrypted values (rare, mostly
  * restored/pre-2013 rows) in `value` with an empty `encrypted_value`.
  *
- * @param {object} row normalized row
- * @param {Buffer} key
- * @returns {string}
  */
-function decodeCookieValue(row, key) {
+export function decodeCookieValue(row: EncryptedCookieFields, key: Buffer): string {
   if (!row.encryptedValue || row.encryptedValue.length === 0) return row.value ?? "";
   const plaintext = stripDomainHash(decryptChromeValue(row.encryptedValue, key), row.hostKey);
   return plaintext.toString("utf8");
@@ -257,16 +330,14 @@ function decodeCookieValue(row, key) {
  * URL is always https so `secure`/`__Host-` cookies are accepted; the cookie's
  * own domain/path scope is carried explicitly.
  *
- * @param {object} row normalized row
- * @param {string} value
  */
-function toElectronCookie(row, value) {
+export function toElectronCookie(row: ElectronCookieFields, value: string): ElectronCookie {
   const isDomainCookie = row.hostKey.startsWith(".");
   const host = isDomainCookie ? row.hostKey.slice(1) : row.hostKey;
   // IPv6 literals need brackets in a URL, or `cookies.set` rejects the cookie.
   const urlHost = host.includes(":") ? `[${host}]` : host;
   const cookiePath = row.path && row.path.startsWith("/") ? row.path : "/";
-  const cookie = {
+  const cookie: ElectronCookie = {
     url: `https://${urlHost}${cookiePath}`,
     name: row.name,
     value,
@@ -286,12 +357,20 @@ function toElectronCookie(row, value) {
  * Turn matching Chrome rows into `session.cookies.set` payloads, collecting the
  * ones we can't decrypt instead of failing the whole import.
  *
- * @param {{ rows: object[], scope: string, key: Buffer, nowMs?: number }} input
- * @returns {{ cookies: object[], skippedCount: number, selectedCount: number }}
  */
-function buildCookiePlan({ rows, scope, key, nowMs = Date.now() }) {
+export function buildCookiePlan({
+  rows,
+  scope,
+  key,
+  nowMs = Date.now(),
+}: {
+  rows: readonly (EncryptedCookieFields & ElectronCookieFields)[];
+  scope: string;
+  key: Buffer;
+  nowMs?: number;
+}): { cookies: ElectronCookie[]; skippedCount: number; selectedCount: number } {
   const selected = selectCookiesForScope(rows, scope, nowMs);
-  const cookies = [];
+  const cookies: ElectronCookie[] = [];
   let skippedCount = 0;
   for (const row of selected) {
     try {
@@ -306,14 +385,15 @@ function buildCookiePlan({ rows, scope, key, nowMs = Date.now() }) {
 }
 
 /** JSON rows out of `sqlite3`, tolerating the CLI's empty-output-for-no-rows. */
-function parseSqliteJson(stdout) {
+function parseSqliteJson(stdout: unknown): Record<string, unknown>[] {
   const text = String(stdout ?? "").trim();
   if (!text) return [];
-  const parsed = JSON.parse(text);
-  return Array.isArray(parsed) ? parsed : [];
+  const parsed: unknown = JSON.parse(text);
+  // `sqlite3 -json` prints an array of row objects; their values stay unknown.
+  return Array.isArray(parsed) ? (parsed as Record<string, unknown>[]) : [];
 }
 
-function normalizeRow(raw) {
+export function normalizeRow(raw: Record<string, unknown>): CookieRow {
   return {
     hostKey: String(raw.host_key ?? ""),
     name: String(raw.name ?? ""),
@@ -337,16 +417,17 @@ function normalizeRow(raw) {
  * Read Chrome's profiles out of `Local State` (name + last-used order), falling
  * back to scanning for profile dirs that hold a cookie DB.
  *
- * @param {{ rootDir?: string, fsImpl?: typeof fs }} [options]
- * @returns {Promise<Array<{ id: string, name: string, cookieDbPath: string }>>}
  */
-async function listChromeProfiles({ rootDir = defaultChromeRoot(), fsImpl = fs } = {}) {
+export async function listChromeProfiles({
+  rootDir = defaultChromeRoot(),
+  fsImpl = fs,
+}: { rootDir?: string | undefined; fsImpl?: ProfileFs } = {}): Promise<ChromeProfile[]> {
   const state = await fsImpl.promises
     .readFile(path.join(rootDir, "Local State"), "utf8")
-    .then((text) => JSON.parse(text))
+    .then((text): unknown => JSON.parse(text))
     .catch(() => null);
-  const infoCache = state?.profile?.info_cache ?? {};
-  const lastUsed = state?.profile?.last_used;
+  const infoCache = propertyOf(propertyOf(state, "profile"), "info_cache") ?? {};
+  const lastUsed = propertyOf(propertyOf(state, "profile"), "last_used");
   let dirs = Object.keys(infoCache).filter(
     (dir) => dir && dir !== "." && dir !== ".." && !/[\\/]/.test(dir),
   );
@@ -359,13 +440,13 @@ async function listChromeProfiles({ rootDir = defaultChromeRoot(), fsImpl = fs }
       return [];
     }
   }
-  if (lastUsed && dirs.includes(lastUsed)) {
+  if (typeof lastUsed === "string" && lastUsed && dirs.includes(lastUsed)) {
     dirs = [lastUsed, ...dirs.filter((dir) => dir !== lastUsed)];
   }
   return dirs
     .map((dir) => ({
       id: dir,
-      name: String(infoCache[dir]?.name || dir),
+      name: String(propertyOf(propertyOf(infoCache, dir), "name") || dir),
       cookieDbPath: path.join(rootDir, dir, "Cookies"),
     }))
     .filter((profile) => fsImpl.existsSync(profile.cookieDbPath));
@@ -378,12 +459,11 @@ async function listChromeProfiles({ rootDir = defaultChromeRoot(), fsImpl = fs }
  * live file entirely, so sqlite's own recovery runs on the copy: nothing here
  * can checkpoint or otherwise rewrite Chrome's database.
  *
- * @template T
- * @param {{ cookieDbPath: string, fsImpl?: typeof fs }} options
- * @param {(snapshotPath: string) => Promise<T>} fn
- * @returns {Promise<T>}
  */
-async function withCookieSnapshot({ cookieDbPath, fsImpl = fs }, fn) {
+async function withCookieSnapshot<T>(
+  { cookieDbPath, fsImpl = fs }: { cookieDbPath: string; fsImpl?: SnapshotFs },
+  fn: (snapshotPath: string) => Promise<T>,
+): Promise<T> {
   const workDir = await fsImpl.promises.mkdtemp(path.join(os.tmpdir(), "omnigent-chrome-cookie-"));
   try {
     const snapshot = path.join(workDir, "Cookies");
@@ -405,10 +485,16 @@ async function withCookieSnapshot({ cookieDbPath, fsImpl = fs }, fn) {
  * subdomains, and the dot-prefixed domain cookies for any of them. Rows outside
  * those trees are never read, and partitioned cookies are left behind.
  *
- * @param {{ snapshot: string, scopes: string[], run?: Function }} options
- * @returns {Promise<object[]>}
  */
-async function queryCookieRows({ snapshot, scopes, run = execFileAsync }) {
+async function queryCookieRows({
+  snapshot,
+  scopes,
+  run = execFileAsync,
+}: {
+  snapshot: string;
+  scopes: readonly string[] | null | undefined;
+  run?: RunCommand;
+}): Promise<CookieRow[]> {
   const treeFilters = (scopes ?? []).map((scope) => {
     const literal = escapeSqlLiteral(scope);
     const ancestors = cookieAncestorDomains(scope).map((domain) => `'${escapeSqlLiteral(domain)}'`);
@@ -417,7 +503,7 @@ async function queryCookieRows({ snapshot, scopes, run = execFileAsync }) {
   });
   if (treeFilters.length === 0) return [];
   const where = treeFilters.join(" OR ");
-  let lastError = null;
+  let lastError: unknown = null;
   for (const columns of COLUMN_SETS) {
     try {
       // No `-readonly`: the snapshot keeps Chrome's WAL header, and a WAL
@@ -446,10 +532,17 @@ async function queryCookieRows({ snapshot, scopes, run = execFileAsync }) {
  * keeps the picker at sites the user actually has cookies for instead of
  * offering a whole suffix such as `co.uk` or `github.io`.
  *
- * @param {{ snapshot: string, candidates: string[], run?: Function }} options
- * @returns {Promise<string[]>} candidates that survived, order preserved
+ * @returns candidates that survived, order preserved
  */
-async function scopeCandidatesWithCookies({ snapshot, candidates, run = execFileAsync }) {
+async function scopeCandidatesWithCookies({
+  snapshot,
+  candidates,
+  run = execFileAsync,
+}: {
+  snapshot: string;
+  candidates: string[];
+  run?: RunCommand;
+}): Promise<string[]> {
   const ancestors = candidates.slice(1);
   if (ancestors.length === 0) return candidates;
   const literals = ancestors.map((scope) => `'${escapeSqlLiteral(`.${scope}`)}'`).join(", ");
@@ -467,10 +560,18 @@ async function scopeCandidatesWithCookies({ snapshot, candidates, run = execFile
  * cookie for, in one snapshot. The returned rows belong to the widest available
  * scope, which contains the narrower scopes' trees.
  *
- * @param {{ cookieDbPath: string, host: string, run?: Function, fsImpl?: typeof fs }} options
- * @returns {Promise<{ scopes: string[], rows: object[] }>}
  */
-async function readScopeTrees({ cookieDbPath, host, run = execFileAsync, fsImpl = fs }) {
+export async function readScopeTrees({
+  cookieDbPath,
+  host,
+  run = execFileAsync,
+  fsImpl = fs,
+}: {
+  cookieDbPath: string;
+  host: string;
+  run?: RunCommand;
+  fsImpl?: SnapshotFs;
+}): Promise<{ scopes: string[]; rows: CookieRow[] }> {
   const candidates = cookieScopeCandidates(host);
   try {
     return await withCookieSnapshot({ cookieDbPath, fsImpl }, async (snapshot) => {
@@ -478,7 +579,7 @@ async function readScopeTrees({ cookieDbPath, host, run = execFileAsync, fsImpl 
       const rows =
         scopes.length === 0
           ? []
-          : await queryCookieRows({ snapshot, scopes: [scopes[scopes.length - 1]], run });
+          : await queryCookieRows({ snapshot, scopes: scopes.slice(-1), run });
       return { scopes, rows };
     });
   } catch (err) {
@@ -492,10 +593,19 @@ async function readScopeTrees({ cookieDbPath, host, run = execFileAsync, fsImpl 
 /**
  * Read every row inside the given scopes' trees.
  *
- * @param {{ cookieDbPath: string, scopes: string[], run?: Function, fsImpl?: typeof fs }} options
- * @returns {Promise<object[]>} normalized rows
+ * @returns normalized rows
  */
-async function readCookieRows({ cookieDbPath, scopes, run = execFileAsync, fsImpl = fs }) {
+export async function readCookieRows({
+  cookieDbPath,
+  scopes,
+  run = execFileAsync,
+  fsImpl = fs,
+}: {
+  cookieDbPath: string;
+  scopes: string[];
+  run?: RunCommand;
+  fsImpl?: SnapshotFs;
+}): Promise<CookieRow[]> {
   return await withCookieSnapshot({ cookieDbPath, fsImpl }, async (snapshot) =>
     queryCookieRows({ snapshot, scopes, run }),
   );
@@ -506,11 +616,11 @@ async function readCookieRows({ cookieDbPath, scopes, run = execFileAsync, fsImp
  * approval dialog the first time — the caller must have a user-initiated import
  * behind this.
  *
- * @param {{ run?: Function }} [options]
- * @returns {Promise<string>}
  */
-async function readSafeStoragePassword({ run = execFileAsync } = {}) {
-  let stdout;
+export async function readSafeStoragePassword({
+  run = execFileAsync,
+}: { run?: RunCommand } = {}): Promise<string> {
+  let stdout: unknown;
   try {
     ({ stdout } = await run(
       SECURITY_BINARY,
@@ -518,13 +628,13 @@ async function readSafeStoragePassword({ run = execFileAsync } = {}) {
       { timeout: KEYCHAIN_TIMEOUT_MS },
     ));
   } catch (err) {
-    if (err && err.code === 44) {
+    if (err && propertyOf(err, "code") === 44) {
       throw new Error(
         "Chrome's cookie key isn't in your login Keychain. Open Google Chrome once, then retry.",
         { cause: err },
       );
     }
-    if (err && (err.killed || err.signal)) {
+    if (err && (propertyOf(err, "killed") || propertyOf(err, "signal"))) {
       throw new Error("Timed out waiting for Keychain access. Retry and approve the prompt.", {
         cause: err,
       });
@@ -545,17 +655,21 @@ async function readSafeStoragePassword({ run = execFileAsync } = {}) {
  * How many of `host`'s cookies each installed Chrome profile holds. No Keychain
  * access, so this is safe to call as soon as the dialog opens.
  *
- * @param {{ host: string, rootDir?: string, run?: Function, fsImpl?: typeof fs, nowMs?: number }} options
- * @returns {Promise<{ ok: boolean, host: string, profiles: Array<{ id: string, name: string, cookieCount: number }> }>}
  */
-async function previewSiteCookies({
+export async function previewSiteCookies({
   host,
   rootDir,
   run = execFileAsync,
   fsImpl = fs,
   nowMs = Date.now(),
-}) {
-  let normalized;
+}: {
+  host: unknown;
+  rootDir?: string;
+  run?: RunCommand;
+  fsImpl?: ChromeFs;
+  nowMs?: number;
+}): Promise<CookiePreview> {
+  let normalized: string;
   try {
     normalized = normalizeHost(host);
   } catch {
@@ -569,13 +683,13 @@ async function previewSiteCookies({
   }
   const candidates = cookieScopeCandidates(normalized);
   const profiles = await listChromeProfiles({ rootDir, fsImpl });
-  const found = [];
+  const found: CookiePreviewProfile[] = [];
   // Profiles can hold different parent-domain cookies, so the picker offers the
   // union; each profile still reports counts only for the scopes it has.
-  const offered = new Set();
+  const offered = new Set<string>();
   for (const profile of profiles) {
-    let scopes;
-    let rows;
+    let scopes: string[];
+    let rows: CookieRow[];
     try {
       // oxlint-disable-next-line no-await-in-loop -- one Chrome DB at a time keeps disk reads small
       ({ scopes, rows } = await readScopeTrees({
@@ -593,11 +707,12 @@ async function previewSiteCookies({
       host: scope,
       cookieCount: selectCookiesForScope(rows, scope, nowMs).length,
     }));
-    if (scopeCounts.some((entry) => entry.cookieCount > 0)) {
+    const [ownScope] = scopeCounts;
+    if (ownScope && scopeCounts.some((entry) => entry.cookieCount > 0)) {
       found.push({
         id: profile.id,
         name: profile.name,
-        cookieCount: scopeCounts[0].cookieCount,
+        cookieCount: ownScope.cookieCount,
         scopes: scopeCounts,
       });
     }
@@ -608,24 +723,51 @@ async function previewSiteCookies({
   return { ok: true, host: normalized, scopes, profiles: found };
 }
 
+export interface CookiePreviewProfile {
+  id: string;
+  name: string;
+  /** Cookies for the page host itself. */
+  cookieCount: number;
+  scopes: { host: string; cookieCount: number }[];
+}
+
+export type CookiePreview =
+  | { ok: false; host: ""; scopes: []; profiles: []; error: string }
+  | { ok: true; host: string; scopes: string[]; profiles: CookiePreviewProfile[] };
+
+export interface ImportSiteCookiesOptions {
+  host: unknown;
+  /** Renderer-picked scope: the page host or one of its parent domains. */
+  scope?: unknown;
+  profileId: unknown;
+  cookiesApi: { set: (cookie: ElectronCookie) => Promise<unknown> };
+  rootDir?: string;
+  run?: RunCommand;
+  fsImpl?: ChromeFs;
+  readPassword?: (options: { run: RunCommand }) => Promise<string>;
+  nowMs?: number;
+  beforeWrite?: () => boolean;
+}
+
+export type ImportSiteCookiesResult =
+  | { ok: false; error: string }
+  | {
+      ok: true;
+      host: string;
+      scope: string;
+      profileId: string;
+      profileName: string;
+      found: number;
+      imported: number;
+      skipped: number;
+      failed: number;
+    };
+
 /**
  * Decrypt `host`'s cookies for one Chrome profile and write them into the given
  * session, returning counts only (never values).
- *
- * @param {{
- *   host: string,
- *   scope?: string,
- *   profileId: string,
- *   cookiesApi: { set: (cookie: object) => Promise<unknown> },
- *   rootDir?: string,
- *   run?: Function,
- *   fsImpl?: typeof fs,
- *   readPassword?: Function,
- *   nowMs?: number,
- *   beforeWrite?: () => boolean,
- * }} options
  */
-async function importSiteCookies({
+export async function importSiteCookies({
   host,
   scope,
   profileId,
@@ -636,7 +778,7 @@ async function importSiteCookies({
   readPassword = readSafeStoragePassword,
   nowMs = Date.now(),
   beforeWrite = () => true,
-}) {
+}: ImportSiteCookiesOptions): Promise<ImportSiteCookiesResult> {
   const pageHost = normalizeHost(host);
   // The renderer picks a scope, but only from the page's own ancestors: a host
   // it names itself can never widen the import to an unrelated site.
@@ -656,7 +798,7 @@ async function importSiteCookies({
   if (!scopes.includes(target)) {
     return { ok: false, error: "That site scope isn't available for this tab." };
   }
-  let key;
+  let key: Buffer;
   try {
     key = deriveMacKey(await readPassword({ run }));
   } catch (err) {
@@ -694,31 +836,3 @@ async function importSiteCookies({
     failed,
   };
 }
-
-module.exports = {
-  // Orchestration used by the IPC layer.
-  previewSiteCookies,
-  importSiteCookies,
-  listChromeProfiles,
-  readCookieRows,
-  readScopeTrees,
-  readSafeStoragePassword,
-  // Pure helpers, exported for unit tests.
-  normalizeHost,
-  cookieScopeCandidates,
-  cookieAppliesToScope,
-  cookieInScope,
-  chromeExpirySeconds,
-  selectCookiesForScope,
-  deriveMacKey,
-  decryptChromeValue,
-  decodeCookieValue,
-  toElectronCookie,
-  buildCookiePlan,
-  normalizeRow,
-  defaultChromeRoot,
-  SAFE_STORAGE_SERVICE,
-  KEY_ITERATIONS,
-  KEY_SALT,
-  KEY_LENGTH,
-};

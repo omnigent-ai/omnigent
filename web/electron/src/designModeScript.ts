@@ -5,9 +5,7 @@
 // trusts only markers carrying this view's nonce — keep the interpolation,
 // don't hardcode the markers.
 
-"use strict";
-
-function buildDesignModeScript(nonce) {
+export function buildDesignModeScript(nonce: string): string {
   const SELECT = "__omni_" + nonce + "_element_select__";
   const SUBMIT = "__omni_" + nonce + "_element_prompt_submit__";
   const DISMISS = "__omni_" + nonce + "_element_dismiss__";
@@ -390,5 +388,3 @@ function buildDesignModeScript(nonce) {
 })();
 `;
 }
-
-module.exports = { buildDesignModeScript };

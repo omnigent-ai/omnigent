@@ -53,8 +53,8 @@ describe("browser IPC pending navigation lifecycle", () => {
     "sender trust revoked",
   ]) {
     it(`drops pending DNS after ${action}`, async () => {
-      const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
-      const registry = createBrowserViewRegistry();
+      const { createBrowserViewRegistry } = require("../src/browserViewRegistry.ts");
+      const registry = createBrowserViewRegistry({});
       const deferred = Promise.withResolvers();
       const opened = [];
       let checks = 0;
@@ -673,7 +673,7 @@ describe("browserIpc — trust gate", () => {
         ipcMain.invoke(ch, event, {
           conversationId: "conv_1",
           action: "snapshot",
-          js: require("../src/browserActionScript.mjs").buildBrowserActionScript("snapshot"),
+          js: require("../src/browserActionScript.ts").buildBrowserActionScript("snapshot"),
         }),
       ),
     );
@@ -1528,8 +1528,8 @@ it("applies navigation policy even when renderer options claim user intent", asy
 
 describe("browser IPC sessions on this machine", () => {
   function localNavigation({ hostId = "local", live = true, protocol = 1 } = {}) {
-    const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
-    const { createBrowserViewBoundsController } = require("../src/browserViewBounds");
+    const { createBrowserViewRegistry } = require("../src/browserViewRegistry.ts");
+    const { createBrowserViewBoundsController } = require("../src/browserViewBounds.ts");
     const { isHostThisMachine } = require("../src/hostIdentity");
     let liveEnrollment = live;
     const webContents = makeWebContents();

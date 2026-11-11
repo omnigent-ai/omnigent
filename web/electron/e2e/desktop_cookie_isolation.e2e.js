@@ -17,7 +17,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { buildBrowserActionScript } = require("../src/browserActionScript.mjs");
+const { buildBrowserActionScript } = require("../src/browserActionScript.ts");
 
 const {
   desktopDepsAvailable,

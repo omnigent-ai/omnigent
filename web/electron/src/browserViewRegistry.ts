@@ -17,7 +17,9 @@
  *    detached on hide and destroyed only on explicit close.
  */
 
-const {
+import type { Rectangle } from "electron";
+
+import {
   checkAgentNavigation,
   isAgentConnectionAllowed,
   isAgentNavigationAllowed,
@@ -25,12 +27,239 @@ const {
   isLocalhostSubdomain,
   isProxyAddress,
   lookupHostAddresses,
-} = require("./browserUrlPolicy.ts");
+  type NavigationVerdict,
+} from "./browserUrlPolicy.ts";
+import type {
+  BrowserViewBoundsController,
+  BrowserViewBoundsControllerOptions,
+  RendererBounds,
+} from "./browserViewBounds.ts";
 
-const DEFAULT_CAP = 10;
+export const DEFAULT_CAP = 10;
+
+/** Who asked for an agent navigation; the host decides whether it may reach loopback. */
+export interface AgentContext {
+  hostIsThisMachine?: boolean;
+  sourceHostId?: string | null;
+  /** Set once the view's page from this context is being cleared. */
+  revoked?: boolean;
+}
+
+/** The parts of a `context-menu` event's params the pane menu reads. */
+export interface ContextMenuParams {
+  linkURL?: string;
+  selectionText?: unknown;
+}
+
+/** Plain menu data; the host builds the Electron Menu. */
+export type ContextMenuItem = { label: string; click: () => void } | { type: "separator" };
+
+/** The parts of a `before-input-event` input the recent-session forwarding reads. */
+export interface BrowserViewInput {
+  type?: string;
+  key?: string;
+  code?: string;
+  control?: boolean;
+  shift?: boolean;
+  alt?: boolean;
+  meta?: boolean;
+  isAutoRepeat?: boolean;
+}
+
+interface PreventableEvent {
+  preventDefault: () => void;
+}
+
+type NavigationGuard = (event: PreventableEvent, targetUrl: string) => void;
+
+/** Any webContents listener that design mode stores on an entry. */
+export type DesignModeListener = (...args: never[]) => void;
+
+/** The webContents design mode attached its listeners to. */
+export interface DesignModeWebContents {
+  removeListener: (
+    event: "console-message" | "input-event",
+    listener: DesignModeListener,
+  ) => unknown;
+}
+
+/** The parts of a view's webContents the registry drives. */
+export interface BrowserViewWebContents {
+  id: number;
+  loadURL: (url: string) => unknown;
+  close: () => void;
+  copy: () => void;
+  on: ((
+    event: "context-menu",
+    listener: (event: unknown, params: ContextMenuParams) => void,
+  ) => unknown) &
+    ((event: "will-navigate" | "will-redirect", listener: NavigationGuard) => unknown) &
+    ((
+      event: "will-frame-navigate",
+      listener: (event: PreventableEvent & { url: string }) => void,
+    ) => unknown) &
+    ((
+      event: "before-input-event",
+      listener: (event: PreventableEvent, input: BrowserViewInput) => void,
+    ) => unknown) &
+    ((event: "blur", listener: () => void) => unknown);
+  setWindowOpenHandler: (
+    handler: (details: { url: string; disposition: string }) => { action: "deny" },
+  ) => void;
+}
+
+/** The parts of a WebContentsView the registry drives. */
+export interface BrowserView {
+  setBounds: (bounds: Rectangle) => void;
+  setVisible: (visible: boolean) => void;
+  webContents: BrowserViewWebContents;
+}
+
+export interface BrowserViewOptions {
+  webPreferences: {
+    partition: string;
+    nodeIntegration: false;
+    contextIsolation: true;
+    sandbox: true;
+  };
+}
+
+/** One view and its per-view state. */
+export interface BrowserViewEntry<View extends BrowserView> {
+  conversationId: string;
+  view: View;
+  boundsController: BrowserViewBoundsController;
+  lastRequestedUrl: string;
+  navigationPolicyEnforced: boolean;
+  agentContext: AgentContext | null;
+  designModeListener: DesignModeListener | null;
+  designModeInputListener: DesignModeListener | null;
+  designModeWebContents: DesignModeWebContents | null;
+  recentSessionSwitching: boolean;
+}
+
+export interface BrowserViewRegistryDeps<View extends BrowserView> {
+  /** (opts) => new WebContentsView(opts) — injectable for tests */
+  WebContentsViewCtor: (options: BrowserViewOptions) => View;
+  /** bounds-controller factory (createBrowserViewBoundsController) */
+  createBoundsController: (
+    options: BrowserViewBoundsControllerOptions,
+  ) => BrowserViewBoundsController;
+  /** (view) => mainWindow.contentView.addChildView(view) */
+  attachToHost: (view: View) => void;
+  /** (view) => mainWindow.contentView.removeChildView(view) */
+  detachFromHost: (view: View) => void;
+  /** (channel, payload) => mainWindow.webContents.send(...) */
+  sendToRenderer: (channel: string, payload: Record<string, unknown>) => void;
+  getHostZoomFactor?: () => number;
+  getHostDisplayScaleFactor?: () => number | null;
+  isHostFocused?: () => boolean;
+  openUrlExternal?: (url: string) => void;
+  copyTextToClipboard?: (text: string) => void;
+  showContextMenu?: (items: ContextMenuItem[]) => void;
+  /** Dismiss shell-owned UI when an overlay hides the pane. */
+  onSuppressionChange?: (suppressed: boolean) => void;
+  allowsLocalhost?: (context: AgentContext | null | undefined) => boolean;
+  /** Addresses for the agent DNS check, resolved in the view's partition. */
+  resolveHost?: (hostname: string, partition: string) => Promise<string[]>;
+  /** "DIRECT" or a PAC-style proxy list for `url` in the view's partition. */
+  resolveProxy?: (url: string, partition: string) => Promise<string>;
+  cap?: number;
+  partitionScope?: string;
+}
+
+export interface OpenOrNavigateOptions {
+  force?: boolean;
+  /** Apply the agent navigation policy to this URL and its redirects. */
+  agent?: boolean;
+  agentContext?: AgentContext | null;
+}
+
+export interface OkResult {
+  ok: true;
+}
+export interface ErrorResult {
+  ok: false;
+  error: string;
+}
+
+export type GetOrCreateResult<View extends BrowserView> =
+  | { ok: true; entry: BrowserViewEntry<View>; created: boolean }
+  | { ok: false; error: string; cap: number };
+
+export type OpenOrNavigateResult<View extends BrowserView> = GetOrCreateResult<View> | ErrorResult;
+
+/** The request fields Electron's `webRequest` hooks pass. */
+export interface AgentRequestDetails {
+  webContentsId?: number;
+  url: string;
+}
+
+export interface AgentResponseDetails extends AgentRequestDetails {
+  ip?: string;
+  resourceType?: string;
+  statusCode?: number;
+}
+
+type RequestHeaders = Record<string, string | string[]>;
+
+/** The navigation policy for a request from an agent view or its partition. */
+interface RequestPolicy {
+  allowLocalhost: boolean;
+  conversationId?: string;
+  partition: string;
+}
+
+export interface BrowserViewRegistry<View extends BrowserView> {
+  get: (conversationId: string) => BrowserViewEntry<View> | null;
+  getOrCreate: (conversationId: string) => GetOrCreateResult<View>;
+  openOrNavigate: (
+    conversationId: string,
+    url: string | null | undefined,
+    bounds?: RendererBounds | null,
+    opts?: OpenOrNavigateOptions,
+  ) => OpenOrNavigateResult<View>;
+  /** Start an agent navigation; the returned check is false once a newer one starts. */
+  beginAgentNavigation: (conversationId: string) => () => boolean;
+  needsAgentViewRevocation: (
+    entry: BrowserViewEntry<View> | null | undefined,
+    nextContext: AgentContext | null | undefined,
+  ) => boolean;
+  revokeAgentView: (
+    conversationId: string,
+    isCurrent?: () => boolean,
+  ) => Promise<OkResult | ErrorResult>;
+  checkAgentNavigation: (
+    conversationId: string,
+    url: unknown,
+    agentContext: AgentContext | null | undefined,
+  ) => Promise<NavigationVerdict>;
+  shouldCancelAgentRequest: (details: AgentRequestDetails, partition?: string) => Promise<boolean>;
+  agentRequestHeaders: (
+    details: { webContentsId?: number; requestHeaders?: RequestHeaders },
+    partition?: string,
+  ) => { requestHeaders?: RequestHeaders };
+  shouldCancelAgentResponse: (
+    details: AgentResponseDetails,
+    partition?: string,
+  ) => Promise<boolean>;
+  setActive: (conversationId: string | null | undefined) => OkResult | ErrorResult;
+  setSuppressed: (suppressed: unknown) => OkResult;
+  cancelRecentSessionSwitch: () => OkResult;
+  setRecentSessionSwitchSupported: (supported: unknown) => OkResult;
+  setOpenTabSupported: (supported: unknown) => OkResult;
+  close: (conversationId: string, reason?: string | null) => { ok: true; removed: boolean };
+  closeAll: (reason?: string | null) => void;
+  activeConversationId: () => string | null;
+  isSuppressed: () => boolean;
+  size: () => number;
+  has: (conversationId: string) => boolean;
+  forEach: (fn: (entry: BrowserViewEntry<View>, conversationId: string) => void) => void;
+  cap: number;
+}
 
 // Map WebSocket handshakes onto the HTTP URL rules.
-function httpUrlForWebSocket(url) {
+function httpUrlForWebSocket(url: string): string {
   return url.replace(/^ws(s?):/, "http$1:");
 }
 
@@ -49,16 +278,15 @@ function httpUrlForWebSocket(url) {
  * server — two windows connected to different servers could carry the same
  * conversationId and would otherwise share a cookie jar.
  *
- * @param {string} scope Registry-unique namespace (one per shell window).
- * @param {string} viewId Conversation ID or encoded browser-tab view ID.
- * @returns {string}
+ * @param scope Registry-unique namespace (one per shell window).
+ * @param viewId Conversation ID or encoded browser-tab view ID.
  */
-function agentPartition(scope, viewId) {
+export function agentPartition(scope: string, viewId: string): string {
   let conversationId = viewId;
   // Session IDs are UUID hex strings; tab keys follow browserViewId in
   // web/src/hooks/useBrowserTabs.ts. Only storage uses the owning session ID.
   const tab = /^browser-tab:([^:]+):[^:]+$/.exec(viewId);
-  if (tab) {
+  if (tab?.[1] !== undefined) {
     try {
       conversationId = decodeURIComponent(tab[1]);
     } catch {
@@ -73,12 +301,12 @@ function agentPartition(scope, viewId) {
 // no cross-run uniqueness is needed.
 let registrySeq = 0;
 
-function createBrowserViewRegistry({
-  WebContentsViewCtor, // (opts) => new WebContentsView(opts) — injectable for tests
-  createBoundsController, // bounds-controller factory (createBrowserViewBoundsController)
-  attachToHost, // (view) => mainWindow.contentView.addChildView(view)
-  detachFromHost, // (view) => mainWindow.contentView.removeChildView(view)
-  sendToRenderer, // (channel, payload) => mainWindow.webContents.send(...)
+export function createBrowserViewRegistry<View extends BrowserView>({
+  WebContentsViewCtor,
+  createBoundsController,
+  attachToHost,
+  detachFromHost,
+  sendToRenderer,
   getHostZoomFactor = () => 1,
   getHostDisplayScaleFactor = () => null,
   isHostFocused = () => true,
@@ -97,18 +325,23 @@ function createBrowserViewRegistry({
   // Partition namespace for this registry's views — see agentPartition.
   // Injectable so tests can pin it; defaults to a per-instance unique value.
   partitionScope = `w${++registrySeq}`,
-} = {}) {
-  const entries = new Map(); // conversationId -> BrowserViewEntry
-  const pendingNavigations = new Map();
+}: BrowserViewRegistryDeps<View>): BrowserViewRegistry<View> {
+  type Entry = BrowserViewEntry<View>;
+  const entries = new Map<string, Entry>();
+  const pendingNavigations = new Map<string, symbol>();
 
-  function beginAgentNavigation(conversationId) {
+  function beginAgentNavigation(conversationId: string): () => boolean {
     const generation = Symbol();
     pendingNavigations.set(conversationId, generation);
     return () => pendingNavigations.get(conversationId) === generation;
   }
-  const allowsLocalhost = (context) => !context?.revoked && contextAllowsLocalhost(context);
+  const allowsLocalhost = (context: AgentContext | null | undefined) =>
+    !context?.revoked && contextAllowsLocalhost(context);
 
-  function needsAgentViewRevocation(entry, nextContext) {
+  function needsAgentViewRevocation(
+    entry: Entry | null | undefined,
+    nextContext: AgentContext | null | undefined,
+  ): boolean {
     const context = entry?.agentContext;
     return (
       context?.hostIsThisMachine === true &&
@@ -118,10 +351,13 @@ function createBrowserViewRegistry({
     );
   }
 
-  async function revokeAgentView(conversationId, isCurrent = beginAgentNavigation(conversationId)) {
+  async function revokeAgentView(
+    conversationId: string,
+    isCurrent = beginAgentNavigation(conversationId),
+  ): Promise<OkResult | ErrorResult> {
     const entry = get(conversationId);
     const context = entry?.agentContext;
-    if (!context) return { ok: true };
+    if (!entry || !context) return { ok: true };
     context.revoked = true;
     try {
       await entry.view.webContents.loadURL("about:blank");
@@ -135,7 +371,7 @@ function createBrowserViewRegistry({
       return { ok: false, error: "Unable to clear the previous browser page" };
     }
   }
-  let activeConversationId = null;
+  let activeConversationId: string | null = null;
   // When true, the active view is hidden in place (setVisible(false)) so DOM
   // overlays (dialogs, menus, tooltips, toasts) aren't covered by the native
   // layer, which always paints above the renderer regardless of z-index. Sticky
@@ -158,15 +394,15 @@ function createBrowserViewRegistry({
     }
   }
 
-  function setSuppressed(suppressed) {
+  function setSuppressed(suppressed: unknown): OkResult {
     overlaySuppressed = !!suppressed;
     applyActiveVisibility();
     onSuppressionChange(overlaySuppressed);
     return { ok: true };
   }
 
-  function makeEntry(conversationId, view) {
-    const entry = {
+  function makeEntry(conversationId: string, view: View): Entry {
+    const entry: Entry = {
       conversationId,
       view,
       boundsController: createBoundsController({
@@ -200,11 +436,11 @@ function createBrowserViewRegistry({
     return entry;
   }
 
-  function get(conversationId) {
+  function get(conversationId: string): Entry | null {
     return entries.get(conversationId) || null;
   }
 
-  function getOrCreate(conversationId) {
+  function getOrCreate(conversationId: string): GetOrCreateResult<View> {
     const existing = entries.get(conversationId);
     if (existing) return { ok: true, entry: existing, created: false };
     if (entries.size >= cap) {
@@ -231,7 +467,7 @@ function createBrowserViewRegistry({
   // Popups never open the system browser (an abuse vector for agent-visited
   // pages): background-tab clicks go to a supporting renderer as new tabs, others
   // load in this view. loadURL skips will-navigate, so enforce policy here.
-  function installWindowOpenPolicy(entry) {
+  function installWindowOpenPolicy(entry: Entry): void {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.setWindowOpenHandler !== "function") return;
     wc.setWindowOpenHandler(({ url, disposition }) => {
@@ -275,21 +511,22 @@ function createBrowserViewRegistry({
   // opened externally nor copied. "Open Link in Browser" is user-chosen, so
   // shell.openExternal is safe here (unlike the page-initiated path above).
   // Items are plain data; the host (main.js) builds the actual Electron Menu.
-  function attachViewContextMenu(entry) {
+  function attachViewContextMenu(entry: Entry): void {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
     wc.on("context-menu", (_event, params) => {
-      const items = [];
-      if (params.linkURL) {
-        if (/^https?:\/\//i.test(params.linkURL)) {
+      const items: ContextMenuItem[] = [];
+      const { linkURL } = params;
+      if (linkURL) {
+        if (/^https?:\/\//i.test(linkURL)) {
           items.push({
             label: "Open Link in Browser",
-            click: () => openUrlExternal(params.linkURL),
+            click: () => openUrlExternal(linkURL),
           });
         }
         items.push({
           label: "Copy Link Address",
-          click: () => copyTextToClipboard(params.linkURL),
+          click: () => copyTextToClipboard(linkURL),
         });
       }
       if (typeof params.selectionText === "string" && params.selectionText.trim() !== "") {
@@ -302,10 +539,10 @@ function createBrowserViewRegistry({
   }
 
   // Hook will-navigate/will-redirect: they can block; did-navigate fires too late.
-  function attachAgentNavGuard(conversationId, entry) {
+  function attachAgentNavGuard(conversationId: string, entry: Entry): void {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
-    const guard = (event, targetUrl) => {
+    const guard: NavigationGuard = (event, targetUrl) => {
       if (!entry.navigationPolicyEnforced) return;
       const verdict = isAgentNavigationAllowed(targetUrl, {
         allowLocalhost: allowsLocalhost(entry.agentContext),
@@ -336,7 +573,7 @@ function createBrowserViewRegistry({
   // The embedded page owns a separate WebContents, so Ctrl+Tab never reaches
   // the shell renderer's window listener. Forward only the recent-session
   // gesture; all other page keyboard input remains local to the page.
-  function cancelRecentSessionInput(entry, notifyRenderer) {
+  function cancelRecentSessionInput(entry: Entry, notifyRenderer: boolean): void {
     if (!entry.recentSessionSwitching) return;
     entry.recentSessionSwitching = false;
     if (notifyRenderer) {
@@ -353,14 +590,14 @@ function createBrowserViewRegistry({
     }
   }
 
-  function cancelRecentSessionSwitch() {
+  function cancelRecentSessionSwitch(): OkResult {
     if (activeConversationId === null) return { ok: true };
     const entry = entries.get(activeConversationId);
     if (entry) cancelRecentSessionInput(entry, false);
     return { ok: true };
   }
 
-  function setRecentSessionSwitchSupported(supported) {
+  function setRecentSessionSwitchSupported(supported: unknown): OkResult {
     recentSessionSwitchSupported = !!supported;
     if (!recentSessionSwitchSupported) {
       entries.forEach((entry) => cancelRecentSessionInput(entry, false));
@@ -368,12 +605,12 @@ function createBrowserViewRegistry({
     return { ok: true };
   }
 
-  function setOpenTabSupported(supported) {
+  function setOpenTabSupported(supported: unknown): OkResult {
     openTabSupported = !!supported;
     return { ok: true };
   }
 
-  function attachRecentSessionInput(entry) {
+  function attachRecentSessionInput(entry: Entry): void {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
     wc.on("before-input-event", (event, input) => {
@@ -413,7 +650,10 @@ function createBrowserViewRegistry({
     });
   }
 
-  function checkAgentNavigationWithPolicy(url, { allowLocalhost, partition }) {
+  function checkAgentNavigationWithPolicy(
+    url: unknown,
+    { allowLocalhost, partition }: { allowLocalhost: boolean; partition: string },
+  ): Promise<NavigationVerdict> {
     return checkAgentNavigation(url, {
       allowLocalhost,
       resolveHost: (hostname) => resolveHost(hostname, partition),
@@ -421,14 +661,18 @@ function createBrowserViewRegistry({
   }
 
   // The IPC first hop uses the same partition resolver as network preflight.
-  function checkAgentNavigationFor(conversationId, url, agentContext) {
+  function checkAgentNavigationFor(
+    conversationId: string,
+    url: unknown,
+    agentContext: AgentContext | null | undefined,
+  ): Promise<NavigationVerdict> {
     return checkAgentNavigationWithPolicy(url, {
       allowLocalhost: allowsLocalhost(agentContext),
       partition: agentPartition(partitionScope, conversationId),
     });
   }
 
-  function entryForWebContents(webContentsId) {
+  function entryForWebContents(webContentsId: number | undefined): Entry | null {
     for (const entry of entries.values()) {
       try {
         if (entry.view.webContents.id === webContentsId) return entry;
@@ -439,7 +683,10 @@ function createBrowserViewRegistry({
     return null;
   }
 
-  function requestPolicyFor(webContentsId, partition) {
+  function requestPolicyFor(
+    webContentsId: number | undefined,
+    partition: string | undefined,
+  ): RequestPolicy | null {
     const entry = entryForWebContents(webContentsId);
     if (entry) {
       return entry.navigationPolicyEnforced
@@ -466,14 +713,17 @@ function createBrowserViewRegistry({
     };
   }
 
-  function hostnameOf(url) {
+  function hostnameOf(url: string): string {
     return URL.canParse(url) ? new URL(url).hostname : "";
   }
 
   // Resolve named hosts in the owning partition before any request is sent.
   // IP literals and exact loopback names need only the URL check; `*.localhost`
   // must also be on a direct route so a proxy never receives the request.
-  async function shouldCancelAgentRequest({ webContentsId, url }, partition) {
+  async function shouldCancelAgentRequest(
+    { webContentsId, url }: AgentRequestDetails,
+    partition?: string,
+  ): Promise<boolean> {
     const policy = requestPolicyFor(webContentsId, partition);
     if (!policy) return false;
     const policyUrl = httpUrlForWebSocket(url);
@@ -495,10 +745,13 @@ function createBrowserViewRegistry({
 
   // Cache hits can omit the connected IP, so guarded HTTP requests bypass
   // cache reads with no-cache while preserving the page's existing directives.
-  function agentRequestHeaders({ webContentsId, requestHeaders }, partition) {
+  function agentRequestHeaders(
+    { webContentsId, requestHeaders }: { webContentsId?: number; requestHeaders?: RequestHeaders },
+    partition?: string,
+  ): { requestHeaders?: RequestHeaders } {
     if (!requestPolicyFor(webContentsId, partition)) return {};
-    const headers = {};
-    const directives = new Map(); // lowercased → as sent, keeping e.g. no-store
+    const headers: RequestHeaders = {};
+    const directives = new Map<string, string>(); // lowercased → as sent, keeping e.g. no-store
     for (const [name, value] of Object.entries(requestHeaders ?? {})) {
       if (name.toLowerCase() !== "cache-control") {
         headers[name] = value;
@@ -518,8 +771,12 @@ function createBrowserViewRegistry({
   // Chromium pins `*.localhost` to loopback, so only a proxy could send it
   // anywhere else; an unknown route counts as proxied. WebSockets keep their
   // ws(s) URL here because Chromium picks their proxy by that scheme.
-  async function checkDirectLocalhostRoute(requestUrl, hostname, partition) {
-    const blocked = {
+  async function checkDirectLocalhostRoute(
+    requestUrl: string,
+    hostname: string,
+    partition: string,
+  ): Promise<NavigationVerdict> {
+    const blocked: NavigationVerdict = {
       ok: false,
       error: `navigation blocked: host "${hostname}" may be routed through a proxy`,
     };
@@ -531,9 +788,9 @@ function createBrowserViewRegistry({
   }
 
   async function shouldCancelAgentResponse(
-    { webContentsId, url, ip, resourceType, statusCode },
-    partition,
-  ) {
+    { webContentsId, url, ip, resourceType, statusCode }: AgentResponseDetails,
+    partition?: string,
+  ): Promise<boolean> {
     const policy = requestPolicyFor(webContentsId, partition);
     if (!policy) return false;
     const policyUrl = httpUrlForWebSocket(url);
@@ -541,7 +798,7 @@ function createBrowserViewRegistry({
     const localhostSubdomain = isLocalhostSubdomain(hostname);
     // WebSocket upgrades omit the connected IP.
     const ipLessUpgrade = !ip && resourceType === "webSocket" && statusCode === 101;
-    let verdict;
+    let verdict: NavigationVerdict;
     if (policy.allowLocalhost && localhostSubdomain) {
       // A loopback IP may be a local proxy's, so `*.localhost` also needs a direct route.
       verdict = ipLessUpgrade ? { ok: true } : isAgentConnectionAllowed(policyUrl, ip, policy);
@@ -575,7 +832,12 @@ function createBrowserViewRegistry({
     return true;
   }
 
-  function openOrNavigate(conversationId, url, bounds, opts) {
+  function openOrNavigate(
+    conversationId: string,
+    url: string | null | undefined,
+    bounds?: RendererBounds | null,
+    opts?: OpenOrNavigateOptions,
+  ): OpenOrNavigateResult<View> {
     const force = !!(opts && opts.force);
     if (needsAgentViewRevocation(get(conversationId), opts?.agentContext)) {
       return { ok: false, error: "Previous browser page must be cleared before navigating" };
@@ -595,7 +857,7 @@ function createBrowserViewRegistry({
     // Latch policy for this URL's redirect chain; URL-less remounts keep the prior state.
     if (url) {
       entry.navigationPolicyEnforced = !!(opts && opts.agent);
-      entry.agentContext = entry.navigationPolicyEnforced ? (opts.agentContext ?? null) : null;
+      entry.agentContext = entry.navigationPolicyEnforced ? (opts?.agentContext ?? null) : null;
     }
     if (bounds) entry.boundsController.setRendererBounds(bounds);
     // Only attach immediately when this is the active conversation; otherwise
@@ -624,14 +886,15 @@ function createBrowserViewRegistry({
         try {
           entry.view.webContents.loadURL(url);
         } catch (e) {
-          return { ok: false, error: `loadURL failed: ${e && e.message ? e.message : e}` };
+          const message = (e as { message?: unknown } | null | undefined)?.message;
+          return { ok: false, error: `loadURL failed: ${e && message ? message : e}` };
         }
       }
     }
     return { ok: true, entry, created };
   }
 
-  function setActive(conversationId) {
+  function setActive(conversationId: string | null | undefined): OkResult | ErrorResult {
     // null = "detach everything" sentinel (no pane mounted): stop painting over
     // the React layout, but keep the view so its agent can still drive it.
     if (conversationId === null || conversationId === undefined) {
@@ -698,7 +961,7 @@ function createBrowserViewRegistry({
     return { ok: true };
   }
 
-  function close(conversationId, reason) {
+  function close(conversationId: string, reason?: string | null): { ok: true; removed: boolean } {
     pendingNavigations.delete(conversationId);
     const entry = entries.get(conversationId);
     if (!entry) return { ok: true, removed: false };
@@ -743,7 +1006,7 @@ function createBrowserViewRegistry({
     return { ok: true, removed: true };
   }
 
-  function closeAll(reason) {
+  function closeAll(reason?: string | null): void {
     pendingNavigations.clear();
     for (const conversationId of [...entries.keys()]) {
       close(conversationId, reason);
@@ -773,15 +1036,9 @@ function createBrowserViewRegistry({
     activeConversationId: () => activeConversationId,
     isSuppressed: () => overlaySuppressed,
     size: () => entries.size,
-    has: (conversationId) => entries.has(conversationId),
+    has: (conversationId: string) => entries.has(conversationId),
     forEach: (fn) => entries.forEach(fn),
     // Constants exposed for tests / main.js wiring
     cap,
   };
 }
-
-module.exports = {
-  createBrowserViewRegistry,
-  agentPartition,
-  DEFAULT_CAP,
-};

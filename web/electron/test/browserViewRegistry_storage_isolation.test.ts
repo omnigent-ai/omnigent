@@ -2,7 +2,7 @@
 // receive a distinct storage `partition` so cookie/localStorage/cache stores
 // are isolated between agent sessions.
 //
-// The bug: `getOrCreate` in browserViewRegistry.js passes NO `partition` to
+// The bug: `getOrCreate` in browserViewRegistry.ts passes NO `partition` to
 // `WebContentsViewCtor`, which means Electron assigns every view to
 // `session.defaultSession` — one shared cookie jar for all agents and the main
 // window. Agent A's login bleeds into Agent B's view.
@@ -21,16 +21,19 @@
 // `undefined` for every view (they all silently land on defaultSession).
 // After the fix it passes because each conversation gets its own partition key.
 
-"use strict";
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
+import { readFileSync } from "node:fs";
+import path from "node:path";
 
-const { readFileSync } = require("node:fs");
-const path = require("node:path");
-
-const { createBrowserViewRegistry, agentPartition } = require("../src/browserViewRegistry");
-const { createBrowserViewBoundsController } = require("../src/browserViewBounds");
+import {
+  agentPartition,
+  createBrowserViewRegistry,
+  type BrowserView,
+  type BrowserViewOptions,
+} from "../src/browserViewRegistry.ts";
+import { createBrowserViewBoundsController } from "../src/browserViewBounds.ts";
 
 /**
  * Build a registry that captures the `webPreferences` object passed to
@@ -47,19 +50,21 @@ function makePartitionCapturingRegistry() {
   // Because the registry has no "which conversationId am I creating for?" arg
   // to the ctor, we correlate via call order: the Nth call to ctor corresponds
   // to the Nth distinct conversationId passed to openOrNavigate.
-  const createdPrefs = []; // array of webPreferences objects in creation order
+  // array of webPreferences objects in creation order
+  const createdPrefs: Partial<BrowserViewOptions["webPreferences"]>[] = [];
 
   const registry = createBrowserViewRegistry({
-    WebContentsViewCtor: (opts) => {
+    WebContentsViewCtor: (opts): BrowserView => {
       // Record exactly what webPreferences the registry passed us.
       createdPrefs.push((opts && opts.webPreferences) || {});
       return {
         setBounds() {},
         setVisible() {},
         webContents: {
+          id: createdPrefs.length,
           loadURL() {},
           close() {},
-          removeListener() {},
+          copy() {},
           on() {},
           setWindowOpenHandler() {},
         },
@@ -81,13 +86,20 @@ describe("browserViewRegistry — storage partition isolation", () => {
     const ids = ["conv_A", "browser-tab:conv_A:first", "browser-tab:conv_A:second"];
     for (const id of ids) registry.openOrNavigate(id, "https://example.com/");
     assert.equal(new Set(createdPrefs.map((prefs) => prefs.partition)).size, 1);
-    assert.equal(new Set(ids.map((id) => registry.get(id).view)).size, 3);
+    const views = ids.map((id) => registry.get(id)?.view);
+    assert.ok(
+      views.every((view) => view !== undefined),
+      "every id should have an entry",
+    );
+    assert.equal(new Set(views).size, 3);
 
-    registry.close(ids[1]);
-    registry.openOrNavigate(ids[1], "https://example.com/");
-    assert.equal(createdPrefs[3].partition, createdPrefs[0].partition);
+    const [, firstTab = ""] = ids;
+    registry.close(firstTab);
+    registry.openOrNavigate(firstTab, "https://example.com/");
+    assert.equal(createdPrefs[3]?.partition, createdPrefs[0]?.partition);
     registry.openOrNavigate("browser-tab:conv_B:first", "https://example.com/");
-    assert.notEqual(createdPrefs[4].partition, createdPrefs[0].partition);
+    assert.equal(createdPrefs.length, 5);
+    assert.notEqual(createdPrefs[4]?.partition, createdPrefs[0]?.partition);
   });
 
   it("decodes the owning session ID and leaves malformed tab keys isolated", () => {
@@ -110,7 +122,7 @@ describe("browserViewRegistry — storage partition isolation", () => {
 
     assert.equal(createdPrefs.length, 2, "two distinct views should have been created");
 
-    const [prefsA, prefsB] = createdPrefs;
+    const [prefsA = {}, prefsB = {}] = createdPrefs;
 
     // Each view MUST be given a partition.
     assert.ok(
@@ -131,7 +143,7 @@ describe("browserViewRegistry — storage partition isolation", () => {
 
     assert.equal(createdPrefs.length, 2, "two distinct views should have been created");
 
-    const [prefsA, prefsB] = createdPrefs;
+    const [prefsA = {}, prefsB = {}] = createdPrefs;
 
     // The critical assertion: if both partitions are the same (or both
     // undefined), all views share one cookie store — the bug.
@@ -148,7 +160,7 @@ describe("browserViewRegistry — storage partition isolation", () => {
     registry.openOrNavigate("conv_XYZ123", "https://example.com/");
 
     assert.equal(createdPrefs.length, 1);
-    const { partition } = createdPrefs[0];
+    const { partition } = createdPrefs[0] ?? {};
     assert.ok(
       partition && partition.includes("conv_XYZ123"),
       `partition "${partition}" does not embed the conversationId "conv_XYZ123"`,
@@ -174,7 +186,7 @@ describe("browserViewRegistry — partition storage placement", () => {
   it("uses an in-memory partition (no persist: prefix) so agent cookies stay off disk", () => {
     const { createdPrefs, registry } = makePartitionCapturingRegistry();
     registry.openOrNavigate("conv_A", "https://example.com/");
-    const { partition } = createdPrefs[0];
+    const { partition } = createdPrefs[0] ?? {};
     assert.ok(partition, "a partition must be set");
     assert.ok(
       !partition.startsWith("persist:"),
@@ -196,8 +208,8 @@ describe("browserViewRegistry — partition storage placement", () => {
     one.registry.openOrNavigate("conv_same", "https://example.com/");
     two.registry.openOrNavigate("conv_same", "https://example.com/");
     assert.notEqual(
-      one.createdPrefs[0].partition,
-      two.createdPrefs[0].partition,
+      one.createdPrefs[0]?.partition,
+      two.createdPrefs[0]?.partition,
       "two registries gave the same conversationId one shared partition",
     );
   });
@@ -211,7 +223,7 @@ describe("agent partition permission hardening wiring (src/main.js)", () => {
   // agent partition before constructing the view. Comment-stripped source
   // match (same technique as main.test.js): proves the calls exist as live
   // code, which the unit tests above cannot see.
-  const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
+  const mainSource = readFileSync(path.join(import.meta.dirname, "../src/main.js"), "utf8");
   const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
   it("registers the browser permission policy on each agent partition", () => {

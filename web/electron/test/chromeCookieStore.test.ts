@@ -1,16 +1,23 @@
-// Tests for src/chromeCookieStore.js, run with `node --test`. Anything that
+// Tests for src/chromeCookieStore.ts, run with `node --test`. Anything that
 // shells out to `sqlite3` is skipped where that CLI is missing or predates `-json`
 // (sqlite 3.33); the Keychain and the Electron session are always injected.
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const crypto = require("node:crypto");
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
-const { execFileSync } = require("node:child_process");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
 
-const store = require("../src/chromeCookieStore");
+import * as store from "../src/chromeCookieStore.ts";
+import type { ElectronCookie, SnapshotFs } from "../src/chromeCookieStore.ts";
+
+/** The message of a rejection, which these tests expect to be an Error. */
+function errorMessage(err: unknown): string {
+  assert.ok(err instanceof Error);
+  return err.message;
+}
 
 // Probe the same binary and output mode the module uses, not whatever `PATH` resolves.
 const hasSqlite3 = (() => {
@@ -23,18 +30,18 @@ const hasSqlite3 = (() => {
 })();
 
 /** Unix seconds → Chrome's microseconds-since-1601. */
-function chromeExpiresUtc(unixSeconds) {
+function chromeExpiresUtc(unixSeconds: number): number {
   return Math.round((unixSeconds + 11644473600) * 1e6);
 }
 
 /** AES-128-CBC in Chrome's `v10` envelope (IV = 16 spaces). */
-function encryptChromeValue(plaintext, key, prefix = "v10") {
+function encryptChromeValue(plaintext: Buffer, key: Buffer, prefix = "v10"): Buffer {
   const cipher = crypto.createCipheriv("aes-128-cbc", key, Buffer.alloc(16, 0x20));
   return Buffer.concat([Buffer.from(prefix, "latin1"), cipher.update(plaintext), cipher.final()]);
 }
 
 /** Chrome 130+ binds a value to its host via a SHA-256 prefix. */
-function boundPlaintext(hostKey, value) {
+function boundPlaintext(hostKey: string, value: string): Buffer {
   return Buffer.concat([crypto.createHash("sha256").update(hostKey).digest(), Buffer.from(value)]);
 }
 
@@ -158,20 +165,23 @@ describe("chromeCookieStore — decryption", () => {
 
 describe("chromeCookieStore — Electron cookie mapping", () => {
   it("maps a domain cookie to an explicit domain + https URL", () => {
-    const cookie = store.toElectronCookie({
-      hostKey: ".example.com",
-      name: "SID",
-      path: "/mail",
-      secure: true,
-      httpOnly: true,
-      sameSite: 1,
-      expiresUtc: chromeExpiresUtc(1_900_000_000),
-    });
+    const cookie = store.toElectronCookie(
+      {
+        hostKey: ".example.com",
+        name: "SID",
+        path: "/mail",
+        secure: true,
+        httpOnly: true,
+        sameSite: 1,
+        expiresUtc: chromeExpiresUtc(1_900_000_000),
+      },
+      "sid-value",
+    );
     assert.deepEqual(cookie, {
       url: "https://example.com/mail",
       domain: ".example.com",
       name: "SID",
-      value: undefined,
+      value: "sid-value",
       path: "/mail",
       secure: true,
       httpOnly: true,
@@ -181,15 +191,18 @@ describe("chromeCookieStore — Electron cookie mapping", () => {
   });
 
   it("leaves host-only cookies without a domain and omits session expiry", () => {
-    const cookie = store.toElectronCookie({
-      hostKey: "example.com",
-      name: "session",
-      path: "",
-      secure: false,
-      httpOnly: false,
-      sameSite: -1,
-      expiresUtc: 0,
-    });
+    const cookie = store.toElectronCookie(
+      {
+        hostKey: "example.com",
+        name: "session",
+        path: "",
+        secure: false,
+        httpOnly: false,
+        sameSite: -1,
+        expiresUtc: 0,
+      },
+      "",
+    );
     assert.equal(cookie.domain, undefined);
     assert.equal(cookie.path, "/");
     assert.equal(cookie.expirationDate, undefined);
@@ -197,15 +210,18 @@ describe("chromeCookieStore — Electron cookie mapping", () => {
   });
 
   it("brackets IPv6 hosts so cookies.set accepts the URL", () => {
-    const cookie = store.toElectronCookie({
-      hostKey: "::1",
-      name: "ipv6",
-      path: "/",
-      secure: false,
-      httpOnly: false,
-      sameSite: -1,
-      expiresUtc: 0,
-    });
+    const cookie = store.toElectronCookie(
+      {
+        hostKey: "::1",
+        name: "ipv6",
+        path: "/",
+        secure: false,
+        httpOnly: false,
+        sameSite: -1,
+        expiresUtc: 0,
+      },
+      "",
+    );
     assert.equal(cookie.url, "https://[::1]/");
   });
 
@@ -214,13 +230,16 @@ describe("chromeCookieStore — Electron cookie mapping", () => {
     assert.deepEqual(
       codes.map(
         (sameSite) =>
-          store.toElectronCookie({
-            hostKey: "example.com",
-            name: "n",
-            path: "/",
-            sameSite,
-            expiresUtc: 0,
-          }).sameSite,
+          store.toElectronCookie(
+            {
+              hostKey: "example.com",
+              name: "n",
+              path: "/",
+              sameSite,
+              expiresUtc: 0,
+            },
+            "",
+          ).sameSite,
       ),
       ["unspecified", "no_restriction", "lax", "strict"],
     );
@@ -273,13 +292,13 @@ describe("chromeCookieStore — Electron cookie mapping", () => {
 
 describe("chromeCookieStore — system binaries", () => {
   it("runs sqlite3 and security by absolute path", async () => {
-    const calls = [];
-    const failing = async (command) => {
+    const calls: string[] = [];
+    const failing = async (command: string): Promise<never> => {
       calls.push(command);
       throw new Error("boom");
     };
     // A fake snapshot keeps this test independent of a real sqlite3 binary.
-    const fsImpl = {
+    const fsImpl: SnapshotFs = {
       promises: {
         mkdtemp: async () => path.join(os.tmpdir(), "omnigent-chrome-cookie-fake"),
         copyFile: async () => {},
@@ -295,14 +314,14 @@ describe("chromeCookieStore — system binaries", () => {
       }),
       (err) => {
         // Fixed text: the exec error would carry the command line and temp paths.
-        assert.equal(err.message, "Could not read Chrome's cookie database.");
-        assert.doesNotMatch(err.message, /sqlite3/);
+        assert.equal(errorMessage(err), "Could not read Chrome's cookie database.");
+        assert.doesNotMatch(errorMessage(err), /sqlite3/);
         return true;
       },
     );
     calls.length = 0;
     const password = await store.readSafeStoragePassword({
-      run: async (command) => {
+      run: async (command: string) => {
         calls.push(command);
         return { stdout: "secret\n" };
       },
@@ -357,8 +376,8 @@ describe("chromeCookieStore — Keychain", () => {
         },
       }),
       (err) => {
-        assert.match(err.message, /Couldn't read Chrome's cookie key/);
-        assert.doesNotMatch(err.message, /SecKeychain/);
+        assert.match(errorMessage(err), /Couldn't read Chrome's cookie key/);
+        assert.doesNotMatch(errorMessage(err), /SecKeychain/);
         return true;
       },
     );
@@ -366,7 +385,11 @@ describe("chromeCookieStore — Keychain", () => {
 });
 
 describe("chromeCookieStore — Chrome profile discovery", () => {
-  function writeProfile(root, dir, { localState, withCookies = true } = {}) {
+  function writeProfile(
+    root: string,
+    dir: string,
+    { localState, withCookies = true }: { localState?: unknown; withCookies?: boolean } = {},
+  ) {
     fs.mkdirSync(path.join(root, dir), { recursive: true });
     if (withCookies) fs.writeFileSync(path.join(root, dir, "Cookies"), "");
     if (localState) fs.writeFileSync(path.join(root, "Local State"), JSON.stringify(localState));
@@ -397,7 +420,7 @@ describe("chromeCookieStore — Chrome profile discovery", () => {
           ["Default", "Work"],
         ],
       );
-      assert.equal(profiles[0].cookieDbPath, path.join(root, "Profile 2", "Cookies"));
+      assert.equal(profiles[0]?.cookieDbPath, path.join(root, "Profile 2", "Cookies"));
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -433,13 +456,13 @@ describe("chromeCookieStore — import scopes", () => {
 describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
   const key = store.deriveMacKey("test-password");
 
-  function makeCookieDb(databasePath, { legacyColumns = false } = {}) {
+  function makeCookieDb(databasePath: string, { legacyColumns = false } = {}) {
     // Chrome renamed secure/httponly and added samesite in 2016; a legacy
     // profile must still read through the fallback column set.
     const scopeColumns = legacyColumns
       ? "secure INTEGER NOT NULL DEFAULT 0, httponly INTEGER NOT NULL DEFAULT 0"
       : "is_secure INTEGER NOT NULL DEFAULT 0, is_httponly INTEGER NOT NULL DEFAULT 0, samesite INTEGER NOT NULL DEFAULT -1";
-    const insertCookie = (hostKey, name, encrypted, scope) =>
+    const insertCookie = (hostKey: string, name: string, encrypted: Buffer, scope: string) =>
       `INSERT INTO cookies (host_key, name, path, encrypted_value, expires_utc, ${legacyColumns ? "secure, httponly" : "is_secure, is_httponly, samesite"})
         VALUES ('${hostKey}', '${name}', '/', X'${encrypted.toString("hex")}',
           ${chromeExpiresUtc(1_900_000_000)}, ${scope});`;
@@ -495,6 +518,7 @@ describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
       });
       assert.deepEqual(rows.map((row) => row.name).sort(), ["SID", "hostonly"]);
       const sid = rows.find((row) => row.name === "SID");
+      assert.ok(sid);
       assert.equal(sid.hostKey, ".example.com");
       assert.equal(sid.secure, true);
       assert.equal(sid.httpOnly, true);
@@ -523,6 +547,7 @@ describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
       // files.example.com's host-only cookie.
       assert.equal(rows.length, 3);
       const shared = rows.find((row) => row.hostKey === ".example.com");
+      assert.ok(shared);
       assert.equal(shared.secure, true);
       assert.equal(shared.httpOnly, true);
       // No samesite column: Chrome's pre-2016 default.
@@ -532,7 +557,7 @@ describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
     }
   });
 
-  function makeScopeDb(databasePath, entries) {
+  function makeScopeDb(databasePath: string, entries: [string, string, string?][]) {
     const statements = [
       "PRAGMA journal_mode=WAL;",
       `CREATE TABLE cookies (
@@ -578,7 +603,7 @@ describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
       });
       assert.deepEqual(plain.scopes, ["foo.github.io"]);
 
-      const written = [];
+      const written: ElectronCookie[] = [];
       const result = await store.importSiteCookies({
         host: "mail.example.co.uk",
         scope: "co.uk",
@@ -649,7 +674,7 @@ describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
       assert.deepEqual(preview.scopes, ["mail.example.com", "example.com"]);
       // The parent scope covers everything under example.com, so it can only
       // add to the narrower one.
-      assert.deepEqual(preview.profiles[0].scopes, [
+      assert.deepEqual(preview.profiles[0]?.scopes, [
         { host: "mail.example.com", cookieCount: 1 },
         { host: "example.com", cookieCount: 3 },
       ]);
@@ -663,7 +688,7 @@ describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
     try {
       fs.mkdirSync(path.join(root, "Default"));
       makeCookieDb(path.join(root, "Default", "Cookies"));
-      const written = [];
+      const written: ElectronCookie[] = [];
       const result = await store.importSiteCookies({
         host: "files.example.com",
         profileId: "Default",
@@ -690,7 +715,7 @@ describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
     try {
       fs.mkdirSync(path.join(root, "Default"));
       makeCookieDb(path.join(root, "Default", "Cookies"));
-      const written = [];
+      const written: ElectronCookie[] = [];
       const result = await store.importSiteCookies({
         host: "files.example.com",
         scope: "example.com",
@@ -719,7 +744,7 @@ describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
     try {
       fs.mkdirSync(path.join(root, "Default"));
       makeCookieDb(path.join(root, "Default", "Cookies"));
-      const written = [];
+      const written: ElectronCookie[] = [];
       const result = await store.importSiteCookies({
         host: "files.example.com",
         scope: "unrelated.test",
@@ -762,7 +787,7 @@ describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
     try {
       fs.mkdirSync(path.join(root, "Default"));
       makeCookieDb(path.join(root, "Default", "Cookies"));
-      const written = [];
+      const written: ElectronCookie[] = [];
       const result = await store.importSiteCookies({
         host: "files.example.com",
         profileId: "Default",
@@ -820,8 +845,8 @@ describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
           readPassword: async () => "test-password",
         }),
         (err) => {
-          assert.equal(err.message, "Could not read Chrome's cookie database.");
-          assert.doesNotMatch(err.message, /sqlite3|omnigent-chrome-cookie-|\/Users\//);
+          assert.equal(errorMessage(err), "Could not read Chrome's cookie database.");
+          assert.doesNotMatch(errorMessage(err), /sqlite3|omnigent-chrome-cookie-|\/Users\//);
           return true;
         },
       );

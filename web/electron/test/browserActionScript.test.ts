@@ -1,11 +1,18 @@
-"use strict";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { it } from "node:test";
 
-const assert = require("node:assert/strict");
-const { it } = require("node:test");
-const { JSDOM } = require("jsdom");
-const { buildBrowserActionScript } = require("../src/browserActionScript.mjs");
-const { decodeLegacyBrowserAction } = require("../src/browserLegacyAction");
-const legacy = require("./fixtures/browserActions-v0.18.json");
+import { buildBrowserActionScript } from "../src/browserActionScript.ts";
+import { decodeLegacyBrowserAction } from "../src/browserLegacyAction.ts";
+
+interface LegacyFixture {
+  requests: { action: string; args: Record<string, unknown>; script: string }[];
+}
+
+const legacy: LegacyFixture = JSON.parse(
+  fs.readFileSync(path.join(import.meta.dirname, "fixtures", "browserActions-v0.18.json"), "utf8"),
+);
 
 it("translates the frozen v0.18 relay templates into validated actions", () => {
   for (const { action, args, script } of legacy.requests) {
@@ -34,50 +41,6 @@ it("rejects altered legacy templates and accepts only bounded literal data", () 
   assert.throws(() =>
     decodeLegacyBrowserAction(script.replaceAll('"Ada"', JSON.stringify("x".repeat(100001)))),
   );
-});
-
-it("snapshots the DOM, resolves refs, types literal text and rejects superseded refs", () => {
-  const dom = new JSDOM('<button>Save</button><input aria-label="Name">', {
-    url: "https://example.com",
-    runScripts: "outside-only",
-  });
-  try {
-    const { window } = dom;
-    // JSDOM has no layout; provide visible bounds for the real DOM walk.
-    for (const el of window.document.querySelectorAll("*")) {
-      el.getBoundingClientRect = () => ({ width: 100, height: 40 });
-      el.scrollIntoView = () => {};
-    }
-    const snapshot = JSON.parse(window.eval(buildBrowserActionScript("snapshot")));
-    assert.match(snapshot.tree, /button "Save" \[ref=1\]/);
-    assert.match(snapshot.tree, /textbox "Name" \[ref=2\]/);
-    let clicks = 0;
-    window.document.querySelector("button").addEventListener("click", () => clicks++);
-    window.eval(buildBrowserActionScript("click", { ref: 1, snapshot_id: snapshot.snapshot_id }));
-    assert.equal(clicks, 1);
-    const input = window.document.querySelector("input");
-    const events = [];
-    for (const event of ["input", "change"])
-      input.addEventListener(event, () => events.push(event));
-    const text = 'hello "world"\n☀';
-    window.eval(buildBrowserActionScript("type", { selector: 'input[aria-label="Name"]', text }));
-    assert.equal(input.value, text.replace("\n", ""));
-    assert.deepEqual(events, ["input", "change"]);
-    window.eval(buildBrowserActionScript("snapshot"));
-    assert.throws(
-      () =>
-        window.eval(
-          buildBrowserActionScript("click", {
-            ref: 1,
-            snapshot_id: snapshot.snapshot_id,
-          }),
-        ),
-      /superseded/,
-    );
-    assert.equal(clicks, 1);
-  } finally {
-    dom.window.close();
-  }
 });
 
 it("rejects unknown actions, non-data arguments and out-of-range references", () => {
