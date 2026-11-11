@@ -806,40 +806,16 @@ async def test_late_create_refuses_a_one_time_rule_instead_of_moving_it_a_year(
     assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
 
 
-@pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
-@pytest.mark.parametrize("first_run_at", [0, 253402300800])
-async def test_out_of_range_first_run_at_is_rejected(
-    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, first_run_at: int
-) -> None:
-    rule, _fire_at = _one_time_rule_in(hours=2)
-    resp = await auth_client.post(
-        "/v1/scheduled-tasks",
-        json=_create_body(rrule=rule, timezone="UTC", first_run_at=first_run_at),
-        headers=_headers(),
-    )
-    # Rejected by request validation, before any datetime formatting can overflow.
-    assert resp.status_code == 422, resp.text
-    assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
-
-
-async def test_legacy_scheduler_refuses_first_run_at(
-    auth_client: httpx.AsyncClient, db_uri: str
-) -> None:
-    _rule, fire_at = _one_time_rule_in(hours=2)
-    resp = await auth_client.post(
-        "/v1/scheduled-tasks", json=_create_body(first_run_at=fire_at), headers=_headers()
-    )
-    assert resp.status_code == 400, resp.text
-    assert "first_run_at needs one-time automations" in resp.text
-    assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
-
-
-@pytest.mark.parametrize("auth_app", [True], indirect=True)
-async def test_one_time_rules_wait_for_their_release_feature(
+# The legacy timer re-anchors COUNT at each re-arm, so it would fire a one-time rule
+# again. The database scheduler accepts one-time rules but doesn't create them
+# without one_time_automations, so a reminder can't reach an older scheduler that
+# would pause it.
+@pytest.mark.parametrize(
+    "auth_app", [False, True], indirect=True, ids=["legacy_timer", "no_release_feature"]
+)
+async def test_servers_without_one_time_automations_refuse_them(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    # The database scheduler alone accepts one-time rules but doesn't create them,
-    # so a reminder can't reach an older scheduler that would pause it.
     info = (await auth_client.get("/v1/info", headers=_headers())).json()
     assert info["scheduled_task_one_time"] is False
     rule, fire_at = _one_time_rule_in(hours=2)
@@ -855,20 +831,6 @@ async def test_one_time_rules_wait_for_their_release_feature(
     assert guarded.status_code == 400, guarded.text
     assert "first_run_at needs one-time automations" in guarded.text
     assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
-
-
-async def test_legacy_scheduler_rejects_a_one_time_rule(
-    auth_client: httpx.AsyncClient, db_uri: str
-) -> None:
-    # The legacy timer re-anchors COUNT at each re-arm, so it would fire again.
-    info = (await auth_client.get("/v1/info", headers=_headers())).json()
-    assert info["scheduled_task_one_time"] is False
-    rule, _fire_at = _one_time_rule_in(hours=2)
-    resp = await auth_client.post(
-        "/v1/scheduled-tasks", json=_create_body(rrule=rule), headers=_headers()
-    )
-    assert resp.status_code == 400, resp.text
-    assert "fires only once" in resp.text
 
 
 async def test_create_rejects_unknown_agent(auth_client: httpx.AsyncClient, db_uri: str) -> None:

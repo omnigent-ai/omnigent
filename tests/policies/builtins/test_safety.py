@@ -736,7 +736,9 @@ def _nine_am_pacific_two_days_out() -> tuple[datetime, str]:
 
 def test_ask_on_scheduled_task_change_asks_for_a_reminder() -> None:
     """A reminder ASKs with its time and full message, which runs unattended later."""
-    message = "Check CI on PR #12, then " + "summarize the failures. " * 10
+    # Longer than the 1,024-character argument preview, so a truncated copy would
+    # lose the sentinel at the end.
+    message = "Check CI on PR #12, then " + "summarize the failures. " * 60 + "END-SENTINEL"
     local, shown = _nine_am_pacific_two_days_out()
     for timing, expected in (
         ({"delay_seconds": 2700}, "2700 seconds after approval, rounded up to the next minute"),
@@ -746,6 +748,7 @@ def test_ask_on_scheduled_task_change_asks_for_a_reminder() -> None:
         assert result["result"] == "ASK"
         assert f"set a reminder for this session {expected}." in result["reason"]
         assert message in result["reason"]
+        assert result["reason"].index("END-SENTINEL") > 1024
 
 
 def test_reminder_approval_shows_the_resolved_time_whatever_the_raw_text() -> None:

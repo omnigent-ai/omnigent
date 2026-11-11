@@ -706,11 +706,18 @@ async def test_reminder_creates_a_one_time_task_that_continues_this_session() ->
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_frozen_now")
-@pytest.mark.parametrize("one_time", [False, None])
-async def test_reminder_is_refused_on_a_server_without_one_time_schedules(
-    one_time: bool | None,
-) -> None:
-    client = _ReminderClient(one_time=one_time)
+@pytest.mark.parametrize(
+    "info",
+    [
+        _Resp(body={"scheduled_task_session_modes": True}),
+        _Resp(body={"scheduled_task_session_modes": True, "scheduled_task_one_time": False}),
+        _Resp(status_code=503, body={"error": "unavailable"}),
+    ],
+    ids=["field_absent", "disabled", "info_unreadable"],
+)
+async def test_reminder_is_refused_on_a_server_without_one_time_schedules(info: _Resp) -> None:
+    client = _ReminderClient()
+    client._info = info
     out = await _execute_scheduled_task_tool(
         "sys_reminder_set",
         json.dumps({"message": "ping", "delay_seconds": 600}),
@@ -786,7 +793,7 @@ async def test_reminder_passes_the_servers_refusal_to_the_agent() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_frozen_now")
-@pytest.mark.parametrize("next_run_at", ["2027-11-10T23:01:00+00:00", None])
+@pytest.mark.parametrize("next_run_at", ["2027-11-10T23:01:00+00:00", None, "not a time"])
 async def test_reminder_scheduled_for_another_time_is_deleted(next_run_at: str | None) -> None:
     """A server that saved the reminder for another minute doesn't get to keep it."""
     client = _ReminderClient(_Resp(body={"id": _TASK_ID, "next_run_at": next_run_at}))
@@ -833,23 +840,6 @@ async def test_reminder_reports_a_wrong_schedule_it_could_not_delete(
     assert "was deleted" not in out["error"]
     assert out["scheduled_task_id"] == _TASK_ID
     assert client.calls[-1] == ("DELETE", f"/v1/scheduled-tasks/{_TASK_ID}", None)
-
-
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("_frozen_now")
-async def test_reminder_is_refused_when_server_info_is_unreadable() -> None:
-    client = _ReminderClient()
-    client._info = _Resp(status_code=503, body={"error": "unavailable"})
-    out = json.loads(
-        await _execute_scheduled_task_tool(
-            "sys_reminder_set",
-            json.dumps({"message": "ping", "delay_seconds": 600}),
-            server_client=client,
-            conversation_id="conv_1",
-        )
-    )
-    assert "does not support one-time reminders" in out["error"]
-    assert not [call for call in client.calls if call[0] == "POST"]
 
 
 @pytest.mark.asyncio
