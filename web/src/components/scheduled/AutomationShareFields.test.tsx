@@ -106,12 +106,15 @@ describe("AutomationShareFields", () => {
   });
 
   it("stops adding at the server's limit", () => {
-    renderFields(
-      Array.from({ length: MAX_AUTOMATION_SHARES }, (_, index) => ({
+    const onValue = renderFields(
+      Array.from({ length: MAX_AUTOMATION_SHARES - 1 }, (_, index) => ({
         userId: `user${index}@example.com`,
         level: 1,
       })),
     );
+    add("last@example.com");
+    expect(onValue.mock.lastCall?.[0]).toHaveLength(MAX_AUTOMATION_SHARES);
+    expect(screen.getByLabelText("User or group")).toHaveProperty("disabled", true);
     expect(screen.getByRole("button", { name: "Add" })).toHaveProperty("disabled", true);
     expect(screen.getByText(/up to 10 people or groups/)).toBeTruthy();
   });
