@@ -1194,10 +1194,10 @@ def _classify_gh_api(rest: list[str]) -> _ShellOp:
     """
     Classify a ``gh api`` call (REST method decides read vs write).
 
-    ``gh api`` defaults to GET (read); an explicit write method
-    (``-X POST`` / ``--method PATCH`` / …) or the presence of field flags
-    (``-f`` / ``--field`` / ``--raw-field`` / ``--input``, which make gh default
-    to POST) marks it a write. The repository comes only from the endpoint operand.
+    ``gh api`` defaults to GET (read). An explicit method (``-X POST`` /
+    ``--method PATCH`` / …) decides the call. Without a method, field flags
+    (``-f`` / ``--field`` / ``--raw-field`` / ``--input``) make gh default to
+    POST, so they mark it a write. The repository comes only from the endpoint operand.
 
     :param rest: Tokens after ``gh api``, e.g. ``["repos/o/r/pulls", "-X", "POST"]``.
     :returns: A read or write :class:`_ShellOp` for the api call.
@@ -1225,7 +1225,12 @@ def _classify_gh_api(rest: list[str]) -> _ShellOp:
         for t in rest
     )
     write_methods = {"POST", "PUT", "PATCH", "DELETE"}
-    is_write = any(method in write_methods for method in methods) or has_fields
+    # An explicit method overrides the POST that field flags imply. With several
+    # methods, any write among them makes the call a write.
+    if methods:
+        is_write = any(method in write_methods for method in methods)
+    else:
+        is_write = has_fields
     hostname_values = _flag_values(rest, frozenset({"--hostname"}))
     if _conflicting_values(hostname_values, str.lower):
         return _unparseable_op("conflicting gh api hostnames")
