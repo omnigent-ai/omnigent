@@ -2041,7 +2041,6 @@ module.exports = function (pi) {
     if (!(cumulativeInputTokens || cumulativeOutputTokens)) return;
     const postKey = usagePostKey();
     if (postKey === lastPostedUsageKey) return;
-    lastPostedUsageKey = postKey;
     // Persist the running total before the POST so a relaunch restores it even
     // when the flush fails and the server never records this report.
     persistCumulativeUsage();
@@ -2053,7 +2052,16 @@ module.exports = function (pi) {
     };
     if (completeCost) data.cumulative_cost_usd = cumulativeCostUsd;
     if (usageModel) data.model = usageModel;
-    await postEvent(config, { type: "external_session_usage", data });
+    try {
+      const response = await postEventChecked(
+        config,
+        { type: "external_session_usage", data },
+        AbortSignal.timeout(assistantItemPostTimeoutMs(config)),
+      );
+      if (response && postKey === usagePostKey()) lastPostedUsageKey = postKey;
+    } catch (_err) {
+      // A later observation can report these saved totals after the server recovers.
+    }
   }
 
   // Restore cumulative totals before recording new usage after a relaunch.
@@ -2529,11 +2537,10 @@ module.exports = function (pi) {
     rememberContext(ctx);
     // Pi can retry or compact after this attempt; only usage is final here.
     const messages = event && Array.isArray(event.messages) ? event.messages : [];
-    let changed = false;
     for (const message of messages) {
-      if (accumulateUsage(message)) changed = true;
+      accumulateUsage(message);
     }
-    if (changed) await postSessionUsage();
+    await postSessionUsage();
   });
 
   pi.on("agent_settled", async (event, ctx) => {
