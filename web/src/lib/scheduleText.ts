@@ -337,7 +337,7 @@ const MONTH_NAMES = [
  * formatter doesn't special-case, so a valid-but-unusual rule still renders
  * something readable rather than blank.
  */
-export function describeSchedule(rrule: string): string {
+export function describeSchedule(rrule: string, timezone?: string): string {
   const rule = tryParse(rrule);
   if (!rule) return rrule;
   const o = rule.origOptions;
@@ -365,7 +365,9 @@ export function describeSchedule(rrule: string): string {
       hours.length <= 1 &&
       minutes.length <= 1
     ) {
-      return `Once on ${monthName} ${monthDays[0]}${timeSuffix}`;
+      // A reminder is stored in UTC, so name the zone its time is in.
+      const zone = !timezone ? "" : timezone === "UTC" ? " UTC" : ` (${timezone})`;
+      return `Once on ${monthName} ${monthDays[0]}${timeSuffix}${zone}`;
     }
     // Remove COUNT before describing the underlying recurrence.
     const recurring = rrule

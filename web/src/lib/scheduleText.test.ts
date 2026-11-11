@@ -205,6 +205,14 @@ describe("describeSchedule", () => {
         "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=23;BYMINUTE=0;BYSECOND=0;COUNT=1",
       ),
     ).toBe("Once on November 12 at 11:00 PM");
+    const reminder = "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=23;BYMINUTE=0;BYSECOND=0;COUNT=1";
+    // With its task's zone the time can't be mistaken for the viewer's local time.
+    expect(describeSchedule(reminder, "UTC")).toBe("Once on November 12 at 11:00 PM UTC");
+    expect(describeSchedule(reminder, "Asia/Tokyo")).toBe(
+      "Once on November 12 at 11:00 PM (Asia/Tokyo)",
+    );
+    // Recurring schedules read as before.
+    expect(describeSchedule("FREQ=DAILY;BYHOUR=9;BYMINUTE=0", "UTC")).toBe("Every day at 9:00 AM");
     for (const rule of [
       "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=1",
       "COUNT=1;FREQ=DAILY;BYHOUR=9;BYMINUTE=0",

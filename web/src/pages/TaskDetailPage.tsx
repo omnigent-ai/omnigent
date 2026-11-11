@@ -296,7 +296,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
     !task.permissionMode || (permissionOption?.value === "default" && harness !== "claude-native")
       ? "Agent default"
       : (permissionOption?.label ?? task.permissionMode);
-  const scheduleSummary = describeSchedule(task.rrule);
+  const scheduleSummary = describeSchedule(task.rrule, task.timezone);
   const nextRun = formatNextRunAt(task.nextRunAt, now);
   // A single per-task busy flag: the header actions disable while any of this
   // task's mutations are in flight.
