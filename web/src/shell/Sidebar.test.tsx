@@ -4322,6 +4322,59 @@ describe("Sidebar view options", () => {
     ).toEqual(["conv_done_new", "conv_done_old", "conv_running"]);
   });
 
+  it("opens view submenus in place of the main menu on a mobile viewport", () => {
+    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...mediaQuery,
+      media: query,
+      matches: query === "(max-width: 767.98px)",
+    }));
+    try {
+      mockConversations([conv("conv_idle", "Codex", { status: "idle" })]);
+      renderGroupingSidebar();
+      const openMenu = () => {
+        fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+          button: 0,
+          ctrlKey: false,
+          pointerType: "mouse",
+        });
+        return screen.getByRole("menu");
+      };
+      const menu = openMenu();
+
+      fireEvent.click(within(menu).getByTestId("session-grouping-menu"));
+      expect(screen.getAllByRole("menu")).toEqual([menu]);
+      expect(within(menu).getByRole("menuitem", { name: "Back from Grouping" })).toHaveTextContent(
+        "Grouping",
+      );
+      expect(within(menu).getByRole("menuitemradio", { name: "Harness" })).toBeInTheDocument();
+      expect(within(menu).queryByTestId("session-ordering-menu")).toBeNull();
+
+      fireEvent.click(within(menu).getByTestId("session-filter-menu-back"));
+      expect(within(menu).queryByRole("menuitemradio")).toBeNull();
+      fireEvent.click(within(menu).getByTestId("session-show-menu"));
+      fireEvent.click(within(menu).getByTestId("session-show-branch"));
+      expect(within(menu).getByTestId("session-show-repo")).toBeInTheDocument();
+
+      fireEvent.click(within(menu).getByTestId("session-filter-menu-back"));
+      fireEvent.click(within(menu).getByTestId("session-ordering-menu"));
+      fireEvent.click(within(menu).getByRole("menuitemradio", { name: "Created" }));
+      expect(screen.queryByRole("menu")).toBeNull();
+      expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!)).toMatchObject({
+        ordering: "created",
+        show: ["branch"],
+      });
+      // Reopening starts from the main list, not the last submenu.
+      const reopened = openMenu();
+      fireEvent.click(within(reopened).getByTestId("session-grouping-menu"));
+      fireEvent.keyDown(reopened, { key: "Escape" });
+      expect(screen.queryByRole("menu")).toBeNull();
+      expect(within(openMenu()).getByTestId("session-grouping-menu")).toBeInTheDocument();
+    } finally {
+      matchMedia.mockRestore();
+    }
+  });
+
   it.each(["default", "status", "created", "updated"])(
     "uses Created for saved %s grouping and project folders",
     (grouping) => {
