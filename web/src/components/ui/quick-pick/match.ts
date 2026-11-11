@@ -131,6 +131,34 @@ export function mergeRanges(ranges: readonly MatchRange[]): MatchRange[] {
   return merged;
 }
 
+const WORD_RUN = /[\p{L}\p{N}][\p{L}\p{N}\p{M}]*/gu;
+
+/**
+ * `ranges` with each word that holds several of them marked whole, so "gostng"
+ * on "Go to Settings" reads as "Go" and "Settings", not "S", "t", "ng". A word
+ * holding one range keeps it as is, such as the typed prefix "Set".
+ */
+export function wordCoalescedRanges(text: string, ranges: readonly MatchRange[]): MatchRange[] {
+  const merged = mergeRanges(ranges);
+  const result: MatchRange[] = [];
+  let index = 0;
+  for (const word of text.matchAll(WORD_RUN)) {
+    const start = word.index;
+    const end = start + word[0].length;
+    while (index < merged.length && merged[index].end <= start) result.push(merged[index++]);
+    let inside = index;
+    while (inside < merged.length && merged[inside].start >= start && merged[inside].end <= end) {
+      inside++;
+    }
+    if (inside - index > 1) {
+      result.push({ start, end });
+      index = inside;
+    }
+  }
+  result.push(...merged.slice(index));
+  return mergeRanges(result);
+}
+
 function contiguousStart(query: readonly string[], target: readonly string[], from = 0): number {
   const last = target.length - query.length;
   outer: for (let start = from; start <= last; start++) {
@@ -507,4 +535,30 @@ export function compareCandidateMatches(first: CandidateMatch, second: Candidate
     first.penalty - second.penalty ||
     second.weight - first.weight
   );
+}
+
+/**
+ * Every place a query token appears contiguously in `text`, folded the way the
+ * matcher folds; for excerpts whose matches the user scans for, such as message text.
+ */
+export function occurrenceRanges(query: string, text: string): MatchRange[] {
+  const target = foldText(text);
+  const ranges: MatchRange[] = [];
+  for (const token of tokenizeQuery(query)) {
+    let first = contiguousStart(token, target.values);
+    while (first !== -1) {
+      ranges.push(sourceRange(target, first, first + token.length - 1));
+      first = contiguousStart(token, target.values, first + token.length);
+    }
+  }
+  return mergeRanges(ranges);
+}
+
+/** Convenience for highlighting one string against a free-form query. */
+export function matchText(query: string, text: string): MatchRange[] | null {
+  const match = matchCandidate(
+    tokenizeQuery(query),
+    prepareFields([{ key: "text", text, weight: 0 }]),
+  );
+  return match ? (match.ranges.text ?? []) : null;
 }

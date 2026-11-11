@@ -7,9 +7,12 @@ import {
   foldText,
   matchCandidate,
   matchField,
+  matchText,
   mergeRanges,
+  occurrenceRanges,
   prepareFields,
   tokenizeQuery,
+  wordCoalescedRanges,
 } from "./match";
 
 function match(query: string, text: string, matching?: MatchStrategy) {
@@ -284,5 +287,75 @@ describe("mergeRanges", () => {
       { start: 0, end: 2 },
       { start: 1, end: 4 },
     ]);
+  });
+});
+
+describe("matchText", () => {
+  it("returns one string's highlight ranges for a multi-word query, or null", () => {
+    expect(matchText("cafe noir", "Le Cafe\u0301 noir")).toEqual([
+      { start: 3, end: 8 },
+      { start: 9, end: 13 },
+    ]);
+    expect(matchText("noir cafe", "Le Café noir")).toEqual([
+      { start: 3, end: 7 },
+      { start: 8, end: 12 },
+    ]);
+    expect(matchText("cafe tea", "Le Café noir")).toBeNull();
+  });
+});
+
+describe("occurrenceRanges", () => {
+  it("marks every occurrence of every token, folded like the matcher", () => {
+    expect(occurrenceRanges("cafe", "Café or CAFE, then cafe")).toEqual([
+      { start: 0, end: 4 },
+      { start: 8, end: 12 },
+      { start: 19, end: 23 },
+    ]);
+    expect(occurrenceRanges("deploy fail", "deploy failed; redeploy")).toEqual([
+      { start: 0, end: 6 },
+      { start: 7, end: 11 },
+      { start: 17, end: 23 },
+    ]);
+  });
+
+  it("merges overlapping tokens and steps past each occurrence", () => {
+    expect(occurrenceRanges("ab bc", "abc")).toEqual([{ start: 0, end: 3 }]);
+    expect(occurrenceRanges("aa", "aaaaa")).toEqual([{ start: 0, end: 4 }]);
+  });
+
+  it("reports UTF-16 offsets past astral and decomposed characters", () => {
+    expect(occurrenceRanges("go", "🚀 go, 🚀 go")).toEqual([
+      { start: 3, end: 5 },
+      { start: 10, end: 12 },
+    ]);
+    expect(occurrenceRanges("e", "e\u0301e")).toEqual([{ start: 0, end: 3 }]);
+  });
+
+  it("returns nothing for a fuzzy-only match or an empty query", () => {
+    expect(occurrenceRanges("opst", "Open settings")).toEqual([]);
+    expect(occurrenceRanges("  ", "Open settings")).toEqual([]);
+  });
+});
+
+describe("wordCoalescedRanges", () => {
+  const words = (query: string, text: string) => {
+    const ranges = matchField(tokenizeQuery(query)[0], foldText(text), 0, "words")!.ranges;
+    return wordCoalescedRanges(text, ranges).map(({ start, end }) => text.slice(start, end));
+  };
+
+  it("marks a word whole when it holds several matched pieces", () => {
+    expect(words("gostng", "Go to Settings")).toEqual(["Go", "Settings"]);
+    expect(words("stng", "Settings")).toEqual(["Settings"]);
+  });
+
+  it("keeps a single run inside a word as typed", () => {
+    expect(words("gose", "Go to Settings")).toEqual(["Go", "Se"]);
+    expect(words("nt", "New tab")).toEqual(["N", "t"]);
+  });
+
+  it("leaves ranges that cross words or sit between them alone", () => {
+    const text = "Show Files";
+    expect(wordCoalescedRanges(text, [{ start: 2, end: 7 }])).toEqual([{ start: 2, end: 7 }]);
+    expect(wordCoalescedRanges(text, [])).toEqual([]);
   });
 });
