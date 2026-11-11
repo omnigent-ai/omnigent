@@ -643,22 +643,27 @@ class SqlAlchemyPermissionStore(PermissionStore):
         # primary-key reads below pipeline on the same connection rather than
         # paying three separate checkout/BEGIN/COMMIT cycles (which is what
         # calling is_admin + check_access + get_permission_level separately
-        # did — see the GET /v1/sessions/{id} snapshot path).
+        # did — see the GET /v1/sessions/{id} snapshot path). The user's and
+        # the public grant share one statement (two primary-key lookups).
         with self._session("resolve_access") as session:
             user_row = session.get(SqlUser, (workspace_id, user_id))
-            user_grant = session.get(
-                SqlSessionPermission, (workspace_id, user_id, conversation_id)
-            )
-            public_grant = session.get(
-                SqlSessionPermission,
-                (workspace_id, RESERVED_USER_PUBLIC, conversation_id),
+            grant_levels = dict(
+                session.execute(
+                    select(SqlSessionPermission.user_id, SqlSessionPermission.level).where(
+                        SqlSessionPermission.workspace_id == workspace_id,
+                        SqlSessionPermission.user_id.in_([user_id, RESERVED_USER_PUBLIC]),
+                        SqlSessionPermission.conversation_id == conversation_id,
+                    )
+                )
+                .tuples()
+                .all()
             )
             access = ResolvedAccess(
                 is_admin=user_row is not None
                 and user_row.deleted_at is None
                 and user_row.is_admin,
-                user_grant_level=user_grant.level if user_grant is not None else None,
-                public_grant_level=public_grant.level if public_grant is not None else None,
+                user_grant_level=grant_levels.get(user_id),
+                public_grant_level=grant_levels.get(RESERVED_USER_PUBLIC),
             )
         # Cache only a positive standing: a no-access result is left uncached so
         # a freshly granted user is authorized on their next request, not after

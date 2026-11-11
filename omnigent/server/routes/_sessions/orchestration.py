@@ -28,7 +28,7 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.db.utils import generate_agent_id, generate_task_id
+from omnigent.db.utils import generate_agent_id, generate_task_id, shared_read_scope
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import (
@@ -13816,6 +13816,81 @@ async def _run_runner_status_probe(
         _runner_status_probe_inflight.pop(session_id, None)
 
 
+class _RequestAgentReads:
+    """Memoize ``AgentStore.get`` for one snapshot build.
+
+    The snapshot, its model-options lookup and its harness resolver each read the
+    bound agent; sharing one result keeps that to a single store call per request.
+    Failed reads are not memoized, so each caller still handles its own error.
+    Every other attribute delegates to the wrapped store.
+    """
+
+    def __init__(self, agent_store: AgentStore) -> None:
+        self._agent_store = agent_store
+        self._agents: dict[str, Agent | None] = {}
+
+    def get(self, agent_id: str) -> Agent | None:
+        if agent_id not in self._agents:
+            self._agents[agent_id] = self._agent_store.get(agent_id)
+        return self._agents[agent_id]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._agent_store, name)
+
+
+def _read_snapshot_items_and_agent(
+    conv_store: ConversationStore,
+    session_id: str,
+    conv: Conversation,
+    agent_reads: _RequestAgentReads | None,
+    include_items: bool,
+) -> list[ConversationItem]:
+    """Read the newest committed items and warm the agent memo in one checkout.
+
+    Returns the items chronologically; an agent read failure is left for the
+    snapshot's own agent lookup to retry and handle.
+    """
+    with shared_read_scope():
+        items: list[ConversationItem] = []
+        if include_items:
+            items_page = conv_store.list_items(
+                conversation_id=session_id,
+                limit=100,
+                order="desc",
+            )
+            items = list(reversed(items_page.data))
+        if agent_reads is not None and conv.agent_id is not None:
+            with contextlib.suppress(Exception):
+                agent_reads.get(conv.agent_id)
+    return items
+
+
+def _read_snapshot_liveness_and_usage(
+    session_id: str,
+    conv: Conversation,
+    conv_store: ConversationStore,
+    liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None,
+    include_usage: bool,
+) -> tuple[SessionLiveness | None, dict[str, Any]]:
+    """Read the session's liveness and subtree usage in one checkout per database."""
+    with shared_read_scope():
+        liveness = (
+            liveness_lookup([session_id]).get(session_id) if liveness_lookup is not None else None
+        )
+        # Empty usage marks a skipped aggregate; None would fall back to the
+        # parent's own spend and under-report it.
+        subtree_usage = (
+            load_session_usage(
+                conv.id,
+                conv_store,
+                root_conversation_id=conv.root_conversation_id,
+            )
+            if include_usage
+            else {}
+        )
+    return liveness, subtree_usage
+
+
 async def _get_session_snapshot(
     conv_store: ConversationStore,
     session_id: str,
@@ -13888,20 +13963,22 @@ async def _get_session_snapshot(
         conv = await asyncio.to_thread(conv_store.get_conversation, session_id)
     if conv is None:
         raise _session_not_found()
+    agent_reads = _RequestAgentReads(agent_store) if agent_store is not None else None
+    if agent_reads is not None:
+        agent_store = cast(AgentStore, agent_reads)
     # Return the most recent committed items while preserving the
     # SessionResponse contract that ``items`` is chronological. The
     # store's default page is the oldest 100 (``order="asc"``), which
     # makes long-session reconnects appear stale in clients that use the
     # snapshot directly.
-    items: list[ConversationItem] = []
-    if include_items:
-        items_page = await asyncio.to_thread(
-            conv_store.list_items,
-            conversation_id=session_id,
-            limit=100,
-            order="desc",
-        )
-        items = list(reversed(items_page.data))
+    items = await asyncio.to_thread(
+        _read_snapshot_items_and_agent,
+        conv_store,
+        session_id,
+        conv,
+        agent_reads if agent_cache is not None else None,
+        include_items,
+    )
     # Resolve the bound runner client once — used for live status (on a
     # status-cache miss) and for native model options below.
     #
@@ -14100,24 +14177,18 @@ async def _get_session_snapshot(
     # both fields when no lookup is wired (focused tests).
     runner_online: bool | None = None
     host_online: bool | None = None
-    if liveness_lookup is not None:
-        liveness = await asyncio.to_thread(liveness_lookup, [session_id])
-        result = liveness.get(session_id)
-        if result is not None:
-            runner_online = result.runner_online
-            host_online = result.host_online
-    # Display costs include descendants. Empty usage marks a skipped aggregate;
-    # None would fall back to the parent's own spend and under-report it.
-    subtree_usage = (
-        await asyncio.to_thread(
-            load_session_usage,
-            conv.id,
-            conv_store,
-            root_conversation_id=conv.root_conversation_id,
-        )
-        if include_usage
-        else {}
+    # Display costs include descendants.
+    liveness_result, subtree_usage = await asyncio.to_thread(
+        _read_snapshot_liveness_and_usage,
+        session_id,
+        conv,
+        conv_store,
+        liveness_lookup,
+        include_usage,
     )
+    if liveness_result is not None:
+        runner_online = liveness_result.runner_online
+        host_online = liveness_result.host_online
     # Static signal telling the open view a host-bound, host-down session is a
     # resumable managed host it can wake by sending a message, vs a terminal
     # host_offline dead-end. Computed independently of liveness_lookup (the web

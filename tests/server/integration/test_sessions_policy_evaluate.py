@@ -1601,27 +1601,27 @@ async def _seed_authenticated_session(auth_client: httpx.AsyncClient, db_uri: st
 
 # Measured SQL-statement budget for the AUTHENTICATED evaluate route — the
 # blocking PreToolUse hook. Counted as executed statements, not store-method
-# calls: a store-call oracle cannot see that one call fans out to three
-# statements (conversation + metadata + labels), which is exactly how an
-# earlier "6 queries" claim survived being wrong by five.
+# calls: a store-call oracle cannot see that one call fans out to two
+# statements (conversation joined to labels + metadata), which is exactly how
+# an earlier "6 queries" claim survived being wrong by five.
 #
 # Measured (both dialects) for the seed below: one owner grant, one agent
 # declaring one tool_call policy, one conversation, no declared labels, no
-# children. Composition: the handler's conversation load 3, session-policy
+# children. Composition: the handler's conversation load 2, session-policy
 # lookup, agent row, spawn-tree scan 3.
 #
-# ACL resolution used to add 3 more (users + the user and public grants). The
+# ACL resolution used to add 2 more (users + the user and public grants). The
 # warm-up request below now also warms the permission store's resolve_access
 # cache, so the steady-state route serves the access decision from memory —
 # which is the production hot path, since the check re-runs on every event of a
-# turn. A cold process still pays those 3.
+# turn. A cold process still pays those 2.
 #
 # This is the number the PR must quote — an earlier description claimed 6.
 # It is also the oracle for the preload optimisation: dropping the
 # ``conversation=`` argument makes the builder re-read the conversation and
 # pushes this up, which no behavioural assertion can see because both
 # variants return the same verdict.
-_EVALUATE_ROUTE_SQL_BUDGET = 8
+_EVALUATE_ROUTE_SQL_BUDGET = 7
 
 
 @pytest.mark.asyncio

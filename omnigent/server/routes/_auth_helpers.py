@@ -26,6 +26,7 @@ from fastapi import Request
 from omnigent.db.utils import shared_read_scope
 from omnigent.entities import Conversation
 from omnigent.entities.agent import Agent
+from omnigent.entities.permission import ResolvedAccess
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import (
     LEVEL_OWNER,
@@ -281,10 +282,25 @@ class SessionAccess:
         when permissions are disabled (no lookup happened) or for admins
         (who bypass the conversation lookup) — callers fall back to their
         own fetch in those cases.
+    :param resolved: The caller's grants on this session as read for the
+        decision, or ``None`` when permissions are disabled.
     """
 
     level: int | None
     conversation: Conversation | None
+    resolved: ResolvedAccess | None = None
+
+    def owns_top_level_session(self, session_id: str) -> bool | None:
+        """Whether the caller owns *session_id*, from the grants already read.
+
+        ``None`` when that needs another read: no grants were resolved, or the
+        conversation is a sub-agent whose owner is its root's.
+        """
+        conv = self.conversation
+        if self.resolved is None or conv is None or conv.root_conversation_id != session_id:
+            return None
+        grant_level = self.resolved.user_grant_level
+        return grant_level is not None and grant_level >= LEVEL_OWNER
 
 
 def _require_access_and_level_sync(
@@ -344,7 +360,7 @@ def _require_access_and_level_sync(
         # conversation). A missing conversation is left for the snapshot builder
         # to 404 on, exactly as today.
         if access.is_admin:
-            return SessionAccess(level=level, conversation=None)
+            return SessionAccess(level=level, conversation=None, resolved=access)
 
         conv = conversation_store.get_conversation(conversation_id)
         if conv is None:
@@ -369,7 +385,7 @@ def _require_access_and_level_sync(
                 conversation_store,
             )
         if allowed:
-            return SessionAccess(level=level, conversation=conv)
+            return SessionAccess(level=level, conversation=conv, resolved=access)
 
         # Denied — distinguish "has some access but not enough" (403) from
         # "no access at all" (404, to avoid leaking session existence).
