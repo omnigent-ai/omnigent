@@ -1925,9 +1925,7 @@ def create_app(
         on_work_dispatched=managed_host_keepalive.record_work_dispatched,
     )
     host_registry = HostRegistry(
-        mcp_disabled_servers=app_mcp_disabled_servers,
-        feature_flags=resolved_feature_flags,
-        policy_modules=policy_modules,
+        mcp_disabled_servers=app_mcp_disabled_servers, feature_flags=resolved_feature_flags
     )
     runner_router = RunnerRouter(
         registry=tunnel_registry,
@@ -2394,6 +2392,7 @@ def create_app(
     app.state.harness_install = app_harness_install
     app.state.mcp_disabled_servers = app_mcp_disabled_servers
     app.state.automations = True if automations is None else automations
+    app.state.policy_modules = list(policy_modules or [])
 
     def automations_available() -> bool:
         return scheduled_task_store is not None and deployment_gate_enabled(

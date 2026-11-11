@@ -212,7 +212,6 @@ from omnigent.runner.identity import (
     RUNNER_LAUNCH_HARNESS_ENV_VAR,
     RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
-    RUNNER_POLICY_MODULES_ENV_VAR,
     RUNNER_SESSION_ENV_NAMES_ENV_VAR,
     RUNNER_SLICE_KEY_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
@@ -970,7 +969,6 @@ def _build_runner_env(
     host_id: str | None = None,
     harness: str | None = None,
     mcp_disabled_servers_active_harnesses: list[str] | None = None,
-    policy_modules: list[str] | None = None,
     interactive_shells: list[str] | None = None,
     host_owns_global_cleanup: bool = False,
     harness_tmp_parent: Path | None = None,
@@ -1081,8 +1079,6 @@ def _build_runner_env(
         env[RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR] = json.dumps(
             mcp_disabled_servers_active_harnesses
         )
-    if policy_modules is not None:
-        env[RUNNER_POLICY_MODULES_ENV_VAR] = json.dumps(policy_modules)
     if interactive_shells is not None:
         env[RUNNER_INTERACTIVE_SHELLS_ENV_VAR] = json.dumps(interactive_shells)
     return env
@@ -2200,7 +2196,6 @@ class HostProcess:
             host_id=self._identity.host_id,
             harness=frame.harness,
             mcp_disabled_servers_active_harnesses=frame.mcp_disabled_servers_active_harnesses,
-            policy_modules=frame.policy_modules,
             interactive_shells=self._interactive_shells,
             host_owns_global_cleanup=self._maintenance_janitor is not None,
             harness_tmp_parent=self._harness_tmp_parent,

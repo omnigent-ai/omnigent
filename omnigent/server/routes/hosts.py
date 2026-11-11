@@ -1507,7 +1507,6 @@ def create_hosts_router(
                 session_id=body.session_id,
                 harness=harness,
                 mcp_disabled_servers_active_harnesses=host_registry.mcp_disabled_servers_active_harnesses(),
-                policy_modules=host_registry.launch_policy_modules(),
                 inference_config=(
                     target.conv.inference_snapshot["runtime_config"]
                     if target.conv.inference_snapshot

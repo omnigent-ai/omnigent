@@ -26,10 +26,13 @@ import httpx
 import pytest
 
 from omnigent.errors import OmnigentError
-from omnigent.host.connect import _build_runner_env
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.native import native_terminal
-from omnigent.policies.registry import load_registry
+from omnigent.policies.registry import (
+    LOCAL_SINGLE_USER_HEADER,
+    POLICY_MODULES_HEADER,
+    load_registry,
+)
 from omnigent.runner import subagent_work
 from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
@@ -68,10 +71,9 @@ from omnigent.runner.identity import (
     RUNNER_AUTH_REJECTED_EXIT_CODE,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
-    RUNNER_POLICY_MODULES_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
-    runner_policy_modules,
 )
+from omnigent.runner.native import ResolvedSpec
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.runner.transports.ws_tunnel.frames import (
     EventAckFrame,
@@ -4206,10 +4208,10 @@ async def test_resolve_agent_spec_rejects_unregistered_handler_in_tenant_bundle(
             )
 
 
-async def test_resolve_agent_spec_rejects_unregistered_handler_in_operator_bundle(
+async def test_resolve_agent_spec_loads_operator_bundle_handler_without_module_list(
     tmp_path: Path,
 ) -> None:
-    """Operator-authored bundles are also checked against the handler registry."""
+    """Operator-authored bundles keep custom handlers even when no module list is sent."""
     bundle = bundle_files({"config.yaml": _UNREGISTERED_HANDLER_CONFIG.encode()})
 
     async with httpx.AsyncClient(
@@ -4220,11 +4222,33 @@ async def test_resolve_agent_spec_rejects_unregistered_handler_in_operator_bundl
         ),
         base_url="http://server.test",
     ) as client:
-        with pytest.raises(OmnigentError, match="not a registered policy handler"):
-            await _resolve_agent_spec_from_server(
-                client, _AgentSpecCache(tmp_path), "ag_operator", session_id="conv_test"
+        resolved = await _resolve_agent_spec_from_server(
+            client, _AgentSpecCache(tmp_path), "ag_operator", session_id="conv_test"
+        )
+
+    assert resolved is not None
+    assert resolved.spec.name == "handler-agent"
+
+
+async def test_resolve_agent_spec_loads_operator_callable_tools(tmp_path: Path) -> None:
+    """Operator bundles may declare server-side callable tools, as the shipped examples do."""
+    example = Path("tests/resources/examples/agent_with_tools.yaml").read_bytes()
+    bundle = bundle_files({"agent.yaml": example})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200, content=bundle, headers={"X-Agent-Session-Scoped": "false"}
             )
-    assert list(tmp_path.iterdir()) == []
+        ),
+        base_url="http://server.test",
+    ) as client:
+        resolved = await _resolve_agent_spec_from_server(
+            client, _AgentSpecCache(tmp_path), "ag_tools", session_id="conv_test"
+        )
+
+    assert resolved is not None
+    assert resolved.spec.name == "assistant_with_tools"
 
 
 async def test_resolve_agent_spec_ignores_mutated_named_cache(tmp_path: Path) -> None:
@@ -4289,24 +4313,24 @@ async def test_stale_lease_cannot_join_a_reused_session(tmp_path: Path) -> None:
 
 
 async def test_session_resolution_is_removed_on_session_delete(tmp_path: Path) -> None:
-    """Deleting a session through the runner API releases its extracted bundle."""
-    released: list[str] = []
-
-    async def cleanup(session_id: str) -> None:
-        released.append(session_id)
+    """Deleting a session through the runner API removes its extracted bundle directory."""
+    workdirs = _SessionSpecWorkdirs()
+    extraction = tmp_path / "extraction"
+    extraction.mkdir()
+    assert await workdirs.retain("session", workdirs.lease("session"), extraction)
 
     async with httpx.AsyncClient(
         base_url="https://server.invalid",
         transport=httpx.MockTransport(lambda _: httpx.Response(404)),
     ) as server_client:
-        app = create_runner_app(server_client=server_client, spec_workdir_cleanup=cleanup)
+        app = create_runner_app(server_client=server_client, spec_workdir_cleanup=workdirs.release)
         async with httpx.AsyncClient(
             base_url="https://runner.invalid", transport=httpx.ASGITransport(app=app)
         ) as runner_client:
             response = await runner_client.delete("/v1/sessions/session")
 
     assert response.status_code == 200
-    assert released == ["session"]
+    assert not extraction.exists()
 
 
 async def test_invalid_bundle_leaves_no_partial_extraction(tmp_path: Path) -> None:
@@ -4341,55 +4365,93 @@ def restored_policy_registry() -> Iterator[None]:
     load_registry()
 
 
-async def test_runner_accepts_bundle_handler_from_configured_policy_module(
-    tmp_path: Path, restored_policy_registry: None
-) -> None:
-    """A handler declared by a configured policy module loads in the runner."""
-    env = {RUNNER_POLICY_MODULES_ENV_VAR: json.dumps([__name__])}
-    load_registry(extra_modules=runner_policy_modules(env))
-    bundle = _policy_bundle("example_org.policies.configured_gate")
+def _policy_modules_header(modules: list[str]) -> dict[str, str]:
+    return {POLICY_MODULES_HEADER: json.dumps(modules)}
 
+
+async def _resolve_tenant_policy_bundle(
+    cache: _AgentSpecCache, handler: str, headers: dict[str, str] | None = None
+) -> ResolvedSpec | None:
+    bundle = _policy_bundle(handler)
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda _: httpx.Response(200, content=bundle)),
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, content=bundle, headers=headers or {})
+        ),
         base_url="http://server.test",
     ) as client:
-        resolved = await _resolve_agent_spec_from_server(
-            client, _AgentSpecCache(tmp_path), "ag_policy", session_id="conv_test"
+        return await _resolve_agent_spec_from_server(
+            client, cache, "ag_policy", session_id="conv_test"
         )
+
+
+async def test_runner_accepts_tenant_handler_from_server_policy_modules(
+    tmp_path: Path, restored_policy_registry: None
+) -> None:
+    """A tenant bundle may use a handler from a module the server sends with the bundle."""
+    headers = _policy_modules_header([__name__])
+
+    resolved = await _resolve_tenant_policy_bundle(
+        _AgentSpecCache(tmp_path), "example_org.policies.configured_gate", headers
+    )
 
     assert resolved is not None
     assert resolved.spec.name == "policy-agent"
 
 
-async def test_runner_rejects_bundle_handler_that_is_not_configured(
+async def test_runner_rejects_tenant_handler_outside_server_policy_modules(
     tmp_path: Path, restored_policy_registry: None
 ) -> None:
-    """Without a configured policy module, an unregistered handler is rejected."""
-    load_registry(extra_modules=runner_policy_modules({}))
-    bundle = _policy_bundle("example_org.policies.unconfigured_gate")
+    """A handler the server does not configure is rejected, even with a module list present."""
+    headers = _policy_modules_header([__name__])
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda _: httpx.Response(200, content=bundle)),
-        base_url="http://server.test",
-    ) as client:
-        with pytest.raises(OmnigentError, match="not a registered policy handler"):
-            await _resolve_agent_spec_from_server(
-                client, _AgentSpecCache(tmp_path), "ag_policy", session_id="conv_test"
-            )
+    with pytest.raises(OmnigentError, match="not a registered policy handler"):
+        await _resolve_tenant_policy_bundle(
+            _AgentSpecCache(tmp_path), "example_org.policies.unconfigured_gate", headers
+        )
 
 
-def test_host_launch_stamps_policy_modules_for_the_runner() -> None:
-    """The host passes the server's configured modules to the runner environment."""
-    env = _build_runner_env(
-        {},
-        server_url="http://server.test",
-        runner_id="runner_test",
-        binding_token="token",
-        workspace=str(Path.cwd()),
-        parent_pid=0,
-        policy_modules=[__name__],
+async def test_runner_rejects_tenant_handler_without_module_list(
+    tmp_path: Path, restored_policy_registry: None
+) -> None:
+    """A tenant bundle with a custom handler is rejected when the server sends no module list."""
+    with pytest.raises(OmnigentError, match="not a registered policy handler"):
+        await _resolve_tenant_policy_bundle(
+            _AgentSpecCache(tmp_path), "example_org.policies.configured_gate"
+        )
+
+
+async def test_runner_drops_previous_policy_modules_when_server_omits_them(
+    tmp_path: Path, restored_policy_registry: None
+) -> None:
+    """Registration follows the latest response: a later list without the module rejects it."""
+    cache = _AgentSpecCache(tmp_path)
+    handler = "example_org.policies.configured_gate"
+    await _resolve_tenant_policy_bundle(cache, handler, _policy_modules_header([__name__]))
+
+    with pytest.raises(OmnigentError, match="not a registered policy handler"):
+        await _resolve_tenant_policy_bundle(cache, handler)
+
+
+async def test_runner_accepts_tenant_handler_on_local_single_user_server(
+    tmp_path: Path, restored_policy_registry: None
+) -> None:
+    """A local single-user server keeps its operator's custom handlers for tenant bundles."""
+    resolved = await _resolve_tenant_policy_bundle(
+        _AgentSpecCache(tmp_path),
+        "example_org.policies.unconfigured_gate",
+        {LOCAL_SINGLE_USER_HEADER: "1"},
     )
 
-    assert runner_policy_modules(env) == [__name__]
-    assert runner_policy_modules({}) == []
-    assert runner_policy_modules({RUNNER_POLICY_MODULES_ENV_VAR: "not json"}) == []
+    assert resolved is not None
+    assert resolved.spec.name == "policy-agent"
+
+
+@pytest.mark.parametrize("raw", ["not json", '"a string"', '["ok", 3]'])
+async def test_runner_rejects_malformed_policy_modules_header(tmp_path: Path, raw: str) -> None:
+    """A malformed module list fails the resolution instead of registering nothing silently."""
+    with pytest.raises(RuntimeError, match="malformed policy modules header"):
+        await _resolve_tenant_policy_bundle(
+            _AgentSpecCache(tmp_path),
+            "example_org.policies.configured_gate",
+            {POLICY_MODULES_HEADER: raw},
+        )

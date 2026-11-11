@@ -26,6 +26,11 @@ from dataclasses import dataclass
 
 _logger = logging.getLogger(__name__)
 
+# Bundle-fetch response headers. The server sends its configured policy_modules and whether it
+# is a local single-user server; the runner uses them to decide handler authority for a bundle.
+POLICY_MODULES_HEADER = "X-Omnigent-Policy-Modules"
+LOCAL_SINGLE_USER_HEADER = "X-Omnigent-Local-Single-User"
+
 
 @dataclass(frozen=True)
 class PolicyRegistryEntry:

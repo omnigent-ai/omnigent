@@ -1433,6 +1433,7 @@ class _AgentSpecCache:
         self._admission = asyncio.Lock()
         self._lock = threading.Lock()
         self._closed = False
+        self._policy_modules: tuple[str, ...] | None = None
 
     async def resolve(self, response: httpx.Response, agent_id: str) -> ResolvedSpec:
         """Queue before occupying a worker, and retain admission through cancellation."""
@@ -1463,7 +1464,17 @@ class _AgentSpecCache:
         with self._lock:
             if self._closed:
                 raise RuntimeError("spec_resolver: agent bundle cache is closed")
+            self._register_policy_modules(_policy_modules_from_response(response))
             return _load_agent_spec_bundle(self.root, response, agent_id)
+
+    def _register_policy_modules(self, modules: tuple[str, ...]) -> None:
+        """Match the registry to the server's module list; no list means no custom handlers."""
+        if modules == self._policy_modules:
+            return
+        from omnigent.policies.registry import load_registry
+
+        load_registry(extra_modules=list(modules))
+        self._policy_modules = modules
 
     def close(self) -> None:
         """Retire the cache before deleting it so queued workers cannot recreate it."""
@@ -1472,12 +1483,29 @@ class _AgentSpecCache:
             shutil.rmtree(self.root, ignore_errors=True)
 
 
+def _policy_modules_from_response(resp: httpx.Response) -> tuple[str, ...]:
+    """Decode the server's configured policy modules; an absent header yields none."""
+    from omnigent.policies.registry import POLICY_MODULES_HEADER
+
+    raw = resp.headers.get(POLICY_MODULES_HEADER)
+    if raw is None:
+        return ()
+    try:
+        decoded = json.loads(raw)
+    except ValueError as exc:
+        raise RuntimeError("spec_resolver: malformed policy modules header") from exc
+    if not isinstance(decoded, list) or not all(isinstance(item, str) for item in decoded):
+        raise RuntimeError("spec_resolver: malformed policy modules header")
+    return tuple(decoded)
+
+
 def _load_agent_spec_bundle(
     spec_cache_root: Path, resp: httpx.Response, agent_id: str
 ) -> ResolvedSpec:
     """Extract and load a fresh bundle while the runner's worker lock is held."""
     from omnigent.automations_availability import AUTOMATIONS_HEADER, without_scheduled_task_tools
     from omnigent.mcp_selection import MCP_SELECTION_HEADER, selected_mcp_spec
+    from omnigent.policies.registry import LOCAL_SINGLE_USER_HEADER
     from omnigent.runner.native import ResolvedSpec
     from omnigent.spec import load
 
@@ -1494,12 +1522,14 @@ def _load_agent_spec_bundle(
     dest = Path(mkdtemp(prefix=f"{cache_key.name}-", dir=spec_cache_root))
     try:
         # An older runner may not support sub-agents validated by a newer server.
-        # Provenance controls environment expansion, never handler authority.
+        # Same rule as the server: only tenant bundles on a multi-user server are checked.
+        local_single_user = resp.headers.get(LOCAL_SINGLE_USER_HEADER) == "1"
+        enforce_handler_allowlist = not expand_env and not local_single_user
         spec = load(
             resp.content,
             dest=dest,
             expand_env=expand_env,
-            enforce_handler_allowlist=True,
+            enforce_handler_allowlist=enforce_handler_allowlist,
             prune_invalid_sub_agents=True,
         )
         spec = selected_mcp_spec(spec, json.loads(resp.headers.get(MCP_SELECTION_HEADER, "{}")))
@@ -1663,10 +1693,9 @@ def create_app(
         server_client=server_client,
     )
 
-    # Each resolution extracts into a fresh directory under this runner-lifetime
-    # root. Session teardown removes a session's directories after its resources
-    # stop; shutdown clears any leftovers. A temporary root inside spec_resolver
-    # would break AgentSpec Path references after return.
+    # Each resolution extracts into a fresh directory under this root; session
+    # teardown removes a session's directories, and shutdown clears the rest.
+    # A temporary root inside spec_resolver would break AgentSpec Path references.
     import tempfile
 
     _spec_cache = _AgentSpecCache(Path(tempfile.mkdtemp(prefix=f"runner-specs-{_runner_id}-")))
@@ -1958,11 +1987,6 @@ async def _run_tunnel_from_env() -> None:
 
     # Reuse the tunnel's token factory for the app's httpx client so the
     # runner resolves Databricks auth once at boot, not twice.
-    # Register the operator's configured policy modules before any bundle is validated.
-    from omnigent.policies.registry import load_registry
-    from omnigent.runner.identity import runner_policy_modules
-
-    load_registry(extra_modules=runner_policy_modules())
     app = create_app(auth_token_factory=auth_token_factory, auth_resolved=True)
     from omnigent.native._native_forwarder_health import (
         last_post_at as native_forwarder_last_post_at,
