@@ -537,17 +537,24 @@ def _reminder_review(args: dict[str, object]) -> PolicyResponse:
             "result": "DENY",
             "reason": "Cannot set a reminder. The reminder message must be a non-empty string.",
         }
+    from datetime import UTC, datetime
+
+    from omnigent.tools.builtins.scheduled_tasks import resolve_reminder_time
+
+    # Resolve the time exactly as the tool will, so padding or a long fraction in
+    # the raw argument can't hide the moment being approved.
+    resolved = resolve_reminder_time(args, datetime.now(UTC))
+    if isinstance(resolved, str):
+        return {"result": "DENY", "reason": f"Cannot set a reminder. {resolved}"}
     if args.get("at") is not None:
-        when = f"at {_clip(str(args['at']))}"
-    elif args.get("delay_seconds") is not None:
-        when = f"{_clip(str(args['delay_seconds']))} seconds after approval"
+        when = f"at {resolved:%Y-%m-%d %H:%M} UTC"
     else:
-        when = "(no time given)"
+        # Validated above, so this is a number of at most 364 days.
+        when = f"{args['delay_seconds']} seconds after approval, rounded up to the next minute"
     return {
         "result": "ASK",
         "reason": (
-            f"Agent wants to set a reminder for this session {when}, "
-            "rounded up to the next minute.\n"
+            f"Agent wants to set a reminder for this session {when}.\n"
             "When it fires, this message is sent into the session as a new turn, "
             "even if nobody is watching:\n"
             f"{message}\n"

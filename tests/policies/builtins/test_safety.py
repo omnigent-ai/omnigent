@@ -17,6 +17,8 @@ Covers:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta, timezone
+
 import pytest
 
 from omnigent.policies.builtins.safety import ask_on_os_tools, block_skills
@@ -707,30 +709,67 @@ def test_ask_on_scheduled_task_change_asks_for_create_with_preview(data_name: st
     assert "Task permission setting: agent default (no task override)" in result["reason"]
 
 
-@pytest.mark.parametrize(
-    "timing,shown",
-    [
-        ({"delay_seconds": 2700}, "2700 seconds after approval"),
-        ({"at": "2026-11-12T15:00:00-08:00"}, "at 2026-11-12T15:00:00-08:00"),
-    ],
-)
-def test_ask_on_scheduled_task_change_asks_for_a_reminder(
-    timing: dict[str, object], shown: str
-) -> None:
-    """A reminder ASKs with its time and full message, which runs unattended later."""
+def _reminder_review(arguments: dict[str, object]):
     from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
 
-    message = "Check CI on PR #12, then " + "summarize the failures. " * 10
-    result = ask_on_scheduled_task_change(
-        {
-            "type": "tool_call",
-            "target": "sys_reminder_set",
-            "data": {"arguments": {"message": message, **timing}},
-        }
+    return ask_on_scheduled_task_change(
+        {"type": "tool_call", "target": "sys_reminder_set", "data": {"arguments": arguments}}
     )
-    assert result["result"] == "ASK"
-    assert f"set a reminder for this session {shown}" in result["reason"]
-    assert message in result["reason"]
+
+
+def _tomorrow_at_nine_pacific() -> tuple[datetime, str]:
+    """A whole-minute time a day out, and the UTC minute the prompt must show."""
+    pacific = timezone(timedelta(hours=-8))
+    local = (datetime.now(pacific) + timedelta(days=1)).replace(
+        hour=9, minute=0, second=0, microsecond=0
+    )
+    return local, f"at {local.astimezone(UTC):%Y-%m-%d %H:%M} UTC"
+
+
+def test_ask_on_scheduled_task_change_asks_for_a_reminder() -> None:
+    """A reminder ASKs with its time and full message, which runs unattended later."""
+    message = "Check CI on PR #12, then " + "summarize the failures. " * 10
+    local, shown = _tomorrow_at_nine_pacific()
+    for timing, expected in (
+        ({"delay_seconds": 2700}, "2700 seconds after approval, rounded up to the next minute"),
+        ({"at": local.isoformat()}, shown),
+    ):
+        result = _reminder_review({"message": message, **timing})
+        assert result["result"] == "ASK"
+        assert f"set a reminder for this session {expected}." in result["reason"]
+        assert message in result["reason"]
+
+
+def test_reminder_approval_shows_the_resolved_time_whatever_the_raw_text() -> None:
+    """Padding or a long fraction can't push the time or its offset out of view."""
+    local, shown = _tomorrow_at_nine_pacific()
+    stamp = local.isoformat()
+    date_part, offset = stamp[:19], stamp[19:]
+    for raw in (" " * 2048 + stamp, f"{date_part}.{'0' * 80}{offset}"):
+        result = _reminder_review({"message": "ping", "at": raw})
+        assert result["result"] == "ASK", result
+        assert f"set a reminder for this session {shown}." in result["reason"]
+    # The same digits with another offset name another moment, and the prompt says so.
+    other = _reminder_review({"message": "ping", "at": f"{date_part}.{'0' * 80}+09:00"})
+    assert shown not in other.get("reason", "")
+
+
+@pytest.mark.parametrize(
+    "timing,error",
+    [
+        ({}, "exactly one"),
+        ({"at": "tomorrow"}, "not an ISO-8601"),
+        ({"at": "2026-11-12T15:00:00"}, "UTC offset"),
+        ({"delay_seconds": 10}, "at least one minute"),
+        ({"delay_seconds": 10**400}, "at most 364 days"),
+    ],
+)
+def test_reminder_approval_denies_a_time_the_tool_would_reject(
+    timing: dict[str, object], error: str
+) -> None:
+    result = _reminder_review({"message": "ping", **timing})
+    assert result["result"] == "DENY"
+    assert error in result["reason"]
 
 
 @pytest.mark.parametrize("message", [None, "", "   ", 5])
