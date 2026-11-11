@@ -14,6 +14,7 @@ count, so a wrong field turns the test red.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -481,7 +482,7 @@ def test_detection_priority_order(clean_env, monkeypatch: pytest.MonkeyPatch) ->
 
 # ── Codex config.toml custom provider (cli-config) detection ───────────────
 
-# The exact shape `isaac configure codex` writes (Unity Gateway mode): a custom
+# The shape a Codex setup writes (Unity Gateway mode): a custom
 # [model_providers.Databricks] table authenticated by a token-printing
 # command, selected via a top-level model_provider — and NO auth.json.
 _ISAAC_STYLE_CODEX_CONFIG = """
@@ -530,9 +531,9 @@ def _write_codex_config(home, body: str) -> None:
 def test_codex_config_custom_provider_detected(clean_env) -> None:
     """An isaac-style config.toml (custom provider + auth command) is detected.
 
-    This is the exact state ``isaac configure codex`` leaves behind — no
+    This is the state a Codex setup leaves behind — no
     auth.json at all — which the subscription detection cannot see. Failure
-    means internal users' gateway-configured codex shows as "not configured"
+    means managed users' gateway-configured codex shows as "not configured"
     in setup (the original bug).
     """
     _write_codex_config(clean_env, _ISAAC_STYLE_CODEX_CONFIG)
@@ -875,7 +876,7 @@ def test_prewarm_detect_providers_failure_falls_back_to_fresh_sweep(
     assert sweeps == ["sweep", "sweep"]
 
 
-# --- Claude Code managed-settings gateway (the `isaac configure claude` shape) ---
+# --- Claude Code managed-settings gateway (the shape a Claude setup writes) ---
 #
 # The credential lives in Claude Code's own enterprise settings, so omnigent
 # REFLECTS it (readiness + label) but surfaces it as the existing `subscription`
@@ -1029,6 +1030,68 @@ def test_claude_managed_gateway_first_readable_file_decides(clean_env, monkeypat
     low.write_text(json.dumps(_ISAAC_CLAUDE_SETTINGS))
     monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (high, low))
     assert ambient.claude_managed_gateway() == (None, False)
+
+
+def _claude_code_managed_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    managed_dir = tmp_path / "claude-code"
+    managed_dir.mkdir()
+    monkeypatch.setattr(
+        ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_dir / "managed-settings.json",)
+    )
+    return managed_dir
+
+
+def test_claude_code_managed_mcp_presence_counts_unparseable_file(tmp_path, monkeypatch) -> None:
+    """An unparseable file still counts as deployed, as it does for Claude Code."""
+    managed_dir = _claude_code_managed_dir(tmp_path, monkeypatch)
+    assert not ambient.claude_code_managed_mcp_present()
+
+    (managed_dir / "managed-mcp.json").write_text("not json")
+    assert ambient.claude_code_managed_mcp_present()
+
+
+@pytest.mark.parametrize(
+    ("platform", "own_dir", "other_dir"),
+    [("darwin", "macos", "linux"), ("linux", "linux", "macos")],
+)
+def test_claude_code_managed_mcp_reads_only_this_platforms_directory(
+    tmp_path, monkeypatch, platform: str, own_dir: str, other_dir: str
+) -> None:
+    managed_dirs = {"macos": tmp_path / "macos", "linux": tmp_path / "linux"}
+    for managed_dir in managed_dirs.values():
+        managed_dir.mkdir()
+    monkeypatch.setattr(ambient, "_CLAUDE_CODE_MACOS_MANAGED_DIR", managed_dirs["macos"])
+    monkeypatch.setattr(ambient, "_CLAUDE_CODE_LINUX_MANAGED_DIR", managed_dirs["linux"])
+    monkeypatch.setattr(
+        ambient,
+        "CLAUDE_CODE_MANAGED_SETTINGS_PATHS",
+        tuple(managed_dir / "managed-settings.json" for managed_dir in managed_dirs.values()),
+    )
+    monkeypatch.setattr(ambient.sys, "platform", platform)
+
+    assert ambient.claude_code_managed_mcp_paths() == (managed_dirs[own_dir] / "managed-mcp.json",)
+    (managed_dirs[other_dir] / "managed-mcp.json").write_text("{}")
+    assert not ambient.claude_code_managed_mcp_present()
+    (managed_dirs[own_dir] / "managed-mcp.json").write_text("{}")
+    assert ambient.claude_code_managed_mcp_present()
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="needs file permissions"
+)
+def test_claude_code_managed_mcp_presence_follows_permission_errors(tmp_path, monkeypatch) -> None:
+    """An unreadable file still counts, but one in an unsearchable directory does not."""
+    managed_dir = _claude_code_managed_dir(tmp_path, monkeypatch)
+    managed_mcp = managed_dir / "managed-mcp.json"
+    managed_mcp.write_text("{}")
+    managed_mcp.chmod(0)
+    assert ambient.claude_code_managed_mcp_present()
+
+    managed_dir.chmod(0)
+    try:
+        assert not ambient.claude_code_managed_mcp_present()
+    finally:
+        managed_dir.chmod(0o700)
 
 
 def test_claude_managed_model_picker_reads_replacement_options(tmp_path: Path) -> None:

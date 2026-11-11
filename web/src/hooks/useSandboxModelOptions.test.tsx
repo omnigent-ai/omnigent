@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
+import { sandboxSessionCatalogKey, writeModelCatalogCache } from "@/lib/modelCatalogCache";
+import * as host from "@/lib/host";
 import type { SandboxStatus } from "@/lib/types";
 import {
   sandboxModelOptionsKey,
@@ -34,7 +36,9 @@ const catalog = {
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
   fetchMock.mockReset();
+  vi.restoreAllMocks();
 });
 
 describe("useSandboxModelOptions", () => {
@@ -50,7 +54,8 @@ describe("useSandboxModelOptions", () => {
     );
   });
 
-  it("does not reuse another target or owner's cached catalog", async () => {
+  it("isolates target, owner, and server catalogs within one QueryClient", async () => {
+    const server = vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue("server-a");
     fetchMock.mockResolvedValue(new Response(JSON.stringify(catalog)));
     const { result, rerender } = renderHook(
       ({ provider, user }) => useSandboxModelOptions(provider, "claude-native", "ag_1", user, true),
@@ -64,6 +69,14 @@ describe("useSandboxModelOptions", () => {
     rerender({ provider: "kubernetes", user: "bob" });
     expect(result.current.data).toBeUndefined();
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    server.mockReturnValue("server-b");
+    rerender({ provider: "kubernetes", user: "alice" });
+    expect(result.current.data).toBeUndefined();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    server.mockReturnValue("server-a");
+    rerender({ provider: "kubernetes", user: "alice" });
+    expect(result.current.data).toEqual(catalog);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
   it("keeps successful empty discovery distinct from request failure", async () => {
@@ -343,6 +356,34 @@ describe("useSandboxLaunchModelOptions", () => {
       expect(result.current).toBeUndefined();
     },
   );
+
+  it.each([
+    ["the agent's own saved catalog", "ag_1", ["opus"]],
+    ["another agent's saved catalog", "ag_other", ["gateway/opus", "gateway/gpt"]],
+  ])("prefers %s over the gateway list", async (_label, savedFor, expected) => {
+    writeModelCatalogCache(
+      sandboxSessionCatalogKey("agent_sandbox", "claude-native", savedFor),
+      [{ id: "opus", displayName: "Opus" }],
+      false,
+    );
+    serve();
+    const { result } = render();
+    await waitFor(() => expect(result.current?.map((row) => row.id)).toEqual(expected));
+  });
+
+  it("offers no saved catalog to an agent the provider's catalog cannot serve", async () => {
+    writeModelCatalogCache(
+      sandboxSessionCatalogKey("agent_sandbox", "claude-native", "ag_1"),
+      [{ id: "opus", displayName: "Opus" }],
+      false,
+    );
+    const preview = { ...ready, models: [], status: "unconfigured" };
+    serve(preview);
+    const { client, result } = render();
+    const key = sandboxModelOptionsKey("agent_sandbox", "claude-native", "ag_1", "alice");
+    await waitFor(() => expect(client.getQueryData(key)).toEqual(preview));
+    expect(result.current).toBeUndefined();
+  });
 
   it("recovers a launch's rows after an unavailable preview or a failed request", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });

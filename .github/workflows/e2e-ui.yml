@@ -49,6 +49,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  OMNIGENT_CI_PIPELINE: e2e-ui
   # No SPA build during `uv sync`: this workflow builds the bundle in a
   # dedicated step, so the setup.py build would be a redundant npm hit.
   OMNIGENT_SKIP_WEB_UI: "true"

@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { getCliServerUrl, hostFetch, resolveWebSocketUrl, setOmnigentHostConfig } from "./host";
+import {
+  getCliServerUrl,
+  hostFetch,
+  resolveMediaUrl,
+  resolveWebSocketUrl,
+  setOmnigentHostConfig,
+} from "./host";
 
 afterEach(() => {
   setOmnigentHostConfig({});
@@ -66,6 +72,19 @@ describe("resolveWebSocketUrl base path", () => {
     const url = resolveWebSocketUrl("/v1/sessions/abc/stream");
     expect(url).toBe(
       `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/proxy/6767/v1/sessions/abc/stream`,
+    );
+  });
+});
+
+describe("resolveMediaUrl", () => {
+  it("is null without a host resolver, so standalone media keeps the fetch path", () => {
+    expect(resolveMediaUrl("/v1/sessions/abc/demo.mp4?download=true")).toBeNull();
+  });
+
+  it("delegates to the host resolver", () => {
+    setOmnigentHostConfig({ resolveMediaUrl: (path) => `/host${path}&csrf=t` });
+    expect(resolveMediaUrl("/v1/sessions/abc/demo.mp4?download=true")).toBe(
+      "/host/v1/sessions/abc/demo.mp4?download=true&csrf=t",
     );
   });
 });

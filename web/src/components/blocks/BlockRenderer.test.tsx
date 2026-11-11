@@ -14,7 +14,8 @@ import type { RenderItem } from "@/lib/renderItems";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
-import { BlockRenderer, rendersOnlyWorkedFold } from "./BlockRenderer";
+import { BlockRenderer, mayDefineReferenceLink, rendersOnlyWorkedFold } from "./BlockRenderer";
+import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
 afterEach(cleanup);
 
@@ -393,6 +394,120 @@ describe("BlockRenderer dispatch", () => {
     expect(container.querySelector("em")).toBeNull();
   });
 
+  it("keeps a settled streamed reply's markdown as it rendered while streaming", () => {
+    // Streaming mode closes unclosed syntax; a streamed reply keeps that once it settles.
+    const { container } = render(
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <BlockRenderer
+          items={[
+            { kind: "text", itemId: "t1", text: "*settled", final: true, streamKey: "text#0" },
+          ]}
+          sessionStatus="idle"
+        />
+      </FileViewerContext.Provider>,
+    );
+
+    expect(container.querySelector("em")).toHaveTextContent("settled");
+  });
+
+  it.each([
+    ["at the top level", "See [the docs][docs].\n\n[docs]: https://example.com/docs"],
+    ["in a blockquote", "See [the docs][docs].\n\n> [docs]: https://example.com/docs"],
+    [
+      "in a blockquote inside a list item",
+      "See [the docs][docs].\n\n10. q\n\n    > [docs]: https://example.com/docs",
+    ],
+    [
+      "after CR line endings",
+      "See [the docs][docs].\n\nNotes.\r\r[docs]: https://example.com/docs",
+    ],
+    ["with a caret-only label", "See [the docs][^].\n\n[^]: https://example.com/docs"],
+  ])("resolves a settled streamed reply's reference link defined %s", (_where, text) => {
+    // Streamed text stays in streaming mode, which renders each block alone, so a
+    // reply with a link definition in another block settles into static mode.
+    render(
+      <TestProviders queryClient={new QueryClient()} fileViewerContext={FILE_VIEWER_NOOP}>
+        <BlockRenderer
+          items={[
+            {
+              kind: "text",
+              itemId: "t1",
+              text,
+              final: true,
+              streamKey: "text#0",
+            },
+          ]}
+          sessionStatus="idle"
+        />
+      </TestProviders>,
+    );
+
+    expect(screen.getByRole("link", { name: "the docs" })).toHaveAttribute(
+      "href",
+      "https://example.com/docs",
+    );
+  });
+
+  it("keeps a streamed reply's footnotes mounted as it settles", () => {
+    // Streamdown keeps a message with footnotes in one block, so they need no static switch.
+    const queryClient = new QueryClient();
+    const view = (sessionStatus: "running" | "idle") => (
+      <TestProviders queryClient={queryClient} fileViewerContext={FILE_VIEWER_NOOP}>
+        <BlockRenderer
+          items={[
+            {
+              kind: "text",
+              itemId: "t1",
+              text: "Claim.[^1]\n\n[^1]: A note.",
+              final: sessionStatus === "idle",
+              streamKey: "text#0",
+            },
+          ]}
+          sessionStatus={sessionStatus}
+        />
+      </TestProviders>
+    );
+    const { container, rerender } = render(view("running"));
+    const footnotes = container.querySelector("[data-footnotes]");
+    expect(footnotes).toHaveTextContent("A note.");
+
+    rerender(view("idle"));
+    expect(container.querySelector("[data-footnotes]")).toBe(footnotes);
+    expect(container.querySelector("[data-footnote-ref]")).toHaveTextContent("1");
+  });
+
+  it.each([
+    ["a definition", "See [a][docs].\n\n[docs]: https://example.com", true],
+    ["no space after the colon", "[docs]:/docs", true],
+    ["an escaped bracket in the label", String.raw`[foo\]]: /url`, true],
+    ["a definition in a list item", "- [docs]: https://example.com", true],
+    ["a definition on a list item's continuation", "10. See [docs][].\n\n    [docs]: /url", true],
+    ["a blockquote in a list item's continuation", "See [x][a].\n\n10. q\n\n    > [a]: /url", true],
+    ["a label split across lines", "See [foo bar][].\n\n[foo\nbar]: /url", true],
+    ["a label split across blockquote lines", "> [foo\n> bar]: /url", true],
+    ["a split label whose first line ends in a backslash", "[foo\\\nbar]: /url", true],
+    ["CR line endings", "See [docs][].\r\r[docs]: /docs", true],
+    // Code isn't parsed: matching there only keeps the static rendering.
+    ["a definition-like line in code", "```ini\n[docs]: x\n```", true],
+    ["an unescaped bracket in the label", "[foo[bar]: text", false],
+    ["a split label broken by a blank line", "[foo\n\nbar]: /url", false],
+    ["a footnote definition", "[^1]: A note.", false],
+    ["a caret-only label", "See [docs][^].\n\n[^]: https://example.com/docs", true],
+    ["plain prose", "Done. There are two names in the file.", false],
+  ])("mayDefineReferenceLink: %s", (_case, text, expected) => {
+    expect(mayDefineReferenceLink(text)).toBe(expected);
+  });
+
+  it("scans long pathological text in linear time", () => {
+    const started = performance.now();
+    expect(mayDefineReferenceLink("`".repeat(64_000))).toBe(false);
+    expect(mayDefineReferenceLink("[" + "a".repeat(64_000))).toBe(false);
+    expect(mayDefineReferenceLink("[a\n".repeat(20_000))).toBe(false);
+    expect(mayDefineReferenceLink(" ".repeat(64_000) + "x")).toBe(false);
+    expect(mayDefineReferenceLink("[" + "\\".repeat(64_000) + "]")).toBe(false);
+    expect(performance.now() - started).toBeLessThan(250);
+  });
+
   it("uses streaming markdown mode only for the live trailing text item", () => {
     const items: RenderItem[] = [
       { kind: "text", itemId: "t1", text: "*settled", final: true },
@@ -766,6 +881,33 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("Called 1 tool")).toBeDefined();
     });
 
+    it("folds Codex commentary into one row without the opt-in", () => {
+      const items: RenderItem[] = [
+        {
+          kind: "text",
+          itemId: "m0",
+          text: "Reading the tests.",
+          final: true,
+          phase: "commentary",
+        },
+        tool(1, "Bash"),
+        { kind: "text", itemId: "m1", text: "Adding the case.", final: true, phase: "commentary" },
+        tool(2, "Bash"),
+        { kind: "text", itemId: "m2", text: "Added the test.", final: true, phase: "final_answer" },
+      ];
+      const view = render(<BlockRenderer items={items} sessionStatus="idle" workedForS={9} />);
+      expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+      expect(screen.getByRole("button", { name: "Worked for 9s" })).toBeDefined();
+      expect(screen.queryByText("Reading the tests.")).toBeNull();
+      expect(screen.getByText("Added the test.")).toBeDefined();
+
+      // A Codex bubble that ends without a marked answer keeps its last message.
+      view.rerender(<BlockRenderer items={items.slice(0, 4)} sessionStatus="idle" />);
+      expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(2);
+      expect(screen.getByText("Adding the case.")).toBeDefined();
+      expect(screen.queryByText("Reading the tests.")).toBeNull();
+    });
+
     describe("with foldNarration", () => {
       it("folds narration and work behind one row, leaving the last message", () => {
         const items: RenderItem[] = [
@@ -854,10 +996,7 @@ describe("BlockRenderer dispatch", () => {
           tool(2, "Bash"),
           { kind: "text", itemId: "m3", text: "Done.", final: true, phase: "final_answer" },
         ];
-        const view = render(<BlockRenderer items={items} sessionStatus="idle" />);
-        expect(screen.getByText("Multiplying first.")).toBeDefined();
-
-        view.rerender(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
+        render(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
         expect(screen.queryByText("Multiplying first.")).toBeNull();
         // Answer text and an unlabelled message stay visible beside the folds.
         expect(screen.getByText("17 × 23 = 391.")).toBeDefined();
@@ -1948,6 +2087,68 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("All done.")).toBeDefined();
     });
 
+    it("keeps the closing trace laid out as it was, and indents it once opened", async () => {
+      // Hold the mount-open frame: the fold closes in the next animation frame.
+      const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation(() => 0);
+      try {
+        const items: RenderItem[] = [
+          tool(1),
+          { kind: "text", itemId: "m1", text: "Done.", final: true },
+        ];
+        const view = (lifecycle: "streaming" | "completed") => (
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={items} sessionStatus="running" turnLifecycle={lifecycle} />
+          </FileViewerContext.Provider>
+        );
+        const { rerender } = render(view("streaming"));
+        rerender(view("completed"));
+        const trigger = await screen.findByRole("button", { name: "Worked" });
+        expect(trigger).toHaveAttribute("aria-expanded", "true");
+        expect(screen.queryByTestId("turn-worked-fold-pin-line")).toBeNull();
+        expect(trigger.closest(".turn-fold-row")).toHaveClass("turn-fold-row-enter");
+
+        fireEvent.click(trigger);
+        fireEvent.click(trigger);
+        expect(trigger).toHaveAttribute("aria-expanded", "true");
+        expect(screen.getByTestId("turn-worked-fold-pin-line")).toBeDefined();
+        expect(trigger.closest(".turn-fold-row")).not.toHaveClass("turn-fold-row-enter");
+      } finally {
+        raf.mockRestore();
+      }
+    });
+
+    it("still closes a fold that re-renders before its closing frame", async () => {
+      const frames: (FrameRequestCallback | null)[] = [];
+      const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+        frames.push(callback);
+        return frames.length;
+      });
+      const caf = vi.spyOn(window, "cancelAnimationFrame").mockImplementation((id) => {
+        frames[id - 1] = null;
+      });
+      try {
+        const items: RenderItem[] = [
+          tool(1),
+          { kind: "text", itemId: "m1", text: "Done.", final: true },
+        ];
+        const view = (lifecycle: "streaming" | "completed") => (
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={[...items]} sessionStatus="running" turnLifecycle={lifecycle} />
+          </FileViewerContext.Provider>
+        );
+        const { rerender } = render(view("streaming"));
+        rerender(view("completed"));
+        const trigger = await screen.findByRole("button", { name: "Worked" });
+        rerender(view("completed"));
+        act(() => frames.splice(0).forEach((callback) => callback?.(0)));
+        expect(trigger).toHaveAttribute("aria-expanded", "false");
+        expect(trigger).toBeVisible();
+      } finally {
+        raf.mockRestore();
+        caf.mockRestore();
+      }
+    });
+
     it("mounts settled history already collapsed (nothing to animate)", () => {
       const items: RenderItem[] = [
         { kind: "text", itemId: "m0", text: "Looking around.", final: true },
@@ -2196,6 +2397,30 @@ describe("BlockRenderer dispatch", () => {
       });
       expect(container.textContent).toContain("CHARLIE");
     });
+
+    it("keeps a Mermaid fence's source while the shown text trails the turn's end", () => {
+      const open = "Flow:\n\n```mermaid\nflowchart LR\n  Alpha --> Beta\n";
+      const view = (text: string, sessionStatus: "running" | "idle") => (
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer
+            items={[{ kind: "text", itemId: null, text, final: false, streamKey: "text#0" }]}
+            sessionStatus={sessionStatus}
+          />
+        </FileViewerContext.Provider>
+      );
+      const { rerender, container } = render(view("Flow:", "running"));
+      act(() => rerender(view(open, "running")));
+      // The turn ends within the throttle window, before the fence's close is shown.
+      act(() => rerender(view(`${open}\`\`\`\n\nDone.`, "idle")));
+      expect(container.querySelector('[data-streamdown="code-block"]')).toHaveTextContent(
+        "Alpha --> Beta",
+      );
+      expect(container.querySelector(".chat-mermaid")).toBeNull();
+
+      act(() => vi.advanceTimersByTime(100));
+      expect(container).toHaveTextContent("Done.");
+      expect(container.querySelector(".chat-mermaid")).not.toBeNull();
+    });
   });
 
   // A text block carrying a ~50KB unbroken base64 data URL (an
@@ -2213,6 +2438,36 @@ describe("BlockRenderer dispatch", () => {
           />
         </FileViewerContext.Provider>,
       );
+
+    it("keeps message typography for assistant prose over 50K characters", () => {
+      const text = "Long assistant prose. ".repeat(2_500);
+      const { container } = renderText(text);
+
+      const fallback = container.querySelector(".break-all");
+      expect(fallback).toHaveClass(
+        "chat-markdown",
+        "text-message",
+        "font-mono",
+        "whitespace-pre-wrap",
+      );
+      expect(fallback).not.toHaveClass("text-sm");
+      expect(fallback!.textContent).toBe(text);
+    });
+
+    it("keeps the small-text default for non-message callers", () => {
+      const { container } = render(
+        <FilePathAwareMessageResponse className="text-muted-foreground">
+          {"Long non-message prose. ".repeat(2_500)}
+        </FilePathAwareMessageResponse>,
+      );
+
+      expect(container.querySelector(".break-all")).toHaveClass(
+        "text-sm",
+        "font-mono",
+        "whitespace-pre-wrap",
+        "text-muted-foreground",
+      );
+    });
 
     it("renders a giant unbroken token via the break-anywhere fallback", () => {
       // A long base64-ish token with no whitespace — exactly the freezing

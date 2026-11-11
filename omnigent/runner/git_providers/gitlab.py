@@ -1,4 +1,4 @@
-"""GitLab MR panel adapter, authenticated by glab on the execution host."""
+"""GitLab MR panel adapter, authenticated by glab or an execution-host token."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from omnigent.runner.git_providers import (
     ReviewerRef,
     gitlab_observer,
     local_git,
+    read_pinned_revision,
 )
 from omnigent.runner.session_prs import PullRequestRef
 
@@ -182,7 +183,10 @@ def _resolved(
 
 
 def _base_info(root: str, reference: PullRequestRef | None = None) -> dict[str, Any]:
-    repo = reference or next(iter(_remotes(root)), None)
+    from omnigent.runner.gitlab_client import env_token_for_host
+
+    remotes = _remotes(root) if reference is None else []
+    repo = reference or (_source_remote(root, remotes) if remotes else None)
     host = repo.host if repo else "gitlab.com"
     return {
         "object": INFO_OBJECT,
@@ -198,8 +202,15 @@ def _base_info(root: str, reference: PullRequestRef | None = None) -> dict[str, 
         "warnings": [],
         "auth": {
             "authenticated": False,
-            "hint": f"Run GITLAB_HOST={host} glab auth login on the execution host.",
-            "cli": {"name": "glab", "available": shutil.which("glab") is not None},
+            "hint": (
+                f"Run GITLAB_HOST={host} glab auth login, or set GITLAB_HOST={host} "
+                "and GITLAB_TOKEN on the execution host."
+            ),
+            "cli": (
+                None
+                if env_token_for_host(host)
+                else {"name": "glab", "available": shutil.which("glab") is not None}
+            ),
             "accounts": None,
             "selected_account": None,
         },
@@ -278,6 +289,16 @@ def _pr_payload(
     }
     refs = _object(mr.get("diff_refs"))
     author = _object(mr.get("author"))
+    source_project = mr.get("source_project_id")
+    head_repository_url = None
+    if source_project == mr.get("target_project_id"):
+        head_repository_url = ref.url.rsplit("/-/merge_requests/", 1)[0]
+    elif isinstance(source_project, int):
+        try:
+            web_url = client.object(f"projects/{source_project}").get("web_url")
+            head_repository_url = web_url if isinstance(web_url, str) and web_url else None
+        except ValueError:
+            warnings.append("GitLab source project is unavailable; file links are hidden.")
     return {
         "number": ref.number,
         "url": ref.url,
@@ -290,6 +311,7 @@ def _pr_payload(
         "head_ref": mr.get("source_branch"),
         "head_sha": refs.get("head_sha") or mr.get("sha"),
         "base_sha": refs.get("base_sha"),
+        "head_repository_url": head_repository_url,
         "body": mr.get("description"),
         "comments": comments,
         "comments_partial": comments_partial,
@@ -301,7 +323,7 @@ def _info(root: str, reference: PullRequestRef | None = None) -> dict[str, Any]:
     info = _base_info(root, reference)
     if reference is None and _git(root, ["rev-parse", "--show-toplevel"])[0] != 0:
         return {**info, "available": False, "reason": "not_a_git_repo"}
-    if not info["auth"]["cli"]["available"]:
+    if (cli := info["auth"]["cli"]) is not None and not cli["available"]:
         return info
     try:
         resolved = _resolved(root, reference)
@@ -387,6 +409,73 @@ def _content(client: GitLabClient, project: object, path: str, revision: str) ->
         ) from exc
 
 
+_MR_CHANGED = "The merge request changed. Refresh to retry."
+
+
+def _mr_revisions(client: GitLabClient, reference: PullRequestRef) -> tuple[str, str] | None:
+    """Return the merge request's diff ``(head, base)``, or ``None`` when it cannot be read."""
+    try:
+        refs = _object(_mr(client, reference).get("diff_refs"))
+    except ValueError:
+        return None
+    head, base = refs.get("head_sha"), refs.get("base_sha")
+    return (head, base) if isinstance(head, str) and isinstance(base, str) else None
+
+
+def _file_list(changes: list[dict[str, Any]], partial: bool) -> dict[str, Any]:
+    data = []
+    for change in changes:
+        patch = _text_patch(change)
+        unavailable = patch is None
+        lines = patch.splitlines() if patch is not None else []
+        data.append(
+            {
+                "object": CHANGED_FILE_OBJECT,
+                "path": change["new_path"],
+                "name": change["new_path"],
+                "previous_path": change["old_path"] if change.get("renamed_file") else None,
+                "status": _file_status(change),
+                "lines_added": None
+                if unavailable
+                else sum(line.startswith("+") for line in lines),
+                "lines_removed": None
+                if unavailable
+                else sum(line.startswith("-") for line in lines),
+            }
+        )
+    return {
+        "object": "list",
+        "data": data,
+        "has_more": partial,
+        "warning": "GitLab returned incomplete file changes." if partial else None,
+    }
+
+
+def _whole_patch(changes: list[dict[str, Any]], partial: bool) -> dict[str, Any]:
+    if partial:
+        return {
+            "object": PR_DIFF_OBJECT,
+            "patch": "",
+            "unavailable_reason": "incomplete_diff",
+            "message": "GitLab returned an incomplete diff. "
+            "View the merge request on GitLab for all changes.",
+        }
+    patches = []
+    for change in changes:
+        patch = _text_patch(change)
+        if patch is None:
+            continue
+        old, new = _patch_path("a/", change["old_path"]), _patch_path("b/", change["new_path"])
+        before, after = (
+            ("/dev/null" if change.get("new_file") else old),
+            ("/dev/null" if change.get("deleted_file") else new),
+        )
+        patches.append(
+            f"diff --git {old} {new}\n--- {before}\n+++ {after}\n" + patch.rstrip("\n") + "\n"
+        )
+    return {"object": PR_DIFF_OBJECT, "patch": "".join(patches)}
+
+
 class GitLabPullRequests:
     """Normalize GitLab metadata and exact MR revisions to the shared PR contract."""
 
@@ -398,8 +487,12 @@ class GitLabPullRequests:
     mcp_prs = staticmethod(gitlab_observer.mcp_prs)
 
     def titles_available(self, root: str) -> bool:
+        from omnigent.runner.gitlab_client import env_token_for_host
+
         del root
-        return shutil.which("glab") is not None
+        return shutil.which("glab") is not None or any(
+            env_token_for_host(host) for host in GitLabProvider().authorities(EnvInstances())
+        )
 
     def pr_title(
         self, root: str, reference: PullRequestRef, deadline: float
@@ -424,61 +517,37 @@ class GitLabPullRequests:
         resolved = _resolved(root, reference)
         if resolved is None:
             return {"object": "list", "data": [], "has_more": False}
-        changes, partial = _changes(*resolved)
-        data = []
-        for change in changes:
-            patch = _text_patch(change)
-            unavailable = patch is None
-            lines = patch.splitlines() if patch is not None else []
-            data.append(
-                {
-                    "object": CHANGED_FILE_OBJECT,
-                    "path": change["new_path"],
-                    "name": change["new_path"],
-                    "previous_path": change["old_path"] if change.get("renamed_file") else None,
-                    "status": _file_status(change),
-                    "lines_added": None
-                    if unavailable
-                    else sum(line.startswith("+") for line in lines),
-                    "lines_removed": None
-                    if unavailable
-                    else sum(line.startswith("-") for line in lines),
-                }
-            )
-        return {
-            "object": "list",
-            "data": data,
-            "has_more": partial,
-            "warning": "GitLab returned incomplete file changes." if partial else None,
-        }
+        return _file_list(*_changes(*resolved))
 
     def pr_diff(self, root: str, reference: PullRequestRef | None) -> dict[str, Any]:
         resolved = _resolved(root, reference)
         if resolved is None:
             return {"object": PR_DIFF_OBJECT, "patch": ""}
-        changes, partial = _changes(*resolved)
-        if partial:
-            return {
-                "object": PR_DIFF_OBJECT,
-                "patch": "",
-                "unavailable_reason": "incomplete_diff",
-                "message": "GitLab returned an incomplete diff. "
-                "View the merge request on GitLab for all changes.",
-            }
-        patches = []
-        for change in changes:
-            patch = _text_patch(change)
-            if patch is None:
-                continue
-            old, new = _patch_path("a/", change["old_path"]), _patch_path("b/", change["new_path"])
-            before, after = (
-                ("/dev/null" if change.get("new_file") else old),
-                ("/dev/null" if change.get("deleted_file") else new),
-            )
-            patches.append(
-                f"diff --git {old} {new}\n--- {before}\n+++ {after}\n" + patch.rstrip("\n") + "\n"
-            )
-        return {"object": PR_DIFF_OBJECT, "patch": "".join(patches)}
+        return _whole_patch(*_changes(*resolved))
+
+    def pinned_changed_files(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        client = _client(root, reference.host)
+        return read_pinned_revision(
+            lambda: _mr_revisions(client, reference),
+            lambda: _file_list(*_changes(client, reference, _mr(client, reference))),
+            head_sha=head_sha,
+            base_sha=base_sha,
+            moved=_MR_CHANGED,
+        )
+
+    def pinned_diff(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        client = _client(root, reference.host)
+        return read_pinned_revision(
+            lambda: _mr_revisions(client, reference),
+            lambda: _whole_patch(*_changes(client, reference, _mr(client, reference))),
+            head_sha=head_sha,
+            base_sha=base_sha,
+            moved=_MR_CHANGED,
+        )
 
     def file_diff(
         self,

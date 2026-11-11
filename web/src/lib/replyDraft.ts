@@ -102,6 +102,20 @@ export function appendReplyQuote(
   };
 }
 
+/** `first` followed by `second` as a new paragraph, keeping both drafts' cards. */
+export function appendReplyDraft(first: ReplyDraft, second: ReplyDraft): ReplyDraft {
+  const [head, ...rest] = second.quotes;
+  if (!head) return { quotes: first.quotes, text: joinParagraphs([first.text, second.text]) };
+  return {
+    quotes: [
+      ...first.quotes,
+      { ...head, before: joinParagraphs([first.text, head.before]) },
+      ...rest,
+    ],
+    text: second.text,
+  };
+}
+
 export function removeReplyQuote(draft: ReplyDraft, id: string): ReplyDraft {
   const index = draft.quotes.findIndex((quote) => quote.id === id);
   if (index < 0) return draft;

@@ -66,7 +66,7 @@ _KIND_GLYPH: dict[str, str] = {
     # GEAR carries a VS16 for the same 2-cell-emoji rendering reason as the
     # ADMISSION TICKETS glyph above.
     CLI_CONFIG_KIND: "\N{GEAR}\N{VARIATION SELECTOR-16}",
-    # CLOUD for Bedrock-style gateways (AWS Bedrock, corporate AI gateways)
+    # CLOUD for Bedrock-style gateways (AWS Bedrock, enterprise AI gateways)
     BEDROCK_KIND: "\N{CLOUD}",
 }
 
@@ -931,7 +931,7 @@ def build_cli_config_provider_entry(
     A cli-config provider pins a custom model provider defined in the
     harness CLI's own config file (today: a ``[model_providers.X]`` table
     in ``~/.codex/config.toml`` with self-contained auth, e.g. the
-    Databricks Unity Gateway written by ``isaac configure codex``). The
+    Databricks Unity Gateway set up by a Codex setup). The
     provider definition and credential stay in that file; this entry only
     records which provider the launch selects.
 

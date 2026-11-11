@@ -63,7 +63,9 @@ from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner import _proc
 from omnigent.inner.databricks_executor import (
+    _forget_remembered_profile,
     _read_databrickscfg,
+    _remember_profile,
     _ReusedDatabricksTokenSource,
 )
 from omnigent.models.model_catalog import resolve_catalog_model
@@ -87,6 +89,7 @@ from omnigent.util.server_url import display_server_url
 
 if TYPE_CHECKING:
     from omnigent._runner_startup import RunnerStartupProgress
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
 
 console = Console()
 
@@ -137,6 +140,10 @@ _PER_TURN_TIMEOUT_S = 120.0
 # Overall budget for following one headless ``-p`` session to idle
 # (first-turn recovery and the extra-turns loop share it).
 _LOOP_TIMEOUT_S = 1800.0  # 30 min total
+# Snapshot statuses that keep a headless ``-p`` run going. The server reports any
+# ``waiting`` (an async orchestrator's, or a claude-native turn's background-agent
+# hold) as ``running``; ``waiting`` is here in case a snapshot ever carries it raw.
+_HEADLESS_UNFINISHED_STATUSES = frozenset({"running", "launching", "waiting"})
 
 # Optional bearer token for remote omnigent servers that sit
 # behind an auth proxy (for example Databricks Apps). When set, the
@@ -755,8 +762,75 @@ def _remote_headers(
     return headers
 
 
-# Reuse the SDK's in-memory token cache for each server.
+# One token source per server, shared by every client in the process, so a
+# launch walks ~/.databrickscfg once instead of once per client.
 _databricks_auth_cache: dict[str, _ReusedDatabricksTokenSource] = {}
+
+
+def _shared_token_source(server_url: str | None) -> _ReusedDatabricksTokenSource:
+    """Return this process's Databricks token source for *server_url*.
+
+    :param server_url: The remote server URL, e.g.
+        ``"https://myapp-123.aws.databricksapps.com"``, or ``None`` for
+        ambient credentials, which get an unshared source.
+    :returns: The shared source, created on first use.
+    """
+    if server_url is None:
+        return _ReusedDatabricksTokenSource()
+    key = server_url.rstrip("/")
+    source = _databricks_auth_cache.get(key)
+    if source is None:
+        source = _databricks_auth_cache[key] = _ReusedDatabricksTokenSource(server_url)
+    return source
+
+
+def _remember_accepted_credential(server_url: str, authorization: str | None) -> None:
+    """Remember the profile behind *authorization* once the server accepted it.
+
+    Only a bearer minted by the shared source counts; an env-var or OIDC
+    token says nothing about which profile works.
+
+    :param server_url: The remote server URL the token was accepted by.
+    :param authorization: The ``Authorization`` header the server accepted.
+    """
+    from omnigent.cli_auth import load_databricks_workspace_host
+
+    source = _databricks_auth_cache.get(server_url.rstrip("/"))
+    if source is None or source.profile_name is None or authorization is None:
+        return
+    if authorization != f"Bearer {source.current_token()}":
+        return
+    workspace_host = load_databricks_workspace_host(server_url)
+    if workspace_host is not None:
+        _remember_profile(workspace_host, source.profile_name)
+
+
+def _forget_refused_credential(server_url: str) -> None:
+    """Forget the credential the server just refused for *server_url*.
+
+    The next client resolves again, and the profile walk goes back to its
+    default order instead of preferring the refused profile.
+
+    :param server_url: The remote server URL that refused the credential.
+    """
+    from omnigent.cli_auth import load_databricks_workspace_host
+
+    _databricks_auth_cache.pop(server_url.rstrip("/"), None)
+    workspace_host = load_databricks_workspace_host(server_url)
+    if workspace_host is not None:
+        _forget_remembered_profile(workspace_host)
+
+
+def _adopt_verified_credential(server_url: str, auth: _DatabricksBearerAuth) -> None:
+    """Serve later clients of *server_url* from *auth*, whose token the server accepted.
+
+    A recovery resolves credentials outside the shared source; without this the
+    next client would walk ``~/.databrickscfg`` and mint again.
+
+    :param server_url: The remote server URL that accepted the token.
+    :param auth: The resolved auth that minted the accepted token.
+    """
+    _shared_token_source(server_url).adopt(auth)
 
 
 def _stored_databricks_record_token(server_url: str) -> str | None:
@@ -775,14 +849,9 @@ def _stored_databricks_record_token(server_url: str) -> str | None:
     """
     from omnigent.cli_auth import load_databricks_workspace_host
 
-    workspace_host = load_databricks_workspace_host(server_url)
-    if workspace_host is None:
+    if load_databricks_workspace_host(server_url) is None:
         return None
-    source = _databricks_auth_cache.get(server_url)
-    if source is None:
-        source = _ReusedDatabricksTokenSource(host=workspace_host)
-        _databricks_auth_cache[server_url] = source
-    return source.current_token()
+    return _shared_token_source(server_url).current_token()
 
 
 class _DatabricksTokenAuth(httpx.Auth):
@@ -818,7 +887,7 @@ class _DatabricksTokenAuth(httpx.Auth):
         # cache). Resolving per request rebuilt Config and shelled out to
         # the Databricks CLI (~0.5s) every time — a heavy tax on the
         # long-lived transcript-forwarder client that posts reply items.
-        self._sdk_token_source = _ReusedDatabricksTokenSource(server_url)
+        self._sdk_token_source = _shared_token_source(server_url)
 
     def pin_session(self, session_id: str | None) -> None:
         """Repoint this auth at a different session's host.
@@ -2737,7 +2806,7 @@ async def _run_bound_turn(
             async with asyncio.timeout(_LOOP_TIMEOUT_S):
                 while True:
                     await chat.refresh()
-                    if chat.status not in ("running", "launching"):
+                    if chat.status not in _HEADLESS_UNFINISHED_STATUSES:
                         break
                     await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
         reconciled = await _persisted_turn_text(client, bound.id)
@@ -2806,7 +2875,7 @@ async def _run_bound_turn(
         # relay cache holds "waiting" (sub-agents still running); "idle" means
         # truly done (single-turn agent, or synthesis completed in the probe).
         await chat.refresh()
-        if chat.status not in ("running", "launching"):
+        if chat.status not in _HEADLESS_UNFINISHED_STATUSES:
             return
         # Async orchestrator confirmed. Loop, refreshing after each turn.
         for _ in range(_MAX_EXTRA_TURNS):
@@ -2814,7 +2883,7 @@ async def _run_bound_turn(
             if extra.text:
                 all_text_parts.append(extra.text)
             await chat.refresh()
-            if chat.status not in ("running", "launching"):
+            if chat.status not in _HEADLESS_UNFINISHED_STATUSES:
                 return  # Idle: synthesis done or all sub-agents complete.
         logger.warning(
             "headless -p hit the %d-turn guard for session %s; "
@@ -2837,7 +2906,7 @@ async def _run_bound_turn(
         return "\n\n".join(p for p in all_text_parts if p)
     # An auto-woken turn can finish between live-stream subscriptions.
     # Recheck its durable output once the session has stopped running.
-    if chat.status not in ("running", "launching"):
+    if chat.status not in _HEADLESS_UNFINISHED_STATUSES:
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             logger.info("Recovered headless output from completed session %s", bound.id)
