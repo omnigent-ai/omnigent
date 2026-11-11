@@ -1374,6 +1374,9 @@ describe("change-event prompts", () => {
     expect(prompt).toContain(
       "read them from the pull request itself, for example gh api repos/<owner/repo>/pulls/<number>",
     );
+    expect(prompt).toContain(
+      "if that read fails, stop before this pull request and say why, so the next run tries it again",
+    );
     // Merges from before activation never count, even inside the search overlap.
     expect(prompt).toContain(
       'On the first run, use the current time as both the check time and the "Watching since:" time',
