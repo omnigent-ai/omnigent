@@ -69,6 +69,26 @@ MCP independent creation.
   automation can message the owner's other sessions or start workers. The
   Automations page's Jira/Slack/GitHub trigger templates rely on this: their
   kept session starts one worker per match (`docs/AUTOMATIONS.md`).
+- `projects`: `sys_project_list` pages the owner's projects oldest first and
+  their own sessions with each one's project, marking the calling session; a
+  legacy label folder shows only as a session's project.
+  `sys_session_update` files one of those sessions into a project by name,
+  creating a missing project only once the session can move, or unfiles it
+  with `""`, through the sidebar's move request; agents call it once per
+  session, and `project` is its only field. An open sidebar regroups without a
+  reload; a collapsed folder stays collapsed. Changing the project changes only
+  folder membership, so running sessions, including the caller, keep their
+  turn. Sub-agents follow their parent and a family follows its
+  representative; each refusal names the session to update instead. An
+  edit-shared caller cannot change a project or create one through the update,
+  while listing stays an ordinary owner read. A session shared with the caller
+  but owned by someone else is refused, even when it is already in the target
+  project. Updates refuse to run against a server that does not advertise
+  `session_move_source_checks` in `/v1/info`. `tool_groups.projects: false`
+  drops both tools. Covered by
+  `tests/server/integration/test_session_orchestration_projects.py::test_project_tools_list_and_file_running_sessions`
+  and the browser journeys in
+  `tests/e2e_ui/sessions/test_agent_files_sessions_into_projects.py`.
 - `refusal`: disabled orchestration, another owner, edit-shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid
@@ -89,6 +109,13 @@ MCP independent creation.
   Pass `sandbox_provider`, `sandbox_profile_id`, and `sandbox_profile_revision`
   to choose an authorized profile/revision from the
   [provider catalog](../docs/extending/provider_profiles.md).
+- In a session's Chat, ask the agent to list your projects and file some
+  sessions, including itself, into an existing or new project. The sidebar folders
+  update while the agent keeps running.
+- In a native Claude Code session's Chat or agent terminal, ask the same; the
+  relay exposes `mcp__omnigent__sys_project_list` and
+  `mcp__omnigent__sys_session_update`, and the session lands in its folder
+  mid-turn (`test_native_claude_files_itself_into_a_project`, nightly).
 - Use the existing Share dialog to share the sender or receiver, then repeat.
   A read-only share of the sender keeps both tools working; an edit share
   refuses them.
@@ -208,6 +235,9 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
 - A fresh managed sandbox is distinct from reusing an existing managed host.
   Even the most permissive setting offers only the clicked session's existing
   managed host; another family's managed host remains unavailable.
+- Project moves skip the source check in no-auth and single-user local mode,
+  where nobody else can hold an edit grant. A move only ever applies to the
+  owner's own sessions; the PATCH remains owner-gated per session and family member.
 - A receiver shared with edit access can continue working but cannot message
   back while shared that way. A read-only share does not stop it.
 - Privacy checks govern these tools. They do not confine arbitrary code holding

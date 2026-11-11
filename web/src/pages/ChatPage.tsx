@@ -1,4 +1,9 @@
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
+import {
+  EditSentMessageContext,
+  useEditSentMessage,
+  type SentMessage,
+} from "@/components/chat/editSentMessage";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useConversationRedirect } from "@/hooks/useConversationRedirect";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
@@ -154,6 +159,7 @@ import {
   type MentionState,
   parseMentionToken,
   rankMentionEntries,
+  recallFileMentions,
 } from "@/lib/composerMentions";
 import { useChildSessions } from "@/hooks/useChildSessions";
 import {
@@ -241,6 +247,13 @@ import {
   useHostMcpServers,
   type HostMcpServer,
 } from "@/hooks/useHarnessInventory";
+import {
+  liveMcpNameForHostServer,
+  liveMcpRowFields,
+  liveMcpStatusNote,
+  useReconnectLiveMcpServer,
+  useSessionLiveMcpServers,
+} from "@/hooks/useSessionLiveMcpServers";
 import { useMcpRegistryCatalog, useRegistrySignIn } from "@/hooks/useMcpRegistry";
 import {
   getSessionHost,
@@ -1747,6 +1760,11 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // out of streaming-frame re-renders.
 
   const composerRef = useRef<ComposerHandle>(null);
+  // Stable, so the memoized transcript doesn't re-render when the composer does.
+  const editSentMessage = useCallback(
+    (message: SentMessage) => composerRef.current?.editSentMessage(message),
+    [],
+  );
   // Cold selector (harness rarely changes) — gates the selection popup's "Ask
   // in side chat" action to harnesses that support side chat.
   const selectionSessionHarness = useChatStore((s) => s.sessionHarness);
@@ -1963,6 +1981,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     );
   });
 
+  const composerReadOnly = isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason);
+
   // Single return so both surfaces keep stable fragment positions across
   // view flips — an early return would change the tree shape and remount
   // the terminal overlays, disposing the live attaches they exist to
@@ -1976,25 +1996,27 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           {/* The scrolling transcript column owns every streaming-hot store
           subscription and the bubble pipeline, so an SSE frame re-renders it
           alone — this surface's composer and chrome below bail out. */}
-          <Transcript
-            hostId={hostId}
-            setConversationEl={setConversationEl}
-            containerEl={containerEl}
-            scroller={scroller}
-            setScroller={setScroller}
-            sendScrollNonce={sendScrollNonce}
-            hasMoreHistory={hasMoreHistory}
-            loadingMoreHistory={loadingMoreHistory}
-            isMobileViewport={isMobileViewport}
-            showsWorking={showsWorking}
-            agentsError={agentsError}
-            sandboxLaunching={sandboxLaunching}
-            spacerMeasureRef={spacerMeasureRef}
-          />
+          <EditSentMessageContext.Provider value={composerReadOnly ? null : editSentMessage}>
+            <Transcript
+              hostId={hostId}
+              setConversationEl={setConversationEl}
+              containerEl={containerEl}
+              scroller={scroller}
+              setScroller={setScroller}
+              sendScrollNonce={sendScrollNonce}
+              hasMoreHistory={hasMoreHistory}
+              loadingMoreHistory={loadingMoreHistory}
+              isMobileViewport={isMobileViewport}
+              showsWorking={showsWorking}
+              agentsError={agentsError}
+              sandboxLaunching={sandboxLaunching}
+              spacerMeasureRef={spacerMeasureRef}
+            />
+          </EditSentMessageContext.Provider>
           {/* Floating reply button — scoped to the conversation container.
           Withheld when the composer refuses quotes (read-only grant or a
           structurally non-interactive session), as SideChatPane does. */}
-          {!isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason) && (
+          {!composerReadOnly && (
             <SelectionPopup
               containerRef={conversationRef}
               onReply={(text) => composerRef.current?.appendReplyQuote(text)}
@@ -2121,6 +2143,8 @@ export function ConversationLoadError({
 
 interface ComposerHandle {
   appendReplyQuote: (text: string) => void;
+  /** Load a sent message into the composer, confirming before replacing a draft. */
+  editSentMessage: (message: SentMessage) => void;
   startSideChat: (selectedText: string) => void;
   /** Take keyboard focus for typing (not on phones, or while a /btw answer holds it). */
   focus: () => void;
@@ -2773,6 +2797,15 @@ function ComposerImpl(
           : hostMcpQuery.isError
             ? "Couldn’t load MCP servers from this session’s host."
             : sdkAgentStatus;
+  // claude-sdk's CLI reports the connections it holds; other harnesses can't be asked.
+  const liveMcpQuery = useSessionLiveMcpServers(
+    composerSessionId,
+    mcpPanelRequested && sessionHarness === "claude-sdk",
+  );
+  // A failed refetch keeps the last data; showing it would present old state as live.
+  const liveMcp =
+    !liveMcpQuery.isError && liveMcpQuery.data?.live ? liveMcpQuery.data.servers : undefined;
+  const liveMcpReconnect = useReconnectLiveMcpServer(composerSessionId);
   const mcpSettingsHarness = nativeMcpHarness
     ? sessionHarness
     : hostMcpHarness && INVENTORY_HARNESS_IDS[hostMcpHarness];
@@ -3688,14 +3721,27 @@ function ComposerImpl(
       hasRegistryServers && registryCatalog.error
         ? "Couldn’t check MCP service connections."
         : undefined,
+      sessionHarness === "claude-sdk"
+        ? liveMcpStatusNote(liveMcpQuery.data, liveMcpQuery.isError)
+        : undefined,
     ]
       .filter(Boolean)
       .join(" ") || undefined;
   const mcpServers = useMemo(() => {
-    const byName = new Map<string, McpServerRow>(
+    const liveByName = new Map((liveMcp ?? []).map((server) => [server.name, server]));
+    const takeLive = (liveName: string) => {
+      const live = liveByName.get(liveName);
+      // An answer that omits a server means the session did not load it.
+      if (live === undefined) return liveMcp ? { live: { status: "not-loaded" } } : {};
+      liveByName.delete(liveName);
+      return liveMcpRowFields(live);
+    };
+    // Keyed by harness identity: two plugins can each ship a server with one name.
+    const rows = new Map<string, McpServerRow>(
       (hostMcpQuery.data ?? []).filter(isSessionHostServer).map((server) => [
-        server.name,
+        `host:${liveMcpNameForHostServer(server)}`,
         {
+          key: `host:${liveMcpNameForHostServer(server)}`,
           name: server.name,
           description:
             [server.plugin && `${server.plugin} plugin`, server.url_host]
@@ -3713,16 +3759,30 @@ function ComposerImpl(
           signIn: HOST_SIGN_IN_URL_RE.test(server.sign_in_url ?? "")
             ? { kind: "url", url: server.sign_in_url! }
             : undefined,
+          ...takeLive(liveMcpNameForHostServer(server)),
         },
       ]),
     );
+    // The CLI also loads servers the host inventory doesn't list, e.g. project ones.
+    // Wait for the inventory, or its servers would flash up here before merging.
+    if (!hostMcpQuery.isLoading) {
+      for (const live of liveByName.values()) {
+        const key = `live:${live.name}`;
+        rows.set(key, { key, name: live.name, ...liveMcpRowFields(live) });
+      }
+    }
     const catalogLoaded = !registryCatalog.loading && !registryCatalog.error;
     for (const server of selectedAgent?.mcp_servers ?? []) {
       // A shared name is not a shared endpoint, so an agent server claims none of
       // the host's account state: its Sign in could point at the wrong service.
+      const hostKeys = [...rows.entries()]
+        .filter(([key, row]) => key.startsWith("host:") && row.name === server.name)
+        .map(([key]) => key);
       const row: McpServerRow = {
+        key: hostKeys[0] ?? `agent:${server.name}`,
         name: server.name,
-        description: server.description ?? byName.get(server.name)?.description,
+        description:
+          server.description ?? (hostKeys[0] ? rows.get(hostKeys[0])?.description : undefined),
       };
       // Only a read from this open: a stale row would offer a needless popup.
       if (hasRegistryServers && server.transport === "registry" && catalogLoaded) {
@@ -3741,17 +3801,21 @@ function ComposerImpl(
           row.connection = "unavailable";
         }
       }
-      byName.set(server.name, row);
+      // Take the first host row's place and drop the rest, as the agent's server wins.
+      for (const key of hostKeys.slice(1)) rows.delete(key);
+      rows.set(row.key!, row);
     }
-    return [...byName.values()];
+    return [...rows.values()];
   }, [
     hasRegistryServers,
     isSessionHostServer,
     hostMcpQuery.data,
+    hostMcpQuery.isLoading,
     registryCatalog.error,
     registryCatalog.loading,
     registryCatalog.services,
     selectedAgent?.mcp_servers,
+    liveMcp,
   ]);
 
   const slashCompletionCommands = mcpPanelRequested
@@ -3778,9 +3842,11 @@ function ComposerImpl(
   const showMcpServers = mcpPanelRequested && !slashCompletion.inline;
   // Clear on both edges: a popup that rejects after the panel closes would
   // otherwise greet the next open with a stale message.
+  const { clearError: clearLiveMcpReconnectError } = liveMcpReconnect;
   useEffect(() => {
     clearRegistrySignInError();
-  }, [showMcpServers, clearRegistrySignInError]);
+    clearLiveMcpReconnectError();
+  }, [showMcpServers, clearRegistrySignInError, clearLiveMcpReconnectError]);
 
   // Mobile reserves the overlay height in the transcript's trailing padding.
   const composerFormRef = useRef<HTMLFormElement>(null);
@@ -3836,6 +3902,42 @@ function ComposerImpl(
   // User edits and quote changes leave recall mode.
   const recallingRef = useRef(false);
 
+  // Replace the draft with a message brought back for editing, and focus it.
+  // Files recovered from history are validated; queued drafts were checked when added.
+  const loadIntoComposer = (
+    text: string,
+    loadedFiles: File[],
+    {
+      replyDraft,
+      validateFiles = false,
+    }: { replyDraft?: StoredReplyDraft; validateFiles?: boolean } = {},
+  ) => {
+    restoreRecalledText(text, replyDraft);
+    dirtyRef.current = true;
+    resetCursor();
+    recallingRef.current = false;
+    textareaRef.current = tailTextareaRef.current;
+    if (validateFiles) replaceFiles(loadedFiles);
+    else restoreFiles(loadedFiles);
+    textareaRef.current?.focus();
+  };
+  const { editMessage: editSentMessage, confirmDialog: replaceDraftDialog } = useEditSentMessage({
+    target: conversationId,
+    // An edited message may land wherever the user could type it.
+    canAccept: () => !inputDisabled,
+    hasDraft: () => hasDraft,
+    loadText: (text) => {
+      setCommandError(null);
+      dismissMention();
+      const sessionTokens = recallSessionMentions(text).sessions.map((it) => it.token!);
+      const recalled = recallFileMentions(text, sessionTokens);
+      loadIntoComposer(recalled.text, [], { validateFiles: true });
+      // After the load, which clears file mentions while restoring session mentions.
+      setMentionedItems(recalled.files);
+    },
+    focusComposer: () => textareaRef.current?.focus(),
+  });
+
   const replyQuoteInsertedRef = useRef(false);
   useImperativeHandle(ref, () => ({
     focus() {
@@ -3853,6 +3955,9 @@ function ComposerImpl(
       dismissMention();
       resetCursor();
       recallingRef.current = false;
+    },
+    editSentMessage(message) {
+      editSentMessage(message);
     },
     startSideChat(selectedText) {
       // Quote in the visible side chat, or open a pending tab immediately.
@@ -4249,6 +4354,7 @@ function ComposerImpl(
         isMobile && "z-20 px-4 pb-[max(16px,env(safe-area-inset-bottom))]",
       )}
     >
+      {replaceDraftDialog}
       {/* Hidden file input for the attach button */}
       <input
         ref={fileInputRef}
@@ -4287,14 +4393,8 @@ function ComposerImpl(
             // Re-sending re-queues it (busy) or sends it (idle).
             const target = queuedMessages.find((m) => m.queueId === queueId);
             if (!target) return;
-            restoreRecalledText(target.text, target.replyDraft);
-            dirtyRef.current = true;
-            resetCursor();
-            recallingRef.current = false;
-            textareaRef.current = tailTextareaRef.current;
-            restoreFiles(target.files ?? []);
             dequeueMessage(queueId);
-            textareaRef.current?.focus();
+            loadIntoComposer(target.text, target.files ?? [], { replyDraft: target.replyDraft });
           }}
           onSteer={(queueId) => steerMessage(queueId)}
           onReorder={reorderQueuedMessage}
@@ -4471,6 +4571,9 @@ function ComposerImpl(
                       ? { name: registrySignIn.error.id, message: registrySignIn.error.message }
                       : null
                   }
+                  onMcpReconnect={isReadOnly ? undefined : liveMcpReconnect.reconnect}
+                  mcpReconnectingName={liveMcpReconnect.reconnectingName}
+                  mcpReconnectError={liveMcpReconnect.error}
                 />
               )}
               {/* "@"-file-mention browser — native coding-agent sessions only.

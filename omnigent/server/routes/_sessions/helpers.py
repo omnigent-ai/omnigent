@@ -182,6 +182,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CLAUDE_NATIVE_UI_LABEL_KEY,
     _CLAUDE_NATIVE_UI_LABEL_VALUE,
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+    _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
     _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODES,
@@ -250,6 +251,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _read_explicit_unread,
     _read_last_seen,
     _session_active_response_cache,
+    _session_background_agents_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_blocked_on_cache,
@@ -326,6 +328,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
+    FORK_SOURCE_LABEL_KEY,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
@@ -3097,6 +3100,68 @@ def _merge_claude_permission_launch_args(
     return [*stripped, "--permission-mode", mode]
 
 
+def _claude_args_without_permission_mode(args: list[str] | None) -> list[str]:
+    """
+    Claude launch args with permission-mode selectors removed, for comparing two sets.
+
+    Everything from an ``--`` option terminator on is positional text, so it
+    is kept exactly as stored.
+
+    :param args: Stored launch args, e.g. ``["--permission-mode", "plan", "--", "hi"]``.
+    :returns: The args without selectors, e.g. ``["--", "hi"]``.
+    """
+    stored = list(args or ())
+    end = stored.index("--") if "--" in stored else len(stored)
+    options, _ = _strip_claude_permission_launch_arg(stored[:end])
+    return [*options, *stored[end:]]
+
+
+def _drop_claude_launch_args_from_another_host(
+    conversation_store: ConversationStore, conv: Conversation
+) -> Conversation:
+    """
+    Drop launch args a Claude Code fork still carries from its source when bound elsewhere.
+
+    Stored launch args can name files on the machine that started the session
+    (an ``--mcp-config`` path, say), and Claude exits at startup when one is
+    missing. A fork's args are still its source's when they match the source's
+    apart from the permission mode; on any other host they are dropped. Args
+    that differ are the fork's own and are kept. The permission mode is rebuilt
+    from the session's label, never read out of the args.
+
+    :param conversation_store: Store holding the session and its source.
+    :param conv: The session row as just bound, with its stored ``host_id``.
+    :returns: The session row, updated when its args were dropped.
+    """
+    from omnigent.runner.routing import routing_host_id  # noqa: FlagLocalImports
+
+    source_id = conv.labels.get(FORK_SOURCE_LABEL_KEY)
+    if (
+        not source_id
+        or conv.host_id is None
+        or conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
+    ):
+        return conv
+    copied = _claude_args_without_permission_mode(conv.terminal_launch_args)
+    if not copied:
+        return conv
+    source = conversation_store.get_conversation(source_id)
+    if source is None:
+        return conv
+    source_args = _claude_args_without_permission_mode(source.terminal_launch_args)
+    # A side chat shares its source's runner without a host binding of its own.
+    source_host_id = routing_host_id(source, conversation_store)
+    if copied != source_args or source_host_id is None or source_host_id == conv.host_id:
+        return conv
+    mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+    kept: list[str] = (
+        ["--permission-mode", mode]
+        if mode is not None and mode in _CLAUDE_NATIVE_PERMISSION_MODES
+        else []
+    )
+    return conversation_store.update_conversation(conv.id, terminal_launch_args=kept) or conv
+
+
 def _pin_claude_permission_launch_args(
     existing_args: list[str] | None,
     mode: str,
@@ -5062,6 +5127,7 @@ def _publish_status(
     failure_intake: Mapping[str, str] | None = None,
     disconnect_evidence: Mapping[str, str] | None = None,
     turn_completed: bool = False,
+    background_agents: list[BackgroundTaskInfo] | None = None,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -5102,6 +5168,9 @@ def _publish_status(
     :param turn_completed: Whether an ``"idle"`` edge reports a turn the harness
         confirmed finished (e.g. claude-native's ``Stop`` hook), which clears a
         sticky ``failed`` like a ``running`` edge would.
+    :param background_agents: Background agents a finished claude-native turn
+        left running, on its ``"waiting"`` edge. Kept for snapshots until the
+        next non-``waiting`` edge; ignored on every other status.
     """
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
@@ -5130,6 +5199,13 @@ def _publish_status(
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
     _set_blocked_on(session_id, blocked_on)
+    # Only a ``waiting`` edge names background agents; any other edge ends that wait.
+    if status != "waiting":
+        background_agents = None
+    if background_agents:
+        _session_background_agents_cache[session_id] = background_agents
+    else:
+        _session_background_agents_cache.pop(session_id, None)
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
     if status == "idle" and previous_status in ("running", "waiting") and persist_live_status:
@@ -5236,6 +5312,7 @@ def _publish_status(
         error=error,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
+        background_agents=background_agents or None,
         blocked_on=blocked_on,
     )
     payload = event.model_dump()
@@ -5248,6 +5325,8 @@ def _publish_status(
     # its detail when the count clears).
     if not background_tasks:
         payload.pop("background_tasks", None)
+    if not background_agents:
+        payload.pop("background_agents", None)
     if blocked_on is None:
         payload.pop("blocked_on", None)
     session_stream.publish(session_id, payload)
@@ -12662,6 +12741,7 @@ __all__ = [
     "_devin_subagent_labels_from_body",
     "_discovery_key",
     "_dispatch_skill_slash_command_to_runner",
+    "_drop_claude_launch_args_from_another_host",
     "_emit_server_routing_decision",
     "_error_item_from_sse",
     "_evaluate_output_policy",

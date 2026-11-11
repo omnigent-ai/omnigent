@@ -11,6 +11,7 @@ import {
   parseGithubReviewer,
   isTaskSessionTriggerPrompt,
   isTriggerPrompt,
+  triggerPromptSource,
   readTriggerWorkerSettings,
   MAX_INSTRUCTIONS_CHARS,
   renderTriggerPrompt,
@@ -83,6 +84,10 @@ describe("saved trigger prompts", () => {
       );
       expect(updated).toContain('model "model-with-\\"quotes\\"", reasoning_effort "low"');
       expect(updated).toContain("Keep this custom instruction.");
+      const context = { ...CTX, taskSessionMode };
+      expect(renderTriggerPrompt(source, fields(), { ...context, ...settings })).toBe(
+        updateTriggerWorkerSettings(renderTriggerPrompt(source, fields(), context), settings),
+      );
       expect(splitTriggerPrompt(updated).userPrompt).toBe(splitTriggerPrompt(original).userPrompt);
       expect(
         updateTriggerWorkerSettings(updated, { agentId: null, model: "old-model", effort: "high" }),
@@ -780,12 +785,13 @@ describe("triggerScopeOperators", () => {
   });
 });
 
-describe("isTriggerPrompt", () => {
+describe("isTriggerPrompt and triggerPromptSource", () => {
   it.each(SOURCE_MODES)(
-    "recognizes a rendered $source prompt in $taskSessionMode mode",
+    "recognizes a rendered $source prompt and its source in $taskSessionMode mode",
     ({ source, taskSessionMode }) => {
       const prompt = renderTriggerPrompt(source, fields(), { ...CTX, taskSessionMode });
       expect(isTriggerPrompt(prompt)).toBe(true);
+      expect(triggerPromptSource(prompt)).toBe(source);
       expect(isTaskSessionTriggerPrompt(prompt)).toBe(taskSessionMode === "continue");
       // The server's _TRIGGER_PROMPT_OPENINGS match only this prefix.
       expect(prompt).toMatch(/^This automation watches \S+ and starts one Omnigent session/);
@@ -795,6 +801,7 @@ describe("isTriggerPrompt", () => {
   it("doesn't match a prompt written by hand", () => {
     expect(isTriggerPrompt("Summarize the new Jira tickets.")).toBe(false);
     expect(isTriggerPrompt(` ${renderTriggerPrompt("jira", fields(), CTX)}`)).toBe(false);
+    expect(triggerPromptSource("Summarize the new Jira tickets.")).toBeNull();
   });
 });
 

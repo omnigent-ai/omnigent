@@ -118,6 +118,7 @@ from omnigent.runner.launch_failure import (
     FailureDiagnosis,
     classify_terminal_failure,
 )
+from omnigent.runner.live_mcp_routes import register_live_mcp_routes
 from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
@@ -1606,13 +1607,16 @@ def create_runner_app(
         :param include_pane_activity: Whether recent pane input or output counts.
             Viewing a pane (attach, resize, a redraw) produces both, so callers
             asking about agent work rather than pane liveness pass ``False``.
-        :returns: ``True`` when a permission hook is parked or, with
-            *include_pane_activity*, the pane shows recent input or output.
+        :returns: ``True`` when a permission hook is parked, a background agent
+            outlives the settled turn, or, with *include_pane_activity*, the
+            pane shows recent input or output.
         """
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
         from omnigent.terminals.pane_reaper import PANE_OUTPUT_BUSY_WINDOW_S
 
         if approval_wait_is_fresh(session_id):
+            return True
+        if resource_registry.session_has_background_agents(session_id):
             return True
         if not include_pane_activity:
             return False
@@ -1872,7 +1876,23 @@ def create_runner_app(
         failure_detail: str | None = None,
         inferred: bool = False,
     ) -> None:
-        event: dict[str, object] = {"type": "session.status", "status": status}
+        background_agents: list[dict[str, object]] = []
+        wire_status = status
+        if status == "waiting":
+            # Claude's background-agent hold. A server that may predate
+            # ``waiting`` gets ``idle``: the turn ended, and ``running`` would
+            # hold every follow-up behind Steer. An unknown version is treated
+            # the same way, since a pre-0.3.0 server 500s its session reads on
+            # ``waiting``. Current servers always name their version in the
+            # session-init envelope, so only a legacy server whose probe failed
+            # lands here.
+            if _server_version is None or not _version_supports_waiting_status(_server_version):
+                wire_status = "idle"
+            else:
+                background_agents = resource_registry.session_background_agents(session_id)
+        event: dict[str, object] = {"type": "session.status", "status": wire_status}
+        if background_agents:
+            event["background_agents"] = background_agents
         if status == "failed":
             # A lost terminal hook may still leave a cause in the program-status report.
             event["error"] = {
@@ -1906,6 +1926,10 @@ def create_runner_app(
         if inferred:
             event["inferred"] = True
         _publish_event(session_id, event)
+        if wire_status != status:
+            # Only the server's copy is downgraded: the agent still works in
+            # this pane, so the runner keeps counting the session as busy.
+            _native_pane_status[session_id] = status
 
     resource_registry.set_session_status_publisher(
         _publish_session_status,
@@ -2194,6 +2218,19 @@ def create_runner_app(
                 event.session_id
             )
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
+            _release_required_terminal_session(event)
+            return
+
+        # The finished turn's background agent died with the pane. Nothing else
+        # ends the server's ``waiting`` (or clears its agent list), so settle it
+        # here; a replacement pane owns the session's status instead.
+        if event.session_was_waiting:
+            _required_terminal_exit_errors.pop(event.session_id, None)
+            if _terminal_exit_still_owns_session(event, exit_turn_epoch):
+                _clean_terminal_exit_responses[event.session_id] = _live_response_id.get(
+                    event.session_id
+                )
+                _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
             _release_required_terminal_session(event)
             return
 
@@ -5340,6 +5377,8 @@ def create_runner_app(
 
         from omnigent.harnesses.claude_native.bridge import (
             BRIDGE_ID_LABEL_KEY,
+            TOOLS_CHANGED_READY_TIMEOUT_S,
+            ClaudeBridgeNotReady,
             bridge_dir_for_bridge_id,
             post_tools_changed,
             start_tool_relay,
@@ -5577,11 +5616,20 @@ def create_runner_app(
             from threading import Event
 
             cancelled = Event()
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + TOOLS_CHANGED_READY_TIMEOUT_S
             try:
-                # Bridge readiness waits must not compete with git or message delivery.
-                await _BRIDGE_NOTIFICATIONS.run(
-                    post_tools_changed, bridge_dir, cancelled=cancelled
-                )
+                while True:
+                    try:
+                        await _BRIDGE_NOTIFICATIONS.run(
+                            post_tools_changed, bridge_dir, timeout_s=0.0, cancelled=cancelled
+                        )
+                        break
+                    except ClaudeBridgeNotReady:
+                        remaining = deadline - loop.time()
+                        if remaining <= 0:
+                            raise
+                        await asyncio.sleep(min(0.05, remaining))
             except (RuntimeError, OSError):
                 # Fire-and-forget below, so anything escaping here resurfaces as
                 # an unretrieved task exception at ERROR. Re-advertising the tool
@@ -8424,6 +8472,7 @@ def create_runner_app(
     _opencode_native_model_options = _native_controls.opencode_native_model_options
     _teardown_session_terminals = _native_controls.teardown_session_terminals
 
+    register_live_mcp_routes(app, process_manager=process_manager)
     register_model_option_routes(
         app,
         _claude_model_options_rows=_claude_model_options_rows,
@@ -8898,6 +8947,9 @@ def create_runner_app(
             # active turn, so every signal above reads idle. Reaping it kills the
             # prompt and strands its approval card unanswerable.
             if approval_wait_is_fresh(conv_id):
+                return True
+            # A settled turn's background agent still works in this pane.
+            if resource_registry.session_has_background_agents(conv_id):
                 return True
             # An attached viewer alone does not spare the pane (a tab left open
             # overnight kept idle native stacks resident). Count it only when a

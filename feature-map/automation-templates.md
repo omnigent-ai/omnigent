@@ -64,6 +64,15 @@ to customize.
   and preserves the separate prompts when saved and reopened.
   The detail page also keeps the system prompt collapsed by default, with a
   bounded read-only preview when expanded; use Edit automation to change it.
+- `source-switching`: editing a recognized trigger whose worker settings can be
+  read shows Trigger type with the five integrations (not Schedule). Picking another one opens that integration's
+  form with the instructions, Harness for matching sessions, worker placement, and
+  the task-session choice carried over and empty conditions; a default name follows the source, a custom
+  name is kept. Each integration's draft, including an Edit as prompt draft,
+  comes back unchanged when switching back and forth, and switching back to the
+  saved source restores its prompt. A note warns that saving replaces the old trigger, and the
+  save always starts a new polling session (the reset checkbox is locked on); a
+  task-session trigger's first match after that starts a new task session.
 - `default-project`: new automations select Omnigent Automation. Saving reuses or
   creates that project; canceling creates nothing. The project picker can choose
   another project or remove the default. Editing preserves the saved project.
@@ -136,7 +145,7 @@ to customize.
 - `responsive`: gallery items have icons, descriptions, access requirements,
   pointer cursors, and keyboard focus indicators. Continued trigger cadence is
   fixed; other tasks expose schedule controls. Name comes first, followed by
-  Trigger type during creation. The modal opens with Instructions focused.
+  Trigger type during creation and when editing a recognized trigger. The modal opens with Instructions focused.
   Agent sits directly below Run on, outside Advanced. When editing a recognized
   trigger, Harness for matching sessions appears there instead. Run on and session
   mode precede Repeat and Time because both determine the minimum interval. Time

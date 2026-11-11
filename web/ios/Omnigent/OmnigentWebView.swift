@@ -79,9 +79,10 @@ struct OmnigentWebView: UIViewRepresentable {
     webView.allowsBackForwardNavigationGestures = false
     webView.isFindInteractionEnabled = true
     webView.isOpaque = false
-    webView.backgroundColor = .clear
-    webView.underPageBackgroundColor = .clear
-    webView.scrollView.backgroundColor = .clear
+    // The rounded keyboard exposes WebKit's backing surfaces below the page.
+    webView.backgroundColor = DesignTokens.nativeBackground
+    webView.underPageBackgroundColor = DesignTokens.nativeBackground
+    webView.scrollView.backgroundColor = DesignTokens.nativeBackground
     webView.scrollView.contentInsetAdjustmentBehavior = .never
 
     // Allow Safari Web Inspector to attach to the web content. Since iOS 16.4 a

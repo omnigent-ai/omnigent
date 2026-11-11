@@ -389,7 +389,7 @@ class ClaudeNativeExecutor(Executor):
             Claude-native output/tool activity is terminal-originated
             and mirrored from Claude's transcript.
         :param system_prompt: Per-turn composed system prompt. Ignored here:
-            claude-native delivers raw author instructions once, at terminal
+            claude-native delivers session startup instructions once, at terminal
             launch, via ``--append-system-prompt`` (see
             ``omnigent.runner.native.orchestration`` and
             ``omnigent.harnesses.claude_native.main``) — not per-turn through this
