@@ -213,7 +213,11 @@ export function reconcileSuggestion(pages: SuggestionPage[], saved: Suggestion):
 }
 
 /** Where a suggestion sits in cached pages, so a failed update can put it back. */
-export type SuggestionPlace = { page: number; index: number; item: Suggestion };
+export interface SuggestionPlace {
+  page: number;
+  index: number;
+  item: Suggestion;
+}
 
 export function locateSuggestion(pages: SuggestionPage[], id: string): SuggestionPlace | null {
   for (const [page, { data }] of pages.entries()) {
