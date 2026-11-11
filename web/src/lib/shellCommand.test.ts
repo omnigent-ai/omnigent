@@ -8,10 +8,14 @@ import {
 } from "./shellCommand";
 
 describe("isShellCodeClassName", () => {
-  it.each(["language-bash", "language-sh", "language-shell", "language-zsh", "x language-BASH"])(
-    "accepts %s",
-    (className) => expect(isShellCodeClassName(className)).toBe(true),
-  );
+  it.each([
+    "language-bash",
+    "language-sh",
+    "language-shell",
+    "language-shellscript",
+    "language-zsh",
+    "x language-BASH",
+  ])("accepts %s", (className) => expect(isShellCodeClassName(className)).toBe(true));
 
   it.each([undefined, "", "language-python", "language-console", "bash"])(
     "rejects %s",
@@ -26,6 +30,14 @@ describe("shellCommandKeystrokes", () => {
 
   it("treats CRLF line endings as one Enter", () => {
     expect(shellCommandKeystrokes("ls\r\npwd")).toBe("ls\rpwd\r");
+  });
+
+  it("keeps a command's escaped trailing space", () => {
+    expect(shellCommandKeystrokes("touch a\\ \n")).toBe("touch a\\ \r");
+  });
+
+  it("drops control characters that would edit the line instead of typing it", () => {
+    expect(shellCommandKeystrokes("echo safe\u0015\u0010\u001b[A\n")).toBe("echo safe[A\r");
   });
 
   it("returns nothing for a blank block", () => {

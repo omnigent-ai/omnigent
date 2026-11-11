@@ -24,16 +24,26 @@ export function isShellCodeClassName(className: string | undefined): boolean {
     );
 }
 
+// C0 and C1 control characters other than tab and newline. A code block can
+// carry them invisibly, and as keystrokes they edit the line instead of typing
+// it (Ctrl-U clears it, Ctrl-P recalls history), so the shell would run
+// something other than the visible text.
+// oxlint-disable-next-line no-control-regex
+const CONTROL_CHARACTERS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
+
 /**
  * The keystrokes that run *code* at a shell prompt: each line followed by Enter.
+ *
+ * Only the block's trailing newlines are dropped, so trailing spaces that are
+ * part of a command (an escaped space before the line end) are kept.
  *
  * :param code: The code block's text, e.g. ``"cd web\npnpm test\n"``.
  * :returns: The text with newlines sent as Enter, e.g. ``"cd web\rpnpm test\r"``,
  *     or ``""`` when the block is blank.
  */
 export function shellCommandKeystrokes(code: string): string {
-  const trimmed = code.replace(/\s+$/, "");
-  return trimmed === "" ? "" : `${trimmed.replace(/\r?\n/g, "\r")}\r`;
+  const lines = code.replace(/\r\n?/g, "\n").replace(CONTROL_CHARACTERS, "").replace(/\n+$/, "");
+  return lines.trim() === "" ? "" : `${lines.replace(/\n/g, "\r")}\r`;
 }
 
 /** Runs a code block's text in a new shell; ``null`` where the viewer can't open one. */

@@ -11,23 +11,13 @@ absolute ``tmp_path`` paths that the runner-local shell writes.
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
+from tests._helpers.polling import poll_until
 from tests.e2e_ui.conftest import configure_mock_llm
-
-
-def _wait_for(page: Page, condition, timeout_s: float) -> bool:
-    """Poll *condition*, letting the page keep running between checks."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if condition():
-            return True
-        page.wait_for_timeout(100)
-    return bool(condition())
 
 
 @pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
@@ -72,6 +62,4 @@ def test_run_in_shell_runs_each_line_in_a_new_shell(
     expect(terminal_view).to_be_visible(timeout=60_000)
     expect(terminal_view).to_have_attribute("data-state", "connected", timeout=30_000)
 
-    assert _wait_for(
-        page, lambda: first_marker.exists() and second_marker.exists(), timeout_s=20.0
-    ), "the shell never ran the code block's commands"
+    poll_until(lambda: first_marker.exists() and second_marker.exists(), timeout_s=20)
