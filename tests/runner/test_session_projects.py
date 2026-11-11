@@ -652,8 +652,9 @@ async def test_project_rename_warns_when_the_member_walk_hits_its_page_cap(monke
         result = json.loads(
             await execute_project_update({"project": "Q3", "icon": "📦"}, client, SOURCE)
         )
-    assert result["status"] == "updated"
-    assert result["warning"] == "the project has too many sessions to check them all"
+    assert result["status"] == "partial"
+    assert result["warning"].startswith("the project has too many sessions to check them all;")
+    assert "sys_project_list project='Q3'" in result["warning"]
     assert len([r for r in requests if r.url.path == "/v1/sessions"]) == 2
 
 
@@ -786,3 +787,33 @@ async def test_update_restores_an_archived_session():
     (patched,) = [r for r in requests if r.method == "PATCH"]
     assert json.loads(patched.content) == {"archived": False}
     assert patched.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+
+
+async def test_update_reports_a_project_it_created_before_a_refused_patch():
+    requests: list[httpx.Request] = []
+    snapshot = {"id": PARENT, "title": "Old", "labels": {}}
+    base = _organize_server(requests, snapshot)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/projects":
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"id": PROJECT_ID, "name": "New"})
+            return httpx.Response(200, json={"data": []})
+        if request.method == "PATCH":
+            requests.append(request)
+            return httpx.Response(400, json={"error": {"message": "title rejected"}})
+        return base(request)
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_session_update(
+                {"session_id": PARENT, "title": "Bad", "project": "New"}, client, SOURCE
+            )
+        )
+    assert result == {
+        "session_id": PARENT,
+        "error": "HTTP 400: title rejected",
+        "project": "New",
+        "project_created": True,
+    }

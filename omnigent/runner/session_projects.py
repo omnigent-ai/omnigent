@@ -594,7 +594,11 @@ async def execute_session_update(
     payload = _session_changes(current, changes, project_id)
     status, error = await _patch_session(client, canonical, payload, headers=headers)
     if error is not None:
-        return json.dumps({"session_id": session_id, "error": error})
+        failed: dict[str, Any] = {"session_id": session_id, "error": error}
+        if created:
+            # The project was created before the refused PATCH and still exists.
+            failed.update(project=name, project_created=True)
+        return json.dumps(failed)
     result: dict[str, Any] = {"session_id": session_id, "status": status}
     if set_project:
         result["project"] = name or None
@@ -778,13 +782,16 @@ async def execute_project_update(
     )
     if moved:
         status = "updated"
-    if not_moved:
+    if not_moved or not complete:
         status = "partial"
     result: dict[str, Any] = {"project": new_name or current_name, "status": status}
     if not_moved:
         result["sessions_not_moved"] = not_moved
     if not complete:
-        result["warning"] = "the project has too many sessions to check them all"
+        result["warning"] = (
+            "the project has too many sessions to check them all; list the rest with "
+            f"sys_project_list project={current_name!r} and move each with sys_session_update"
+        )
     if new_name is not None and new_name != current_name:
         result["previous_name"] = current_name
     if "icon" in args:

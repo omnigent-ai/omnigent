@@ -81,3 +81,22 @@ def test_ignores_requests_without_a_calling_session():
     require_archive_outside_source_lineage(
         SimpleNamespace(headers={}), _session_id(0), _Conversations(1)
     )
+
+
+def test_follows_a_child_through_its_side_chat_to_the_source_parent():
+    # caller (child) -> side chat -> its source -> the source's parent
+    conversations = _Conversations(1)
+    rows = conversations.rows
+    side_chat, source, grandparent = _session_id(1), _session_id(2), _session_id(3)
+    rows[_session_id(0)].parent_conversation_id = side_chat
+    rows[side_chat] = SimpleNamespace(
+        id=side_chat,
+        parent_conversation_id=None,
+        labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source},
+    )
+    rows[source] = SimpleNamespace(id=source, parent_conversation_id=grandparent, labels={})
+    rows[grandparent] = SimpleNamespace(id=grandparent, parent_conversation_id=None, labels={})
+    for target in (side_chat, source, grandparent):
+        with pytest.raises(OmnigentError, match="a session it runs under"):
+            _check(conversations, target)
+    _check(conversations, UNRELATED)
