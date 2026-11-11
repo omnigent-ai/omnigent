@@ -5747,14 +5747,7 @@ async def _auto_create_codex_terminal(
         codex_ws_port = s.getsockname()[1]
     codex_ws_url = f"ws://127.0.0.1:{codex_ws_port}"
 
-    # Write the minimal MCP bridge config so serve-mcp can boot, and
-    # start the tool relay so tool_relay.json is on disk before codex
-    # launches its MCP server. This mirrors the claude-native relay
-    # start in ``create_session_terminal``. The relay is started here
-    # (not in ``_ensure_comment_relay_started``) because that helper
-    # is scoped inside ``create_routes`` and not reachable at module
-    # level. The ``_run_turn_bg`` fallback path covers sessions whose
-    # terminal was created outside this function.
+    # Configure the shared MCP bridge before Codex can launch its MCP server.
     from omnigent.harnesses.codex_native.bridge import (
         codex_mcp_config_overrides,
         write_mcp_bridge_config,
@@ -5872,6 +5865,11 @@ async def _auto_create_codex_terminal(
         server_client=server_client,
         turn_routing=launch_config.turn_routing,
     )
+    # Codex can list tools during startup or resume, before the first turn.
+    # Keep notification asynchronous: its lazy MCP server may not exist yet.
+    if ensure_comment_relay is not None:
+        await ensure_comment_relay(session_id, explicit_bridge_dir=bridge_dir, await_notify=False)
+
     app_server.listen_url = codex_ws_url
     await app_server.start()
     _AUTO_CODEX_APP_SERVERS[session_id] = app_server
@@ -6134,14 +6132,6 @@ async def _auto_create_codex_terminal(
         bridge_dir=bridge_dir,
         server_client=server_client,
     )
-
-    # Start the relay now (into codex's serve-mcp bridge dir) so tool_relay.json
-    # is on disk and the relay recorded before codex connects on its first turn:
-    # the first-turn `_ensure_comment_relay_started` then fast-paths, avoiding
-    # the ~30s stall (see its docstring for the lazy-bridge / await_notify=False
-    # rationale).
-    if ensure_comment_relay is not None:
-        await ensure_comment_relay(session_id, explicit_bridge_dir=bridge_dir, await_notify=False)
 
     _logger.info(
         "Auto-created codex terminal + forwarder for session %s",
