@@ -1140,6 +1140,23 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
+  it("counts text sent for the user as recent input", () => {
+    // WHY: "Run in shell" types a command for the user; a validated clipboard
+    // write that command triggers must be allowed like one typed by hand.
+    vi.spyOn(performance, "now").mockReturnValue(10_000);
+    const onClipboardRequest = vi.fn();
+    const { socket, session } = makeSession(undefined, undefined, true, onClipboardRequest);
+    socket.open();
+
+    session.sendText("pbcopy-ish\r");
+    socket.emit("message", {
+      data: JSON.stringify({ type: "clipboard-write", encoding: "base64", data: btoa("copied") }),
+    });
+
+    expect(onClipboardRequest).toHaveBeenCalledWith("copied");
+    session.dispose();
+  });
+
   it("does not forward clipboard frames when the surface is disabled", () => {
     vi.spyOn(performance, "now").mockReturnValue(10_000);
     const onClipboardRequest = vi.fn();

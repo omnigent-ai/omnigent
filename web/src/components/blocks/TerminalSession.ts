@@ -1000,14 +1000,13 @@ export class TerminalSession {
   }
 
   /**
-   * Send *text* to the shell as if the user typed it. Dropped while the
-   * socket is down, like a keystroke.
+   * Send *text* to the shell as if the user typed it, through the same input
+   * path (and input bookkeeping) as a keystroke.
    *
    * :param text: Keystrokes, e.g. ``"ls -la\r"`` to run ``ls -la``.
    */
   sendText(text: string): void {
-    if (this.ws.readyState !== WebSocket.OPEN) return;
-    this.ws.send(INPUT_ENCODER.encode(text));
+    this.term.input(text, true);
   }
 
   /**

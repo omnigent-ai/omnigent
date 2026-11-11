@@ -24,10 +24,8 @@ export function isShellCodeClassName(className: string | undefined): boolean {
     );
 }
 
-// C0 and C1 control characters other than tab and newline. A code block can
-// carry them invisibly, and as keystrokes they edit the line instead of typing
-// it (Ctrl-U clears it, Ctrl-P recalls history), so the shell would run
-// something other than the visible text.
+// Editing controls (all C0/C1 but tab and newline) would rewrite the line, so
+// the shell would run something other than the visible text.
 // oxlint-disable-next-line no-control-regex
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
 
