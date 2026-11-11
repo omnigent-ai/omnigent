@@ -19,6 +19,7 @@ import pytest
 from omnigent.harnesses.claude_native.status_file import (
     IDLE,
     RUNNING,
+    WAITING,
     BackgroundHolder,
     SessionStatusPoller,
     find_background_holder,
@@ -307,6 +308,75 @@ def test_shell_status_maps_to_idle(tmp_path: Path) -> None:
     assert status.raw_status == "shell"
 
 
+def _background_poller(
+    tmp_path: Path, statuses: list[str], background: list[bool]
+) -> SessionStatusPoller:
+    return SessionStatusPoller(
+        on_status=lambda status, _reason: statuses.append(status),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+        on_background=background.append,
+    )
+
+
+def test_background_signal_follows_shell_and_idle_only(tmp_path: Path) -> None:
+    """``shell`` turns the signal on and ``idle`` off; a turn or dialog leaves it alone.
+
+    The sequence is what Claude writes when a turn starts a background shell,
+    the shell's completion triggers a follow-up turn, and that turn ends.
+    """
+    sessions = tmp_path / "sessions"
+    statuses: list[str] = []
+    background: list[bool] = []
+    poller = _background_poller(tmp_path, statuses, background)
+    for status in ("busy", "shell", "waiting", "shell", "busy", "idle"):
+        _write_session_file(sessions, pid=1, session_id="s", status=status)
+        poller.tick()
+    assert background == [True, False]
+    assert statuses == [RUNNING, IDLE, RUNNING, IDLE, RUNNING, IDLE]
+
+
+def test_observe_reports_background_without_status_edges(tmp_path: Path) -> None:
+    """While OSC owns status the file contributes only the background signal."""
+    sessions = tmp_path / "sessions"
+    statuses: list[str] = []
+    background: list[bool] = []
+    poller = _background_poller(tmp_path, statuses, background)
+    _write_session_file(sessions, pid=1, session_id="s", status="shell")
+    poller.observe()
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    poller.observe()
+    assert background == [True]
+    assert statuses == []
+
+    # Handing status back to the file republishes its current value.
+    poller.resync()
+    poller.tick()
+    assert statuses == [RUNNING]
+
+
+def test_background_signal_is_reasserted_after_resync_and_cleared_on_retire(
+    tmp_path: Path,
+) -> None:
+    """A reconnected server relearns the value; a dead pane clears it."""
+    sessions = tmp_path / "sessions"
+    statuses: list[str] = []
+    background: list[bool] = []
+    poller = _background_poller(tmp_path, statuses, background)
+    _write_session_file(sessions, pid=1, session_id="s", status="shell")
+    poller.observe()
+    poller.observe()
+    assert background == [True]
+
+    poller.resync()
+    poller.observe()
+    assert background == [True, True]
+
+    poller.retire()
+    assert background == [True, True, False]
+
+
 def test_unknown_status_clears_dedup_so_next_read_publishes(tmp_path: Path) -> None:
     """An unrecognized literal must not swallow the next real edge.
 
@@ -433,6 +503,57 @@ def test_resync_republishes_an_unchanged_file(tmp_path: Path) -> None:
     # Still reading the same resolved file — a resync re-asserts a working
     # poller rather than restarting resolution.
     assert poller.active is True
+
+
+def test_busy_left_by_a_background_agent_reads_waiting(tmp_path: Path) -> None:
+    """A busy file reads waiting while a settled turn's background agent works.
+
+    Claude keeps the file ``busy`` for the agent's lifetime without rewriting
+    it, so the bridge's mark is rechecked on every tick of an unchanged file.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    agent_after_turn = [False]
+    published: list[tuple[str, str | None]] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, reason: published.append((status, reason)),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+        background_agents_after_turn=lambda: agent_after_turn[0],
+    )
+    poller.tick()
+    assert published == [(RUNNING, None)]
+
+    # The turn's Stop lists a running agent; the forwarded idle edge resyncs.
+    agent_after_turn[0] = True
+    poller.tick()
+    poller.resync()
+    poller.tick()
+    assert published == [(RUNNING, None), (WAITING, None), (WAITING, None)]
+    assert poller.holding_background_agents is True
+
+    # A follow-up prompt starts a turn the same busy file now reports.
+    agent_after_turn[0] = False
+    poller.tick()
+    assert published[-1] == (RUNNING, None)
+    assert poller.holding_background_agents is False
+
+    # A dialog still needs the user, whatever the agent is doing.
+    agent_after_turn[0] = True
+    poller.tick()
+    _write_session_file(
+        sessions, pid=1, session_id="s", status="waiting", blocked_on="permission prompt"
+    )
+    poller.tick()
+    assert published[-2:] == [(WAITING, None), (RUNNING, "permission prompt")]
+    assert poller.holding_background_agents is False
+
+    # The agent finishing lets Claude go idle, which ends the wait.
+    _write_session_file(sessions, pid=1, session_id="s", status="idle")
+    poller.tick()
+    assert published[-1] == (IDLE, None)
+    assert poller.holding_background_agents is False
 
 
 def test_resync_does_not_revive_a_retired_poller(tmp_path: Path) -> None:
