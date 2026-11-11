@@ -42,7 +42,7 @@ pytestmark = pytest.mark.asyncio
 def orchestration_environment(monkeypatch, request, tmp_path):
     monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "admin-credentials"))
     features = getattr(request, "param", None)
-    monkeypatch.setenv("OMNIGENT_FEATURES", f"sibling_sessions,{features or ''}")
+    monkeypatch.setenv("OMNIGENT_FEATURES", features or "")
     return features
 
 
@@ -1378,7 +1378,7 @@ async def test_nested_agent_gate_tracks_request_context_before_creation(
 
     auth_app.state.feature_flags = resolve_feature_flags({})
     info = (await auth_client.get("/v1/info")).json()
-    assert info["sibling_sessions"] is info["features"]["sibling_sessions"] is False
+    assert info["sibling_sessions"] is info["features"]["sibling_sessions"] is True
     auth_app.state.feature_flags = RequestFeatureFlags(resolve_feature_flags({}).enabled_features)
     sibling_id = None
     for active in (False, True, False):
