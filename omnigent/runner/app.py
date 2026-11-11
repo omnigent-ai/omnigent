@@ -112,6 +112,7 @@ from omnigent.runner.launch_failure import (
     FailureDiagnosis,
     classify_terminal_failure,
 )
+from omnigent.runner.live_mcp_routes import register_live_mcp_routes
 from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
@@ -160,7 +161,7 @@ from omnigent.runner.resource_registry import (
     trim_terminal_output,
 )
 from omnigent.runner.resource_routes import register_resource_routes
-from omnigent.runner.session_history import build_session_history
+from omnigent.runner.session_history import build_session_history, is_cancellation_marker
 from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
     parse_runner_session_init_envelope,
@@ -774,6 +775,16 @@ class InstructionComposition:
 # system_prompt param. See the harness-conditional swap in
 # _stream_message_to_harness.
 _GATED_COMPOSED_INSTRUCTION_HARNESSES = frozenset({"opencode-native", "hermes"})
+
+
+def _history_message_from_body(body: _JsonObject) -> _JsonObject:
+    """Preserve the persisted initiating item when recording an incoming message."""
+    return {
+        "type": "message",
+        "role": body.get("role", "user"),
+        "content": body.get("content", []),
+        "id": body.get("persisted_item_id"),
+    }
 
 
 def _wrap_as_message_event(body: _JsonObject) -> _JsonObject:
@@ -1575,7 +1586,9 @@ def create_runner_app(
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
 
-    def _native_pane_shows_live_work(terminals: Any, session_id: str, terminal_name: str) -> bool:
+    def _native_pane_shows_live_work(
+        terminals: Any, session_id: str, terminal_name: str, *, include_pane_activity: bool = True
+    ) -> bool:
         """Whether a native pane shows the live work the pane reaper spares it for.
 
         A pane parked on a permission prompt is quiet and can read ``idle``, and a
@@ -1585,14 +1598,22 @@ def create_runner_app(
         :param terminals: Terminal registry holding the pane instance.
         :param session_id: Session/conversation id, e.g. ``"conv_abc"``.
         :param terminal_name: Native harness terminal name, e.g. ``"claude"``.
-        :returns: ``True`` when a permission hook is parked or the pane shows recent
-            input or output.
+        :param include_pane_activity: Whether recent pane input or output counts.
+            Viewing a pane (attach, resize, a redraw) produces both, so callers
+            asking about agent work rather than pane liveness pass ``False``.
+        :returns: ``True`` when a permission hook is parked, a background agent
+            outlives the settled turn, or, with *include_pane_activity*, the
+            pane shows recent input or output.
         """
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
         from omnigent.terminals.pane_reaper import PANE_OUTPUT_BUSY_WINDOW_S
 
         if approval_wait_is_fresh(session_id):
             return True
+        if resource_registry.session_has_background_agents(session_id):
+            return True
+        if not include_pane_activity:
+            return False
         instance = terminals.get(session_id, terminal_name, "main")
         if instance is None:
             return False
@@ -1600,7 +1621,13 @@ def create_runner_app(
             return True
         return instance.screen_changed_within(PANE_OUTPUT_BUSY_WINDOW_S) is True
 
-    def _has_active_work() -> bool:
+    # Sessions whose Claude pane reports a background shell still running after
+    # its turn ended. Real work: it keeps the runner and its sandbox up, but only
+    # while that session's native pane exists, so a lost "stopped" edge cannot
+    # pin either.
+    _sessions_with_background_shell: set[str] = set()
+
+    def _has_active_work(*, include_pane_activity: bool = True) -> bool:
         if _active_turns:
             return True
         if _claude_prompt_waiters:
@@ -1626,7 +1653,11 @@ def create_runner_app(
                 ):
                     continue
                 session_ids.add(session_id)
-                if _native_pane_shows_live_work(terminals, session_id, name):
+                if session_id in _sessions_with_background_shell:
+                    return True
+                if _native_pane_shows_live_work(
+                    terminals, session_id, name, include_pane_activity=include_pane_activity
+                ):
                     return True
         if process_manager is not None and any(
             process_manager.has_active_turn(session_id) for session_id in session_ids
@@ -1646,6 +1677,10 @@ def create_runner_app(
         return is_native_harness(_session_harness_name(session_id))
 
     app.state.has_active_work = _has_active_work
+    # Agent work only, for keeping a managed sandbox awake: a native pane's recent
+    # input or output also comes from someone just viewing it. A prompt typed into
+    # the pane still counts once the harness reports its turn in flight.
+    app.state.has_sandbox_work = lambda: _has_active_work(include_pane_activity=False)
 
     def _drain_session_streams() -> None:
         for queue in list(_session_event_queues.values()):
@@ -1653,8 +1688,17 @@ def create_runner_app(
 
     app.state.drain_session_streams = _drain_session_streams
 
+    # Monotonic time of the newest published agent-work event, so a turn that
+    # starts and ends between two busy checks still counts. ``session.*`` events
+    # (status edges, plain-shell output, resource changes) are notifications, and
+    # a tunnel reconnect republishes every status, so they are left out.
+    _last_event_published_at: list[float | None] = [None]
+    app.state.last_event_published_at = lambda: _last_event_published_at[0]
+
     def _publish_event(session_id: str, event: Mapping[str, object]) -> None:
         event_body = cast(_JsonObject, event)
+        if not str(event_body.get("type", "")).startswith("session."):
+            _last_event_published_at[0] = time.monotonic()
         queue = _session_event_queues.get(session_id)
         if queue is None:
             queue = asyncio.Queue()
@@ -1826,7 +1870,23 @@ def create_runner_app(
         failure_detail: str | None = None,
         inferred: bool = False,
     ) -> None:
-        event: dict[str, object] = {"type": "session.status", "status": status}
+        background_agents: list[dict[str, object]] = []
+        wire_status = status
+        if status == "waiting":
+            # Claude's background-agent hold. A server that may predate
+            # ``waiting`` gets ``idle``: the turn ended, and ``running`` would
+            # hold every follow-up behind Steer. An unknown version is treated
+            # the same way, since a pre-0.3.0 server 500s its session reads on
+            # ``waiting``. Current servers always name their version in the
+            # session-init envelope, so only a legacy server whose probe failed
+            # lands here.
+            if _server_version is None or not _version_supports_waiting_status(_server_version):
+                wire_status = "idle"
+            else:
+                background_agents = resource_registry.session_background_agents(session_id)
+        event: dict[str, object] = {"type": "session.status", "status": wire_status}
+        if background_agents:
+            event["background_agents"] = background_agents
         if status == "failed":
             # A lost terminal hook may still leave a cause in the program-status report.
             event["error"] = {
@@ -1860,6 +1920,10 @@ def create_runner_app(
         if inferred:
             event["inferred"] = True
         _publish_event(session_id, event)
+        if wire_status != status:
+            # Only the server's copy is downgraded: the agent still works in
+            # this pane, so the runner keeps counting the session as busy.
+            _native_pane_status[session_id] = status
 
     resource_registry.set_session_status_publisher(
         _publish_session_status,
@@ -1878,6 +1942,10 @@ def create_runner_app(
     )
 
     def _publish_session_background(session_id: str, running: bool) -> None:
+        if running:
+            _sessions_with_background_shell.add(session_id)
+        else:
+            _sessions_with_background_shell.discard(session_id)
         background_reports.report(session_id, running)
 
     resource_registry.set_session_background_publisher(_publish_session_background)
@@ -2020,11 +2088,30 @@ def create_runner_app(
             message = f"{message}\n\nLast captured terminal output:\n{pane}"
         return message
 
+    def _terminal_exit_still_owns_session(
+        event: TerminalExitEvent, turn_epoch: int | None
+    ) -> bool:
+        registry = resource_registry.terminal_registry
+        current = (
+            registry.get(event.session_id, event.terminal_name, event.session_key)
+            if registry is not None
+            else None
+        )
+        return _turn_bind_epoch.get(event.session_id) == turn_epoch and (
+            current is None or current.diagnostic_id == event.terminal_instance_id
+        )
+
     def _release_required_terminal_session(
-        session_id: str, *, grace_s: float = _TERMINAL_EXIT_RELEASE_GRACE_S
+        event: TerminalExitEvent, *, grace_s: float = _TERMINAL_EXIT_RELEASE_GRACE_S
     ) -> None:
         if process_manager is None:
             return
+        session_id = event.session_id
+        expected_client = process_manager.registered_client(session_id)
+        turn_epoch = _turn_bind_epoch.get(session_id)
+
+        def _still_owns_session() -> bool:
+            return _terminal_exit_still_owns_session(event, turn_epoch)
 
         async def _release() -> None:
             # Let a live turn stream converge first (bounded): the harness's own
@@ -2032,9 +2119,17 @@ def create_runner_app(
             # sever the stream carrying it.
             deadline = time.monotonic() + grace_s
             while session_id in _live_response_id and time.monotonic() < deadline:
+                if not _still_owns_session():
+                    return
                 await asyncio.sleep(0.05)
+            if not _still_owns_session():
+                return
             try:
-                await process_manager.release(session_id)
+                await process_manager.release(
+                    session_id,
+                    expected_client=expected_client,
+                    can_release=_still_owns_session,
+                )
             except Exception:
                 _logger.exception(
                     "Failed to release harness subprocess after required terminal exit: "
@@ -2079,16 +2174,23 @@ def create_runner_app(
             # Should the release still sever the stream before that error lands,
             # the drop reports this closed pane and its output, not the transport.
             _required_terminal_exit_errors[event.session_id] = _build_delivery_timeout_error(event)
-            _release_required_terminal_session(
-                event.session_id, grace_s=_EXPECTED_CLOSE_RELEASE_GRACE_S
-            )
+            _release_required_terminal_session(event, grace_s=_EXPECTED_CLOSE_RELEASE_GRACE_S)
             return
 
         # A required terminal exit ends the session. Tear down any registered
         # Codex app-server alongside it; this is a no-op for other harnesses.
-        _teardown_task = asyncio.create_task(
-            _native_runtime.teardown_codex_native_app_server(event.session_id)
-        )
+        exit_turn_epoch = _turn_bind_epoch.get(event.session_id)
+        exited_app_server = _native_runtime._AUTO_CODEX_APP_SERVERS.get(event.session_id)
+
+        async def _teardown_after_exit() -> None:
+            if (
+                _terminal_exit_still_owns_session(event, exit_turn_epoch)
+                and _native_runtime._AUTO_CODEX_APP_SERVERS.get(event.session_id)
+                is exited_app_server
+            ):
+                await _native_runtime.teardown_codex_native_app_server(event.session_id)
+
+        _teardown_task = asyncio.create_task(_teardown_after_exit())
         _teardown_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_teardown_task)
 
@@ -2110,7 +2212,20 @@ def create_runner_app(
                 event.session_id
             )
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
-            _release_required_terminal_session(event.session_id)
+            _release_required_terminal_session(event)
+            return
+
+        # The finished turn's background agent died with the pane. Nothing else
+        # ends the server's ``waiting`` (or clears its agent list), so settle it
+        # here; a replacement pane owns the session's status instead.
+        if event.session_was_waiting:
+            _required_terminal_exit_errors.pop(event.session_id, None)
+            if _terminal_exit_still_owns_session(event, exit_turn_epoch):
+                _clean_terminal_exit_responses[event.session_id] = _live_response_id.get(
+                    event.session_id
+                )
+                _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
+            _release_required_terminal_session(event)
             return
 
         # Record the exit before release severs its stream, preserving the cause.
@@ -2125,7 +2240,7 @@ def create_runner_app(
         _required_terminal_exit_errors[event.session_id] = error
 
         if event.session_was_idle:
-            _release_required_terminal_session(event.session_id)
+            _release_required_terminal_session(event)
             return
 
         if _shutting_down.is_set():
@@ -2138,7 +2253,7 @@ def create_runner_app(
                 event.session_id,
                 extra={"session_id": event.session_id},
             )
-            _release_required_terminal_session(event.session_id)
+            _release_required_terminal_session(event)
             return
 
         exit_log = debug_event("required_terminal_exited", session_id=event.session_id)
@@ -2183,7 +2298,7 @@ def create_runner_app(
             status="failed",
             output=error["message"],
         )
-        _release_required_terminal_session(event.session_id)
+        _release_required_terminal_session(event)
 
     resource_registry.set_terminal_exit_publisher(_publish_terminal_exit)
 
@@ -3318,8 +3433,13 @@ def create_runner_app(
             last = history[-1]
             last_type = last.get("type")
             last_role = last.get("role")
+            # A turn the user stopped ends on its cancellation marker: nothing to resume.
             needs_turn = (
-                (last_type == "message" and last_role == "user")
+                (
+                    last_type == "message"
+                    and last_role == "user"
+                    and not is_cancellation_marker(last)
+                )
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )
@@ -4888,11 +5008,7 @@ def create_runner_app(
                 if not buf:
                     _session_message_buffers.pop(session_id, None)
                 _session_histories.setdefault(session_id, []).append(
-                    {
-                        "type": "message",
-                        "role": next_body.get("role", "user"),
-                        "content": next_body.get("content", []),
-                    }
+                    _history_message_from_body(next_body)
                 )
             else:
                 all_bodies = list(buf)
@@ -4901,11 +5017,7 @@ def create_runner_app(
 
                 for body in all_bodies:
                     _session_histories.setdefault(session_id, []).append(
-                        {
-                            "type": "message",
-                            "role": body.get("role", "user"),
-                            "content": body.get("content", []),
-                        }
+                        _history_message_from_body(body)
                     )
                 next_body = all_bodies[-1]
 
@@ -5259,6 +5371,8 @@ def create_runner_app(
 
         from omnigent.harnesses.claude_native.bridge import (
             BRIDGE_ID_LABEL_KEY,
+            TOOLS_CHANGED_READY_TIMEOUT_S,
+            ClaudeBridgeNotReady,
             bridge_dir_for_bridge_id,
             post_tools_changed,
             start_tool_relay,
@@ -5496,11 +5610,20 @@ def create_runner_app(
             from threading import Event
 
             cancelled = Event()
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + TOOLS_CHANGED_READY_TIMEOUT_S
             try:
-                # Bridge readiness waits must not compete with git or message delivery.
-                await _BRIDGE_NOTIFICATIONS.run(
-                    post_tools_changed, bridge_dir, cancelled=cancelled
-                )
+                while True:
+                    try:
+                        await _BRIDGE_NOTIFICATIONS.run(
+                            post_tools_changed, bridge_dir, timeout_s=0.0, cancelled=cancelled
+                        )
+                        break
+                    except ClaudeBridgeNotReady:
+                        remaining = deadline - loop.time()
+                        if remaining <= 0:
+                            raise
+                        await asyncio.sleep(min(0.05, remaining))
             except (RuntimeError, OSError):
                 # Fire-and-forget below, so anything escaping here resurfaces as
                 # an unretrieved task exception at ERROR. Re-advertising the tool
@@ -6471,6 +6594,9 @@ def create_runner_app(
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
             _response_data: _JsonObject = {}
+            _terminal_response_type: str | None = None
+            _dispatch_tasks: list[_asyncio.Task[object]] = []
+            _stream_failed_error: _JsonObject | None = None
             # A sign-in refusal kept from the chat while its message waits to be resent.
             _held_refusal: _JsonObject | None = None
             _held_body: _JsonObject | None = None
@@ -6484,6 +6610,66 @@ def create_runner_app(
                     _held_refusal.update(turn_input_identity)
                 _publish_event(conv_id, _held_refusal)
                 _held_refusal = None
+
+            def _owns_live_turn() -> bool:
+                live = _live_response_id.get(conv_id)
+                return _response_id is None or live == _response_id
+
+            async def _finish_harness_stream() -> _JsonObject | None:
+                """Settle the owned outcome after stream close and pending dispatches."""
+                nonlocal _held_refusal
+                if _dispatch_tasks:
+                    await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
+                lifecycle_event: _JsonObject | None = None
+                lifecycle_error: _JsonObject | None = None
+                cancelled = _terminal_response_type == "response.cancelled"
+                if _owns_live_turn():
+                    if (
+                        conv_id in _clean_terminal_exit_responses
+                        and _clean_terminal_exit_responses[conv_id] == _response_id
+                    ):
+                        _clean_terminal_exit_responses.pop(conv_id)
+                        cancelled = True
+                        if _response_id is not None:
+                            lifecycle_event = {
+                                "type": "response.cancelled",
+                                "response": {
+                                    **_response_data,
+                                    "status": "cancelled",
+                                    "completed_at": int(time.time()),
+                                },
+                                **turn_input_identity,
+                            }
+                    elif (
+                        exit_error := _required_terminal_exit_errors.pop(conv_id, None)
+                    ) is not None:
+                        cancelled = False
+                        lifecycle_error = {**exit_error, "type": exit_error["code"]}
+                        lifecycle_event = _response_failed_payload(
+                            lifecycle_error, source="harness", input_identity=turn_input_identity
+                        )
+                if (
+                    not _owns_live_turn()
+                    or _turn_message_bodies.get(conv_id) is not _held_body
+                    or lifecycle_event is not None
+                    or cancelled
+                ):
+                    _report_held_refusal()
+                holding = _held_refusal is not None and _stream_failed_error is not None
+                if holding:
+                    _hold_message_for_sign_in(conv_id, _stream_failed_error)
+                    _held_refusal = None
+                if lifecycle_event is not None:
+                    _publish_event(conv_id, lifecycle_event)
+                _on_proxy_stream_end(
+                    conv_id,
+                    error=lifecycle_error
+                    or (None if holding or cancelled else _stream_failed_error),
+                    owner_response_id=_response_id,
+                    sign_in_hold=holding,
+                    cancelled=cancelled,
+                )
+                return lifecycle_event
 
             try:
                 async with client.stream(
@@ -6532,7 +6718,6 @@ def create_runner_app(
 
                     _omnigent_task_id = cast(str | None, body.get("task_id"))
                     _buffer = ""
-                    _dispatch_tasks: list[_asyncio.Task[object]] = []
                     # Sub-agent start edge → minted child id, so the completion
                     # edge can address the child it created. Per-stream.
                     _subagent_child_futures: dict[str, _asyncio.Future[str]] = {}
@@ -6547,12 +6732,6 @@ def create_runner_app(
                     # Parts of _text_acc the server stored before the last completed tool
                     # call, so a later compaction snapshot already covers them.
                     _text_acc_before_tool = 0
-                    _stream_failed_error: _JsonObject | None = None
-
-                    def _owns_live_turn() -> bool:
-                        live = _live_response_id.get(conv_id)
-                        return _response_id is None or live == _response_id
-
                     async for chunk in harness_resp.aiter_text():
                         _buffer += chunk
                         while "\n\n" in _buffer:
@@ -6583,6 +6762,7 @@ def create_runner_app(
                                     resp_obj = event.get("response") or {}
                                     _response_data = dict(resp_obj)
                                     _response_id = resp_obj.get("id")
+                                    _terminal_response_type = None
                                     if _response_id and conv_id:
                                         _resp_to_conv[_response_id] = conv_id
                                         _live_response_id[conv_id] = _response_id
@@ -6598,6 +6778,22 @@ def create_runner_app(
                                     )
 
                                 _evt_type = event.get("type")
+                                if _evt_type in {
+                                    "response.completed",
+                                    "response.failed",
+                                    "response.cancelled",
+                                }:
+                                    terminal_response = event.get("response")
+                                    _terminal_response_type = (
+                                        _evt_type
+                                        if isinstance(_response_id, str)
+                                        and _response_id
+                                        and isinstance(terminal_response, dict)
+                                        and terminal_response.get("id") == _response_id
+                                        and terminal_response.get("status")
+                                        == _evt_type.split(".")[1]
+                                        else None
+                                    )
                                 if (
                                     _evt_type == "response.compaction.in_progress"
                                     and conv_id in _sdk_compact_inprogress
@@ -6652,6 +6848,11 @@ def create_runner_app(
                                         )
                                         _text_acc.clear()
                                     _text_acc_before_tool = 0
+                                elif (
+                                    _evt_type == "response.cancelled"
+                                    and _terminal_response_type == _evt_type
+                                ):
+                                    _stream_failed_error = None
                                 elif _evt_type == "response.failed":
                                     _err = event.get("error") or (event.get("response") or {}).get(
                                         "error"
@@ -6661,6 +6862,12 @@ def create_runner_app(
                                         if isinstance(_err, dict)
                                         else {"message": "harness turn failed"}
                                     )
+                                    if (
+                                        _terminal_response_type == "response.failed"
+                                        and _owns_live_turn()
+                                    ):
+                                        # The turn's own error supersedes an earlier exit stand-in.
+                                        _required_terminal_exit_errors.pop(conv_id, None)
                                     if (
                                         dispatch is not None
                                         and _owns_live_turn()
@@ -6949,30 +7156,8 @@ def create_runner_app(
                             else:
                                 yield raw_sse_bytes
 
-                    if _dispatch_tasks:
-                        await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
-
-                    if (
-                        not _owns_live_turn()
-                        or _turn_message_bodies.get(conv_id) is not _held_body
-                    ):
-                        # A newer turn took the session, or an interrupt or Stop cancelled
-                        # this one meanwhile: report the refusal as usual.
-                        _report_held_refusal()
-                    _holding = _held_refusal is not None and _stream_failed_error is not None
-                    if _holding:
-                        _hold_message_for_sign_in(conv_id, _stream_failed_error)
-                        # Queued again: there is nothing left to report however the turn ends.
-                        _held_refusal = None
-                    # _on_proxy_stream_end clears any claude-sdk `/compact`
-                    # spinner (publishing `failed` when no compaction landed);
-                    # it is the single convergence point for every turn-end path.
-                    _on_proxy_stream_end(
-                        conv_id,
-                        error=None if _holding else _stream_failed_error,
-                        owner_response_id=_response_id,
-                        sign_in_hold=_holding,
-                    )
+                if terminal_event := await _finish_harness_stream():
+                    yield _encode_sse_event(terminal_event)
 
             except _ContextWindowOverflow as overflow:
                 _report_held_refusal()
@@ -6999,6 +7184,10 @@ def create_runner_app(
                 )
 
             except (httpx.HTTPError, RuntimeError) as exc:
+                if isinstance(exc, httpx.HTTPError) and _terminal_response_type is not None:
+                    if terminal_event := await _finish_harness_stream():
+                        yield _encode_sse_event(terminal_event)
+                    return
                 # A refusal kept before the stream broke still reports its message undelivered.
                 _report_held_refusal()
                 if (
@@ -7426,11 +7615,7 @@ def create_runner_app(
                             },
                         )
 
-                new_item = {
-                    "type": "message",
-                    "role": message_body.get("role", "user"),
-                    "content": message_body.get("content", []),
-                }
+                new_item = _history_message_from_body(message_body)
                 if conversation_id in _session_histories:
                     _session_histories[conversation_id].append(new_item)
                 else:
@@ -8240,6 +8425,7 @@ def create_runner_app(
     _opencode_native_model_options = _native_controls.opencode_native_model_options
     _teardown_session_terminals = _native_controls.teardown_session_terminals
 
+    register_live_mcp_routes(app, process_manager=process_manager)
     register_model_option_routes(
         app,
         _claude_model_options_rows=_claude_model_options_rows,
@@ -8713,6 +8899,9 @@ def create_runner_app(
             # active turn, so every signal above reads idle. Reaping it kills the
             # prompt and strands its approval card unanswerable.
             if approval_wait_is_fresh(conv_id):
+                return True
+            # A settled turn's background agent still works in this pane.
+            if resource_registry.session_has_background_agents(conv_id):
                 return True
             # An attached viewer alone does not spare the pane (a tab left open
             # overnight kept idle native stacks resident). Count it only when a

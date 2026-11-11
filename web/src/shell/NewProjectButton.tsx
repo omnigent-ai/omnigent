@@ -194,6 +194,199 @@ export function NewProjectButton({
     );
   };
 
+  const dialog = (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) {
+          submissionGeneration.current += 1;
+        }
+        setOpen(next);
+        if (!next) {
+          setEmojiOpen(false);
+          setWorkspacePickerOpen(false);
+        }
+      }}
+    >
+      <DialogContent
+        className="sm:max-w-lg"
+        onClick={(e) => e.stopPropagation()}
+        // emoji-mart preventDefaults the pointer event, so Radix's own
+        // outside-dismissal never fires for clicks elsewhere in the modal.
+        // Catch them in the capture phase and close the picker ourselves,
+        // unless the pointer is inside the picker or on its trigger tile.
+        onPointerDownCapture={(e) => {
+          if (!emojiOpen) return;
+          const target = e.target as Element;
+          if (
+            target.closest('[data-slot="popover-content"]') ||
+            target.closest('[data-testid="new-project-icon"]')
+          )
+            return;
+          setEmojiOpen(false);
+        }}
+      >
+        <DialogHeader>
+          <DialogTitle>New project</DialogTitle>
+          <DialogDescription>
+            Create a project, then file sessions into it from a session's menu.
+          </DialogDescription>
+        </DialogHeader>
+        {/* One combined control: emoji tile (left) + name (right) share a
+            single border, so it reads as a single input. */}
+        <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
+          <Popover open={emojiOpen} onOpenChange={setEmojiOpen}>
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                aria-label="Choose project icon"
+                data-testid="new-project-icon"
+                className="flex w-[38px] shrink-0 cursor-pointer items-center justify-center self-stretch bg-primary/10 outline-none transition-colors"
+              >
+                {icon ? (
+                  <span className="text-xl leading-none">{icon}</span>
+                ) : (
+                  <SmilePlusIcon className="size-4 text-primary" />
+                )}
+              </button>
+            </PopoverTrigger>
+            <PopoverContent
+              align="start"
+              // Publish the collision-aware available viewport height (Radix
+              // exposes it as a CSS var), capped at the picker's natural size,
+              // so the .emoji-picker-popover rule in index.css shrinks
+              // emoji-mart to fit — it then scrolls its grid internally
+              // instead of clipping on short screens.
+              collisionPadding={8}
+              style={
+                {
+                  "--emoji-picker-height":
+                    "min(420px, var(--radix-popover-content-available-height))",
+                } as CSSProperties
+              }
+              className="emoji-picker-popover flex max-h-[var(--radix-popover-content-available-height)] w-auto flex-col overflow-hidden p-0"
+              // The Dialog's scroll lock (react-remove-scroll) preventDefaults
+              // wheel events over the picker — it can't see emoji-mart's scroll
+              // region inside shadow DOM. Stop the wheel from reaching the
+              // document-level lock so the grid scrolls.
+              onWheel={(e) => e.stopPropagation()}
+              onInteractOutside={() => setEmojiOpen(false)}
+            >
+              <EmojiPicker
+                onSelect={(native) => {
+                  setIcon(native);
+                  setEmojiOpen(false);
+                }}
+              />
+            </PopoverContent>
+          </Popover>
+          <input
+            autoFocus
+            className="w-full bg-transparent px-3 py-2 text-ui outline-none"
+            placeholder="Project name…"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onCompositionStart={() => {
+              isComposingRef.current = true;
+            }}
+            onCompositionEnd={() => {
+              isComposingRef.current = false;
+            }}
+            onKeyDown={(e) => {
+              if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void submit();
+              }
+            }}
+          />
+        </div>
+        <Collapsible>
+          <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-1 rounded-sm text-left outline-none focus-visible:ring-3 focus-visible:ring-ring/50">
+            <span className="font-medium text-ui">
+              Working directory{" "}
+              <span className="font-normal text-muted-foreground">(optional)</span>
+            </span>
+            <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-out group-data-[state=open]:rotate-90" />
+          </CollapsibleTrigger>
+          <CollapsibleContent className="new-project-working-directory-content mt-2 flex flex-col gap-1.5">
+            <label
+              htmlFor="new-project-create-workspace"
+              className={`flex h-10 items-center gap-2 rounded-lg border border-input bg-transparent px-3 text-ui ${
+                folderCreationDisabled ? "cursor-not-allowed opacity-50" : "cursor-pointer"
+              }`}
+            >
+              <Checkbox
+                id="new-project-create-workspace"
+                checked={createWorkspaceFolder}
+                onCheckedChange={(checked) => {
+                  setCreateWorkspaceFolder(checked === true);
+                  setSubmitError(null);
+                }}
+                disabled={folderCreationDisabled}
+              />
+              <span>Create a folder using the project name</span>
+            </label>
+            <button
+              id="new-project-workspace"
+              type="button"
+              data-testid="new-project-workspace"
+              aria-label={`Working directory: ${
+                createWorkspaceFolder
+                  ? joinPath("~", name.trim() || "Project name")
+                  : workspace?.path || "Not selected"
+              }`}
+              onClick={() => setWorkspacePickerOpen(true)}
+              disabled={createWorkspaceFolder || dialogHostId === null || isPending}
+              className="flex h-10 w-full items-center justify-between gap-3 rounded-lg border border-input bg-transparent px-3 text-ui outline-none transition-colors hover:bg-muted/50 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <span className="flex min-w-0 items-center gap-2">
+                <FolderOpenIcon className="size-4 shrink-0 text-muted-foreground" />
+                <span className="truncate">
+                  {createWorkspaceFolder
+                    ? joinPath("~", name.trim() || "Project name")
+                    : workspace?.path || (hostsLoading ? "Loading hosts…" : "Choose a folder…")}
+                </span>
+              </span>
+              <span className="shrink-0 text-muted-foreground text-sm">Browse</span>
+            </button>
+            <WorkspacePickerDialog
+              open={workspacePickerOpen}
+              onOpenChange={setWorkspacePickerOpen}
+              hostId={dialogHostId}
+              initialPath={workspace?.path}
+              onConfirm={(path) => {
+                if (dialogHostId !== null) {
+                  setWorkspace({ hostId: dialogHostId, path });
+                }
+              }}
+              description="Choose a default working directory for sessions in this project."
+            />
+          </CollapsibleContent>
+        </Collapsible>
+        {(submitError || createProject.isError) && (
+          <p className="text-ui text-destructive" role="alert">
+            {submitError ?? friendlyProjectError(createProject.error)}
+          </p>
+        )}
+        <DialogFooter className="border-t-0 bg-transparent">
+          <Button type="button" variant="ghost" onClick={() => setOpen(false)} disabled={isPending}>
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            data-testid="new-project-confirm"
+            loading={isPending}
+            disabled={name.trim() === "" || isPending}
+            onClick={() => void submit()}
+          >
+            Create
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+
   return (
     <>
       <Tooltip>
@@ -224,201 +417,7 @@ export function NewProjectButton({
         </TooltipTrigger>
         <TooltipContent side="bottom">New project</TooltipContent>
       </Tooltip>
-      <Dialog
-        open={open}
-        onOpenChange={(next) => {
-          if (!next) {
-            submissionGeneration.current += 1;
-          }
-          setOpen(next);
-          if (!next) {
-            setEmojiOpen(false);
-            setWorkspacePickerOpen(false);
-          }
-        }}
-      >
-        <DialogContent
-          className="sm:max-w-lg"
-          onClick={(e) => e.stopPropagation()}
-          // emoji-mart preventDefaults the pointer event, so Radix's own
-          // outside-dismissal never fires for clicks elsewhere in the modal.
-          // Catch them in the capture phase and close the picker ourselves,
-          // unless the pointer is inside the picker or on its trigger tile.
-          onPointerDownCapture={(e) => {
-            if (!emojiOpen) return;
-            const target = e.target as Element;
-            if (
-              target.closest('[data-slot="popover-content"]') ||
-              target.closest('[data-testid="new-project-icon"]')
-            )
-              return;
-            setEmojiOpen(false);
-          }}
-        >
-          <DialogHeader>
-            <DialogTitle>New project</DialogTitle>
-            <DialogDescription>
-              Create a project, then file sessions into it from a session's menu.
-            </DialogDescription>
-          </DialogHeader>
-          {/* One combined control: emoji tile (left) + name (right) share a
-              single border, so it reads as a single input. */}
-          <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
-            <Popover open={emojiOpen} onOpenChange={setEmojiOpen}>
-              <PopoverTrigger asChild>
-                <button
-                  type="button"
-                  aria-label="Choose project icon"
-                  data-testid="new-project-icon"
-                  className="flex w-[38px] shrink-0 cursor-pointer items-center justify-center self-stretch bg-primary/10 outline-none transition-colors"
-                >
-                  {icon ? (
-                    <span className="text-xl leading-none">{icon}</span>
-                  ) : (
-                    <SmilePlusIcon className="size-4 text-primary" />
-                  )}
-                </button>
-              </PopoverTrigger>
-              <PopoverContent
-                align="start"
-                // Publish the collision-aware available viewport height (Radix
-                // exposes it as a CSS var), capped at the picker's natural size,
-                // so the .emoji-picker-popover rule in index.css shrinks
-                // emoji-mart to fit — it then scrolls its grid internally
-                // instead of clipping on short screens.
-                collisionPadding={8}
-                style={
-                  {
-                    "--emoji-picker-height":
-                      "min(420px, var(--radix-popover-content-available-height))",
-                  } as CSSProperties
-                }
-                className="emoji-picker-popover flex max-h-[var(--radix-popover-content-available-height)] w-auto flex-col overflow-hidden p-0"
-                // The Dialog's scroll lock (react-remove-scroll) preventDefaults
-                // wheel events over the picker — it can't see emoji-mart's scroll
-                // region inside shadow DOM. Stop the wheel from reaching the
-                // document-level lock so the grid scrolls.
-                onWheel={(e) => e.stopPropagation()}
-                onInteractOutside={() => setEmojiOpen(false)}
-              >
-                <EmojiPicker
-                  onSelect={(native) => {
-                    setIcon(native);
-                    setEmojiOpen(false);
-                  }}
-                />
-              </PopoverContent>
-            </Popover>
-            <input
-              autoFocus
-              className="w-full bg-transparent px-3 py-2 text-ui outline-none"
-              placeholder="Project name…"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              onCompositionStart={() => {
-                isComposingRef.current = true;
-              }}
-              onCompositionEnd={() => {
-                isComposingRef.current = false;
-              }}
-              onKeyDown={(e) => {
-                if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  void submit();
-                }
-              }}
-            />
-          </div>
-          <Collapsible>
-            <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-1 rounded-sm text-left outline-none focus-visible:ring-3 focus-visible:ring-ring/50">
-              <span className="font-medium text-ui">
-                Working directory{" "}
-                <span className="font-normal text-muted-foreground">(optional)</span>
-              </span>
-              <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-out group-data-[state=open]:rotate-90" />
-            </CollapsibleTrigger>
-            <CollapsibleContent className="new-project-working-directory-content mt-2 flex flex-col gap-1.5">
-              <label
-                htmlFor="new-project-create-workspace"
-                className={`flex h-10 items-center gap-2 rounded-lg border border-input bg-transparent px-3 text-ui ${
-                  folderCreationDisabled ? "cursor-not-allowed opacity-50" : "cursor-pointer"
-                }`}
-              >
-                <Checkbox
-                  id="new-project-create-workspace"
-                  checked={createWorkspaceFolder}
-                  onCheckedChange={(checked) => {
-                    setCreateWorkspaceFolder(checked === true);
-                    setSubmitError(null);
-                  }}
-                  disabled={folderCreationDisabled}
-                />
-                <span>Create a folder using the project name</span>
-              </label>
-              <button
-                id="new-project-workspace"
-                type="button"
-                data-testid="new-project-workspace"
-                aria-label={`Working directory: ${
-                  createWorkspaceFolder
-                    ? joinPath("~", name.trim() || "Project name")
-                    : workspace?.path || "Not selected"
-                }`}
-                onClick={() => setWorkspacePickerOpen(true)}
-                disabled={createWorkspaceFolder || dialogHostId === null || isPending}
-                className="flex h-10 w-full items-center justify-between gap-3 rounded-lg border border-input bg-transparent px-3 text-ui outline-none transition-colors hover:bg-muted/50 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <span className="flex min-w-0 items-center gap-2">
-                  <FolderOpenIcon className="size-4 shrink-0 text-muted-foreground" />
-                  <span className="truncate">
-                    {createWorkspaceFolder
-                      ? joinPath("~", name.trim() || "Project name")
-                      : workspace?.path || (hostsLoading ? "Loading hosts…" : "Choose a folder…")}
-                  </span>
-                </span>
-                <span className="shrink-0 text-muted-foreground text-sm">Browse</span>
-              </button>
-              <WorkspacePickerDialog
-                open={workspacePickerOpen}
-                onOpenChange={setWorkspacePickerOpen}
-                hostId={dialogHostId}
-                initialPath={workspace?.path}
-                onConfirm={(path) => {
-                  if (dialogHostId !== null) {
-                    setWorkspace({ hostId: dialogHostId, path });
-                  }
-                }}
-                description="Choose a default working directory for sessions in this project."
-              />
-            </CollapsibleContent>
-          </Collapsible>
-          {(submitError || createProject.isError) && (
-            <p className="text-ui text-destructive" role="alert">
-              {submitError ?? friendlyProjectError(createProject.error)}
-            </p>
-          )}
-          <DialogFooter className="border-t-0 bg-transparent">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => setOpen(false)}
-              disabled={isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              data-testid="new-project-confirm"
-              loading={isPending}
-              disabled={name.trim() === "" || isPending}
-              onClick={() => void submit()}
-            >
-              Create
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {dialog}
     </>
   );
 }

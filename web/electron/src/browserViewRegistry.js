@@ -142,6 +142,9 @@ function createBrowserViewRegistry({
   // across attaches: a view that becomes active while suppressed stays hidden.
   let overlaySuppressed = false;
   let recentSessionSwitchSupported = false;
+  // Set by an SPA that opens `browser-open-tab` requests as new tabs; an older
+  // SPA would drop them, so modifier-clicks navigate in place until declared.
+  let openTabSupported = false;
 
   // Apply the current suppress flag to the active view (no-op with none active).
   function applyActiveVisibility() {
@@ -225,13 +228,13 @@ function createBrowserViewRegistry({
     return { ok: true, entry, created: true };
   }
 
-  // Popups stay in this view: an agent-visited page opening the user's system
-  // browser is an abuse vector. Programmatic loadURL skips will-navigate,
-  // so enforce navigation policy here too when enabled.
+  // Popups never open the system browser (an abuse vector for agent-visited
+  // pages): background-tab clicks go to a supporting renderer as new tabs, others
+  // load in this view. loadURL skips will-navigate, so enforce policy here.
   function installWindowOpenPolicy(entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.setWindowOpenHandler !== "function") return;
-    wc.setWindowOpenHandler(({ url }) => {
+    wc.setWindowOpenHandler(({ url, disposition }) => {
       let parsed;
       try {
         parsed = new URL(url);
@@ -253,6 +256,10 @@ function createBrowserViewRegistry({
           });
           return { action: "deny" };
         }
+      }
+      if (disposition === "background-tab" && openTabSupported) {
+        sendToRenderer("browser-open-tab", { conversationId: entry.conversationId, url });
+        return { action: "deny" };
       }
       try {
         wc.loadURL(url);
@@ -358,6 +365,11 @@ function createBrowserViewRegistry({
     if (!recentSessionSwitchSupported) {
       entries.forEach((entry) => cancelRecentSessionInput(entry, false));
     }
+    return { ok: true };
+  }
+
+  function setOpenTabSupported(supported) {
+    openTabSupported = !!supported;
     return { ok: true };
   }
 
@@ -754,6 +766,7 @@ function createBrowserViewRegistry({
     setSuppressed,
     cancelRecentSessionSwitch,
     setRecentSessionSwitchSupported,
+    setOpenTabSupported,
     close,
     closeAll,
     // Introspection

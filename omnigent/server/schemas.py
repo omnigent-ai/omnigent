@@ -18,6 +18,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    RootModel,
     SerializerFunctionWrapHandler,
     Strict,
     field_validator,
@@ -29,8 +30,18 @@ from pydantic.json_schema import SkipJsonSchema
 from omnigent.entities import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
+    CompactionData,
     ConversationItem,
+    ErrorData,
+    FunctionCallData,
+    FunctionCallOutputData,
+    NativeToolData,
+    ResourceEventData,
+    RoutingDecisionData,
+    SlashCommandData,
+    TerminalCommandData,
 )
+from omnigent.entities.conversation import StartupInputOptions
 from omnigent.inner.native_attachments import reject_authored_framework_notices
 from omnigent.onboarding.sandboxes.profiles import SandboxProfileSummary
 
@@ -65,20 +76,7 @@ class PaginatedList(BaseModel):
     has_more: bool = False
 
 
-class AgentList(PaginatedList):
-    """
-    The built-in agent list, plus the packaged names this deployment hides.
-
-    :param suppressed_agent_names: Packaged built-ins ``OMNIGENT_SEEDED_AGENTS``
-        trimmed from ``data``. The web picker also discovers agents from a
-        user's recent sessions, so it needs these names to keep a hidden
-        built-in with prior sessions from resurfacing as a custom agent.
-    """
-
-    suppressed_agent_names: list[str] = Field(default_factory=list)
-
-
-# ── Agents ──────────────────────────────────────────────────────
+# ── Agents ──────────────────────────────────────────────────
 
 
 class MCPServerSummary(BaseModel):
@@ -171,6 +169,55 @@ class UpsertMCPServerRequest(BaseModel):
             if self.url:
                 raise ValueError("url is not allowed when transport is 'stdio'")
         return self
+
+
+class LiveMCPServerStatus(BaseModel):
+    """
+    One MCP server's connection inside a session's running harness.
+
+    :param name: Server name as the harness reports it, e.g. ``"docs"`` or
+        ``"plugin:tools:docs"``.
+    :param status: ``"connected"``, ``"failed"``, ``"needs-auth"``,
+        ``"pending"``, or ``"disabled"``; other harness values pass through.
+    :param error: The harness's reason for a failed connection, or ``None``.
+    :param scope: Where the harness loaded the server from, e.g. ``"user"``.
+    """
+
+    name: str
+    status: str
+    error: str | None = None
+    scope: str | None = None
+
+
+class SessionLiveMCPServers(BaseModel):
+    """
+    The MCP connections a session's running harness reports.
+
+    :param live: ``True`` when the harness answered; ``servers`` is then current.
+    :param reason: Why there is no live answer: ``"not_running"`` (no harness
+        process yet; it starts with the next message), ``"unsupported"`` (the
+        harness cannot report MCP status), or ``"unavailable"`` (the harness did
+        not answer). ``None`` when ``live`` is true.
+    :param detail: Readable explanation for ``"unavailable"``, or ``None``.
+    :param servers: The harness's servers; empty unless ``live``.
+    :param reconnect_error: On a reconnect response, the harness's reason the
+        reconnect failed, or ``None`` when it succeeded.
+    """
+
+    live: bool
+    reason: Literal["not_running", "unsupported", "unavailable"] | None = None
+    detail: str | None = None
+    servers: list[LiveMCPServerStatus] = Field(default_factory=list)
+    reconnect_error: str | None = None
+
+
+class ReconnectLiveMCPServerRequest(BaseModel):
+    """Body for reconnecting one MCP server in a session's running harness."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # A blank name can never match a server, so reject it before asking the runner.
+    name: str = Field(min_length=1, max_length=256, pattern=r"\S")
 
 
 class MCPServerPatch(BaseModel):
@@ -413,6 +460,24 @@ class AgentDetailObject(AgentObject):
     """Agent summary with caller ownership for management actions."""
 
     user_owned: bool
+
+
+class AgentList(BaseModel):
+    """
+    Paginated list of agents; ``data`` is a page of ``AgentObject``.
+
+    :param suppressed_agent_names: Packaged built-ins ``OMNIGENT_SEEDED_AGENTS``
+        trimmed from ``data``. The web picker also discovers agents from a
+        user's recent sessions, so it needs these names to keep a hidden
+        built-in with prior sessions from resurfacing as a custom agent.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[AgentObject] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+    suppressed_agent_names: list[str] = Field(default_factory=list)
 
 
 # ── Session Policies ───────────────────────────────────────────
@@ -2188,7 +2253,7 @@ class ModelUsage(BaseModel):
 
 class BackgroundTaskInfo(BaseModel):
     """
-    One still-running background shell from the claude-native ``Stop`` hook.
+    One still-running background shell or agent from the claude-native ``Stop`` hook.
 
     Claude Code leaves finished shells in the hook's ``background_tasks``
     array, so the list surfaced here is filtered to the non-terminal ones —
@@ -2196,8 +2261,8 @@ class BackgroundTaskInfo(BaseModel):
     best-effort: the hook shape is external, so an entry missing one field
     still yields a usable row (e.g. a ``description`` with no ``command``).
 
-    :param id: Opaque per-shell identifier, e.g. ``"abc123"``.
-    :param type: Task kind, e.g. ``"shell"``.
+    :param id: Opaque per-task identifier, e.g. ``"abc123"``.
+    :param type: Task kind, e.g. ``"shell"`` or ``"subagent"``.
     :param status: Per-task status, e.g. ``"running"``.
     :param description: Human-readable label, e.g. ``"Wait for CI"``.
     :param command: Command the shell is running, e.g. ``"sleep 120"``.
@@ -2237,10 +2302,14 @@ class SessionResponse(BaseModel):
         ``"idle"`` (no loop running), ``"running"`` (loop
         executing), ``"waiting"`` (loop parked on background
         work / sub-agents), or ``"failed"`` (terminal failure).
-        Current read paths collapse ``"waiting"`` -> ``"running"``
-        before building this snapshot; the literal stays a superset
-        of what the runtime can produce so a server that forwards
-        the raw status never 500s on serialization.
+        Read paths collapse ``"waiting"`` -> ``"running"``, because headless
+        clients poll this field to tell when a run is done; the literal stays
+        a superset so a server that forwards the raw status never 500s.
+    :param background_agents: Background agents a finished claude-native
+        turn left running, while the session waits on them. :attr:`status`
+        still reads ``"running"`` then, so older clients keep treating the run
+        as unfinished; clients that know this field show the session as
+        waiting, with its composer free. ``None`` otherwise.
     :param background_task_count: Background shells (claude-native) still
         running as of the last status edge, so a reload re-shows "N shells
         still running" even though the session has settled to ``"idle"``.
@@ -2488,6 +2557,7 @@ class SessionResponse(BaseModel):
     agent_id: str
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
+    background_agents: list[BackgroundTaskInfo] | None = None
     background_task_count: int | None = None
     background_tasks: list[BackgroundTaskInfo] | None = None
     created_at: int
@@ -2732,7 +2802,8 @@ class BackgroundSessionTitleRequest(BaseModel):
     """Private runner request for isolated background title inference."""
 
     prompt: str = Field(min_length=1, max_length=20_000)
-    additional_instructions: str | None = Field(default=None, max_length=4_000)
+    # Fits the server's and the session owner's 4,000-character guidance plus framing.
+    additional_instructions: str | None = Field(default=None, max_length=10_000)
     agent_id: str | None = None
     model_override: str | None = None
     harness_override: str | None = None
@@ -3319,6 +3390,186 @@ class ChildSessionList(BaseModel):
     has_more: bool = False
 
 
+class _SessionItemCommon(BaseModel):
+    """Store-assigned fields shared by every flattened session item."""
+
+    id: str = Field(description='Store-assigned item ID, e.g. ``"msg_abc123"``.')
+    response_id: str = Field(description="ID of the task/response that produced this item.")
+    status: str = Field(description='Item status, e.g. ``"completed"``.')
+    created_at: int = Field(description="Unix epoch seconds of creation.")
+    created_by: str | None = Field(
+        default=None,
+        description="Identity of the human author; omitted for agent, tool, and system items.",
+    )
+
+
+class SessionContentBlock(BaseModel):
+    """
+    One ``content`` or ``summary`` block of a message or reasoning item.
+
+    Blocks are heterogeneous (``input_text``, ``output_text``,
+    ``input_image``, ``summary_text``, ...), so kinds other than text
+    carry extra keys.
+
+    :param type: Block kind, e.g. ``"input_text"`` or ``"output_text"``.
+    :param text: Text body of a text block; absent for other kinds.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str
+    text: str | None = None
+
+
+class SessionMessageItem(_SessionItemCommon):
+    """
+    ``message`` item as returned by ``GET /v1/sessions/{id}/items``.
+
+    Mirrors ``MessageData`` field for field. The entity keeps the blocks
+    as free-form dicts, so this variant spells out the typed block shape
+    instead of inheriting it.
+
+    :param type: Always ``"message"``.
+    :param role: ``"user"`` or ``"assistant"``.
+    :param content: Content blocks in order.
+    :param model: Agent name; present on assistant messages, absent on
+        user messages.
+    :param is_meta: ``True`` for durable context hidden from user-facing
+        transcripts; omitted when ``False``.
+    :param user_authored: ``True`` for confirmed or conservatively
+        preserved user input; omitted when ``False``.
+    :param subagent_return_id: Native task id of an explicitly completed
+        child; omitted when unset.
+    :param interrupted: ``True`` for a partial assistant response from an
+        interrupted turn; omitted when ``False``.
+    :param stream_message_id: Native live-preview stream finalized by this
+        assistant message.
+    :param phase: Assistant-only harness label, e.g. ``"commentary"``;
+        omitted when unset.
+    :param startup_options: Request options kept while a startup input
+        awaits delivery; omitted when unset.
+    """
+
+    type: Literal["message"]
+    role: Literal["user", "assistant"]
+    content: list[SessionContentBlock]
+    model: str | None = None
+    is_meta: bool = False
+    user_authored: bool = False
+    subagent_return_id: str | None = None
+    interrupted: bool = False
+    stream_message_id: str | None = None
+    phase: str | None = None
+    startup_options: StartupInputOptions | None = None
+
+
+class SessionFunctionCallItem(_SessionItemCommon, FunctionCallData):
+    """``function_call`` item: common fields plus ``FunctionCallData``."""
+
+    type: Literal["function_call"]
+
+
+class SessionFunctionCallOutputItem(_SessionItemCommon, FunctionCallOutputData):
+    """``function_call_output`` item: common fields plus ``FunctionCallOutputData``."""
+
+    type: Literal["function_call_output"]
+
+
+class SessionErrorItem(_SessionItemCommon, ErrorData):
+    """``error`` item: common fields plus ``ErrorData``."""
+
+    type: Literal["error"]
+
+
+class SessionReasoningItem(_SessionItemCommon):
+    """
+    ``reasoning`` item as returned by ``GET /v1/sessions/{id}/items``.
+
+    Mirrors ``ReasoningData`` field for field, with its text blocks typed
+    as ``SessionContentBlock`` like message content.
+
+    :param type: Always ``"reasoning"``.
+    :param model: Agent name.
+    :param summary: Summary text blocks,
+        e.g. ``[{"type": "summary_text", "text": "..."}]``.
+    :param content: Raw reasoning text blocks; absent when redacted.
+    :param encrypted_content: Encrypted reasoning content; absent when none.
+    """
+
+    type: Literal["reasoning"]
+    model: str
+    summary: list[SessionContentBlock]
+    content: list[SessionContentBlock] | None = None
+    encrypted_content: str | None = None
+
+
+class SessionCompactionItem(_SessionItemCommon, CompactionData):
+    """``compaction`` item: common fields plus ``CompactionData``."""
+
+    type: Literal["compaction"]
+
+
+class SessionNativeToolItem(_SessionItemCommon, NativeToolData):
+    """``native_tool`` item: common fields plus ``NativeToolData``."""
+
+    type: Literal["native_tool"]
+
+
+class SessionResourceEventItem(_SessionItemCommon, ResourceEventData):
+    """``resource_event`` item: common fields plus ``ResourceEventData``."""
+
+    type: Literal["resource_event"]
+
+
+class SessionRoutingDecisionItem(_SessionItemCommon, RoutingDecisionData):
+    """``routing_decision`` item: common fields plus ``RoutingDecisionData``."""
+
+    type: Literal["routing_decision"]
+
+
+class SessionSlashCommandItem(_SessionItemCommon, SlashCommandData):
+    """``slash_command`` item: common fields plus ``SlashCommandData``."""
+
+    type: Literal["slash_command"]
+
+
+class SessionTerminalCommandItem(_SessionItemCommon, TerminalCommandData):
+    """``terminal_command`` item: common fields plus ``TerminalCommandData``."""
+
+    type: Literal["terminal_command"]
+
+
+class SessionItem(
+    RootModel[
+        Annotated[
+            SessionMessageItem
+            | SessionFunctionCallItem
+            | SessionFunctionCallOutputItem
+            | SessionErrorItem
+            | SessionReasoningItem
+            | SessionCompactionItem
+            | SessionNativeToolItem
+            | SessionResourceEventItem
+            | SessionRoutingDecisionItem
+            | SessionSlashCommandItem
+            | SessionTerminalCommandItem,
+            Field(discriminator="type"),
+        ]
+    ]
+):
+    """One record of ``GET /v1/sessions/{id}/items``; ``type`` selects the variant."""
+
+
+class SessionItemList(BaseModel):
+    """Paginated list of session items; ``data`` is a page of ``SessionItem``."""
+
+    object: Literal["list"] = "list"
+    data: list[SessionItem] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
 class SideChatSummary(BaseModel):
     """
     A side chat listed in its parent session's Workspace rail.
@@ -3583,7 +3834,8 @@ class SessionStatusEvent(_SSEEventBase):
     :param status: New session status. ``"launching"`` (session or
         child task created, but no concrete harness start observed),
         ``"idle"`` (no loop running), ``"running"`` (loop executing),
-        ``"waiting"`` (parent turn parked on the async-work drain), or
+        ``"waiting"`` (parent turn parked on the async-work drain, or a
+        claude-native turn that ended with a background agent running), or
         ``"failed"`` (terminal failure).
     :param response_id: Optional active response id for terminal-backed
         integrations, e.g. ``"codex_turn_abc123"``. Clients use it to
@@ -3603,6 +3855,9 @@ class SessionStatusEvent(_SSEEventBase):
     :param background_tasks: Per-shell detail backing that tally, so the UI
         can name each running shell. ``None`` when the edge reports no detail
         (an older runner may send only the count).
+    :param background_agents: On a claude-native ``waiting`` edge, the
+        background agents the finished turn left running, so the UI can say
+        what the session still waits on. ``None`` on every other edge.
     :param blocked_on: Short human phrase naming what a still-``running``
         session is parked on, e.g. ``"permission prompt"`` or
         ``"dialog open"``. Set by terminal-backed integrations whose agent
@@ -3624,6 +3879,7 @@ class SessionStatusEvent(_SSEEventBase):
     error: ErrorDetail | None = None
     background_task_count: int | None = None
     background_tasks: list[BackgroundTaskInfo] | None = None
+    background_agents: list[BackgroundTaskInfo] | None = None
     blocked_on: str | None = None
 
 
@@ -5494,6 +5750,28 @@ HarnessStreamEvent = (
     | SubagentCompletedEvent
     | SubagentToolCallEvent
 )
+
+
+# ── User settings ─────────────────────────────────────────────────
+
+
+class SessionTitleInstructionsRequest(BaseModel):
+    """Replace the caller's title instructions; null or blank clears them.
+
+    The stripped value may hold at most 4,000 characters. The raw bound only
+    caps request size before stripping.
+    """
+
+    instructions: str | None = Field(..., max_length=16_000)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SessionTitleInstructionsResponse(BaseModel):
+    """The caller's saved title instructions and the limit the server enforces."""
+
+    instructions: str | None
+    max_chars: int
 
 
 # ── Projects ──────────────────────────────────────────────────────

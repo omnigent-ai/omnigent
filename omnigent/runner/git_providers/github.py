@@ -89,7 +89,7 @@ class GitHubPullRequests:
 
         return github_resource._gh_installed()
 
-    def review_diff(
+    def pinned_diff(
         self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
     ) -> dict[str, Any]:
         """Fetch a patch whose revisions match the displayed review conversations."""
@@ -99,7 +99,7 @@ class GitHubPullRequests:
             root, reference, head_sha=head_sha, base_sha=base_sha
         )
 
-    def review_changed_files(
+    def pinned_changed_files(
         self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
     ) -> dict[str, Any]:
         """List changed files whose revisions match the displayed patch."""

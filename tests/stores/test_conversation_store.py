@@ -124,6 +124,54 @@ def test_fork_drops_sandbox_repo_label(
     assert REQUESTED_HOST_ID_LABEL_KEY not in fork.labels
 
 
+def test_fork_drops_the_automation_source_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Deleting a session deletes the automation its label names, so a fork of an
+    automation's copy must not name that automation too."""
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id, {SCHEDULED_TASK_SOURCE_LABEL_KEY: "st_1", "kept": "yes"}
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert SCHEDULED_TASK_SOURCE_LABEL_KEY not in fork.labels
+
+
+@pytest.mark.parametrize("closed_by", ["label", "legacy_title"])
+def test_fork_of_a_closed_child_is_open(
+    conversation_store: SqlAlchemyConversationStore,
+    closed_by: str,
+) -> None:
+    """Forking a closed child (a stopped side chat, a closed sub-agent) is how
+    the user continues it, so the fork must not inherit the seal."""
+    from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, is_session_closed
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title="researcher:auth"
+    )
+    if closed_by == "label":
+        conversation_store.set_labels(child.id, {CLOSED_LABEL_KEY: "true", "kept": "yes"})
+    else:
+        conversation_store.set_labels(child.id, {"kept": "yes"})
+        conversation_store.update_conversation(
+            child.id, title=f"researcher:auth:closed:{child.id}"
+        )
+
+    fork = conversation_store.fork_conversation(child.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert not is_session_closed(fork.labels, fork.title)
+    assert fork.title == "Fork of researcher:auth"
+    saved = conversation_store.get_conversation(child.id)
+    assert saved is not None and is_session_closed(saved.labels, saved.title)
+
+
 def test_fork_drops_per_repo_sandbox_labels(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -408,9 +456,22 @@ def test_get_session_activity(
     )
     conversation_store.set_session_usage(child.id, {"total_cost_usd": 5.0})
 
-    result = conversation_store.get_session_activity(
-        [a.id, b.id, child.id, a.id, "5eca720dc2bc6cdc3a99028d7bd0f917"]
-    )
+    statements: list[str] = []
+
+    def record_query(_conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
+        statements.append(statement.lower())
+
+    event.listen(conversation_store._engine, "before_cursor_execute", record_query)
+    try:
+        result = conversation_store.get_session_activity(
+            [a.id, b.id, child.id, a.id, "5eca720dc2bc6cdc3a99028d7bd0f917"]
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", record_query)
+
+    reads = [statement for statement in statements if statement.startswith("select")]
+    assert len(reads) == 2
+    assert all("conversation_labels" not in statement for statement in reads)
 
     assert set(result) == {a.id, b.id, child.id}
     assert result[a.id].updated_at == conversation_store.get_conversation(a.id).updated_at  # type: ignore[union-attr]
