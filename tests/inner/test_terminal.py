@@ -6,7 +6,9 @@ import asyncio
 import errno
 import json
 import logging
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -2194,6 +2196,124 @@ async def test_exit_history_omits_wrapped_credential_without_its_prefix_real_tmu
         await instance.close()
 
 
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.parametrize(
+    ("payload", "start_on_attach", "program_status_app"),
+    [
+        pytest.param("x" * 20000, False, None, id="ascii"),
+        pytest.param("界" * 6000, True, None, id="utf8-attach-gate"),
+        pytest.param("界" * 6000, False, "synthetic", id="utf8-status-relay"),
+        pytest.param("x" * 20000, True, "synthetic", id="ascii-gate-and-relay"),
+    ],
+)
+async def test_launch_long_command_preserves_arguments_real_tmux(
+    tmp_path: Path,
+    short_tmp_parent: Path,
+    payload: str,
+    start_on_attach: bool,
+    program_status_app: str | None,
+) -> None:
+    """Large argv crosses the tmux boundary intact, including quoting and startup gates."""
+    private_dir = tmp_path / "terminal 'state'"
+    private_dir.mkdir(mode=0o700)
+    output = tmp_path / "captured arguments.json"
+    literal = "literal 'quotes' \"$VALUE\" `text` ; $(text)\nnext line"
+    script = (
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "Path(sys.argv[1]).write_text(json.dumps({\n"
+        "    'args': sys.argv[2:], 'cwd': os.getcwd(),\n"
+        "    'setting': os.environ['SYNTHETIC_LAUNCH_SETTING'],\n"
+        "}))\n"
+        "sys.exit(37)\n"
+    )
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=private_dir,
+        command=sys.executable,
+        args=["-c", script, str(output), payload, literal, ""],
+        env={
+            "PATH": f"{Path(shutil.which('tmux') or '/usr/bin/tmux').parent}:/usr/bin:/bin",
+            "SYNTHETIC_LAUNCH_SETTING": literal,
+        },
+        inherit_env=False,
+        keep_alive_after_exit=True,
+        tmux_start_on_attach=start_on_attach,
+        program_status_app=program_status_app,
+    )
+    try:
+        await instance.launch(cwd=tmp_path)
+        command_directory = instance._launch_command_tmpdir
+        assert command_directory is not None
+        assert not command_directory.is_relative_to(private_dir)
+        if start_on_attach:
+            assert not output.exists()
+            await instance._tmux("wait-for", "-S", terminal_mod._TMUX_START_ON_ATTACH_CHANNEL)
+        async with asyncio.timeout(10):
+            while await instance.is_alive():
+                await asyncio.sleep(0.01)
+
+        assert instance.last_exit_status() == 37
+        assert json.loads(output.read_text()) == {
+            "args": [payload, literal, ""],
+            "cwd": str(tmp_path),
+            "setting": literal,
+        }
+    finally:
+        await instance.close()
+    assert not private_dir.exists()
+    assert not command_directory.exists()
+
+
+@pytest.mark.parametrize("failure", ["exit", "spawn", "cancelled"])
+async def test_launch_long_command_cleans_up_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Startup argv files are private and removed even when tmux cannot launch."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        args=["x" * 20000],
+        inherit_env=False,
+    )
+    captured: list[Path] = []
+
+    async def spawn(*cmd: str, **kwargs: object) -> _ProcessWithStdout:
+        launch_file = Path(shlex.split(cmd[-1])[1])
+        captured.append(launch_file)
+        assert not launch_file.is_relative_to(instance.private_dir)
+        assert stat.S_IMODE(launch_file.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(launch_file.stat().st_mode) == 0o600
+        assert (
+            launch_file.read_text() == f"exec {shlex.join([instance.command, *instance.args])}\n"
+        )
+        assert sum(len(arg.encode()) + 1 for arg in cmd) < 16384
+        if failure == "spawn":
+            raise OSError("synthetic spawn failure")
+        if failure == "cancelled":
+            raise asyncio.CancelledError
+        return _ProcessWithStdout(returncode=1, stderr=b"synthetic launch failure")
+
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(create_subprocess_exec=spawn, subprocess=asyncio.subprocess),
+    )
+    expected = {"exit": RuntimeError, "spawn": OSError, "cancelled": asyncio.CancelledError}[
+        failure
+    ]
+    with pytest.raises(expected):
+        await instance.launch(cwd=tmp_path)
+    assert len(captured) == 1
+    assert not captured[0].exists()
+    assert not captured[0].parent.exists()
+    assert not instance.running
+
+
 async def _capture_launch_argv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3048,8 +3168,13 @@ async def test_launch_strips_runner_binding_token_from_tmux_child(
 
 @pytest.mark.parametrize("inherit_env", [False, True])
 @pytest.mark.parametrize("sandbox_active", [False, True])
+@pytest.mark.parametrize("command_args", [[], ["x" * 20000]], ids=["short", "long"])
 async def test_terminal_desktop_session_follows_sandbox_policy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inherit_env: bool, sandbox_active: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inherit_env: bool,
+    sandbox_active: bool,
+    command_args: list[str],
 ) -> None:
     from omnigent.inner.sandbox import SandboxPolicy
 
@@ -3070,6 +3195,7 @@ async def test_terminal_desktop_session_follows_sandbox_policy(
         session_key="test-keyring",
         socket_path=tmp_path / "tmux.sock",
         private_dir=tmp_path,
+        args=command_args,
         inherit_env=inherit_env,
         env={**session_env, "XDG_CONFIG_HOME": "/home/test/.config"},
         sandbox_policy=SandboxPolicy(
@@ -3091,6 +3217,13 @@ async def test_terminal_desktop_session_follows_sandbox_policy(
     else:
         assert {name: env[name] for name in session_env} == session_env
     assert env["XDG_CONFIG_HOME"] == "/home/test/.config"
+    if command_args:
+        launch_file = Path(shlex.split(spawn.call_args.args[-1])[1])
+        assert not launch_file.is_relative_to(tmp_path)
+        executable = "/test/launcher" if sandbox_active else "bash"
+        assert launch_file.read_text() == f"exec {shlex.join([executable, *command_args])}\n"
+    instance.running = False
+    await instance.close()
 
 
 @pytest.mark.asyncio

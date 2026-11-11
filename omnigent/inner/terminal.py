@@ -483,6 +483,8 @@ _IDLE_WATCHER_JOIN_TIMEOUT_S = 1.0
 # (1024 chars ≤ 4KB packed). tmux writes each invocation's bytes to the
 # pane in submission order, so the program sees one contiguous stream.
 _SEND_KEYS_LITERAL_CHARS_PER_CALL = 1024
+# Leave room for tmux's setup commands within its 16KB message limit.
+_TMUX_INLINE_COMMAND_BYTES = 8192
 
 
 class _IdleDetector:
@@ -1130,6 +1132,7 @@ class TerminalInstance:
     _egress_tmpdir: Path | None = field(default=None, repr=False)
     _git_ssh_broker: GitSshBroker | None = field(default=None, repr=False)
     _git_ssh_tmpdir: Path | None = field(default=None, repr=False)
+    _launch_command_tmpdir: Path | None = field(default=None, init=False, repr=False)
     _clipboard_bridge: TerminalClipboardBridge | None = field(default=None, init=False, repr=False)
     _idle_task: asyncio.Task[None] | None = field(default=None, repr=False)
     # Threaded idle-watcher state. Mirrors :attr:`_idle_task` but for
@@ -1633,6 +1636,8 @@ class TerminalInstance:
             await self._launch_impl(cwd=cwd)
         except BaseException:
             self._stop_network_brokers()
+            cleanup_private_tmpdir(self._launch_command_tmpdir)
+            self._launch_command_tmpdir = None
             raise
 
     async def _launch_impl(self, *, cwd: Path | None = None) -> None:
@@ -1640,6 +1645,8 @@ class TerminalInstance:
 
         if self.running:
             return
+        cleanup_private_tmpdir(self._launch_command_tmpdir)
+        self._launch_command_tmpdir = None
         self._last_exit_snapshot = None
         self._last_exit_status = None
         self._last_exit_signal = None
@@ -1713,6 +1720,15 @@ class TerminalInstance:
                 *inner_cmd,
             ]
         inner_str = shlex.join(inner_cmd)
+        if len(inner_str.encode("utf-8")) > _TMUX_INLINE_COMMAND_BYTES:
+            # The command must stay outside the pane's writable terminal directory.
+            self._launch_command_tmpdir = create_private_tmpdir()
+            descriptor, path = tempfile.mkstemp(
+                prefix="launch-", suffix=".sh", dir=self._launch_command_tmpdir
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as script:
+                script.write(f"exec {inner_str}\n")
+            inner_str = shlex.join(["/bin/sh", path])
         if self.tmux_start_on_attach:
             inner_str = f"tmux wait-for {_TMUX_START_ON_ATTACH_CHANNEL}; exec {inner_str}"
 
@@ -2037,6 +2053,8 @@ class TerminalInstance:
         # socket inside a soon-to-be-deleted dir, then remove the
         # tmpdir.
         self._stop_network_brokers()
+        cleanup_private_tmpdir(self._launch_command_tmpdir)
+        self._launch_command_tmpdir = None
 
         # Clean up the private dir (contains socket + fork).
         if self.private_dir.exists():
