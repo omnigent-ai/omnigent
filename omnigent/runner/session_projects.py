@@ -21,6 +21,12 @@ from omnigent.tools.builtins.session_projects import (
 
 _DEFAULT_LISTED_SESSIONS = 50
 _SNAPSHOT_PARAMS = {"include_items": "false", "include_liveness": "false"}
+# The shared-runner check reads only the caller's runner binding.
+_CALLER_RUNNER_PARAMS = {
+    **_SNAPSHOT_PARAMS,
+    "include_usage": "false",
+    "include_live_status": "false",
+}
 _CONCURRENT_NAME_READS = 8
 _SESSION_UPDATE_FIELDS = ("project", "title", "pinned", "archived")
 # Upper bound on pages walked when resolving a project or listing its members.
@@ -448,7 +454,7 @@ async def _shares_runner(
         return False
     try:
         response = await client.get(
-            f"/v1/sessions/{source_id}", params=_SNAPSHOT_PARAMS, timeout=30.0
+            f"/v1/sessions/{source_id}", params=_CALLER_RUNNER_PARAMS, timeout=30.0
         )
         if response.is_error:
             return True

@@ -39,6 +39,12 @@ def _client(handler) -> httpx.AsyncClient:
         ({"session_id": SOURCE, "project": "x" * 101}, "project must be a name"),
         ({"session_id": SOURCE, "project": "  "}, "project must be a name"),
         ({"session_id": "not-a-session", "project": "Q3"}, "invalid session ID"),
+        ({"session_id": SOURCE, "title": "  "}, "title must be non-blank"),
+        ({"session_id": SOURCE, "title": "x" * 201}, "title must be non-blank"),
+        ({"session_id": SOURCE, "pinned": "yes"}, "pinned must be true or false"),
+        ({"session_id": SOURCE, "archived": 1}, "archived must be true or false"),
+        ({"session_id": SOURCE, "archived": True, "pinned": True}, "cannot be pinned"),
+        ({"session_id": SOURCE, "archived": True}, "cannot archive itself"),
     ],
 )
 async def test_update_rejects_invalid_arguments_before_any_request(args, message):
@@ -228,30 +234,6 @@ async def test_list_pages_projects_and_sessions_until_the_last_page():
 
 
 ORGANIZE_INFO = {"session_move_source_checks": True, "session_organize_source_checks": True}
-
-
-@pytest.mark.parametrize(
-    ("args", "message"),
-    [
-        ({"session_id": SOURCE, "title": "  "}, "title must be non-blank"),
-        ({"session_id": SOURCE, "title": "x" * 201}, "title must be non-blank"),
-        ({"session_id": SOURCE, "pinned": "yes"}, "pinned must be true or false"),
-        ({"session_id": SOURCE, "archived": 1}, "archived must be true or false"),
-        ({"session_id": SOURCE, "archived": True, "pinned": True}, "cannot be pinned"),
-        ({"session_id": SOURCE, "archived": True}, "cannot archive itself"),
-    ],
-)
-async def test_update_rejects_invalid_organizing_fields_before_any_request(args, message):
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(500)
-
-    async with _client(handler) as client:
-        result = json.loads(await execute_session_update(args, client, SOURCE))
-    assert message in result["error"]
-    assert requests == []
 
 
 @pytest.mark.parametrize(
@@ -499,7 +481,10 @@ async def test_update_refuses_to_archive_a_session_on_the_callers_runner():
             await execute_session_update({"session_id": PARENT, "archived": True}, client, SOURCE)
         )
     assert "shares the calling session's runner" in result["error"]
-    assert [r.url.path for r in requests if r.method == "GET"][-1] == f"/v1/sessions/{SOURCE}"
+    caller_read = [r for r in requests if r.method == "GET"][-1]
+    assert caller_read.url.path == f"/v1/sessions/{SOURCE}"
+    assert caller_read.url.params["include_usage"] == "false"
+    assert caller_read.url.params["include_live_status"] == "false"
     assert not [r for r in requests if r.method == "PATCH"]
 
 
@@ -817,3 +802,26 @@ async def test_update_reports_a_project_it_created_before_a_refused_patch():
         "project": "New",
         "project_created": True,
     }
+
+
+async def test_project_rename_reports_a_member_check_that_fails_after_the_rename():
+    requests: list[httpx.Request] = []
+    base = _project_server(requests)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions":
+            requests.append(request)
+            return httpx.Response(503, text="unavailable")
+        return base(request)
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_project_update({"project": "Q3", "name": "Q4"}, client, SOURCE)
+        )
+    assert result == {
+        "project": "Q4",
+        "status": "updated",
+        "error": "project updated, but its sessions could not be checked: "
+        "could not list the project's sessions: HTTP 503",
+    }
+    assert [r.url.path for r in requests if r.method == "PATCH"] == [f"/v1/projects/{PROJECT_ID}"]
