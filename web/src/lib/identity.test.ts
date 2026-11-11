@@ -608,34 +608,37 @@ describe("authenticatedFetch", () => {
       },
     );
 
-    it.each(["/v1/sessions?limit=50", "/health?session_ids=a", "/v1/sessions/projects"])(
-      "keys host-less %s by the per-client key when there is no modal host",
-      async (url) => {
-        // Without a key the request would route by workspace id, putting every
-        // host-less read from the workspace on one replica.
-        vi.doUnmock("./sessionHost");
-        vi.doMock("./host", () => ({
-          getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
-          hostFetch: fetchMock,
-          isDatabricksWorkspace: vi.fn(() => true),
-          isHostRoutingEnabled: vi.fn(() => true),
-        }));
-        const { authenticatedFetch, setSessionHostResolver } = await import("./identity");
-        const resolve = vi.fn(async () => {});
-        setSessionHostResolver(resolve);
-        fetchMock.mockResolvedValue(mockJsonResponse({}));
+    it.each([
+      "/v1/sessions?limit=50",
+      "/health?session_ids=a",
+      "/v1/sessions/projects",
+      "/v1/sessions/orchestrated",
+      "/v1/sessions/updates",
+    ])("keys host-less %s by the per-client key when there is no modal host", async (url) => {
+      // Without a key the request would route by workspace id, putting every
+      // host-less read from the workspace on one replica.
+      vi.doUnmock("./sessionHost");
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+        isHostRoutingEnabled: vi.fn(() => true),
+      }));
+      const { authenticatedFetch, setSessionHostResolver } = await import("./identity");
+      const resolve = vi.fn(async () => {});
+      setSessionHostResolver(resolve);
+      fetchMock.mockResolvedValue(mockJsonResponse({}));
 
-        await authenticatedFetch(url);
-        await authenticatedFetch(url);
+      await authenticatedFetch(url);
+      await authenticatedFetch(url);
 
-        const keys = fetchMock.mock.calls.map(([, init]) =>
-          new Headers((init as RequestInit).headers).get("X-Databricks-Omnigent-Slice-Key"),
-        );
-        expect(keys[0]).toMatch(/^[0-9a-f]{32}$/);
-        expect(keys[1]).toBe(keys[0]);
-        expect(resolve).not.toHaveBeenCalled();
-      },
-    );
+      const keys = fetchMock.mock.calls.map(([, init]) =>
+        new Headers((init as RequestInit).headers).get("X-Databricks-Omnigent-Slice-Key"),
+      );
+      expect(keys[0]).toMatch(/^[0-9a-f]{32}$/);
+      expect(keys[1]).toBe(keys[0]);
+      expect(resolve).not.toHaveBeenCalled();
+    });
 
     it("keys project reads by the client key and discovery-publishing writes by the modal host", async () => {
       vi.doUnmock("./sessionHost");
@@ -656,11 +659,12 @@ describe("authenticatedFetch", () => {
       await authenticatedFetch("/v1/sessions/projects");
       await authenticatedFetch("/v1/projects/proj_1", { method: "PATCH", body: "{}" });
       await authenticatedFetch("/v1/scheduled-tasks/task_1/run", { method: "POST" });
+      await authenticatedFetch("/v1/scheduled-tasks", { method: "POST", body: "{}" });
 
       const keys = fetchMock.mock.calls.map(([, init]) =>
         new Headers((init as RequestInit).headers).get("X-Databricks-Omnigent-Slice-Key"),
       );
-      expect(keys).toEqual([CLIENT_KEY, "host_modal", "host_modal"]);
+      expect(keys).toEqual([CLIENT_KEY, "host_modal", "host_modal", "host_modal"]);
     });
 
     it("keys a session sub-path with an unknown host by the client key", async () => {

@@ -69,7 +69,7 @@ type UrlHostScope = { scoped: true; hostId: string | null } | { scoped: false };
 
 // Routes under /v1/sessions/ whose next segment is not a session id. Read as a
 // session id, they would look up a host that can't exist.
-const SESSION_COLLECTION_ROUTES = new Set(["projects", "updates"]);
+const SESSION_COLLECTION_ROUTES = new Set(["orchestrated", "projects", "updates"]);
 
 function skillsParamsForUrl(url: string): URLSearchParams | null {
   const match = url.match(/\/v1\/skills(?:\?([^#]*))?(?:#.*)?$/);
@@ -303,10 +303,10 @@ function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined):
   return (typeof body === "string" || body instanceof FormData) && BODY_HOST_KEYED_RE.test(url);
 }
 
-// Writes whose events (`projects_changed`, a run's `session_added`) reach only
-// updates streams on the replica that handled them.
+// Writes whose events (`projects_changed`, a scheduled task's or run's
+// `session_added`) reach only updates streams on the replica that handled them.
 const DISCOVERY_PUBLISHING_WRITE_RE =
-  /\/v1\/(?:projects(?:[/?#]|$)|scheduled-tasks\/[^/?#]+\/run(?:[?#]|$))/;
+  /\/v1\/(?:projects(?:[/?#]|$)|scheduled-tasks(?:[?#]|$|\/[^/?#]+\/run(?:[?#]|$)))/;
 
 function isDiscoveryPublishingWrite(url: string, method: string | undefined): boolean {
   const verb = (method ?? "GET").toUpperCase();
@@ -693,8 +693,15 @@ export async function authenticatedFetch(
           { ...init, headers: retryHeaders, cache: "no-store" },
           { unkeyed: true },
         );
-        if (hostId !== null && res.ok) markHostKeyless(hostId);
-        else if (demoted && (await _isWrongReplica(res))) clearHostKeyless(hostId);
+        if (hostId !== null && res.ok) {
+          markHostKeyless(hostId);
+        } else if (demoted && (await _isWrongReplica(res))) {
+          // The default replica missed too, so the demotion is stale: try the host's key.
+          clearHostKeyless(hostId);
+          const keyedHeaders = new Headers(headers);
+          keyedHeaders.set(SLICE_KEY_HEADER, hostId);
+          res = await hostFetch(url, { ...init, headers: keyedHeaders, cache: "no-store" });
+        }
       }
     }
   } else if (

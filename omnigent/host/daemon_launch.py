@@ -112,14 +112,18 @@ def open_daemon_client(
     """
     from omnigent_client._http import is_loopback_url
 
-    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, databricks_request_headers
+    from omnigent.cli_auth import (
+        OMNIGENT_SLICE_KEY_HEADER,
+        UNKEYED_REQUEST_EXTENSION,
+        databricks_request_headers,
+    )
 
     pinned = {**headers, **databricks_request_headers(base_url, host_id=host_id)}
 
     async def pin_request(request: httpx.Request) -> None:
         # Auth refresh may inject this machine's key; the selected host wins.
         key = client.headers.get(OMNIGENT_SLICE_KEY_HEADER)
-        if key is not None:
+        if key is not None and not request.extensions.get(UNKEYED_REQUEST_EXTENSION):
             request.headers[OMNIGENT_SLICE_KEY_HEADER] = key
 
     # A proxy cannot reach a loopback server, so local targets bypass it.

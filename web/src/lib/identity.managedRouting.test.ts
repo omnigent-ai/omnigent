@@ -178,26 +178,32 @@ describe("managed first-message routing", () => {
     expect(isHostKeyless("new-host")).toBe(true);
   });
 
-  it.each([
-    [true, true],
-    [false, false],
-  ])(
-    "sends a demoted host's request unkeyed (default replica reaches it: %s)",
-    async (reached, stillKeyless) => {
-      const { authenticatedFetch, markHostKeyless, isHostKeyless } = await setup();
-      markHostKeyless("new-host");
-      fetchMock
-        .mockResolvedValueOnce(wrongReplica())
-        .mockResolvedValueOnce(reached ? Response.json({}) : wrongReplica());
+  it("keeps a demoted host's request unkeyed when the default replica reaches it", async () => {
+    const { authenticatedFetch, markHostKeyless, isHostKeyless } = await setup();
+    markHostKeyless("new-host");
+    fetchMock.mockResolvedValueOnce(wrongReplica()).mockResolvedValueOnce(Response.json({}));
 
-      await authenticatedFetch(EVENTS_URL);
+    expect((await authenticatedFetch(EVENTS_URL)).ok).toBe(true);
 
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-      expect(requestHeaders(1).has(SLICE_KEY)).toBe(false);
-      // A miss on the default replica too shows the demotion is stale.
-      expect(isHostKeyless("new-host")).toBe(stillKeyless);
-    },
-  );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(requestHeaders(1).has(SLICE_KEY)).toBe(false);
+    expect(isHostKeyless("new-host")).toBe(true);
+  });
+
+  it("clears a stale keyless demotion and tries the newly resolved host", async () => {
+    const { authenticatedFetch, markHostKeyless, isHostKeyless } = await setup();
+    markHostKeyless("new-host");
+    fetchMock
+      .mockResolvedValueOnce(wrongReplica())
+      .mockResolvedValueOnce(wrongReplica())
+      .mockResolvedValueOnce(Response.json({}));
+
+    expect((await authenticatedFetch(EVENTS_URL)).ok).toBe(true);
+
+    expect(requestHeaders(1).has(SLICE_KEY)).toBe(false);
+    expect(requestHeaders(2).get(SLICE_KEY)).toBe("new-host");
+    expect(isHostKeyless("new-host")).toBe(false);
+  });
 
   it("deduplicates concurrent forced host refreshes", async () => {
     const { authenticatedFetch, resolve, setSessionHost, resolveSessionHost } = await setup();

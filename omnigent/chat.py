@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
-from collections.abc import Awaitable, Callable, Generator
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
@@ -932,6 +932,33 @@ class _DatabricksTokenAuth(httpx.Auth):
         :param request: The outgoing httpx request.
         :yields: The request with auth header set.
         """
+        self._apply_headers(request)
+        yield request
+
+    def sync_auth_flow(
+        self, request: httpx.Request
+    ) -> Generator[httpx.Request, httpx.Response, None]:
+        """Authenticate *request*, re-sending it unkeyed once after a ``wrong_replica`` miss."""
+        self._apply_headers(request)
+        response = yield request
+        if _keyed_wrong_replica_candidate(request, response):
+            response.read()
+            if _is_wrong_replica(response):
+                yield _unkeyed(request)
+
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        """Async twin of :meth:`sync_auth_flow`."""
+        self._apply_headers(request)
+        response = yield request
+        if _keyed_wrong_replica_candidate(request, response):
+            await response.aread()
+            if _is_wrong_replica(response):
+                yield _unkeyed(request)
+
+    def _apply_headers(self, request: httpx.Request) -> None:
+        """Set the routing and ``Authorization`` headers on *request*."""
         if self._server_url:
             from omnigent.cli_auth import databricks_request_headers
 
@@ -963,7 +990,35 @@ class _DatabricksTokenAuth(httpx.Auth):
                 token = self._sdk_token()
                 if token:
                     request.headers["Authorization"] = f"Bearer {token}"
-        yield request
+
+
+def _keyed_wrong_replica_candidate(request: httpx.Request, response: httpx.Response) -> bool:
+    # Only a 400 can be wrong_replica; reading other bodies would buffer streams.
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, UNKEYED_REQUEST_EXTENSION
+
+    return (
+        response.status_code == 400
+        and OMNIGENT_SLICE_KEY_HEADER in request.headers
+        and not request.extensions.get(UNKEYED_REQUEST_EXTENSION)
+    )
+
+
+def _is_wrong_replica(response: httpx.Response) -> bool:
+    from omnigent.runner.session_requests import is_wrong_replica
+
+    return is_wrong_replica(response)
+
+
+def _unkeyed(request: httpx.Request) -> httpx.Request:
+    """*request* re-addressed without a slice key, reaching the default replica.
+
+    A host whose tunnels connected without a key is only reachable there.
+    """
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, UNKEYED_REQUEST_EXTENSION
+
+    request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
+    request.extensions[UNKEYED_REQUEST_EXTENSION] = True
+    return request
 
 
 def _server_headers(

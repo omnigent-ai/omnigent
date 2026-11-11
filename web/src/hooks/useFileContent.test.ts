@@ -21,7 +21,7 @@ const isAndroidShell = vi.fn(() => false);
 vi.mock("@/lib/host", () => ({
   isDatabricksWorkspace: () => isDatabricksWorkspace(),
   resolveMediaUrl: (p: string) => resolveMediaUrl(p),
-  withRoutingKeyParam: (p: string) => `${p}&omnigent_slice_key=client_key`,
+  isHostRoutingEnabled: () => true,
 }));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: (u: string) => authenticatedFetch(u) }));
 vi.mock("@/lib/nativeBridge", () => ({
@@ -110,10 +110,9 @@ describe("workspaceFileMediaUrl", () => {
     );
   });
 
-  it("keys an unknown host's load by the client key and a keyless host's not at all", () => {
-    expect(workspaceFileMediaUrl("sess_abc", "demo.mp4")).toBe(
-      `https://ws.example${MEDIA_URL}&omnigent_slice_key=client_key`,
-    );
+  it("fetches an unknown host's load and leaves a keyless host's unkeyed", () => {
+    // The authenticated fetch recovers from a wrong-replica miss; a bare <video src> can't.
+    expect(workspaceFileMediaUrl("sess_abc", "demo.mp4")).toBeNull();
 
     setSessionHost("sess_abc", "host_1");
     markHostKeyless("host_1");

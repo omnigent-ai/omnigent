@@ -148,6 +148,32 @@ async def test_request_routing_follows_the_target_session(
 
 
 @pytest.mark.asyncio
+async def test_wrong_replica_miss_is_resent_unkeyed_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A keyed miss re-sends once without a key, reaching hosts that connected unkeyed."""
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+    mount = "https://acme.databricks.com/api/2.0/omnigent"
+    auth = _DatabricksTokenAuth(server_url=mount, session_id="conv_unknown")
+    keys: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        keys.append(request.headers.get(OMNIGENT_SLICE_KEY_HEADER))
+        if len(keys) == 1:
+            return httpx.Response(400, json={"error": {"code": "wrong_replica"}})
+        return httpx.Response(
+            200, json={"id": "conv_unknown", "agent_id": "ag", "status": "idle", "created_at": 0}
+        )
+
+    async with OmnigentClient(mount, auth=auth, request_hooks=[route_session_request]) as client:
+        async with httpx.MockTransport(handler) as transport:
+            with monkeypatch.context() as patcher:
+                patcher.setattr(client._http, "_transport", transport)
+                assert (await client.sessions.get("conv_unknown")).id == "conv_unknown"
+
+    assert keys == ["client_key", None]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("path", "body", "content_type", "expected_host"),
     [

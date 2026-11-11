@@ -39,3 +39,11 @@ def test_unwritable_data_dir_keeps_a_process_key(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr(routing_key, "_cached", None)
     key = routing_key.client_routing_key()
     assert routing_key.client_routing_key() == key
+
+
+def test_a_key_stored_by_another_process_first_wins(key_dir: Path) -> None:
+    # Another process stored its key after this one found none; creating must adopt it.
+    (key_dir / "routing_key").write_text("a" * 32)
+    assert routing_key._create() == "a" * 32
+    assert (key_dir / "routing_key").read_text() == "a" * 32
+    assert [p.name for p in key_dir.iterdir()] == ["routing_key"]

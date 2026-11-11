@@ -7,8 +7,10 @@ key in its data dir so its requests spread across replicas but stay on one.
 
 from __future__ import annotations
 
+import os
 import re
 import secrets
+import tempfile
 import threading
 from pathlib import Path
 
@@ -46,13 +48,28 @@ def _load() -> str | None:
 
 
 def _create() -> str:
+    """Store a new key unless another process stored one first, and return the stored key."""
     key = secrets.token_hex(16)
     try:
         path = _key_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_suffix(".tmp")
-        tmp_path.write_text(key, encoding="utf-8")
-        tmp_path.replace(path)
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".routing_key.")
     except OSError:
-        pass  # the in-memory key still holds for this process
+        return key  # the in-memory key still holds for this process
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            tmp.write(key)
+        try:
+            # Links the complete file only if no key exists, so racing processes agree.
+            os.link(tmp_path, path)
+        except FileExistsError:
+            stored = _load()
+            if stored is not None:
+                return stored
+            tmp_path.replace(path)  # the existing file holds no valid key
+    except OSError:
+        pass
+    finally:
+        tmp_path.unlink(missing_ok=True)
     return key

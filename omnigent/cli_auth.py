@@ -682,6 +682,8 @@ DATABRICKS_ORG_ID_HEADER = "X-Databricks-Org-Id"
 # one replica when they carry the same key (the host_id). Omitted for an
 # unsharded / single-replica deployment, which needs no sticky routing.
 OMNIGENT_SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key"
+# httpx request extension marking a deliberate unkeyed re-send; routing hooks keep it unkeyed.
+UNKEYED_REQUEST_EXTENSION = "omnigent_unkeyed"
 
 # Opaque extra request headers for dev/test: a JSON object of header name→value
 # in :data:`DATABRICKS_EXTRA_HEADERS_ENV_VAR`. Databricks deployments use it to
