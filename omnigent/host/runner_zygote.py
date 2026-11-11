@@ -153,12 +153,16 @@ class ZygoteRunnerProc:
                     return
 
     def _signal(self, sig: int) -> None:
-        """Signal the runner pid, ignoring an already-exited process.
+        """Signal the captured runner identity, ignoring an already-exited process.
 
         :param sig: POSIX signal number.
         """
-        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.kill(self.pid, sig)
+        process = self._process
+        if self.returncode is not None or process is None:
+            return
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            if process.is_running():
+                process.send_signal(sig)
 
 
 class ZygoteManager:

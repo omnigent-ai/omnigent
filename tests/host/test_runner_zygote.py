@@ -545,6 +545,44 @@ def test_signal_of_exited_runner_is_a_safe_noop(manager: ZygoteManager, tmp_path
     proc.kill()
 
 
+@pytest.mark.parametrize(
+    ("operation", "expected_signal"), [("terminate", signal.SIGTERM), ("kill", signal.SIGKILL)]
+)
+def test_signal_targets_owned_live_runner(
+    manager: ZygoteManager, tmp_path: Path, operation: str, expected_signal: int
+) -> None:
+    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"), str(tmp_path))
+    try:
+        getattr(proc, operation)()
+        assert _wait_exit(proc) == -expected_signal
+    finally:
+        proc.kill()
+        _wait_exit(proc)
+
+
+@pytest.mark.parametrize("operation", ["terminate", "kill"])
+@pytest.mark.parametrize(
+    "signal_error", [psutil.NoSuchProcess(123), psutil.AccessDenied(123), OSError()]
+)
+def test_signal_handles_identity_loss_or_denial(
+    monkeypatch: pytest.MonkeyPatch, operation: str, signal_error: Exception
+) -> None:
+    original_process = Mock()
+    original_process.is_running.return_value = True
+    original_process.send_signal.side_effect = signal_error
+    process_factory = Mock(return_value=original_process)
+    monkeypatch.setattr("psutil.Process", process_factory)
+    proc = ZygoteRunnerProc(123, ZygoteManager())
+    process_factory.side_effect = AssertionError("must not recapture a recycled PID")
+
+    getattr(proc, operation)()
+
+    original_process.send_signal.assert_called_once_with(
+        signal.SIGTERM if operation == "terminate" else signal.SIGKILL
+    )
+    assert proc.returncode is None
+
+
 def test_stop_forked_runner_does_not_wait_for_control_lock(
     manager: ZygoteManager, tmp_path: Path
 ) -> None:
@@ -596,19 +634,26 @@ def test_stop_forked_runner_waits_for_exit_without_consuming_its_status(ignore_t
             child.stdout.close()
 
 
-def test_stop_forked_runner_preserves_cached_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("operation", ["stop", "terminate", "kill"])
+def test_forked_runner_preserves_cached_exit(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
     proc = ZygoteRunnerProc(os.getpid(), ZygoteManager())
     proc.returncode = 7
+    signal_pid = Mock()
+    monkeypatch.setattr(os, "kill", signal_pid)
     monkeypatch.setattr("psutil.Process.terminate", lambda _self: pytest.fail("already exited"))
 
-    HostProcess._stop_runner_proc(proc)
+    getattr(proc, operation)()
 
     assert proc.returncode == 7
+    signal_pid.assert_not_called()
 
 
+@pytest.mark.parametrize("operation", ["stop", "terminate", "kill"])
 @pytest.mark.parametrize("already_gone", [False, True], ids=["reused", "gone-before-handle"])
-def test_stop_forked_runner_does_not_signal_a_missing_identity(
-    monkeypatch: pytest.MonkeyPatch, already_gone: bool
+def test_forked_runner_does_not_signal_a_missing_identity(
+    monkeypatch: pytest.MonkeyPatch, already_gone: bool, operation: str
 ) -> None:
     original_process = Mock()
     original_process.is_running.return_value = False
@@ -618,11 +663,15 @@ def test_stop_forked_runner_does_not_signal_a_missing_identity(
     monkeypatch.setattr("psutil.Process", process_factory)
     proc = ZygoteRunnerProc(123, ZygoteManager())
     process_factory.side_effect = AssertionError("must not recapture a recycled PID")
+    signal_pid = Mock()
+    monkeypatch.setattr(os, "kill", signal_pid)
 
-    HostProcess._stop_runner_proc(proc)
+    getattr(proc, operation)()
 
     original_process.terminate.assert_not_called()
     original_process.kill.assert_not_called()
+    original_process.send_signal.assert_not_called()
+    signal_pid.assert_not_called()
     assert proc.returncode is None
 
 
