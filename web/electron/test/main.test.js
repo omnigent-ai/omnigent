@@ -4380,7 +4380,8 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
 
     network.verdict = "allow";
     await until(() => h.calls.loadURL.length === 2, "the reconnect");
-    assert.deepEqual(h.calls.loadURL.at(-1), [workspace]);
+    // Back on the page the user was on before Cancel.
+    assert.deepEqual(h.calls.loadURL.at(-1), [`${workspace}/c/123`]);
     assert.equal(h.api.windows.get(h.win).origin, origin);
     assert.equal(h.overlay.hint, null);
     await wait(80);
@@ -4448,10 +4449,24 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
     assert.equal(network.browserSignIns, 0);
   });
 
-  // [Connect target, its URL (null: the setup page's pre-filled server), page loaded]
-  for (const [label, connectTo, landing] of [
-    ["the linked account host", null, `${workspace}/c/conv_1`],
-    ["another server", "https://server.example/", "https://server.example/"],
+  // [Connect target, its URL (null: the setup page's pre-filled server), page loaded,
+  //  window server, browser sign-ins]
+  for (const [label, connectTo, landing, windowServer, signIns] of [
+    ["the linked account host", null, `${workspace}/c/conv_1`, workspace, 1],
+    [
+      "a workspace on the account host",
+      "https://accounts.cloud.databricks.com/omnigent?o=123",
+      workspace,
+      workspace,
+      1,
+    ],
+    [
+      "another server",
+      "https://server.example/",
+      "https://server.example/",
+      "https://server.example/",
+      0,
+    ],
   ]) {
     it(`opens Connect to ${label} after an account-host deep link needs sign-in`, async (t) => {
       const accountOrigin = "https://accounts.cloud.databricks.com";
@@ -4479,7 +4494,9 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
         network,
         deepLinks: require("../src/deepLink"),
         expandWorkspace: async (url) =>
-          new URL(url).origin === accountOrigin ? `${accountOrigin}/omnigent` : url,
+          new URL(url).origin === accountOrigin
+            ? `${accountOrigin}/omnigent${new URL(url).search}`
+            : url,
       });
       t.after(h.cleanup);
       h.api.registerIpc();
@@ -4498,8 +4515,8 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       }
       await connecting;
       assert.deepEqual(h.calls.loadURL, [[landing]]);
-      assert.equal(h.api.windows.get(h.win).serverUrl, connectTo ?? workspace);
-      assert.equal(network.browserSignIns, connectTo ? 0 : 1);
+      assert.equal(h.api.windows.get(h.win).serverUrl, windowServer);
+      assert.equal(network.browserSignIns, signIns);
     });
   }
 

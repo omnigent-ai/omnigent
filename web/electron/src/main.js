@@ -1006,7 +1006,7 @@ function stopReconnect(win) {
   });
   // An in-flight attempt may have re-pinned the window; hold it for setup again.
   databricksAuth?.rejectConnection(win);
-  showConnectFailure(win, state.serverUrl, state.finalMessage);
+  showConnectFailure(win, state.serverUrl, state.finalMessage, state.returnUrl);
 }
 
 /**
