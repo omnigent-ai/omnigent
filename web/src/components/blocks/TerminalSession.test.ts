@@ -770,6 +770,33 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
+  it.each([false, true])(
+    "submits only on request through the input transport (bracketed paste: %s)",
+    async (bracketed) => {
+      const { socket, session } = makeSession();
+      const term = (session as unknown as { term: Terminal }).term;
+      const command = "printf 'hello λ'\npwd";
+      const inputFrames = () =>
+        socket.sent.flatMap((frame) =>
+          typeof frame === "string" ? [] : [new TextDecoder().decode(frame)],
+        );
+      expect(session.submitCommand(command)).toBe(false);
+      expect(inputFrames()).toEqual([]);
+      socket.open();
+      await new Promise<void>((resolve) => {
+        term.write(bracketed ? "\x1b[?2004h" : "", resolve);
+      });
+      expect(inputFrames()).toEqual([]);
+      expect(session.submitCommand(command)).toBe(true);
+      const pasted = command.replaceAll("\n", "\r");
+      expect(inputFrames()).toEqual([bracketed ? `\x1b[200~${pasted}\x1b[201~` : pasted, "\r"]);
+      socket.close();
+      expect(session.submitCommand("pwd")).toBe(false);
+      expect(inputFrames()).toHaveLength(2);
+      session.dispose();
+    },
+  );
+
   it("grabs keyboard focus on open when focusOnConnect is set", () => {
     // WHY: a foreground surface should claim the keyboard as it comes up.
     const { socket, session } = makeSession();

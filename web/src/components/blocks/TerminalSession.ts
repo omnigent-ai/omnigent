@@ -999,6 +999,14 @@ export class TerminalSession {
     this.term.focus();
   }
 
+  /** Send an edited command only after the user explicitly submits it. */
+  submitCommand(text: string): boolean {
+    if (this.disposed || this.ws.readyState !== WebSocket.OPEN) return false;
+    this.term.paste(text);
+    this.term.input("\r", true);
+    return true;
+  }
+
   /**
    * Update the terminal's code font without reconnecting —
    * mirrors {@link setTheme}, mutating options in place. A new glyph size

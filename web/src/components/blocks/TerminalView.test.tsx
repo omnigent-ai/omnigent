@@ -10,10 +10,11 @@ import type * as TerminalSessionModule from "./TerminalSession";
 import type * as TerminalsModule from "@/lib/terminals";
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { StrictMode, act, useMemo, type ReactElement } from "react";
+import { StrictMode, act, useMemo, useState, type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Toaster } from "@/components/ui/sonner";
 import { FileViewerContext, type OpenFileOptions } from "@/shell/FileViewerContext";
+import { ShellCommandDraftContext } from "@/shell/ShellCommandContext";
 import { toast } from "sonner";
 import * as host from "@/lib/host";
 import { isHostKeyless, setSessionHost } from "@/lib/sessionHost";
@@ -73,6 +74,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     url: string;
     container: HTMLDivElement;
     clipboardEnabled: boolean;
+    focusOnConnect: boolean;
     adaptCodexPalette: boolean;
     onClipboardRequest?: (text: string, copyEvent?: ClipboardEvent) => void;
     onFileLink?: (uri: string) => boolean;
@@ -82,6 +84,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
+    submitCommand: ReturnType<typeof vi.fn>;
   }[],
 }));
 
@@ -94,6 +97,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
     focus = vi.fn();
+    submitCommand = vi.fn(() => true);
 
     constructor(
       container: HTMLDivElement,
@@ -104,7 +108,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
       _onInput?: () => void,
       clipboardEnabled = true,
       onClipboardRequest?: (text: string, copyEvent?: ClipboardEvent) => void,
-      _focusOnConnect = true,
+      focusOnConnect = true,
       adaptCodexPalette = false,
       onFileLink?: (uri: string) => boolean,
     ) {
@@ -112,6 +116,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         url,
         container,
         clipboardEnabled,
+        focusOnConnect,
         adaptCodexPalette,
         onClipboardRequest,
         onFileLink,
@@ -121,6 +126,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
         focus: this.focus,
+        submitCommand: this.submitCommand,
       });
     }
   },
@@ -1280,6 +1286,91 @@ describe("terminal clipboard", () => {
     expect(clipboardMock.copyText).toHaveBeenCalledTimes(2);
     expect(visibleClipboardConsent()).toHaveTextContent("Copy needs a click");
   });
+});
+
+describe("shell command draft", () => {
+  function DraftTerminal({
+    active = true,
+    readOnly = false,
+    terminalId = "terminal_bash_s1",
+  } = {}) {
+    const [drafts, setDrafts] = useState<Record<string, string>>({
+      "conv_abc:terminal_bash_s1": "printf hello\npwd",
+    });
+    const draftContext = useMemo(
+      () => ({
+        drafts,
+        setDraft: (key: string, command: string | null) =>
+          setDrafts((current) => {
+            if (command !== null) return { ...current, [key]: command };
+            const { [key]: _removedDraft, ...remainingDrafts } = current;
+            return remainingDrafts;
+          }),
+      }),
+      [drafts],
+    );
+    return (
+      <ShellCommandDraftContext.Provider value={draftContext}>
+        <TerminalView
+          sessionId="conv_abc"
+          terminalId={terminalId}
+          active={active}
+          readOnly={readOnly}
+        />
+      </ShellCommandDraftContext.Provider>
+    );
+  }
+
+  it("keeps the command editable until Enter explicitly submits the edited text", async () => {
+    render(<DraftTerminal />);
+    const input = screen.getByRole("textbox", { name: "Shell command" });
+    expect(input).toHaveValue("printf hello\npwd");
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const terminal = terminalSessionMock.instances[0];
+    expect(terminal.focusOnConnect).toBe(false);
+    act(() => terminal.onState({ kind: "connected" }));
+    expect(input).toHaveFocus();
+    expect(terminal.submitCommand).not.toHaveBeenCalled();
+    expect(fireEvent.keyDown(input, { key: "Enter", shiftKey: true })).toBe(true);
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    expect(terminal.submitCommand).not.toHaveBeenCalled();
+    fireEvent.change(input, { target: { value: "printf edited\npwd" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(terminal.submitCommand).toHaveBeenCalledExactlyOnceWith("printf edited\npwd");
+    expect(screen.queryByRole("textbox", { name: "Shell command" })).toBeNull();
+    expect(terminal.focus).toHaveBeenCalledOnce();
+    expect(terminalSessionMock.instances).toHaveLength(1);
+  });
+
+  it("preserves disconnected or unsent edits and allows cancellation without sending", async () => {
+    render(<DraftTerminal />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const terminal = terminalSessionMock.instances[0];
+    const input = screen.getByRole("textbox", { name: "Shell command" });
+    fireEvent.change(input, { target: { value: "printf edited" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByRole("button", { name: "Run command" })).toBeDisabled();
+    expect(terminal.submitCommand).not.toHaveBeenCalled();
+    act(() => terminal.onState({ kind: "connected" }));
+    expect(terminal.submitCommand).not.toHaveBeenCalled();
+    terminal.submitCommand.mockReturnValue(false);
+    fireEvent.click(screen.getByRole("button", { name: "Run command" }));
+    expect(input).toHaveValue("printf edited");
+    act(() => terminal.onState({ kind: "closed", code: 4405, reason: "detached" }));
+    expect(input).toBeEnabled();
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.queryByRole("textbox", { name: "Shell command" })).toBeNull();
+    expect(terminal.submitCommand).toHaveBeenCalledExactlyOnceWith("printf edited");
+  });
+
+  it.each([{ active: false }, { readOnly: true }, { terminalId: "terminal_bash_other" }])(
+    "does not expose the draft on an ineligible surface: %j",
+    (props) => {
+      render(<DraftTerminal {...props} />);
+      expect(screen.queryByRole("textbox", { name: "Shell command" })).toBeNull();
+    },
+  );
 });
 
 describe("hidden pre-warmed surface", () => {
