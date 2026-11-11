@@ -86,13 +86,23 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
 }));
 vi.mock("@/hooks/useAutomationInbox", () => ({ useAutomationInbox: vi.fn() }));
 vi.mock("@/hooks/useProactiveInbox", () => ({ useProactiveInbox: vi.fn() }));
+// The settings query: `settings` undefined with `available` means still loading
+// or failed, which the page must not read as "no suggestions".
 const advisor = vi.hoisted(() => ({
+  available: true,
   settings: { enabled: true } as { enabled: boolean } | undefined,
+  failed: false,
+  refetch: (() => {}) as () => void,
 }));
 vi.mock("@/hooks/useProactiveAgentSettings", () => ({
   useProactiveAgentSettings: () => ({
-    available: advisor.settings !== undefined,
-    settings: advisor.settings,
+    available: advisor.available,
+    settings: advisor.available ? advisor.settings : undefined,
+    query: {
+      isPending: advisor.available && advisor.settings === undefined && !advisor.failed,
+      isError: advisor.available && advisor.failed,
+      refetch: advisor.refetch,
+    },
   }),
 }));
 vi.mock("@/hooks/useCommentInbox", () => ({ useCommentInbox: vi.fn() }));
@@ -221,7 +231,10 @@ function proactiveInboxStub(overrides: Record<string, unknown> = {}) {
 }
 
 beforeEach(() => {
+  advisor.available = true;
   advisor.settings = { enabled: true };
+  advisor.failed = false;
+  advisor.refetch = vi.fn();
   window.localStorage.removeItem("omnigent:inbox-filter");
   vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(automationInboxStub());
   vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(proactiveInboxStub());
@@ -1856,6 +1869,34 @@ describe("agent suggestions", () => {
     expect(screen.queryByText("Nothing waiting on you")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Retry suggestions" }));
     expect(refetch).toHaveBeenCalledOnce();
+  });
+
+  it("keeps loading while the Omni Advisor settings are unknown", () => {
+    window.localStorage.setItem("omnigent:inbox-filter", "advisor");
+    advisor.settings = undefined;
+    stub({ items: [], enabled: false });
+    renderPage();
+
+    expect(screen.getByRole("tab", { name: "Omni Advisor" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByText("Loading inbox…")).toBeInTheDocument();
+    expect(screen.queryByText("No suggestions from Omni Advisor")).toBeNull();
+  });
+
+  it("shows a settings load failure instead of an empty Omni Advisor tab", () => {
+    window.localStorage.setItem("omnigent:inbox-filter", "advisor");
+    advisor.settings = undefined;
+    advisor.failed = true;
+    stub({ items: [], enabled: false });
+    renderPage();
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t load Omni Advisor settings");
+    expect(screen.queryByText("No suggestions from Omni Advisor")).toBeNull();
+    expect(screen.queryByText("Loading inbox…")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry settings" }));
+    expect(advisor.refetch).toHaveBeenCalledOnce();
   });
 
   it("takes an agent action and opens the composer with its prompt", () => {

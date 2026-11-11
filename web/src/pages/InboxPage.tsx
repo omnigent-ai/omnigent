@@ -251,10 +251,18 @@ export function InboxPage() {
   const navigate = useNavigate();
   const taskDetailsEnabled = isFeatureEnabled(useServerInfo(), "automations_v2");
   const [storedFilter, setFilter] = useState<InboxFilter>(readInboxFilter);
-  const { available: advisorAvailable, settings: advisorSettings } = useProactiveAgentSettings();
+  const {
+    available: advisorAvailable,
+    settings: advisorSettings,
+    query: advisorSettingsQuery,
+  } = useProactiveAgentSettings();
   // The Omni Advisor tab exists only while the agent is on for the viewer; it
   // stays selected while that is still loading.
   const advisorTab = advisorAvailable && advisorSettings?.enabled !== false;
+  // Suggestions load only once the settings say the agent is on, so until they
+  // arrive the page is still assembling, and a failed read is a failure to show.
+  const advisorSettingsPending = advisorAvailable && advisorSettingsQuery.isPending;
+  const advisorSettingsFailed = advisorAvailable && advisorSettingsQuery.isError;
   const filter: InboxFilter = storedFilter === "advisor" && !advisorTab ? "all" : storedFilter;
   const advisorOnly = filter === "advisor";
   // The Unread tab pages through unread suggestions only, so an older unread
@@ -489,7 +497,7 @@ export function InboxPage() {
         snapshotQueries.some((q) => q.isLoading) ||
         commentInbox.isLoading)) ||
     (showUnread && automationInbox.isLoading) ||
-    (showSuggestions && proactiveInbox.isLoading);
+    (showSuggestions && (advisorSettingsPending || proactiveInbox.isLoading));
   const failedSnapshots = snapshotQueries.filter((q) => q.isError);
   const failedSessionCount = advisorOnly
     ? 0
@@ -1100,6 +1108,20 @@ export function InboxPage() {
         </div>
       )}
 
+      {showSuggestions && advisorSettingsFailed && (
+        <div role="alert" className="mb-4 flex items-center gap-2 text-ui text-destructive">
+          Couldn’t load {PROACTIVE_AGENT_DISPLAY_NAME} settings, so its suggestions are not shown.
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void advisorSettingsQuery.refetch()}
+            componentId="inbox.retry_advisor_settings"
+          >
+            Retry settings
+          </Button>
+        </div>
+      )}
+
       {showSuggestions && proactiveInbox.isError && (
         <div role="alert" className="mb-4 flex items-center gap-2 text-ui text-destructive">
           Couldn’t load suggestions.
@@ -1138,7 +1160,7 @@ export function InboxPage() {
       {!assembling &&
         failedSessionCount === 0 &&
         !(showUnread && automationInbox.isError) &&
-        !(showSuggestions && proactiveInbox.isError) &&
+        !(showSuggestions && (advisorSettingsFailed || proactiveInbox.isError)) &&
         visibleCount === 0 && (
           <div className="flex flex-col items-center gap-2 py-16 text-center">
             <InboxIcon className="size-8 text-muted-foreground/50" />
