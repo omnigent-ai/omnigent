@@ -15,7 +15,6 @@ from typing import Any
 
 import httpx
 
-from omnigent.harnesses.grok_native.client import GrokAcpClient
 from omnigent.harnesses.grok_native.items import MirroredItem, session_update_to_items
 
 logger = logging.getLogger(__name__)
