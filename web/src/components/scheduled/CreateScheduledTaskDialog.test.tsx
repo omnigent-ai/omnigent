@@ -115,93 +115,128 @@ vi.mock("@/shell/WorkspacePicker", () => ({
 // so we can test the dialog's selection→payload mapping + dismiss-guard without
 // the real Radix menu / QueryClient. Two entries mirror the two mapping cases:
 // a bare harness (claude-native-ui) and a plain agent (polly).
-vi.mock("@/shell/NewChatDialog", () => ({
-  AgentHarnessPicker: ({
-    onSelectAgent,
-    onOpenChange,
-    effectiveAgentId,
-    agentLabel,
-    host,
-    dropdownModal,
-    contentClassName,
-    harnessEntries,
-    agentEntries,
-    curatedEntries,
-    sandboxSelected,
-    hasAgents,
-    loading,
-  }: {
-    onSelectAgent: (a: AvailableAgent) => void;
-    onOpenChange?: (open: boolean) => void;
-    effectiveAgentId: string | null;
-    agentLabel: string;
-    host?: { host_id: string } | null;
-    dropdownModal?: boolean;
-    contentClassName?: string;
-    harnessEntries: AvailableAgent[];
-    agentEntries: AvailableAgent[];
-    curatedEntries?: AvailableAgent[];
-    sandboxSelected: boolean;
-    hasAgents: boolean;
-    loading?: boolean;
-  }) => (
-    <fieldset
-      disabled={loading}
-      data-testid="agent-picker-stub"
-      data-effective={effectiveAgentId ?? ""}
-      // Surface the host the dialog feeds the picker for badge computation, so
-      // a test can assert it's populated even when no host is pinned.
-      data-badge-host={host?.host_id ?? ""}
-      data-dropdown-modal={dropdownModal === false ? "false" : "true"}
-      data-content-class={contentClassName}
-      data-harness-entries={harnessEntries.map((agent) => agent.name).join(",")}
-      data-agent-entries={agentEntries.map((agent) => agent.name).join(",")}
-      data-curated-entries={curatedEntries?.map((agent) => agent.name).join(",")}
-      data-sandbox-selected={String(sandboxSelected)}
-    >
-      <span>{hasAgents ? agentLabel : "No agents"}</span>
-      {harnessEntries
-        .filter((agent) => agent.name !== "claude-native-ui")
-        .map((agent) => (
-          <button key={agent.id} type="button" onClick={() => onSelectAgent(agent)}>
-            pick {agent.harness}
+vi.mock("@/shell/NewChatDialog", async () => {
+  const { useState } = await import("react");
+  const { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } =
+    await import("@/components/ui/dropdown-menu");
+  // The real picker shows the selected entry's model/effort flyout from its Edit row.
+  function ConfigMenu({ content }: { content: React.ReactNode }) {
+    const [menuOpen, setMenuOpen] = useState(false);
+    return (
+      <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen} modal={false}>
+        <DropdownMenuTrigger asChild>
+          <button type="button" data-testid="picker-config-open">
+            edit
           </button>
-        ))}
+        </DropdownMenuTrigger>
+        <DropdownMenuContent data-testid="picker-config">{content}</DropdownMenuContent>
+      </DropdownMenu>
+    );
+  }
+  return {
+    AgentHarnessPicker: ({
+      onSelectAgent,
+      onOpenChange,
+      effectiveAgentId,
+      agentLabel,
+      host,
+      dropdownModal,
+      contentClassName,
+      harnessEntries,
+      agentEntries,
+      curatedEntries,
+      sandboxSelected,
+      hasAgents,
+      loading,
+      triggerDetails,
+      selectedConfigContent,
+      isEntryConfigurable,
+    }: {
+      onSelectAgent: (a: AvailableAgent) => void;
+      onOpenChange?: (open: boolean) => void;
+      effectiveAgentId: string | null;
+      agentLabel: string;
+      host?: { host_id: string } | null;
+      dropdownModal?: boolean;
+      contentClassName?: string;
+      harnessEntries: AvailableAgent[];
+      agentEntries: AvailableAgent[];
+      curatedEntries?: AvailableAgent[];
+      sandboxSelected: boolean;
+      hasAgents: boolean;
+      loading?: boolean;
+      triggerDetails?: readonly { label: string; value: string }[];
+      selectedConfigContent?: React.ReactNode;
+      isEntryConfigurable?: (agent: AvailableAgent) => boolean;
+    }) => (
+      <fieldset
+        disabled={loading}
+        data-testid="agent-picker-stub"
+        data-effective={effectiveAgentId ?? ""}
+        // Surface the host the dialog feeds the picker for badge computation, so
+        // a test can assert it's populated even when no host is pinned.
+        data-badge-host={host?.host_id ?? ""}
+        data-dropdown-modal={dropdownModal === false ? "false" : "true"}
+        data-content-class={contentClassName}
+        data-harness-entries={harnessEntries.map((agent) => agent.name).join(",")}
+        data-agent-entries={agentEntries.map((agent) => agent.name).join(",")}
+        data-curated-entries={curatedEntries?.map((agent) => agent.name).join(",")}
+        data-sandbox-selected={String(sandboxSelected)}
+        data-trigger-details={(triggerDetails ?? [])
+          .map((detail) => `${detail.label}: ${detail.value}`)
+          .join(", ")}
+        data-configurable={String(
+          [...harnessEntries, ...agentEntries]
+            .filter((agent) => isEntryConfigurable?.(agent))
+            .map((agent) => agent.name)
+            .join(","),
+        )}
+      >
+        <span>{hasAgents ? agentLabel : "No agents"}</span>
+        {selectedConfigContent != null && <ConfigMenu content={selectedConfigContent} />}
+        {harnessEntries
+          .filter((agent) => agent.name !== "claude-native-ui")
+          .map((agent) => (
+            <button key={agent.id} type="button" onClick={() => onSelectAgent(agent)}>
+              pick {agent.harness}
+            </button>
+          ))}
 
-      <button
-        type="button"
-        data-testid="pick-harness-claude"
-        onClick={() =>
-          onSelectAgent(
-            testAgent("ag_claude_native", "claude-native-ui", {
-              display_name: "Claude Code",
-              harness: "claude-native",
-            }),
-          )
-        }
-      >
-        pick claude harness
-      </button>
-      <button
-        type="button"
-        data-testid="pick-agent-polly"
-        onClick={() =>
-          onSelectAgent(
-            testAgent("ag_1", "polly", { display_name: "Polly", harness: "claude-sdk" }),
-          )
-        }
-      >
-        pick polly
-      </button>
-      <button type="button" data-testid="picker-open" onClick={() => onOpenChange?.(true)}>
-        open
-      </button>
-      <button type="button" data-testid="picker-close" onClick={() => onOpenChange?.(false)}>
-        close
-      </button>
-    </fieldset>
-  ),
-}));
+        <button
+          type="button"
+          data-testid="pick-harness-claude"
+          onClick={() =>
+            onSelectAgent(
+              testAgent("ag_claude_native", "claude-native-ui", {
+                display_name: "Claude Code",
+                harness: "claude-native",
+              }),
+            )
+          }
+        >
+          pick claude harness
+        </button>
+        <button
+          type="button"
+          data-testid="pick-agent-polly"
+          onClick={() =>
+            onSelectAgent(
+              testAgent("ag_1", "polly", { display_name: "Polly", harness: "claude-sdk" }),
+            )
+          }
+        >
+          pick polly
+        </button>
+        <button type="button" data-testid="picker-open" onClick={() => onOpenChange?.(true)}>
+          open
+        </button>
+        <button type="button" data-testid="picker-close" onClick={() => onOpenChange?.(false)}>
+          close
+        </button>
+      </fieldset>
+    ),
+  };
+});
 
 const AGENTS: AvailableAgent[] = [
   testAgent("ag_1", "polly", { display_name: "Polly", harness: "claude-sdk" }),
@@ -310,6 +345,94 @@ function renderWithSandboxes(onOpenChange: (open: boolean) => void = vi.fn()) {
       <CreateScheduledTaskDialog open onOpenChange={onOpenChange} />
     </CapabilitiesProvider>,
   );
+}
+
+/** The model/effort the agent picker's trigger shows, e.g. "Model: Opus, Effort: High". */
+function pickerDetails(): string {
+  return screen.getByTestId("agent-picker-stub").getAttribute("data-trigger-details") ?? "";
+}
+
+/** Open the agent picker's model/effort flyout (the real picker's Edit row). */
+function openPickerConfig(): HTMLElement {
+  if (!screen.queryByTestId("picker-config")) {
+    fireEvent.keyDown(screen.getByTestId("picker-config-open"), { key: "Enter" });
+  }
+  return screen.getByTestId("picker-config");
+}
+
+function closePickerConfig() {
+  if (screen.queryByTestId("picker-config")) {
+    fireEvent.keyDown(screen.getByTestId("picker-config-open"), { key: "Enter" });
+  }
+}
+
+/** The flyout's Models or Effort section, or null when the agent offers none. */
+function pickerSection(section: "model" | "effort"): HTMLElement | null {
+  if (!screen.queryByTestId("picker-config-open")) return null;
+  const menu = openPickerConfig();
+  return within(menu).queryByTestId(
+    section === "model" ? "task-agent-models" : "task-agent-efforts",
+  );
+}
+
+/** Whether the agent picker offers a Models or Effort section; leaves the flyout closed. */
+function hasPickerSection(section: "model" | "effort"): boolean {
+  const present = pickerSection(section) !== null;
+  closePickerConfig();
+  return present;
+}
+
+/** A Models or Effort row in the flyout, by its label. Leaves the flyout open. */
+function pickerOption(section: "model" | "effort", name: string): HTMLElement {
+  const group = pickerSection(section);
+  if (!group) throw new Error(`No ${section} section in the agent picker`);
+  return within(group).getByRole("menuitemcheckbox", { name });
+}
+
+/** The labels of a flyout section's rows; closes the flyout again. */
+function pickerOptionLabels(section: "model" | "effort"): string[] {
+  const group = pickerSection(section);
+  const labels = group
+    ? within(group)
+        .getAllByRole("menuitemcheckbox")
+        .map((item) => item.textContent ?? "")
+    : [];
+  closePickerConfig();
+  return labels;
+}
+
+/** The checked row's label in a flyout section; closes the flyout again. */
+function pickerChecked(section: "model" | "effort"): string | null {
+  const group = pickerSection(section);
+  const checked =
+    group?.querySelector('[role="menuitemcheckbox"][aria-checked="true"]')?.textContent ?? null;
+  closePickerConfig();
+  return checked;
+}
+
+/** Whether a flyout section's rows are locked (an existing session owns them). */
+function pickerLocked(section: "model" | "effort"): boolean {
+  const group = pickerSection(section);
+  if (!group) throw new Error(`No ${section} section in the agent picker`);
+  const items = within(group).getAllByRole("menuitemcheckbox");
+  const locked = items.every((item) => item.hasAttribute("data-disabled"));
+  closePickerConfig();
+  return locked;
+}
+
+/** Whether model, effort (in the picker) and permission (in Advanced) are all locked or all editable. */
+function expectLaunchSettingsLocked(locked: boolean) {
+  expect(pickerLocked("model")).toBe(locked);
+  expect(pickerLocked("effort")).toBe(locked);
+  const permission = screen.getByTestId("task-permission-trigger");
+  if (locked) expect(permission).toBeDisabled();
+  else expect(permission).toBeEnabled();
+}
+
+/** Pick a model or effort row in the agent picker's flyout, then close it. */
+function pickInPicker(section: "model" | "effort", name: string) {
+  fireEvent.click(pickerOption(section, name));
+  closePickerConfig();
 }
 
 function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask> = {}) {
@@ -479,7 +602,9 @@ describe("prompt-first automation setup", () => {
     );
     const advanced = screen.getByRole("button", { name: "Advanced" });
     expect(advanced).toHaveAttribute("aria-expanded", "false");
-    expect(advanced).toHaveTextContent("Opus · High");
+    // The agent picker shows model and effort; Advanced no longer repeats them.
+    expect(pickerDetails()).toBe("Model: Opus, Effort: High");
+    expect(advanced).not.toHaveTextContent("Opus");
     fireEvent.change(screen.getByLabelText("Instructions"), {
       target: { value: "Also summarize CI failures" },
     });
@@ -600,8 +725,8 @@ describe("agent picker readiness (needs-setup badges)", () => {
     fireEvent.click(screen.getByTestId("task-host-trigger"));
     fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
     expect(screen.getByTestId("pick-harness-claude")).toBeDisabled();
-    expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
-    expect(screen.getByTestId("task-effort-trigger")).toBeDisabled();
+    // The picker, and with it the model/effort flyout, waits too.
+    expect(screen.getByTestId("picker-config-open")).toBeDisabled();
     const permission = screen.getByTestId("task-permission-trigger");
     expect(permission).toBeDisabled();
     await userEvent.click(permission);
@@ -630,7 +755,7 @@ describe("agent picker readiness (needs-setup badges)", () => {
     expect(picker).toHaveAttribute("data-curated-entries", "codex-native-ui");
     expect(picker).toHaveAttribute("data-harness-entries", "codex-native-ui");
     expect(picker).toHaveAttribute("data-effective", "ag_codex");
-    expect(screen.getByTestId("task-model-trigger")).toBeEnabled();
+    expect(screen.getByTestId("picker-config-open")).toBeEnabled();
     expect(screen.getByTestId("task-permission-trigger")).toBeEnabled();
     expect(submit).toBeEnabled();
     fireEvent.click(submit);
@@ -749,13 +874,14 @@ describe("agent picker readiness (needs-setup badges)", () => {
       "true",
     );
     // The default effective agent is claude-native-ui (a capable native coding
-    // agent), so the model/effort pickers render and the "uses defaults" hint —
-    // shown only when the controls are hidden — is absent.
-    expect(screen.getByTestId("task-model-effort-field")).toBeInTheDocument();
-    expect(screen.getByTestId("task-model-trigger")).toBeInTheDocument();
-    expect(screen.getByTestId("task-effort-trigger")).toBeInTheDocument();
+    // agent), so its picker offers model/effort, Advanced offers permissions, and
+    // the "uses defaults" hint — shown only when the controls are hidden — is absent.
+    expect(screen.getByTestId("task-launch-settings-field")).toBeInTheDocument();
+    expect(screen.getByTestId("task-permission-trigger")).toBeInTheDocument();
+    expect(pickerOptionLabels("model").length).toBeGreaterThan(1);
+    expect(pickerOptionLabels("effort").length).toBeGreaterThan(1);
     expect(
-      screen.queryByText("Uses this agent's default model, effort, and permission settings"),
+      screen.queryByText("Uses this agent's default permission settings"),
     ).not.toBeInTheDocument();
   });
 
@@ -1258,26 +1384,25 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
       const sessionLock = /This automation continues in an existing session/;
       if (editing) {
         expect(screen.getByText(sessionLock)).toBeInTheDocument();
-        expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+        expect(pickerLocked("model")).toBe(true);
         expect(screen.getByTestId("task-permission-trigger")).toBeDisabled();
       }
       if (exercisesRestoration) {
         fireEvent.keyDown(screen.getByLabelText("Repository"), { key: "Enter" });
         fireEvent.click(await screen.findByRole("option", { name: "universe" }));
         expect(screen.queryByText(sessionLock)).not.toBeInTheDocument();
-        expect(screen.getByTestId("task-model-trigger")).toBeEnabled();
+        expect(pickerLocked("model")).toBe(false);
         expect(screen.getByTestId("task-permission-trigger")).toBeEnabled();
         fireEvent.keyDown(screen.getByLabelText("Repository"), { key: "Enter" });
         fireEvent.click(await screen.findByRole("option", { name: label }));
         expect(screen.getByText(sessionLock)).toBeInTheDocument();
-        expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+        expect(pickerLocked("model")).toBe(true);
         expect(screen.getByTestId("task-permission-trigger")).toBeDisabled();
-        expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
-        expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
+        expect(pickerDetails()).toBe("Model: Sonnet, Effort: Medium");
         expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Accept edits");
-        expect(screen.getByRole("button", { name: "Advanced" })).toHaveTextContent(
-          "Sonnet · Medium · Accept edits",
-        );
+        const advanced = screen.getByRole("button", { name: "Advanced" });
+        expect(advanced).toHaveTextContent("Accept edits");
+        expect(advanced).not.toHaveTextContent("Sonnet");
       }
       if (pick !== null) {
         fireEvent.keyDown(screen.getByLabelText("Repository"), { key: "Enter" });
@@ -2014,32 +2139,39 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
       "aria-expanded",
       "false",
     );
-    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-permission-trigger")).not.toBeInTheDocument();
   });
 
   it("renders model + effort for a capable (Claude-native) agent, hides them for a plain agent", () => {
     renderDialog();
-    // Default effective agent is the capable claude-native harness → controls show.
-    expect(screen.getByTestId("task-model-effort-field")).toBeInTheDocument();
+    // Default effective agent is the capable claude-native harness → controls show:
+    // model and effort in the agent picker, permissions under Advanced.
+    expect(screen.getByTestId("task-launch-settings-field")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute(
+      "data-configurable",
+      "claude-native-ui",
+    );
+    expect(pickerOptionLabels("model")).toContain("Opus");
 
     fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
     expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
       "aria-expanded",
       "false",
     );
-    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-permission-trigger")).not.toBeInTheDocument();
+    // The picker sits outside Advanced, so its settings stay reachable.
+    expect(pickerOptionLabels("effort")).toContain("High");
 
-    // Switch to Polly (claude-sdk, no permissionMode capability) → controls hide.
+    // Switch to Polly (claude-sdk, no model or permissionMode capability) → controls hide.
     fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
     fireEvent.click(screen.getByTestId("pick-agent-polly"));
     expect(screen.getByRole("button", { name: "Advanced" })).toBeVisible();
-    expect(screen.queryByTestId("task-model-effort-field")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("task-effort-trigger")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-launch-settings-field")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-permission-trigger")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("picker-config-open")).not.toBeInTheDocument();
+    expect(pickerDetails()).toBe("");
     // The "uses defaults" hint returns when the controls are hidden.
-    expect(
-      screen.getByText("Uses this agent's default model, effort, and permission settings"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("Uses this agent's default permission settings")).toBeInTheDocument();
   });
 
   it("sends the selected model + effort on create for a capable agent", async () => {
@@ -2047,22 +2179,20 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
 
-    // Pick a model (keyboard is the reliable jsdom path for Radix Select).
-    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "Opus" }));
-    // Pick an effort.
-    fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "High" }));
-    // Pick a permission mode.
+    // Pick a model and an effort in the agent picker's flyout.
+    pickInPicker("model", "Opus");
+    pickInPicker("effort", "High");
+    expect(pickerDetails()).toBe("Model: Opus, Effort: High");
+    // Pick a permission mode (keyboard is the reliable jsdom path for Radix Select).
     fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "Accept edits" }));
 
     // Collapsing and reopening keeps the chosen settings; collapsed settings still save.
     fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
-    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-permission-trigger")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
-    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Opus");
-    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("High");
+    expect(pickerChecked("model")).toBe("Opus");
+    expect(pickerChecked("effort")).toBe("High");
     expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Accept edits");
     fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
 
@@ -2125,13 +2255,14 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
         })}
       />,
     );
-    // Prefilled selections surface as the trigger's shown value.
-    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
-    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
+    // Prefilled selections surface on the picker trigger and as checked flyout rows.
+    expect(pickerDetails()).toBe("Model: Sonnet, Effort: Medium");
+    expect(pickerChecked("model")).toBe("Sonnet");
+    expect(pickerChecked("effort")).toBe("Medium");
     expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Accept edits");
-    for (const field of ["model", "effort", "permission"]) {
-      expect(screen.getByTestId(`task-${field}-trigger`)).toBeEnabled();
-    }
+    expect(pickerLocked("model")).toBe(false);
+    expect(pickerLocked("effort")).toBe(false);
+    expect(screen.getByTestId("task-permission-trigger")).toBeEnabled();
     expect(screen.queryByTestId("task-session-settings-note")).not.toBeInTheDocument();
   });
 
@@ -2156,9 +2287,11 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
           />
         </CapabilitiesProvider>,
       );
-      for (const field of ["model", "effort", "permission"]) {
-        expect(screen.getByTestId(`task-${field}-trigger`)).toBeDisabled();
-      }
+      expect(pickerLocked("model")).toBe(true);
+      expect(pickerLocked("effort")).toBe(true);
+      expect(within(openPickerConfig()).getByTestId("task-picker-session-locked")).toBeVisible();
+      closePickerConfig();
+      expect(screen.getByTestId("task-permission-trigger")).toBeDisabled();
       expect(screen.getByTestId("task-session-settings-note")).toHaveTextContent(
         "This automation continues in an existing session, so its model, effort, and permission mode are controlled by that session.",
       );
@@ -2204,30 +2337,23 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
 
       fireEvent.click(screen.getByTestId("task-workspace-browse"));
       fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
-      expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+      expect(pickerLocked("model")).toBe(true);
       fireEvent.click(screen.getByTestId("task-start-new-session"));
       expect(screen.queryByTestId("task-session-settings-note")).not.toBeInTheDocument();
-      for (const [field, option] of [
-        ["model", "Opus"],
-        ["effort", "High"],
-        ["permission", "Auto"],
-      ]) {
-        const control = screen.getByTestId(`task-${field}-trigger`);
-        expect(control).toBeEnabled();
-        fireEvent.keyDown(control, { key: "Enter" });
-        fireEvent.click(screen.getByRole("option", { name: option }));
-      }
+      expectLaunchSettingsLocked(false);
+      pickInPicker("model", "Opus");
+      pickInPicker("effort", "High");
+      const permission = screen.getByTestId("task-permission-trigger");
+      fireEvent.keyDown(permission, { key: "Enter" });
+      fireEvent.click(screen.getByRole("option", { name: "Auto" }));
       if (!reset) {
         fireEvent.click(screen.getByTestId("task-start-new-session"));
-        expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
-        expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
+        expect(pickerDetails()).toBe("Model: Sonnet, Effort: Medium");
         expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Plan");
-        expect(screen.getByRole("button", { name: "Advanced" })).toHaveTextContent(
-          "Sonnet · Medium · Plan",
-        );
-        for (const field of ["model", "effort", "permission"]) {
-          expect(screen.getByTestId(`task-${field}-trigger`)).toBeDisabled();
-        }
+        const advanced = screen.getByRole("button", { name: "Advanced" });
+        expect(advanced).toHaveTextContent("Plan");
+        expect(advanced).not.toHaveTextContent("Sonnet");
+        expectLaunchSettingsLocked(true);
       }
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
@@ -2300,9 +2426,7 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
         editingTask={scheduledTask({ agentId: "ag_claude_native", sessionMode: "continue" })}
       />,
     );
-    for (const field of ["model", "effort", "permission"]) {
-      expect(screen.getByTestId(`task-${field}-trigger`)).toBeEnabled();
-    }
+    expectLaunchSettingsLocked(false);
     expect(screen.queryByTestId("task-session-settings-note")).not.toBeInTheDocument();
   });
 
@@ -2327,16 +2451,14 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
           />
         </CapabilitiesProvider>,
       );
-      expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+      expect(pickerLocked("model")).toBe(true);
       if (change === "host") {
         fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
         fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
       } else {
         fireEvent.click(screen.getByRole("switch", { name: "Start each run in a new session" }));
       }
-      for (const field of ["model", "effort", "permission"]) {
-        expect(screen.getByTestId(`task-${field}-trigger`)).toBeEnabled();
-      }
+      expectLaunchSettingsLocked(false);
       expect(screen.queryByTestId("task-session-settings-note")).not.toBeInTheDocument();
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
@@ -2383,9 +2505,7 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
       fireEvent.click(screen.getByTestId("task-workspace-browse"));
       fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
       expect(screen.getByTestId("task-workspace-browse")).toHaveTextContent("/home/me/repo");
-      for (const field of ["model", "effort", "permission"]) {
-        expect(screen.getByTestId(`task-${field}-trigger`)).toBeDisabled();
-      }
+      expectLaunchSettingsLocked(true);
       expect(screen.getByTestId("task-session-settings-note")).toBeVisible();
       if (!sessionModesSupported) {
         expect(screen.queryByTestId("task-start-new-session")).not.toBeInTheDocument();
@@ -2415,8 +2535,7 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
       />,
     );
     // Reset the model back to Default; leave effort + permission untouched.
-    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+    pickInPicker("model", "Default");
 
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
@@ -2667,7 +2786,21 @@ describe("nested dropdowns do not dismiss the Dialog (isInsidePopper guard)", ()
     await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
   });
 
-  it.each(["host", "model", "effort", "permission", "project"])(
+  // Model and effort live in the agent picker's menu, whose open state the
+  // dialog tracks through the picker's onOpenChange.
+  it("Escape closes only the agent menu and keeps unsaved fields", () => {
+    const onOpenChange = vi.fn();
+    renderDialog(onOpenChange);
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Unsaved draft" } });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      fireEvent.click(screen.getByTestId("picker-open"));
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(screen.getByLabelText("Name")).toHaveValue("Unsaved draft");
+      expect(onOpenChange).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each(["host", "permission", "project"])(
     "Escape closes only the %s menu and keeps unsaved fields",
     (field) => {
       const onOpenChange = vi.fn();
@@ -4850,6 +4983,11 @@ describe("automation harness settings", () => {
     return agent;
   }
   async function choose(field: string, option: string) {
+    // Model and effort are picked in the agent picker's flyout, like the composer.
+    if (field === "model" || field === "effort") {
+      pickInPicker(field, option);
+      return;
+    }
     fireEvent.keyDown(screen.getByTestId(`task-${field}-trigger`), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: option }));
   }
@@ -4864,8 +5002,8 @@ describe("automation harness settings", () => {
   ])("shows independent settings for %s", (harness, model, effort, permission) => {
     mockHarness(harness);
     renderDialog();
-    expect(!!screen.queryByTestId("task-model-trigger")).toBe(model);
-    expect(!!screen.queryByTestId("task-effort-trigger")).toBe(effort);
+    expect(hasPickerSection("model")).toBe(model);
+    expect(hasPickerSection("effort")).toBe(effort);
     expect(!!screen.queryByTestId("task-permission-trigger")).toBe(permission);
     expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith("host_1", harness, model);
   });
@@ -4994,7 +5132,7 @@ describe("automation harness settings", () => {
     await choose("model", "Model A");
     await choose("effort", "High");
     await choose("model", "Model B");
-    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Default");
+    expect(pickerChecked("effort")).toBe("Default");
     await choose("effort", "Low");
     await choose("permission", "Read Only");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
@@ -5027,8 +5165,8 @@ describe("automation harness settings", () => {
         })}
       />,
     );
-    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("saved-model");
-    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("high");
+    expect(pickerChecked("model")).toBe("saved-model");
+    expect(pickerChecked("effort")).toBe("high");
     expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Read Only");
     expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith("host_1", "codex-native", false);
     await choose("model", "Default");
@@ -5061,7 +5199,7 @@ describe("automation harness settings", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: "pick cursor-native" }));
-    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+    expect(hasPickerSection("model")).toBe(false);
     expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Default");
     await choose("permission", "Auto-review");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
@@ -5094,10 +5232,9 @@ describe("automation harness settings", () => {
       render(sandboxDialog(agent.id, true));
       expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith(null, harness, false);
       await choose("model", "Sandbox model");
-      expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sandbox model");
-      fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
-      expect(screen.queryByRole("option", { name: "High" })).not.toBeInTheDocument();
-      fireEvent.click(await screen.findByRole("option", { name: "Low" }));
+      expect(pickerChecked("model")).toBe("Sandbox model");
+      expect(pickerOptionLabels("effort")).not.toContain("High");
+      await choose("effort", "Low");
       expect(sandboxModelsHook.useSandboxModelOptions).toHaveBeenLastCalledWith(
         "company",
         harness,
@@ -5155,8 +5292,8 @@ describe("automation harness settings", () => {
         },
       } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
       render(sandboxDialog(agent.id, true));
-      expect(screen.getByTestId("task-model-trigger")).toBeVisible();
-      expect(screen.queryByTestId("task-effort-trigger")).not.toBeInTheDocument();
+      expect(hasPickerSection("model")).toBe(true);
+      expect(hasPickerSection("effort")).toBe(false);
     },
   );
 
@@ -5195,12 +5332,11 @@ describe("automation harness settings", () => {
       };
       await changeTarget();
       fireEvent.click(screen.getByRole("button", { name: "pick codex-native" }));
-      expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Default");
-      fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
-      expect(screen.queryByRole("option", { name: "saved-model" })).not.toBeInTheDocument();
-      fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+      expect(pickerChecked("model")).toBe("Default");
+      expect(pickerOptionLabels("model")).not.toContain("saved-model");
+      await choose("model", "Default");
       await choose("host", "laptop");
-      expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("saved-model");
+      expect(pickerChecked("model")).toBe("saved-model");
       await changeTarget();
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
@@ -5217,10 +5353,10 @@ describe("automation harness settings", () => {
       data: { models, configured: false, status: "ready" },
     } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
     render(sandboxDialog(agent.id, true, { modelOverride: "model-a", reasoningEffort: "high" }));
-    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Model A");
-    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("High");
+    expect(pickerChecked("model")).toBe("Model A");
+    expect(pickerChecked("effort")).toBe("High");
     await choose("host", "laptop");
-    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+    expect(hasPickerSection("model")).toBe(false);
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
@@ -5286,7 +5422,7 @@ describe("automation harness settings", () => {
     vi.spyOn(identity, "getCurrentUserId").mockReturnValue("alice");
     mockHarness("codex-native");
     const first = renderDialog();
-    expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
+    expect(hasPickerSection("effort")).toBe(true);
     first.unmount();
     vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
       typeof hostsHook.useHostModelOptions
@@ -5296,22 +5432,21 @@ describe("automation harness settings", () => {
     } as ReturnType<typeof hostsHook.useHosts>);
     const { rerender } = renderDialog();
     await choose("host", "Offline host (offline)");
-    expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
+    expect(hasPickerSection("effort")).toBe(true);
     await choose("model", "Model A");
-    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Model A");
+    expect(pickerChecked("model")).toBe("Model A");
     vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: [] } as unknown as ReturnType<
       typeof hostsHook.useHostModelOptions
     >);
     rerender(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
-    expect(screen.queryByTestId("task-effort-trigger")).not.toBeInTheDocument();
+    expect(hasPickerSection("effort")).toBe(false);
     // Clear the explicit selection; cached choices must not resurrect the old list.
     await choose("model", "Default");
     vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
       typeof hostsHook.useHostModelOptions
     >);
     rerender(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
-    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
-    expect(screen.queryByRole("option", { name: "Model A" })).not.toBeInTheDocument();
+    expect(pickerOptionLabels("model")).not.toContain("Model A");
   });
 
   it("does not renew expired host choices just by reopening the dialog", async () => {
@@ -5323,16 +5458,16 @@ describe("automation harness settings", () => {
       dataUpdatedAt: fetchedAt,
     } as ReturnType<typeof hostsHook.useHostModelOptions>);
     const first = renderDialog();
-    expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
+    expect(hasPickerSection("effort")).toBe(true);
     first.unmount();
     vi.spyOn(Date, "now").mockReturnValue(fetchedAt + 25 * 60 * 60 * 1000);
     vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
       typeof hostsHook.useHostModelOptions
     >);
     renderDialog();
-    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
-    expect(await screen.findByRole("option", { name: "Default" })).toBeVisible();
-    expect(screen.queryByRole("option", { name: "Model A" })).not.toBeInTheDocument();
+    const labels = pickerOptionLabels("model");
+    expect(labels).toContain("Default");
+    expect(labels).not.toContain("Model A");
   });
 
   it("restores a provider catalog during an outage but discards it when the provider reports unsupported", async () => {
@@ -5348,7 +5483,7 @@ describe("automation harness settings", () => {
     } as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
     const { rerender } = render(sandboxDialog(agent.id, true));
     await choose("model", "Model A");
-    expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
+    expect(hasPickerSection("effort")).toBe(true);
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
     vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
       data: { models: [], configured: false, status: "unsupported" },
@@ -5356,14 +5491,14 @@ describe("automation harness settings", () => {
     } as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
     rerender(sandboxDialog(agent.id, true));
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-    expect(screen.queryByTestId("task-effort-trigger")).not.toBeInTheDocument();
+    expect(hasPickerSection("effort")).toBe(false);
     vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
       data: { models, configured: false, status: "ready" },
       isError: false,
     } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
     rerender(sandboxDialog(agent.id, true));
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
-    expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
+    expect(hasPickerSection("effort")).toBe(true);
   });
 
   it.each([
@@ -5378,7 +5513,7 @@ describe("automation harness settings", () => {
           <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
         </CapabilitiesProvider>,
       );
-      expect(screen.getByTestId("task-model-trigger")).toBeVisible();
+      expect(hasPickerSection("model")).toBe(true);
       if (supportsPermissions) {
         expect(screen.getByTestId("task-permission-trigger")).toBeVisible();
       } else {
@@ -5592,9 +5727,9 @@ describe("automation random worktree", () => {
     );
     const checkbox = screen.getByRole("checkbox", { name: "Random worktree" });
     expect(checkbox).toHaveAttribute("aria-checked", baseBranch === null ? "false" : "true");
-    if (bound) expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+    if (bound) expect(pickerLocked("model")).toBe(true);
     fireEvent.click(checkbox);
-    if (bound) expect(screen.getByTestId("task-model-trigger")).toBeEnabled();
+    if (bound) expect(pickerLocked("model")).toBe(false);
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalled());
     // Changing baseBranch requests the server-side binding reset.

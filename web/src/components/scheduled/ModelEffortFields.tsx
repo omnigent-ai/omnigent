@@ -23,6 +23,7 @@ export function ModelEffortFields({
   onEffortChange,
   onPermissionModeChange,
   onSelectOpenChange,
+  permissionOnly = false,
 }: {
   /** Selected model id/alias, or "" = agent default (nothing overridden). */
   model: string;
@@ -38,6 +39,8 @@ export function ModelEffortFields({
   /** Forwarded to each Select's onOpenChange so the parent Dialog can keep an
    * open dropdown from dismissing the whole modal. */
   onSelectOpenChange?: (open: boolean) => void;
+  /** Render only the permission control, for callers whose agent picker owns model and effort. */
+  permissionOnly?: boolean;
 }) {
   const modelOptions = settings.models.map((option) => ({
     id: option.id,
@@ -56,7 +59,7 @@ export function ModelEffortFields({
 
   return (
     <div className="flex flex-col gap-3 sm:gap-4">
-      {settings.supportsModel && (
+      {settings.supportsModel && !permissionOnly && (
         <div className="flex flex-col gap-3" data-testid="task-model-effort-row">
           <div
             className="flex w-full min-w-0 items-center justify-between gap-4"
@@ -137,7 +140,7 @@ export function ModelEffortFields({
           )}
         </div>
       )}
-      {settings.catalogMessage && (
+      {settings.catalogMessage && !permissionOnly && (
         <p className="text-sm text-muted-foreground">{settings.catalogMessage}</p>
       )}
 
