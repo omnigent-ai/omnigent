@@ -138,9 +138,8 @@ async def _file(auth_client, db_uri, session_id: str, project_id: str) -> None:
 
 
 _DEFAULTS_THAT_WOULD_CHANGE_THE_WORKER = {"workspace": "/project-default", "git": {"base": "main"}}
-# Nested agents stay in their source session's project, so project_name is for standalone mode.
-_STANDALONE_ONLY = pytest.mark.parametrize(
-    "orchestration_environment", [False], ids=["standalone"], indirect=True
+_NESTED_ONLY = pytest.mark.parametrize(
+    "orchestration_environment", [True], ids=["nested"], indirect=True
 )
 
 
@@ -211,37 +210,69 @@ async def test_worker_handles_unavailable_source_project(
     assert SqlAlchemyConversationStore(db_uri).get_conversation(source["id"]).family_id is None
 
 
-@pytest.mark.parametrize("requested", ["other", "none"])
-async def test_worker_project_override_requires_standalone_mode(
+@pytest.mark.parametrize("requested", ["other", "none", "source"])
+async def test_a_project_named_in_the_request_wins_over_the_source_project(
     auth_client, auth_app, db_uri, monkeypatch, requested, orchestration_environment
 ):
     auth_client.headers["X-Forwarded-Email"] = "alice"
     source = await _create_session_as(auth_client, "", "alice")
+    triage = await _project(auth_client, "Triage")
+    await _file(auth_client, db_uri, source["id"], triage)
+    other = await _project(auth_client, "Elsewhere")
+    project_id = {"other": other, "none": None, "source": triage}[requested]
+
+    worker_id = await _start_worker(
+        auth_client, auth_app, db_uri, monkeypatch, source, body={"project_id": project_id}
+    )
+
+    worker = SqlAlchemyConversationStore(db_uri).get_conversation(worker_id)
+    assert worker.project_id == project_id
+    # Only the source's own project keeps the worker in the source's family.
+    nested = orchestration_environment and requested == "source"
+    assert worker.family_id == (source["id"] if nested else None)
+
+
+@_NESTED_ONLY
+async def test_a_client_sibling_keeps_its_source_project(auth_client, db_uri):
+    auth_client.headers["X-Forwarded-Email"] = "alice"
+    source = await _create_session_as(auth_client, "", "alice")
     await _file(auth_client, db_uri, source["id"], await _project(auth_client, "Triage"))
     other = await _project(auth_client, "Elsewhere")
-    project_id = other if requested == "other" else None
 
-    if not orchestration_environment:
-        worker_id = await _start_worker(
-            auth_client, auth_app, db_uri, monkeypatch, source, body={"project_id": project_id}
-        )
-        worker = SqlAlchemyConversationStore(db_uri).get_conversation(worker_id)
-        assert worker.project_id == project_id
-        assert worker.family_id is None
-        return
-
-    auth_client.headers.update(_bind_runner(db_uri, source["id"]))
     response = await auth_client.post(
-        "/v1/sessions/orchestrated",
-        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
-        json={"agent_id": source["agent_id"], "host_type": "managed", "project_id": project_id},
+        "/v1/sessions",
+        json={
+            "agent_id": source["agent_id"],
+            "sibling_source_id": source["id"],
+            "project_id": other,
+        },
     )
-    assert response.status_code == 400
+
+    assert response.status_code == 400, response.text
     assert "stay in their source session's project" in response.json()["error"]["message"]
     assert SqlAlchemyConversationStore(db_uri).get_conversation(source["id"]).family_id is None
 
 
-@_STANDALONE_ONLY
+@_NESTED_ONLY
+async def test_another_project_keeps_the_destination_policy(auth_client, auth_app, db_uri):
+    from omnigent.server.sharing_settings import SiblingSessionDestinations
+
+    auth_client.headers["X-Forwarded-Email"] = "alice"
+    source = await _create_session_as(auth_client, "", "alice")
+    other = await _project(auth_client, "Elsewhere")
+    auth_app.state.sibling_session_destinations = lambda: SiblingSessionDestinations.CURRENT_HOST
+    auth_client.headers.update(_bind_runner(db_uri, source["id"]))
+
+    response = await auth_client.post(
+        "/v1/sessions/orchestrated",
+        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+        json={"agent_id": source["agent_id"], "host_type": "managed", "project_id": other},
+    )
+
+    assert response.status_code == 403, response.text
+    assert "limited to the current host" in response.json()["error"]["message"]
+
+
 async def test_the_tool_files_a_worker_in_a_named_project_without_its_defaults(
     auth_client, auth_app, db_uri, monkeypatch
 ):
@@ -261,6 +292,7 @@ async def test_the_tool_files_a_worker_in_a_named_project_without_its_defaults(
 
     worker = SqlAlchemyConversationStore(db_uri).get_conversation(worker_id)
     assert worker.project_id == named
+    assert worker.family_id is None
     assert worker.agent_id == source["agent_id"]
     assert worker.workspace != "/project-default"
     assert worker.git_branch is None
@@ -276,7 +308,6 @@ async def test_the_tool_files_a_worker_in_a_named_project_without_its_defaults(
     assert info["project_name"] == "Elsewhere"
 
 
-@_STANDALONE_ONLY
 async def test_a_name_only_another_user_has_gets_a_new_project(
     auth_client, auth_app, db_uri, monkeypatch
 ):
@@ -301,7 +332,6 @@ async def test_a_name_only_another_user_has_gets_a_new_project(
     assert alices is not None and alices.name == "Bob's work"
 
 
-@_STANDALONE_ONLY
 async def test_same_host_worker_in_a_named_project_starts_no_worktree(
     auth_client, auth_app, db_uri, monkeypatch
 ):
@@ -352,32 +382,49 @@ async def test_same_host_worker_in_a_named_project_starts_no_worktree(
     assert worker.git_branch is None
 
 
-@pytest.mark.parametrize("orchestration_environment", [True], ids=["nested"], indirect=True)
-async def test_the_tool_refuses_project_name_for_nested_agents(auth_client, db_uri):
+@_NESTED_ONLY
+@pytest.mark.parametrize("named", ["Elsewhere", "Triage"])
+async def test_the_tool_nests_a_worker_only_in_its_source_project(
+    auth_client, auth_app, db_uri, monkeypatch, named
+):
     auth_client.headers["X-Forwarded-Email"] = "alice"
     source = await _create_session_as(auth_client, "", "alice")
+    await _file(auth_client, db_uri, source["id"], await _project(auth_client, "Triage"))
+
+    worker_id = await _start_worker(
+        auth_client, auth_app, db_uri, monkeypatch, source, tool_args={"project_name": named}
+    )
+
+    worker = SqlAlchemyConversationStore(db_uri).get_conversation(worker_id)
+    projects = {p.id: p.name for p in SqlAlchemyProjectStore(db_uri).list(user_id="alice")}
+    assert projects[worker.project_id] == named
+    assert worker.family_id == (source["id"] if named == "Triage" else None)
+
+
+async def test_the_tool_creates_no_project_for_a_source_shared_with_edit_access(
+    auth_client, db_uri
+):
+    auth_client.headers["X-Forwarded-Email"] = "alice"
+    source = await _create_session_as(auth_client, "", "alice")
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("bob")
+    permissions.grant("bob", source["id"], LEVEL_EDIT)
     auth_client.headers.update(_bind_runner(db_uri, source["id"]))
 
     result = json.loads(
         await execute_tool(
             tool_name="sys_session_create",
             arguments=json.dumps(
-                {
-                    "agent_id": source["agent_id"],
-                    "placement": "managed",
-                    "message": "Go",
-                    "project_name": "New work",
-                }
+                {"agent_id": source["agent_id"], "placement": "managed", "project_name": "Shared"}
             ),
             server_client=auth_client,
             conversation_id=source["id"],
         )
     )
 
-    assert "does not accept project_name" in result.get("error", ""), result
-    # The refusal comes before the lookup, so no empty project is left behind.
+    assert "shared with edit access cannot" in result.get("error", ""), result
     projects = SqlAlchemyProjectStore(db_uri).list(user_id="alice")
-    assert "New work" not in [project.name for project in projects]
+    assert "Shared" not in [project.name for project in projects]
 
 
 # The project tools do not depend on the sibling-sessions environment.

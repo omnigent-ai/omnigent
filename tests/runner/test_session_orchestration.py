@@ -729,7 +729,19 @@ _PROJECT_ID = "ab" * 16
 @pytest.mark.asyncio
 @pytest.mark.parametrize("placement", ["same_host", "managed"])
 @pytest.mark.parametrize("named_by", ["existing_name", "new_name"])
-async def test_independent_create_files_a_named_project(placement, named_by):
+@pytest.mark.parametrize(
+    "server_info",
+    [
+        {},
+        {
+            "sibling_sessions": True,
+            "sibling_other_project_standalone": True,
+            "sibling_session_destinations": "any_host",
+        },
+    ],
+    ids=["standalone_server", "nested_server"],
+)
+async def test_independent_create_files_a_named_project(placement, named_by, server_info):
     session_id = uuid4().hex
     requests = []
 
@@ -737,7 +749,7 @@ async def test_independent_create_files_a_named_project(placement, named_by):
         requests.append(request)
         path = request.url.path
         if path == "/v1/info":
-            return httpx.Response(200, json={})
+            return httpx.Response(200, json=server_info)
         if path == f"/v1/projects/{_PROJECT_ID}":
             return httpx.Response(200, json={"id": _PROJECT_ID, "name": "Triage"})
         if path == "/v1/projects" and request.method == "GET":
@@ -772,6 +784,10 @@ async def test_independent_create_files_a_named_project(placement, named_by):
     assert calls == [*lookup, ("POST", "/v1/sessions/orchestrated"), name_read]
     # The project is resolved after the capability read.
     assert requests[0].url.path == "/v1/info"
+    if named_by == "new_name":
+        # The server checks the calling session before it creates the project.
+        created = next(r for r in requests if r.method == "POST" and r.url.path == "/v1/projects")
+        assert created.headers[ORCHESTRATION_SOURCE_HEADER] == "manager"
     create = next(r for r in requests if r.url.path == "/v1/sessions/orchestrated")
     body = json.loads(create.content)
     assert body["agent_id"] == "worker"
@@ -871,7 +887,7 @@ async def test_a_refused_managed_create_resolves_no_project():
     ],
     ids=["nested_agents", "unreadable_info"],
 )
-async def test_project_name_needs_a_server_without_nested_agents(placement, info, error):
+async def test_project_name_needs_a_server_that_files_other_projects(placement, info, error):
     requests = []
 
     def respond(request):

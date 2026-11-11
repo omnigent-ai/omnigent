@@ -3423,6 +3423,7 @@ async def _add_named_project(
     args: _JsonObject,
     server_client: httpx.AsyncClient,
     server_info: _JsonObject,
+    headers: dict[str, str],
 ) -> str | None:
     """
     Add the project a checked ``sys_session_create`` call names to its create body.
@@ -3434,21 +3435,29 @@ async def _add_named_project(
     :param args: Arguments that passed :func:`_project_argument_error`.
     :param server_client: HTTP client pointed at the Omnigent server.
     :param server_info: The server's ``GET /v1/info`` payload.
+    :param headers: The create's headers, sent on a project create so the server checks the caller.
     :returns: A JSON error when the project name can't be used, else ``None``.
     """
     project_name = args.get("project_name")
     if project_name is None:
         return None
-    # The server keeps a nested agent in its source session's project; refuse before creating one.
-    if server_info.get("sibling_sessions") is True:
+    # An older nested server refuses another project; refuse before creating one.
+    if (
+        server_info.get("sibling_sessions") is True
+        and server_info.get("sibling_other_project_standalone") is not True
+    ):
         return json.dumps(
             {
                 "error": "This server keeps nested agents in this session's project, so it "
                 "does not accept project_name; omit it. No session was created."
             }
         )
+    from omnigent.runner.session_projects import resolve_project_id
+
     try:
-        project_id = await _project_id_for_name(server_client, str(project_name))
+        project_id, _created = await resolve_project_id(
+            server_client, str(project_name), headers=headers
+        )
     except (httpx.HTTPError, ValueError) as exc:
         return json.dumps(
             {"error": f"Could not resolve project_name: {type(exc).__name__}: {exc}"}
@@ -3729,7 +3738,7 @@ async def _execute_session_create(
             if host_id is not None:
                 body["host_id"] = host_id
                 unconfirmed_creation["host_id"] = host_id
-        project_error = await _add_named_project(body, args, server_client, info_data)
+        project_error = await _add_named_project(body, args, server_client, info_data, headers)
         if project_error is not None:
             return project_error
         create_requested = True
