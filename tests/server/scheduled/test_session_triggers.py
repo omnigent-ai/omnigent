@@ -273,6 +273,9 @@ def test_a_long_occurrence_is_hashed_into_the_key() -> None:
         type="turn.completed", session_id="s" * 32, occurrence="r" * 500, occurred_at=0
     )
     assert len(event.trigger_key) <= 256
-    assert event.trigger_key == SessionEvent(
-        type="turn.completed", session_id="s" * 32, occurrence="r" * 500, occurred_at=1
-    ).trigger_key
+    assert (
+        event.trigger_key
+        == SessionEvent(
+            type="turn.completed", session_id="s" * 32, occurrence="r" * 500, occurred_at=1
+        ).trigger_key
+    )
