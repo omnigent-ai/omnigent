@@ -158,6 +158,12 @@ export function ProjectSettingsDialog({
   const [workspace, setWorkspace] = useState("");
   // Repositories a sandbox default clones, in place of a host working directory.
   const [sandboxRepos, setSandboxRepos] = useState<LastSandboxRepo[]>([]);
+  // A URL typed into the repository picker but not yet added; saving would drop it.
+  const [pendingRepoUrl, setPendingRepoUrl] = useState("");
+  const sandboxRepoPending =
+    hostId === SANDBOX_HOST_CHOICE &&
+    sandboxRepoCatalog.length === 0 &&
+    pendingRepoUrl.trim() !== "";
   // Worktree default for the project. The toggle seeds from the project's
   // stored value when set, else from the user-global "always use a worktree"
   // default (Settings › Git). On save it stays "inherit" (stores nothing) while
@@ -222,6 +228,7 @@ export function ProjectSettingsDialog({
     setHostId(c.host_id ?? NONE);
     setWorkspace(c.workspace ?? "");
     setSandboxRepos(sandboxReposFromConfig(c));
+    setPendingRepoUrl("");
     setUseWorktree(c.use_worktree ?? readAlwaysUseWorktree());
     setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
@@ -235,7 +242,7 @@ export function ProjectSettingsDialog({
     e.preventDefault();
     // Guard against submitting a blank draft seeded from a failed load, which
     // the server would read as "clear the stored defaults".
-    if (loadFailed) return;
+    if (loadFailed || sandboxRepoPending) return;
     // A last-start agent that no longer exists saves as the stored agent, even
     // before the fallback effect below has re-rendered the field.
     const savedAgentId = launchAgentGone ? (stored?.agent_id ?? null) : agentId;
@@ -478,8 +485,17 @@ export function ProjectSettingsDialog({
               {sandboxRepoCatalog.length > 0 ? (
                 <Select
                   value={sandboxRepos[0]?.url ?? NONE}
+                  // The catalog picks the first repository; keep its branch
+                  // and any other repositories stored with it.
                   onValueChange={(url) =>
-                    setSandboxRepos(url === NONE ? [] : [{ url, branch: "" }])
+                    setSandboxRepos((current) =>
+                      url === NONE
+                        ? []
+                        : [
+                            { url, branch: current[0]?.url === url ? current[0].branch : "" },
+                            ...current.slice(1).filter((repo) => repo.url !== url),
+                          ],
+                    )
                   }
                   onOpenChange={onDropdownOpenChange}
                   disabled={isLoading}
@@ -513,6 +529,8 @@ export function ProjectSettingsDialog({
                   maxRepos={maxSandboxRepos}
                   enabled={open}
                   testIdPrefix="project-settings-sandbox-repo"
+                  pendingUrl={pendingRepoUrl}
+                  onPendingUrlChange={setPendingRepoUrl}
                 />
               )}
             </Field>
@@ -754,6 +772,11 @@ export function ProjectSettingsDialog({
               disabled so your existing defaults aren't overwritten.
             </p>
           )}
+          {sandboxRepoPending && (
+            <p className="text-destructive text-ui" role="alert">
+              Add or clear the repository URL before saving.
+            </p>
+          )}
           {updateConfig.isError && (
             <p className="text-destructive text-ui" role="alert">
               {(updateConfig.error as Error).message}
@@ -773,7 +796,7 @@ export function ProjectSettingsDialog({
               type="submit"
               data-testid="project-settings-save"
               loading={updateConfig.isPending}
-              disabled={isLoading || loadFailed}
+              disabled={isLoading || loadFailed || sandboxRepoPending}
             >
               Save
             </Button>
