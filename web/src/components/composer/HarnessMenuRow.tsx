@@ -68,7 +68,7 @@ export function HarnessMenuRowContent({
         );
   return (
     <>
-      <span className="composer-agent-choice flex min-w-0 flex-1 items-center gap-2 py-1 pr-1 pl-2 text-[13px] leading-5">
+      <span className="composer-agent-choice flex min-w-0 flex-1 items-center gap-2 py-1 pr-1 pl-2 text-ui leading-5">
         {icon}
         <span className={cn("flex min-w-0 items-center gap-1 text-left", active && "font-medium")}>
           <span data-harness-menu-choice-label="" className="truncate">

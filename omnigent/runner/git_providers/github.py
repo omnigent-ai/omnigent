@@ -38,6 +38,7 @@ _CAPABILITIES = ProviderCapabilities(
     review_thread_creation=True,
     details_editing=True,
     attachment_uploads=True,
+    commit_history=True,
 )
 
 
@@ -88,7 +89,7 @@ class GitHubPullRequests:
 
         return github_resource._gh_installed()
 
-    def review_diff(
+    def pinned_diff(
         self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
     ) -> dict[str, Any]:
         """Fetch a patch whose revisions match the displayed review conversations."""
@@ -98,7 +99,7 @@ class GitHubPullRequests:
             root, reference, head_sha=head_sha, base_sha=base_sha
         )
 
-    def review_changed_files(
+    def pinned_changed_files(
         self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
     ) -> dict[str, Any]:
         """List changed files whose revisions match the displayed patch."""
@@ -199,6 +200,20 @@ class GitHubPullRequests:
             head_sha=head_sha,
             base_sha=base_sha,
         )
+
+    def commits(self, root: str, reference: PullRequestRef, *, head_sha: str) -> dict[str, Any]:
+        """List the PR's commits at ``head_sha``, oldest first."""
+        from omnigent.runner import github_resource
+
+        return github_resource._pr_commits(root, reference, head_sha=head_sha)
+
+    def commit_diff(
+        self, root: str, reference: PullRequestRef, *, commit_sha: str
+    ) -> dict[str, Any]:
+        """Return one commit's patch from GitHub's commit diff media type."""
+        from omnigent.runner import github_resource
+
+        return github_resource._pr_commit_patch(root, reference, commit_sha=commit_sha)
 
     def set_preference(
         self,

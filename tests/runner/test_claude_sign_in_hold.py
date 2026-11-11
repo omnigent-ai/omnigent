@@ -26,6 +26,7 @@ from omnigent.runtime import pending_inputs
 from omnigent.scheduled_context import SCHEDULED_RUN_HEADER
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from tests.budgets import budget
 from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient, _sse
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
@@ -285,7 +286,7 @@ def _published(app: FastAPI, sid: str) -> list[dict[str, Any]]:
 
 
 async def _until(condition: Callable[[], bool]) -> None:
-    async with asyncio.timeout(5):
+    async with asyncio.timeout(budget(5)):
         while not condition():
             await asyncio.sleep(0.01)
 

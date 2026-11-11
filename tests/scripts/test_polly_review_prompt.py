@@ -28,6 +28,9 @@ _TEST_BOOTSTRAP_SHA256 = hashlib.sha256(_TEST_BOOTSTRAP_GUIDANCE).hexdigest()
 def prompt_workspace(tmp_path: Path) -> Path:
     checkout = tmp_path / "trusted checkout"
     (checkout / "docs").mkdir(parents=True)
+    policy = checkout / "dev/lint/lint_reference_policy.py"
+    policy.parent.mkdir(parents=True)
+    policy.write_text("PROHIBITED_NAMES = {'sampletool'}\n", encoding="utf-8")
     artifacts = checkout / "artifacts"
     artifacts.mkdir()
     (artifacts / "pr_meta.json").write_text(
@@ -118,6 +121,19 @@ def test_prompt_references_readable_guidance_from_checkout(
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert not (prompt_workspace / "artifacts/gh_args.json").exists()
+    prompt = (prompt_workspace / "artifacts/review_prompt.txt").read_text()
+    normalized = " ".join(prompt.split())
+    policy = (prompt_workspace / "dev/lint/lint_reference_policy.py").resolve()
+    for phrase in (
+        "**Reference policy** — treat new violations as blocking contract violations.",
+        f"Read `{policy}` from the trusted checkout",
+        "Do not explain prohibited names",
+        "Test fixtures and parametrized values are not exempt: use reserved example domains",
+        "tests must not duplicate prohibited literals",
+        "Include this absolute path and the policy requirements in every reviewer task",
+        "If the policy cannot be read, report an incomplete review; do not claim a clean review",
+    ):
+        assert phrase in normalized
     references = _prompt_references(prompt_workspace)
     assert references == {guidance.resolve()}
     reference = references.pop()
@@ -167,6 +183,29 @@ def test_prompt_generation_fails_without_usable_guidance(
     assert str(guidance.resolve()) in result.stderr
     assert not (prompt_workspace / "artifacts/gh_args.json").exists()
     assert not (prompt_workspace / "artifacts/polly_database_best_practices.md").exists()
+    assert not (prompt_workspace / "artifacts/review_prompt.txt").exists()
+
+
+@pytest.mark.parametrize("failure", ["missing", "blank", "directory", "invalid-utf8"])
+def test_prompt_generation_fails_without_usable_policy(
+    prompt_workspace: Path, failure: str
+) -> None:
+    (prompt_workspace / "docs/DATABASE_BEST_PRACTICES.md").write_text("# Database practices\n")
+    policy = prompt_workspace / "dev/lint/lint_reference_policy.py"
+    policy.unlink()
+    if failure == "blank":
+        policy.write_text(" \n\t")
+    elif failure == "directory":
+        policy.mkdir()
+    elif failure == "invalid-utf8":
+        policy.write_bytes(b"\xff")
+
+    result = _generate_prompt(prompt_workspace, "MEMBER")
+
+    assert result.returncode != 0
+    assert "::error::" in result.stderr
+    assert str(policy.resolve()) in result.stderr
+    assert not (prompt_workspace / "artifacts/gh_args.json").exists()
     assert not (prompt_workspace / "artifacts/review_prompt.txt").exists()
 
 
