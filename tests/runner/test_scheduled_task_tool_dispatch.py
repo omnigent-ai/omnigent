@@ -883,28 +883,6 @@ async def test_a_wrong_schedule_without_a_usable_id_is_reported_not_deleted(
     assert not [call for call in client.calls if call[0] == "DELETE"]
 
 
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("_frozen_now")
-async def test_a_lost_create_response_says_the_reminder_may_exist() -> None:
-    client = _ReminderClient()
-
-    async def lost(url: str, **kwargs: object) -> _Resp:
-        client.calls.append(("POST", url, kwargs.get("json")))  # type: ignore[arg-type]
-        raise httpx.ReadTimeout("response lost")
-
-    client.post = lost  # type: ignore[method-assign]
-    out = json.loads(
-        await _execute_scheduled_task_tool(
-            "sys_reminder_set",
-            json.dumps({"message": "ping", "delay_seconds": 600}),
-            server_client=client,
-            conversation_id="conv_1",
-        )
-    )
-    assert "may still have been created" in out["error"]
-    assert "sys_scheduled_task_list" in out["error"]
-
-
 class _UnreadableResp(_Resp):
     def json(self) -> object:
         raise json.JSONDecodeError("Expecting value", "<truncated>", 0)
@@ -912,8 +890,19 @@ class _UnreadableResp(_Resp):
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_frozen_now")
-async def test_an_unreadable_create_reply_says_the_reminder_may_exist() -> None:
-    client = _ReminderClient(_UnreadableResp(status_code=200))
+@pytest.mark.parametrize("fault", ["response_lost", "reply_unreadable"])
+async def test_an_uncertain_create_says_the_reminder_may_exist(fault: str) -> None:
+    """A create that may have been saved must not invite a duplicate on retry."""
+    if fault == "reply_unreadable":
+        client = _ReminderClient(_UnreadableResp(status_code=200))
+    else:
+        client = _ReminderClient()
+
+        async def lost(url: str, **kwargs: object) -> _Resp:
+            client.calls.append(("POST", url, kwargs.get("json")))  # type: ignore[arg-type]
+            raise httpx.ReadTimeout("response lost")
+
+        client.post = lost  # type: ignore[method-assign]
     out = json.loads(
         await _execute_scheduled_task_tool(
             "sys_reminder_set",
@@ -924,6 +913,7 @@ async def test_an_unreadable_create_reply_says_the_reminder_may_exist() -> None:
     )
     assert "may still have been created" in out["error"]
     assert "sys_scheduled_task_list" in out["error"]
+    # No usable task id came back, so nothing is deleted.
     assert not [call for call in client.calls if call[0] == "DELETE"]
 
 
