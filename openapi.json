@@ -6714,6 +6714,11 @@
             "title": "Session Move Source Checks",
             "type": "boolean"
           },
+          "session_organize_source_checks": {
+            "default": false,
+            "title": "Session Organize Source Checks",
+            "type": "boolean"
+          },
           "session_pull_requests": {
             "default": false,
             "title": "Session Pull Requests",
@@ -6738,6 +6743,11 @@
             ],
             "title": "Sharing Mode",
             "type": "string"
+          },
+          "sibling_other_project_standalone": {
+            "default": false,
+            "title": "Sibling Other Project Standalone",
+            "type": "boolean"
           },
           "sibling_session_destinations": {
             "default": "any_host",
@@ -20132,6 +20142,24 @@
               "title": "Order",
               "type": "string"
             }
+          },
+          {
+            "description": "`workspace` confines the read to the workspace root.",
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "const": "workspace",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope"
+            }
           }
         ],
         "responses": {
@@ -20323,6 +20351,24 @@
               "default": false,
               "title": "Download",
               "type": "boolean"
+            }
+          },
+          {
+            "description": "`workspace` also confines owner reads, including symlinks.",
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "const": "workspace",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope"
             }
           }
         ],
