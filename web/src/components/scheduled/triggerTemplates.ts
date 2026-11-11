@@ -309,7 +309,7 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
         id: "issue",
         label: "Issue opened",
         authorAction: "open an issue in this repository",
-        hiddenFields: ["reviewer"],
+        hiddenFields: ["reviewer", "base"],
       },
       {
         id: "pr",
@@ -321,7 +321,7 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
         id: "any",
         label: "Issue or pull request opened",
         authorAction: "open an issue or pull request in this repository",
-        hiddenFields: ["reviewer"],
+        hiddenFields: ["reviewer", "base"],
         itemPlural: "issues and pull requests",
       },
       {
@@ -339,6 +339,18 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
         description:
           "Runs your automation each time a matching review is requested on an open pull request that isn't a draft, including re-requests. Requests made before this automation existed are skipped.",
         // Commenting a session link on every review request is noisy on others' pull requests.
+        linkBackDefault: false,
+      },
+      {
+        id: "merged",
+        label: "Pull request merged",
+        authorAction: "open a pull request in this repository",
+        // Merging clears pending review requests, so a requested reviewer never matches.
+        hiddenFields: ["reviewer"],
+        description:
+          "Runs your automation each time a matching pull request is merged. Pull requests merged before this automation existed are skipped.",
+        itemPlural: "pull requests",
+        // A comment on every merged pull request notifies everyone subscribed to it.
         linkBackDefault: false,
       },
     ],
@@ -361,6 +373,7 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
         operators: ["is", "is_not"],
         placeholder: "username or org/team",
       },
+      { id: "base", label: "Base branch", operators: ["is", "is_not"], placeholder: "main" },
       {
         id: "qualifiers",
         label: "Search qualifiers (advanced)",
@@ -997,6 +1010,7 @@ export function compileGithubQuery(fields: TriggerFields): string {
   if (fields.event === "review") {
     parts.push("is:pr", "is:open", "-is:draft", githubReviewerQualifier(fields.target ?? ""));
   }
+  if (fields.event === "merged") parts.push("is:pr", "is:merged");
   for (const c of fields.conditions) {
     const negate = c.operator === "is_not" ? "-" : "";
     if (c.field === "label") parts.push(`${negate}label:${githubValue(c.value)}`);
@@ -1008,6 +1022,7 @@ export function compileGithubQuery(fields: TriggerFields): string {
       parts.push(c.operator === "empty" ? "no:assignee" : `${negate}assignee:${who}`);
     }
     if (c.field === "reviewer") parts.push(`${negate}${githubReviewerQualifier(c.value)}`);
+    if (c.field === "base") parts.push(`${negate}base:${githubValue(c.value)}`);
     if (c.field === "qualifiers") parts.push(c.value.trim());
   }
   return parts.join(" ");
@@ -1369,6 +1384,28 @@ function sourceText(source: TriggerSource, fields: TriggerFields, shared: boolea
       details: `the pull request's number, link, title and body, when the review was requested, and whether ${shared ? "you sent the task session" : "you started a session for"} an earlier review request on the same pull request (a re-request)`,
       linkBack: (link) => `Comment "${link}" on each pull request ${handled}.`,
       opening: "new review request",
+      watermark: true,
+    };
+  }
+  if (fields.event === "merged") {
+    const search = `${query} merged:>=<that time>`;
+    return {
+      watch: () => `Watch: merged GitHub pull requests matching: ${query}`,
+      search: () =>
+        `Use the GitHub CLI or your GitHub tools to search for: ${search}, through every page (for example gh api -X GET search/issues -f q=${shellQuote(search)} -f per_page=100 --paginate). This finds pull requests merged since then, however long ago they were opened. GitHub's search returns at most 1000 results in all: if you reach that, split the time since then into shorter merged:<from>..<to> ranges and search each one until every range returns fewer.`,
+      // Search can't sort by merge time, so a partial read can't checkpoint by its last result.
+      readOrder: `Read every page of results, then work through them oldest first by the time they were merged (pull_request.merged_at in each search result). If you can't read every page, ${startNone} in this run and keep the previous check time.`,
+      createdAt: "merged",
+      leaveOut:
+        "Leave out pull requests merged after the time you noted; the next run picks them up.",
+      item: "pull request",
+      fence: "github-pull-request",
+      // A pull request merges once, so its number alone keys the session.
+      title: '"GitHub <owner/repo>#<number> merged"',
+      details:
+        "the pull request's number, link, title and body, its base and head branches, when it was merged and by whom, and its merge commit",
+      linkBack: (link) => `Comment "${link}" on each pull request ${handled}.`,
+      opening: "newly merged pull request",
       watermark: true,
     };
   }

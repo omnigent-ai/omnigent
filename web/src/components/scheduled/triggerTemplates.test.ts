@@ -585,10 +585,14 @@ describe("change events", () => {
 
   it("hides fields that the review queue or opened issues can't use", () => {
     const ids = (event: string) => triggerConditionFields("github", event).map((f) => f.id);
-    expect(ids("review")).toEqual(["label", "author", "qualifiers"]);
+    expect(ids("review")).toEqual(["label", "author", "base", "qualifiers"]);
+    expect(ids("merged")).toEqual(["label", "author", "assignee", "base", "qualifiers"]);
     expect(ids("pr")).toContain("reviewer");
+    expect(ids("pr")).toContain("base");
     expect(ids("issue")).not.toContain("reviewer");
     expect(ids("any")).not.toContain("reviewer");
+    expect(ids("issue")).not.toContain("base");
+    expect(ids("any")).not.toContain("base");
     expect(triggerConditionFields("jira", "assigned").map((f) => f.id)).not.toContain("assignee");
   });
 
@@ -619,6 +623,9 @@ describe("change events", () => {
       "Runs your automation on all new issues that match these conditions. Older issues are skipped, even if they are edited to match later.",
     );
     expect(triggerEventDescription("github", "review")).toContain("including re-requests");
+    expect(triggerEventDescription("github", "merged")).toBe(
+      "Runs your automation each time a matching pull request is merged. Pull requests merged before this automation existed are skipped.",
+    );
     expect(triggerEventDescription("jira", "assigned")).toContain("assigned again later");
   });
 
@@ -661,6 +668,31 @@ describe("compileGithubQuery", () => {
     expect(review("acme/maintainers")).toBe(
       "repo:acme/app is:pr is:open -is:draft team-review-requested:acme/maintainers",
     );
+  });
+
+  it("lists merged pull requests and compiles base branch rows", () => {
+    expect(query("merged")).toBe("repo:acme/app is:pr is:merged");
+    expect(
+      query(
+        "merged",
+        { field: "base", operator: "is", value: "main" },
+        { field: "author", operator: "is", value: "@octocat" },
+      ),
+    ).toBe("repo:acme/app is:pr is:merged base:main author:octocat");
+    expect(query("pr", { field: "base", operator: "is_not", value: "release/1.x" })).toBe(
+      "repo:acme/app is:pr -base:release/1.x",
+    );
+  });
+
+  it("turns link-back off for merges unless the owner chose", () => {
+    const opened = fields({ event: "pr", scope: "acme/app", conditions: [] });
+    expect(withTriggerEvent("github", opened, "merged")).toMatchObject({
+      event: "merged",
+      linkBack: false,
+    });
+    expect(withTriggerEvent("github", opened, "merged")).not.toHaveProperty("target");
+    const chosen = { ...opened, linkBack: true, linkBackTouched: true };
+    expect(withTriggerEvent("github", chosen, "merged").linkBack).toBe(true);
   });
 
   it("compiles reviewer rows on opened pull requests", () => {
@@ -1294,6 +1326,45 @@ describe("change-event prompts", () => {
     expect(prompt).toContain(
       "the time the last review request you handled (started or skipped) before you stopped was requested",
     );
+  });
+
+  it("finds merges since the watermark and keys each session by pull request", () => {
+    const prompt = renderTriggerPrompt(
+      "github",
+      fields({
+        event: "merged",
+        scope: "acme/app",
+        conditions: [{ field: "base", operator: "is", value: "main" }],
+        linkBack: false,
+      }),
+      CTX,
+    );
+    expect(prompt).toContain(
+      "starts one Omnigent session for each newly merged pull request that matches.",
+    );
+    expect(prompt).toContain(
+      "Watch: merged GitHub pull requests matching: repo:acme/app is:pr is:merged base:main",
+    );
+    expect(prompt).toContain(
+      "gh api -X GET search/issues -f q='repo:acme/app is:pr is:merged base:main merged:>=<that time>' -f per_page=100 --paginate",
+    );
+    expect(prompt).toContain("however long ago they were opened");
+    expect(prompt).toContain("split the time since then into shorter merged:<from>..<to> ranges");
+    expect(prompt).toContain("oldest first by the time they were merged");
+    expect(prompt).toContain("If you can't read every page, start no sessions in this run");
+    expect(prompt).toContain("Leave out pull requests merged after the time you noted");
+    expect(prompt).toContain('title "GitHub <owner/repo>#<number> merged"');
+    expect(prompt).toContain("its base and head branches, when it was merged and by whom");
+    // Merges from before activation never count, even inside the search overlap.
+    expect(prompt).toContain(
+      'On the first run, use the current time as both the check time and the "Watching since:" time',
+    );
+    expect(prompt).toContain('Above it, repeat the "Watching since: <time>" line unchanged.');
+    expect(prompt).toContain(
+      "the time the last pull request you handled (started or skipped) before you stopped was merged",
+    );
+    expect(prompt).not.toContain("created:>=");
+    expect(prompt).not.toContain("one hour ago");
   });
 
   it("matches team requests by slug and other users by login", () => {
