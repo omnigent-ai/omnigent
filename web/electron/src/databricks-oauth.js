@@ -17,7 +17,7 @@
 //                                        expired, so the refresh path runs on every connect/reload)
 //
 // The authorize request goes directly to the entered origin's /oidc/v1/authorize.
-// A workspace host yields a workspace-scoped token; an account/SPOG host yields an
+// A workspace host yields a workspace-scoped token; an account host yields an
 // account-scoped token, and the workspace is then chosen from the account
 // workspaces API (see databricks-session.js). Account-first entry via the SISU
 // login host (target=ACCOUNT, for generic multi-account login) is a follow-up.
@@ -109,7 +109,7 @@ function removeStoredRefreshToken(origin) {
 
 /**
  * Persist a token keyed by the WORKSPACE origin it is used against. For an
- * account-first (SPOG) login the token is account-scoped; ``account`` records
+ * account-first login the token is account-scoped; ``account`` records
  * the account origin+id so a later silent refresh hits the account token
  * endpoint. Keying by the workspace origin (not the issuer) is what lets the
  * session-expiry path — which only knows the workspace — find and refresh it.
@@ -217,7 +217,7 @@ async function exchangeCode(issuerOrigin, code, verifier, redirectUri, signal) {
 
 /**
  * Token endpoint for a refresh. A workspace-scoped token refreshes at the
- * workspace's own endpoint; an account-scoped (SPOG) token must refresh at the
+ * workspace's own endpoint; an account-scoped token must refresh at the
  * account endpoint WITH the account id in the path — the accounts host serves
  * every account, and a refresh carries no code for the server to resolve it
  * from (mirrors genie-one-desktop's account OIDC discovery).
@@ -423,7 +423,7 @@ async function runInteractiveLogin(origin, { signal } = {}) {
         code_challenge_method: "S256",
       }).toString();
       // Authorize directly against the entered origin. A workspace host issues a
-      // workspace-scoped token; an account/SPOG host issues an account-scoped one
+      // workspace-scoped token; an account host issues an account-scoped one
       // (the workspace is chosen afterward from the account workspaces API).
       return `${origin}/oidc/v1/authorize?${authQuery}`;
     },

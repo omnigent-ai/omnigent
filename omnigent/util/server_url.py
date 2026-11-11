@@ -10,7 +10,7 @@ An Omnigent server is addressed by two related but distinct URLs:
   deployments this is the workspace SPA mount (``https://<ws>/omnigent``),
   carrying the ``?o=<org>`` workspace selector when one is known so a
   copy-pasted URL still routes to the right workspace on a
-  multi-workspace (SPOG) host.
+  multi-workspace account host.
 
 :class:`ServerUrl` binds the two together with the org id, so callers
 never rebuild either form ad hoc: wire traffic uses
@@ -81,7 +81,7 @@ class ServerUrl:
 
     org_id: str | None = None
     """The ``?o=`` workspace selector when known, e.g. ``"123"``. Routes
-    requests and browser links on multi-workspace (SPOG) hosts."""
+    requests and browser links on multi-workspace account hosts."""
 
     def __post_init__(self) -> None:
         # Enforce the documented ``api_base`` invariant (no trailing slash,

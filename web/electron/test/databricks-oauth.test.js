@@ -3,7 +3,7 @@
 //
 // Covers the parts the session-expiry and rotation logic depend on: the
 // workspace-keyed token store round-trip, silent refresh endpoint selection
-// (workspace-direct vs account/SPOG), single-use refresh-token rotation +
+// (workspace-direct vs account-first), single-use refresh-token rotation +
 // persistence, concurrent-refresh dedupe, and dead-grant (invalid_grant)
 // cleanup. Electron is stubbed so the module loads outside a packaged app.
 
@@ -531,7 +531,7 @@ describe("getValidStoredToken", () => {
     assert.equal(calls[0].url, `${WS}/oidc/v1/token`);
   });
 
-  it("SPOG: refreshes at the account token endpoint with the account id in the path", async () => {
+  it("account-first: refreshes at the account token endpoint with the account id in the path", async () => {
     oauth.saveWorkspaceToken(
       WS,
       { access_token: "old", refresh_token: "r0", expires_at: past() },

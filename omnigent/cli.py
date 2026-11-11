@@ -8904,7 +8904,7 @@ def _resolve_attach_server_url(
 
     :param server: Explicit ``--server`` value, or ``None``.
     :param configured_server: Configured server fallback, or ``None``.
-    :returns: The resolved server value, including a SPOG workspace selector,
+    :returns: The resolved server value, including an account workspace selector,
         or ``None`` when no remote or running local server is available.
     """
     chosen = server if server is not None else configured_server
