@@ -601,7 +601,7 @@ describe("getValidStoredToken", () => {
   it("logs token request metadata without credentials or raw error responses", async () => {
     const logs = [];
     const events = [];
-    mock.method(require("../src/diagnostics").diagnostics, "record", (...args) =>
+    mock.method(require("../src/diagnostics.ts").diagnostics, "record", (...args) =>
       events.push(args),
     );
     mock.method(console, "log", (...args) => logs.push(args));

@@ -1,8 +1,21 @@
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 
-const { acceleratorLabel, createGlobalShowShortcut } = require("../src/globalShowShortcut");
+import {
+  acceleratorLabel,
+  createGlobalShowShortcut,
+  type ShortcutInput,
+  type ShowShortcutRegistrar,
+} from "../src/globalShowShortcut.ts";
+
+interface HarnessOptions {
+  settings?: Record<string, unknown>;
+  refused?: string[];
+  throws?: string[];
+  saveFails?: boolean;
+  isMac?: boolean;
+}
 
 /**
  * A settings store and a fake GlobalShortcut. `refused` chords make register
@@ -14,11 +27,17 @@ function harness({
   throws = [],
   saveFails = false,
   isMac = false,
-} = {}) {
+}: HarnessOptions = {}) {
   let stored = structuredClone(settings);
-  const calls = { registered: [], unregistered: [], saved: [], shown: 0 };
-  const live = new Set();
-  const globalShortcut = {
+  const calls = {
+    registered: [] as { accelerator: string; press: () => void }[],
+    unregistered: [] as string[],
+    saved: [] as Record<string, unknown>[],
+    shown: 0,
+    approvals: [] as string[],
+  };
+  const live = new Set<string>();
+  const globalShortcut: ShowShortcutRegistrar = {
     register: (accelerator, press) => {
       if (throws.includes(accelerator)) throw new TypeError(`Invalid accelerator: ${accelerator}`);
       if (refused.includes(accelerator)) return false;
@@ -34,7 +53,7 @@ function harness({
   const controller = createGlobalShowShortcut({
     globalShortcut,
     loadSettings: () => structuredClone(stored),
-    saveSettings: (next) => {
+    saveSettings: (next: Record<string, unknown>) => {
       if (saveFails) throw new Error("EACCES: permission denied");
       stored = structuredClone(next);
       calls.saved.push(structuredClone(next));
@@ -45,10 +64,9 @@ function harness({
     isMac,
   });
   // The user allows every chord unless a test answers otherwise.
-  calls.approvals = [];
   const shortcut = {
     ...controller,
-    set: (setting, approve = async () => true) =>
+    set: (setting: unknown, approve = async (_accelerator: string) => true) =>
       controller.set(setting, async (accelerator) => {
         calls.approvals.push(accelerator);
         return approve(accelerator);
@@ -82,7 +100,7 @@ describe("createGlobalShowShortcut", () => {
       nextLaunch.calls.registered.map((entry) => entry.accelerator),
       ["Alt+Space"],
     );
-    nextLaunch.calls.registered[0].press();
+    nextLaunch.calls.registered[0]!.press();
     assert.equal(nextLaunch.calls.shown, 1);
   });
 
@@ -152,7 +170,7 @@ describe("createGlobalShowShortcut", () => {
   for (const [holder, refused] of [
     ["", []],
     [" while another app holds its chord", ["Control+K"]],
-  ]) {
+  ] satisfies [string, string[]][]) {
     it(`turns off an already-off shortcut${holder} without asking or registering`, async () => {
       const h = harness({
         settings: { global_shortcut: { enabled: false, accelerator: "Control+K" } },
@@ -194,7 +212,7 @@ describe("createGlobalShowShortcut", () => {
   for (const [failure, options] of [
     ["refuses", { refused: ["Control+Shift+K"] }],
     ["throws on", { throws: ["Control+Shift+K"] }],
-  ]) {
+  ] satisfies [string, HarnessOptions][]) {
     it(`keeps the saved setting and its registration when Electron ${failure} the new chord`, async () => {
       const h = harness({
         settings: { global_shortcut: { enabled: true, accelerator: "Alt+Space" } },
@@ -217,7 +235,7 @@ describe("createGlobalShowShortcut", () => {
   for (const [chord, recorded] of [
     ["a new chord", "Control+Shift+K"],
     ["the saved chord again", "Alt+Space"],
-  ]) {
+  ] satisfies [string, string][]) {
     it(`tries ${chord} recorded while off, and keeps the saved one when it can't be used`, async () => {
       const h = harness({
         settings: { global_shortcut: { enabled: false, accelerator: "Alt+Space" } },
@@ -264,7 +282,7 @@ describe("createGlobalShowShortcut", () => {
   for (const [change, next] of [
     ["a new chord", { enabled: true, accelerator: "Control+Shift+K" }],
     ["turning it off", { enabled: false }],
-  ]) {
+  ] satisfies [string, object][]) {
     it(`keeps the previous chord registered when saving ${change} fails`, async (t) => {
       t.mock.method(console, "warn", () => {});
       const h = harness({
@@ -286,7 +304,7 @@ describe("createGlobalShowShortcut", () => {
   for (const [failure, options] of [
     ["refuses", { refused: ["Alt+Space"] }],
     ["throws on", { throws: ["Alt+Space"] }],
-  ]) {
+  ] satisfies [string, HarnessOptions][]) {
     it(`reports a saved shortcut that Electron ${failure} at launch as not working`, async () => {
       const h = harness({
         settings: { global_shortcut: { enabled: true, accelerator: "Alt+Space" } },
@@ -296,7 +314,7 @@ describe("createGlobalShowShortcut", () => {
 
       const status = h.shortcut.current();
       assert.equal(status.enabled, true);
-      assert.match(status.error, /isn't working/);
+      assert.match(status.error ?? "", /isn't working/);
       assert.deepEqual(h.registered(), []);
     });
   }
@@ -304,7 +322,7 @@ describe("createGlobalShowShortcut", () => {
 
 describe("recording a chord", () => {
   /** Sends one key press through `before-input-event`; returns whether it was taken. */
-  function press(contents, input) {
+  function press(contents: EventEmitter, input: Partial<ShortcutInput>) {
     let taken = false;
     const event = {
       preventDefault: () => {

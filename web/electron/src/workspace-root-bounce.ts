@@ -2,14 +2,24 @@
 // auth hand-back lands the main frame on the bare workspace root. Kept free of
 // Electron imports so navigation behavior can be tested with a fake webContents.
 
-"use strict";
+import { databricksWorkspaceUiUrl } from "./url.ts";
 
-const { databricksWorkspaceUiUrl } = require("./url.ts");
+export const MAX_ROOT_BOUNCES = 1;
 
-const MAX_ROOT_BOUNCES = 1;
+/** The parts of a shell window's webContents the bounce watches and drives. */
+export interface RootBounceWebContents {
+  on: ((event: "did-navigate", listener: (event: unknown, url: string) => void) => unknown) &
+    ((
+      event: "did-navigate-in-page",
+      listener: (event: unknown, url: string, isMainFrame: boolean) => void,
+    ) => unknown) &
+    ((event: "did-finish-load", listener: () => void) => unknown);
+  getURL: () => string;
+  loadURL: (url: string) => Promise<unknown>;
+}
 
 /** Return a URL's origin, or null when it is not an absolute URL. */
-function originOf(rawUrl) {
+function originOf(rawUrl: string): string | null {
   try {
     return new URL(rawUrl).origin;
   } catch {
@@ -23,18 +33,14 @@ function originOf(rawUrl) {
  * One redirect is allowed until a non-root page on the pinned origin finishes.
  * This prevents a workspace without the mount from looping forever if
  * ``/omnigent`` redirects back to ``/``.
- *
- * @param {{
- *   on: (event: string, listener: (...args: unknown[]) => void) => void,
- *   getURL: () => string,
- *   loadURL: (url: string) => Promise<unknown>
- * }} webContents
- * @param {() => string | null} pinnedOrigin
  */
-function registerWorkspaceRootBounce(webContents, pinnedOrigin) {
+export function registerWorkspaceRootBounce(
+  webContents: RootBounceWebContents,
+  pinnedOrigin: () => string | null,
+): void {
   let rootBounces = 0;
 
-  function bounceIfNeeded(rawUrl) {
+  function bounceIfNeeded(rawUrl: string): void {
     const target = databricksWorkspaceUiUrl(rawUrl);
     const pinned = pinnedOrigin();
     if (!target || !pinned || originOf(rawUrl) !== pinned) return;
@@ -58,5 +64,3 @@ function registerWorkspaceRootBounce(webContents, pinnedOrigin) {
     if (databricksWorkspaceUiUrl(current) === null) rootBounces = 0;
   });
 }
-
-module.exports = { MAX_ROOT_BOUNCES, registerWorkspaceRootBounce };

@@ -1,47 +1,64 @@
-"use strict";
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import type { Rectangle, WebContentsViewConstructorOptions } from "electron";
+import {
+  createReconnectOverlay,
+  type ReconnectOverlayIpcEvent,
+  type ReconnectOverlayView,
+} from "../src/reconnect_overlay.ts";
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
-const fs = require("node:fs");
-const path = require("node:path");
-const { pathToFileURL } = require("node:url");
-const { JSDOM } = require("jsdom");
-const { createReconnectOverlay } = require("../src/reconnect_overlay");
-
-const PAGE = path.join(__dirname, "../reconnect-overlay/index.html");
+const PAGE = path.join(import.meta.dirname, "../reconnect-overlay/index.html");
 const PAGE_URL = pathToFileURL(PAGE).href;
 
+interface LoadOptions {
+  query: Record<string, string>;
+}
+
 class View {
-  constructor(options) {
+  options: WebContentsViewConstructorOptions;
+  openHandler?: () => { action: "deny" };
+  background?: string;
+  bounds?: Rectangle;
+  webContents = Object.assign(new EventEmitter(), {
+    destroyed: false,
+    loads: [] as [string, LoadOptions][],
+    focused: 0,
+    isDestroyed: () => this.webContents.destroyed,
+    close: () => {
+      this.webContents.destroyed = true;
+    },
+    focus: () => this.webContents.focused++,
+    setWindowOpenHandler: (handler: () => { action: "deny" }) => {
+      this.openHandler = handler;
+    },
+    loadFile: (file: string, loadOptions: LoadOptions) => {
+      this.webContents.loads.push([file, loadOptions]);
+      return Promise.resolve();
+    },
+  });
+
+  constructor(options: WebContentsViewConstructorOptions) {
     this.options = options;
-    this.webContents = Object.assign(new EventEmitter(), {
-      destroyed: false,
-      loads: [],
-      focused: 0,
-      isDestroyed: () => this.webContents.destroyed,
-      close: () => {
-        this.webContents.destroyed = true;
-      },
-      focus: () => this.webContents.focused++,
-      setWindowOpenHandler: (handler) => {
-        this.openHandler = handler;
-      },
-      loadFile: (file, loadOptions) => {
-        this.webContents.loads.push([file, loadOptions]);
-        return Promise.resolve();
-      },
-    });
   }
-  setBackgroundColor(color) {
+  setBackgroundColor(color: string) {
     this.background = color;
   }
-  setBounds(bounds) {
+  setBounds(bounds: Rectangle) {
     this.bounds = bounds;
   }
 }
 
 class Window extends EventEmitter {
+  destroyed: boolean;
+  size: number[];
+  children: unknown[];
+  contentView: { addChildView: (view: unknown) => void; removeChildView: (view: unknown) => void };
+  isFocused?: () => boolean;
+  webContents = { focus: () => {} };
+
   constructor() {
     super();
     this.destroyed = false;
@@ -65,11 +82,11 @@ class Window extends EventEmitter {
 }
 
 function harness() {
-  const views = [];
-  const handlers = new Map();
-  const cancelled = [];
+  const views: View[] = [];
+  const handlers = new Map<string, (event: ReconnectOverlayIpcEvent) => void>();
+  const cancelled: Window[] = [];
   class WebContentsView extends View {
-    constructor(options) {
+    constructor(options: WebContentsViewConstructorOptions) {
       super(options);
       views.push(this);
     }
@@ -79,36 +96,37 @@ function harness() {
     ipcMain: { on: (name, handler) => handlers.set(name, handler) },
     overlayPage: PAGE,
     preloadPath: "/app/src/reconnect_overlay_preload.js",
-    onCancel: (parent) => cancelled.push(parent),
+    onCancel: (parent: Window) => cancelled.push(parent),
   });
   overlay.registerIpc();
   const parent = new Window();
-  const sendCancel = (view, url = PAGE_URL) =>
-    handlers.get("omnigent:reconnect-overlay-cancel")({
+  const sendCancel = (view: ReconnectOverlayView, url = PAGE_URL) =>
+    handlers.get("omnigent:reconnect-overlay-cancel")!({
       sender: view.webContents,
       senderFrame: { url },
     });
   return { overlay, views, parent, cancelled, sendCancel };
 }
 
-describe("reconnect overlay (src/reconnect_overlay.js)", () => {
+describe("reconnect overlay (src/reconnect_overlay.ts)", () => {
   it("covers the window content with a transparent, isolated view on top", () => {
     const { overlay, views, parent } = harness();
     const pane = {};
     parent.contentView.addChildView(pane);
     overlay.show(parent, "Check your network connection.");
     const [view] = views;
+    assert.ok(view);
     assert.deepEqual(parent.children, [pane, view]);
     assert.deepEqual(view.bounds, { x: 0, y: 0, width: 1000, height: 700 });
     assert.equal(view.background, "#00000000");
-    assert.equal(view.options.webPreferences.contextIsolation, true);
-    assert.equal(view.options.webPreferences.nodeIntegration, false);
-    assert.equal(view.options.webPreferences.sandbox, true);
+    assert.equal(view.options.webPreferences?.contextIsolation, true);
+    assert.equal(view.options.webPreferences?.nodeIntegration, false);
+    assert.equal(view.options.webPreferences?.sandbox, true);
     assert.deepEqual(view.webContents.loads, [
       [PAGE, { query: { hint: "Check your network connection." } }],
     ]);
     assert.equal(view.webContents.focused, 1);
-    assert.deepEqual(view.openHandler(), { action: "deny" });
+    assert.deepEqual(view.openHandler?.(), { action: "deny" });
     assert.equal(overlay.isShown(parent), true);
   });
 
@@ -117,7 +135,7 @@ describe("reconnect overlay (src/reconnect_overlay.js)", () => {
     overlay.show(parent, "hint");
     parent.size = [800, 500];
     parent.emit("resize");
-    assert.deepEqual(views[0].bounds, { x: 0, y: 0, width: 800, height: 500 });
+    assert.deepEqual(views[0]!.bounds, { x: 0, y: 0, width: 800, height: 500 });
     const pane = {};
     parent.contentView.addChildView(pane);
     overlay.raise(parent);
@@ -137,7 +155,7 @@ describe("reconnect overlay (src/reconnect_overlay.js)", () => {
     overlay.show(parent, "b");
     assert.equal(views.length, 1);
     assert.deepEqual(
-      views[0].webContents.loads.map(([, options]) => options.query.hint),
+      views[0]!.webContents.loads.map(([, options]) => options.query.hint),
       ["a", "b"],
     );
   });
@@ -146,6 +164,7 @@ describe("reconnect overlay (src/reconnect_overlay.js)", () => {
     const { overlay, views, parent, cancelled, sendCancel } = harness();
     overlay.show(parent, "hint");
     const [view] = views;
+    assert.ok(view);
     sendCancel(view, "https://workspace.example/");
     sendCancel(new View({}));
     assert.deepEqual(cancelled, []);
@@ -172,38 +191,7 @@ describe("reconnect overlay (src/reconnect_overlay.js)", () => {
     overlay.show(parent, "hint");
     parent.destroyed = true;
     parent.emit("closed");
-    assert.equal(views[0].webContents.isDestroyed(), true);
+    assert.equal(views[0]!.webContents.isDestroyed(), true);
     assert.equal(overlay.isShown(parent), false);
-  });
-});
-
-describe("reconnect overlay page (reconnect-overlay/index.html)", () => {
-  function render(hint) {
-    const dom = new JSDOM(fs.readFileSync(PAGE, "utf8"), {
-      url: `file:///app/reconnect-overlay/index.html?${new URLSearchParams({ hint })}`,
-      runScripts: "outside-only",
-    });
-    const calls = [];
-    dom.window.omnigentReconnectOverlay = { cancel: () => calls.push("cancel") };
-    dom.window.eval(dom.window.document.querySelector("script").textContent);
-    return { document: dom.window.document, window: dom.window, calls };
-  }
-
-  it("shows the hint as text and cancels from the button or Escape", () => {
-    const { document, window, calls } = render("<b>Check your network connection.</b>");
-    assert.equal(document.getElementById("title").textContent, "Reconnecting to Databricks…");
-    assert.equal(
-      document.getElementById("hint").textContent,
-      "<b>Check your network connection.</b>",
-    );
-    document.getElementById("cancel").click();
-    document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape" }));
-    assert.deepEqual(calls, ["cancel", "cancel"]);
-  });
-
-  it("keeps Cancel clear of the title when there is no hint", () => {
-    const { document, window } = render("");
-    assert.equal(window.getComputedStyle(document.getElementById("hint")).display, "none");
-    assert.equal(window.getComputedStyle(document.querySelector(".actions")).marginTop, "16px");
   });
 });

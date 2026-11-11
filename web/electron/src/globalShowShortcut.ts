@@ -1,5 +1,3 @@
-"use strict";
-
 // Optional system-wide shortcut that brings the app to the front from any app.
 // Off by default. The chord stays in settings.json while the shortcut is off.
 
@@ -9,6 +7,81 @@ const DEFAULT_ACCELERATOR = "Alt+Space";
 const UNAVAILABLE_ERROR =
   "Couldn't use that shortcut. It may be invalid or already in use by another app.";
 const SAVE_ERROR = "Couldn't save the shortcut. Try again.";
+
+/** The saved shortcut: whether it is on, and its chord. */
+export interface GlobalShortcutSetting {
+  enabled: boolean;
+  accelerator: string;
+}
+
+/** The saved setting, with an error while it is on but not registered. */
+export interface GlobalShortcutStatus extends GlobalShortcutSetting {
+  error?: string;
+}
+
+export type GlobalShortcutSetResult =
+  { ok: true; setting: GlobalShortcutSetting } | { ok: false; error: string };
+
+/** The fields of a `before-input-event` key press that recording reads. */
+export interface ShortcutInput {
+  type: string;
+  key: string;
+  code: string;
+  control: boolean;
+  alt: boolean;
+  shift: boolean;
+  meta: boolean;
+}
+
+/** The parts of a `did-start-navigation` event that tell a page replacement apart. */
+export interface NavigationStartDetails {
+  isMainFrame?: boolean;
+  isSameDocument?: boolean;
+}
+
+type InputListener = (event: { preventDefault: () => void }, input: ShortcutInput) => void;
+type NavigationStartListener = (
+  details: NavigationStartDetails | undefined,
+  url: string,
+  isInPlace: boolean,
+  isMainFrame: boolean,
+) => void;
+
+/** The webContents of the page recording a chord. */
+export interface RecordingWebContents {
+  on: ((event: "before-input-event", listener: InputListener) => unknown) &
+    ((event: "did-start-navigation", listener: NavigationStartListener) => unknown) &
+    ((event: "render-process-gone", listener: () => void) => unknown);
+  once: (event: "destroyed", listener: () => void) => unknown;
+  removeListener: ((event: "before-input-event", listener: InputListener) => unknown) &
+    ((event: "did-start-navigation", listener: NavigationStartListener) => unknown) &
+    ((event: "destroyed" | "render-process-gone", listener: () => void) => unknown);
+}
+
+/** The part of Electron's `globalShortcut` this module drives. */
+export interface ShowShortcutRegistrar {
+  register: (accelerator: string, callback: () => void) => boolean;
+  unregister: (accelerator: string) => void;
+}
+
+export interface GlobalShowShortcutDeps {
+  globalShortcut: ShowShortcutRegistrar;
+  loadSettings: () => Record<string, unknown>;
+  saveSettings: (settings: Record<string, unknown>) => void;
+  show: () => void;
+  isMac: boolean;
+}
+
+export interface GlobalShowShortcut {
+  current: () => GlobalShortcutStatus;
+  apply: () => void;
+  set: (
+    change: unknown,
+    approve?: (accelerator: string) => Promise<boolean>,
+  ) => Promise<GlobalShortcutSetResult>;
+  record: (contents: RecordingWebContents) => Promise<string | null>;
+  cancelRecording: () => void;
+}
 
 const NAMED_KEYS = new Map([
   ["Space", "Space"],
@@ -28,7 +101,7 @@ const MAC_MODIFIER_GLYPHS = new Map([
 ]);
 
 /** Electron's name for a `KeyboardEvent.code`, or undefined if a global shortcut can't use it. */
-function acceleratorKeyName(code) {
+function acceleratorKeyName(code: string): string | undefined {
   if (/^(Key[A-Z]|Digit[0-9])$/.test(code)) return code.slice(-1);
   if (/^F(1|[2-9]|1\d|2[0-4])$/.test(code)) return code;
   return NAMED_KEYS.get(code);
@@ -37,15 +110,11 @@ function acceleratorKeyName(code) {
 /**
  * The accelerator for a `before-input-event` key press, or undefined unless it has
  * Ctrl, Alt, or Cmd and a usable key.
- *
- * @param {Electron.Input} input
- * @param {boolean} isMac
- * @returns {string | undefined}
  */
-function acceleratorFromInput(input, isMac) {
+function acceleratorFromInput(input: ShortcutInput, isMac: boolean): string | undefined {
   const key = acceleratorKeyName(input.code);
   if (key === undefined || !(input.control || input.alt || input.meta)) return undefined;
-  const modifiers = [];
+  const modifiers: string[] = [];
   if (input.control) modifiers.push("Control");
   if (input.alt) modifiers.push("Alt");
   if (input.shift) modifiers.push("Shift");
@@ -53,24 +122,20 @@ function acceleratorFromInput(input, isMac) {
   return [...modifiers, key].join("+");
 }
 
-/**
- * @param {{
- *   globalShortcut: Electron.GlobalShortcut,
- *   loadSettings: () => Record<string, unknown>,
- *   saveSettings: (settings: Record<string, unknown>) => void,
- *   show: () => void,
- *   isMac: boolean,
- * }} deps
- */
-function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, show, isMac }) {
-  /** @type {string | null} */
-  let registeredAccelerator = null;
+export function createGlobalShowShortcut({
+  globalShortcut,
+  loadSettings,
+  saveSettings,
+  show,
+  isMac,
+}: GlobalShowShortcutDeps): GlobalShowShortcut {
+  let registeredAccelerator: string | null = null;
   // The saved shortcut is on, but its chord didn't register at launch (another app may hold it).
   let launchRegistrationFailed = false;
 
-  /** @returns {{ enabled: boolean, accelerator: string }} */
-  function saved() {
-    const stored = loadSettings()[GLOBAL_SHORTCUT_SETTING];
+  function saved(): GlobalShortcutSetting {
+    const raw = loadSettings()[GLOBAL_SHORTCUT_SETTING];
+    const stored = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : undefined;
     return {
       enabled: stored?.enabled === true,
       accelerator:
@@ -80,12 +145,8 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
     };
   }
 
-  /**
-   * The saved setting, with an error while it is on but not registered.
-   *
-   * @returns {{ enabled: boolean, accelerator: string, error?: string }}
-   */
-  function current() {
+  /** The saved setting, with an error while it is on but not registered. */
+  function current(): GlobalShortcutStatus {
     const setting = saved();
     if (!launchRegistrationFailed || !setting.enabled) return setting;
     return {
@@ -101,7 +162,7 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
   }
 
   /** False when the chord is invalid or taken; Electron may refuse it or throw. */
-  function tryRegister(accelerator) {
+  function tryRegister(accelerator: string): boolean {
     try {
       return globalShortcut.register(accelerator, show) === true;
     } catch {
@@ -109,7 +170,7 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
     }
   }
 
-  function register(accelerator) {
+  function register(accelerator: string): boolean {
     if (!tryRegister(accelerator)) return false;
     registeredAccelerator = accelerator;
     return true;
@@ -128,18 +189,19 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
    * the shortcut is off, so an unusable one is never saved. The registered chord changes
    * only after the save, so a failure leaves it.
    *
-   * @param {{ enabled: boolean, accelerator?: string }} change
-   * @param {(accelerator: string) => Promise<boolean>} approve Asks the user before a chord
-   *   registers, since the page asking can't grant itself system-wide keys.
-   * @returns {Promise<
-   *   | { ok: true, setting: { enabled: boolean, accelerator: string } }
-   *   | { ok: false, error: string }
-   * >}
+   * @param change `{ enabled, accelerator? }` from the renderer.
+   * @param approve Asks the user before a chord registers, since the page asking can't
+   *   grant itself system-wide keys.
    */
-  async function set(change, approve) {
-    if (typeof change?.accelerator !== "string") return turnOff();
-    const on = change.enabled === true;
-    const { accelerator } = change;
+  async function set(
+    change: unknown,
+    approve?: (accelerator: string) => Promise<boolean>,
+  ): Promise<GlobalShortcutSetResult> {
+    const fields =
+      change && typeof change === "object" ? (change as Record<string, unknown>) : undefined;
+    const accelerator = fields?.accelerator;
+    if (typeof accelerator !== "string") return turnOff();
+    const on = fields?.enabled === true;
     const needsApproval = accelerator !== registeredAccelerator;
     if (needsApproval && !(await approve?.(accelerator))) {
       return { ok: false, error: "The shortcut wasn't changed." };
@@ -150,7 +212,7 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
     const previous = registeredAccelerator;
     // A new chord registers beside the previous one, which stays until the save succeeds.
     if (candidate && !tryRegister(accelerator)) return { ok: false, error: UNAVAILABLE_ERROR };
-    const setting = { enabled: on, accelerator };
+    const setting: GlobalShortcutSetting = { enabled: on, accelerator };
     if (!store(setting)) {
       if (candidate) globalShortcut.unregister(accelerator);
       return { ok: false, error: SAVE_ERROR };
@@ -166,8 +228,8 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
    * Turns the shortcut off and keeps its saved chord, without asking or registering, so a
    * Settings window still showing an older chord can't replace it.
    */
-  function turnOff() {
-    const setting = { enabled: false, accelerator: saved().accelerator };
+  function turnOff(): GlobalShortcutSetResult {
+    const setting: GlobalShortcutSetting = { enabled: false, accelerator: saved().accelerator };
     if (!store(setting)) return { ok: false, error: SAVE_ERROR };
     unregister();
     launchRegistrationFailed = false;
@@ -175,7 +237,7 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
   }
 
   /** Writes the setting to settings.json; false when that fails. */
-  function store(setting) {
+  function store(setting: GlobalShortcutSetting): boolean {
     try {
       const settings = loadSettings();
       settings[GLOBAL_SHORTCUT_SETTING] = setting;
@@ -187,21 +249,17 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
     }
   }
 
-  /** @type {(() => void) | null} */
-  let stopRecording = null;
+  let stopRecording: (() => void) | null = null;
 
   /**
    * Takes the next chord pressed in `contents` before the page and the app menu see it,
    * so recording one can't also run an app shortcut such as Cmd+K. Resolves the
    * accelerator, or null when Escape, cancelRecording, or another recording ends it.
-   *
-   * @param {Electron.WebContents} contents
-   * @returns {Promise<string | null>}
    */
-  function record(contents) {
+  function record(contents: RecordingWebContents): Promise<string | null> {
     stopRecording?.();
     return new Promise((resolve) => {
-      const finish = (accelerator) => {
+      const finish = (accelerator: string | null) => {
         contents.removeListener("before-input-event", onInput);
         contents.removeListener("destroyed", stop);
         contents.removeListener("did-start-navigation", onNavigate);
@@ -210,7 +268,7 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
         resolve(accelerator);
       };
       const stop = () => finish(null);
-      const onInput = (event, input) => {
+      const onInput: InputListener = (event, input) => {
         if (input.type !== "keyDown") return;
         if (input.key === "Escape") {
           event.preventDefault();
@@ -224,7 +282,7 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
         finish(accelerator);
       };
       // A reload or navigation replaces the page that asked, so its recording ends with it.
-      const onNavigate = (details, _url, isInPlace, isMainFrame) => {
+      const onNavigate: NavigationStartListener = (details, _url, isInPlace, isMainFrame) => {
         const mainFrame = details?.isMainFrame ?? isMainFrame;
         const sameDocument = details?.isSameDocument ?? isInPlace;
         if (mainFrame && !sameDocument) stop();
@@ -245,10 +303,8 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
 }
 
 /** The chord as the user reads it: ⌃⌥⇧⌘ glyphs on macOS, `Ctrl+Alt+Space` elsewhere. */
-function acceleratorLabel(accelerator, isMac) {
+export function acceleratorLabel(accelerator: string, isMac: boolean): string {
   const parts = accelerator.split("+");
   if (isMac) return parts.map((part) => MAC_MODIFIER_GLYPHS.get(part) ?? part).join("");
   return parts.map((part) => (part === "Control" ? "Ctrl" : part)).join("+");
 }
-
-module.exports = { acceleratorLabel, createGlobalShowShortcut };

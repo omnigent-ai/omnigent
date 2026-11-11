@@ -24,7 +24,7 @@
 
 "use strict";
 
-const { diagnostics } = require("./diagnostics");
+const { diagnostics } = require("./diagnostics.ts");
 
 const crypto = require("node:crypto");
 const { shell } = require("electron");

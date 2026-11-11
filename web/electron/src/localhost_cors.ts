@@ -22,14 +22,19 @@
 // must be trusted too, so a trusted-origin iframe embedded in a hostile
 // page confers nothing.
 
-"use strict";
+import type { HeadersReceivedResponse, OnHeadersReceivedListenerDetails, Session } from "electron";
+
+/** Optional first look at every response; non-null answers the request. */
+export type ResponseHeadersHook = (
+  details: OnHeadersReceivedListenerDetails,
+) => HeadersReceivedResponse | null;
 
 /**
  * Hostnames treated as "localhost" targets. Deliberately the loopback
  * literals only — NOT private-range IPs (192.168.*, 10.*) or mDNS names,
  * which reach other machines on the user's network.
  */
-const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
+export const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /**
  * webRequest URL filter matching the localhost targets. Chromium match
@@ -50,11 +55,8 @@ const LOCALHOST_URL_FILTER = {
  * Parse a URL string into its origin, or null when it isn't a valid URL.
  * (Duplicated from main.js rather than imported to keep this module
  * dependency-free and separately testable.)
- *
- * @param {string} url
- * @returns {string | null}
  */
-function originOf(url) {
+function originOf(url: string): string | null {
   try {
     return new URL(url).origin;
   } catch {
@@ -62,14 +64,9 @@ function originOf(url) {
   }
 }
 
-/**
- * True when a URL points at a loopback host over http(s).
- *
- * @param {string} url
- * @returns {boolean}
- */
-function isLocalhostUrl(url) {
-  let u;
+/** True when a URL points at a loopback host over http(s). */
+export function isLocalhostUrl(url: string): boolean {
+  let u: URL;
   try {
     u = new URL(url);
   } catch {
@@ -82,11 +79,13 @@ function isLocalhostUrl(url) {
 /**
  * Case-insensitive single-header lookup in a webRequest headers object.
  *
- * @param {Record<string, string | string[]> | undefined} headers
- * @param {string} name Lower-case header name to find.
- * @returns {string | null} The header value (first value when repeated).
+ * @param name Lower-case header name to find.
+ * @returns The header value (first value when repeated).
  */
-function headerValue(headers, name) {
+function headerValue(
+  headers: Readonly<Record<string, string | string[]>> | undefined,
+  name: string,
+): string | null {
   if (!headers) return null;
   for (const [key, value] of Object.entries(headers)) {
     if (key.toLowerCase() === name) {
@@ -104,30 +103,31 @@ function headerValue(headers, name) {
  * onHeadersReceived / onCompleted / onErrorOccurred on the shell session —
  * which is why `responseHeadersHook` composes in here.
  *
- * @param {Electron.Session} ses The session to hook (the shell's default
- *   session).
- * @param {(origin: string) => boolean} isTrustedPageOrigin Decides which
- *   page origins may reach localhost. Called per localhost-bound request
- *   with the requesting page's origin (e.g. ``"https://my-server.example"``).
- * @param {(details: Electron.OnHeadersReceivedListenerDetails) =>
- *   Electron.HeadersReceivedResponse | null} [responseHeadersHook]
- *   Optional first look at every response (the shell strips COOP inside
+ * @param ses The session to hook (the shell's default session).
+ * @param isTrustedPageOrigin Decides which page origins may reach localhost.
+ *   Called per localhost-bound request with the requesting page's origin
+ *   (e.g. ``"https://my-server.example"``).
+ * @param responseHeadersHook Optional first look at every response (the shell strips COOP inside
  *   OAuth popups — see main.js): non-null answers the request, null falls
  *   through to the CORS logic. Providing it widens the onHeadersReceived
  *   registration to all URLs; CORS stays scoped to requests the
  *   localhost-filtered onBeforeSendHeaders admitted into `inflight`.
  */
-function registerLocalhostCors(ses, isTrustedPageOrigin, responseHeadersHook) {
+export function registerLocalhostCors(
+  ses: Pick<Session, "webRequest">,
+  isTrustedPageOrigin: (origin: string) => boolean,
+  responseHeadersHook?: ResponseHeadersHook,
+): void {
   /**
    * In-flight localhost requests from trusted pages, keyed by webRequest
    * id: what to echo back in the injected CORS headers. Entries are
    * removed on completion/error (NOT in onHeadersReceived — a redirect
    * re-fires it for the same id).
-   *
-   * @type {Map<number, {origin: string, acrMethod: string | null,
-   *   acrHeaders: string | null}>}
    */
-  const inflight = new Map();
+  const inflight = new Map<
+    number,
+    { origin: string; acrMethod: string | null; acrHeaders: string | null }
+  >();
 
   ses.webRequest.onBeforeSendHeaders(LOCALHOST_URL_FILTER, (details, callback) => {
     const pageOrigin = headerValue(details.requestHeaders, "origin");
@@ -155,7 +155,10 @@ function registerLocalhostCors(ses, isTrustedPageOrigin, responseHeadersHook) {
     callback({});
   });
 
-  const handleHeadersReceived = (details, callback) => {
+  const handleHeadersReceived = (
+    details: OnHeadersReceivedListenerDetails,
+    callback: (response: HeadersReceivedResponse) => void,
+  ) => {
     if (responseHeadersHook) {
       const hooked = responseHeadersHook(details);
       if (hooked) {
@@ -173,7 +176,7 @@ function registerLocalhostCors(ses, isTrustedPageOrigin, responseHeadersHook) {
       callback({});
       return;
     }
-    const responseHeaders = { ...details.responseHeaders };
+    const responseHeaders: Record<string, string | string[]> = { ...details.responseHeaders };
     // Echo the exact page origin (never "*") so credentialed requests —
     // which auth flows typically are — pass Chromium's CORS checks.
     responseHeaders["Access-Control-Allow-Origin"] = [info.origin];
@@ -209,5 +212,3 @@ function registerLocalhostCors(ses, isTrustedPageOrigin, responseHeadersHook) {
     inflight.delete(details.id);
   });
 }
-
-module.exports = { registerLocalhostCors, isLocalhostUrl, LOCAL_HOSTNAMES };

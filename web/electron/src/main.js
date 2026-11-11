@@ -33,12 +33,12 @@ const {
   systemPreferences,
 } = require("electron");
 const { autoUpdater } = require("electron-updater");
-const { createDesktopUpdater } = require("./desktop_updater");
-const { createUpdateOverlay } = require("./update_overlay");
-const { createConnectionLoading } = require("./connection_loading");
-const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
-const { registerFileReveal } = require("./fileReveal");
-const { registerFolderChooser } = require("./folderChooser");
+const { createDesktopUpdater } = require("./desktop_updater.ts");
+const { createUpdateOverlay } = require("./update_overlay.ts");
+const { createConnectionLoading } = require("./connection_loading.ts");
+const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window.ts");
+const { registerFileReveal } = require("./fileReveal.ts");
+const { registerFolderChooser } = require("./folderChooser.ts");
 const { ICON_PNG, pagePath, preloadPath } = require("./paths.ts");
 const { withTestOverrides } = require("./testOverrides");
 const fs = require("node:fs");
@@ -46,7 +46,7 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { omnigentBuild } = require("../package.json");
 const { execFile } = require("node:child_process");
-const { registerLocalhostCors } = require("./localhost_cors");
+const { registerLocalhostCors } = require("./localhost_cors.ts");
 const { isLoopbackPreviewUrl } = require("./browserUrlPolicy.ts");
 const {
   registerBrowserPermissions,
@@ -77,11 +77,11 @@ const {
   labeledWorkspace,
   withConnectLabel,
 } = require("./server_labels.ts");
-const { registerWorkspaceChromeHide } = require("./workspace-chrome");
-const { registerWorkspaceRootBounce } = require("./workspace-root-bounce");
-const { registerServerAwayWatch, AWAY_BANNER_DELAY_MS } = require("./away_banner");
-const { createReturnBanner } = require("./return_banner");
-const { createReconnectOverlay } = require("./reconnect_overlay");
+const { registerWorkspaceChromeHide } = require("./workspace-chrome.ts");
+const { registerWorkspaceRootBounce } = require("./workspace-root-bounce.ts");
+const { registerServerAwayWatch, AWAY_BANNER_DELAY_MS } = require("./away_banner.ts");
+const { createReturnBanner } = require("./return_banner.ts");
+const { createReconnectOverlay } = require("./reconnect_overlay.ts");
 const { createBrowserViewRegistry } = withTestOverrides(
   "browserViewRegistry",
   require("./browserViewRegistry"),
@@ -106,7 +106,7 @@ const { createArcaConnectFlow } = require("./arca_connect_window");
 const { createArcaAutoConnect } = require("./arca_autoconnect");
 const sshConnect = require("./ssh_connect");
 const { createSshConnectFlow } = require("./ssh_connect_window");
-const { registerSessionExpiryReload } = require("./session-expiry");
+const { registerSessionExpiryReload } = require("./session-expiry.ts");
 const { ensureDatabricksSession } = require("./databricks-session");
 const {
   deleteStoredToken: forgetDatabricksToken,
@@ -137,8 +137,8 @@ const {
   macApplicationMenu,
   settingsMenuItem,
 } = require("./settingsNavigation.ts");
-const { createQuitConfirmation } = require("./quitConfirmation");
-const { acceleratorLabel, createGlobalShowShortcut } = require("./globalShowShortcut");
+const { createQuitConfirmation } = require("./quitConfirmation.ts");
+const { acceleratorLabel, createGlobalShowShortcut } = require("./globalShowShortcut.ts");
 const {
   registerDesktopCommandStateReset,
   sanitizeDesktopCommandState,
@@ -146,7 +146,7 @@ const {
 const omnigentCli = withTestOverrides("omnigent_cli", require("./omnigent_cli"));
 
 const serverManager = require("./server_manager");
-const { diagnostics } = require("./diagnostics");
+const { diagnostics } = require("./diagnostics.ts");
 
 const isHostThisMachine = createHostThisMachineChecker();
 

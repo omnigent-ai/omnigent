@@ -1,7 +1,7 @@
 // Detect when a shell window's main frame has navigated AWAY from its pinned
 // server (e.g. an SSO redirect to an identity provider) and stayed away. Kept
 // free of Electron imports so the behavior can be tested with a fake
-// webContents — the same pattern as workspace-root-bounce.js.
+// webContents — the same pattern as workspace-root-bounce.ts.
 //
 // "Away" is origin-based, so it covers every subpage of the server (a
 // Databricks ``…/omnigent`` mount with query args included): any committed
@@ -12,13 +12,39 @@
 // targets — otherwise the banner would offer to "return" to the login page
 // the user is stuck behind.
 
-"use strict";
-
 /** How long the window must stay off the pinned origin before we offer to return. */
-const AWAY_BANNER_DELAY_MS = 10_000;
+export const AWAY_BANNER_DELAY_MS = 10_000;
+
+/** A timer handle from the real or an injected `setTimeout`. */
+export type AwayTimer = ReturnType<typeof setTimeout> | number;
+
+/** The parts of a shell window's webContents the away-watch observes. */
+export interface AwayWatchWebContents {
+  on: ((event: "did-navigate", listener: (event: unknown, url: string) => void) => unknown) &
+    ((
+      event: "did-navigate-in-page",
+      listener: (event: unknown, url: string, isMainFrame: boolean) => void,
+    ) => unknown);
+  getURL: () => string;
+}
+
+export interface ServerAwayWatchOptions {
+  getPinnedOrigin: () => string | null;
+  onAway: (returnUrl: string | null) => void;
+  onReturn: () => void;
+  delayMs?: number;
+  debugLog?: (message: string) => void;
+  setTimeoutFn?: (callback: () => void, ms: number) => AwayTimer;
+  clearTimeoutFn?: (timer: AwayTimer) => void;
+}
+
+export interface ServerAwayWatch {
+  dispose: () => void;
+  reset: () => void;
+}
 
 /** Return a URL's origin, or null when it is not an absolute URL. */
-function originOf(rawUrl) {
+function originOf(rawUrl: string): string | null {
   try {
     return new URL(rawUrl).origin;
   } catch {
@@ -30,15 +56,12 @@ function originOf(rawUrl) {
  * Whether a URL on the pinned origin is an auth-gate page rather than app
  * content. Covers the Databricks workspace login page (which redirects an
  * expired session to ``/login.html?next_url=…`` on the SAME origin — see
- * session-expiry.js) and the Apps front-door OIDC namespace (``/oidc/``,
+ * session-expiry.ts) and the Apps front-door OIDC namespace (``/oidc/``,
  * ``/.auth/`` — see runner/_entry.py). The app's own ``/auth/*`` flow is
  * deliberately NOT listed: those pages belong to the app and bounce quickly.
- *
- * @param {string} rawUrl
- * @returns {boolean}
  */
-function isAuthGatePath(rawUrl) {
-  let pathname;
+export function isAuthGatePath(rawUrl: string): boolean {
+  let pathname: string;
   try {
     pathname = new URL(rawUrl).pathname;
   } catch {
@@ -65,24 +88,9 @@ function isAuthGatePath(rawUrl) {
  *   do not re-report (the user may have dismissed the banner); an on-server
  *   commit or an explicit ``reset()`` re-arms the watch.
  * - While the window is unpinned (setup page), the watch is inert.
- *
- * @param {{
- *   on: (event: string, listener: (...args: unknown[]) => void) => void,
- *   getURL: () => string
- * }} webContents
- * @param {{
- *   getPinnedOrigin: () => string | null,
- *   onAway: (returnUrl: string | null) => void,
- *   onReturn: () => void,
- *   delayMs?: number,
- *   debugLog?: (message: string) => void,
- *   setTimeoutFn?: typeof setTimeout,
- *   clearTimeoutFn?: typeof clearTimeout
- * }} options
- * @returns {{ dispose: () => void, reset: () => void }}
  */
-function registerServerAwayWatch(
-  webContents,
+export function registerServerAwayWatch(
+  webContents: AwayWatchWebContents,
   {
     getPinnedOrigin,
     onAway,
@@ -91,10 +99,10 @@ function registerServerAwayWatch(
     debugLog = () => {},
     setTimeoutFn = setTimeout,
     clearTimeoutFn = clearTimeout,
-  },
-) {
-  let lastServerUrl = null;
-  let awayTimer = null;
+  }: ServerAwayWatchOptions,
+): ServerAwayWatch {
+  let lastServerUrl: string | null = null;
+  let awayTimer: AwayTimer | null = null;
   let notified = false;
   let disposed = false;
 
@@ -105,7 +113,7 @@ function registerServerAwayWatch(
     }
   }
 
-  function onServer(url) {
+  function onServer(url: string): void {
     lastServerUrl = url;
     notified = false;
     cancelTimer();
@@ -129,7 +137,7 @@ function registerServerAwayWatch(
     }, delayMs);
   }
 
-  function handleCommit(url) {
+  function handleCommit(url: string): void {
     if (disposed) return;
     const pinned = getPinnedOrigin();
     if (!pinned) {
@@ -144,8 +152,8 @@ function registerServerAwayWatch(
     else onForeign();
   }
 
-  const onDidNavigate = (_event, url) => handleCommit(url);
-  const onDidNavigateInPage = (_event, url, isMainFrame) => {
+  const onDidNavigate = (_event: unknown, url: string) => handleCommit(url);
+  const onDidNavigateInPage = (_event: unknown, url: string, isMainFrame: boolean) => {
     if (isMainFrame) handleCommit(url);
   };
   webContents.on("did-navigate", onDidNavigate);
@@ -168,5 +176,3 @@ function registerServerAwayWatch(
     },
   };
 }
-
-module.exports = { AWAY_BANNER_DELAY_MS, isAuthGatePath, registerServerAwayWatch };

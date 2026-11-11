@@ -1,21 +1,23 @@
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 
-const { registerWorkspaceRootBounce } = require("../src/workspace-root-bounce");
+import { registerWorkspaceRootBounce } from "../src/workspace-root-bounce.ts";
 
 class FakeWebContents extends EventEmitter {
+  url: string;
+  loads: string[] = [];
+
   constructor(url = "") {
     super();
     this.url = url;
-    this.loads = [];
   }
 
   getURL() {
     return this.url;
   }
 
-  async loadURL(url) {
+  async loadURL(url: string) {
     this.loads.push(url);
     this.url = url;
   }

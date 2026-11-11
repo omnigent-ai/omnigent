@@ -9,7 +9,25 @@
 // lifecycle and request guard live in databricks-auth.js, never embedded SSO.
 //
 // Kept Electron-free at its core (isLoginRedirect) so the matching logic is
-// unit-testable (test/session-expiry.test.js) without booting the app.
+// unit-testable (test/session-expiry.test.ts) without booting the app.
+
+/** The fields of a webRequest ``onBeforeRedirect`` detail object that matter here. */
+export interface LoginRedirectDetails {
+  statusCode?: number;
+  redirectURL?: string;
+}
+
+/** A redirect observed on a session, with the URL of the request that was redirected. */
+export interface SessionRedirectDetails extends LoginRedirectDetails {
+  url: string;
+}
+
+/** The part of an Electron session whose redirects are watched. */
+export interface RedirectWatchSession {
+  webRequest: {
+    onBeforeRedirect: (listener: (details: SessionRedirectDetails) => void) => void;
+  };
+}
 
 /**
  * Whether a webRequest redirect is the auth gate bouncing an expired session
@@ -17,17 +35,14 @@
  * ``login.html`` — the one unambiguous signal from a real expired session
  * (see the module header). A same-origin API-to-API redirect, or any redirect
  * not landing on the login page, is left alone.
- *
- * @param {{ statusCode?: number, redirectURL?: string }} details A webRequest
- *   ``onBeforeRedirect`` detail object (or the fields it carries).
- * @returns {boolean}
  */
-function isLoginRedirect(details) {
+export function isLoginRedirect(details: LoginRedirectDetails | null | undefined): boolean {
   const status = details?.statusCode ?? 0;
   if (status < 300 || status >= 400) return false;
-  let pathname;
+  let pathname: string;
   try {
-    pathname = new URL(details.redirectURL).pathname;
+    // A missing URL stringifies to "undefined", which does not parse either.
+    pathname = new URL(String(details?.redirectURL)).pathname;
   } catch {
     return false;
   }
@@ -46,22 +61,26 @@ function isLoginRedirect(details) {
  *
  * Uses ``onBeforeRedirect`` — an observe-only event with no other listener in
  * this shell (Electron allows one listener per webRequest event per session,
- * and localhost_cors.js claims the others). On a login-page redirect whose
+ * and localhost_cors.ts claims the others). On a login-page redirect whose
  * originating request targeted a connected server origin, the matching windows
  * are reloaded. Guarded to one reload per window between successful loads (via
  * the caller's ``reloadWindowsForOrigin``) so a persistently expired host does
  * not reload-loop.
  *
- * @param {Electron.Session} ses The session whose redirects to watch.
- * @param {(origin: string) => boolean} isConnectedServerOrigin Whether an
- *   origin belongs to a server some window is connected to.
- * @param {(origin: string) => void} reloadWindowsForOrigin Reload every window
- *   pinned to the given origin (the caller owns the once-per-window guard).
+ * @param ses The session whose redirects to watch.
+ * @param isConnectedServerOrigin Whether an origin belongs to a server some
+ *   window is connected to.
+ * @param reloadWindowsForOrigin Reload every window pinned to the given origin
+ *   (the caller owns the once-per-window guard).
  */
-function registerSessionExpiryReload(ses, isConnectedServerOrigin, reloadWindowsForOrigin) {
+export function registerSessionExpiryReload(
+  ses: RedirectWatchSession,
+  isConnectedServerOrigin: (origin: string) => boolean,
+  reloadWindowsForOrigin: (origin: string) => void,
+): void {
   ses.webRequest.onBeforeRedirect((details) => {
     if (!isLoginRedirect(details)) return;
-    let origin;
+    let origin: string;
     try {
       origin = new URL(details.url).origin;
     } catch {
@@ -71,8 +90,3 @@ function registerSessionExpiryReload(ses, isConnectedServerOrigin, reloadWindows
     reloadWindowsForOrigin(origin);
   });
 }
-
-module.exports = {
-  isLoginRedirect,
-  registerSessionExpiryReload,
-};

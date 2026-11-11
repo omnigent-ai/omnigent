@@ -1,46 +1,51 @@
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
-const fs = require("node:fs");
-const path = require("node:path");
-const { pathToFileURL } = require("node:url");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 
-const {
+import {
   createAboutWindow,
   resolveAppIconDataUrl,
   platformDisplayName,
   ABOUT_HEIGHT,
   ABOUT_WIDTH,
-} = require("../src/about_window");
+  type AboutIpcEvent,
+  type AboutWindowOptions,
+} from "../src/about_window.ts";
+import type { UpdateStatus } from "../src/desktop_updater.ts";
 
 const ABOUT_PAGE = "/app/about/index.html";
 
+type Handler = (event: AboutIpcEvent) => unknown;
+
 class FakeWebContents extends EventEmitter {
-  constructor() {
-    super();
-    this.url = "";
-    this.windowOpenHandler = null;
-  }
+  url = "";
+  windowOpenHandler: (() => { action: "deny" }) | null = null;
 
   getURL() {
     return this.url;
   }
 
-  setWindowOpenHandler(handler) {
+  setWindowOpenHandler(handler: () => { action: "deny" }) {
     this.windowOpenHandler = handler;
   }
 }
 
 class FakeWindow extends EventEmitter {
-  constructor(options = {}) {
+  options: AboutWindowOptions<FakeWindow>;
+  webContents = new FakeWebContents();
+  destroyed = false;
+  visible = false;
+  focused = false;
+  minimized = false;
+  loadedFile: string | null = null;
+  excludedFromShownWindowsMenu?: boolean;
+
+  constructor(options: AboutWindowOptions<FakeWindow> = {}) {
     super();
     this.options = options;
-    this.webContents = new FakeWebContents();
-    this.destroyed = false;
-    this.visible = false;
-    this.focused = false;
-    this.minimized = false;
-    this.loadedFile = null;
   }
 
   isDestroyed() {
@@ -67,7 +72,7 @@ class FakeWindow extends EventEmitter {
     this.focused = true;
   }
 
-  loadFile(file) {
+  loadFile(file: string) {
     this.loadedFile = file;
     this.webContents.url = pathToFileURL(file).href;
     return Promise.resolve();
@@ -84,32 +89,40 @@ class FakeWindow extends EventEmitter {
   }
 }
 
+interface AboutOptions {
+  cliStatus?: unknown;
+  desktopStatus?: UpdateStatus;
+  installReady?: boolean;
+  appIconDataUrl?: string;
+  platform?: NodeJS.Platform;
+}
+
 function makeAbout({
   cliStatus,
   desktopStatus,
   installReady = true,
   appIconDataUrl = "data:image/png;base64,native-icon",
   platform = "darwin",
-} = {}) {
-  const windows = [];
+}: AboutOptions = {}) {
+  const windows: FakeWindow[] = [];
   class BrowserWindow extends FakeWindow {
-    constructor(options) {
+    constructor(options: AboutWindowOptions<FakeWindow>) {
       super(options);
       windows.push(this);
     }
   }
-  const handleHandlers = new Map();
-  const onHandlers = new Map();
+  const handleHandlers = new Map<string, Handler>();
+  const onHandlers = new Map<string, Handler>();
   const calls = {
-    desktopChecks: [],
+    desktopChecks: [] as unknown[],
     desktopDownloads: 0,
-    desktopDownloadParents: [],
+    desktopDownloadParents: [] as FakeWindow[],
     desktopInstalls: 0,
-    closedParents: [],
+    closedParents: [] as FakeWindow[],
   };
   const updater = {
-    getStatus: () => desktopStatus ?? { state: "none" },
-    checkForUpdates: async (options) => {
+    getStatus: (): UpdateStatus => desktopStatus ?? { state: "none" },
+    checkForUpdates: async (options?: { manual?: boolean }) => {
       calls.desktopChecks.push(options);
     },
     downloadUpdate: async () => {
@@ -138,8 +151,8 @@ function makeAbout({
         source: "candidate",
         installCommand: "install omnigent",
       },
-    onDesktopDownloadStarted: (parent) => calls.desktopDownloadParents.push(parent),
-    onClosed: (parent) => calls.closedParents.push(parent),
+    onDesktopDownloadStarted: (parent: FakeWindow) => calls.desktopDownloadParents.push(parent),
+    onClosed: (parent: FakeWindow) => calls.closedParents.push(parent),
     aboutPage: ABOUT_PAGE,
     preloadPath: "/app/src/about_preload.js",
     platform,
@@ -148,14 +161,14 @@ function makeAbout({
   return { calls, controller, handleHandlers, onHandlers, windows };
 }
 
-function eventFor(win, url = pathToFileURL(ABOUT_PAGE).href) {
+function eventFor(win: FakeWindow, url = pathToFileURL(ABOUT_PAGE).href): AboutIpcEvent {
   return { sender: win.webContents, senderFrame: { url } };
 }
 
-function fakeImage(dataUrl, empty = false) {
+function fakeImage(dataUrl: string, empty = false) {
   return {
     isEmpty: () => empty,
-    toDataURL: (options) => `${dataUrl}:${options.scaleFactor}x`,
+    toDataURL: (options: { scaleFactor: number }) => `${dataUrl}:${options.scaleFactor}x`,
   };
 }
 
@@ -170,7 +183,7 @@ describe("platformDisplayName", () => {
 
 describe("resolveAppIconDataUrl", () => {
   it("uses the native running-application icon for packaged macOS", async () => {
-    const calls = [];
+    const calls: string[] = [];
     const result = await resolveAppIconDataUrl({
       app: {
         isPackaged: true,
@@ -211,7 +224,7 @@ describe("resolveAppIconDataUrl", () => {
   });
 
   it("uses the bundled PNG in development", async () => {
-    const calls = [];
+    const calls: string[] = [];
     const result = await resolveAppIconDataUrl({
       app: { isPackaged: false, getFileIcon: async () => fakeImage("file") },
       nativeImage: {
@@ -233,10 +246,15 @@ describe("resolveAppIconDataUrl", () => {
 
 describe("About window", () => {
   it("packages the bundled About page with button and Escape close controls", () => {
-    const packageConfig = require("../package.json");
-    const html = fs.readFileSync(path.join(__dirname, "../about/index.html"), "utf8");
-    const script = fs.readFileSync(path.join(__dirname, "../about/index.js"), "utf8");
-    const preload = fs.readFileSync(path.join(__dirname, "../src/about_preload.js"), "utf8");
+    const packageConfig: { build: { files: string[] } } = JSON.parse(
+      fs.readFileSync(path.join(import.meta.dirname, "../package.json"), "utf8"),
+    );
+    const html = fs.readFileSync(path.join(import.meta.dirname, "../about/index.html"), "utf8");
+    const script = fs.readFileSync(path.join(import.meta.dirname, "../about/index.js"), "utf8");
+    const preload = fs.readFileSync(
+      path.join(import.meta.dirname, "../src/about_preload.js"),
+      "utf8",
+    );
 
     assert.ok(packageConfig.build.files.includes("about/**/*"));
     assert.match(html, /img-src 'self' data:/);
@@ -266,12 +284,12 @@ describe("About window", () => {
     assert.equal(first.options.modal, true);
     assert.equal(first.options.width, ABOUT_WIDTH);
     assert.equal(first.options.height, ABOUT_HEIGHT);
-    assert.equal(first.options.webPreferences.contextIsolation, true);
-    assert.equal(first.options.webPreferences.nodeIntegration, false);
-    assert.equal(first.options.webPreferences.sandbox, true);
+    assert.equal(first.options.webPreferences?.contextIsolation, true);
+    assert.equal(first.options.webPreferences?.nodeIntegration, false);
+    assert.equal(first.options.webPreferences?.sandbox, true);
     assert.equal(first.loadedFile, ABOUT_PAGE);
     assert.equal(first.excludedFromShownWindowsMenu, true);
-    assert.deepEqual(first.webContents.windowOpenHandler(), { action: "deny" });
+    assert.deepEqual(first.webContents.windowOpenHandler?.(), { action: "deny" });
 
     first.emit("ready-to-show");
     assert.equal(first.visible, true);
@@ -323,7 +341,7 @@ describe("About window", () => {
   it("accepts IPC only from the tracked bundled page", async () => {
     const h = makeAbout();
     const about = h.controller.open(new FakeWindow());
-    const getInfo = h.handleHandlers.get("omnigent:about-get-info");
+    const getInfo = h.handleHandlers.get("omnigent:about-get-info")!;
 
     assert.deepEqual(await getInfo(eventFor(about)), {
       desktopVersion: "0.13.0-dev.0",
@@ -347,16 +365,18 @@ describe("About window", () => {
         "omnigent:about-install-desktop-update",
       ].map((channel) =>
         assert.rejects(
-          Promise.resolve().then(() => h.handleHandlers.get(channel)(wrongPage)),
+          Promise.resolve().then(() => h.handleHandlers.get(channel)!(wrongPage)),
           /bundled About/,
         ),
       ),
     );
     await assert.rejects(
-      getInfo({
-        sender: new FakeWebContents(),
-        senderFrame: { url: pathToFileURL(ABOUT_PAGE).href },
-      }),
+      Promise.resolve(
+        getInfo({
+          sender: new FakeWebContents(),
+          senderFrame: { url: pathToFileURL(ABOUT_PAGE).href },
+        }),
+      ),
       /bundled About/,
     );
   });
@@ -365,7 +385,7 @@ describe("About window", () => {
     const h = makeAbout();
     const parent = new FakeWindow();
     const about = h.controller.open(parent);
-    const close = h.onHandlers.get("omnigent:about-close");
+    const close = h.onHandlers.get("omnigent:about-close")!;
 
     close(eventFor(about, "https://evil.example/"));
     assert.equal(about.destroyed, false);
@@ -376,24 +396,24 @@ describe("About window", () => {
   });
 
   it("delegates the full desktop update flow and returns raw updater status", async () => {
-    const status = { state: "available", info: { version: "0.14.0" } };
+    const status: UpdateStatus = { state: "available", info: { version: "0.14.0" } };
     const h = makeAbout({ desktopStatus: status });
     const parent = new FakeWindow();
     const about = h.controller.open(parent);
     const event = eventFor(about);
 
     assert.deepEqual(
-      await h.handleHandlers.get("omnigent:about-get-desktop-update-status")(event),
+      await h.handleHandlers.get("omnigent:about-get-desktop-update-status")!(event),
       status,
     );
-    assert.deepEqual(await h.handleHandlers.get("omnigent:about-check-desktop")(event), status);
+    assert.deepEqual(await h.handleHandlers.get("omnigent:about-check-desktop")!(event), status);
     assert.deepEqual(h.calls.desktopChecks, [{ manual: true }]);
 
-    await h.handleHandlers.get("omnigent:about-download-desktop-update")(event);
+    await h.handleHandlers.get("omnigent:about-download-desktop-update")!(event);
     assert.deepEqual(h.calls.desktopDownloadParents, [parent]);
     assert.equal(h.calls.desktopDownloads, 1);
 
-    await h.handleHandlers.get("omnigent:about-install-desktop-update")(event);
+    await h.handleHandlers.get("omnigent:about-install-desktop-update")!(event);
     assert.equal(h.calls.desktopInstalls, 1);
   });
 
@@ -402,7 +422,7 @@ describe("About window", () => {
     const about = h.controller.open(new FakeWindow());
 
     assert.throws(
-      () => h.handleHandlers.get("omnigent:about-install-desktop-update")(eventFor(about)),
+      () => h.handleHandlers.get("omnigent:about-install-desktop-update")!(eventFor(about)),
       /No downloaded update is ready/,
     );
   });

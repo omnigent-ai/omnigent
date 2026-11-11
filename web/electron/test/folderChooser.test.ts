@@ -1,17 +1,30 @@
-"use strict";
-const { test } = require("node:test");
-const assert = require("node:assert/strict");
-const { registerFolderChooser } = require("../src/folderChooser");
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { registerFolderChooser, type FolderChooserDialogOptions } from "../src/folderChooser.ts";
 
-function setup(result = { canceled: false, filePaths: ["/Users/me/app"] }) {
-  const handlers = new Map();
-  const dialogs = [];
-  const pending = [];
+interface DialogResult {
+  canceled: boolean;
+  filePaths: string[];
+}
+
+interface ChooserEvent {
+  trusted: boolean;
+  sender: { id: number };
+}
+
+type Handler = (event: ChooserEvent, ...args: unknown[]) => unknown;
+
+function setup(
+  result: DialogResult | "pending" = { canceled: false, filePaths: ["/Users/me/app"] },
+) {
+  const handlers = new Map<string, Handler>();
+  const dialogs: { win: string; options: FolderChooserDialogOptions }[] = [];
+  const pending: ((value: DialogResult) => void)[] = [];
   const dialog = {
-    showOpenDialog: (win, options) => {
+    showOpenDialog: (win: string, options: FolderChooserDialogOptions) => {
       dialogs.push({ win, options });
       if (result === "pending") {
-        return new Promise((resolve) => {
+        return new Promise<DialogResult>((resolve) => {
           pending.push(resolve);
         });
       }
@@ -22,21 +35,22 @@ function setup(result = { canceled: false, filePaths: ["/Users/me/app"] }) {
     ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
     dialog,
     windowFor: () => "window",
-    isPinnedOriginSender: (event) => event.trusted === true,
+    isPinnedOriginSender: (event: ChooserEvent) => event.trusted === true,
   });
-  const event = (trusted = true, id = 1) => ({ trusted, sender: { id } });
-  const choose = (defaultPath, from = event()) =>
-    handlers.get("omnigent:choose-directory")(from, defaultPath);
-  const dropped = (path, from = event()) => handlers.get("omnigent:dropped-file-path")(from, path);
-  const finish = (value) => pending.splice(0).forEach((resolve) => resolve(value));
+  const event = (trusted = true, id = 1): ChooserEvent => ({ trusted, sender: { id } });
+  const choose = (defaultPath: unknown, from = event()) =>
+    handlers.get("omnigent:choose-directory")!(from, defaultPath);
+  const dropped = (path: unknown, from = event()) =>
+    handlers.get("omnigent:dropped-file-path")!(from, path);
+  const finish = (value: DialogResult) => pending.splice(0).forEach((resolve) => resolve(value));
   return { dialogs, choose, dropped, event, finish };
 }
 
 test("returns the chosen folder, opening at an absolute default path", async () => {
   const { choose, dialogs } = setup();
   assert.equal(await choose("/Users/me"), "/Users/me/app");
-  assert.equal(dialogs[0].win, "window");
-  assert.deepEqual(dialogs[0].options, {
+  assert.equal(dialogs[0]!.win, "window");
+  assert.deepEqual(dialogs[0]!.options, {
     properties: ["openDirectory", "createDirectory"],
     defaultPath: "/Users/me",
   });

@@ -10,7 +10,7 @@
 
 "use strict";
 
-const { diagnostics } = require("./diagnostics");
+const { diagnostics } = require("./diagnostics.ts");
 
 const { net } = require("electron");
 const {

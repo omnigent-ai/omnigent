@@ -380,7 +380,7 @@ electron/
   src/main.js              # main process: window, settings, menu, IPC, badge, notify
   src/paths.ts             # page, preload and icon locations
   src/preload.js           # contextBridge: window.omnigentDesktop + omnigentSetup
-  src/about_window.js      # shell-owned About modal + guarded update IPC
+  src/about_window.ts      # shell-owned About modal + guarded update IPC
   src/about_preload.js     # narrow contextBridge for the About modal
   src/managed_preferences.js # read/validate macOS MDM server choices
   src/find_preload.js      # contextBridge for the find bar: window.omnigentFind
@@ -1186,7 +1186,7 @@ Trusted pages may call services on the user's own machine
 services don't send CORS headers — authentication flows use this to
 reach local auth helpers/token brokers. The shell injects the CORS (and
 preflight) response headers itself, scoped to requests _from_ a trusted
-page origin _to_ a loopback host; see `src/localhost_cors.js`. Trusted
+page origin _to_ a loopback host; see `src/localhost_cors.ts`. Trusted
 means:
 
 - a window's **pinned server origin**, or

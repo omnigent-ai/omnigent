@@ -186,7 +186,7 @@ function loadMainHarness({
   };
 
   const localRequires = {
-    "./diagnostics": {
+    "./diagnostics.ts": {
       diagnostics: {
         record: () => {},
         exportTo: (destination) => {
@@ -195,19 +195,19 @@ function loadMainHarness({
         },
       },
     },
-    "./about_window": {
+    "./about_window.ts": {
       createAboutWindow: () => ({
         open: (parent) => calls.aboutOpens.push(parent),
         registerIpc: () => {},
       }),
     },
-    "./localhost_cors": { registerLocalhostCors: () => {} },
+    "./localhost_cors.ts": { registerLocalhostCors: () => {} },
     "./url.ts": {
       normalizeUrl: (url) => url,
       expandDatabricksWorkspaceUrl: async (url) => url,
     },
-    "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
-    "./workspace-root-bounce": { registerWorkspaceRootBounce: () => {} },
+    "./workspace-chrome.ts": { registerWorkspaceChromeHide: () => {} },
+    "./workspace-root-bounce.ts": { registerWorkspaceRootBounce: () => {} },
     // databricks-session (transitively) requires electron's `net`, unresolvable
     // under the sandbox's real require; behavior is covered in databricks-*.test.js.
     "./databricks-session": {

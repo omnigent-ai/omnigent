@@ -22,24 +22,158 @@
 //     freshly-loaded renderer can replay the latest state without a round trip.
 //   - v1 is stable-only and rides electron-updater's default "latest" channel.
 
-"use strict";
+export type UpdateMode = "none" | "manual" | "start" | "default";
 
 /** Update modes persisted in settings.json under `update_mode`. */
-const UPDATE_MODES = new Set(["none", "manual", "start", "default"]);
-const UPDATES_UNAVAILABLE_IN_DEV = "Desktop updates are unavailable in development builds.";
+export const UPDATE_MODES: ReadonlySet<UpdateMode> = new Set<UpdateMode>([
+  "none",
+  "manual",
+  "start",
+  "default",
+]);
+export const UPDATES_UNAVAILABLE_IN_DEV = "Desktop updates are unavailable in development builds.";
 /** Background re-check cadence for the "default" mode (every 6 hours). */
 const PERIODIC_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+/** The update config the renderer sees. */
+export interface UpdateConfig {
+  mode: UpdateMode;
+  autoInstall: boolean;
+  skippedVersion: string | null;
+}
+
+export type UpdateState =
+  "idle" | "checking" | "available" | "none" | "downloading" | "downloaded" | "error-security";
+
+/** The latest updater state, broadcast to every window and cached for replay. */
+export interface UpdateStatus {
+  state: UpdateState;
+  lastError?: string;
+  currentVersion?: string;
+  /** electron-updater's UpdateInfo, forwarded as-is. */
+  info?: unknown;
+  /** electron-updater's ProgressInfo, forwarded as-is. */
+  progress?: unknown;
+}
+
+export type UpdateSettings = Record<string, unknown>;
+
+/** The parts of electron-updater's `autoUpdater` this module drives. */
+export interface DesktopUpdateBackend {
+  autoDownload: boolean;
+  autoInstallOnAppQuit: boolean;
+  forceDevUpdateConfig: boolean;
+  on: ((event: "checking-for-update" | "update-not-available", listener: () => void) => unknown) &
+    ((
+      event: "update-available" | "update-downloaded" | "download-progress",
+      listener: (info: unknown) => void,
+    ) => unknown) &
+    ((event: "error", listener: (error: unknown) => void) => unknown);
+  checkForUpdates: () => Promise<unknown>;
+  downloadUpdate: () => Promise<unknown>;
+  quitAndInstall: (isSilent: boolean, isForceRunAfter: boolean) => void;
+}
+
+/** A window that receives update status broadcasts. */
+export interface UpdateStatusWindow {
+  isDestroyed: () => boolean;
+  webContents: { send: (channel: string, status: UpdateStatus) => void };
+}
+
+/** The parts of an IPC event the updater reads. */
+export interface UpdaterIpcEvent {
+  sender: unknown;
+}
+
+/** The consent dialog's options, as this module passes them. */
+export interface UpdateConsentDialogOptions {
+  type: "warning";
+  icon: { isEmpty: () => boolean } | undefined;
+  title: string;
+  message: string;
+  detail: string;
+  buttons: string[];
+  defaultId: number;
+  cancelId: number;
+  noLink: boolean;
+}
+
+export interface DesktopUpdaterDeps<
+  Window extends UpdateStatusWindow,
+  Event extends UpdaterIpcEvent,
+> {
+  app: { isPackaged: boolean; getVersion: () => string; quit: () => void };
+  BrowserWindow: {
+    getAllWindows: () => Window[];
+    fromWebContents: (webContents: Event["sender"]) => Window | null;
+  };
+  ipcMain: {
+    handle: (channel: string, listener: (event: Event, ...args: unknown[]) => unknown) => void;
+  };
+  dialog: {
+    showMessageBox: (
+      window: Window,
+      options: UpdateConsentDialogOptions,
+    ) => Promise<{ response: number }>;
+  };
+  /** The `nativeImage` module. */
+  nativeImage: { createFromPath: (path: string) => { isEmpty: () => boolean } };
+  autoUpdater: DesktopUpdateBackend;
+  loadSettings: () => UpdateSettings;
+  saveSettings: (settings: UpdateSettings) => void;
+  /** Whether an IPC call came from a connected server's own pinned page. */
+  isPinnedOriginSender: (event: Event) => boolean;
+  /** The origin a window is pinned to (used for the consent dialog copy). */
+  pinnedOrigin: (win: Window) => string | null;
+  /** Absolute path to the app icon PNG. */
+  iconPath: string;
+  /**
+   * Enable the development update config in an unpackaged build (main.js sets
+   * this from !app.isPackaged).
+   */
+  forceDevUpdateConfig?: boolean;
+  /** Disable the production feed for dev packages. */
+  updatesEnabled?: boolean;
+  /** Version shown in update UI. Defaults to Electron's real app version. */
+  getCurrentVersion?: (() => string) | undefined;
+  /** Called when a downloaded update becomes ready or stops being ready. */
+  onInstallReadyChange?: (installReady: boolean) => void;
+}
+
+export interface DesktopUpdater {
+  getConfig: () => UpdateConfig;
+  /** `patch` comes from the renderer; unknown fields are ignored. */
+  setConfig: (patch?: unknown) => UpdateConfig;
+  getStatus: () => UpdateStatus;
+  init: () => void;
+  checkForUpdates: (options?: { manual?: boolean }) => Promise<void>;
+  downloadUpdate: () => Promise<void>;
+  installUpdateNow: () => boolean;
+  registerIpc: () => void;
+  quitAndInstallIfPending: () => boolean;
+  readonly installPending: boolean;
+}
+
+type ConsentAction = "download" | "install" | "config";
+
+function isUpdateMode(value: unknown): value is UpdateMode {
+  return (UPDATE_MODES as ReadonlySet<unknown>).has(value);
+}
+
+/** An error's message, or the thrown value itself as text. */
+function errorMessage(error: unknown): string {
+  const message =
+    typeof error === "object" && error !== null && "message" in error ? error.message : undefined;
+  return String(message ?? error);
+}
 
 /**
  * Normalize the raw settings object into the update config the renderer sees.
  * Unknown/missing values fall back to the safe defaults (auto-checking on,
  * auto-install on, nothing skipped).
- *
- * @param {Record<string, unknown>} settings
- * @returns {{ mode: string, autoInstall: boolean, skippedVersion: string | null }}
  */
-function normalizeUpdateConfig(settings) {
-  const mode = UPDATE_MODES.has(settings.update_mode) ? settings.update_mode : "default";
+export function normalizeUpdateConfig(settings: UpdateSettings): UpdateConfig {
+  const mode = isUpdateMode(settings.update_mode) ? settings.update_mode : "default";
   return {
     mode,
     autoInstall:
@@ -53,11 +187,8 @@ function normalizeUpdateConfig(settings) {
  * True when an updater error message looks like a code-signing / integrity
  * failure (as opposed to a transient network/404). Those are surfaced to the
  * user as `error-security` even outside a manual check.
- *
- * @param {string} message
- * @returns {boolean}
  */
-function isUpdateSecurityError(message) {
+export function isUpdateSecurityError(message: string): boolean {
   return /signature|sha512|checksum|not signed|code sign/i.test(message);
 }
 
@@ -65,41 +196,11 @@ function isUpdateSecurityError(message) {
  * Build the desktop updater. All host dependencies are injected so the module
  * carries no Electron/`main.js` globals and is directly unit-testable with
  * fakes.
- *
- * @param {object} deps
- * @param {import("electron").App} deps.app
- * @param {typeof import("electron").BrowserWindow} deps.BrowserWindow
- * @param {import("electron").IpcMain} deps.ipcMain
- * @param {import("electron").Dialog} deps.dialog
- * @param {import("electron").NativeImage} deps.nativeImage The `nativeImage` module.
- * @param {import("electron-updater").AppUpdater} deps.autoUpdater
- * @param {() => Record<string, unknown>} deps.loadSettings
- * @param {(settings: Record<string, unknown>) => void} deps.saveSettings
- * @param {(event: Electron.IpcMainInvokeEvent) => boolean} deps.isPinnedOriginSender
- *   Whether an IPC call came from a connected server's own pinned page.
- * @param {(win: Electron.BrowserWindow | null | undefined) => string | null} deps.pinnedOrigin
- *   The origin a window is pinned to (used for the consent dialog copy).
- * @param {string} deps.iconPath Absolute path to the app icon PNG.
- * @param {boolean} [deps.forceDevUpdateConfig] Enable the development update
- *   config in an unpackaged build (main.js sets this from !app.isPackaged).
- * @param {boolean} [deps.updatesEnabled] Disable the production feed for dev packages.
- * @param {() => string} [deps.getCurrentVersion] Version shown in update UI.
- *   Defaults to Electron's real app version.
- * @param {(installReady: boolean) => void} [deps.onInstallReadyChange]
- *   Called when a downloaded update becomes ready or stops being ready.
- * @returns {{
- *   getConfig: () => { mode: string, autoInstall: boolean, skippedVersion: string | null },
- *   setConfig: (patch?: object) => { mode: string, autoInstall: boolean, skippedVersion: string | null },
- *   getStatus: () => object,
- *   init: () => void,
- *   checkForUpdates: (opts?: { manual?: boolean }) => Promise<void>,
- *   installUpdateNow: () => boolean,
- *   registerIpc: () => void,
- *   quitAndInstallIfPending: () => boolean,
- *   readonly installPending: boolean,
- * }}
  */
-function createDesktopUpdater({
+export function createDesktopUpdater<
+  Window extends UpdateStatusWindow,
+  Event extends UpdaterIpcEvent,
+>({
   app,
   BrowserWindow,
   ipcMain,
@@ -115,41 +216,43 @@ function createDesktopUpdater({
   updatesEnabled = true,
   getCurrentVersion = () => app.getVersion(),
   onInstallReadyChange = () => {},
-}) {
-  let updateCheckTimer = null;
-  let currentUpdateStatus = { state: "idle" };
+}: DesktopUpdaterDeps<Window, Event>): DesktopUpdater {
+  let updateCheckTimer: ReturnType<typeof setInterval> | null = null;
+  let currentUpdateStatus: UpdateStatus = { state: "idle" };
   let installPending = false;
   // A user-initiated ("Check for Updates…") check in flight — lets the error
   // handler surface a failure to the user only when they explicitly asked.
   let manualCheckInFlight = false;
-  let statusBeforeCheck = null;
+  let statusBeforeCheck: UpdateStatus | null = null;
 
-  function getConfig() {
+  function getConfig(): UpdateConfig {
     return normalizeUpdateConfig(loadSettings());
   }
 
-  function setConfig(patch = {}) {
+  function setConfig(patch: unknown = {}): UpdateConfig {
+    // Object.hasOwn rejects a null patch and finds no own keys on a primitive.
+    const fields = patch as Record<string, unknown>;
     const settings = loadSettings();
     const next = { ...settings };
-    if (Object.hasOwn(patch, "mode") && UPDATE_MODES.has(patch.mode)) {
-      next.update_mode = patch.mode;
+    if (Object.hasOwn(fields, "mode") && isUpdateMode(fields.mode)) {
+      next.update_mode = fields.mode;
     }
-    if (Object.hasOwn(patch, "autoInstall") && typeof patch.autoInstall === "boolean") {
-      next.update_auto_install = patch.autoInstall;
+    if (Object.hasOwn(fields, "autoInstall") && typeof fields.autoInstall === "boolean") {
+      next.update_auto_install = fields.autoInstall;
     }
-    if (Object.hasOwn(patch, "skippedVersion")) {
+    if (Object.hasOwn(fields, "skippedVersion")) {
       next.update_skipped_version =
-        typeof patch.skippedVersion === "string" ? patch.skippedVersion : null;
+        typeof fields.skippedVersion === "string" ? fields.skippedVersion : null;
     }
     saveSettings(next);
     return getConfig();
   }
 
-  function getStatus() {
+  function getStatus(): UpdateStatus {
     return currentUpdateStatus;
   }
 
-  function broadcast(status) {
+  function broadcast(status: UpdateStatus): void {
     const wasInstallReady = currentUpdateStatus.state === "downloaded";
     currentUpdateStatus = status;
     const installReady = status.state === "downloaded";
@@ -176,7 +279,7 @@ function createDesktopUpdater({
     return new Error(UPDATES_UNAVAILABLE_IN_DEV);
   }
 
-  function applyConfig(cfg) {
+  function applyConfig(cfg: UpdateConfig): void {
     if (updateCheckTimer) {
       clearInterval(updateCheckTimer);
       updateCheckTimer = null;
@@ -237,7 +340,7 @@ function createDesktopUpdater({
       broadcast({ state: "downloaded", currentVersion: getCurrentVersion(), info }),
     );
     autoUpdater.on("error", (err) => {
-      const msg = String(err?.message ?? err);
+      const msg = errorMessage(err);
       const isSecurity = isUpdateSecurityError(msg);
       const wasManualCheck = manualCheckInFlight;
       manualCheckInFlight = false;
@@ -251,7 +354,7 @@ function createDesktopUpdater({
     applyConfig(cfg);
   }
 
-  function checkForUpdates({ manual = false } = {}) {
+  function checkForUpdates({ manual = false }: { manual?: boolean } = {}): Promise<void> {
     if (currentUpdateStatus.state === "downloading" || currentUpdateStatus.state === "downloaded") {
       return Promise.resolve();
     }
@@ -268,8 +371,8 @@ function createDesktopUpdater({
         statusBeforeCheck = null;
         return undefined;
       })
-      .catch((err) => {
-        const msg = String(err?.message ?? err);
+      .catch((err: unknown) => {
+        const msg = errorMessage(err);
         if (manualCheckInFlight) {
           manualCheckInFlight = false;
           broadcast({
@@ -284,7 +387,7 @@ function createDesktopUpdater({
       });
   }
 
-  function installUpdateNow() {
+  function installUpdateNow(): boolean {
     if (!canUseFeed()) {
       reportUnavailableInDev();
       return false;
@@ -299,10 +402,8 @@ function createDesktopUpdater({
    * Start downloading the available update. Feed-gated like the other actions.
    * Used by the trusted shell update overlay (the server-page IPC calls
    * `autoUpdater.downloadUpdate()` inline behind its own consent dialog).
-   *
-   * @returns {Promise<void>}
    */
-  function downloadUpdate() {
+  function downloadUpdate(): Promise<void> {
     if (!canUseFeed()) {
       reportUnavailableInDev();
       return Promise.reject(unavailableInDevError());
@@ -314,8 +415,8 @@ function createDesktopUpdater({
     return autoUpdater
       .downloadUpdate()
       .then(() => undefined)
-      .catch((err) => {
-        const message = String(err?.message ?? err);
+      .catch((err: unknown) => {
+        const message = errorMessage(err);
         broadcast({
           state: isUpdateSecurityError(message) ? "error-security" : "idle",
           lastError: message,
@@ -330,7 +431,7 @@ function createDesktopUpdater({
    * asked for it — so download/install/config changes re-confirm here. Returns
    * true only when the user picks "Allow Once".
    */
-  async function confirmControl(win, action) {
+  async function confirmControl(win: Window | null, action: ConsentAction): Promise<boolean> {
     if (!win) return false;
     const pinned = pinnedOrigin(win);
     if (!pinned) return false;
@@ -342,7 +443,7 @@ function createDesktopUpdater({
       // Keep the full origin string if it somehow doesn't parse.
     }
 
-    const copy = {
+    const consentCopy: Record<ConsentAction, { message: string; detail: string } | undefined> = {
       download: {
         message: "Download an Omnigent update?",
         detail:
@@ -361,7 +462,8 @@ function createDesktopUpdater({
           `${host} wants to change how this Omnigent app checks for and installs updates.\n\n` +
           `Only allow servers you trust.`,
       },
-    }[action];
+    };
+    const copy = consentCopy[action];
     if (!copy) return false;
 
     const icon = nativeImage.createFromPath(iconPath);
@@ -455,9 +557,9 @@ function createDesktopUpdater({
    * Complete a deferred install once the app's own before-quit cleanup has
    * finished. No-op unless a user-approved install is pending.
    *
-   * @returns {boolean} Whether a pending install was handed off.
+   * @returns Whether a pending install was handed off.
    */
-  function quitAndInstallIfPending() {
+  function quitAndInstallIfPending(): boolean {
     if (!installPending) return false;
     autoUpdater.quitAndInstall(false, true);
     return true;
@@ -478,11 +580,3 @@ function createDesktopUpdater({
     },
   };
 }
-
-module.exports = {
-  createDesktopUpdater,
-  normalizeUpdateConfig,
-  isUpdateSecurityError,
-  UPDATE_MODES,
-  UPDATES_UNAVAILABLE_IN_DEV,
-};

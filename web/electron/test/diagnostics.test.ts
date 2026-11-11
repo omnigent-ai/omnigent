@@ -1,13 +1,11 @@
-"use strict";
+import { describe, it, type TestContext } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createDiagnostics, safeFields, LOG_NAME, MAX_FILE_BYTES } from "../src/diagnostics.ts";
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
-const { createDiagnostics, safeFields, LOG_NAME, MAX_FILE_BYTES } = require("../src/diagnostics");
-
-function isolatedDiagnostics(t) {
+function isolatedDiagnostics(t: TestContext) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-diagnostics-test-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const logs = createDiagnostics();
@@ -42,8 +40,9 @@ describe("desktop diagnostics", () => {
     const text = fs.readFileSync(path.join(directory, LOG_NAME), "utf8");
     assert.ok(!text.includes(secret));
     assert.ok(!text.includes("/auth/login"));
-    assert.deepEqual(JSON.parse(text.trim().split("\n").at(-1)), {
-      time: JSON.parse(text.trim().split("\n").at(-1)).time,
+    const lastLine = text.trim().split("\n").at(-1) ?? "";
+    assert.deepEqual(JSON.parse(lastLine), {
+      time: JSON.parse(lastLine).time,
       event: "auth_required",
       origin: "https://example.test",
       phase: "oidc",
@@ -77,7 +76,7 @@ describe("desktop diagnostics", () => {
     }
 
     const files = [file, `${file}.1`, `${file}.2`];
-    fs.writeFileSync(files[2], "oldest event\n");
+    fs.writeFileSync(`${file}.2`, "oldest event\n");
     const before = files.map((source) => fs.readFileSync(source));
     for (const source of files) {
       assert.throws(() => logs.exportTo(source), /outside the desktop diagnostics log files/);
@@ -86,7 +85,7 @@ describe("desktop diagnostics", () => {
       const alias = path.join(directory, "log-alias");
       fs.symlinkSync(directory, alias, "dir");
       const fileAlias = path.join(directory, "file-alias.jsonl");
-      fs.symlinkSync(files[1], fileAlias);
+      fs.symlinkSync(`${file}.1`, fileAlias);
       assert.throws(() => logs.exportTo(fileAlias), /outside the desktop diagnostics log files/);
       assert.throws(
         () => logs.exportTo(path.join(alias, LOG_NAME)),

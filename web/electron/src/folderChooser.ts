@@ -1,15 +1,43 @@
-"use strict";
+import path from "node:path";
 
-const path = require("node:path");
+/** An IPC event from a page whose sender has a stable id. */
+export interface FolderChooserEvent {
+  sender: { id: number };
+}
+
+/** The OS folder chooser's options, as this module passes them. */
+export interface FolderChooserDialogOptions {
+  properties: ("openDirectory" | "createDirectory")[];
+  defaultPath: string | undefined;
+}
+
+export interface FolderChooserDeps<Event extends FolderChooserEvent, Window> {
+  ipcMain: {
+    handle: (channel: string, listener: (event: Event, ...args: unknown[]) => unknown) => void;
+  };
+  dialog: {
+    showOpenDialog: (
+      window: Window,
+      options: FolderChooserDialogOptions,
+    ) => Promise<{ canceled: boolean; filePaths: string[] }>;
+  };
+  windowFor: (event: Event) => Window;
+  isPinnedOriginSender: (event: Event) => boolean;
+}
 
 /**
  * Folder picking for workspaces on this machine, answered only to the pinned
  * server page: the OS folder chooser, and the local path of a file dropped
  * from the file manager (which Chromium otherwise hides from web pages).
  */
-function registerFolderChooser({ ipcMain, dialog, windowFor, isPinnedOriginSender }) {
+export function registerFolderChooser<Event extends FolderChooserEvent, Window>({
+  ipcMain,
+  dialog,
+  windowFor,
+  isPinnedOriginSender,
+}: FolderChooserDeps<Event, Window>): void {
   // Windows with a chooser already up; a second click must not queue another.
-  const choosing = new Set();
+  const choosing = new Set<number>();
 
   ipcMain.handle("omnigent:choose-directory", async (event, defaultPath) => {
     if (!isPinnedOriginSender(event) || choosing.has(event.sender.id)) return null;
@@ -31,5 +59,3 @@ function registerFolderChooser({ ipcMain, dialog, windowFor, isPinnedOriginSende
     isPinnedOriginSender(event) && typeof filePath === "string" ? filePath : "",
   );
 }
-
-module.exports = { registerFolderChooser };
