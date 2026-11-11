@@ -271,6 +271,12 @@ def test_status_edges_report_turn_ends_with_their_response(
     # A stop publishes idle without persisting it, which is no turn end.
     helpers._publish_status(session, "running", response_id="resp_3")
     helpers._publish_status(session, "idle", persist_live_status=False)
+    # An anonymous late failure, then the next turn's own failure: two occurrences.
+    helpers._publish_status(session, "running", response_id="resp_6")
+    helpers._publish_status(session, "failed")
+    helpers._publish_status(session, "running", response_id="resp_6")
+    helpers._publish_status(session, "failed", response_id="resp_6")
+    helpers._publish_status(session, "idle", persist_live_status=False)
     # A short turn can start and end between status polls: its confirmed completion
     # still counts, and a replay of it repeats the same key, which records nothing.
     helpers._publish_status(session, "idle", response_id="resp_5", turn_completed=True)
@@ -287,7 +293,13 @@ def test_status_edges_report_turn_ends_with_their_response(
         (
             "turn.failed",
             session,
-            {"occurrence": "resp_2", "response_id": None, "error_code": "runner_error"},
+            {"occurrence": None, "response_id": None, "error_code": "runner_error"},
+        ),
+        ("turn.failed", session, {"occurrence": None, "response_id": None, "error_code": None}),
+        (
+            "turn.failed",
+            session,
+            {"occurrence": "resp_6", "response_id": "resp_6", "error_code": None},
         ),
         ("turn.completed", session, {"occurrence": "resp_5", "response_id": "resp_5"}),
         ("turn.completed", session, {"occurrence": "resp_5", "response_id": "resp_5"}),
@@ -295,7 +307,7 @@ def test_status_edges_report_turn_ends_with_their_response(
         (
             "turn.failed",
             session,
-            {"occurrence": "resp_4", "response_id": None, "error_code": None},
+            {"occurrence": None, "response_id": None, "error_code": None},
         ),
         ("turn.completed", session, {"occurrence": "resp_4", "response_id": "resp_4"}),
     ]
