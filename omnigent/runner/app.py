@@ -5371,6 +5371,8 @@ def create_runner_app(
 
         from omnigent.harnesses.claude_native.bridge import (
             BRIDGE_ID_LABEL_KEY,
+            TOOLS_CHANGED_READY_TIMEOUT_S,
+            ClaudeBridgeNotReady,
             bridge_dir_for_bridge_id,
             post_tools_changed,
             start_tool_relay,
@@ -5608,11 +5610,20 @@ def create_runner_app(
             from threading import Event
 
             cancelled = Event()
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + TOOLS_CHANGED_READY_TIMEOUT_S
             try:
-                # Bridge readiness waits must not compete with git or message delivery.
-                await _BRIDGE_NOTIFICATIONS.run(
-                    post_tools_changed, bridge_dir, cancelled=cancelled
-                )
+                while True:
+                    try:
+                        await _BRIDGE_NOTIFICATIONS.run(
+                            post_tools_changed, bridge_dir, timeout_s=0.0, cancelled=cancelled
+                        )
+                        break
+                    except ClaudeBridgeNotReady:
+                        remaining = deadline - loop.time()
+                        if remaining <= 0:
+                            raise
+                        await asyncio.sleep(min(0.05, remaining))
             except (RuntimeError, OSError):
                 # Fire-and-forget below, so anything escaping here resurfaces as
                 # an unretrieved task exception at ERROR. Re-advertising the tool

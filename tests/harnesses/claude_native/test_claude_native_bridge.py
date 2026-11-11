@@ -7774,6 +7774,34 @@ def test_inject_slash_command_raises_when_tmux_target_never_published(
 
 
 @pytest.mark.parametrize(
+    "advertisement",
+    [None, "{", "{}", '{"token":"token"}', '{"token":"token","socket":"/test.sock"}'],
+    ids=["missing", "malformed", "empty", "incomplete", "ready"],
+)
+def test_post_tools_changed_zero_timeout_probes_once_without_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, advertisement: str | None
+) -> None:
+    if advertisement is not None:
+        (tmp_path / "server.json").write_text(advertisement)
+    read_json = Mock(wraps=claude_native_bridge._read_json_file)
+    connection = Mock()
+    connection.getresponse.return_value.status = 200
+    connect = Mock(return_value=connection)
+    monkeypatch.setattr(claude_native_bridge, "_read_json_file", read_json)
+    monkeypatch.setattr(claude_native_bridge, "_control_connection", connect)
+
+    if advertisement is not None and "socket" in advertisement:
+        post_tools_changed(tmp_path, timeout_s=0.0)
+        connection.request.assert_called_once()
+        connection.close.assert_called_once()
+    else:
+        with pytest.raises(claude_native_bridge.ClaudeBridgeNotReady):
+            post_tools_changed(tmp_path, timeout_s=0.0)
+        connect.assert_not_called()
+    read_json.assert_called_once_with(tmp_path / "server.json")
+
+
+@pytest.mark.parametrize(
     "transport_error",
     [
         ConnectionRefusedError("bridge unavailable"),
@@ -12601,6 +12629,15 @@ _TASK_DETAILS_PANE = """\
   ← to go back · Esc/Enter/Space to close · x to stop
 """
 
+_DETAILED_TRANSCRIPT_PANE = """\
+● The checks passed.
+────────────────────────────────────────────────────────────────────────────────
+  Showing detailed transcript · ctrl+o to toggle · ? for shortcuts          verbose
+"""
+_WRAPPED_DETAILED_TRANSCRIPT_PANE = _DETAILED_TRANSCRIPT_PANE.replace(
+    "ctrl+o to toggle", "ctrl+o to\n  toggle"
+)
+
 # A sliver-height pane holding a multi-line draft: Claude Code renders the
 # box's opening rule and the draft's first row, then runs out of screen —
 # the closing rule never makes it on. The composer is live, so requiring
@@ -13953,6 +13990,9 @@ _WRAPPED_BTW_PANE = "\n".join(
         (_TASK_DETAILS_PANE, True),
         (_WRAPPED_BTW_PANE, False),
         (_WRAPPED_BTW_PANE, True),
+        (_DETAILED_TRANSCRIPT_PANE, False),
+        (_DETAILED_TRANSCRIPT_PANE, True),
+        (_WRAPPED_DETAILED_TRANSCRIPT_PANE, False),
     ],
     ids=[
         "reverse-search",
@@ -13966,6 +14006,9 @@ _WRAPPED_BTW_PANE = "\n".join(
         "task-details-after-preflight",
         "wrapped-quick-answer",
         "wrapped-quick-answer-after-preflight",
+        "detailed-transcript",
+        "detailed-transcript-after-preflight",
+        "wrapped-detailed-transcript",
     ],
 )
 def test_inject_user_message_restores_an_occupied_input_box_first(
@@ -13981,8 +14024,8 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     keystrokes do not become a chat message: the ctrl+r search filters on
     them and replays an old prompt on Enter, the rewind dialog commits a
     checkpoint restore, a settings panel changes a setting, and shell mode
-    hands the message to bash. The injection must Escape the surface first
-    (its own documented dismissal), restoring the empty input box, then
+    hands the message to bash. The injection must dismiss the surface first
+    with its documented key, restoring the empty input box, then
     deliver the message normally.
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
@@ -13999,14 +14042,15 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     captured: list[list[str]] = []
     first_capture = True
-    # The surface covers the pane until Escape dismisses it; afterwards
+    # The surface covers the pane until its dismissal key; afterwards
     # the fake behaves like the live input box (paste deposits the
     # draft, Enter clears it).
     tui = {"pane": occupied_pane}
+    dismiss_key = "C-o" if "Showing detailed transcript" in occupied_pane else "Escape"
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
-        Simulate a pane whose occupying surface closes on Escape.
+        Simulate a pane whose occupying surface closes on its documented key.
 
         :param cmd: Argv list passed to subprocess.run.
         :param kwargs: Subprocess kwargs (ignored).
@@ -14021,7 +14065,7 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
                 if after_preflight:
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
-        if cmd[-1] == "Escape":
+        if cmd[-1] == dismiss_key:
             tui["pane"] = _composer_pane()
         if "paste-buffer" in cmd:
             tui["pane"] = _composer_pane("restore my composer")
@@ -14034,12 +14078,65 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     inject_user_message(bridge_dir, content="restore my composer")
 
     tails = [cmd[-1] for cmd in captured]
-    # Escape (dismiss the surface) must precede every delivery keystroke.
-    assert tails[:3] == ["Escape", "Space", _CLEAR_ONE_ROW_COMPOSER], (
-        f"Expected the occupying surface to be Escaped before the clear; got {tails}."
+    # Dismissing the surface must precede every delivery keystroke.
+    assert tails[:3] == [dismiss_key, "Space", _CLEAR_ONE_ROW_COMPOSER], (
+        f"Expected the occupying surface to be dismissed before the clear; got {tails}."
     )
-    assert tails.count("Escape") == 1, f"One sighting, one Escape — got {tails.count('Escape')}."
+    assert tails.count(dismiss_key) == 1
+    if dismiss_key == "C-o":
+        assert "Escape" not in tails
     assert tails[-1] == "Enter"
+
+
+@pytest.mark.parametrize("operation", ["message", "settings"])
+@pytest.mark.parametrize("torn_after_toggle", [False, True])
+def test_a_stale_transcript_view_is_not_toggled_twice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    torn_after_toggle: bool,
+) -> None:
+    """A delayed redraw cannot turn a successful close into a second toggle."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    frames = [_DETAILED_TRANSCRIPT_PANE] * 2 + ([""] if torn_after_toggle else [])
+    sends = _fake_tmux(monkeypatch, frames)
+
+    with pytest.raises(claude_native_bridge.ClaudeInputBoxOccupied):
+        if operation == "message":
+            inject_user_message(bridge_dir, content="Follow up")
+        else:
+            claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert [args[-1] for args in sends] == ["C-o"]
+
+
+def test_a_single_transcript_view_frame_does_not_draw_a_toggle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sends = _fake_tmux(monkeypatch, [_DETAILED_TRANSCRIPT_PANE, _IDLE_PANE])
+
+    assert claude_native_bridge._restore_occupied_input("/tmp/example.sock", "main") is None
+    assert sends == []
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (_DETAILED_TRANSCRIPT_PANE, True),
+        (_WRAPPED_DETAILED_TRANSCRIPT_PANE, True),
+        (_DETAILED_TRANSCRIPT_PANE.removesuffix("          verbose\n"), True),
+        (_IDLE_PANE + _DETAILED_TRANSCRIPT_PANE, True),
+        (_DETAILED_TRANSCRIPT_PANE + _IDLE_PANE, False),
+        (_composer_pane(_DETAILED_TRANSCRIPT_PANE), False),
+        (_DETAILED_TRANSCRIPT_PANE.split("\n", 2)[2], False),
+    ],
+    ids=["view", "wrapped", "no-verbose", "old-composer", "quoted", "draft", "no-rule"],
+)
+def test_detailed_transcript_view_requires_its_live_footer(pane: str, expected: bool) -> None:
+    assert claude_native_bridge._detailed_transcript_view_shown(pane) is expected
+    if expected:
+        assert not _claude_prompt_rendered(pane)
+        assert not claude_native_bridge.claude_pane_input_box_shown(pane)
 
 
 def test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_clear(
@@ -14566,8 +14663,8 @@ def test_occupied_input_retries_stay_outside_the_double_escape_window(
 
 @pytest.mark.parametrize(
     "occupied_pane",
-    [_REVERSE_SEARCH_PANE, _WRAPPED_BTW_PANE],
-    ids=["search", "wrapped-quick-answer"],
+    [_REVERSE_SEARCH_PANE, _WRAPPED_BTW_PANE, _DETAILED_TRANSCRIPT_PANE],
+    ids=["search", "wrapped-quick-answer", "detailed-transcript"],
 )
 def test_inject_slash_command_restores_an_occupied_input_box_first(
     tmp_path: Path,
@@ -14598,7 +14695,7 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
     assert [args[-1] for args in sends] == [
-        "Escape",
+        "C-o" if occupied_pane == _DETAILED_TRANSCRIPT_PANE else "Escape",
         "Space",
         _CLEAR_ONE_ROW_COMPOSER,
         "/effort high",
