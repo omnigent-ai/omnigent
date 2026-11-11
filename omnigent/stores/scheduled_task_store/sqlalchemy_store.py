@@ -149,7 +149,6 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         next_run_at=row.next_run_at,
         project_id=row.project_id,
         delegation_ref=row.delegation_ref,
-        muted=row.muted,
     )
 
 
@@ -257,7 +256,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         execution_target: str = "connected_host",
         state: str = "active",
         delegation_ref: str | None = None,
-        muted: bool = False,
     ) -> ScheduledTask:
         """Insert a new scheduled task with a required recurring ``rrule``."""
         created_at = now_epoch()
@@ -286,7 +284,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 host_id=host_id,
                 project_id=project_id,
                 delegation_ref=delegation_ref,
-                muted=muted,
                 state=encode_scheduled_task_state(state),
                 last_run_at=None,
                 last_run_conversation_id=None,
@@ -404,7 +401,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
         expected_schedule: ScheduledTask | None = None,
-        muted: bool | None = None,
     ) -> ScheduledTask | None:
         """Update mutable fields.
 
@@ -491,9 +487,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 changed = True
             if project_id is not _UNSET and row.project_id != project_id:
                 row.project_id = project_id
-                changed = True
-            if muted is not None and row.muted != muted:
-                row.muted = muted
                 changed = True
             if execution_target is not None:
                 encoded_target = encode_scheduled_task_execution_target(execution_target)

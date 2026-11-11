@@ -24,7 +24,6 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Switch } from "@/components/ui/switch";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -265,7 +264,6 @@ export function CreateScheduledTaskDialog({
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   // Older servers reject a task's project fields, so the picker needs the flag.
   const projectsSupported = info !== "loading" && info.scheduled_task_projects === true;
-  const mutedSupported = info !== "loading" && info.scheduled_task_muted === true;
   const sandboxRepoCatalog =
     info !== "loading" && info.scheduled_task_sandbox_workspaces === true && info.sandbox_provider
       ? (info.sandbox_provider_capabilities?.[info.sandbox_provider]?.repo_catalog ?? [])
@@ -479,7 +477,6 @@ export function CreateScheduledTaskDialog({
   const [pickedProjectId, setPickedProjectId] = useState<string | null>(null);
   const [sessionMode, setSessionMode] = useState<ScheduledTaskSessionMode>("new");
   const [startNewSession, setStartNewSession] = useState(false);
-  const [muted, setMuted] = useState(false);
   const executionTarget: ScheduledTaskExecutionTarget = sandboxMode
     ? "managed_sandbox"
     : "connected_host";
@@ -579,7 +576,6 @@ export function CreateScheduledTaskDialog({
         setPickedProjectId(null);
         setSessionMode(editingTask.sessionMode);
         setStartNewSession(false);
-        setMuted(editingTask.muted);
         setTrigger(null);
       } else {
         setName(
@@ -595,7 +591,6 @@ export function CreateScheduledTaskDialog({
         // The manager session must persist: it dedupes against its own workers.
         setSessionMode(initialTrigger && !sourceSession ? "continue" : "new");
         setStartNewSession(false);
-        setMuted(false);
         setTrigger(sourceSession ? null : initialTrigger);
         setTriggerFields(emptyTriggerFields(initialTrigger ?? "jira"));
         setSchedule(
@@ -1172,7 +1167,6 @@ export function CreateScheduledTaskDialog({
         ...(!sandboxMode && hostId !== "" ? { hostId } : {}),
         ...workspacePatch,
         ...((editingTask?.sessionMode ?? "new") !== sessionMode ? { sessionMode } : {}),
-        ...(mutedSupported && muted !== (editingTask?.muted ?? false) ? { muted } : {}),
       };
       const projectInput = await projectChangeInput(
         // Saving over a deleted project clears it, matching the "No project" shown.
@@ -1633,40 +1627,6 @@ export function CreateScheduledTaskDialog({
                         )}
                       </div>
                     )}
-                  {mutedSupported && (
-                    <div
-                      className="flex flex-col gap-2 border-t border-border pt-3"
-                      data-testid="task-muted-field"
-                    >
-                      <div className="flex items-center justify-between gap-4">
-                        <Label htmlFor="task-muted">Mute sessions</Label>
-                        <TooltipProvider>
-                          <Tooltip>
-                            {/* A host element anchors the tooltip; the Switch wrapper does not expose its node. */}
-                            <TooltipTrigger asChild>
-                              <span className="inline-flex">
-                                <Switch
-                                  id="task-muted"
-                                  checked={muted}
-                                  onCheckedChange={setMuted}
-                                  data-testid="task-muted-trigger"
-                                  componentId="tasks.scheduled.muted"
-                                />
-                              </span>
-                            </TooltipTrigger>
-                            <TooltipContent
-                              side="left"
-                              className="max-w-xs"
-                              data-testid="task-muted-tooltip"
-                            >
-                              Muted sessions don't send notifications or show up as unread in the
-                              sidebar.
-                            </TooltipContent>
-                          </Tooltip>
-                        </TooltipProvider>
-                      </div>
-                    </div>
-                  )}
                 </div>
                 {!triggerMode && recurrenceFields}
                 {triggerMode && !scheduleInvalid && (

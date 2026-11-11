@@ -71,8 +71,6 @@ export interface ScheduledTask {
   executionTarget: ScheduledTaskExecutionTarget;
   /** Project every fired session is filed into, or `null` to leave them unfiled. */
   projectId: string | null;
-  /** Every session the task creates starts muted for its owner. */
-  muted: boolean;
   /**
    * The session every run copies: a session the server copied when
    * the automation was created from a session. Each run starts a new session
@@ -176,8 +174,6 @@ export interface CreateScheduledTaskInput {
   executionTarget?: ScheduledTaskExecutionTarget;
   /** File every fired session into this existing project. */
   projectId?: string | null;
-  /** Start every created session muted; send only when the server supports it. */
-  muted?: boolean;
   /**
    * Create the automation from this session: the server copies it into the
    * automation's project, and every run starts a new
@@ -223,8 +219,6 @@ export interface UpdateScheduledTaskInput {
   state?: ScheduledTaskState;
   /** File future fired sessions into this existing project; `null` unfiles them. */
   projectId?: string | null;
-  /** Start sessions created from now on muted. */
-  muted?: boolean;
 }
 
 /** Wire shape of a task row (snake_case), matching `_to_response`. */
@@ -249,8 +243,6 @@ interface ScheduledTaskWire {
   execution_target: ScheduledTaskExecutionTarget;
   // Absent on servers that predate task projects.
   project_id?: string | null;
-  // Absent on servers that predate muted tasks.
-  muted?: boolean;
   source_session_id?: string | null;
   state: ScheduledTaskState;
   last_run_at: number | null;
@@ -338,7 +330,6 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     hostId: wire.host_id,
     executionTarget: wire.execution_target,
     projectId: wire.project_id ?? null,
-    muted: wire.muted === true,
     sourceSessionId: wire.source_session_id ?? null,
     state: wire.state,
     lastRunAt: wire.last_run_at,
@@ -410,7 +401,6 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.hostId != null) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
   if (input.projectId != null) body.project_id = input.projectId;
-  if (input.muted !== undefined) body.muted = input.muted;
   if (input.sourceSessionId != null) body.source_session_id = input.sourceSessionId;
   const templateId = input.templateId ?? "custom";
   const interaction = startTimedInteraction("create_scheduled_task", undefined, templateId);
@@ -459,7 +449,6 @@ export async function updateScheduledTask(
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
   if (input.state !== undefined) body.state = input.state;
   if (input.projectId !== undefined) body.project_id = input.projectId;
-  if (input.muted !== undefined) body.muted = input.muted;
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },

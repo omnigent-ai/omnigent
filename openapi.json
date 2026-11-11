@@ -2018,11 +2018,6 @@
             ],
             "title": "Model Override"
           },
-          "muted": {
-            "default": false,
-            "title": "Muted",
-            "type": "boolean"
-          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -6645,11 +6640,6 @@
           "scheduled_task_inbox": {
             "default": false,
             "title": "Scheduled Task Inbox",
-            "type": "boolean"
-          },
-          "scheduled_task_muted": {
-            "default": true,
-            "title": "Scheduled Task Muted",
             "type": "boolean"
           },
           "scheduled_task_projects": {
@@ -12740,17 +12730,6 @@
               }
             ],
             "title": "Model Override"
-          },
-          "muted": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Muted"
           },
           "name": {
             "anyOf": [

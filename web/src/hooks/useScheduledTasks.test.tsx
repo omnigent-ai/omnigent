@@ -51,7 +51,6 @@ const TASK: api.ScheduledTask = {
   hostId: null,
   executionTarget: "connected_host",
   projectId: null,
-  muted: false,
   state: "active",
   lastRunAt: null,
   lastRunStatus: null,

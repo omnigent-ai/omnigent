@@ -38,8 +38,6 @@ _SESSION_MODE_PREVIOUS = "b2e4f6a8c013"
 _SESSION_MODE_REVISION = "d0a1f879a01d"
 _MCP_SERVICES_PREVIOUS = "1ad1db53f99d"
 _MCP_SERVICES_REVISION = "f2c6a9d1b3e8"
-_MUTED_PREVIOUS = "a7d4c2e9f610"
-_MUTED_REVISION = "b5d8e1f3a7c2"
 _COMMENT_ANCHOR_REVISION = "f9b3e6c2a401"
 _MCP_SERVICES_MERGE_REVISION = "a7d4c2e9f610"
 _SCHEMA_PATHS = [
@@ -95,7 +93,6 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     assert columns["session_id"]["nullable"] is True
     assert columns["source_session_id"]["nullable"] is True
     assert columns["mcp_services"]["nullable"] is True
-    assert columns["muted"]["nullable"] is False
     cols = set(columns)
     assert cols == {
         "workspace_id",
@@ -110,7 +107,6 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "reasoning_effort",
         "permission_mode",
         "mcp_services",
-        "muted",
         "max_cost_usd",
         "workspace",
         "base_branch",
@@ -1012,41 +1008,3 @@ def test_merge_reconciles_mcp_services_and_comment_anchor_branches(
             _MCP_SERVICES_REVISION,
             _COMMENT_ANCHOR_REVISION,
         }
-
-
-def test_muted_migration_defaults_existing_tasks_and_round_trips(
-    dispatch_migration_engine: Engine,
-) -> None:
-    engine = dispatch_migration_engine
-    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
-    # Later migrations open their own autocommit blocks on PostgreSQL, so this
-    # upgrade cannot run inside an outer transaction.
-    command.upgrade(config, _MUTED_PREVIOUS)
-    values = {
-        "name": "nightly",
-        "prompt": b"p",
-        "rrule": "FREQ=DAILY;BYHOUR=9",
-        "agent_id": b"g" * 16,
-        "timezone": "UTC",
-        "created_at": 1,
-    }
-    before = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
-    with engine.begin() as conn:
-        conn.execute(before.insert().values(id=b"a" * 16, **values))
-    with engine.begin() as conn:
-        config.attributes["connection"] = conn
-        command.upgrade(config, _MUTED_REVISION)
-    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
-    with engine.begin() as conn:
-        # A task saved before the migration keeps firing unmuted sessions.
-        assert conn.execute(sa.select(tasks.c.muted)).scalar_one() is False
-        conn.execute(tasks.insert().values(id=b"b" * 16, muted=True, **values))
-        stored = conn.execute(sa.select(tasks.c.muted).where(tasks.c.id == b"b" * 16)).scalar_one()
-    assert stored is True
-    with engine.begin() as conn:
-        config.attributes["connection"] = conn
-        command.downgrade(config, _MUTED_PREVIOUS)
-    columns = {c["name"] for c in sa.inspect(engine).get_columns("scheduled_tasks")}
-    assert "muted" not in columns
-    with engine.begin() as conn:
-        assert conn.execute(sa.select(sa.func.count()).select_from(before)).scalar_one() == 2

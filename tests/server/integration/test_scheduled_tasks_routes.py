@@ -1140,31 +1140,6 @@ async def test_update_moves_and_clears_the_task_project(
     assert cleared.json()["project_id"] is None
 
 
-async def test_create_and_update_the_task_mute(
-    auth_client: httpx.AsyncClient, db_uri: str
-) -> None:
-    _make_user(db_uri)
-    info = (await auth_client.get("/v1/info", headers=_headers())).json()
-    assert info["scheduled_task_muted"] is True
-    unmuted = await auth_client.post(
-        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
-    )
-    assert unmuted.status_code == 200, unmuted.text
-    assert unmuted.json()["muted"] is False
-
-    created = await auth_client.post(
-        "/v1/scheduled-tasks", json=_create_body(muted=True), headers=_headers()
-    )
-    assert created.status_code == 200, created.text
-    assert created.json()["muted"] is True
-    task_url = f"/v1/scheduled-tasks/{created.json()['id']}"
-    renamed = await auth_client.patch(task_url, json={"name": "renamed"}, headers=_headers())
-    assert renamed.json()["muted"] is True
-    cleared = await auth_client.patch(task_url, json={"muted": False}, headers=_headers())
-    assert cleared.status_code == 200, cleared.text
-    assert (await auth_client.get(task_url, headers=_headers())).json()["muted"] is False
-
-
 async def test_task_projects_are_refused_without_a_project_store(
     runtime_init: None,
     db_uri: str,

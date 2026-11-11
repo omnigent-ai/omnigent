@@ -332,7 +332,6 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
     hostId: null,
     executionTarget: "connected_host",
     projectId: null,
-    muted: false,
     state: "active",
     lastRunAt: null,
     lastRunStatus: null,
@@ -2426,71 +2425,6 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     expect(input.modelOverride).toBeNull();
     expect(input.reasoningEffort).toBe("high");
     expect(input.permissionMode).toBe("plan");
-  });
-});
-
-describe("CreateScheduledTaskDialog muted sessions", () => {
-  function renderWithMute(
-    ui: React.ReactElement = <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />,
-  ) {
-    return render(
-      <CapabilitiesProvider info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_muted: true }}>
-        {ui}
-      </CapabilitiesProvider>,
-    );
-  }
-
-  function fillRequired() {
-    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
-    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
-  }
-
-  async function submit(mock: typeof mutateAsync) {
-    const button = screen.getByTestId("create-scheduled-task-submit");
-    await waitFor(() => expect(button).toBeEnabled());
-    fireEvent.click(button);
-    await waitFor(() => expect(mock).toHaveBeenCalledTimes(1));
-    return mock.mock.calls[0][0];
-  }
-
-  it("hides the option when the server does not accept muted tasks", () => {
-    renderDialog();
-    expect(screen.queryByTestId("task-muted-field")).not.toBeInTheDocument();
-  });
-
-  it("explains the option in a tooltip", async () => {
-    renderWithMute();
-    fireEvent.focus(screen.getByTestId("task-muted-trigger"));
-    expect(
-      (await screen.findAllByText(/send notifications or show up as unread/)).length,
-    ).toBeGreaterThan(0);
-  });
-
-  it("starts off and sends nothing unless switched on", async () => {
-    renderWithMute();
-    fillRequired();
-    expect(screen.getByTestId("task-muted-trigger")).not.toBeChecked();
-    expect(await submit(mutateAsync)).not.toHaveProperty("muted");
-  });
-
-  it("creates the automation muted when switched on", async () => {
-    renderWithMute();
-    fillRequired();
-    fireEvent.click(screen.getByTestId("task-muted-trigger"));
-    expect(await submit(mutateAsync)).toMatchObject({ muted: true });
-  });
-
-  it("prefills an edited muted task and sends the change when switched off", async () => {
-    renderWithMute(
-      <CreateScheduledTaskDialog
-        open
-        onOpenChange={vi.fn()}
-        editingTask={scheduledTask({ muted: true })}
-      />,
-    );
-    expect(screen.getByTestId("task-muted-trigger")).toBeChecked();
-    fireEvent.click(screen.getByTestId("task-muted-trigger"));
-    expect((await submit(updateMutateAsync)).input).toMatchObject({ muted: false });
   });
 });
 

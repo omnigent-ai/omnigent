@@ -79,7 +79,6 @@ class ScheduledTaskStore(ABC):
         execution_target: str = "connected_host",
         state: str = "active",
         delegation_ref: str | None = None,
-        muted: bool = False,
     ) -> ScheduledTask:
         """
         Insert a new scheduled task.
@@ -115,7 +114,6 @@ class ScheduledTaskStore(ABC):
             once a schedule has no remaining occurrences.
         :param delegation_ref: Names the authorization grant a deployment uses to
             act as the owner when the task fires; never a credential.
-        :param muted: Whether every fired session starts muted for the owner.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ValueError: If ``state`` is not a recognized value.
         """
@@ -206,7 +204,6 @@ class ScheduledTaskStore(ABC):
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
         expected_schedule: ScheduledTask | None = None,
-        muted: bool | None = None,
     ) -> ScheduledTask | None:
         """
         Update mutable fields of a task.

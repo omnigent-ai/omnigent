@@ -1576,10 +1576,6 @@ class SqlScheduledTask(OmnigentBase):
     project_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     # Opaque grant reference, never credentials.
     delegation_ref: Mapped[str | None] = mapped_column(String(1024), nullable=True)
-    # Whether every fired session starts muted for the task's owner.
-    muted: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=false()
-    )
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
