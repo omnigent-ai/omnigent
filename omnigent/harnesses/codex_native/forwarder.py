@@ -5215,41 +5215,62 @@ async def _handle_terminal_turn_boundary_inner(
         params,
         forwarder_state=forwarder_state,
     )
-    with _turn_status_publication_scope(session_id, terminal.edge, phase="before_status"):
-        if delta_coalescer is not None:
-            await delta_coalescer.flush()
-        # Safety net: if a compaction was reported in progress but Codex never
-        # emitted a completion signal we recognize (e.g. a protocol-spelling
-        # drift), force the spinner closed at the turn boundary so it can't hang.
-        if (
-            forwarder_state is not None
-            and forwarder_state.compaction_status_posted == "in_progress"
-        ):
-            await _post_compaction_status(
-                client, session_id, "completed", forwarder_state=forwarder_state
+    prepared_bridge = (
+        read_bridge_state(bridge_dir)
+        if bridge_dir is not None and terminal.edge is not None
+        else None
+    )
+    preparation_error: Exception | None = None
+    try:
+        with _turn_status_publication_scope(session_id, terminal.edge, phase="before_status"):
+            if delta_coalescer is not None:
+                await delta_coalescer.flush()
+            # Safety net: if a compaction was reported in progress but Codex never
+            # emitted a completion signal we recognize (e.g. a protocol-spelling
+            # drift), force the spinner closed at the turn boundary so it can't hang.
+            if (
+                forwarder_state is not None
+                and forwarder_state.compaction_status_posted == "in_progress"
+            ):
+                await _post_compaction_status(
+                    client, session_id, "completed", forwarder_state=forwarder_state
+                )
+            await _maybe_persist_interrupted_partial_text(
+                client,
+                session_id=session_id,
+                method=method,
+                params=params,
+                forwarder_state=forwarder_state,
             )
-        await _maybe_persist_interrupted_partial_text(
-            client,
-            session_id=session_id,
-            method=method,
-            params=params,
-            forwarder_state=forwarder_state,
-        )
-        await _flush_turn_diff(
-            client,
-            session_id=session_id,
-            params=params,
-            forwarder_state=forwarder_state,
-        )
+            await _flush_turn_diff(
+                client,
+                session_id=session_id,
+                params=params,
+                forwarder_state=forwarder_state,
+            )
+    except Exception as exc:  # noqa: BLE001 -- re-raised after publishing the native outcome.
+        preparation_error = exc
+    if preparation_error is not None and bridge_dir is not None:
+        if prepared_bridge is None or read_bridge_state(bridge_dir) != prepared_bridge:
+            raise preparation_error
     terminal_turn_id = _terminal_turn_id_from_params(params)
     if forwarder_state is not None and terminal_turn_id is not None:
         forwarder_state.forget_user_message_copies(terminal_turn_id)
     handled = terminal.handled
-    if terminal.edge is not None:
-        await _post_turn_status_edge(client, session_id, terminal.edge)
-        if forwarder_state is not None and terminal.edge.status == "failed":
-            forwarder_state.turn_failure_surfaced = True
-            await forwarder_state.forget_posted_terminals()
+    # A failed output flush must not discard the native turn's known outcome.
+    # Keep this post in the current handler, preserving native event order.
+    try:
+        if terminal.edge is not None:
+            await _post_turn_status_edge(client, session_id, terminal.edge)
+            if forwarder_state is not None and terminal.edge.status == "failed":
+                forwarder_state.turn_failure_surfaced = True
+                await forwarder_state.forget_posted_terminals()
+    except Exception:
+        if preparation_error is not None:
+            raise preparation_error from preparation_error.__cause__
+        raise
+    if preparation_error is not None:
+        raise preparation_error
     terminal_thread_id = _thread_id_from_params(params)
     if (
         handled
