@@ -42,7 +42,7 @@ def test_upgrade_creates_table_and_downgrade_drops_it(tmp_path: Path) -> None:
         "agent_id",
         "prompt_version",
         "dedupe_key",
-        "state",
+        "status",
         "content",
         "resolution",
         "created_at",
@@ -55,11 +55,14 @@ def test_upgrade_creates_table_and_downgrade_drops_it(tmp_path: Path) -> None:
     }
     assert indexes == {
         "ix_inbox_items_user_created": (["workspace_id", "user_id", "created_at", "id"], False),
-        "ix_inbox_items_user_state_created": (
-            ["workspace_id", "user_id", "state", "created_at", "id"],
+        "ix_inbox_items_user_status_created": (
+            ["workspace_id", "user_id", "status", "created_at", "id"],
             False,
         ),
-        "ix_inbox_items_session": (["workspace_id", "user_id", "source_session_id"], False),
+        "ix_inbox_items_session": (
+            ["workspace_id", "user_id", "source_session_id", "id"],
+            False,
+        ),
         "uq_inbox_items_user_dedupe_key": (["workspace_id", "user_id", "dedupe_key"], True),
     }
     # The application supplies every value on this new table.
@@ -80,7 +83,7 @@ def _row(**overrides: object) -> dict[str, object]:
         "source_session_id": bytes(range(16)),
         "agent_id": bytes(range(1, 17)),
         "dedupe_key": "v1:x",
-        "state": 1,
+        "status": 1,
         "content": b"\x01\x00{}",
         "resolution": None,
         "created_at": 1,
@@ -91,8 +94,8 @@ def _row(**overrides: object) -> dict[str, object]:
 
 _INSERT = sa.text(
     "INSERT INTO inbox_items (workspace_id, id, user_id, source_session_id, agent_id, "
-    "dedupe_key, state, content, resolution, created_at) VALUES "
-    "(:workspace_id, :id, :user_id, :source_session_id, :agent_id, :dedupe_key, :state, "
+    "dedupe_key, status, content, resolution, created_at) VALUES "
+    "(:workspace_id, :id, :user_id, :source_session_id, :agent_id, :dedupe_key, :status, "
     ":content, :resolution, :created_at)"
 )
 
@@ -119,7 +122,7 @@ def _second(**overrides: object) -> dict[str, object]:
     [
         {"dedupe_key": "é" * 256 + "k"},
         {"created_at": "x" * 16_384},
-        {"state": 5},
+        {"status": 5},
         {"content": b"c" * 16_384},
         {"resolution": b"r" * 16_384},
         {"source_session_id": b"short"},
@@ -127,7 +130,7 @@ def _second(**overrides: object) -> dict[str, object]:
     ids=[
         "multibyte-dedupe-key-one-byte-over",
         "text-timestamp",
-        "unknown-state",
+        "unknown-status",
         "content-one-byte-over",
         "resolution-one-byte-over",
         "bad-uuid",
@@ -146,9 +149,14 @@ def test_sqlite_rejects_values_outside_the_column_bounds(
         {"dedupe_key": "é" * 256},
         {"content": b"c" * 16_383},
         {"resolution": b"r" * 16_383},
-        {"state": 4},
+        {"status": 4},
     ],
-    ids=["multibyte-dedupe-key-at-limit", "content-at-limit", "resolution-at-limit", "last-state"],
+    ids=[
+        "multibyte-dedupe-key-at-limit",
+        "content-at-limit",
+        "resolution-at-limit",
+        "last-status",
+    ],
 )
 def test_sqlite_accepts_values_at_the_column_bounds(
     engine: sa.Engine, overrides: dict[str, object]
