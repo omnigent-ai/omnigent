@@ -148,6 +148,8 @@ interface BuiltinAgentsListWire {
   suppressed_agent_names?: string[];
 }
 
+const NO_SUPPRESSED_NAMES: ReadonlySet<string> = new Set();
+
 /** The built-in catalog plus the packaged names the deployment hides. */
 export interface AgentCatalog {
   agents: AvailableAgent[];
@@ -487,6 +489,8 @@ const AVAILABLE_AGENTS_STALE_MS = 30_000;
  */
 export function useAgentCatalog(enabled = true): {
   data: AvailableAgent[] | undefined;
+  /** Built-in names the deployment hides; empty until the catalog loads. */
+  suppressedNames: ReadonlySet<string>;
   isLoading: boolean;
   isError: boolean;
   retry: () => void;
@@ -522,7 +526,13 @@ export function useAgentCatalog(enabled = true): {
   );
   const { refetch } = catalogQuery;
   const retry = useCallback(() => void refetch(), [refetch]);
-  return { data, isLoading: catalogQuery.isLoading, isError: catalogQuery.isError, retry };
+  return {
+    data,
+    suppressedNames: catalog?.suppressedNames ?? NO_SUPPRESSED_NAMES,
+    isLoading: catalogQuery.isLoading,
+    isError: catalogQuery.isError,
+    retry,
+  };
 }
 
 interface UseAvailableAgentsOptions {
