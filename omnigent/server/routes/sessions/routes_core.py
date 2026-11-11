@@ -3687,7 +3687,7 @@ def register_core_routes(
                 else None,
                 binding_action="clear" if body.runner_id == "" else "bind",
             )
-            from omnigent.server.managed_hosts import move_claim_is_live
+            from omnigent.server.managed_hosts import is_move_claim, move_claim_is_live
 
             if move_claim_is_live(conv.runner_id):
                 # Only the move releases its claim, so its cleanup can't land on
@@ -3695,6 +3695,17 @@ def register_core_routes(
                 raise OmnigentError(
                     "The session is moving to a new sandbox. Try again once the move finishes.",
                     code=ErrorCode.CONFLICT,
+                )
+            startup = getattr(request.app.state, "startup_inputs", None)
+            if is_move_claim(conv.runner_id) and startup is not None:
+                # A lapsed claim's move stopped with its server. Settle what it
+                # held while the claim still stands, so later messages aren't
+                # queued for a sandbox no launch will bring up.
+                await startup.release_held_inputs(
+                    session_id,
+                    "The message wasn't sent: the session's move to a new sandbox didn't "
+                    "finish. Send it again.",
+                    move_claim=conv.runner_id,
                 )
             # Empty string is the clear sentinel (None = leave unchanged);
             # used by /clear and /switch to move the runner between sessions.

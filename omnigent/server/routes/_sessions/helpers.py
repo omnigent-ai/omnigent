@@ -6548,6 +6548,14 @@ async def _launch_runner_on_host_impl(
                 error_code="session_not_found",
                 error="session was deleted while its relaunch was in flight",
             )
+        from omnigent.server.managed_hosts import is_move_claim
+
+        if is_move_claim(fresh.runner_id) and not replace_move_claim:
+            # A move holds the session, perhaps claimed since the caller's read:
+            # there's no runner to ride, and its sandbox's launch starts one.
+            # Not recorded as a launch, so the move's own launch, which may be
+            # waiting on this lock, doesn't take it for its result.
+            return _move_in_progress_attempt(fresh.runner_id or "")
         last = _relaunch_last_attempt.get(conv.id)
         # A waiter may already have read the active flight's replacement binding.
         if last is not None and last is not previous_attempt and last.runner_id == fresh.runner_id:
@@ -6563,12 +6571,6 @@ async def _launch_runner_on_host_impl(
             host_conn,
             replace_move_claim=replace_move_claim,
         )
-        from omnigent.server.managed_hosts import is_move_claim
-
-        if is_move_claim(fresh.runner_id) and not replace_move_claim:
-            # Refused for the move, which launches nothing: the move's own
-            # launch, waiting on this lock, must not take it for its result.
-            return attempt
         # Re-insert so the plain dict's insertion order is newest-last, then
         # evict from the front once past the cap.
         _relaunch_last_attempt.pop(conv.id, None)
@@ -6576,6 +6578,20 @@ async def _launch_runner_on_host_impl(
         while len(_relaunch_last_attempt) > _RELAUNCH_MEMO_MAX:
             del _relaunch_last_attempt[next(iter(_relaunch_last_attempt))]
         return attempt
+
+
+def _move_in_progress_attempt(claim: str) -> _HostLaunchAttempt:
+    """
+    The refusal for a launch that finds a move's claim on the session.
+
+    :param claim: The move's claim, e.g. ``"runner_token_move_…"``; callers
+        recognize the refusal by it (:func:`~omnigent.server.managed_hosts.is_move_claim`).
+    """
+    return _HostLaunchAttempt(
+        runner_id=claim,
+        error_code="session_binding_changed",
+        error="the session is moving to a new sandbox",
+    )
 
 
 async def _launch_runner_on_host_locked(
@@ -6594,11 +6610,7 @@ async def _launch_runner_on_host_locked(
 
     if is_move_claim(conv.runner_id) and not replace_move_claim:
         # The session is moving onto a new sandbox; that launch starts its runner.
-        return _HostLaunchAttempt(
-            runner_id=conv.runner_id or "",
-            error_code="session_binding_changed",
-            error="the session is moving to a new sandbox",
-        )
+        return _move_in_progress_attempt(conv.runner_id or "")
     await host_registry.admit_launch(host_conn, conv.id)
     superseded_runner_id = conv.runner_id
     reap_superseded = await _owns_host_runner(conv, conversation_store)

@@ -5854,6 +5854,13 @@ async function reconcileLaunchStatus(id: string, set: Setter, get: Getter): Prom
   set((s) => (s.sandboxStatus === before ? launchSnapshotPatch(session, s) : {}));
 }
 
+/** Launch-stage events applied per live conversation; see {@link captureLaunchStatus}. */
+const launchStatusRevisions = new WeakMap<ConversationEntry, number>();
+
+function launchStatusRevision(entry: ConversationEntry): number {
+  return launchStatusRevisions.get(entry) ?? 0;
+}
+
 /**
  * Capture a conversation's launch stage before a request that starts a sandbox launch.
  *
@@ -5863,11 +5870,17 @@ async function reconcileLaunchStatus(id: string, set: Setter, get: Getter): Prom
  * lands after the capture is newer, and wins.
  */
 export function captureLaunchStatus(conversationId: string): (session: Session) => void {
+  const entry = conversationRegistry.peek(conversationId);
+  const revision = entry === undefined ? undefined : launchStatusRevision(entry);
   const before = setterForState(conversationId)?.sandboxStatus;
   return (session) => {
     const status = session.sandboxStatus;
     const state = setterForState(conversationId);
-    if (status == null || state === null || state.sandboxStatus !== before) return;
+    if (status == null || state === null || entry === undefined) return;
+    // A launch that moved on and back (provisioning, then ready) leaves the same
+    // stage behind, so the count of launch events is compared too.
+    if (conversationRegistry.peek(conversationId) !== entry) return;
+    if (launchStatusRevision(entry) !== revision || state.sandboxStatus !== before) return;
     handleSessionEvent(
       {
         type: "session_sandbox_status",
@@ -8654,7 +8667,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         mcpStartupLaunch: updateMcpStartupLaunch(s.mcpStartupLaunch, event.pending),
       }));
       return;
-    case "session_sandbox_status":
+    case "session_sandbox_status": {
+      const launchEntry =
+        sourceConversationId === null ? undefined : conversationRegistry.peek(sourceConversationId);
+      if (launchEntry !== undefined) {
+        launchStatusRevisions.set(launchEntry, launchStatusRevision(launchEntry) + 1);
+      }
       // `ready` clears the launch indicator and starts the launch grace (the runner is
       // up, its terminal not yet); `failed` keeps the reason so the page can explain
       // why the sandbox never came up.
@@ -8701,6 +8719,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           .catch(() => {});
       }
       return;
+    }
     case "session_mcp_startup": {
       // Mirror the harness's per-MCP-server startup map while the round
       // is in flight; cleared once no server is still `starting`.

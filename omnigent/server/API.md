@@ -1443,7 +1443,8 @@ launch is refused, a message is held for the sandbox, and
 `PATCH /v1/sessions/{id}` with a `runner_id` returns 409, on every
 replica. Only the move releases its claim, after it has settled the
 session; a claim over an hour old is left by a server that stopped
-mid-move, and `PATCH` may clear it. The call clears the session's host,
+mid-move, and `PATCH` may clear it, marking messages held for that move
+not sent. The call clears the session's host,
 workspace and branch, drops any earlier sandbox's
 `omnigent.sandbox.repo*` and `omnigent.sandbox.requested_host_id`
 labels, and registers the sandbox to the caller. Like a managed fork,

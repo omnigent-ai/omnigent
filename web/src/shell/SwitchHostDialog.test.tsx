@@ -604,6 +604,39 @@ describe("SwitchHostDialog", () => {
       });
     });
 
+    it("doesn't reopen a launch that finished before the move's response", async () => {
+      conversationRegistry.acquire("conv_1");
+      launchManagedHostMock.mockImplementation(async () => {
+        for (const stage of ["provisioning", "ready"] as const) {
+          handleSessionEvent(
+            {
+              type: "session_sandbox_status",
+              conversationId: "conv_1",
+              stage,
+              error: null,
+              provider: "modal",
+              details: null,
+            },
+            "conv_1",
+          );
+        }
+        // Read before the launch finished, so it still says provisioning.
+        return {
+          sandboxStatus: { stage: "provisioning", error: null, provider: "modal" },
+        } as Awaited<ReturnType<typeof launchManagedHost>>;
+      });
+      const client = renderDialog(SANDBOX_SERVER);
+      fireEvent.change(screen.getByTestId("mock-host-select"), {
+        target: { value: "__sandbox__:modal" },
+      });
+      fireEvent.click(screen.getByTestId("switch-host-button"));
+
+      await waitFor(() =>
+        expect(client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_1"))).toEqual([]),
+      );
+      expect(conversationRegistry.peek("conv_1")!.getState().sandboxStatus).toBeNull();
+    });
+
     it("keeps a launch event that lands before the move's response", async () => {
       conversationRegistry.acquire("conv_1");
       launchManagedHostMock.mockImplementation(async () => {

@@ -1621,7 +1621,10 @@ async def test_relaunch_that_reads_a_move_claim_is_refused(
     from typing import cast
 
     from omnigent.server.managed_hosts import new_move_claim
-    from omnigent.server.routes._sessions.helpers import _launch_runner_on_host_locked
+    from omnigent.server.routes._sessions.helpers import (
+        _launch_runner_on_host_impl,
+        _launch_runner_on_host_locked,
+    )
 
     env = managed_session_env
     session_id = await _session_released_from_laptop(env, agent_name="move-claim-relaunch-agent")
@@ -1644,6 +1647,77 @@ async def test_relaunch_that_reads_a_move_claim_is_refused(
     assert attempt.error_code == "session_binding_changed"
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None and conv.runner_id == claim
+
+    # A caller that read the session before the move claimed it finds the claim
+    # under the relaunch lock, and gets the same refusal rather than the claim
+    # back as a runner to wait for.
+    unclaimed = replace(seen, runner_id=None)
+    late = await _launch_runner_on_host_impl(
+        unclaimed,
+        env.conv_store,
+        cast(Any, _NoAdmission()),
+        cast(Any, SimpleNamespace(host_id=_LAPTOP_HOST_ID)),
+    )
+
+    assert (late.runner_id, late.error_code) == (claim, "session_binding_changed")
+
+
+async def test_message_relaunching_as_a_move_claims_waits_for_the_sandbox(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A message that found the session unbound, and relaunches on its host just
+    as a move claims it, is held for the sandbox like one sent after the claim,
+    rather than waiting on the claim as if it were a runner and failing.
+    """
+    from omnigent.server.managed_hosts import is_move_claim, new_move_claim
+    from omnigent.server.routes import sessions as sessions_facade
+
+    env = managed_session_env
+    session_id = await _session_released_from_laptop(
+        env, agent_name="move-claim-relaunch-msg-agent"
+    )
+    claim = new_move_claim()
+    admissions: list[str] = []
+
+    # The user's laptop, connected (no tunnel is needed for the relaunch to start).
+    laptop = SimpleNamespace(
+        host_id=_LAPTOP_HOST_ID,
+        owner=None,
+        pending_launches={},
+        registered_with_managed_token=False,
+    )
+    host_registry = env.app.state.host_registry
+    get_connection = host_registry.get
+    monkeypatch.setattr(
+        host_registry,
+        "get",
+        lambda host_id: laptop if host_id == _LAPTOP_HOST_ID else get_connection(host_id),
+    )
+
+    async def admit_launch(conn: object, conversation_id: str, **_: object) -> None:
+        admissions.append(conversation_id)
+
+    monkeypatch.setattr(host_registry, "admit_launch", admit_launch)
+    relaunch = sessions_facade._launch_runner_on_host
+
+    async def claimed_as_it_relaunches(conv: Conversation, *args: Any, **kwargs: Any) -> Any:
+        # The move claims the session between the message's read and its relaunch.
+        env.conv_store.set_runner_id(conv.id, claim)
+        return await relaunch(conv, *args, **kwargs)
+
+    monkeypatch.setattr(sessions_facade, "_launch_runner_on_host", claimed_as_it_relaunches)
+
+    body = await _post_user_message(env, session_id)
+
+    assert body["queued"] is True and body.get("pending_id"), body
+    assert admissions == []
+    assert [item.status for item in env.conv_store.list_pending_inputs(session_id)] == [
+        "in_progress"
+    ]
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None and is_move_claim(conv.runner_id)
 
 
 async def test_move_launch_queued_behind_a_refused_relaunch_still_starts(
@@ -1731,15 +1805,20 @@ async def test_runner_change_waits_for_a_move_to_release_its_claim(
     """
     Releasing or rebinding the runner of a session a move holds is refused, so
     nothing takes the session while the move settles. A claim past its lease,
-    left by a server that stopped mid-move, can be cleared.
+    left by a server that stopped mid-move, can be cleared; the startup its move
+    left pending is settled with it, so messages are dispatched normally again
+    instead of queueing for a sandbox nothing will launch.
     """
     import time
+
+    from starlette.datastructures import Headers
 
     from omnigent.server.managed_hosts import (
         MOVE_CLAIM_LEASE_S,
         MOVE_CLAIM_RUNNER_ID_PREFIX,
         new_move_claim,
     )
+    from omnigent.server.schemas import SessionEventInput
 
     env = managed_session_env
     session_id = await _session_released_from_laptop(env, agent_name="move-claim-patch-agent")
@@ -1759,11 +1838,24 @@ async def test_runner_change_waits_for_a_move_to_release_its_claim(
         + "0" * 32
     )
     env.conv_store.replace_runner_id(session_id, lapsed)
+    # The stopped move had marked its startup pending, still on the user's host,
+    # and a message was held for its sandbox.
+    env.conv_store.set_labels(session_id, {STARTUP_LABEL: "pending"})
+    startup = env.app.state.startup_inputs
+    event = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    )
+    await startup.enqueue(session_id, event, user_id=None, headers=Headers({}), first=False)
     cleared = await env.client.patch(f"/v1/sessions/{session_id}", json={"runner_id": ""})
 
     assert cleared.status_code == 200, cleared.text
     conv = env.conv_store.get_conversation(session_id)
-    assert conv is not None and conv.runner_id is None
+    assert conv is not None
+    assert (conv.host_id, conv.runner_id) == (_LAPTOP_HOST_ID, None)
+    assert conv.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN
+    assert [item.status for item in env.conv_store.list_pending_inputs(session_id)] == ["failed"]
+    assert not await startup.accepts(conv, env.app)
 
 
 async def test_runner_release_racing_a_move_keeps_its_claim(
