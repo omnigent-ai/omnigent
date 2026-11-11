@@ -131,12 +131,21 @@ import {
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
 import { useScrollRestore } from "./useScrollRestore";
 import { isPdfAnchor } from "./pdfCommentHelpers";
+import { DIFF_VIEWER_ENGINE, useEngine, type ViewerEngine } from "@/lib/enginePreferences";
 
 // Load the editor on diff intent, in parallel with the file requests.
 const loadMonacoDiffViewer = () => import("./MonacoDiffViewer");
 const MonacoDiffViewer = lazy(() =>
   loadMonacoDiffViewer().then((m) => ({ default: m.MonacoDiffViewer })),
 );
+// The diff view each diff viewer engine renders, and how to warm it up before it mounts.
+const DIFF_VIEWS = {
+  monaco: {
+    View: MonacoDiffViewer,
+    prepare: (lang: ReturnType<typeof detectLang>) =>
+      loadMonacoDiffViewer().then((m) => m.prepareDiffEditor(lang)),
+  },
+} satisfies Record<ViewerEngine, unknown>;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -886,14 +895,13 @@ function FileViewerBody({
   const prepareDiff =
     requestedDiff &&
     (isDiffAvailable || (linkedDiff && changedFiles.data === undefined && !changedFiles.isError));
+  const diffView = DIFF_VIEWS[useEngine(DIFF_VIEWER_ENGINE)];
   useEffect(() => {
     if (!prepareDiff) return;
-    void loadMonacoDiffViewer()
-      .then((m) => m.prepareDiffEditor(lang))
-      .catch(() => {
-        // The mounted viewer retries initialization and surfaces load errors.
-      });
-  }, [prepareDiff, lang]);
+    void diffView.prepare(lang).catch(() => {
+      // The mounted viewer retries initialization and surfaces load errors.
+    });
+  }, [prepareDiff, lang, diffView]);
   const [diffLayout, setDiffLayout] = useState<"unified" | "split">(
     () => persistedPrefsRef.current.diffLayout,
   );
@@ -1929,7 +1937,7 @@ function FileViewerBody({
                 >
                   {/* key={path} remounts per file so onMount re-runs (EOL + comment
                   wiring re-applied) and `ready` resets while the new grammar loads. */}
-                  <MonacoDiffViewer
+                  <diffView.View
                     position={filePosition}
                     key={path}
                     before={diffQuery.data.before}

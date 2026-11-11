@@ -19,6 +19,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DIFF_VIEWER_ENGINE } from "@/lib/enginePreferences";
 import { toast } from "sonner";
 import { copyText } from "@/lib/clipboard";
 import type { Comment } from "@/hooks/useComments";
@@ -799,6 +800,15 @@ describe("FileViewer URL sync — diff param", () => {
     // Failure: diffActive was not initialized from the URL param (remained false).
     expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
     expect(screen.queryByTestId("code-viewer")).toBeNull();
+  });
+
+  it("prepares and shows Monaco's diff when this device has a pin for an engine not offered yet", async () => {
+    localStorage.setItem(DIFF_VIEWER_ENGINE.intent.storageKey, "pierre");
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({ open: true, path: "file1.py", initialSearch: "diff=1" });
+
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+    expect(prepareDiffEditor).toHaveBeenCalledWith("python");
   });
 
   it("prepares a linked diff during discovery and scopes the early request to that file", async () => {
