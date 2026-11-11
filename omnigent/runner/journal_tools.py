@@ -218,7 +218,10 @@ def _stream_publisher(publish_event: _Publisher | None) -> _Publisher:
         return publish_event
     from omnigent.runtime import session_stream
 
-    return session_stream.publish
+    def publish(conversation_id: str, event: dict[str, Any]) -> None:
+        session_stream.publish(conversation_id, event)
+
+    return publish
 
 
 async def _request_input(
