@@ -67,6 +67,7 @@ YAML usage::
 
 from __future__ import annotations
 
+import logging
 import re
 import shlex
 from collections.abc import Callable
@@ -86,6 +87,8 @@ from omnigent.policies.builtins._shell import (
     unwrap_shell_command,
 )
 from omnigent.policies.schema import PolicyEvent, PolicyResponse
+
+_log = logging.getLogger(__name__)
 
 # ── Shared constants ──────────────────────────────────────────────────────────
 
@@ -190,8 +193,9 @@ def _normalize_repo(value: str) -> str:
     """
     Reduce a repo reference to a bare lowercase ``owner/repo``.
 
-    :param value: A bare ``owner/repo``, or a GitHub URL, e.g.
-        ``"https://github.com/Octo/Repo/pull/1"`` or ``"git@github.com:Octo/Repo.git"``.
+    :param value: A bare ``owner/repo``, a scheme-less ``github.com/owner/repo``,
+        or a GitHub URL, e.g. ``"https://github.com/Octo/Repo/pull/1"``,
+        ``"git@github.com:Octo/Repo.git"``, or ``"github.com:Octo/Repo"``.
     :returns: The lowercased ``owner/repo`` (``"octo/repo"``), or empty string
         when no repo can be extracted.
     """
@@ -201,6 +205,9 @@ def _normalize_repo(value: str) -> str:
     bare_match = _REPO_BARE_PATTERN.match(value)
     if bare_match:
         return f"{bare_match.group(1)}/{bare_match.group(2)}".lower()
+    if value.lower().startswith("github.com/"):
+        # Without a scheme the URL parser sees no host, so supply the scheme here.
+        return _repo_from_url(f"https://{value}")
     return _repo_from_url(value)
 
 
@@ -244,11 +251,22 @@ def _normalize_repos(values: list[str] | None) -> set[str]:
     """
     Normalize a list of repo references to a set of lowercase ``owner/repo``.
 
-    :param values: Repo IDs and/or GitHub URLs. ``None`` → empty list.
-    :returns: Set of normalized ``owner/repo``, un-parseable / empty entries
-        dropped.
+    :param values: Configured repo IDs and/or GitHub URLs. ``None`` → empty list.
+    :returns: Set of normalized ``owner/repo``. Entries that cannot be parsed
+        are dropped and logged as warnings.
     """
-    return {repo for value in (values or []) if (repo := _normalize_repo(value))}
+    repos: set[str] = set()
+    for value in values or []:
+        repo = _normalize_repo(value)
+        if repo:
+            repos.add(repo)
+        else:
+            _log.warning(
+                "GitHub policy ignores configured repo %r: expected owner/repo or a "
+                "github.com URL.",
+                value,
+            )
+    return repos
 
 
 def _normalize_branch(value: str) -> str:

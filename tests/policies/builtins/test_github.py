@@ -1333,6 +1333,60 @@ def test_repository_url_is_normalized_for_github_host() -> None:
 
 
 @pytest.mark.parametrize(
+    "reference",
+    [
+        "github.com/Example/Allowed",
+        "github.com/Example/Allowed.git",
+        "github.com:Example/Allowed",
+        "https://github.com/Example/Allowed",
+    ],
+)
+def test_scheme_less_github_reference_is_normalized(reference: str) -> None:
+    assert _normalize_repo(reference) == "example/allowed"
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "notgithub.com/example/allowed",
+        "github.com.example/example/allowed",
+        "github.com@evil.example/example/allowed",
+        "github.com/example/%61llowed",
+        "github.com/example/allowed/../other",
+    ],
+)
+def test_scheme_less_reference_with_foreign_host_or_unsafe_path_is_rejected(
+    reference: str,
+) -> None:
+    assert _normalize_repo(reference) == ""
+
+
+def test_scheme_less_allowlist_entries_and_repo_arguments_are_honored() -> None:
+    policy = github_policy(write_repos=["github.com/example/allowed"])
+    assert _target_action("gh pr create -R github.com/example/allowed --base main") == "ALLOW"
+    assert _target_action("gh pr create -R github.com/example/other --base main") == "DENY"
+    colon_policy = github_policy(write_repos=["github.com:example/allowed"])
+    assert _action(colon_policy(_sh("gh pr create -R example/allowed --base main"))) == "ALLOW"
+    mcp_result = policy(
+        tc("mcp__github__create_issue", {"repository": "github.com/example/other"})
+    )
+    assert mcp_result is not None and mcp_result["result"] == "DENY"
+    assert policy(tc("mcp__github__create_issue", {"repository": "github.com/example/allowed"})) is None
+
+
+def test_unparseable_allowlist_entry_is_dropped_with_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING", logger="omnigent.policies.builtins.github"):
+        policy = github_policy(
+            write_repos=["example/allowed", "https://github.com/example/allowed/../other"]
+        )
+    assert "https://github.com/example/allowed/../other" in caplog.text
+    assert _action(policy(_sh("gh pr create -R example/allowed --base main"))) == "ALLOW"
+    assert _action(policy(_sh("gh pr create -R example/other --base main"))) == "DENY"
+
+
+@pytest.mark.parametrize(
     "command",
     [
         "git push https://github.com/example/allowed/../other main",
