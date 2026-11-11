@@ -406,6 +406,33 @@ describe("sort order", () => {
       vi.useRealTimers();
     }
   });
+
+  it("sorts a one-time reminder by the server's next run", () => {
+    // A yearly COUNT=1 rule has no next run the client can compute, so only the
+    // server's next_run_at puts a reminder due in two minutes first.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    try {
+      setTasks([
+        task({ id: "daily", name: "Daily", state: "active", rrule: "FREQ=DAILY;BYHOUR=6" }),
+        task({
+          id: "reminder",
+          name: "Reminder: check CI",
+          state: "active",
+          rrule: "FREQ=YEARLY;BYMONTH=1;BYMONTHDAY=1;BYHOUR=0;BYMINUTE=2;BYSECOND=0;COUNT=1",
+          timezone: "UTC",
+          nextRunAt: "2026-01-01T00:02:00+00:00",
+        }),
+      ]);
+      renderPage();
+      const names = screen
+        .getAllByTestId("scheduled-task-row")
+        .map((r) => r.querySelector(".font-semibold")?.textContent);
+      expect(names).toEqual(["Reminder: check CI", "Daily"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("filtering + search", () => {

@@ -978,7 +978,7 @@ async def _continue_session(
         reason, error_code = problem
         _logger.warning("scheduled fire: task %s cannot continue its session: %s", task.id, reason)
         await recorder.finish(
-            "failed", error=f"{reason}; {_NEW_SESSION_HINT}", error_code=error_code
+            "failed", error=f"{reason}; {_recovery_hint(task)}", error_code=error_code
         )
         return
     assert conv is not None
@@ -1020,7 +1020,7 @@ async def _continue_session(
             "failed",
             conversation_id=session_id,
             error="the session already has a cost cap this automation did not set; remove it "
-            f"from the session's policies, or {_NEW_SESSION_HINT}",
+            f"from the session's policies, or {_recovery_hint(task)}",
             error_code="continued_session_budget_conflict",
         )
         return
@@ -1045,6 +1045,14 @@ async def _continue_session(
 
 
 _NEW_SESSION_HINT = "edit the automation to start a new session on its next run"
+# A one-time task, such as a reminder, has no next run to change.
+_ONE_TIME_HINT = "it has no later run; set a new reminder or create a new automation"
+
+
+def _recovery_hint(task: ScheduledTask) -> str:
+    """What the owner can do about a continued run that failed."""
+    return _ONE_TIME_HINT if is_one_time_rule(task.rrule) else _NEW_SESSION_HINT
+
 
 UNATTENDED_PERMISSION_ERROR_CODE = "permission_mode_not_allowed"
 

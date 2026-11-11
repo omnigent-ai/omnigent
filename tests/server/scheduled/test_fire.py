@@ -3154,6 +3154,9 @@ async def test_a_one_time_task_fails_instead_of_replacing_its_deleted_session() 
     assert [(run["status"], run.get("error_code")) for run in store.runs] == [
         ("failed", "continued_session_missing")
     ]
+    # It has no next run, so the hint for recurring tasks would mislead.
+    assert "next run" not in store.runs[0]["error"]
+    assert "set a new reminder" in store.runs[0]["error"]
 
 
 @pytest.mark.asyncio
