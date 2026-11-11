@@ -1986,6 +1986,13 @@ async def _run_tunnel_from_env() -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     last_activity_at = loop.time()
+    work_idle_started_at = last_activity_at
+    from omnigent.host.idle import RUNNER_WORK_IDLE_ENV
+
+    work_idle = os.environ.get(RUNNER_WORK_IDLE_ENV) == "1"
+    from omnigent.runner.busy_check import MutatingRequestActivity
+
+    mutations = MutatingRequestActivity(loop.time)
 
     loop.set_exception_handler(_handle_loop_exception)
 
@@ -2040,6 +2047,7 @@ async def _run_tunnel_from_env() -> None:
                 event_dispatcher.last_dispatch_at,
                 native_forwarder_last_post_at(),
                 published_at if isinstance(published_at, float) else None,
+                mutations.last_activity_at if work_idle else None,
             )
             if stamp is not None
         ]
@@ -2121,7 +2129,11 @@ async def _run_tunnel_from_env() -> None:
         callback = getattr(app.state, "has_sandbox_work", None)
         if not callable(callback):
             return _has_active_work()
-        return event_dispatcher.has_pending or bool(callback())
+        return (
+            bool(work_idle and mutations.active)
+            or event_dispatcher.has_pending
+            or bool(callback())
+        )
 
     # Each pong tells the server whether to keep a managed sandbox warm: while
     # the runner works, and for its idle timeout after (0: while connected), so
@@ -2131,7 +2143,7 @@ async def _run_tunnel_from_env() -> None:
     keep_warm_grace_s = idle_timeout_s if idle_timeout_s > 0 else math.inf
     tunnel_task = asyncio.create_task(
         serve_tunnel(
-            cast("_ASGIApp", app),  # FastAPI is ASGI-compatible; cast narrows for mypy
+            cast("_ASGIApp", app),
             server_url=server_url,
             runner_id=runner_id,
             runner_version=_RUNNER_VERSION,
@@ -2141,6 +2153,7 @@ async def _run_tunnel_from_env() -> None:
             event_dispatcher=event_dispatcher,
             on_reconnect=getattr(app.state, "catch_up_scan", None),
             on_activity=_mark_activity,
+            on_request_activity=mutations.admit if work_idle else None,
             report_keep_warm=lambda: sandbox_busy.keep_warm(keep_warm_grace_s),
             shutdown_event=tunnel_shutdown_event,
             on_graceful_shutdown=getattr(app.state, "drain_session_streams", None),
@@ -2174,8 +2187,21 @@ async def _run_tunnel_from_env() -> None:
         idle_task = asyncio.create_task(
             _run_inactivity_monitor(
                 idle_timeout_s=idle_timeout_s,
-                get_last_activity=_last_activity,
-                has_active_work=_has_active_work,
+                get_last_activity=(
+                    (lambda: _last_work_progress() or work_idle_started_at)
+                    if work_idle
+                    else _last_activity
+                ),
+                has_active_work=(
+                    (
+                        lambda: (
+                            not callable(getattr(app.state, "has_sandbox_work", None))
+                            or _has_sandbox_work()
+                        )
+                    )
+                    if work_idle
+                    else _has_active_work
+                ),
                 request_shutdown=_request_idle_shutdown,
             ),
             name=f"runner-idle-monitor:{runner_id}",
@@ -2241,6 +2267,15 @@ async def _run_tunnel_from_env() -> None:
             # cancelled by the finally as a backstop.
             await asyncio.wait({tunnel_task}, timeout=_GRACEFUL_SHUTDOWN_TUNNEL_TIMEOUT_S)
     finally:
+        idle_completed = (
+            work_idle
+            and exit_reason == "idle timeout reached"
+            and sys.exc_info()[0] is None
+            and not stop_event.is_set()
+            and tunnel_task.done()
+            and not tunnel_task.cancelled()
+            and tunnel_task.exception() is None
+        )
         # Log why the runner is stopping so the runner log explains the exit.
         # A crash unwinding through here is attributed by sys.excepthook with
         # its traceback, so only record the reason for an orderly shutdown.
@@ -2263,6 +2298,10 @@ async def _run_tunnel_from_env() -> None:
             with contextlib.suppress(Exception):
                 await direct_attach_listener.stop()
         await _lifespan_cm.__aexit__(None, None, None)
+        if idle_completed:
+            from omnigent.runner.identity import mark_idle_exit
+
+            mark_idle_exit(runner_id)
 
 
 def _install_signal_handlers(

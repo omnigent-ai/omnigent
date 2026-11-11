@@ -116,6 +116,7 @@ class SandboxCapabilities:
     multi_repo: bool = False
     git_clone_options: bool = False
     resume_preserves_host: bool = False
+    managed_idle_suspend: bool = False
 
 
 @dataclass(frozen=True)

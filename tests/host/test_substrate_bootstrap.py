@@ -142,6 +142,21 @@ def test_preparation_gates_host_launch(monkeypatch: pytest.MonkeyPatch, prepare_
     assert state.stage == "failed"  # Preparation or the final host process exited.
 
 
+def test_idle_host_reactivation_requires_a_new_generation(monkeypatch):
+    state = bootstrap.Bootstrap(_UID, ActorSignals())
+    launch = Mock(return_value=True)
+    monkeypatch.setattr(state, "_run_host", launch)
+    state.activate(payload())
+    state.worker.join(timeout=5)
+    assert state.stage == "idle" and state.cleaned
+    state.activate(payload())
+    assert launch.call_count == 1
+    token = "woken-host-token"
+    state.activate(payload(token=token, generation=hashlib.sha256(token.encode()).hexdigest()))
+    state.worker.join(timeout=5)
+    assert launch.call_count == 2
+
+
 def test_failed_preparation_can_retry_same_host_without_rebinding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

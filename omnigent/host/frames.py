@@ -237,6 +237,8 @@ class HostFrameKind(str, Enum):
     STOP_RUNNER = "host.stop_runner"
     STOP_RUNNER_RESULT = "host.stop_runner_result"
     RUNNER_EXITED = "host.runner_exited"
+    QUIESCE = "host.quiesce"
+    QUIESCE_RESULT = "host.quiesce_result"
     RUNNER_STATUS = "host.runner_status"
     RUNNER_STATUS_RESULT = "host.runner_status_result"
     STAT = "host.stat"
@@ -527,6 +529,20 @@ class HostRunnerExitedFrame:
     runner_id: str
     error: str
     had_connected: bool | None = None
+
+
+@dataclass
+class HostQuiesceFrame:
+    """Close host admission only after every runner has completed its work."""
+
+    request_id: str
+    generation: str
+
+
+@dataclass
+class HostQuiesceResultFrame:
+    request_id: str
+    status: str
 
 
 @dataclass
@@ -1659,6 +1675,8 @@ HostFrame = (
     | HostStopRunnerFrame
     | HostStopRunnerResultFrame
     | HostRunnerExitedFrame
+    | HostQuiesceFrame
+    | HostQuiesceResultFrame
     | HostRunnerStatusFrame
     | HostRunnerStatusResultFrame
     | HostStatFrame
@@ -1883,6 +1901,22 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "runner_id": frame.runner_id,
                 "error": frame.error,
                 "had_connected": frame.had_connected,
+            }
+        )
+    if isinstance(frame, HostQuiesceFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.QUIESCE.value,
+                "request_id": frame.request_id,
+                "generation": frame.generation,
+            }
+        )
+    if isinstance(frame, HostQuiesceResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.QUIESCE_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
             }
         )
     if isinstance(frame, HostRunnerStatusFrame):
@@ -2738,6 +2772,15 @@ def _decode_known_host_frame(
             return _decode_stop_runner_result(msg)
         case HostFrameKind.RUNNER_EXITED:
             return _decode_runner_exited(msg)
+        case HostFrameKind.QUIESCE:
+            return HostQuiesceFrame(
+                request_id=_required_str(msg, "request_id"),
+                generation=_required_str(msg, "generation"),
+            )
+        case HostFrameKind.QUIESCE_RESULT:
+            return HostQuiesceResultFrame(
+                request_id=_required_str(msg, "request_id"), status=_required_str(msg, "status")
+            )
         case HostFrameKind.RUNNER_STATUS:
             return _decode_runner_status(msg)
         case HostFrameKind.RUNNER_STATUS_RESULT:

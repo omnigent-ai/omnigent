@@ -2406,6 +2406,9 @@ def create_app(
             # Turn completion is event-driven, with a lazy-on-read stale-running
             # backstop. Persistent scheduling separately recovers expired startups.
 
+        from omnigent.server.managed_idle import ManagedIdleSuspend
+
+        idle_suspend: ManagedIdleSuspend | None = None
         managed_sandbox_reaper: ManagedSandboxReaper | None = None
         if sandbox_config is not None:
             if host_store is None:
@@ -2420,6 +2423,11 @@ def create_app(
                 )
                 app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
                 await managed_sandbox_reaper.start()
+                idle_suspend = ManagedIdleSuspend(
+                    host_store, conversation_store, sandbox_config, host_registry
+                )
+                app_inst.state.managed_idle_suspend = idle_suspend
+                idle_suspend.start()
 
         session_pull_requests.install_refresher(pull_request_refresher)
         try:
@@ -2437,6 +2445,8 @@ def create_app(
                 await scheduled_task_scheduler.stop()
             elif scheduled_task_scheduler is not None:
                 scheduled_task_scheduler.stop()
+            if idle_suspend is not None:
+                await idle_suspend.shutdown()
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
             metrics_publish_task.cancel()

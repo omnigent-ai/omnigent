@@ -6,9 +6,9 @@ It is an initial implementation, not a production-qualified deployment.
 
 Implemented: managed launch, authenticated activation, VOLUMES snapshot wake with
 generation-checked host credentials, cleanup, repository preparation, and
-host configuration. **Automatic idle suspension is not implemented.** Use only a
-single server replica for this experimental path; distributed suspend/wake
-coordination remains a release gate. MEMORY snapshot templates are not supported.
+host configuration, and **automatic work-aware idle suspension**. Use one server
+replica for this experimental deployment; the durable operation gate is shared,
+but multi-replica deployment qualification remains a release gate. MEMORY snapshot templates are not supported.
 Substrate can retain processes locally even with VOLUMES fidelity; the provider
 inspects the restored bootstrap before deciding whether to reuse or restart the host.
 See the [implementation plan](../../../../designs/SUBSTRATE_MANAGED_RUNNERS.md).
@@ -146,6 +146,35 @@ Substrate Control NetworkPolicy. Actor traffic still uses the per-Actor egress
 policy. Substrate and your cluster CNI must enforce their documented network
 isolation; this overlay is not a replacement for it.
 
+## Automatic idle suspension
+
+Updated Substrate host images enable the existing runner idle timeout as a
+**work-only** clock. The overlay sets `sandbox.host_config.runner.idle_timeout_s`
+to 600 seconds; set it to 0 to keep runners resident. Read-only polling does not
+renew the clock. Active turns, queued events, and queued/in-flight HTTP mutations
+prevent idle shutdown. Old host images without the quiescence capability remain
+resident until upgraded.
+
+After every runner on a host has finished idle shutdown (or an explicit stop),
+the server requests generation-bound quiescence. Pending launches, host mutations,
+retiring runners, and uncertain exits prevent acknowledgement. The host closes
+admission and exits, and bootstrap confirms descendant cleanup before the server
+calls synchronous `SuspendActor`. This reclaims the whole host, not one session
+while another session on it is working.
+
+Launch, wake and suspension share a persistent per-host operation gate. A new
+message waits for an in-flight suspension and then wakes the same Actor. An
+expired timer never grants another coordinator authority over an unresolved
+operation. Timeouts, disconnected acknowledgements and interrupted provider calls
+can therefore require operator recovery: data is retained and new launches/wakes
+are blocked rather than risking a delayed suspend interrupting new work. Inspect
+server logs and Substrate's operation state; do not simply erase the gate while
+an old operation might still execute.
+
+Unexpected runner exits keep the host warm because they are not proof of idle
+completion. A fresh host process resets that uncertainty. The offline-age reaper
+remains a separate retention/deletion policy.
+
 ## Verify launch and snapshot wake
 
 1. Create a managed session with provider `substrate`, a supported harness, and
@@ -155,15 +184,16 @@ isolation; this overlay is not a replacement for it.
    tool call actually executes in the Actor, rather than a connected local host.
 3. Identify its Actor with `kubectl ate get actors -a omnigent-runners`. Record
    the Actor UID and Omnigent host ID. Wait for all work on that host to finish.
-4. Manually suspend the idle Actor:
+4. Wait past the configured runner idle timeout and the server's observation
+   interval (about five seconds). Keep polling or viewing the session to verify
+   that reads do not prevent suspension:
 
    ```sh
-   kubectl ate suspend actor ACTOR_NAME -a omnigent-runners --mode=sync
    kubectl ate get actor ACTOR_NAME -a omnigent-runners -o yaml
    ```
 
-   Verify suspended state and completed durable snapshot storage. Operator
-   suspension does not check Omnigent's runner activity: never do this mid-turn.
+   Verify automatic suspended state and a completed durable snapshot. Repeat with
+   another runner actively working on the same host: it must remain running.
 5. Once the host reports offline, send “Read substrate-check.txt and append after
    wake.” Omnigent resumes the Actor, then either activates a cold host with a fresh
    token or renews the exact credential of a locally retained host. Check the
@@ -221,6 +251,11 @@ snapshotted. Synchronously suspend Actors **before** planned worker rollouts,
 scale-downs, and node drains. Automatic evacuation is not implemented; an
 unhandled eviction can still lose writes since the last durable snapshot.
 
+The overlay uses a Recreate server rollout. Upgrade the server code completely
+before selecting updated host images; do not mix old, ungated server code with
+automatic suspension. Before rolling back, stop coordinators and ensure all
+operations have settled; do not downgrade with busy/unknown operation records.
+
 For upgrades, create a versioned template, then change the configured template
 for new hosts. Existing Actors keep their template reference. Retain the old
 image/template and provider connection settings until those hosts are retired.
@@ -246,7 +281,8 @@ Validated on Substrate v1.0.0, gVisor, arm64, and Kubernetes v1.37.0:
 
 - Verified Control TLS with projected, audience-bound credentials and router mTLS.
 - A real managed session with both host and runner online over WSS.
-- Host filesystem RPCs, synchronous VOLUMES suspension, message-triggered wake,
+- Host filesystem RPCs, automatic idle suspension while polling the session,
+  synchronous VOLUMES snapshots, message-triggered wake,
   retained Actor UID/host ID/workspace marker, and Actor cleanup.
 - A non-root, PID-1 actor and nested Bubblewrap: the credential path is inaccessible
   without an explicit read grant and readable with the exact-file grant.
@@ -259,9 +295,9 @@ are also covered. The package mirror could not be reached during local checks.
 
 The deployed smoke uses an isolated server/database and does not qualify model
 inference, every native harness, cross-node restoration, microVM, or multi-replica
-operation. No browser verification was performed. Automatic idle suspension and
-its durable admission/transition protocol remain unimplemented; this is not
-production support or a completed implementation of every phase of the plan.
+operation. No browser verification was performed. Automatic suspension is
+implemented and tested, but full production qualification and automatic recovery
+from ambiguous provider outcomes are not claimed.
 
 To repeat the deployed lifecycle check, run this from a checkout in the disposable
 server test container, with local single-user header auth, its isolated database,
@@ -282,5 +318,4 @@ does not assert inference output. Never point it at a shared development databas
 or production deployment. New E2E setup is limited to this distinct real gRPC,
 mTLS/WSS, and snapshot boundary; unit tests retain the input/error matrices.
 
-Do not advertise automatic multiplexing or upstream latency/density figures as
-measured Omnigent behavior.
+Do not present upstream latency/density figures as measured Omnigent performance.

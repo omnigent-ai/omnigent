@@ -2,8 +2,8 @@
 
 Requires a disposable, single-workspace Omnigent deployment and access to its
 isolated database and mounted Substrate credentials. Creates its own session,
-checks authenticated host filesystem RPCs across a durable snapshot, and deletes
-only that session/host. It does not qualify native harness inference or auto-idle.
+checks automatic idle suspension and authenticated host filesystem RPCs across
+wake, and deletes only that session/host. It does not qualify model inference.
 Run as a module from the checkout; see the Substrate overlay runbook.
 """
 
@@ -97,8 +97,20 @@ def main() -> None:
             ).raise_for_status()
             print("Host connected over WSS; workspace marker created", flush=True)
 
-            launcher.stop(host.sandbox_id)
-            assert launcher.is_running(host.sandbox_id) is False
+            def automatically_suspended() -> bool:
+                # Browsing must not renew the work-only idle clock.
+                client.get(f"/v1/sessions/{session_id}").raise_for_status()
+                state = store.sandbox_operation(host_id)
+                if state and state.get("phase") == "unknown":
+                    raise AssertionError("Automatic suspension became unresolved")
+                return bool(
+                    state
+                    and state.get("phase") == "suspended"
+                    and launcher.is_running(host.sandbox_id) is False
+                )
+
+            poll_until(automatically_suspended, timeout_s=args.timeout, interval_s=0.5)
+            print("Automatic idle suspension confirmed while polling the session", flush=True)
             poll_until(
                 lambda: (
                     client.get(f"/v1/hosts/{host_id}").raise_for_status().json()["status"]

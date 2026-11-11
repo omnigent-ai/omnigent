@@ -388,6 +388,8 @@ class _TunnelActivityKwargs(TypedDict, total=False):
     """Optional activity callbacks forwarded to each tunnel connection."""
 
     on_activity: Callable[[], None]
+    # Admit before task creation; release also runs on pre-dispatch cancellation.
+    on_request_activity: Callable[[str], Callable[[], None]]
     report_keep_warm: Callable[[], bool]
 
 
@@ -402,6 +404,7 @@ async def serve_tunnel(
     auth_token_factory: Callable[[], str | None] | None = None,
     on_reconnect: Callable[[], Awaitable[None]] | None = None,
     on_activity: Callable[[], None] | None = None,
+    on_request_activity: Callable[[str], Callable[[], None]] | None = None,
     report_keep_warm: Callable[[], bool] | None = None,
     shutdown_event: asyncio.Event | None = None,
     on_graceful_shutdown: Callable[[], None] | None = None,
@@ -644,6 +647,8 @@ async def serve_tunnel(
             activity_kwargs: _TunnelActivityKwargs = {}
             if on_activity is not None:
                 activity_kwargs["on_activity"] = on_activity
+            if on_request_activity is not None:
+                activity_kwargs["on_request_activity"] = on_request_activity
             if report_keep_warm is not None:
                 activity_kwargs["report_keep_warm"] = report_keep_warm
             close_details = await _serve_tunnel_once(
@@ -1140,6 +1145,7 @@ async def _serve_tunnel_once(
     auth_token: str | None = None,
     tunnel_token: str | None = None,
     on_activity: Callable[[], None] | None = None,
+    on_request_activity: Callable[[str], Callable[[], None]] | None = None,
     report_keep_warm: Callable[[], bool] | None = None,
     shutdown_event: asyncio.Event | None = None,
     on_graceful_shutdown: Callable[[], None] | None = None,
@@ -1306,6 +1312,7 @@ async def _serve_tunnel_once(
                 dispatch_tasks,
                 ws_channels,
                 on_activity=on_activity,
+                on_request_activity=on_request_activity,
                 report_keep_warm=report_keep_warm,
                 event_dispatcher=event_dispatcher,
                 diagnostics=diagnostics,
@@ -1711,6 +1718,7 @@ async def _handle_tunnel_frame(
     ws_channels: dict[str, _RunnerWSChannel],
     *,
     on_activity: Callable[[], None] | None = None,
+    on_request_activity: Callable[[str], Callable[[], None]] | None = None,
     report_keep_warm: Callable[[], bool] | None = None,
     event_dispatcher: RunnerEventDispatcher | None = None,
     diagnostics: TunnelDiagnostics | None = None,
@@ -1763,10 +1771,20 @@ async def _handle_tunnel_frame(
     elif isinstance(frame, RequestFrame):
         if on_activity is not None:
             on_activity()
-        task = asyncio.create_task(
-            dispatch_via_asgi(app, frame, send_text),
-            name=f"ws-tunnel-dispatch:{frame.id}",
+        release_activity = (
+            on_request_activity(frame.method) if on_request_activity is not None else None
         )
+        try:
+            task = asyncio.create_task(
+                dispatch_via_asgi(app, frame, send_text),
+                name=f"ws-tunnel-dispatch:{frame.id}",
+            )
+        except BaseException:
+            if release_activity is not None:
+                release_activity()
+            raise
+        if release_activity is not None:
+            task.add_done_callback(lambda _done: release_activity())
         dispatch_tasks[frame.id] = task
         path = frame.path.split("?", 1)[0].split("/")
         if (

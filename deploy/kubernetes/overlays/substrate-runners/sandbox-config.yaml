@@ -8,6 +8,9 @@ data:
     sandbox:
       provider: substrate
       server_url: https://omnigent.example.com
+      host_config:
+        runner:
+          idle_timeout_s: 600
       substrate:
         endpoint: api.ate-system.svc:443
         atespace: omnigent-runners

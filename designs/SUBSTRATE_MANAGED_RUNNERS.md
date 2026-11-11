@@ -2,9 +2,10 @@
 
 **Status:** Implementation in progress. The experimental provider, activation
 protocol, VOLUMES lifecycle primitives, and deployment overlay are implemented.
-Automatic idle suspension and distributed transition fencing remain incomplete.
-The core gVisor lifecycle has passed a real-cluster smoke; broader production
-and harness qualification remains incomplete. See the
+Automatic work-aware idle suspension is implemented with a persistent operation
+gate, generation-bound host quiescence, and process-cleanup acknowledgement. The
+core gVisor lifecycle and automatic suspend/wake have passed real-cluster smoke
+checks; broader production and harness qualification remains incomplete. See the
 [experimental runbook](../deploy/kubernetes/overlays/substrate-runners/README.md).
 
 ## Goal and recommendation
@@ -219,9 +220,14 @@ provider-opt-in idle-stop path using existing runner work signals.
   idle from missing in-memory reports. Prefer temporarily retaining compute over
   suspending work whose status is unknown.
 
-Ship manual/operator suspend-resume in the first vertical slice. Enable automatic
-suspension only after the concurrency tests pass. Do not advertise automatic
-multiplexing while idle Actors remain resident indefinitely.
+The first commit supplied manual lifecycle support. The automatic path uses
+runner idle-exit attestations and confirmed process death, not absent traffic or
+expired keepalives. Launches are gated before sending and retain an internal
+acknowledgement independently of caller timeouts. Quiescence closes host admission;
+bootstrap confirms that the host and descendants have exited before suspension.
+Completed suspended state survives server restart. Ambiguous operations stay
+blocked without expiry-based takeover; transparent recovery needs stronger
+provider completion/fencing guarantees and is not claimed.
 
 ### Cleanup and upgrades
 
@@ -448,6 +454,7 @@ migration of existing providers, guaranteed preservation of in-flight external
 requests, or guaranteed recovery of writes made after the last durable snapshot.
 
 Phase 0 must settle the released version/client bindings and prove image/runtime
-compatibility. Phase 3 must settle the durable idle-transition schema and race
-protocol before automatic suspension ships. These are implementation gates, not
-claims that the existing code already provides those guarantees.
+compatibility. Phase 3 now has a durable idle-transition protocol and race
+coverage. Production release still requires deployment-scale qualification and
+an operator recovery procedure for ambiguous provider operations; those are not
+replaced by expiring leases or a timeout-based automatic reset.

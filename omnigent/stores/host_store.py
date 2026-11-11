@@ -212,7 +212,13 @@ def _delete_host_row(session: Session, row: SqlHost) -> None:
         sql_delete(SqlPreference).where(
             SqlPreference.workspace_id == current_workspace_id(),
             SqlPreference.user_id == "__host_lifecycle__",
-            SqlPreference.key.in_(["recovery:" + row.host_id, "retained_sandbox:" + row.host_id]),
+            SqlPreference.key.in_(
+                [
+                    "recovery:" + row.host_id,
+                    "retained_sandbox:" + row.host_id,
+                    "operation:" + row.host_id,
+                ]
+            ),
         )
     )
 
@@ -1193,6 +1199,94 @@ class HostStore:
             return _row_to_host(row)
 
         return run_write_transaction(self._session_immediate, "register_managed_host", write)
+
+    def claim_sandbox_operation(
+        self,
+        host_id: str,
+        token: str,
+        operation: str,
+        *,
+        expected_sandbox_id: str | None = None,
+    ) -> dict[str, str] | None:
+        """Serialize managed compute operations without expiring in-flight authority."""
+
+        def write(session: Session) -> dict[str, str] | None:
+            row = session.get(SqlHost, (current_workspace_id(), host_id), with_for_update=True)
+            if (
+                row is None
+                or row.deleted_at is not None
+                or row.sandbox_provider is None
+                or (row.sandbox_id is None and operation != "starting")
+            ):
+                raise ValueError("Managed host no longer has an active sandbox")
+            require_active_account(session, row.user_id, generation=row.account_generation)
+            if expected_sandbox_id is not None and row.sandbox_id != expected_sandbox_id:
+                raise ValueError("Managed sandbox generation changed")
+            key = (current_workspace_id(), "__host_lifecycle__", "operation:" + host_id)
+            record = session.get(SqlPreference, key)
+            previous = json.loads(record.value) if record is not None else {}
+            if previous.get("phase") == "unknown":
+                raise ValueError(
+                    "Managed sandbox operation is unresolved; operator recovery is required"
+                )
+            if previous.get("phase") == "busy":
+                return None
+            value = {
+                "token": token,
+                "operation": operation,
+                "phase": "busy",
+                "previous": previous.get("phase", "active"),
+                "sandbox_id": row.sandbox_id or "",
+                "generation": row.token_hash or "",
+            }
+            encoded = json.dumps(value)
+            if record is None:
+                session.add(
+                    SqlPreference(workspace_id=key[0], user_id=key[1], key=key[2], value=encoded)
+                )
+            else:
+                record.value = encoded
+            return value
+
+        return run_write_transaction(self._lifecycle_session, "claim_sandbox_operation", write)
+
+    def finish_sandbox_operation(self, host_id: str, token: str, phase: str) -> bool:
+        """Only the coordinator that owns an operation may settle its result."""
+        if phase not in {"active", "suspended", "unknown"}:
+            raise ValueError("Invalid sandbox operation result")
+
+        def write(session: Session) -> bool:
+            row = session.get(SqlHost, (current_workspace_id(), host_id), with_for_update=True)
+            record = session.get(
+                SqlPreference,
+                (current_workspace_id(), "__host_lifecycle__", "operation:" + host_id),
+            )
+            if row is None or record is None:
+                return False
+            value = json.loads(record.value)
+            if value.get("token") != token or value.get("phase") != "busy":
+                return False
+            if row.deleted_at is not None or (
+                value.get("sandbox_id") != row.sandbox_id and value.get("operation") != "starting"
+            ):
+                phase_result = "unknown"
+            else:
+                phase_result = phase
+            value.update(phase=phase_result, sandbox_id=row.sandbox_id)
+            record.value = json.dumps(value)
+            if phase_result == "suspended":
+                row.status = encode_host_status("offline")
+            return True
+
+        return run_write_transaction(self._lifecycle_session, "finish_sandbox_operation", write)
+
+    def sandbox_operation(self, host_id: str) -> dict[str, str] | None:
+        with self._session("read_sandbox_operation") as session:
+            record = session.get(
+                SqlPreference,
+                (current_workspace_id(), "__host_lifecycle__", "operation:" + host_id),
+            )
+            return json.loads(record.value) if record is not None else None
 
     def claim_managed_recovery(self, host: Host, token: str) -> bool:
         """Lease recovery by host identity, so siblings and replicas share one launch."""

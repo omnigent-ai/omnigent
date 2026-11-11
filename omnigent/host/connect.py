@@ -1358,6 +1358,10 @@ class HostProcess:
             self._interactive_shells = ["bash"]
         self._harness_tmp_parent = resolve_harness_tmp_parent()
         self._runners: dict[str, _RunnerHandle] = {}
+        self._idle_runners: list[_RunnerHandle] = []
+        self._idle_seen_runner = False
+        self._idle_uncertain = False
+        self._idle_quiescing = False
         from omnigent.host.skills import HostSkillDiscovery
 
         self._skill_discovery = HostSkillDiscovery(self._fetch_skill_bundle)
@@ -1647,7 +1651,7 @@ class HostProcess:
         """Run a subprocess-owning operation off-loop without losing its exit status.
 
         Cancellation stops waiting for the result but cannot stop a worker
-        thread. Keep the orphan reaper paused until the worker itself finishes.
+        thread. Keep reaping and idle quiescence blocked until the worker finishes.
         """
         self._owned_subprocess_ops += 1
         task = asyncio.create_task(asyncio.to_thread(operation))
@@ -2332,6 +2336,10 @@ class HostProcess:
             connect_marker=_connect_marker_path(log_path),
             create_time=_proc.process_create_time(proc.pid),
         )
+        if self._idle_capabilities():
+            self._idle_seen_runner = True
+            if not self._idle_uncertain:
+                self._idle_runners.append(self._runners[runner_id])
         launch_context = current_scheduled_run()
         with scheduled_run_scope(None, session_id=frame.session_id):
             watcher = asyncio.create_task(
@@ -2434,6 +2442,10 @@ class HostProcess:
             env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
             # The runner and host watchdog share this per-launch marker.
             env[RUNNER_CONNECT_MARKER_ENV_VAR] = str(_connect_marker_path(log_path))
+            from omnigent.host.idle import RUNNER_WORK_IDLE_ENV, idle_suspend_enabled
+
+            if idle_suspend_enabled():
+                env[RUNNER_WORK_IDLE_ENV] = "1"
 
             zygote = self._ensure_zygote_started()
             if zygote is not None:
@@ -2536,7 +2548,10 @@ class HostProcess:
             if isinstance(proc, ZygoteRunnerProc):
                 # No watcher owns an abandoned spawn's retained exit status.
                 await asyncio.to_thread(proc.wait, timeout=5.0)
+            if await asyncio.to_thread(proc.poll) is None:
+                self._idle_uncertain = True
         except Exception:  # detached cleanup must be observed
+            self._idle_uncertain = True
             _logger.warning(
                 "Failed to stop abandoned runner pid=%s",
                 proc.pid,
@@ -2781,6 +2796,23 @@ class HostProcess:
         # loop to avoid freezing the daemon on the enabled path.
         while await asyncio.to_thread(handle.proc.poll) is None:
             await asyncio.sleep(_RUNNER_WATCH_INTERVAL_S)
+        if self._idle_capabilities():
+            from omnigent.runner.identity import runner_exited_idle
+
+            idle = handle.stop_requested or (
+                handle.proc.returncode == 0
+                and handle.connect_marker is not None
+                and await asyncio.to_thread(
+                    runner_exited_idle, handle.connect_marker, runner_id, handle.proc.pid
+                )
+            )
+            if not idle:
+                self._idle_uncertain = True
+                self._idle_runners.clear()
+            else:
+                self._idle_runners = [
+                    tracked for tracked in self._idle_runners if tracked is not handle
+                ]
         if self._runners.get(runner_id) is not handle:
             # _handle_stop (or _cleanup_runners) removed it first —
             # an intentional termination, not a crash to report.
@@ -5127,7 +5159,7 @@ class HostProcess:
             self._ensure_model_options_prewarm()
             self._start_capability_discovery()
             while True:
-                if self._lifecycle_lost.is_set():
+                if self._lifecycle_lost.is_set() or self._idle_quiescing:
                     break
                 try:
                     await self._connect_and_serve()
@@ -5140,6 +5172,8 @@ class HostProcess:
                     # ``run_host_process`` can fail loud.
                     raise
                 except Exception as exc:
+                    if self._idle_quiescing:
+                        break
                     if self._lifecycle_lost.is_set():
                         # The lifecycle monitor aborted the tunnel to retire this
                         # stale daemon; the resulting disconnect is expected, so
@@ -5775,7 +5809,7 @@ class HostProcess:
             interactive_shells=self._interactive_shells,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
-            capabilities=list(HOST_CAPABILITIES),
+            capabilities=[*HOST_CAPABILITIES, *self._idle_capabilities()],
             connection_id=connection_id,
             workspace_socket=str(listener.path) if (listener := self._workspace_socket) else None,
             workspace_token_key=listener.token_key if listener else None,
@@ -6026,6 +6060,33 @@ class HostProcess:
         with telemetry.consume_frame_span(kind, carrier):
             await self._dispatch_host_frame(ws, frame)
 
+    def _idle_capabilities(self) -> list[str]:
+        from omnigent.host.idle import CAP_IDLE_QUIESCE, idle_suspend_enabled
+
+        return [CAP_IDLE_QUIESCE] if idle_suspend_enabled() else []
+
+    def _can_quiesce_idle(self, generation: str) -> bool:
+        from omnigent.host.idle import activation_generation, idle_suspend_enabled
+
+        if (
+            not idle_suspend_enabled()
+            or generation != activation_generation()
+            or not self._idle_seen_runner
+            or self._idle_uncertain
+            or self._idle_runners
+            or self._runners
+            or self._pending_runner_launches
+            or self._runner_stop_tasks
+            or self._owned_subprocess_ops
+            or self._active_harness_logins
+            or any(
+                task is not asyncio.current_task() and not task.done()
+                for task in self._frame_tasks
+            )
+        ):
+            return False
+        return True
+
     async def _dispatch_host_frame(
         self,
         ws: websockets.asyncio.client.ClientConnection,
@@ -6039,6 +6100,33 @@ class HostProcess:
             ignored.
         :returns: None.
         """
+        from omnigent.host.frames import HostQuiesceFrame, HostQuiesceResultFrame
+
+        if isinstance(frame, HostQuiesceFrame):
+            async with self._runner_lifecycle_lock:
+                accepted = self._can_quiesce_idle(frame.generation)
+                if accepted:
+                    self._idle_quiescing = True
+            await self._send_text(
+                ws,
+                self._encode_frame(
+                    HostQuiesceResultFrame(frame.request_id, "ok" if accepted else "busy")
+                ),
+            )
+            if accepted:
+                await ws.close()
+            return
+        if self._idle_quiescing:
+            if isinstance(frame, HostLaunchRunnerFrame):
+                await self._send_text(
+                    ws,
+                    self._encode_frame(
+                        self._launch_failed(
+                            frame, "Host is suspending after idle", error_code="host_quiescing"
+                        )
+                    ),
+                )
+            return
         if isinstance(frame, HostConnectionErrorFrame):
             # Defensive for direct callers; production handles this inline in
             # _serve_frames so detached request tasks cannot swallow it.
@@ -6070,6 +6158,10 @@ class HostProcess:
                         error_code=LAUNCH_HANDLER_FAILED_ERROR_CODE,
                     )
             finally:
+                if frame.request_id in self._spawned_launch_requests and (
+                    launch_result is None or launch_result.status == "failed"
+                ):
+                    self._idle_uncertain = True
                 self._spawned_launch_requests.discard(frame.request_id)
                 completion.set_result(None)
             if launch_result is not None:
@@ -6102,7 +6194,9 @@ class HostProcess:
             list_result = await asyncio.to_thread(self._handle_list_dir, frame)
             await self._send_text(ws, self._encode_frame(list_result))
         elif isinstance(frame, HostCreateDirFrame):
-            create_dir_result = await asyncio.to_thread(self._handle_create_dir, frame)
+            create_dir_result = await self._run_host_subprocess_in_thread(
+                lambda: self._handle_create_dir(frame)
+            )
             await self._send_text(ws, self._encode_frame(create_dir_result))
         elif isinstance(frame, HostCloneRepositoryFrame):
             # git runs for minutes; the owned-subprocess guard keeps the orphan
@@ -6191,7 +6285,9 @@ class HostProcess:
             await self._send_text(ws, self._encode_frame(fs_result))
         elif isinstance(frame, HostFsWriteFrame):
             # gh/git writes can block; run off the event loop and reply back.
-            fs_write_result = await asyncio.to_thread(self._handle_fs_write, frame)
+            fs_write_result = await self._run_host_subprocess_in_thread(
+                lambda: self._handle_fs_write(frame)
+            )
             await self._send_text(ws, self._encode_frame(fs_write_result))
         elif isinstance(frame, HostSkillsFrame):
             skills_result = await asyncio.to_thread(self._handle_skills, frame)
@@ -6203,7 +6299,9 @@ class HostProcess:
             content_result = await asyncio.to_thread(self._handle_skill_content, frame)
             await self._send_text(ws, self._encode_frame(content_result))
         elif isinstance(frame, HostSetMcpServerEnabledFrame):
-            enabled_result = await asyncio.to_thread(self._handle_set_mcp_server_enabled, frame)
+            enabled_result = await self._run_host_subprocess_in_thread(
+                lambda: self._handle_set_mcp_server_enabled(frame)
+            )
             await self._send_text(ws, self._encode_frame(enabled_result))
         elif isinstance(frame, HostMcpToolsFrame):
             tools_result = await self._handle_mcp_tools(frame)
@@ -6550,4 +6648,8 @@ def _serve_host_until_exit(
         # Serving is over: drop the callback so a hangup during the exit-drain
         # window cannot signal runners through a torn-down host.
         crash_reporting.set_hangup_callback(None)
+    if host._idle_quiescing:
+        from omnigent.host.idle import HOST_IDLE_EXIT_CODE
+
+        raise SystemExit(HOST_IDLE_EXIT_CODE)
     return host.lifecycle_lost
