@@ -552,7 +552,7 @@ describe("SwitchHostDialog", () => {
       });
     });
 
-    it("blocks a branch without a repository and a malformed repository URL", () => {
+    it("blocks a branch without a repository, a malformed repository URL and an invalid branch", () => {
       onlyOriginHostOnline();
       renderDialog(ARCLET_SERVER);
       const button = screen.getByTestId("switch-host-button");
@@ -574,6 +574,16 @@ describe("SwitchHostDialog", () => {
 
       fireEvent.change(repo, { target: { value: "git@github.com:org/repo.git" } });
       expect(button).toBeEnabled();
+      expect(screen.queryByTestId("switch-host-sandbox-repo-error")).toBeNull();
+
+      // A bad branch is reported under the branch input, not the repository.
+      fireEvent.change(screen.getByTestId("switch-host-sandbox-branch-input"), {
+        target: { value: "bad..branch" },
+      });
+      expect(button).toBeDisabled();
+      expect(screen.getByTestId("switch-host-sandbox-branch-error")).toHaveTextContent(
+        "Enter a valid branch name",
+      );
       expect(screen.queryByTestId("switch-host-sandbox-repo-error")).toBeNull();
     });
 

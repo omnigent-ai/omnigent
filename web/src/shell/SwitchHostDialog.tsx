@@ -300,6 +300,8 @@ function SupportedSwitchHostDialog({
   }
 
   const repoProblem = sandboxRepoProblem(sandboxRepoUrl, sandboxRepoBranch);
+  const repositoryError = repoProblem?.field === "repository" ? repoProblem.message : null;
+  const branchError = repoProblem?.field === "branch" ? repoProblem.message : null;
   const canSwitch = sandboxSelected
     ? repoProblem === null
     : selectedHostId !== null && workspaceValid;
@@ -446,16 +448,16 @@ function SupportedSwitchHostDialog({
                     onChange={(e) => setSandboxRepoUrl(e.target.value)}
                     placeholder="https://github.com/org/repo"
                     data-testid="switch-host-sandbox-repo-input"
-                    aria-invalid={repoProblem !== null || undefined}
+                    aria-invalid={repositoryError !== null || undefined}
                     className="rounded-md border border-input aria-invalid:border-destructive bg-background px-3 py-2 font-mono text-xs outline-none transition-colors focus-visible:border-ring"
                   />
-                  {repoProblem !== null ? (
+                  {repositoryError !== null ? (
                     <p
                       role="alert"
                       className="text-xs text-destructive"
                       data-testid="switch-host-sandbox-repo-error"
                     >
-                      {repoProblem}
+                      {repositoryError}
                     </p>
                   ) : (
                     <p className="text-xs text-muted-foreground">
@@ -479,8 +481,18 @@ function SupportedSwitchHostDialog({
                     onChange={(e) => setSandboxRepoBranch(e.target.value)}
                     placeholder="main"
                     data-testid="switch-host-sandbox-branch-input"
-                    className="rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none transition-colors focus-visible:border-ring"
+                    aria-invalid={branchError !== null || undefined}
+                    className="rounded-md border border-input aria-invalid:border-destructive bg-background px-3 py-2 font-mono text-xs outline-none transition-colors focus-visible:border-ring"
                   />
+                  {branchError !== null && (
+                    <p
+                      role="alert"
+                      className="text-xs text-destructive"
+                      data-testid="switch-host-sandbox-branch-error"
+                    >
+                      {branchError}
+                    </p>
+                  )}
                 </div>
                 <p
                   className="flex items-start gap-1.5 text-xs text-warning"
