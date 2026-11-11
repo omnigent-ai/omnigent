@@ -1453,6 +1453,33 @@ def test_gh_api_repository_comes_from_the_endpoint(command: str, expected: str) 
     assert _target_action(command) == expected
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr create -R example/allowed -R example/other --base main",
+        "gh -R example/allowed pr create -R example/other --base main",
+        "gh pr create -R example/allowed -Rexample/other --base main",
+        "gh pr create -R example/allowed --base main --base release",
+        "gh api -X POST repos/example/allowed/issues --hostname github.com --hostname other.example",
+    ],
+)
+def test_conflicting_gh_selectors_require_approval(command: str) -> None:
+    assert _target_action(command) == "ASK"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr create -R example/allowed -R Example/Allowed --base main",
+        "gh -R example/allowed pr create -R example/allowed --base main",
+        "gh pr create -R example/allowed --base main --base main",
+        "gh api -X POST repos/example/allowed/issues --hostname github.com --hostname GitHub.com",
+    ],
+)
+def test_repeated_identical_gh_selectors_are_accepted(command: str) -> None:
+    assert _target_action(command) == "ALLOW"
+
+
 def test_gh_api_delete_is_destructive() -> None:
     command = "gh api -X DELETE repos/example/allowed/issues/1"
     assert _target_action(command) == "DENY"
