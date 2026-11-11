@@ -435,10 +435,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 current = _to_entity(row)
                 if any(
                     getattr(current, field) != getattr(expected_schedule, field)
-                    for field in ("rrule", "session_mode", "execution_target")
+                    # Shares too: a save validated against the old ones may not
+                    # retarget the session they apply to.
+                    for field in ("rrule", "session_mode", "execution_target", "share_with")
                 ):
                     raise OmnigentError(
-                        "The automation's schedule or execution settings changed. "
+                        "The automation's schedule, execution or sharing settings changed. "
                         "Reload and try again.",
                         code=ErrorCode.CONFLICT,
                     )

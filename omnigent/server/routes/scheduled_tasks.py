@@ -1452,6 +1452,15 @@ def create_scheduled_tasks_router(
             )
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        if "share_with" in fields:
+            # Before the agent copy below, so a refused share leaves nothing behind.
+            fields["share_with"] = await _validated_shares(
+                request,
+                body.share_with,
+                owner=owner,
+                execution_target=target_execution,
+                workspace=fields.get("workspace", None if target_changed else existing.workspace),
+            )
         if agent_changed or {"workspace", "host_id", "execution_target"}.intersection(fields):
             # Revalidate placement against the selected agent and execution target.
             agent, workspace, _, _ = await _validate_launch_inputs(
@@ -1512,7 +1521,8 @@ def create_scheduled_tasks_router(
             and fields.get("session_id") not in (None, existing.session_id)
             and _from_agent_tool(request)
         ):
-            # Saving shares the continued session, so retargeting widens who sees it.
+            # Saving shares the continued session, so retargeting widens who sees it. The
+            # store refuses the save if the shares change before it commits.
             raise OmnigentError(
                 "Agent tools cannot point a shared automation at another session",
                 code=ErrorCode.FORBIDDEN,
@@ -1527,14 +1537,6 @@ def create_scheduled_tasks_router(
                 fields["host_id"] = picked.host_id
         elif "permission_mode" in fields and continuing.continues_session:
             await _require_mode_fits_session(request, continuing)
-        if "share_with" in fields:
-            fields["share_with"] = await _validated_shares(
-                request,
-                body.share_with,
-                owner=owner,
-                execution_target=target_execution,
-                workspace=fields.get("workspace", existing.workspace),
-            )
         project_owner = _project_owner(owner)
         try:
             if fields.get("project_id") is not None:
