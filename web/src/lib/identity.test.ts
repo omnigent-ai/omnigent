@@ -18,6 +18,7 @@ function mockJsonResponse(body: unknown, init?: { ok?: boolean; status?: number 
 }
 
 const fetchMock = vi.fn();
+const CLIENT_KEY = expect.stringMatching(/^[0-9a-f]{32}$/);
 
 beforeEach(() => {
   fetchMock.mockReset();
@@ -409,7 +410,7 @@ describe("authenticatedFetch", () => {
       },
       { query: "session_id=session-a", mode: "known", expected: "host_target" },
       { query: "session_id=session-a", mode: "resolve", expected: "host_target" },
-      { query: "session_id=session-a", mode: "unknown", expected: null },
+      { query: "session_id=session-a", mode: "unknown", expected: CLIENT_KEY },
     ])(
       "routes unified skill discovery to its own host ($mode)",
       async ({ query, mode, expected }) => {
@@ -432,7 +433,7 @@ describe("authenticatedFetch", () => {
         fetchMock.mockResolvedValueOnce(mockJsonResponse({ skills: [] }));
         await authenticatedFetch(`/api/2.0/omnigent/v1/skills?${query}`);
         const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
-        expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe(expected);
+        expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toEqual(expected);
         if (mode === "resolve" || mode === "unknown") {
           expect(resolve).toHaveBeenCalledExactlyOnceWith("session-a");
         } else {
@@ -441,12 +442,16 @@ describe("authenticatedFetch", () => {
       },
     );
 
-    it("stamps X-Databricks-Omnigent-Slice-Key on host-scoped URLs", async () => {
-      // Mock sessionHost module before importing identity
+    it.each([
+      [false, "host_123"],
+      [true, null],
+    ])("keys host-scoped URLs by their host (keyless %s)", async (keyless, key) => {
+      // A host proven keyless lives on the unkeyed default replica, so it must not
+      // receive the client key either.
       vi.doMock("./sessionHost", () => ({
         getSessionHost: vi.fn(() => "host_123"),
         setSessionHost: vi.fn(),
-        isHostKeyless: vi.fn(() => false),
+        isHostKeyless: vi.fn(() => keyless),
         markHostKeyless: vi.fn(),
         clearHostKeyless: vi.fn(),
         modalHostId: vi.fn(() => null),
@@ -465,9 +470,9 @@ describe("authenticatedFetch", () => {
 
       await authenticatedFetch("/v1/hosts/host_123/runners");
 
-      const init = fetchMock.mock.calls[0][1] as RequestInit;
-      const headers = new Headers(init.headers);
-      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_123");
+      const [, init, options] = fetchMock.mock.calls[0] as [string, RequestInit, unknown];
+      expect(new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key")).toBe(key);
+      expect(options).toEqual({ unkeyed: keyless });
     });
 
     it("stamps the slice-key header in standalone dev against a workspace", async () => {
@@ -631,7 +636,7 @@ describe("authenticatedFetch", () => {
       },
     );
 
-    it("keys /v1/sessions/projects by the modal host, not as a session", async () => {
+    it("keys project reads by the client key and project writes by the modal host", async () => {
       vi.doUnmock("./sessionHost");
       const { resolveModalHost, setSessionHost } = await import("./sessionHost");
       setSessionHost("session-a", "host_modal");
@@ -643,18 +648,20 @@ describe("authenticatedFetch", () => {
         isHostRoutingEnabled: vi.fn(() => true),
       }));
       const { authenticatedFetch } = await import("./identity");
-      fetchMock.mockResolvedValueOnce(mockJsonResponse({ projects: [] }));
+      fetchMock.mockResolvedValue(mockJsonResponse({}));
 
+      // Project writes publish projects_changed on their replica, which only the
+      // updates stream keyed by the same modal host receives.
       await authenticatedFetch("/v1/sessions/projects");
+      await authenticatedFetch("/v1/projects/proj_1", { method: "PATCH", body: "{}" });
 
-      const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
-      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_modal");
+      const keys = fetchMock.mock.calls.map(([, init]) =>
+        new Headers((init as RequestInit).headers).get("X-Databricks-Omnigent-Slice-Key"),
+      );
+      expect(keys).toEqual([CLIENT_KEY, "host_modal"]);
     });
 
-    it("sends a session sub-path with an unknown host unkeyed", async () => {
-      // Unkeyed is deliberate here: a session whose host is unknown may run on
-      // a host whose tunnel dialed in without a key, which the default route
-      // reaches.
+    it("keys a session sub-path with an unknown host by the client key", async () => {
       vi.doUnmock("./sessionHost");
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
@@ -668,13 +675,14 @@ describe("authenticatedFetch", () => {
       await authenticatedFetch("/v1/sessions/sess_unknown/items");
 
       const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
-      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBeNull();
+      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toEqual(CLIENT_KEY);
     });
 
     it.each(["import", "bundle", "hostless_bundle"])(
       "keys %s by its own destination",
       async (kind) => {
-        // Requests route by their own host_id; hostless creates stay unkeyed.
+        // Requests route by their own host_id, never the modal host; hostless
+        // creates need no particular replica and carry the client key.
         vi.doMock("./sessionHost", () => ({
           getSessionHost: vi.fn(() => null),
           setSessionHost: vi.fn(),
@@ -705,20 +713,20 @@ describe("authenticatedFetch", () => {
         });
 
         const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
-        expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe(
-          kind === "hostless_bundle" ? null : "host_target",
+        expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toEqual(
+          kind === "hostless_bundle" ? CLIENT_KEY : "host_target",
         );
       },
     );
 
     it.each([
       [{ host_type: "managed", host_id: "host_fork" }, "host_fork"],
-      [{ host_type: "managed" }, null],
+      [{ host_type: "managed" }, CLIENT_KEY],
       [{}, "host_source"],
     ])("keys a managed fork only by the host it names (%j)", async (body, key) => {
       // A managed fork's launch runs on the replica it lands on, so it must
-      // land where its own new host will connect (unkeyed without an id),
-      // never on the source's; any other fork keeps the source's key.
+      // land where its own new host will connect (the client key without an
+      // id), never on the source's; any other fork keeps the source's key.
       vi.doMock("./sessionHost", () => ({
         getSessionHost: vi.fn(() => "host_source"),
         setSessionHost: vi.fn(),
@@ -746,7 +754,7 @@ describe("authenticatedFetch", () => {
       });
 
       const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
-      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe(key);
+      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toEqual(key);
     });
   });
 });

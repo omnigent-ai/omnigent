@@ -462,10 +462,14 @@ async def test_open_daemon_client_no_slice_key_off_workspace() -> None:
         assert OMNIGENT_SLICE_KEY_HEADER not in client.headers
 
 
-async def test_open_daemon_client_no_slice_key_without_host() -> None:
-    """A hostless (local) session leaves routing to the default fallback."""
+async def test_open_daemon_client_uses_machine_key_without_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hostless (local) session carries this machine's own routing key."""
+    monkeypatch.setattr("omnigent.host.identity.load_host_identity_if_present", lambda: None)
+    monkeypatch.setattr("omnigent.routing_key.client_routing_key", lambda: "client_key")
     async with open_daemon_client("https://ws.example.com/api/2.0/omnigent", {}, None) as client:
-        assert OMNIGENT_SLICE_KEY_HEADER not in client.headers
+        assert client.headers[OMNIGENT_SLICE_KEY_HEADER] == "client_key"
 
 
 def test_daemon_poll_intervals_open_tight_then_hold_at_the_cadence() -> None:

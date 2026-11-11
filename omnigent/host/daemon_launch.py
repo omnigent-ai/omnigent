@@ -105,7 +105,7 @@ def open_daemon_client(
     :param headers: Base HTTP headers (auth bearer, workspace routing); not
         mutated — a fresh dict carries the merged routing headers.
     :param host_id: The host to pin to, e.g. ``"host_abc123"``; ``None`` (a
-        hostless / local session) leaves routing to the default fallback.
+        hostless / local session) uses this machine's own routing key.
     :param auth: Optional per-request ``httpx.Auth`` (e.g. token refresh).
     :param timeout: Optional httpx timeout for the client.
     :returns: An ``httpx.AsyncClient`` whose requests all name *host_id*.

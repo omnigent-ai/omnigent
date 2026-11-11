@@ -83,7 +83,7 @@ def test_auth_keys_by_session_host_on_workspace_mount() -> None:
 
     The client is built for one session; it names the session (not a parsed
     URL), and the auth resolves the host from the session→host map. On the
-    workspace mount the routing header rides; an unmapped session sends none.
+    workspace mount the routing header rides; other requests carry the machine's key.
     """
     mount = "https://acme.databricks.com/api/2.0/omnigent"
     set_session_host("conv_1", "host_abc")
@@ -92,15 +92,13 @@ def test_auth_keys_by_session_host_on_workspace_mount() -> None:
     assert _slice_key(keyed, f"{mount}/v1/sessions/conv_1/events") == "host_abc"
     assert _slice_key(keyed, f"{mount}/v1/sessions/conv_1/stream") == "host_abc"
     for route in ("agents", "hosts", "runners", "sessions", "sessions-other", "me"):
-        assert _slice_key(keyed, f"{mount}/v1/{route}") is None
+        assert _slice_key(keyed, f"{mount}/v1/{route}") == "client_key"
 
-    # Unmapped session → no key (workspace fallback).
     unmapped = _DatabricksTokenAuth(server_url=mount, session_id="conv_unknown")
-    assert _slice_key(unmapped, f"{mount}/v1/sessions/conv_unknown/events") is None
+    assert _slice_key(unmapped, f"{mount}/v1/sessions/conv_unknown/events") == "client_key"
 
-    # Hostless (local / no session) client → no key.
     hostless = _DatabricksTokenAuth(server_url=mount, session_id=None)
-    assert _slice_key(hostless, f"{mount}/v1/sessions/conv_1/events") is None
+    assert _slice_key(hostless, f"{mount}/v1/sessions/conv_1/events") == "client_key"
 
 
 def test_auth_no_key_off_workspace() -> None:

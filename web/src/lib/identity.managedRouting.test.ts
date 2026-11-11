@@ -5,6 +5,7 @@ const fetchMock = vi.fn();
 const getHostConfig = vi.fn<() => OmnigentHostConfig>();
 const isWorkspace = vi.fn(() => true);
 const SLICE_KEY = "X-Databricks-Omnigent-Slice-Key";
+const CLIENT_KEY_RE = /^[0-9a-f]{32}$/;
 const SESSION_ID = "managed-session";
 const EVENTS_URL = `/v1/sessions/${SESSION_ID}/events`;
 
@@ -64,7 +65,7 @@ describe("managed first-message routing", () => {
     expect(resolve).toHaveBeenNthCalledWith(1, SESSION_ID);
     expect(resolve).toHaveBeenNthCalledWith(2, SESSION_ID, { force: true });
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(requestHeaders(0).has(SLICE_KEY)).toBe(false);
+    expect(requestHeaders(0).get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
     expect(requestHeaders(1).get(SLICE_KEY)).toBe("new-host");
     expect(requestHeaders(1).get("Content-Type")).toBe("application/json");
     expect(requestHeaders(1).get("X-Forwarded-Email")).toBe("alice@example.com");
@@ -90,7 +91,7 @@ describe("managed first-message routing", () => {
     expect((await authenticatedFetch(EVENTS_URL, { method: "POST", body: "{}" })).ok).toBe(true);
 
     expect(resolve).toHaveBeenCalledTimes(1);
-    expect(requestHeaders(0).has(SLICE_KEY)).toBe(false);
+    expect(requestHeaders(0).get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
     expect(requestHeaders(1).get(SLICE_KEY)).toBe("new-host");
   });
 
@@ -102,7 +103,7 @@ describe("managed first-message routing", () => {
     expect((await authenticatedFetch(EVENTS_URL)).ok).toBe(true);
 
     expect(resolve).toHaveBeenCalledExactlyOnceWith(SESSION_ID, { force: true });
-    expect(requestHeaders(0).has(SLICE_KEY)).toBe(false);
+    expect(requestHeaders(0).get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
     expect(requestHeaders(1).get(SLICE_KEY)).toBe("new-host");
   });
 
@@ -184,7 +185,9 @@ describe("managed first-message routing", () => {
       setSessionHost(sessionId, "new-host");
     });
     fetchMock.mockImplementation(async (_url, init: RequestInit) =>
-      new Headers(init.headers).has(SLICE_KEY) ? Response.json({ queued: true }) : wrongReplica(),
+      new Headers(init.headers).get(SLICE_KEY) === "new-host"
+        ? Response.json({ queued: true })
+        : wrongReplica(),
     );
 
     const first = authenticatedFetch(EVENTS_URL, { method: "POST", body: "first" });
@@ -258,14 +261,14 @@ describe("managed create routing by a chosen host id", () => {
       { host_type: "managed", host_id: "0123456789abcdef0123456789abcdef" },
       "0123456789abcdef0123456789abcdef",
     ],
-    [{ host_type: "managed" }, null],
+    [{ host_type: "managed" }, expect.stringMatching(CLIENT_KEY_RE)],
   ])("keys a managed POST /v1/sessions by the body's host_id (%o)", async (body, key) => {
     const { authenticatedFetch } = await setup();
     fetchMock.mockResolvedValueOnce(Response.json({ id: "conv_new" }, { status: 201 }));
 
     await authenticatedFetch("/v1/sessions", { method: "POST", body: JSON.stringify(body) });
 
-    expect(requestHeaders(0).get(SLICE_KEY)).toBe(key);
+    expect(requestHeaders(0).get(SLICE_KEY)).toEqual(key);
   });
 
   it("routes a session by its chosen host id until the host binds", async () => {

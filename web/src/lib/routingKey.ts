@@ -1,8 +1,12 @@
-// Random per-client slice key for host-less requests when no modal host is known. Unkeyed
-// requests route by workspace id onto one replica; this spreads clients across replicas.
-// Stored in localStorage so a browser's tabs, reloads, and reconnects share one replica.
+// Random per-client slice key for requests that need no particular replica. Unkeyed requests
+// route by workspace id onto one replica; this spreads clients across replicas. Stored in
+// localStorage (persistent in the desktop and mobile apps too), so a client stays on one replica.
 
 import { randomUUID } from "@/lib/randomUUID";
+
+/** Request header carrying the slice key; WebSockets and media URLs use `omnigent_slice_key`. */
+export const SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key";
+export const SLICE_KEY_PARAM = "omnigent_slice_key";
 
 const STORAGE_KEY = "omnigent:routing-key";
 const KEY_RE = /^[0-9a-f]{32}$/;

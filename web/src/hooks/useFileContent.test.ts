@@ -21,6 +21,7 @@ const isAndroidShell = vi.fn(() => false);
 vi.mock("@/lib/host", () => ({
   isDatabricksWorkspace: () => isDatabricksWorkspace(),
   resolveMediaUrl: (p: string) => resolveMediaUrl(p),
+  withRoutingKeyParam: (p: string) => `${p}&omnigent_slice_key=client_key`,
 }));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: (u: string) => authenticatedFetch(u) }));
 vi.mock("@/lib/nativeBridge", () => ({
@@ -109,8 +110,10 @@ describe("workspaceFileMediaUrl", () => {
     );
   });
 
-  it("leaves the load unkeyed when the session host is unknown or proven keyless", () => {
-    expect(workspaceFileMediaUrl("sess_abc", "demo.mp4")).toBe(`https://ws.example${MEDIA_URL}`);
+  it("keys an unknown host's load by the client key and a keyless host's not at all", () => {
+    expect(workspaceFileMediaUrl("sess_abc", "demo.mp4")).toBe(
+      `https://ws.example${MEDIA_URL}&omnigent_slice_key=client_key`,
+    );
 
     setSessionHost("sess_abc", "host_1");
     markHostKeyless("host_1");

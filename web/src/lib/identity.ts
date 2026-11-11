@@ -23,13 +23,13 @@ import {
   isDatabricksWorkspace,
   isHostRoutingEnabled,
 } from "./host";
-import { clientRoutingKey } from "./routingKey";
+import { clientRoutingKey, SLICE_KEY_HEADER } from "./routingKey";
 import {
   clearHostKeyless,
   getSessionHost,
   isHostKeyless,
   markHostKeyless,
-  modalHostId,
+  updatesRoutingKey,
 } from "@/lib/sessionHost";
 
 // Single-user sentinel from `GET /v1/me` (server's RESERVED_USER_LOCAL);
@@ -37,12 +37,6 @@ import {
 const RESERVED_USER_LOCAL = "local";
 
 let currentUserId: string | null = null;
-
-// Replica-routing header, used when the server shards replicas by host. A
-// host's control tunnel and its runners' tunnels register on the same replica,
-// keyed by host_id, so a request scoped to a host (or a session running on one)
-// must carry that host_id to reach the replica holding the tunnel.
-const SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key";
 
 // The request is valid but reached a replica without its host tunnel.
 // Unlike runner_unavailable, wrong_replica can recover by re-addressing.
@@ -57,13 +51,13 @@ export const WRONG_REPLICA_CODE = "wrong_replica";
  * - ``/v1/hosts/{host_id}/...`` → ``{scoped: true, hostId}`` from the path.
  * - ``/v1/sessions/{session_id}/...`` → ``{scoped: true, hostId}`` from
  *   {@link getSessionHost}; ``hostId`` is ``null`` when the session hasn't been
- *   loaded yet → send NO key (the modal host would be a wrong guess for a
- *   specific session; a keyless miss re-addresses instead).
+ *   loaded yet → send the client's own key, not the modal host (a wrong guess
+ *   for a specific session); a wrong_replica miss resolves the host and
+ *   re-addresses.
  * - ``/v1/skills`` → the query's ``host_id`` or the host for ``session_id``.
  * - everything else (session lists, ``/v1/sessions/projects``,
  *   ``/v1/sessions/updates``, ``/health``) is a cross-host / DB-backed read →
- *   ``{scoped: false}``, where the modal host is a legitimate cache-affinity
- *   hint.
+ *   ``{scoped: false}``, which any replica can serve.
  *
  * The host-scoped families are an ALLOWLIST of what exists today (verified:
  * ``/v1/sessions/{id}/agent`` is under the sessions prefix, and
@@ -74,7 +68,7 @@ export const WRONG_REPLICA_CODE = "wrong_replica";
 type UrlHostScope = { scoped: true; hostId: string | null } | { scoped: false };
 
 // Routes under /v1/sessions/ whose next segment is not a session id. Read as a
-// session id, they would look up a host that can't exist and go out unkeyed.
+// session id, they would look up a host that can't exist.
 const SESSION_COLLECTION_ROUTES = new Set(["projects", "updates"]);
 
 function skillsParamsForUrl(url: string): URLSearchParams | null {
@@ -273,7 +267,7 @@ function isManagedForkRequest(url: string, body: BodyInit | null | undefined): b
  * request. A managed-sandbox create's ``host_id`` is the id it chose for its
  * new sandbox host, so the launch runs where that host's tunnel will land.
  * Multipart creates carry the same routing fields in their metadata part.
- * Creates without a host ID stay unkeyed.
+ * Creates without a host ID carry the client's own key.
  */
 function hostIdFromBody(url: string, body: BodyInit | null | undefined): string | null {
   const metadata = body instanceof FormData ? body.get("metadata") : body;
@@ -294,9 +288,9 @@ function hostIdFromBody(url: string, body: BodyInit | null | undefined): string 
  * side effect pinned to a replica and must key by their OWN target host:
  *
  * - A managed create keys by the host_id it chose for its sandbox host. One
- *   without a host_id stays unkeyed: if the new host connects elsewhere, its
- *   first message must resolve the assigned host and re-address after
- *   wrong_replica. A create that names a host keeps that key.
+ *   without a host_id carries the client's own key: if the new host connects
+ *   elsewhere, its first message must resolve the assigned host and re-address
+ *   after wrong_replica. A create that names a host keeps that key.
  * - A local import reads the chosen host's transcripts over its tunnel, which is
  *   registered on the replica keyed by that host_id — never the importing user's
  *   modal host (null / a different host for a fresh user), which is why an
@@ -307,6 +301,14 @@ function hostIdFromBody(url: string, body: BodyInit | null | undefined): string 
  */
 function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined): boolean {
   return (typeof body === "string" || body instanceof FormData) && BODY_HOST_KEYED_RE.test(url);
+}
+
+const PROJECTS_RE = /\/v1\/projects(?:[/?#]|$)/;
+
+// A project create/update/delete/reorder, which publishes `projects_changed`.
+function isProjectWrite(url: string, method: string | undefined): boolean {
+  const verb = (method ?? "GET").toUpperCase();
+  return verb !== "GET" && verb !== "HEAD" && PROJECTS_RE.test(url);
 }
 
 // Admin flag from the same `/v1/me` probe. Mode-agnostic (the shared
@@ -580,24 +582,23 @@ export async function authenticatedFetch(
   // same tick, exactly as before the gate.
   const hostResolve = beginSessionHostResolve(url);
   if (hostResolve !== null) await hostResolve;
-  // Whether WE (not the caller) stamped the slice key on this request; only then
-  // is a keyless re-address meaningful on a wrong-replica (wrong_replica) response.
+  // Whether WE (not the caller) stamped a host's slice key on this request; only
+  // then is a keyless re-address meaningful on a wrong-replica (wrong_replica) response.
   let stampedSliceKey = false;
   // The host this request is FOR, even when we deliberately send it keyless
   // (demoted). Lets the retry logic below demote/un-demote the right host.
   let derivedHostId: string | null = null;
-  if (!headers.has(SLICE_KEY_HEADER) && isHostRoutingEnabled()) {
-    // Key by the request's OWN host when it's host-scoped; otherwise (a
-    // cross-host / DB-backed read) fall back to the modal host as a
-    // cache-affinity hint, or to the per-client key when there is no modal host
-    // ({@link clientRoutingKey}). The distinction matters: a host-scoped request whose
-    // host isn't known yet must send NO key rather than the modal — the modal
-    // is the wrong guess for a SPECIFIC session, so it would route to a replica
-    // that doesn't hold the tunnel; a keyless miss re-addresses instead. Only
-    // an unscoped route (list / updates) may ride the modal — a JSON request
-    // whose target host is in the body may not (see {@link isBodyHostKeyedRequest}):
-    // it is keyable ONLY by that body host_id (a managed create with none stays
-    // unkeyed).
+  // Sent without a key because its host's tunnels connected without one.
+  let unkeyed = false;
+  const callerKeyed = headers.has(SLICE_KEY_HEADER);
+  if (!callerKeyed && isHostRoutingEnabled()) {
+    // Key by the request's OWN host when it needs that host's replica: a
+    // host-scoped URL, or a create/import/fork naming its host in the body (see
+    // {@link isBodyHostKeyedRequest}). A host demoted to keyless goes unkeyed.
+    // Project writes share the `/updates` stream's replica, which delivers their
+    // change events. Everything else, including a host-scoped request whose host
+    // is unknown, carries this client's key; a wrong_replica miss then resolves
+    // the session's host and re-addresses.
     const scope = hostScopeForUrl(url);
     if (isManagedForkRequest(url, init?.body)) {
       derivedHostId = hostIdFromBody(url, init?.body);
@@ -605,11 +606,8 @@ export async function authenticatedFetch(
       derivedHostId = scope.hostId;
     } else if (isBodyHostKeyedRequest(url, init?.body)) {
       derivedHostId = hostIdFromBody(url, init?.body);
-    } else {
-      derivedHostId = modalHostId();
-      // The client key names no host, so it is not stamped as one: a wrong_replica
-      // reply is returned as for an unkeyed request, and nothing is demoted.
-      if (derivedHostId === null) headers.set(SLICE_KEY_HEADER, clientRoutingKey());
+    } else if (isProjectWrite(url, init?.method)) {
+      headers.set(SLICE_KEY_HEADER, updatesRoutingKey());
     }
     // Skip keying a host we've already PROVEN routes keyless (its tunnels dialed
     // in without a key → they live on the default replica). This spares the long
@@ -620,6 +618,10 @@ export async function authenticatedFetch(
     if (derivedHostId && (!isDatabricksWorkspace() || !isHostKeyless(derivedHostId))) {
       headers.set(SLICE_KEY_HEADER, derivedHostId);
       stampedSliceKey = true;
+    } else if (derivedHostId) {
+      unkeyed = true;
+    } else if (!headers.has(SLICE_KEY_HEADER)) {
+      headers.set(SLICE_KEY_HEADER, clientRoutingKey());
     }
   }
   // Bypass the browser HTTP cache for all API calls. Session
@@ -628,11 +630,15 @@ export async function authenticatedFetch(
   // URL change. Without no-store the browser may serve a stale
   // cached response — e.g. one captured before an elicitation was
   // published — causing the ApprovalCard to vanish on navigate-back.
-  let res = await hostFetch(url, {
-    ...init,
-    headers,
-    cache: "no-store",
-  });
+  let res = await hostFetch(
+    url,
+    {
+      ...init,
+      headers,
+      cache: "no-store",
+    },
+    { unkeyed },
+  );
 
   // Wrong-replica fallback: a keyed request that reached the wrong replica comes
   // back 400 wrong_replica. Re-address ONCE with the key removed so it routes by
@@ -646,11 +652,15 @@ export async function authenticatedFetch(
     // (callers/tests hold it by reference).
     const retryHeaders = new Headers(headers);
     retryHeaders.delete(SLICE_KEY_HEADER);
-    res = await hostFetch(url, {
-      ...init,
-      headers: retryHeaders,
-      cache: "no-store",
-    });
+    res = await hostFetch(
+      url,
+      {
+        ...init,
+        headers: retryHeaders,
+        cache: "no-store",
+      },
+      { unkeyed: true },
+    );
     // Only a successful keyless retry proves this host uses the default replica.
     // Failed retries must preserve the host key for subsequent requests.
     if (derivedHostId && res.ok) {
@@ -658,7 +668,7 @@ export async function authenticatedFetch(
     }
   } else if (
     derivedHostId === null &&
-    !headers.has(SLICE_KEY_HEADER) &&
+    !callerKeyed &&
     isDatabricksWorkspace() &&
     (await _isWrongReplica(res))
   ) {
@@ -684,7 +694,7 @@ export async function authenticatedFetch(
   } else if (
     isDatabricksWorkspace() &&
     derivedHostId &&
-    !stampedSliceKey &&
+    unkeyed &&
     isHostKeyless(derivedHostId) &&
     (await _isWrongReplica(res))
   ) {

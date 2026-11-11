@@ -8,7 +8,7 @@
 import { useEffect, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { withBasePath } from "@/lib/basePath";
-import { isDatabricksWorkspace, resolveMediaUrl } from "@/lib/host";
+import { isDatabricksWorkspace, resolveMediaUrl, withRoutingKeyParam } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
 import { getSessionHost, isHostKeyless } from "@/lib/sessionHost";
 import { readVideoResponse } from "@/lib/videoFetch";
@@ -69,8 +69,8 @@ function workspaceFileUrl(
  *
  * A `<video src>` load sends no request headers, so the session host's routing
  * key rides `?omnigent_slice_key=`, as the terminal attach WebSocket does. A
- * host already proven to route keyless is left unkeyed, matching
- * `authenticatedFetch`.
+ * host already proven to route keyless is left unkeyed and a hostless session
+ * carries the client's own key, matching `authenticatedFetch`.
  *
  * :param conversationId: The session/conversation ID, e.g. ``"sess_abc123"``.
  * :param path: Workspace-relative or host-absolute file path.
@@ -79,7 +79,8 @@ export function workspaceFileMediaUrl(conversationId: string, path: string): str
   const query: Record<string, string> = { download: "true" };
   const hostId = getSessionHost(conversationId);
   if (hostId && !isHostKeyless(hostId)) query.omnigent_slice_key = hostId;
-  return resolveMediaUrl(workspaceFileUrl(conversationId, path, query));
+  const url = workspaceFileUrl(conversationId, path, query);
+  return resolveMediaUrl(hostId ? url : withRoutingKeyParam(url));
 }
 
 /**

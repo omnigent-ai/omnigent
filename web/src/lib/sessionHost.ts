@@ -12,7 +12,9 @@
 // this decoupled from the query-key convention and needs no QueryClient handle.
 // A session's host_id is fixed for its lifetime, so the recorded value can't go
 // stale. Returns `null` when the session hasn't been loaded yet or is a hostless
-// local session, leaving routing to the default.
+// local session; such requests carry the client's own key (`routingKey.ts`).
+
+import { clientRoutingKey } from "./routingKey";
 
 const _sessionHosts = new Map<string, string>();
 const _hostChangeListeners = new Set<() => void>();
@@ -233,11 +235,19 @@ export function resolveModalHost(): void {
 
 /**
  * The frozen modal host_id, or `null` before it is resolved or when no host
- * could be picked (callers then use the per-client key from `routingKey.ts`).
- * Read by `authenticatedFetch` (host-less routes) and `buildUpdatesUrl`.
+ * could be picked. Read through {@link updatesRoutingKey}.
  */
 export function modalHostId(): string | null {
   return _modalHostId;
+}
+
+/**
+ * Slice key for the `/updates` stream and the project writes it reports. The
+ * server delivers those events only within one replica, so they share the modal
+ * host's replica, or this client's key when there is no modal host.
+ */
+export function updatesRoutingKey(): string {
+  return _modalHostId ?? clientRoutingKey();
 }
 
 /**
