@@ -138,7 +138,7 @@ describe("VideoPlayer", () => {
     expect(video.pause).toHaveBeenCalledOnce();
     expect(container.querySelector("video")).toBeNull();
     expect(screen.getByRole("status")).toHaveTextContent(
-      "Unable to play this video. Download it to watch locally.",
+      "This video couldn't be played. Download the file to open it in another app.",
     );
     fireEvent.click(screen.getByRole("button", { name: "Download video: Feature demo" }));
     expect(downloadWorkspaceFile).toHaveBeenCalledWith("sess_1", "demo.webm");
