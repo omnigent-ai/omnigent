@@ -472,7 +472,7 @@ export function PoliciesPage() {
     );
   }
 
-  if (!isSingleUser && (meIsAdmin === false || policiesForbidden)) {
+  if (policiesForbidden || (!isSingleUser && meIsAdmin === false)) {
     return (
       <PageScroll
         maxWidthClassName="max-w-4xl"

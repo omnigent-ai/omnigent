@@ -143,6 +143,15 @@ describe("PoliciesPage gating", () => {
     // so the section is hidden behind the same message rather than rendering
     // an empty page + Add button or a raw error.
     setPoliciesForbidden();
+    const { unmount } = renderPage();
+    expect(
+      await screen.findByText("You don't have permission to manage global policies."),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add policy" })).not.toBeInTheDocument();
+    unmount();
+
+    // Single-user mode skips the admin probe, so the 403 alone must hide the section.
+    serverInfoMocks.singleUser = true;
     renderPage();
     expect(
       await screen.findByText("You don't have permission to manage global policies."),
