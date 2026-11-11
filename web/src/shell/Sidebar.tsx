@@ -302,6 +302,7 @@ import {
   sessionsListAcceptsDrop,
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
+import { isRowFullyVisible } from "./sidebarRowVisibility";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { useHarnessLabels } from "@/lib/agentLabels";
 import {
@@ -5346,17 +5347,6 @@ function SessionTooltipContent({
 // Max gap between the first click and the dblclick of one double-click.
 // Browsers pair clicks within ~500ms; the margin absorbs event-loop delay.
 const DOUBLE_CLICK_PAIR_WINDOW_MS = 750;
-
-// Whether the row lies entirely inside its nearest scrolling ancestor (or the viewport).
-function isRowFullyVisible(row: HTMLElement): boolean {
-  let scroller = row.parentElement;
-  while (scroller && !/auto|scroll/.test(getComputedStyle(scroller).overflowY)) {
-    scroller = scroller.parentElement;
-  }
-  const bounds = scroller?.getBoundingClientRect() ?? { top: 0, bottom: window.innerHeight };
-  const rect = row.getBoundingClientRect();
-  return rect.top >= bounds.top && rect.bottom <= bounds.bottom;
-}
 
 function ConversationRowImpl({
   conversation,

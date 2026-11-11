@@ -4962,9 +4962,9 @@ def test_materialize_attributes_effective_gateway_without_copying_credentials(
     assert providers == tomllib.loads(resolved_config)["model_providers"]
 
 
-@pytest.mark.parametrize("existing_name", [None, "My Gateway", ""])
+@pytest.mark.parametrize("existing_name", [None, "My Gateway", "", " \t", 7, False])
 def test_materialize_inherited_gateway_name_preserves_explicit_values(
-    tmp_path: Path, existing_name: str | None
+    tmp_path: Path, existing_name: str | int | bool | None
 ) -> None:
     import tomllib
 
@@ -4974,12 +4974,15 @@ def test_materialize_inherited_gateway_name_preserves_explicit_values(
     private_home.mkdir()
     config_path = private_home / "config.toml"
     config_path.write_text(
+        'model_provider = "Selected"\n'
+        '[model_providers.Selected]\nname = "Selected"\n'
+        'base_url = "https://other.example.test/v1"\n'
         "[model_providers.Managed]\nrequest_max_retries = 2\n"
         + (f"name = {json.dumps(existing_name)}\n" if existing_name is not None else "")
     )
     materialize_codex_provider_config(
         private_home,
-        [],
+        ['model_provider="Selected"'],
         effective_providers={
             "Managed": {
                 "name": "Managed Gateway",
@@ -4988,7 +4991,12 @@ def test_materialize_inherited_gateway_name_preserves_explicit_values(
         },
     )
     provider = tomllib.loads(config_path.read_text())["model_providers"]["Managed"]
-    assert provider["name"] == ("Managed Gateway" if existing_name is None else existing_name)
+    expected_name = (
+        "Managed Gateway"
+        if existing_name is None or (isinstance(existing_name, str) and not existing_name.strip())
+        else existing_name
+    )
+    assert provider["name"] == expected_name
     assert "base_url" not in provider
 
 

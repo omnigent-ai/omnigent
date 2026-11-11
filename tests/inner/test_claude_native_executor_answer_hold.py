@@ -248,10 +248,9 @@ async def test_the_hold_ends_with_the_refusal_when_nobody_answers(
     "refusal",
     [
         True,
-        ClaudeInputBoxOccupied(_SHELL_MODE, surface="the detailed transcript"),
         ClaudeInputBoxOccupied(_SHELL_MODE, surface="the side-chat history"),
     ],
-    ids=["question", "transcript", "side-chat-history"],
+    ids=["question", "side-chat-history"],
 )
 async def test_stopping_a_held_turn_keeps_the_pane(
     pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: bool | Exception
@@ -403,7 +402,6 @@ async def test_stopping_a_turn_held_for_the_input_box_keeps_the_pane(
     [
         "shell mode",
         "the prompt-history search",
-        "the detailed transcript",
         "the side-chat history",
     ],
 )

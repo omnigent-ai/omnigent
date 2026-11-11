@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import queue
-import select
 import shlex
 import shutil
 import socket
@@ -29,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import pairwise
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
-from typing import Any, TextIO
+from typing import Any
 from unittest.mock import Mock
 
 import httpx
@@ -88,6 +87,8 @@ from omnigent.inner.datamodel import (
 from omnigent.inner.native_attachments import materialize_attachment
 from omnigent.native import native_cost_popup, policy_allow_cache
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
+from tests._helpers.live_server import terminate_process
+from tests._helpers.stdio_jsonrpc import read_json_line, write_json_line
 
 
 @pytest.fixture(autouse=True)
@@ -4324,6 +4325,8 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     settings = _load_invocation_settings(args)
     prompt_hooks = settings["hooks"]["UserPromptSubmit"][0]["hooks"]
     assert any("framework-context" in hook["command"] for hook in prompt_hooks)
+    startup_hooks = settings["hooks"]["SessionStart"][0]["hooks"]
+    assert any("startup-context" in hook["command"] for hook in startup_hooks)
     assert (
         "omnigent.harnesses.claude_native.hook"
         in settings["hooks"]["Stop"][0]["hooks"][0]["command"]
@@ -4386,7 +4389,7 @@ def test_generated_claude_subprocesses_pin_runner_tmpdir(
         for hook in entry["hooks"]
         if "/venv/bin/python" in hook["command"]
     ]
-    assert len(python_commands) == 19
+    assert len(python_commands) == 20
     expected_tmpdir = f"env TMPDIR={shlex.quote(str(runner_tmpdir))}"
     assert all(expected_tmpdir in command for command in python_commands)
 
@@ -4428,6 +4431,42 @@ def test_framework_context_hook_consumes_hidden_notice(
     output = json.loads(capsys.readouterr().out)
     assert output["hookSpecificOutput"]["additionalContext"] == "downscaled"
     assert not path.exists()
+
+
+def test_session_start_hook_preserves_generated_startup_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    startup_context = "Follow the authored role.\n\nKeep image guidance."
+    augment_claude_args(
+        ("--append-system-prompt-file", "profile.md"),
+        bridge_dir=tmp_path,
+        append_system_prompt=startup_context,
+    )
+    notice = tmp_path / claude_native_bridge.CLAUDE_FRAMEWORK_CONTEXT_FILE
+    notice.write_text("One-shot notice", encoding="utf-8")
+    for source in ("startup", "resume", "clear", "compact"):
+        monkeypatch.setattr(
+            sys,
+            "stdin",
+            io.StringIO(json.dumps({"hook_event_name": "SessionStart", "source": source})),
+        )
+        assert claude_native_hook.main(["startup-context", "--bridge-dir", str(tmp_path)]) == 0
+        assert json.loads(capsys.readouterr().out) == {
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": startup_context,
+            }
+        }
+        assert (
+            tmp_path / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
+        ).read_text() == startup_context
+        assert notice.read_text() == "One-shot notice"
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO('{"hook_event_name":"UserPromptSubmit"}'))
+    assert claude_native_hook.main(["--bridge-dir", str(tmp_path)]) == 0
+    assert capsys.readouterr().out == ""
 
 
 @pytest.mark.parametrize(
@@ -4791,18 +4830,8 @@ _FRAMEWORK_PROMPT = "Keep framework metadata separate."
             ("--append-system-prompt=Earlier.", "--append-system-prompt="),
             ("--append-system-prompt=Earlier.", f"--append-system-prompt={_FRAMEWORK_PROMPT}"),
         ),
-        (("--append-system-prompt-file", "profile.md"), None),
-        (("--append-system-prompt-file=profile.md",), None),
-        (
-            ("--append-system-prompt-file", "profile.md", "--append-system-prompt", "Review."),
-            (
-                "--append-system-prompt-file",
-                "profile.md",
-                "--append-system-prompt",
-                f"{_FRAMEWORK_PROMPT}\n\nReview.",
-            ),
-        ),
         (("--", "--append-system-prompt=Positional."), None),
+        (("--", "--append-system-prompt-file=missing.md"), None),
     ],
     ids=[
         "no-user-prompt",
@@ -4811,40 +4840,24 @@ _FRAMEWORK_PROMPT = "Keep framework metadata separate."
         "repeated-flags-last-wins",
         "final-empty-value-clears",
         "final-empty-joined-value-clears",
-        "caller-file-separate-value",
-        "caller-file-joined-value",
-        "caller-file-and-prompt",
         "after-end-of-options",
+        "file-after-end-of-options",
     ],
 )
 def test_augment_claude_args_appends_caller_system_prompt(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     user_args: tuple[str, ...],
     merged_args: tuple[str, ...] | None,
 ) -> None:
     """Omnigent's prompt joins the caller's last prompt value, or is added when there is none."""
-    # Claude reads a caller's prompt file itself, so Omnigent must never open it.
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "profile.md").write_text("Reviewer profile.\n", encoding="utf-8")
-
-    def refuse_caller_prompt_file(real_open: Callable[..., Any]) -> Callable[..., Any]:
-        def guarded_open(file: Any, *args: Any, **kwargs: Any) -> Any:
-            if isinstance(file, str | os.PathLike) and os.path.basename(file) == "profile.md":
-                raise AssertionError("Omnigent opened the caller's prompt file")
-            return real_open(file, *args, **kwargs)
-
-        return guarded_open
-
-    monkeypatch.setattr("builtins.open", refuse_caller_prompt_file(io.open))
-    monkeypatch.setattr(io, "open", refuse_caller_prompt_file(io.open))
-    monkeypatch.setattr(os, "open", refuse_caller_prompt_file(os.open))
     omnigent_args = augment_claude_args(
         (),
         bridge_dir=tmp_path,
         python_executable="/venv/bin/python",
         append_system_prompt=_FRAMEWORK_PROMPT,
     )
+    startup_context = tmp_path / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
+    startup_context.write_text("Stale startup context", encoding="utf-8")
 
     args = augment_claude_args(
         user_args,
@@ -4852,6 +4865,7 @@ def test_augment_claude_args_appends_caller_system_prompt(
         python_executable="/venv/bin/python",
         append_system_prompt=_FRAMEWORK_PROMPT,
     )
+    assert not startup_context.exists()
 
     prompt_index = omnigent_args.index("--append-system-prompt")
     assert omnigent_args.count("--append-system-prompt") == 1
@@ -4862,6 +4876,90 @@ def test_augment_claude_args_appends_caller_system_prompt(
         # The caller's prompt is sent once, so the launch command does not grow by its size.
         del omnigent_args[prompt_index : prompt_index + 2]
         assert args == [*merged_args, *omnigent_args]
+
+
+@pytest.mark.parametrize(
+    "user_args",
+    [
+        ("--append-system-prompt-file", "profile.md"),
+        ("--append-system-prompt-file=profile.md",),
+        ("--append-system-prompt-file", "profile.md", "--append-system-prompt", "Review."),
+        (
+            "--append-system-prompt",
+            "Earlier.",
+            "--append-system-prompt-file=missing.md",
+            "--append-system-prompt-file",
+            "profile.md",
+            "--append-system-prompt=Later.",
+        ),
+        (
+            "--append-system-prompt=Earlier.",
+            "--append-system-prompt-file=profile.md",
+            "--append-system-prompt=",
+        ),
+    ],
+    ids=["file-separate", "file-joined", "file-and-inline", "last-values-win", "empty-inline"],
+)
+def test_augment_claude_args_leaves_caller_prompt_files_to_claude(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, user_args: tuple[str, ...]
+) -> None:
+    """Only generated instructions enter the bridge; caller files stay unopened."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "profile.md"
+    file_text = "Reviewer profile.\n"
+    source.write_text(file_text, encoding="utf-8")
+    bridge_dir = tmp_path / "bridge"
+    omnigent_args = augment_claude_args(
+        (), bridge_dir=bridge_dir, workspace=workspace, python_executable="/venv/bin/python"
+    )
+
+    def refuse_caller_prompt_file(real_open: Callable[..., Any]) -> Callable[..., Any]:
+        def guarded_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(file, str | os.PathLike) and os.path.basename(file) in (
+                "profile.md",
+                "missing.md",
+            ):
+                raise AssertionError("Omnigent opened the caller's prompt file")
+            return real_open(file, *args, **kwargs)
+
+        return guarded_open
+
+    monkeypatch.setattr("builtins.open", refuse_caller_prompt_file(io.open))
+    monkeypatch.setattr(io, "open", refuse_caller_prompt_file(io.open))
+    monkeypatch.setattr(os, "open", refuse_caller_prompt_file(os.open))
+
+    args = augment_claude_args(
+        ("--resume", "session-id", *user_args),
+        bridge_dir=bridge_dir,
+        workspace=workspace,
+        python_executable="/venv/bin/python",
+        append_system_prompt=_FRAMEWORK_PROMPT,
+    )
+
+    assert args == ["--resume", "session-id", *user_args, *omnigent_args]
+    startup_context = bridge_dir / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
+    assert startup_context.read_text(encoding="utf-8") == _FRAMEWORK_PROMPT
+    if os.name != "nt":
+        assert startup_context.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("file_contents", [None, b"\xff"], ids=["missing", "invalid-utf8"])
+def test_augment_claude_args_delegates_prompt_file_errors_to_claude(
+    tmp_path: Path, file_contents: bytes | None
+) -> None:
+    if file_contents is not None:
+        (tmp_path / "profile.md").write_bytes(file_contents)
+
+    args = augment_claude_args(
+        ("--append-system-prompt-file", "profile.md"),
+        bridge_dir=tmp_path / "bridge",
+        workspace=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt=_FRAMEWORK_PROMPT,
+    )
+    assert args[:2] == ["--append-system-prompt-file", "profile.md"]
+    assert "--append-system-prompt" not in args
 
 
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
@@ -4882,15 +4980,22 @@ def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None
     ]
 
 
-def test_augment_claude_args_omits_unsupplied_system_prompt(tmp_path: Path) -> None:
+@pytest.mark.parametrize("user_args", [(), ("--append-system-prompt-file", "missing.md")])
+def test_augment_claude_args_omits_unsupplied_system_prompt(
+    tmp_path: Path, user_args: tuple[str, ...]
+) -> None:
     """The bridge does not invent framework policy on its own."""
+    startup_context = tmp_path / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
+    startup_context.write_text("Stale startup context", encoding="utf-8")
     args = augment_claude_args(
-        (),
+        user_args,
         bridge_dir=tmp_path,
         python_executable="/venv/bin/python",
     )
 
     assert "--append-system-prompt" not in args
+    assert args[: len(user_args)] == list(user_args)
+    assert not startup_context.exists()
 
 
 def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> None:
@@ -5153,7 +5258,7 @@ def test_mcp_server_initialize_omits_blocked_channel_capability(
             + "\n"
         )
         proc.stdin.flush()
-        initialize = _read_json_line(proc.stdout, timeout_s=5.0)
+        initialize = read_json_line(proc.stdout, timeout_s=5.0)
         assert initialize["id"] == 1
         capabilities = initialize["result"]["capabilities"]
         # Tools/list_changed is still needed for the active-turn relay.
@@ -5164,12 +5269,7 @@ def test_mcp_server_initialize_omits_blocked_channel_capability(
             "experimental", {}
         )
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5.0)
+        terminate_process(proc, timeout_s=5)
 
 
 def test_write_tmux_target_persists_socket_and_target(tmp_path: Path) -> None:
@@ -7674,6 +7774,34 @@ def test_inject_slash_command_raises_when_tmux_target_never_published(
 
 
 @pytest.mark.parametrize(
+    "advertisement",
+    [None, "{", "{}", '{"token":"token"}', '{"token":"token","socket":"/test.sock"}'],
+    ids=["missing", "malformed", "empty", "incomplete", "ready"],
+)
+def test_post_tools_changed_zero_timeout_probes_once_without_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, advertisement: str | None
+) -> None:
+    if advertisement is not None:
+        (tmp_path / "server.json").write_text(advertisement)
+    read_json = Mock(wraps=claude_native_bridge._read_json_file)
+    connection = Mock()
+    connection.getresponse.return_value.status = 200
+    connect = Mock(return_value=connection)
+    monkeypatch.setattr(claude_native_bridge, "_read_json_file", read_json)
+    monkeypatch.setattr(claude_native_bridge, "_control_connection", connect)
+
+    if advertisement is not None and "socket" in advertisement:
+        post_tools_changed(tmp_path, timeout_s=0.0)
+        connection.request.assert_called_once()
+        connection.close.assert_called_once()
+    else:
+        with pytest.raises(claude_native_bridge.ClaudeBridgeNotReady):
+            post_tools_changed(tmp_path, timeout_s=0.0)
+        connect.assert_not_called()
+    read_json.assert_called_once_with(tmp_path / "server.json")
+
+
+@pytest.mark.parametrize(
     "transport_error",
     [
         ConnectionRefusedError("bridge unavailable"),
@@ -7844,11 +7972,11 @@ async def test_channel_server_relays_active_omnigent_tools(
     try:
         assert proc.stdin is not None
         assert proc.stdout is not None
-        _write_json_line(
+        write_json_line(
             proc.stdin,
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         )
-        initialize = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        initialize = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=5.0)
         assert initialize["id"] == 1
 
         relay = start_tool_relay(
@@ -7867,14 +7995,14 @@ async def test_channel_server_relays_active_omnigent_tools(
             loop=asyncio.get_running_loop(),
         )
         post_tools_changed(bridge_dir, cancelled=threading.Event() if cancellable else None)
-        changed = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        changed = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=5.0)
         assert changed["method"] == "notifications/tools/list_changed"
 
-        _write_json_line(
+        write_json_line(
             proc.stdin,
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
         )
-        listed = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        listed = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=5.0)
         listed_tools = listed["result"]["tools"]
         custom_tools = [tool for tool in listed_tools if tool["name"] == "sys_custom"]
         assert custom_tools == [
@@ -7888,7 +8016,7 @@ async def test_channel_server_relays_active_omnigent_tools(
             }
         ]
 
-        _write_json_line(
+        write_json_line(
             proc.stdin,
             {
                 "jsonrpc": "2.0",
@@ -7900,7 +8028,7 @@ async def test_channel_server_relays_active_omnigent_tools(
                 },
             },
         )
-        tool_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        tool_result = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=5.0)
         assert tool_result["id"] == 3
         if result_kind == "text":
             text = tool_result["result"]["content"][0]["text"]
@@ -7914,12 +8042,7 @@ async def test_channel_server_relays_active_omnigent_tools(
     finally:
         if relay is not None:
             relay.close()
-        proc.terminate()
-        try:
-            proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5.0)
+        terminate_process(proc, timeout_s=5)
 
 
 def test_call_relay_tool_returns_mcp_error_on_read_timeout(
@@ -8144,17 +8267,17 @@ async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
     try:
         assert proc.stdin is not None
         assert proc.stdout is not None
-        _write_json_line(
+        write_json_line(
             proc.stdin,
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         )
-        initialize = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        initialize = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=5.0)
         assert initialize["id"] == 1
 
         # Call the flaky relay tool. Decoding the undecodable response raises
         # UnicodeDecodeError, which escapes _call_relay_tool's except OSError
         # and is caught by the loop's per-request guard.
-        _write_json_line(
+        write_json_line(
             proc.stdin,
             {
                 "jsonrpc": "2.0",
@@ -8163,7 +8286,7 @@ async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
                 "params": {"name": "sys_flaky", "arguments": {}},
             },
         )
-        call_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        call_result = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=5.0)
         assert call_result["id"] == 2
         # The guard reports the uncaught exception as a JSON-RPC -32603
         # ("Internal error") response — NOT a normal MCP error result. This is
@@ -8175,23 +8298,18 @@ async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
         # The decisive assertion: the server is STILL ALIVE and answers the
         # next request. Before the per-request loop guard, the exception above
         # would have exited the process and this read would time out.
-        _write_json_line(
+        write_json_line(
             proc.stdin,
             {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}},
         )
-        listed = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        listed = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=5.0)
         assert listed["id"] == 3
         assert "tools" in listed["result"]
     finally:
         httpd.shutdown()
         httpd.server_close()
         server_thread.join(timeout=5.0)
-        proc.terminate()
-        try:
-            proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5.0)
+        terminate_process(proc, timeout_s=5)
 
 
 @pytest.mark.parametrize("concurrent_method", ["ping", "tools/call"])
@@ -8812,43 +8930,6 @@ async def test_relay_close_keeps_advertisement_owned_by_newer_relay(
             old_relay.close()
         if new_relay is not None:
             new_relay.close()
-
-
-def _write_json_line(handle: TextIO, payload: dict[str, object]) -> None:
-    """
-    Write one JSON-RPC line to a subprocess stdin stream.
-
-    :param handle: Text stdin handle returned by
-        :class:`subprocess.Popen`.
-    :param payload: JSON-compatible object to write.
-    :returns: None.
-    """
-    handle.write(json.dumps(payload) + "\n")
-    handle.flush()
-
-
-def _read_json_line(handle: TextIO, *, timeout_s: float) -> dict[str, object]:
-    """
-    Read one JSON line from a subprocess stdout stream.
-
-    :param handle: Text stdout handle returned by
-        :class:`subprocess.Popen`.
-    :param timeout_s: Seconds to wait, e.g. ``5.0``.
-    :returns: Parsed JSON object.
-    :raises TimeoutError: If no line is available before the
-        timeout.
-    """
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        ready, _write, _error = select.select([handle], [], [], 0.05)
-        if not ready:
-            continue
-        line = handle.readline()
-        if line:
-            payload = json.loads(line)
-            assert isinstance(payload, dict)
-            return payload
-    raise TimeoutError("subprocess did not emit a JSON line")
 
 
 def test_usage_from_transcript_entry_sums_context_tokens() -> None:
@@ -12548,6 +12629,15 @@ _TASK_DETAILS_PANE = """\
   ← to go back · Esc/Enter/Space to close · x to stop
 """
 
+_DETAILED_TRANSCRIPT_PANE = """\
+● The checks passed.
+────────────────────────────────────────────────────────────────────────────────
+  Showing detailed transcript · ctrl+o to toggle · ? for shortcuts          verbose
+"""
+_WRAPPED_DETAILED_TRANSCRIPT_PANE = _DETAILED_TRANSCRIPT_PANE.replace(
+    "ctrl+o to toggle", "ctrl+o to\n  toggle"
+)
+
 # A sliver-height pane holding a multi-line draft: Claude Code renders the
 # box's opening rule and the draft's first row, then runs out of screen —
 # the closing rule never makes it on. The composer is live, so requiring
@@ -12569,23 +12659,11 @@ _SHORTCUTS_PANEL_PANE = """\
   / for commands          shift + tab to auto-accept edits
 """
 
-_DETAILED_TRANSCRIPT_PANE = """\
-⏺ The investigation is complete.
-✻ Finished for 1m 37s
-─────────────────────────────────────────────────────────────────────────────
-  Showing detailed transcript · ctrl+o to toggle · ? for shortcuts      verbose
-"""
 _CLIPPED_SIDE_CHAT_HISTORY_PANE = """\
       The earlier answer is still visible here.
     ⇧←/→ to browse · c to copy · f to fork · x to clear history · Esc to close
 """
-_READ_ONLY_VIEWER_PANES = [
-    pytest.param(_DETAILED_TRANSCRIPT_PANE, "the detailed transcript", id="transcript"),
-    pytest.param(
-        _DETAILED_TRANSCRIPT_PANE.replace("ctrl+o to toggle", "ctrl+o to\ntoggle"),
-        "the detailed transcript",
-        id="wrapped-transcript",
-    ),
+_CLIPPED_SIDE_CHAT_HISTORY_PANES = [
     pytest.param(
         _CLIPPED_SIDE_CHAT_HISTORY_PANE, "the side-chat history", id="clipped-side-chat-history"
     ),
@@ -12597,8 +12675,8 @@ _READ_ONLY_VIEWER_PANES = [
 ]
 
 
-@pytest.mark.parametrize(("pane", "surface"), _READ_ONLY_VIEWER_PANES)
-def test_read_only_viewers_occupy_the_input_until_the_person_closes_them(
+@pytest.mark.parametrize(("pane", "surface"), _CLIPPED_SIDE_CHAT_HISTORY_PANES)
+def test_clipped_side_chat_history_occupies_the_input_until_the_person_closes_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pane: str, surface: str
 ) -> None:
     bridge_dir = _picker_bridge_dir(tmp_path)
@@ -12610,9 +12688,9 @@ def test_read_only_viewers_occupy_the_input_until_the_person_closes_them(
     assert _claude_prompt_rendered(pane + _READY_PANE)
 
 
-@pytest.mark.parametrize(("pane", "surface"), _READ_ONLY_VIEWER_PANES)
+@pytest.mark.parametrize(("pane", "surface"), _CLIPPED_SIDE_CHAT_HISTORY_PANES)
 @pytest.mark.parametrize("operation", ["message", "settings"])
-def test_a_read_only_viewer_receives_no_injected_keys(
+def test_clipped_side_chat_history_receives_no_injected_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pane: str, surface: str, operation: str
 ) -> None:
     bridge_dir = _picker_bridge_dir(tmp_path)
@@ -12634,8 +12712,8 @@ def test_a_read_only_viewer_receives_no_injected_keys(
     assert sends == []
 
 
-@pytest.mark.parametrize(("pane", "surface"), _READ_ONLY_VIEWER_PANES)
-def test_a_read_only_viewer_opened_during_readiness_holds_the_input(
+@pytest.mark.parametrize(("pane", "surface"), _CLIPPED_SIDE_CHAT_HISTORY_PANES)
+def test_clipped_side_chat_history_opened_during_readiness_holds_the_input(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pane: str, surface: str
 ) -> None:
     bridge_dir = _picker_bridge_dir(tmp_path)
@@ -12654,6 +12732,19 @@ def test_a_read_only_viewer_opened_during_readiness_holds_the_input(
 
     assert refused.value.surface == surface
     assert sends == []
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        "▔" * 80 + "\n" + _CLIPPED_SIDE_CHAT_HISTORY_PANE,
+        _CLIPPED_SIDE_CHAT_HISTORY_PANE.replace("x to clear history · ", ""),
+        _CLIPPED_SIDE_CHAT_HISTORY_PANE + "\n──────────────────────────────\nStarting Claude…",
+    ],
+    ids=["complete-overlay", "incomplete-footer", "old-footer"],
+)
+def test_other_panes_are_not_held_as_clipped_side_chat_history(pane: str) -> None:
+    assert _occupying_surface(pane) != claude_native_bridge._SIDE_CHAT_HISTORY_SURFACE
 
 
 def _picker_bridge_dir(tmp_path: Path) -> Path:
@@ -13986,6 +14077,9 @@ _WRAPPED_BTW_PANE = "\n".join(
         (_TASK_DETAILS_PANE, True),
         (_WRAPPED_BTW_PANE, False),
         (_WRAPPED_BTW_PANE, True),
+        (_DETAILED_TRANSCRIPT_PANE, False),
+        (_DETAILED_TRANSCRIPT_PANE, True),
+        (_WRAPPED_DETAILED_TRANSCRIPT_PANE, False),
     ],
     ids=[
         "reverse-search",
@@ -13999,6 +14093,9 @@ _WRAPPED_BTW_PANE = "\n".join(
         "task-details-after-preflight",
         "wrapped-quick-answer",
         "wrapped-quick-answer-after-preflight",
+        "detailed-transcript",
+        "detailed-transcript-after-preflight",
+        "wrapped-detailed-transcript",
     ],
 )
 def test_inject_user_message_restores_an_occupied_input_box_first(
@@ -14014,8 +14111,8 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     keystrokes do not become a chat message: the ctrl+r search filters on
     them and replays an old prompt on Enter, the rewind dialog commits a
     checkpoint restore, a settings panel changes a setting, and shell mode
-    hands the message to bash. The injection must Escape the surface first
-    (its own documented dismissal), restoring the empty input box, then
+    hands the message to bash. The injection must dismiss the surface first
+    with its documented key, restoring the empty input box, then
     deliver the message normally.
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
@@ -14032,14 +14129,15 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     captured: list[list[str]] = []
     first_capture = True
-    # The surface covers the pane until Escape dismisses it; afterwards
+    # The surface covers the pane until its dismissal key; afterwards
     # the fake behaves like the live input box (paste deposits the
     # draft, Enter clears it).
     tui = {"pane": occupied_pane}
+    dismiss_key = "C-o" if "Showing detailed transcript" in occupied_pane else "Escape"
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
-        Simulate a pane whose occupying surface closes on Escape.
+        Simulate a pane whose occupying surface closes on its documented key.
 
         :param cmd: Argv list passed to subprocess.run.
         :param kwargs: Subprocess kwargs (ignored).
@@ -14054,7 +14152,7 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
                 if after_preflight:
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
-        if cmd[-1] == "Escape":
+        if cmd[-1] == dismiss_key:
             tui["pane"] = _composer_pane()
         if "paste-buffer" in cmd:
             tui["pane"] = _composer_pane("restore my composer")
@@ -14067,12 +14165,65 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     inject_user_message(bridge_dir, content="restore my composer")
 
     tails = [cmd[-1] for cmd in captured]
-    # Escape (dismiss the surface) must precede every delivery keystroke.
-    assert tails[:3] == ["Escape", "Space", _CLEAR_ONE_ROW_COMPOSER], (
-        f"Expected the occupying surface to be Escaped before the clear; got {tails}."
+    # Dismissing the surface must precede every delivery keystroke.
+    assert tails[:3] == [dismiss_key, "Space", _CLEAR_ONE_ROW_COMPOSER], (
+        f"Expected the occupying surface to be dismissed before the clear; got {tails}."
     )
-    assert tails.count("Escape") == 1, f"One sighting, one Escape — got {tails.count('Escape')}."
+    assert tails.count(dismiss_key) == 1
+    if dismiss_key == "C-o":
+        assert "Escape" not in tails
     assert tails[-1] == "Enter"
+
+
+@pytest.mark.parametrize("operation", ["message", "settings"])
+@pytest.mark.parametrize("torn_after_toggle", [False, True])
+def test_a_stale_transcript_view_is_not_toggled_twice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    torn_after_toggle: bool,
+) -> None:
+    """A delayed redraw cannot turn a successful close into a second toggle."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    frames = [_DETAILED_TRANSCRIPT_PANE] * 2 + ([""] if torn_after_toggle else [])
+    sends = _fake_tmux(monkeypatch, frames)
+
+    with pytest.raises(claude_native_bridge.ClaudeInputBoxOccupied):
+        if operation == "message":
+            inject_user_message(bridge_dir, content="Follow up")
+        else:
+            claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert [args[-1] for args in sends] == ["C-o"]
+
+
+def test_a_single_transcript_view_frame_does_not_draw_a_toggle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sends = _fake_tmux(monkeypatch, [_DETAILED_TRANSCRIPT_PANE, _IDLE_PANE])
+
+    assert claude_native_bridge._restore_occupied_input("/tmp/example.sock", "main") is None
+    assert sends == []
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (_DETAILED_TRANSCRIPT_PANE, True),
+        (_WRAPPED_DETAILED_TRANSCRIPT_PANE, True),
+        (_DETAILED_TRANSCRIPT_PANE.removesuffix("          verbose\n"), True),
+        (_IDLE_PANE + _DETAILED_TRANSCRIPT_PANE, True),
+        (_DETAILED_TRANSCRIPT_PANE + _IDLE_PANE, False),
+        (_composer_pane(_DETAILED_TRANSCRIPT_PANE), False),
+        (_DETAILED_TRANSCRIPT_PANE.split("\n", 2)[2], False),
+    ],
+    ids=["view", "wrapped", "no-verbose", "old-composer", "quoted", "draft", "no-rule"],
+)
+def test_detailed_transcript_view_requires_its_live_footer(pane: str, expected: bool) -> None:
+    assert claude_native_bridge._detailed_transcript_view_shown(pane) is expected
+    if expected:
+        assert not _claude_prompt_rendered(pane)
+        assert not claude_native_bridge.claude_pane_input_box_shown(pane)
 
 
 def test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_clear(
@@ -14599,8 +14750,8 @@ def test_occupied_input_retries_stay_outside_the_double_escape_window(
 
 @pytest.mark.parametrize(
     "occupied_pane",
-    [_REVERSE_SEARCH_PANE, _WRAPPED_BTW_PANE],
-    ids=["search", "wrapped-quick-answer"],
+    [_REVERSE_SEARCH_PANE, _WRAPPED_BTW_PANE, _DETAILED_TRANSCRIPT_PANE],
+    ids=["search", "wrapped-quick-answer", "detailed-transcript"],
 )
 def test_inject_slash_command_restores_an_occupied_input_box_first(
     tmp_path: Path,
@@ -14631,7 +14782,7 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
     assert [args[-1] for args in sends] == [
-        "Escape",
+        "C-o" if occupied_pane == _DETAILED_TRANSCRIPT_PANE else "Escape",
         "Space",
         _CLEAR_ONE_ROW_COMPOSER,
         "/effort high",
@@ -16275,8 +16426,9 @@ async def _run_hook_command(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("has_startup_context", [False, True])
 async def test_lifecycle_hooks_record_through_the_relay_without_starting_python(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, has_startup_context: bool
 ) -> None:
     """The lifecycle hook posts to the relay with curl.
 
@@ -16295,6 +16447,10 @@ async def test_lifecycle_hooks_record_through_the_relay_without_starting_python(
         (bridge_dir / "bridge.json").write_text(
             json.dumps({"active_session_id": "conv_hook_eval"}), encoding="utf-8"
         )
+        if has_startup_context:
+            (bridge_dir / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE).write_text(
+                "Startup guidance", encoding="utf-8"
+            )
         lifecycle_hook = _unmatched_hook_command(
             settings, "UserPromptSubmit", "/hook/claude/event"
         )
@@ -16521,21 +16677,31 @@ async def test_relay_hook_failures_reach_the_sessions_hook_stderr_file(
     assert "omnigent claude hook: failed to record hook" in stderr_file.read_text()
 
 
-def test_framework_context_hook_starts_python_only_for_pending_context(tmp_path: Path) -> None:
-    """Without pending framework context the shell answers the prompt hook.
+@pytest.mark.parametrize("startup", [False, True], ids=["pending-notice", "startup"])
+def test_framework_context_hook_starts_python_only_for_pending_context(
+    tmp_path: Path, startup: bool
+) -> None:
+    """Without framework context the shell answers the hook.
 
-    Pending context still goes to the Python hook, which reads and removes it,
-    so Claude gets it once.
+    The terminal-side Python hook consumes prompt notices and retains startup
+    context for later SessionStart events.
     """
+    event_name = "SessionStart" if startup else "UserPromptSubmit"
+    subcommand = "startup-context" if startup else "framework-context"
+    filename = (
+        claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
+        if startup
+        else claude_native_bridge.CLAUDE_FRAMEWORK_CONTEXT_FILE
+    )
     fake_python, runs = _fake_hook_python(tmp_path)
     fake_settings = claude_native_bridge.build_hook_settings(
         tmp_path, python_executable=str(fake_python)
     )
-    fake_hook = _unmatched_hook_command(fake_settings, "UserPromptSubmit", "framework-context")
+    fake_hook = _unmatched_hook_command(fake_settings, event_name, subcommand)
     real_hook = _unmatched_hook_command(
-        claude_native_bridge.build_hook_settings(tmp_path), "UserPromptSubmit", "framework-context"
+        claude_native_bridge.build_hook_settings(tmp_path), event_name, subcommand
     )
-    payload = json.dumps({"hook_event_name": "UserPromptSubmit"})
+    payload = json.dumps({"hook_event_name": event_name})
 
     def run(command: str) -> str:
         result = subprocess.run(
@@ -16551,18 +16717,20 @@ def test_framework_context_hook_starts_python_only_for_pending_context(tmp_path:
 
     assert run(fake_hook) == ""
     assert not runs.exists()
-    (tmp_path / claude_native_bridge.CLAUDE_FRAMEWORK_CONTEXT_FILE).write_text(
-        "pending context", encoding="utf-8"
-    )
-    outputs = [run(real_hook), run(fake_hook)]
+    context_file = tmp_path / filename
+    context_file.write_text("generated context", encoding="utf-8")
+    outputs = [run(real_hook), run(real_hook)]
 
     assert json.loads(outputs[0]) == {
         "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": "pending context",
+            "hookEventName": event_name,
+            "additionalContext": "generated context",
         }
     }
-    assert outputs[1] == ""
+    assert outputs[1] == (outputs[0] if startup else "")
+    assert context_file.exists() == startup
+    context_file.unlink(missing_ok=True)
+    assert run(fake_hook) == ""
     assert not runs.exists()
 
 
@@ -17787,7 +17955,7 @@ async def test_relay_mcp_cancellation_releases_pending_approval(
     )
     try:
         assert proc.stdin is not None
-        _write_json_line(
+        write_json_line(
             proc.stdin,
             {
                 "jsonrpc": "2.0",
@@ -17798,7 +17966,7 @@ async def test_relay_mcp_cancellation_releases_pending_approval(
         )
         await asyncio.wait_for(waiting.wait(), 8)
         if stop == "notification":
-            _write_json_line(
+            write_json_line(
                 proc.stdin,
                 {
                     "jsonrpc": "2.0",
@@ -17817,22 +17985,17 @@ async def test_relay_mcp_cancellation_releases_pending_approval(
         assert not pending_approvals.resolve("elicit_cancel_relay", True)
         if stop == "notification":
             assert proc.stdout is not None
-            cancelled_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=3)
+            cancelled_result = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=3)
             assert cancelled_result["id"] == 51
             assert cancelled_result["result"]["isError"]
-            _write_json_line(proc.stdin, {"jsonrpc": "2.0", "id": 52, "method": "ping"})
-            ping_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=3)
+            write_json_line(proc.stdin, {"jsonrpc": "2.0", "id": 52, "method": "ping"})
+            ping_result = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=3)
             assert ping_result == {"jsonrpc": "2.0", "id": 52, "result": {}}
     finally:
         pending_approvals.resolve("elicit_cancel_relay", False)
         if stop != "relay_close":
             relay.close()
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
+        terminate_process(proc, timeout_s=5)
 
 
 @pytest.mark.asyncio
@@ -17929,3 +18092,62 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved)
         }
     else:
         assert settings_path.read_bytes() == original
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_a_read_only_pinned_tmpdir_still_allocates_bridges_elsewhere(tmp_path: Path) -> None:
+    """A runner whose ``TMPDIR`` exists but can't be written keeps tempfile's fallback."""
+    pinned = tmp_path / "read-only-tmp"
+    pinned.mkdir()
+    pinned.chmod(0o500)
+    probe = (
+        "from omnigent.harnesses.claude_native import bridge\n"
+        "print(bridge._TRUSTED_PARENT)\n"
+        "print(bridge.prepare_acp_mcp_bridge_dir())\n"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", probe],
+            env={**os.environ, "TMPDIR": str(pinned)},
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        )
+    finally:
+        pinned.chmod(0o700)
+    trusted_parent, bridge_dir = map(Path, completed.stdout.split())
+    assert trusted_parent != pinned
+    assert bridge_dir.is_relative_to(trusted_parent) and bridge_dir.is_dir()
+    shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_a_sandboxed_helper_accepts_the_bridge_under_its_read_only_pinned_tmpdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sandboxed relay may only read the ``TMPDIR`` its entry pins, so tempfile falls
+    back elsewhere; the runner's bridge under that pinned root must still validate."""
+    from omnigent._platform import stable_user_id
+    from omnigent.harnesses.claude_native import bridge
+
+    pinned = tmp_path / "runner-tmp"
+    bridge_dir = pinned / f"omnigent-{stable_user_id()}" / "acp-mcp" / "abc123"
+    bridge_dir.mkdir(parents=True, mode=0o700)
+    for directory in (bridge_dir.parent, bridge_dir.parent.parent):
+        directory.chmod(0o700)
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path / "sandbox-scratch")
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "sandbox-scratch" / "claude-native")
+    with pytest.raises(RuntimeError, match="not under an allowed bridge root"):
+        bridge._trusted_parent_for_bridge_dir(bridge_dir)
+
+    monkeypatch.setenv("TMPDIR", f"{pinned}/")
+    pinned.chmod(0o500)
+    try:
+        assert bridge._trusted_parent_for_bridge_dir(bridge_dir) == pinned
+        bridge._ensure_secure_dir(bridge_dir)
+        # Only the uid-scoped tree under it counts, not the whole pinned root.
+        with pytest.raises(RuntimeError, match="not under an allowed bridge root"):
+            bridge._trusted_parent_for_bridge_dir(pinned / "elsewhere")
+    finally:
+        pinned.chmod(0o700)

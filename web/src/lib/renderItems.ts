@@ -181,6 +181,8 @@ export type Bubble =
       awaitingAgent?: boolean;
       /** Pending input whose send request has not been answered for a while. */
       stillSending?: boolean;
+      /** Pending input the server accepted (its send request succeeded). */
+      accepted?: boolean;
       /** Saved startup message the server never delivered (the launch failed). */
       undelivered?: boolean;
       content: MessageContentBlock[];
@@ -2008,6 +2010,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       Boolean(a.pending) !== Boolean(b.pending) ||
       Boolean(a.awaitingAgent) !== Boolean(b.awaitingAgent) ||
       Boolean(a.stillSending) !== Boolean(b.stillSending) ||
+      Boolean(a.accepted) !== Boolean(b.accepted) ||
       Boolean(a.undelivered) !== Boolean(b.undelivered) ||
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
