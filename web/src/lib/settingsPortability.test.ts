@@ -18,6 +18,10 @@ import {
   useProjectFolderCollapse,
   useProjectFolderPageSize,
 } from "./projectFolderPaginationPreferences";
+import {
+  SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
+  useSessionRowQuickActions,
+} from "./sessionRowQuickActionsPreferences";
 import { applyImportedSettings, collectSettings } from "./settingsPortability";
 import {
   type SessionWorkspaceState,
@@ -189,4 +193,21 @@ it("carries project folder pagination through export and import and updates moun
     applyImportedSettings(exported);
   });
   expect(result.current).toEqual([false, 3]);
+});
+
+it("carries hidden session-row quick actions through export and import to a mounted sidebar", () => {
+  localStorage.setItem(SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY, "false");
+  const exported = collectSettings()!;
+  expect(exported.settings[SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY]).toBe("false");
+  const { result } = renderHook(() => useSessionRowQuickActions());
+  expect(result.current).toBe(false);
+
+  act(() => {
+    applyImportedSettings({ version: 1, settings: {} });
+  });
+  expect(result.current).toBe(true);
+  act(() => {
+    applyImportedSettings(exported);
+  });
+  expect(result.current).toBe(false);
 });
