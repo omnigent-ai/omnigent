@@ -277,6 +277,7 @@ from omnigent.util.reasoning_effort import (
 from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
 )
+from omnigent.util.uuid import normalize_uuid
 from omnigent.version import VERSION
 
 # Continues a claude-sdk session in a fresh session on ``/clear`` once the
@@ -4145,6 +4146,8 @@ def register_core_routes(
             _prune_session_read_state(session_id)
             # Stop asynchronously after the archive commits and Undo grace elapses.
             # The deferred archived-flag check keeps an undone session's runner alive.
+            # A session that archives itself is still mid-turn, so its teardown also
+            # waits for that turn to end.
             _spawn_archive_stop(
                 session_id,
                 conversation_store,
@@ -4152,6 +4155,8 @@ def register_core_routes(
                 getattr(request.app.state, "host_registry", None),
                 delete_worktree=body.delete_worktree,
                 host_store=getattr(request.app.state, "host_store", None),
+                after_turn=normalize_uuid(request.headers.get(ORCHESTRATION_SOURCE_HEADER))
+                == normalize_uuid(session_id),
             )
         elif body.archived is False:
             # Cancel local teardown immediately; the deferred flag check handles

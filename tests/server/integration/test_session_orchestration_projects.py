@@ -692,7 +692,7 @@ async def test_a_child_cannot_archive_its_rebound_parent(auth_client, peers, db_
         )
 
     result = await archive_parent()
-    assert "cannot archive its own session or a session it runs under" in result["error"], result
+    assert "cannot archive a session it runs under" in result["error"], result
     into_existing = await archive_parent(project="Existing")
     assert "a session it runs under" in into_existing["error"], into_existing
     into_new = await archive_parent(project="Brand new")
@@ -768,3 +768,40 @@ async def test_project_update_promotes_a_label_only_folder(auth_client, peers, d
     assert "Somewhere" not in {
         p["name"] for p in (await auth_client.get("/v1/projects")).json()["data"]
     }
+
+
+@_ONE_ENVIRONMENT
+@pytest.mark.parametrize("undone", [False, True], ids=["turn-ends", "undone"])
+async def test_a_session_archives_itself_and_stops_once_its_turn_ends(
+    auth_client, peers, db_uri, monkeypatch, undone
+):
+    source, _, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    torn_down: list[str] = []
+
+    async def record_teardown(session_id: str, _store, _runner_router) -> list[str]:
+        torn_down.append(session_id)
+        return []
+
+    monkeypatch.setattr(sessions_module, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0)
+    monkeypatch.setattr(orchestration, "_SELF_ARCHIVE_TURN_POLL_S", 0.01)
+    monkeypatch.setattr(sessions_module, "_best_effort_stop", record_teardown)
+    # The tool call happens mid-turn.
+    monkeypatch.setitem(sessions_common._session_status_cache, source["id"], "running")
+    result = await _project_tool(
+        auth_client, source, "sys_session_update", session_id=source["id"], archived=True
+    )
+    assert result["status"] == "updated" and result["archived"] is True, result
+    assert store.get_conversation(source["id"]).archived is True
+
+    # custom-lint: disable-next=sleep-then-assert -- checks that nothing happens mid-turn
+    await asyncio.sleep(0.2)
+    assert torn_down == [] and source["id"] in orchestration._pending_archive_stops
+    if undone:
+        # An Undo on another replica only clears the flag; the wait ends without
+        # the turn ending.
+        store.update_conversation(source["id"], archived=False)
+    else:
+        sessions_common._session_status_cache[source["id"]] = "idle"
+    await asyncio.wait_for(asyncio.gather(*list(orchestration._detached_stop_tasks)), 5)
+    assert torn_down == ([] if undone else [source["id"]])
