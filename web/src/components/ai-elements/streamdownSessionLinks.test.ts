@@ -13,7 +13,11 @@ describe("sameServerSessionPath", () => {
     ["the HTTPS default port", "omnigent://example.test:443/c/worker_1", httpsPage],
     ["a differently cased host", "omnigent://EXAMPLE.test/c/worker_1", httpsPage],
     ["the same host and port", "omnigent://127.0.0.1:53694/c/worker_1", httpPage],
-    ["the HTTP default port", "omnigent://localhost:80/c/worker_1", { protocol: "http:", host: "localhost" }],
+    [
+      "the HTTP default port",
+      "omnigent://localhost:80/c/worker_1",
+      { protocol: "http:", host: "localhost" },
+    ],
   ])("routes a link with %s in the app", (_case, href, page) => {
     expect(sameServerSessionPath(href, page)).toBe("/c/worker_1");
   });
@@ -22,7 +26,11 @@ describe("sameServerSessionPath", () => {
     ["another host", "omnigent://other.example/c/worker_1", httpsPage],
     ["another port", "omnigent://127.0.0.1:53695/c/worker_1", httpPage],
     ["the HTTP default port on an HTTPS page", "omnigent://example.test:80/c/worker_1", httpsPage],
-    ["a page that isn't served over HTTP", "omnigent://example.test/c/worker_1", { protocol: "file:", host: "example.test" }],
+    [
+      "a page that isn't served over HTTP",
+      "omnigent://example.test/c/worker_1",
+      { protocol: "file:", host: "example.test" },
+    ],
     ["a link that isn't a session link", "omnigent://example.test/settings", httpsPage],
   ])("keeps the deep link for %s", (_case, href, page) => {
     expect(sameServerSessionPath(href, page)).toBeNull();
