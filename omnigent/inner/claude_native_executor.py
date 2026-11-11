@@ -258,6 +258,7 @@ class ClaudeNativeExecutor(Executor):
         loop = asyncio.get_running_loop()
         while loop.time() < deadline:
             await asyncio.sleep(_MESSAGE_HOLD_POLL_S)
+            self._require_active_session()
             try:
                 if await asyncio.to_thread(ready):
                     return True
@@ -409,7 +410,9 @@ class ClaudeNativeExecutor(Executor):
         text = _latest_user_text(messages, self._bridge_dir)
         notices = _latest_framework_notices(messages)
         if not text:
-            yield ExecutorError(message="Claude native turn had no user text to send")
+            yield ExecutorError(
+                message="Claude native turn had no user text to send", undelivered=True
+            )
             return
         if is_auth_slash_command(text):
             # Claude Code's sign-in is an interactive TUI handoff the bridge
