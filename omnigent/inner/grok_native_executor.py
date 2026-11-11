@@ -67,7 +67,10 @@ class GrokNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="grok native turn had no user text to send")
             return
-        state = read_bridge_state(self._bridge_dir)
+        # The runner's serve lifecycle publishes bridge state after the pane
+        # binds and session/new returns — a fast-posted first turn can arrive
+        # before it lands, so wait briefly rather than erroring the turn.
+        state = await _wait_bridge_state(self._bridge_dir)
         if state is None or not state.session_id:
             yield ExecutorError(
                 message="grok native session not ready (no bridge state/session id)"
@@ -166,6 +169,23 @@ async def _answer_permission_request(
             return {"outcome": {"selected": {"optionId": reject_id}}}
         return None
     return None
+
+
+async def _wait_bridge_state(
+    bridge_dir: Path, timeout_s: float = 60.0
+) -> GrokBridgeState | None:
+    """Poll for published bridge state up to *timeout_s*."""
+    import asyncio
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while True:
+        state = read_bridge_state(bridge_dir)
+        if state is not None and state.ws_url:
+            return state
+        if time.monotonic() >= deadline:
+            return state
+        await asyncio.sleep(0.5)
 
 
 async def _cancel_session(state: GrokBridgeState) -> None:
