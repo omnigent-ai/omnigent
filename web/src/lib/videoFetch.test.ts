@@ -164,4 +164,37 @@ describe("readVideoResponse", () => {
     ).rejects.toMatchObject({ name: "AbortError" });
     expect(cancelled).toBe(true);
   });
+
+  it("rejects at once when aborted during a pending read whose cancel never settles", async () => {
+    const controller = new AbortController();
+    let readPending = false;
+    let cancelRequested = false;
+    const body = new ReadableStream<Uint8Array>(
+      {
+        pull() {
+          // The read never gets a chunk, so only the abort can end it.
+          readPending = true;
+          return new Promise<void>(() => {});
+        },
+        cancel() {
+          cancelRequested = true;
+          return new Promise<void>(() => {});
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const response = new Response(body, { headers: { "content-type": "video/mp4" } });
+    const read = readVideoResponse(response, "a.mp4", {
+      signal: controller.signal,
+      limitBytes: LIMIT,
+    }).catch((error: unknown) => error);
+    await expect.poll(() => readPending).toBe(true);
+    controller.abort();
+    const hung = new Promise((resolve) => {
+      setTimeout(() => resolve("hung"), 200);
+    });
+    const outcome = await Promise.race([read, hung]);
+    expect(outcome).toMatchObject({ name: "AbortError" });
+    expect(cancelRequested).toBe(true);
+  });
 });
