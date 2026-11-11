@@ -11,7 +11,8 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { type ReactNode, Suspense } from "react";
+import { MemoryRouter, Outlet, Route, Routes } from "react-router-dom";
 import { sessionNumberAriaShortcut } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
@@ -58,16 +59,27 @@ function mockConversations(convs: Conversation[]) {
   useConvMock.mockReturnValue(conversationPage(convs, { first_id: null, last_id: null }));
 }
 
-function renderAt(initialEntry: string, config = sidebarConfig) {
+// Like the app shell, the sidebar is a layout route that stays mounted across navigation.
+function renderAt(initialEntry: string, config = sidebarConfig, chatPage: ReactNode = null) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const shell = (
+    <>
+      <Sidebar open onClose={vi.fn()} />
+      <Suspense fallback={null}>
+        <Outlet />
+      </Suspense>
+    </>
+  );
   const tree = () => (
     <QueryClientProvider client={qc}>
       <SidebarDataProvider config={config}>
         <TooltipProvider>
           <MemoryRouter initialEntries={[initialEntry]}>
             <Routes>
-              <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
-              <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+              <Route element={shell}>
+                <Route path="/" element={null} />
+                <Route path="/c/:conversationId" element={chatPage} />
+              </Route>
             </Routes>
           </MemoryRouter>
         </TooltipProvider>
@@ -229,6 +241,39 @@ describe("collapsing the project that holds the open session", () => {
     );
     fireEvent.click(screen.getByRole("link", { name: /pinned_x/ }));
     expect(screen.queryByRole("link", { name: /sibling_b/ })).not.toBeInTheDocument();
+  });
+
+  it("stays collapsed when the route commits after the collapse", async () => {
+    openFiledSession();
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Repro 2506"]));
+    let releaseRoute = () => {};
+    let routeReleased = false;
+    const routeGate = new Promise<void>((resolve) => {
+      releaseRoute = () => {
+        routeReleased = true;
+        resolve();
+      };
+    });
+    function SlowChatPage() {
+      if (!routeReleased) throw routeGate;
+      return <div data-testid="chat-page" />;
+    }
+    renderAt("/", sidebarConfig, <SlowChatPage />);
+
+    fireEvent.click(screen.getByRole("link", { name: /sibling_b/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Repro 2506" }));
+    expect(screen.queryByTestId("chat-page")).not.toBeInTheDocument();
+    await act(async () => {
+      releaseRoute();
+      await routeGate;
+    });
+
+    expect(await screen.findByTestId("chat-page")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Repro 2506" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(expandedProjects()).toEqual([]);
   });
 
   it("stays collapsed when a session only its folder had loaded joins the list", () => {

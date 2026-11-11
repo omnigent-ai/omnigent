@@ -19,13 +19,13 @@ from __future__ import annotations
 
 import json
 import re
-import time
 import uuid
 
 import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
+from tests._helpers.polling import poll_until
 from tests._helpers.session import send_user_text
 from tests.e2e_ui.conftest import configure_mock_llm
 
@@ -138,19 +138,14 @@ def test_click_pinned_project_session_keeps_project_collapsed(
     expect(_section(page, project).locator(f'a[href="/c/{session_b}"]')).to_have_count(0)
 
 
-def _wait_for_reply(base_url: str, session_id: str, text: str) -> None:
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        resp = httpx.get(
-            f"{base_url}/v1/sessions/{session_id}/items",
-            params={"order": "desc", "limit": 10},
-            timeout=10.0,
-        )
-        resp.raise_for_status()
-        if text in json.dumps(resp.json()):
-            return
-        time.sleep(0.25)
-    raise AssertionError(f"mock reply {text!r} never landed in {session_id}")
+def _reply_landed(base_url: str, session_id: str, text: str) -> bool:
+    resp = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/items",
+        params={"order": "desc", "limit": 10},
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+    return text in json.dumps(resp.json())
 
 
 def test_collapsing_project_of_open_session_stays_collapsed(
@@ -196,7 +191,7 @@ def test_collapsing_project_of_open_session_stays_collapsed(
 
     with httpx.Client(base_url=base_url) as client:
         send_user_text(client, session_id=pinned_id, text=f"pinned-activity-{nonce}")
-    _wait_for_reply(base_url, pinned_id, reply)
+    poll_until(lambda: _reply_landed(base_url, pinned_id, reply), timeout_s=60, interval_s=0.25)
     # The unread marker shows once the sidebar has applied the pinned session's update.
     expect(pinned_link).to_contain_text("(unread)", timeout=30_000)
 
