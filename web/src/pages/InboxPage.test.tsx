@@ -1911,6 +1911,17 @@ describe("agent suggestions", () => {
     expect(advisor.refetch).toHaveBeenCalledOnce();
   });
 
+  it("keeps showing suggestions when a settings refetch fails but the settings are cached", () => {
+    window.localStorage.setItem("omnigent:inbox-filter", "advisor");
+    advisor.failed = true;
+    stub({ items: [suggestion()], unreadCount: 1 });
+    renderPage();
+
+    expect(screen.getByTestId("inbox-suggestion")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry settings" })).toBeNull();
+  });
+
   it("takes an agent action and opens the composer with its prompt", () => {
     const update = vi.fn();
     stub({ items: [suggestion({ status: "read" })], update });
