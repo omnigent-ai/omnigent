@@ -46,6 +46,10 @@ def _output_limit_kwargs(kwargs: dict[str, Any], *, native_responses: bool) -> d
     supplied = [name for name in names if result.get(name) is not None]
     if not supplied:
         return result
+    for name in supplied:
+        value = result[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise OmnigentError(f"{name} must be a positive integer", code=ErrorCode.INVALID_INPUT)
     limit = result[supplied[0]]
     if any(result[name] != limit for name in supplied[1:]):
         raise OmnigentError("Conflicting output token limits", code=ErrorCode.INVALID_INPUT)

@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from omnigent.llms.client import Client
+from omnigent.llms.client import Client, _output_limit_kwargs
 from omnigent.llms.errors import (
     ContextWindowExceededError,
     LLMErrorDetail,
@@ -179,6 +179,65 @@ async def test_conflicting_output_budgets_do_not_send(
             **{alias: 18},
         )
     assert captured == []
+
+
+@pytest.mark.parametrize("native_responses", [False, True])
+@pytest.mark.parametrize("name", ["max_output_tokens", "max_tokens", "max_completion_tokens"])
+@pytest.mark.parametrize("limit", [0, -1, True, False, 1.0, 1.5, "1"])
+def test_invalid_output_budget_values(name: str, limit: Any, native_responses: bool) -> None:
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    with pytest.raises(OmnigentError, match=f"{name} must be a positive integer") as error:
+        _output_limit_kwargs({name: limit}, native_responses=native_responses)
+    assert error.value.code == ErrorCode.INVALID_INPUT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "limits",
+    [
+        {"max_output_tokens": 0},
+        {"max_output_tokens": 1, "max_tokens": True},
+        {"max_output_tokens": 1, "max_completion_tokens": 1.0},
+    ],
+)
+async def test_invalid_output_budgets_do_not_send(
+    monkeypatch: pytest.MonkeyPatch, provider: str, stream: bool, limits: dict[str, Any]
+) -> None:
+    from omnigent.errors import OmnigentError
+    from omnigent.llms.adapters import _create_adapter
+
+    adapter = _create_adapter(provider)
+    monkeypatch.setattr("omnigent.llms.client.get_adapter", lambda provider: adapter)
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(**kwargs, transport=httpx.MockTransport(respond)),
+    )
+    with pytest.raises(OmnigentError, match="must be a positive integer"):
+        await Client().responses.create(
+            input=[{"role": "user", "content": "hi"}],
+            model=f"{provider}/test-model",
+            connection_params={"base_url": "http://provider.test/v1", "api_key": "test"},
+            stream=stream,
+            **limits,
+        )
+    assert requests == []
+
+
+@pytest.mark.parametrize("native_responses", [False, True])
+def test_unset_output_budgets_remain_optional(native_responses: bool) -> None:
+    kwargs = {"max_output_tokens": None, "max_tokens": None, "max_completion_tokens": None}
+    assert _output_limit_kwargs(kwargs, native_responses=native_responses) == kwargs
 
 
 # ── Helpers ──────────────────────────────────────────────────
