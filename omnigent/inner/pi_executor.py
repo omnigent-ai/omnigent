@@ -2573,36 +2573,44 @@ class PiExecutor(Executor):
         A ``before_turn`` refresh runs before Pi starts and takes the longer budget;
         the default fits the bridge's answer to Pi inside Pi's command deadline. A
         token past half its cache lifetime is still served while it renews in the
-        background with the longer budget, so a slow helper need not block Pi.
+        background with up to the longer budget, so a slow helper need not block Pi.
         """
         now = time.monotonic()
         if now < self._gateway_refresh_after:
-            if now >= self._gateway_renew_after:
+            # Renewals end before expiry, so an expired-token refresh never waits on one.
+            renewal_timeout_s = min(
+                _GATEWAY_TURN_AUTH_TIMEOUT_S, self._gateway_refresh_after - now - 1
+            )
+            if now >= self._gateway_renew_after and renewal_timeout_s >= _GATEWAY_AUTH_TIMEOUT_S:
                 self._gateway_renew_after = self._gateway_refresh_after
-                self._gateway_renewal = asyncio.create_task(self._renew_gateway_token())
+                self._gateway_renewal = asyncio.create_task(
+                    self._renew_gateway_token(renewal_timeout_s)
+                )
             return self._databricks_token
         async with self._gateway_auth_lock:
             if time.monotonic() < self._gateway_refresh_after:
                 return self._databricks_token
             self._gateway_refresh_after = 0.0
-            return await self._refresh_gateway_token(within_pi_deadline=not before_turn)
+            if before_turn:
+                return await self._refresh_gateway_token(
+                    _GATEWAY_TURN_AUTH_TIMEOUT_S, _GATEWAY_TURN_AUTH_TIMEOUT_S + 1
+                )
+            return await self._refresh_gateway_token(
+                _GATEWAY_AUTH_TIMEOUT_S, _GATEWAY_BRIDGE_TIMEOUT_S
+            )
 
-    async def _renew_gateway_token(self) -> None:
+    async def _renew_gateway_token(self, helper_timeout_s: float) -> None:
         """Replace a cached token early; on failure it still expires on schedule."""
         async with self._gateway_auth_lock:
             try:
-                await self._refresh_gateway_token(within_pi_deadline=False)
+                await self._refresh_gateway_token(helper_timeout_s, helper_timeout_s + 1)
             except _GatewayAuthError as exc:
                 logger.warning("Pi gateway credential renewal failed: %s", exc)
 
-    async def _refresh_gateway_token(self, *, within_pi_deadline: bool) -> str:
+    async def _refresh_gateway_token(
+        self, helper_timeout_s: float, refresh_timeout_s: float
+    ) -> str:
         """Fetch and cache a credential; the caller holds the refresh lock."""
-        if within_pi_deadline:
-            helper_timeout_s = _GATEWAY_AUTH_TIMEOUT_S
-            refresh_timeout_s = _GATEWAY_BRIDGE_TIMEOUT_S
-        else:
-            helper_timeout_s = _GATEWAY_TURN_AUTH_TIMEOUT_S
-            refresh_timeout_s = _GATEWAY_TURN_AUTH_TIMEOUT_S + 1
         try:
             async with asyncio.timeout(refresh_timeout_s):
                 if self._gateway_host_override is not None:

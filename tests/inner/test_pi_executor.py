@@ -53,6 +53,7 @@ from omnigent.models.model_catalog import ModelEntry
 from omnigent.models.model_metadata import ModelCapability, ModelMetadata, ModelWireAPI
 from omnigent.onboarding.providers import ModelInfo
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+from tests._helpers.polling import poll_until_async
 
 
 def _cancel_all_tasks(loop):
@@ -2467,12 +2468,13 @@ async def test_gateway_refresh_before_turn_outlasts_the_bridge_deadline(monkeypa
     assert await executor._get_gateway_token(before_turn=True) == "slow-token"
 
 
-@pytest.mark.parametrize("renewal", ["slow", "failing", "hanging"])
+@pytest.mark.parametrize("renewal", ["slow", "failing", "hanging", "late"])
 async def test_gateway_renews_aging_token_outside_the_bridge_deadline(
     tmp_path, monkeypatch, renewal
 ):
     # A renewal slower than Pi's bridge budget (a slow workspace) must still reach Pi,
     # while a failed one leaves the cached token usable only until its lifetime ends.
+    # A renewal must also end before expiry so the bridge can then refresh on its own.
     from omnigent.inner import pi_executor
 
     monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.1)
@@ -2480,10 +2482,12 @@ async def test_gateway_renews_aging_token_outside_the_bridge_deadline(
     monkeypatch.setattr(pi_executor, "_GATEWAY_TURN_AUTH_TIMEOUT_S", 5)
     runs = shlex.quote(str(tmp_path / "helper runs"))
     pid_file = tmp_path / "renewal pid"
+    hang = f"echo $$ > {shlex.quote(str(pid_file))}; sleep 30 & wait"
     renewal_command = {
         "slow": "sleep 0.5; printf renewed",
         "failing": "exit 1",
-        "hanging": f"echo $$ > {shlex.quote(str(pid_file))}; sleep 30 & wait",
+        "hanging": hang,
+        "late": f"if [ $(wc -l < {runs}) -eq 2 ]; then {hang}; else printf renewed; fi",
     }[renewal]
     executor = PiExecutor(
         pi_path="/usr/bin/pi",
@@ -2508,22 +2512,31 @@ async def test_gateway_renews_aging_token_outside_the_bridge_deadline(
         await writer.wait_closed()
         return response
 
+    def renewal_helper_exited() -> bool:
+        try:
+            os.kill(int(pid_file.read_text()), 0)
+        except ProcessLookupError:
+            return True
+        return False
+
     try:
         assert await executor._get_gateway_token(before_turn=True) == "first"
-        now += 451  # past half of the default 15-minute cache lifetime
+        # Both ages are past half of the default 15-minute cache lifetime.
+        age = 897 if renewal == "late" else 451
+        now += age
         assert await request_credential() == {"token": "first"}
+        if renewal in ("hanging", "late"):
+            await poll_until_async(lambda: pid_file.exists() and pid_file.read_text(), timeout_s=3)
         if renewal == "hanging":
-            async with asyncio.timeout(3):
-                while not pid_file.exists():
-                    await asyncio.sleep(0.01)
             await asyncio.wait_for(executor.close(), 3)
-            with pytest.raises(ProcessLookupError):
-                os.kill(int(pid_file.read_text()), 0)
+            assert renewal_helper_exited()
             return
-        now += 450  # the first token's cache lifetime has ended
+        if renewal == "late":
+            await poll_until_async(renewal_helper_exited, timeout_s=900 - age)
+        now += 900 - age  # the first token's cache lifetime has ended
         expected = (
             {"token": "renewed"}
-            if renewal == "slow"
+            if renewal in ("slow", "late")
             else {"error": "Pi gateway auth command failed"}
         )
         assert await request_credential() == expected
