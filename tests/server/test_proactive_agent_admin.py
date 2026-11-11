@@ -132,6 +132,24 @@ async def test_run_now_for_everyone(client: httpx.AsyncClient) -> None:
     assert mixed.status_code == 400
 
 
+async def test_run_now_for_everyone_stops_scanning_after_the_page_cap() -> None:
+    from types import SimpleNamespace
+
+    from omnigent.server.routes import proactive_agent_admin as admin
+
+    pages = {"read": 0}
+
+    class EndlessPausedTasks:
+        def list_for_agent(self, agent_id: str, *, after: str | None, limit: int) -> tuple:
+            pages["read"] += 1
+            return [SimpleNamespace(state="paused")] * limit, f"page-{pages['read']}"
+
+    tasks, truncated = await admin._all_tasks(EndlessPausedTasks())
+
+    assert (tasks, truncated) == ([], True)
+    assert pages["read"] == admin._RUN_ALL_MAX_PAGES
+
+
 async def test_admin_routes_are_hidden_where_the_agent_is_not_offered(
     db_uri: str, tmp_path: Path
 ) -> None:

@@ -28,6 +28,8 @@ from omnigent.stores.proactive_agent_settings_store import (
 MAX_RUN_USERS = 100
 MAX_RUN_ALL_TASKS = 500
 _RUN_ALL_PAGE = 100
+# Pages one "run for everyone" may read, counting paused and retired tasks too.
+_RUN_ALL_MAX_PAGES = 20
 
 
 class ProactiveAgentPrompt(BaseModel):
@@ -191,10 +193,15 @@ def _display_user(user_id: str | None) -> str:
 
 
 async def _all_tasks(store: Any) -> tuple[list[ScheduledTask], bool]:
-    """Every live proactive task, read in bounded pages, up to the run cap."""
+    """Live proactive tasks, read in bounded pages, up to the run cap.
+
+    Reads at most :data:`_RUN_ALL_MAX_PAGES` pages, so a workspace with many
+    paused tasks cannot make one request scan its whole task history; the
+    result is reported as truncated when either cap stops the scan early.
+    """
     tasks: list[ScheduledTask] = []
     after: str | None = None
-    while True:
+    for _ in range(_RUN_ALL_MAX_PAGES):
         page, after = await asyncio.to_thread(
             store.list_for_agent, PROACTIVE_AGENT_ID, after=after, limit=_RUN_ALL_PAGE
         )
@@ -203,6 +210,7 @@ async def _all_tasks(store: Any) -> tuple[list[ScheduledTask], bool]:
             return tasks[:MAX_RUN_ALL_TASKS], True
         if after is None:
             return tasks, False
+    return tasks, True
 
 
 async def _start(
