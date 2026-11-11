@@ -243,6 +243,7 @@ from omnigent.server.schemas import (
     UpdateSessionRequest,
 )
 from omnigent.server.session_orchestration import (
+    require_archive_outside_source_lineage,
     require_named_source_private,
     require_orchestration_source,
 )
@@ -3190,15 +3191,19 @@ def register_core_routes(
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
-        if set_project:
-            # A session shared with edit access must not let collaborators
-            # refile the owner's other sessions through agent tools.
+        # A session shared with edit access must not let collaborators refile,
+        # rename, pin or archive the owner's other sessions through agent tools.
+        # Only those tools name a calling session, so other PATCHes are unaffected.
+        await asyncio.to_thread(
+            require_named_source_private,
+            request,
+            user_id,
+            conversation_store,
+            permission_store,
+        )
+        if body.archived is True:
             await asyncio.to_thread(
-                require_named_source_private,
-                request,
-                user_id,
-                conversation_store,
-                permission_store,
+                require_archive_outside_source_lineage, request, session_id, conversation_store
             )
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
