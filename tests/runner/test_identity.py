@@ -19,6 +19,19 @@ from omnigent.runner.identity import (
 )
 
 
+def test_idle_exit_marker_is_launch_and_process_bound(monkeypatch, tmp_path):
+    from omnigent.runner.identity import mark_idle_exit, runner_exited_idle
+
+    marker = tmp_path / "launch.connected"
+    monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(marker))
+    mark_idle_exit("runner")
+    assert runner_exited_idle(marker, "runner", os.getpid())
+    assert not runner_exited_idle(marker, "another", os.getpid())
+    assert not runner_exited_idle(marker, "runner", os.getpid() + 1)
+    marker.with_suffix(".idle").write_text("broken")
+    assert not runner_exited_idle(marker, "runner", os.getpid())
+
+
 def test_token_bound_runner_id_is_stable_and_token_scoped() -> None:
     """Token-bound ids are deterministic and differ across secret tokens.
 

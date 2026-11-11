@@ -297,6 +297,7 @@ class SubstrateSandboxLauncher(SandboxHostLauncher):
             programmatic_terminate=True,
             multi_repo=True,
             git_clone_options=True,
+            managed_idle_suspend=True,
         )
 
     def _template(self, reference: Mapping[str, str]) -> dict[str, Any]:
@@ -516,6 +517,21 @@ class SubstrateSandboxLauncher(SandboxHostLauncher):
         self._template(actor["actorTemplate"])
         if actor.get("status", {}).get("state") != "ACTOR_STATE_RUNNING":
             self.client.call("ResumeActor", {"actor": handle.ref})
+
+    def wait_for_idle(self, sandbox_id: str, generation: str) -> None:
+        handle = ActorHandle.parse(sandbox_id, self.config)
+        self._actor(handle)
+        deadline = time.monotonic() + _TIMEOUT_S
+        while time.monotonic() < deadline:
+            status = self._bootstrap(handle, "/status")
+            if status.get("generation") != generation:
+                raise click.ClickException("Substrate activation changed during quiescence")
+            if status.get("stage") == "idle":
+                return
+            if status.get("stage") == "failed":
+                raise click.ClickException("Substrate host could not finish idle cleanup")
+            time.sleep(0.2)
+        raise click.ClickException("Substrate host quiescence timed out")
 
     def stop(self, sandbox_id: str) -> None:
         handle = ActorHandle.parse(sandbox_id, self.config)

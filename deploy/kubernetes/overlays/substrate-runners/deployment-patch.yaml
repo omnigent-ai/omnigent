@@ -3,6 +3,9 @@ kind: Deployment
 metadata:
   name: omnigent
 spec:
+  strategy:
+    type: Recreate
+    rollingUpdate: null
   template:
     spec:
       serviceAccountName: omnigent-substrate

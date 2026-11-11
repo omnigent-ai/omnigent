@@ -143,6 +143,24 @@ def touch_connect_marker(env: Mapping[str, str] | None = None) -> None:
         )
 
 
+def mark_idle_exit(runner_id: str) -> None:
+    """Attest a completed idle shutdown to the owning host for this launch only."""
+    configured = os.environ.get(RUNNER_CONNECT_MARKER_ENV_VAR)
+    if configured:
+        Path(configured).with_suffix(".idle").write_text(
+            json.dumps({"runner_id": runner_id, "pid": os.getpid()})
+        )
+
+
+def runner_exited_idle(connect_marker: Path, runner_id: str, pid: int) -> bool:
+    try:
+        with connect_marker.with_suffix(".idle").open() as stream:
+            value = json.loads(stream.read(512))
+        return value == {"runner_id": runner_id, "pid": pid}
+    except (OSError, ValueError):
+        return False
+
+
 def sign_in_pending_marker_path(connect_marker: Path) -> Path:
     """Return the bounded startup-state marker for this exact launch."""
     return connect_marker.with_suffix(".sign-in-pending")

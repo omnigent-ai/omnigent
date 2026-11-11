@@ -4323,7 +4323,10 @@ async def relaunch_managed_host(
     heartbeat = asyncio.create_task(renew())
     result = None
     try:
-        result = await _relaunch_managed_host(
+        from omnigent.server.managed_idle import enabled, operation
+
+        launch = partial(
+            _relaunch_managed_host,
             config=config,
             host=host,
             host_store=host_store,
@@ -4334,6 +4337,11 @@ async def relaunch_managed_host(
             recovery_token=token,
             launch_state=launch_state,
         )
+        if enabled(host, config):
+            async with operation(host_store, host.host_id, "starting"):
+                result = await launch()
+        else:
+            result = await launch()
         return result
     finally:
         heartbeat.cancel()
@@ -4638,6 +4646,8 @@ async def _register_and_start_host(
     """
     token = secrets.token_urlsafe(32)
     record = None
+    operation_token = None
+    operation_succeeded = False
     # The sandbox the failure cleanup below releases. It switches to a
     # provider-assigned id as soon as start_host surfaces one, BEFORE that id is
     # persisted, so a failed write still terminates the real sandbox rather than
@@ -4669,6 +4679,20 @@ async def _register_and_start_host(
                 sandbox_id=sandbox_id,
                 token_expires_at=now_epoch() + config.token_ttl_s,
             )
+        if not keep_host_on_failure and getattr(
+            launcher.capabilities, "managed_idle_suspend", False
+        ):
+            operation_token = secrets.token_hex(16)
+            claimed = await asyncio.to_thread(
+                host_store.claim_sandbox_operation,
+                host_id,
+                operation_token,
+                "starting",
+                expected_sandbox_id=sandbox_id,
+            )
+            if claimed is None:
+                operation_token = None
+                raise ValueError("Managed sandbox startup is already in progress")
         # Persist an allocated identity before activation can authenticate.
         materialize = getattr(launcher, "materialize", None)
         if materialize is not None:
@@ -4724,6 +4748,7 @@ async def _register_and_start_host(
                 )
             record = updated
         await _wait_for_host_online(host_store, host_id)
+        operation_succeeded = True
     except Exception as exc:
         # The provider allocated the sandbox before registration or startup
         # could fail, so both failures must attempt cleanup.
@@ -4810,6 +4835,16 @@ async def _register_and_start_host(
             status_code=502,
             detail=f"managed sandbox host startup failed: {message}",
         ) from exc
+    finally:
+        if operation_token is not None:
+            await asyncio.shield(
+                asyncio.to_thread(
+                    host_store.finish_sandbox_operation,
+                    host_id,
+                    operation_token,
+                    "active" if operation_succeeded else "unknown",
+                )
+            )
     return ManagedHostLaunch(
         host_id=host_id,
         workspace=workspace,
@@ -4946,6 +4981,40 @@ _resume_locks: dict[str, asyncio.Lock] = {}
 
 
 async def resume_managed_host(
+    host_id: str,
+    host_store: HostStore,
+    config: ManagedSandboxDeployment | None,
+    *,
+    repos: Sequence[RepoWorkspace] = (),
+    force: bool = False,
+    on_stage: SandboxStageObserver | None = None,
+    agent_name: str | None = None,
+    slice_key_enabled: bool = False,
+    launch_state: ManagedLaunch | None = None,
+) -> None:
+    """Wake compute under the same durable gate used by automatic suspension."""
+    from omnigent.server.managed_idle import enabled, operation
+
+    host = await asyncio.to_thread(host_store.get_host, host_id)
+    call = partial(
+        _resume_managed_host,
+        host_id,
+        host_store,
+        config,
+        repos=repos,
+        on_stage=on_stage,
+        agent_name=agent_name,
+        slice_key_enabled=slice_key_enabled,
+        launch_state=launch_state,
+    )
+    if host is not None and enabled(host, config):
+        async with operation(host_store, host_id, "wake") as record:
+            await call(force=force or record["previous"] == "suspended")
+    else:
+        await call(force=force)
+
+
+async def _resume_managed_host(
     host_id: str,
     host_store: HostStore,
     config: ManagedSandboxDeployment | None,

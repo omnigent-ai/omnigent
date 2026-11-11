@@ -132,8 +132,11 @@ class Activation:
         )
 
     def environment(self) -> dict[str, str]:
+        from omnigent.host.idle import HOST_IDLE_SUSPEND_ENV
+
         return {
             **os.environ,
+            HOST_IDLE_SUSPEND_ENV: "1",
             "HOME": HOME,
             "IS_SANDBOX": "1",
             HOST_ID_ENV_VAR: self.host_id,
@@ -221,14 +224,14 @@ class Bootstrap:
                     and self.activation.server_url == activation.server_url
                 )
                 retryable = (
-                    self.stage == "failed"
+                    self.stage in {"failed", "idle"}
                     and self.cleaned
                     and (self.worker is None or not self.worker.is_alive())
                     and (self.signals.child is None or self.signals.child.poll() is not None)
                 )
                 if not same_host or (not retryable and self.activation != activation):
                     raise ActivationError("Actor is already bound to another activation")
-                if not retryable:
+                if not retryable or (self.stage == "idle" and self.activation == activation):
                     return
             self.activation = activation
             self.stage = "preparing"
@@ -248,6 +251,7 @@ class Bootstrap:
             }
 
     def _launch(self, activation: Activation) -> None:
+        idle = False
         try:
             directory = _token_directory()
             token_file = directory / "host-token"
@@ -260,7 +264,7 @@ class Bootstrap:
                     **activation.environment(),
                     HOST_TOKEN_FILE_ENV_VAR: str(token_file),
                 }
-                self._run_host(activation, environment)
+                idle = self._run_host(activation, environment)
             finally:
                 with contextlib.suppress(FileNotFoundError):
                     Path(temporary).unlink()
@@ -276,9 +280,9 @@ class Bootstrap:
             )
             with self.lock:
                 self.cleaned = cleaned
-                self.stage = "failed"
+                self.stage = "idle" if idle and cleaned else "failed"
 
-    def _run_host(self, activation: Activation, environment: dict[str, str]) -> None:
+    def _run_host(self, activation: Activation, environment: dict[str, str]) -> bool:
         from omnigent.onboarding.sandboxes.kubernetes import (
             _render_host_command,
             _render_workspace_prep_command,
@@ -303,7 +307,7 @@ class Bootstrap:
         if self.signals.child.wait() != 0:
             raise ActivationError("Workspace preparation failed")
         if self.signals.signum is not None:
-            return
+            return False
         self.signals.child = subprocess.Popen(
             _render_host_command(activation.server_url),
             env=environment,
@@ -313,7 +317,9 @@ class Bootstrap:
             self.signals.forward(self.signals.signum, None)
         with self.lock:
             self.stage = "prepared"
-        self.signals.child.wait()
+        from omnigent.host.idle import HOST_IDLE_EXIT_CODE
+
+        return self.signals.child.wait() == HOST_IDLE_EXIT_CODE
 
 
 def handler(bootstrap: Bootstrap) -> type[BaseHTTPRequestHandler]:
