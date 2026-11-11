@@ -195,7 +195,7 @@ def _recorded_command(installed: service.HostService) -> list[str]:
 def test_wrapper_launched_service_survives_interpreter_cache_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, system: str
 ) -> None:
-    """A wrapper's cache venv can be gone after a restart; the service must not pin it."""
+    """Re-enabling through a wrapper replaces a service pinned to its disposable cache venv."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "state"))
@@ -211,15 +211,15 @@ def test_wrapper_launched_service_survives_interpreter_cache_cleanup(
     wrapper.parent.mkdir()
     wrapper.write_text("#!/bin/sh\n")
     wrapper.chmod(0o755)
-    _capture_runs(monkeypatch)
+    calls = _capture_runs(monkeypatch)
+    environment = {"HOME": str(tmp_path), "PATH": f"{wrapper.parent}:/usr/bin:/bin"}
+    stale = service.enable_user_host_service("https://example.com", environment=environment)
+    assert _recorded_command(stale)[0] == str(cache_python)
+    calls.clear()
 
     installed = service.enable_user_host_service(
         "https://example.com",
-        environment={
-            "HOME": str(tmp_path),
-            "PATH": f"{wrapper.parent}:/usr/bin:/bin",
-            "OMNIGENT_WRAPPER_COMMAND": "wrapper omni",
-        },
+        environment={**environment, "OMNIGENT_WRAPPER_COMMAND": "wrapper omni"},
     )
     shutil.rmtree(cache_venv)
 
@@ -233,6 +233,18 @@ def test_wrapper_launched_service_survives_interpreter_cache_cleanup(
         "--server",
         "https://example.com",
     ]
+    reloads = {
+        "Darwin": [
+            ["launchctl", "bootout", f"gui/501/{installed.label}"],
+            ["launchctl", "bootstrap", "gui/501", str(installed.path)],
+        ],
+        "Linux": [
+            ["systemctl", "--user", "daemon-reload"],
+            ["systemctl", "--user", "enable", "--now", installed.label],
+            ["systemctl", "--user", "restart", installed.label],
+        ],
+    }
+    assert calls == reloads[system]
 
 
 @pytest.mark.parametrize(
