@@ -339,6 +339,41 @@ it("shows a pending update to every instance, so the sidebar badge agrees with t
   expect(result.current.inbox.items).toEqual([]);
 });
 
+it("subtracts a dismissal from the unread total once, in every instance, across polls", async () => {
+  // Three unread suggestions; one unread fixture would hide a second
+  // decrement behind the zero clamp.
+  const others = [
+    { ...item, id: "two", createdAt: 2 },
+    { ...item, id: "three", createdAt: 3 },
+  ];
+  vi.mocked(listSuggestions).mockResolvedValue(page([...others, item], 3));
+  const { result } = renderHook(
+    () => ({ inbox: useProactiveInbox(true), sidebar: useProactiveInbox(true, ["unread"]) }),
+    { wrapper },
+  );
+  await waitFor(() => expect(result.current.sidebar.unreadCount).toBe(3));
+  const patch = deferred<Suggestion>();
+  vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
+
+  act(() => result.current.inbox.update("sug", { resolution: "not_now" }));
+  expect(result.current.inbox.unreadCount).toBe(2);
+  expect(result.current.sidebar.unreadCount).toBe(2);
+  expect(result.current.inbox.items).toEqual(others);
+  await waitFor(() => expect(updateSuggestion).toHaveBeenCalledOnce());
+
+  // A poll that read the list before the dismissal lands on both queries.
+  await act(async () => void (await result.current.inbox.refetch()));
+  await act(async () => void (await result.current.sidebar.refetch()));
+  expect(result.current.inbox.unreadCount).toBe(2);
+  expect(result.current.sidebar.unreadCount).toBe(2);
+
+  vi.mocked(listSuggestions).mockResolvedValue(page(others, 2));
+  await act(async () => patch.resolve({ ...item, status: "dismissed", resolution: "not_now" }));
+  await waitFor(() => expect(result.current.inbox.unreadCount).toBe(2));
+  expect(result.current.sidebar.unreadCount).toBe(2);
+  expect(result.current.inbox.items).toEqual(others);
+});
+
 it.each(["succeeds", "fails"])(
   "moves a list's unread total even when its loaded pages stop before the item, and the PATCH %s",
   async (outcome) => {
