@@ -163,7 +163,7 @@ describe("ensureSession", () => {
 
   it("signs in through the browser on Connect and installs the session cookie", async () => {
     const recorded = [];
-    mock.method(require("../src/diagnostics").diagnostics, "record", (...args) =>
+    mock.method(require("../src/diagnostics.ts").diagnostics, "record", (...args) =>
       recorded.push(args),
     );
     const noGrant = Object.assign(new Error("none"), { code: "NO_STORED_TOKEN" });

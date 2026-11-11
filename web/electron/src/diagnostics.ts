@@ -1,11 +1,9 @@
-"use strict";
+import fs from "node:fs";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
 
-const fs = require("node:fs");
-const path = require("node:path");
-const { randomUUID } = require("node:crypto");
-
-const LOG_NAME = "desktop-diagnostics.jsonl";
-const MAX_FILE_BYTES = 1024 * 1024;
+export const LOG_NAME = "desktop-diagnostics.jsonl";
+export const MAX_FILE_BYTES = 1024 * 1024;
 const BACKUPS = 2;
 const ALLOWED_FIELDS = new Set([
   "origin",
@@ -64,31 +62,64 @@ const SAFE_OUTCOMES = new Set([
 ]);
 const SAFE_REQUEST_ID = /^[a-zA-Z0-9._:-]{1,128}$/;
 
+/** The fields a diagnostics record keeps after filtering. */
+export interface DiagnosticFields {
+  origin?: string;
+  status?: number;
+  interactive?: boolean;
+  requestId?: string;
+  code?: string;
+  phase?: string;
+  outcome?: string;
+}
+
+/** The part of Electron's `app` that locates the logs directory. */
+export interface DiagnosticsApp {
+  setAppLogsPath: () => void;
+  getPath: (name: "logs") => string;
+}
+
+export interface Diagnostics {
+  initialize: (app: DiagnosticsApp) => void;
+  record: (event: string, fields?: Readonly<Record<string, unknown>>) => void;
+  snapshot: () => string;
+  exportTo: (destination: string) => void;
+}
+
+/** The `code` of a thrown fs or system error, if it has one. */
+function errorCode(error: unknown): unknown {
+  return typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+}
+
 /** A bounded, main-process-only record. Never serialize an Error, URL query or response body. */
-function safeFields(fields) {
-  const result = {};
+export function safeFields(
+  fields: Readonly<Record<string, unknown>> | null | undefined,
+): DiagnosticFields {
+  const result: DiagnosticFields = {};
   for (const [key, value] of Object.entries(fields ?? {})) {
     if (!ALLOWED_FIELDS.has(key)) continue;
     if (key === "origin") {
       try {
-        const url = new URL(value);
+        const url = new URL(String(value));
         if (["http:", "https:"].includes(url.protocol)) result.origin = url.origin;
       } catch {
         // An invalid URL is not useful diagnostic context.
       }
     } else if (key === "status") {
-      if (Number.isInteger(value) && value >= 100 && value <= 599) result.status = value;
+      if (typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599) {
+        result.status = value;
+      }
     } else if (key === "interactive") {
       if (typeof value === "boolean") result.interactive = value;
     } else if (key === "requestId") {
       if (typeof value === "string" && SAFE_REQUEST_ID.test(value)) result.requestId = value;
     } else if (key === "code") {
-      if (SAFE_CODES.has(value) || (typeof value === "string" && /^net_\d{1,5}$/.test(value))) {
+      if (typeof value === "string" && (SAFE_CODES.has(value) || /^net_\d{1,5}$/.test(value))) {
         result.code = value;
       }
-    } else if (key === "phase" && SAFE_PHASES.has(value)) {
+    } else if (key === "phase" && typeof value === "string" && SAFE_PHASES.has(value)) {
       result.phase = value;
-    } else if (key === "outcome" && SAFE_OUTCOMES.has(value)) {
+    } else if (key === "outcome" && typeof value === "string" && SAFE_OUTCOMES.has(value)) {
       result.outcome = value;
     }
   }
@@ -96,12 +127,13 @@ function safeFields(fields) {
 }
 
 /** Keep diagnostics separate from stdout and untrusted renderer/CLI output. */
-function createDiagnostics() {
-  let directory = null;
+export function createDiagnostics(): Diagnostics {
+  let directory: string | null = null;
   let writeFailed = false;
-  const logPath = () => path.join(directory, LOG_NAME);
+  // Callers check `directory` first.
+  const logPath = () => path.join(directory ?? "", LOG_NAME);
 
-  function initialize(app) {
+  function initialize(app: DiagnosticsApp): void {
     try {
       app.setAppLogsPath();
       const logsDirectory = app.getPath("logs");
@@ -109,11 +141,11 @@ function createDiagnostics() {
       directory = logsDirectory;
       record("desktop_started", { outcome: "ready" });
     } catch (error) {
-      console.warn("[omnigent] could not initialize desktop diagnostics", error.code);
+      console.warn("[omnigent] could not initialize desktop diagnostics", errorCode(error));
     }
   }
 
-  function record(event, fields = {}) {
+  function record(event: string, fields: Readonly<Record<string, unknown>> = {}): void {
     if (!directory || !SAFE_LABEL.test(event)) return;
     const line =
       JSON.stringify({ time: new Date().toISOString(), event, ...safeFields(fields) }) + "\n";
@@ -129,15 +161,17 @@ function createDiagnostics() {
       fs.appendFileSync(file, line, { mode: 0o600 });
     } catch (error) {
       // Diagnostics must never break sign-in. Report once to the terminal.
-      if (!writeFailed) console.warn("[omnigent] could not write desktop diagnostics", error.code);
+      if (!writeFailed) {
+        console.warn("[omnigent] could not write desktop diagnostics", errorCode(error));
+      }
       writeFailed = true;
     }
   }
 
   /** Export only our own bounded files; never include cookies, tokens or server/CLI logs. */
-  function snapshot() {
+  function snapshot(): string {
     if (!directory) throw new Error("Desktop diagnostics are not initialized");
-    const entries = [];
+    const entries: string[] = [];
     for (let index = BACKUPS; index >= 0; index--) {
       const file = index === 0 ? logPath() : `${logPath()}.${index}`;
       try {
@@ -145,22 +179,22 @@ function createDiagnostics() {
         if (!stats.isFile() || stats.size > MAX_FILE_BYTES) continue;
         entries.push(fs.readFileSync(file, "utf8"));
       } catch (error) {
-        if (error.code !== "ENOENT") throw error;
+        if (errorCode(error) !== "ENOENT") throw error;
       }
     }
     return entries.join("");
   }
 
-  function exportTo(destination) {
+  function exportTo(destination: string): void {
     if (!directory) throw new Error("Desktop diagnostics are not initialized");
     const logsDirectory = fs.realpathSync(directory);
     // Resolve both the containing directory and existing target: a save dialog
     // can return a path through a symlink to this log or one of its backups.
-    let target;
+    let target: string;
     try {
       target = fs.realpathSync(destination);
     } catch (error) {
-      if (error.code !== "ENOENT") throw error;
+      if (errorCode(error) !== "ENOENT") throw error;
       target = path.join(fs.realpathSync(path.dirname(destination)), path.basename(destination));
     }
     if (
@@ -182,8 +216,8 @@ function createDiagnostics() {
       try {
         fs.unlinkSync(temporary);
       } catch (error) {
-        if (error.code !== "ENOENT")
-          console.warn("[omnigent] could not remove diagnostics temp file", error.code);
+        if (errorCode(error) !== "ENOENT")
+          console.warn("[omnigent] could not remove diagnostics temp file", errorCode(error));
       }
     }
   }
@@ -191,6 +225,4 @@ function createDiagnostics() {
   return { initialize, record, snapshot, exportTo };
 }
 
-const diagnostics = createDiagnostics();
-
-module.exports = { diagnostics, createDiagnostics, safeFields, LOG_NAME, MAX_FILE_BYTES };
+export const diagnostics = createDiagnostics();

@@ -1,17 +1,21 @@
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 
-const {
+import {
   AWAY_BANNER_DELAY_MS,
   isAuthGatePath,
   registerServerAwayWatch,
-} = require("../src/away_banner");
+  type AwayTimer,
+  type ServerAwayWatchOptions,
+} from "../src/away_banner.ts";
 
 const ORIGIN = "https://ws.cloud.databricks.com";
 const FOREIGN = "https://company.okta.com";
 
 class FakeWebContents extends EventEmitter {
+  url: string;
+
   constructor(url = "") {
     super();
     this.url = url;
@@ -24,15 +28,15 @@ class FakeWebContents extends EventEmitter {
 
 /** Deterministic timers: run() executes any pending callback. */
 function fakeTimers() {
-  const timers = new Map();
+  const timers = new Map<AwayTimer, () => void>();
   let nextId = 0;
   return {
-    setTimeoutFn: (fn, _ms) => {
+    setTimeoutFn: (fn: () => void, _ms: number) => {
       const id = ++nextId;
       timers.set(id, fn);
       return id;
     },
-    clearTimeoutFn: (id) => {
+    clearTimeoutFn: (id: AwayTimer) => {
       timers.delete(id);
     },
     pending: () => timers.size,
@@ -43,10 +47,15 @@ function fakeTimers() {
   };
 }
 
-function makeWatch({ pinned = ORIGIN, url = "", ...opts } = {}) {
+interface WatchSetup extends Partial<ServerAwayWatchOptions> {
+  pinned?: string | null | (() => string | null);
+  url?: string;
+}
+
+function makeWatch({ pinned = ORIGIN, url = "", ...opts }: WatchSetup = {}) {
   const webContents = new FakeWebContents(url);
   const timers = fakeTimers();
-  const events = { away: [], returns: 0 };
+  const events = { away: [] as (string | null)[], returns: 0 };
   const getPinnedOrigin = typeof pinned === "function" ? pinned : () => pinned;
   const watch = registerServerAwayWatch(webContents, {
     getPinnedOrigin,
@@ -118,7 +127,7 @@ describe("registerServerAwayWatch", () => {
   });
 
   it("cancels a pending timer when the window unpins mid-flow", () => {
-    let pinned = ORIGIN;
+    let pinned: string | null = ORIGIN;
     const { webContents, timers, events } = makeWatch({ pinned: () => pinned });
     webContents.emit("did-navigate", {}, `${ORIGIN}/omnigent`);
     webContents.url = `${FOREIGN}/login`;

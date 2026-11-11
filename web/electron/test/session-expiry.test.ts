@@ -1,4 +1,4 @@
-// Unit tests for expired-session recovery (src/session-expiry.js), run with
+// Unit tests for expired-session recovery (src/session-expiry.ts), run with
 // `node --test` (no extra deps). Covers the pure redirect matcher and the
 // onBeforeRedirect wiring against a fake webRequest.
 //
@@ -7,10 +7,14 @@
 // window on that so the gate can re-challenge, since a desktop user has no
 // address bar to refresh manually.
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
 
-const { isLoginRedirect, registerSessionExpiryReload } = require("../src/session-expiry");
+import {
+  isLoginRedirect,
+  registerSessionExpiryReload,
+  type SessionRedirectDetails,
+} from "../src/session-expiry.ts";
 
 describe("isLoginRedirect", () => {
   it("matches a 303 redirect to the login page", () => {
@@ -82,14 +86,14 @@ describe("isLoginRedirect", () => {
 
 /** A fake session whose onBeforeRedirect listener can be driven by tests. */
 function fakeSession() {
-  let listener = null;
+  let listener: ((details: SessionRedirectDetails) => void) | null = null;
   return {
     webRequest: {
-      onBeforeRedirect: (cb) => {
+      onBeforeRedirect: (cb: (details: SessionRedirectDetails) => void) => {
         listener = cb;
       },
     },
-    emit: (details) => listener?.(details),
+    emit: (details: SessionRedirectDetails) => listener?.(details),
   };
 }
 
@@ -102,7 +106,7 @@ describe("registerSessionExpiryReload", () => {
 
   it("reloads the connected origin on a login redirect", () => {
     const ses = fakeSession();
-    const reloaded = [];
+    const reloaded: string[] = [];
     registerSessionExpiryReload(
       ses,
       (origin) => origin === "https://ws.databricks.com",
@@ -116,7 +120,7 @@ describe("registerSessionExpiryReload", () => {
 
   it("ignores a login redirect for an origin no window is connected to", () => {
     const ses = fakeSession();
-    const reloaded = [];
+    const reloaded: string[] = [];
     registerSessionExpiryReload(
       ses,
       () => false, // nothing is a connected server
@@ -130,7 +134,7 @@ describe("registerSessionExpiryReload", () => {
 
   it("ignores a non-login redirect", () => {
     const ses = fakeSession();
-    const reloaded = [];
+    const reloaded: string[] = [];
     registerSessionExpiryReload(
       ses,
       () => true,
@@ -150,7 +154,7 @@ describe("registerSessionExpiryReload", () => {
     // A malformed request URL must not throw out of the listener; it's
     // simply skipped (no origin to attribute the reload to).
     const ses = fakeSession();
-    const reloaded = [];
+    const reloaded: string[] = [];
     registerSessionExpiryReload(
       ses,
       () => true,

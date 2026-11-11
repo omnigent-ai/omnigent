@@ -1,4 +1,4 @@
-"use strict";
+import type { MenuItemConstructorOptions } from "electron";
 
 // The Quit menu item (⌘Q / Ctrl+Q) asks before quitting, because quitting also
 // disconnects the hosts this app runs and stops a local server it started.
@@ -6,24 +6,64 @@
 // Quit, OS logout, and Restart to Update call app.quit() directly.
 
 /** settings.json key; anything other than `false` keeps the prompt on. */
-const CONFIRM_BEFORE_QUIT_SETTING = "confirm_before_quit";
+export const CONFIRM_BEFORE_QUIT_SETTING = "confirm_before_quit";
 
-/**
- * @param {Record<string, unknown>} settings
- * @returns {boolean}
- */
-function confirmBeforeQuitEnabled(settings) {
+/** Settings as read from and written to settings.json. */
+export type QuitSettings = Record<string, unknown>;
+
+/** What quitting would stop. */
+export interface RunningWork {
+  hosts: number;
+  localServer: boolean;
+}
+
+/** The part of a clicked checkbox menu item the warn toggle reads and resets. */
+export interface CheckedMenuItem {
+  checked: boolean;
+}
+
+export interface WarnBeforeQuitMenuItem extends MenuItemConstructorOptions {
+  id: string;
+  label: string;
+  type: "checkbox";
+  checked: boolean;
+  click: (item: CheckedMenuItem) => void;
+}
+
+export interface QuitMenuItem extends MenuItemConstructorOptions {
+  id: string;
+  label: string;
+  accelerator: string;
+  click: () => void;
+}
+
+/** `ask` shows the prompt in a window's page; false when no page can. */
+export interface QuitConfirmationDeps {
+  isMac: boolean;
+  appName: () => string;
+  loadSettings: () => QuitSettings;
+  saveSettings: (settings: QuitSettings) => void;
+  runningWork: () => RunningWork;
+  ask: (detail: string | null) => boolean;
+  quit: () => void;
+}
+
+export interface QuitConfirmation {
+  requestQuit: () => void;
+  confirmQuit: (choice: { dontAskAgain: boolean }) => void;
+  menuItems: () => [WarnBeforeQuitMenuItem, QuitMenuItem];
+  quitStarted: () => void;
+}
+
+export function confirmBeforeQuitEnabled(settings: QuitSettings | null | undefined): boolean {
   return settings?.[CONFIRM_BEFORE_QUIT_SETTING] !== false;
 }
 
 /**
  * The prompt's detail line naming what quitting stops, or null when this app
  * runs nothing that would stop.
- *
- * @param {{ hosts: number, localServer: boolean }} running
- * @returns {string | null}
  */
-function quitPromptDetail({ hosts, localServer }) {
+export function quitPromptDetail({ hosts, localServer }: RunningWork): string | null {
   if (hosts > 0 && localServer) {
     return "Sessions running on this computer will go offline, and the local Omnigent server will stop.";
   }
@@ -32,18 +72,7 @@ function quitPromptDetail({ hosts, localServer }) {
   return null;
 }
 
-/**
- * @param {{
- *   isMac: boolean,
- *   appName: () => string,
- *   loadSettings: () => Record<string, unknown>,
- *   saveSettings: (settings: Record<string, unknown>) => void,
- *   runningWork: () => { hosts: number, localServer: boolean },
- *   ask: (detail: string | null) => boolean,
- *   quit: () => void,
- * }} deps `ask` shows the prompt in a window's page; false when no page can.
- */
-function createQuitConfirmation({
+export function createQuitConfirmation({
   isMac,
   appName,
   loadSettings,
@@ -51,12 +80,12 @@ function createQuitConfirmation({
   runningWork,
   ask,
   quit,
-}) {
+}: QuitConfirmationDeps): QuitConfirmation {
   // Once shutdown has started, a Cancel could not stop it, so Quit stops asking.
   let quitting = false;
 
-  /** @returns {boolean} false when the setting could not be saved */
-  function setConfirmBeforeQuit(enabled) {
+  /** False when the setting could not be saved. */
+  function setConfirmBeforeQuit(enabled: boolean): boolean {
     try {
       const settings = loadSettings();
       settings[CONFIRM_BEFORE_QUIT_SETTING] = enabled;
@@ -88,7 +117,7 @@ function createQuitConfirmation({
    * The page's prompt was confirmed, optionally with "Don't ask again" checked.
    * The user said quit, so this quits even when that choice can't be saved.
    */
-  function confirmQuit({ dontAskAgain }) {
+  function confirmQuit({ dontAskAgain }: { dontAskAgain: boolean }): void {
     if (dontAskAgain) setConfirmBeforeQuit(false);
     startQuit();
   }
@@ -96,10 +125,8 @@ function createQuitConfirmation({
   /**
    * The warn-before-quitting toggle and Quit itself, for the macOS app menu or
    * the File menu elsewhere.
-   *
-   * @returns {Electron.MenuItemConstructorOptions[]}
    */
-  function menuItems() {
+  function menuItems(): [WarnBeforeQuitMenuItem, QuitMenuItem] {
     return [
       {
         id: "confirm_before_quit",
@@ -130,10 +157,3 @@ function createQuitConfirmation({
     },
   };
 }
-
-module.exports = {
-  CONFIRM_BEFORE_QUIT_SETTING,
-  confirmBeforeQuitEnabled,
-  createQuitConfirmation,
-  quitPromptDetail,
-};

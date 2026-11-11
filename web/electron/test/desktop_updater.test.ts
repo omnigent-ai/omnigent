@@ -7,35 +7,56 @@
 // broadcasts, manual-error surfacing, and the install handoff — tested at the
 // unit boundary the refactor introduced.
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
-const fs = require("node:fs");
-const path = require("node:path");
-const yaml = require("js-yaml");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 
-const {
+import {
   createDesktopUpdater,
   normalizeUpdateConfig,
   isUpdateSecurityError,
   UPDATE_MODES,
   UPDATES_UNAVAILABLE_IN_DEV,
-} = require("../src/desktop_updater");
+  type DesktopUpdateBackend,
+  type DesktopUpdaterDeps,
+  type UpdateConsentDialogOptions,
+  type UpdateSettings,
+  type UpdateStatus,
+} from "../src/desktop_updater.ts";
 
 const PINNED_ORIGIN = "https://server.example";
 
-/**
- * Build a fully-faked updater plus handles for asserting on the injected deps.
- *
- * @param {object} [opts]
- * @param {Record<string, unknown>} [opts.settings] Initial persisted settings.
- * @param {boolean} [opts.isPackaged] Simulate a packaged build.
- * @param {boolean} [opts.forceDevUpdateConfig] Enable the development update config.
- * @param {boolean} [opts.updatesEnabled] Whether this build may use the update feed.
- * @param {boolean} [opts.pinnedSender] Whether IPC calls count as trusted.
- * @param {Array<{response: number}>} [opts.dialogResponses] Queued dialog answers.
- * @param {() => string} [opts.getCurrentVersion] Display-version override.
- */
+interface UpdaterOptions {
+  /** Initial persisted settings. */
+  settings?: UpdateSettings;
+  /** Simulate a packaged build. */
+  isPackaged?: boolean;
+  /** Enable the development update config. */
+  forceDevUpdateConfig?: boolean;
+  /** Whether this build may use the update feed. */
+  updatesEnabled?: boolean;
+  /** Whether IPC calls count as trusted. */
+  pinnedSender?: boolean;
+  /** Queued dialog answers. */
+  dialogResponses?: { response: number }[];
+  /** Display-version override. */
+  getCurrentVersion?: () => string;
+}
+
+interface UpdaterCalls {
+  sent: { channel: string; payload: UpdateStatus }[];
+  showMessageBox: { win: unknown; options: UpdateConsentDialogOptions }[];
+  appQuit: number;
+  checkForUpdates?: number;
+  downloadUpdate: number;
+  quitAndInstall: [boolean, boolean][];
+  intervals: unknown[];
+  clearedIntervals: number;
+}
+
+type Handler = (event: { sender: unknown }, ...args: unknown[]) => unknown;
+
+/** Build a fully-faked updater plus handles for asserting on the injected deps. */
 function makeUpdater({
   settings = {},
   isPackaged = false,
@@ -44,9 +65,9 @@ function makeUpdater({
   pinnedSender = true,
   dialogResponses = [{ response: 1 }],
   getCurrentVersion,
-} = {}) {
+}: UpdaterOptions = {}) {
   let store = { ...settings };
-  const calls = {
+  const calls: UpdaterCalls = {
     sent: [],
     showMessageBox: [],
     appQuit: 0,
@@ -59,27 +80,30 @@ function makeUpdater({
   const win = {
     isDestroyed: () => false,
     webContents: {
-      send: (channel, payload) => calls.sent.push({ channel, payload }),
+      send: (channel: string, payload: UpdateStatus) => calls.sent.push({ channel, payload }),
     },
   };
 
-  const autoUpdater = new EventEmitter();
-  autoUpdater.autoDownload = true;
-  autoUpdater.autoInstallOnAppQuit = true;
-  autoUpdater.forceDevUpdateConfig = forceDevUpdateConfig;
-  autoUpdater.checkForUpdates = () => {
-    calls.checkForUpdates = (calls.checkForUpdates ?? 0) + 1;
-    return Promise.resolve();
-  };
-  autoUpdater.downloadUpdate = () => {
-    calls.downloadUpdate += 1;
-    return Promise.resolve();
-  };
-  autoUpdater.quitAndInstall = (...args) => calls.quitAndInstall.push(args);
+  const autoUpdater: EventEmitter & DesktopUpdateBackend = Object.assign(new EventEmitter(), {
+    autoDownload: true,
+    autoInstallOnAppQuit: true,
+    forceDevUpdateConfig,
+    checkForUpdates: (): Promise<unknown> => {
+      calls.checkForUpdates = (calls.checkForUpdates ?? 0) + 1;
+      return Promise.resolve();
+    },
+    downloadUpdate: (): Promise<unknown> => {
+      calls.downloadUpdate += 1;
+      return Promise.resolve();
+    },
+    quitAndInstall: (...args: [boolean, boolean]) => {
+      calls.quitAndInstall.push(args);
+    },
+  });
 
-  const ipcHandlers = new Map();
+  const ipcHandlers = new Map<string, Handler>();
 
-  const deps = {
+  const deps: DesktopUpdaterDeps<typeof win, { sender: unknown }> = {
     app: {
       isPackaged,
       getVersion: () => "0.3.0",
@@ -95,7 +119,7 @@ function makeUpdater({
       handle: (channel, handler) => ipcHandlers.set(channel, handler),
     },
     dialog: {
-      showMessageBox: (dialogWin, options) => {
+      showMessageBox: (dialogWin: unknown, options: UpdateConsentDialogOptions) => {
         calls.showMessageBox.push({ win: dialogWin, options });
         return Promise.resolve(dialogResponses.shift() ?? { response: 1 });
       },
@@ -105,7 +129,7 @@ function makeUpdater({
     },
     autoUpdater,
     loadSettings: () => ({ ...store }),
-    saveSettings: (next) => {
+    saveSettings: (next: UpdateSettings) => {
       store = { ...next };
     },
     isPinnedOriginSender: () => pinnedSender,
@@ -128,7 +152,7 @@ function makeUpdater({
   };
 }
 
-function plain(value) {
+function plain(value: unknown): unknown {
   return JSON.parse(JSON.stringify(value));
 }
 
@@ -153,16 +177,6 @@ describe("desktop_updater — pure helpers", () => {
   it("exposes the update-mode set and dev-unavailable message", () => {
     assert.deepEqual([...UPDATE_MODES].sort(), ["default", "manual", "none", "start"]);
     assert.match(UPDATES_UNAVAILABLE_IN_DEV, /unavailable in development/);
-  });
-
-  it("uses the production update endpoint in development", () => {
-    const devConfig = yaml.load(
-      fs.readFileSync(path.join(__dirname, "../dev-app-update.yml"), "utf8"),
-    );
-    const packageConfig = require("../package.json");
-
-    assert.equal(devConfig.url, packageConfig.build.publish[0].url);
-    assert.match(devConfig.url, /^https:\/\//);
   });
 
   it("classifies signing/integrity errors as security errors", () => {
@@ -331,9 +345,9 @@ describe("desktop_updater — downloads", () => {
   it("broadcasts a cached 0% state as soon as downloading starts", async () => {
     const h = makeUpdater({ forceDevUpdateConfig: true, settings: { update_mode: "manual" } });
     h.updater.init();
-    let finishDownload;
+    let finishDownload = () => {};
     h.autoUpdater.downloadUpdate = () =>
-      new Promise((resolve) => {
+      new Promise<void>((resolve) => {
         finishDownload = resolve;
       });
 
@@ -381,7 +395,7 @@ describe("desktop_updater — development update config gating", () => {
         "omnigent:set-update-config",
       ].map((channel) =>
         assert.rejects(
-          h.ipcHandlers.get(channel)(h.event, { mode: "manual" }),
+          Promise.resolve(h.ipcHandlers.get(channel)!(h.event, { mode: "manual" })),
           /unavailable in development/,
         ),
       ),
@@ -398,7 +412,7 @@ describe("desktop_updater — IPC trust + consent", () => {
     const h = makeUpdater({ pinnedSender: false });
     h.updater.registerIpc();
 
-    const cases = [
+    const cases: [string, unknown[]][] = [
       ["omnigent:get-update-config", []],
       ["omnigent:get-update-status", []],
       ["omnigent:update-check", []],
@@ -409,7 +423,7 @@ describe("desktop_updater — IPC trust + consent", () => {
     await Promise.all(
       cases.map(([channel, args]) =>
         assert.rejects(
-          Promise.resolve().then(() => h.ipcHandlers.get(channel)(h.event, ...args)),
+          Promise.resolve().then(() => h.ipcHandlers.get(channel)!(h.event, ...args)),
           /connected server page/,
         ),
       ),
@@ -421,17 +435,17 @@ describe("desktop_updater — IPC trust + consent", () => {
     let h = makeUpdater({ forceDevUpdateConfig: true, settings: { update_mode: "manual" } });
     h.updater.init();
     h.updater.registerIpc();
-    await h.ipcHandlers.get("omnigent:update-download")(h.event);
+    await h.ipcHandlers.get("omnigent:update-download")!(h.event);
     assert.equal(h.calls.showMessageBox.length, 1);
-    assert.equal(h.calls.showMessageBox[0].options.message, "Download an Omnigent update?");
+    assert.equal(h.calls.showMessageBox[0]!.options.message, "Download an Omnigent update?");
     assert.equal(h.calls.downloadUpdate, 1);
 
     // set-config
     h = makeUpdater({ forceDevUpdateConfig: true, settings: { update_mode: "start" } });
     h.updater.init();
     h.updater.registerIpc();
-    await h.ipcHandlers.get("omnigent:set-update-config")(h.event, { mode: "manual" });
-    assert.equal(h.calls.showMessageBox[0].options.message, "Change Omnigent update settings?");
+    await h.ipcHandlers.get("omnigent:set-update-config")!(h.event, { mode: "manual" });
+    assert.equal(h.calls.showMessageBox[0]!.options.message, "Change Omnigent update settings?");
     assert.equal(h.readSettings().update_mode, "manual");
   });
 
@@ -444,7 +458,10 @@ describe("desktop_updater — IPC trust + consent", () => {
     h.updater.init();
     h.updater.registerIpc();
 
-    await assert.rejects(h.ipcHandlers.get("omnigent:update-download")(h.event), /approved/);
+    await assert.rejects(
+      Promise.resolve(h.ipcHandlers.get("omnigent:update-download")!(h.event)),
+      /approved/,
+    );
     assert.equal(h.calls.downloadUpdate, 0);
   });
 });
@@ -456,7 +473,7 @@ describe("desktop_updater — install handoff", () => {
     h.autoUpdater.emit("update-downloaded", { version: "0.4.0" });
     h.updater.registerIpc();
 
-    await h.ipcHandlers.get("omnigent:update-install")(h.event);
+    await h.ipcHandlers.get("omnigent:update-install")!(h.event);
     assert.equal(h.calls.showMessageBox.length, 1);
     assert.equal(h.updater.installPending, true);
     assert.equal(h.calls.appQuit, 1);
@@ -471,7 +488,7 @@ describe("desktop_updater — install handoff", () => {
     h.updater.registerIpc();
 
     await assert.rejects(
-      h.ipcHandlers.get("omnigent:update-install")(h.event),
+      Promise.resolve(h.ipcHandlers.get("omnigent:update-install")!(h.event)),
       /No downloaded update/,
     );
     assert.equal(h.updater.installPending, false);

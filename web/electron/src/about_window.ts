@@ -4,14 +4,107 @@
 // live in this bundled Electron page instead. Its narrow preload can only read
 // local version information and trigger fixed-purpose update checks.
 
-"use strict";
+import type { BrowserWindowConstructorOptions } from "electron";
+import { pathToFileURL } from "node:url";
 
-const { pathToFileURL } = require("node:url");
+import type { DesktopUpdater } from "./desktop_updater.ts";
 
-const ABOUT_WIDTH = 760;
-const ABOUT_HEIGHT = 480;
+export const ABOUT_WIDTH = 760;
+export const ABOUT_HEIGHT = 480;
 
-function platformDisplayName(platform) {
+/** The parts of a NativeImage the About page's icon comes from. */
+export interface AppIconImage {
+  isEmpty: () => boolean;
+  toDataURL: (options: { scaleFactor: number }) => string;
+}
+
+export interface AppIconSources {
+  app: {
+    isPackaged: boolean;
+    getFileIcon: (path: string, options: { size: "large" }) => Promise<AppIconImage>;
+  };
+  nativeImage: {
+    createFromNamedImage: (imageName: string) => AppIconImage;
+    createFromPath: (path: string) => AppIconImage;
+  };
+  platform?: NodeJS.Platform;
+  executablePath?: string;
+  fallbackIconPath: string;
+}
+
+/** The parts of a shell window the About modal attaches to. */
+export interface AboutParentWindow {
+  isDestroyed: () => boolean;
+  on: (event: "closed", listener: () => void) => unknown;
+  removeListener: (event: "closed", listener: () => void) => unknown;
+}
+
+/** The parts of the About BrowserWindow this module drives. */
+export interface AboutWindowHandle {
+  excludedFromShownWindowsMenu?: boolean;
+  webContents: {
+    setWindowOpenHandler: (handler: () => { action: "deny" }) => void;
+    on: (
+      event: "will-navigate",
+      listener: (event: { preventDefault: () => void }, url: string) => void,
+    ) => unknown;
+  };
+  isDestroyed: () => boolean;
+  isMinimized: () => boolean;
+  restore: () => void;
+  show: () => void;
+  focus: () => void;
+  close: () => void;
+  destroy: () => void;
+  loadFile: (filePath: string) => Promise<void>;
+  once: (event: "ready-to-show", listener: () => void) => unknown;
+  on: (event: "closed", listener: () => void) => unknown;
+}
+
+export type AboutWindowOptions<Parent> = Omit<BrowserWindowConstructorOptions, "parent"> & {
+  parent?: Parent;
+};
+
+/** The parts of an IPC event used to recognize the About page. */
+export interface AboutIpcEvent {
+  sender: { getURL?: () => string } | null | undefined;
+  senderFrame?: { url?: string } | null;
+}
+
+export interface AboutWindowDeps<
+  Parent extends AboutParentWindow,
+  About extends AboutWindowHandle,
+> {
+  BrowserWindow: new (options: AboutWindowOptions<Parent>) => About;
+  ipcMain: {
+    handle: (channel: string, listener: (event: AboutIpcEvent) => unknown) => void;
+    on: (channel: string, listener: (event: AboutIpcEvent) => void) => unknown;
+  };
+  nativeTheme: { shouldUseDarkColors: boolean };
+  updater: Pick<
+    DesktopUpdater,
+    "getStatus" | "checkForUpdates" | "downloadUpdate" | "installUpdateNow"
+  >;
+  getDesktopVersion: () => string;
+  getAppIconDataUrl: () => Promise<string | null>;
+  getCliStatus: () => Promise<unknown>;
+  onDesktopDownloadStarted?: (parent: Parent) => void;
+  onClosed?: (parent: Parent) => void;
+  /** Absolute path to the bundled About HTML. */
+  aboutPage: string;
+  /** Absolute path to about_preload.js. */
+  preloadPath: string;
+  platform?: NodeJS.Platform;
+}
+
+export interface AboutWindow<Parent, About> {
+  open: (nextParent?: Parent | null) => About;
+  close: () => void;
+  registerIpc: () => void;
+  senderIsAbout: (event: AboutIpcEvent) => boolean;
+}
+
+export function platformDisplayName(platform: NodeJS.Platform): string {
   if (platform === "darwin") return "macOS";
   if (platform === "win32") return "Windows";
   if (platform === "linux") return "Linux";
@@ -19,14 +112,14 @@ function platformDisplayName(platform) {
 }
 
 /** Resolve the current platform app icon, with the bundled PNG as fallback. */
-async function resolveAppIconDataUrl({
+export async function resolveAppIconDataUrl({
   app,
   nativeImage,
   platform = process.platform,
   executablePath = process.execPath,
   fallbackIconPath,
-}) {
-  const candidates = [];
+}: AppIconSources): Promise<string | null> {
+  const candidates: (() => AppIconImage | Promise<AppIconImage>)[] = [];
   if (app.isPackaged && platform === "darwin") {
     candidates.push(() => nativeImage.createFromNamedImage("NSApplicationIcon"));
     candidates.push(() => app.getFileIcon(executablePath, { size: "large" }));
@@ -35,10 +128,10 @@ async function resolveAppIconDataUrl({
   }
   candidates.push(() => nativeImage.createFromPath(fallbackIconPath));
 
-  async function resolveCandidate(index) {
+  async function resolveCandidate(index: number): Promise<string | null> {
     if (index >= candidates.length) return null;
     try {
-      const image = await candidates[index]();
+      const image = await candidates[index]!();
       if (image && !image.isEmpty()) return image.toDataURL({ scaleFactor: 2 });
     } catch {
       // Try the next source. Native icon lookup can fail on older platforms.
@@ -49,23 +142,10 @@ async function resolveAppIconDataUrl({
   return resolveCandidate(0);
 }
 
-/**
- * @param {object} deps
- * @param {typeof import("electron").BrowserWindow} deps.BrowserWindow
- * @param {import("electron").IpcMain} deps.ipcMain
- * @param {import("electron").NativeTheme} deps.nativeTheme
- * @param {{ getStatus: Function, checkForUpdates: Function,
- *   downloadUpdate: Function, installUpdateNow: Function }} deps.updater
- * @param {() => string} deps.getDesktopVersion
- * @param {() => Promise<string | null>} deps.getAppIconDataUrl
- * @param {() => Promise<object>} deps.getCliStatus
- * @param {(parent: Electron.BrowserWindow) => void} deps.onDesktopDownloadStarted
- * @param {(parent: Electron.BrowserWindow) => void} deps.onClosed
- * @param {string} deps.aboutPage Absolute path to the bundled About HTML.
- * @param {string} deps.preloadPath Absolute path to about_preload.js.
- * @param {NodeJS.Platform} [deps.platform]
- */
-function createAboutWindow({
+export function createAboutWindow<
+  Parent extends AboutParentWindow,
+  About extends AboutWindowHandle,
+>({
   BrowserWindow,
   ipcMain,
   nativeTheme,
@@ -78,14 +158,12 @@ function createAboutWindow({
   aboutPage,
   preloadPath,
   platform = process.platform,
-}) {
+}: AboutWindowDeps<Parent, About>): AboutWindow<Parent, About> {
   const aboutPageUrl = pathToFileURL(aboutPage);
-  /** @type {Electron.BrowserWindow | null} */
-  let about = null;
-  /** @type {Electron.BrowserWindow | null} */
-  let parent = null;
+  let about: About | null = null;
+  let parent: Parent | null = null;
 
-  function senderIsAbout(event) {
+  function senderIsAbout(event: AboutIpcEvent): boolean {
     if (!about || about.isDestroyed() || event.sender !== about.webContents) return false;
     const frameUrl = event.senderFrame?.url ?? event.sender?.getURL?.() ?? "";
     try {
@@ -96,7 +174,7 @@ function createAboutWindow({
     }
   }
 
-  function guard(event) {
+  function guard(event: AboutIpcEvent): void {
     if (!senderIsAbout(event)) {
       throw new Error("About IPC is only available to the bundled About window");
     }
@@ -106,7 +184,7 @@ function createAboutWindow({
     if (about && !about.isDestroyed()) about.close();
   }
 
-  function open(nextParent = null) {
+  function open(nextParent: Parent | null = null): About {
     const validParent = nextParent && !nextParent.isDestroyed() ? nextParent : null;
     if (about && !about.isDestroyed()) {
       if (parent === validParent) {
@@ -214,11 +292,3 @@ function createAboutWindow({
 
   return { open, close: closeAbout, registerIpc, senderIsAbout };
 }
-
-module.exports = {
-  createAboutWindow,
-  resolveAppIconDataUrl,
-  platformDisplayName,
-  ABOUT_WIDTH,
-  ABOUT_HEIGHT,
-};
