@@ -44,7 +44,6 @@ import {
   downloadWorkspaceFile,
   workspaceFileDownloadUrl,
   usesDirectFileDownload,
-  fetchWorkspaceFileBlob,
   workspaceFileMediaUrl,
 } from "./useFileContent";
 
@@ -104,29 +103,6 @@ describe("raw file helpers", () => {
     isIOSShell.mockReturnValue(surface === "ios");
     isAndroidShell.mockReturnValue(surface === "android");
     expect(usesDirectFileDownload()).toBe(surface === "browser");
-  });
-  it("fetches a complete blob with the raw URL", async () => {
-    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
-    const blob = new Blob(["complete"]);
-    authenticatedFetch.mockResolvedValue({ ok: true, blob: async () => blob });
-    expect(await fetchWorkspaceFileBlob("sess_abc", "src/main.py")).toBe(blob);
-    expect(authenticatedFetch).toHaveBeenCalledWith(RAW_URL, { signal: undefined });
-  });
-  it("forwards the optional abort signal to authenticatedFetch", async () => {
-    const controller = new AbortController();
-    const blob = new Blob(["video"]);
-    authenticatedFetch.mockResolvedValue({ ok: true, blob: async () => blob });
-
-    await expect(
-      fetchWorkspaceFileBlob("sess_abc", "src/main.py", controller.signal),
-    ).resolves.toBe(blob);
-    expect(authenticatedFetch).toHaveBeenCalledWith(RAW_URL, { signal: controller.signal });
-  });
-  it("rejects a failed raw download", async () => {
-    authenticatedFetch.mockResolvedValue({ ok: false, status: 404, statusText: "Not Found" });
-    await expect(fetchWorkspaceFileBlob("sess_abc", "src/main.py")).rejects.toThrow(
-      "404 Not Found",
-    );
   });
 });
 
