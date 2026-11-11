@@ -7,7 +7,30 @@ from collections.abc import Mapping
 
 CLIENT_SURFACE_LABEL_KEY = "omnigent.client_surface"
 CLIENT_SURFACE_ENV_VAR = "OMNIGENT_CLIENT_SURFACE"
-CLIENT_SURFACES = frozenset({"web", "desktop", "ios", "android", "mobile", "cli"})
+CLIENT_SURFACES = frozenset(
+    {
+        "web",
+        "desktop",
+        "ios",
+        "android",
+        "mobile",
+        "cli",
+        "runner",
+        "host",
+        "harness",
+        "sdk",
+        "script",
+    }
+)
+# User-Agent product tokens Omnigent's own Python clients send, e.g.
+# ``omnigent-runner/0.22.0 python-httpx/0.28.1``; ``omnigent-client`` is the SDK.
+_OMNIGENT_USER_AGENT_SURFACES = {
+    "omnigent-cli/": "cli",
+    "omnigent-runner/": "runner",
+    "omnigent-host/": "host",
+    "omnigent-harness/": "harness",
+    "omnigent-client/": "sdk",
+}
 
 
 def resolve_client_surface(
@@ -40,23 +63,29 @@ def classify_surface(user_agent: str | None) -> str:
 
     Mapping:
     * ``None`` or absent → ``"unknown"``
+    * ``"omnigent-<component>/"`` prefix → ``"cli"``, ``"runner"``, ``"host"``,
+      ``"harness"``, or ``"sdk"`` (``omnigent-client``)
     * ``"Electron"`` in UA → ``"desktop"``
     * ``"iPhone"`` or ``"iPad"`` in UA → ``"ios"``
     * ``"Android"`` in UA → ``"android"``
-    * empty / ``"python-httpx"`` / ``"python-requests"`` → ``"cli"``
-    * anything else → ``"web"``
+    * a browser (``"Mozilla/"``) → ``"web"``
+    * anything else (empty, bare ``python-httpx``, ``Python-urllib``, ``node``,
+      ``Bun``, ``curl``, ...) → ``"script"``: a client that is not Omnigent's own
 
     :param user_agent: Raw ``User-Agent`` header value, or ``None``.
     :returns: Surface label string.
     """
     if user_agent is None:
         return "unknown"
-    if not user_agent or "python-httpx" in user_agent or "python-requests" in user_agent:
-        return "cli"
+    for prefix, surface in _OMNIGENT_USER_AGENT_SURFACES.items():
+        if user_agent.startswith(prefix):
+            return surface
     if "Electron" in user_agent:
         return "desktop"
     if "iPhone" in user_agent or "iPad" in user_agent:
         return "ios"
     if "Android" in user_agent:
         return "android"
-    return "web"
+    if "Mozilla/" in user_agent:
+        return "web"
+    return "script"

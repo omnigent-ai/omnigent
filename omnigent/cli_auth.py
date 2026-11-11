@@ -735,7 +735,11 @@ def databricks_request_headers(
     omits the token and still gets routing.
 
     Both values are omitted when absent, so single-workspace and
-    local-unauthenticated callers get ``{}`` and are unaffected.
+    local-unauthenticated callers get only the ``User-Agent``.
+
+    Always sets ``User-Agent`` to this component's identity, e.g.
+    ``omnigent-runner/0.22.0 python-httpx/0.28.1`` (see
+    :func:`~omnigent.telemetry.request_headers.client_user_agent`).
 
     Also folds in this machine's telemetry installation ID (omitted when
     telemetry is opted out of), so a server-side emitter can attribute an event
@@ -762,16 +766,21 @@ def databricks_request_headers(
     :param org_id: An explicit workspace selector captured from the current
         server URL. When omitted, the selector from the stored login record is
         used. An explicit value wins over stored state.
-    :returns: A header dict carrying ``Authorization``, ``X-Databricks-Org-Id``,
-        ``X-Databricks-Omnigent-Slice-Key``, ``X-Omnigent-Installation-Id``,
-        and/or the configured extra headers as available, possibly empty.
+    :returns: A header dict carrying ``User-Agent`` plus ``Authorization``,
+        ``X-Databricks-Org-Id``, ``X-Databricks-Omnigent-Slice-Key``,
+        ``X-Omnigent-Installation-Id``, and/or the configured extra headers as
+        available.
     """
-    from omnigent.telemetry.request_headers import telemetry_request_headers
+    from omnigent.telemetry.request_headers import (
+        client_identity_headers,
+        telemetry_request_headers,
+    )
 
-    # This machine's installation ID, so a server-side telemetry emitter can
-    # name the machine an event came from without a lookup. Empty when
-    # telemetry is opted out of.
-    headers: dict[str, str] = telemetry_request_headers()
+    # A User-Agent naming this component (runner, CLI, ...) so the server can
+    # tell Omnigent's own traffic from custom scripts. Then this machine's
+    # installation ID, so a server-side telemetry emitter can name the machine
+    # an event came from without a lookup (empty when telemetry is opted out).
+    headers: dict[str, str] = {**client_identity_headers(), **telemetry_request_headers()}
     if bearer_token:
         headers["Authorization"] = f"Bearer {bearer_token}"
     org_id = org_id or load_databricks_org_id(server_url)

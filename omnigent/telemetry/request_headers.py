@@ -9,12 +9,63 @@ free — and lets it skip the field when the header is absent.
 
 from __future__ import annotations
 
+import os
+import re
 import uuid
 
 # Installation ID of the machine making the request. Read by the server's
 # session-event route to attribute native turn-end / usage telemetry to the
 # host running the session.
 INSTALLATION_ID_HEADER = "X-Omnigent-Installation-Id"
+
+
+# Which Omnigent component this process is. Child processes (hooks, forwarders)
+# inherit it, so a helper a runner spawns identifies as that runner.
+CLIENT_COMPONENT_ENV_VAR = "OMNIGENT_CLIENT_COMPONENT"
+# ``omnigent-<component>/`` User-Agent product tokens; unknown values fall back to cli.
+CLIENT_COMPONENTS = frozenset({"cli", "host", "runner", "harness"})
+_DETAIL_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def set_client_component(component: str, detail: str | None = None) -> None:
+    """Record this process's component for its (and its children's) User-Agent.
+
+    :param component: One of :data:`CLIENT_COMPONENTS`, e.g. ``"runner"``.
+    :param detail: Optional qualifier, e.g. the harness name ``"claude-sdk"``.
+    """
+    os.environ[CLIENT_COMPONENT_ENV_VAR] = f"{component}/{detail}" if detail else component
+
+
+def client_user_agent() -> str:
+    """Return the User-Agent identifying this Omnigent component to the server.
+
+    :returns: e.g. ``"omnigent-runner/0.22.0 python-httpx/0.28.1"`` or
+        ``"omnigent-harness/0.22.0 (claude-sdk) python-httpx/0.28.1"``. The
+        trailing httpx token is kept for anything that sniffs it.
+    """
+    import httpx
+
+    from omnigent.version import VERSION
+
+    component, _, detail = os.environ.get(CLIENT_COMPONENT_ENV_VAR, "").partition("/")
+    if component not in CLIENT_COMPONENTS:
+        component, detail = "cli", ""
+    product = f"omnigent-{component}/{VERSION}"
+    detail = _DETAIL_UNSAFE_RE.sub("", detail)[:64]
+    if detail:
+        product += f" ({detail})"
+    return f"{product} python-httpx/{httpx.__version__}"
+
+
+def client_identity_headers() -> dict[str, str]:
+    """Return the headers naming this Omnigent component on a server request.
+
+    Not gated on the telemetry opt-out: like any HTTP client's default
+    User-Agent, it carries only a component name and version.
+
+    :returns: ``{"User-Agent": client_user_agent()}``.
+    """
+    return {"User-Agent": client_user_agent()}
 
 
 def telemetry_request_headers() -> dict[str, str]:

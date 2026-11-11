@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.server.schemas import UsageReport
+from omnigent.version import VERSION
 
 from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
 from ._files import FilesNamespace
@@ -20,6 +21,9 @@ from ._session import Session
 from ._sessions import SessionsNamespace
 from ._sessions_chat import SessionsChat, ToolCallable
 from ._tool_handler import StreamHooks, ToolHandler
+
+# Default User-Agent for SDK requests, e.g. ``omnigent-client/0.22.0 python-httpx/0.28.1``.
+SDK_USER_AGENT = f"omnigent-client/{VERSION} python-httpx/{httpx.__version__}"
 
 
 def _port_or_default(url: httpx.URL) -> int | None:
@@ -137,7 +141,9 @@ class OmnigentClient:
         # requires a trusted Origin; the SDK sends none of its own, so the
         # sentinel is what lets it through. Caller-supplied headers win on
         # conflict (so an explicit Origin override is still honored).
-        default_headers = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+        # The User-Agent names the SDK so the server can tell an SDK script from
+        # Omnigent's own components, whose headers override it.
+        default_headers = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, "User-Agent": SDK_USER_AGENT}
         if headers:
             default_headers.update(headers)
         self._http = httpx.AsyncClient(

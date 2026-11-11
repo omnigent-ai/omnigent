@@ -12,6 +12,7 @@ import pytest
 
 from omnigent.telemetry.surface import (
     CLIENT_SURFACE_LABEL_KEY,
+    CLIENT_SURFACES,
     classify_surface,
     resolve_client_surface,
 )
@@ -44,14 +45,39 @@ def test_classify_surface_android() -> None:
     assert classify_surface("Mozilla/5.0 (Linux; Android 14) Mobile Safari/537.36") == "android"
 
 
-def test_classify_surface_python_httpx() -> None:
-    """python-httpx UA → ``"cli"``."""
-    assert classify_surface("python-httpx/0.27.0") == "cli"
+@pytest.mark.parametrize(
+    ("user_agent", "surface"),
+    [
+        ("omnigent-cli/0.22.0 python-httpx/0.28.1", "cli"),
+        ("omnigent-runner/0.22.0 python-httpx/0.28.1", "runner"),
+        ("omnigent-host/0.22.0 python-httpx/0.28.1", "host"),
+        ("omnigent-harness/0.22.0 (claude-sdk) python-httpx/0.28.1", "harness"),
+        ("omnigent-client/0.22.0 python-httpx/0.28.1", "sdk"),
+    ],
+)
+def test_classify_surface_omnigent_components(user_agent: str, surface: str) -> None:
+    """Omnigent's own clients are named by their ``omnigent-<component>/`` token."""
+    assert classify_surface(user_agent) == surface
 
 
-def test_classify_surface_empty_string() -> None:
-    """Empty string → ``"cli"``."""
-    assert classify_surface("") == "cli"
+@pytest.mark.parametrize(
+    "user_agent",
+    [
+        "",
+        "python-httpx/0.28.1",
+        "python-requests/2.32.3",
+        "Python-urllib/3.12",
+        "node",
+        "Bun/1.1.38",
+        "porthole-mcp/1.0",
+        "curl/8.5.0",
+        "testclient",
+        "Python/3.12 websockets/14.2",
+    ],
+)
+def test_classify_surface_non_browser_clients_are_scripts(user_agent: str) -> None:
+    """A non-browser UA without an Omnigent token is a script, not web or our CLI."""
+    assert classify_surface(user_agent) == "script"
 
 
 def test_classify_surface_regular_browser() -> None:
@@ -67,7 +93,7 @@ def test_classify_surface_regular_browser() -> None:
 # ── is_disabled ─────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("surface", ["desktop", "web", "ios", "android", "mobile", "cli"])
+@pytest.mark.parametrize("surface", sorted(CLIENT_SURFACES))
 def test_client_surface_header_overrides_transport_user_agent(surface: str) -> None:
     assert (
         resolve_client_surface({"x-omnigent-client": surface, "user-agent": "python-httpx/0.28"})
@@ -86,10 +112,134 @@ def test_client_surface_inherits_for_internal_child_requests() -> None:
 
 @pytest.mark.parametrize("header", [None, "unrecognised", "desktop\r\ninjected: value"])
 def test_client_surface_invalid_header_uses_user_agent(header: str | None) -> None:
-    headers = {"user-agent": "python-httpx/0.28"}
+    headers = {"user-agent": "omnigent-runner/0.22.0 python-httpx/0.28"}
     if header is not None:
         headers["x-omnigent-client"] = header
-    assert resolve_client_surface(headers) == "cli"
+    assert resolve_client_surface(headers) == "runner"
+
+
+def test_runner_spawned_child_session_keeps_parent_surface() -> None:
+    """A runner creating a child session doesn't relabel a desktop session as runner."""
+    parent = {CLIENT_SURFACE_LABEL_KEY: "desktop"}
+    headers = {"user-agent": client_user_agent_for("runner")}
+    assert resolve_client_surface(headers, parent_labels=parent) == "desktop"
+
+
+# ── client identity User-Agent ──────────────────────────────────────────────
+
+
+def client_user_agent_for(component: str, detail: str | None = None) -> str:
+    """Return the User-Agent a process of *component* would send."""
+    import os
+
+    from omnigent.telemetry.request_headers import (
+        CLIENT_COMPONENT_ENV_VAR,
+        client_user_agent,
+        set_client_component,
+    )
+
+    saved = os.environ.get(CLIENT_COMPONENT_ENV_VAR)
+    try:
+        set_client_component(component, detail)
+        return client_user_agent()
+    finally:
+        if saved is None:
+            os.environ.pop(CLIENT_COMPONENT_ENV_VAR, None)
+        else:
+            os.environ[CLIENT_COMPONENT_ENV_VAR] = saved
+
+
+def test_client_user_agent_defaults_to_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx
+
+    from omnigent.telemetry.request_headers import CLIENT_COMPONENT_ENV_VAR, client_user_agent
+    from omnigent.version import VERSION
+
+    monkeypatch.delenv(CLIENT_COMPONENT_ENV_VAR, raising=False)
+    assert client_user_agent() == f"omnigent-cli/{VERSION} python-httpx/{httpx.__version__}"
+
+
+@pytest.mark.parametrize(
+    ("component", "detail", "surface"),
+    [
+        ("cli", None, "cli"),
+        ("host", None, "host"),
+        ("runner", None, "runner"),
+        ("harness", "claude-sdk", "harness"),
+    ],
+)
+def test_client_user_agent_round_trips_through_classifier(
+    component: str, detail: str | None, surface: str
+) -> None:
+    user_agent = client_user_agent_for(component, detail)
+    assert user_agent.startswith(f"omnigent-{component}/")
+    assert " python-httpx/" in user_agent
+    assert classify_surface(user_agent) == surface
+
+
+def test_client_component_is_inherited_by_child_processes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hook or forwarder a runner spawns identifies as that runner."""
+    import subprocess
+    import sys
+
+    from omnigent.telemetry.request_headers import CLIENT_COMPONENT_ENV_VAR, set_client_component
+
+    monkeypatch.delenv(CLIENT_COMPONENT_ENV_VAR, raising=False)
+    set_client_component("runner")
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from omnigent.telemetry.request_headers import client_user_agent;"
+            "print(client_user_agent())",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert classify_surface(child.stdout.strip()) == "runner"
+
+
+def test_client_user_agent_names_harness_and_strips_unsafe_detail() -> None:
+    assert " (claude-sdk) " in client_user_agent_for("harness", "claude-sdk")
+    # Header-injection characters in the qualifier are dropped, not sent.
+    assert " (claudesdkx) " in client_user_agent_for("harness", "claude sdk\r\nx")
+
+
+def test_client_user_agent_unknown_component_falls_back_to_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.telemetry.request_headers import CLIENT_COMPONENT_ENV_VAR, client_user_agent
+
+    monkeypatch.setenv(CLIENT_COMPONENT_ENV_VAR, "evil/x")
+    assert client_user_agent().startswith("omnigent-cli/")
+    assert "(" not in client_user_agent()
+
+
+def test_server_request_headers_carry_component_user_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared server-request header builder names the calling component."""
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.telemetry.request_headers import CLIENT_COMPONENT_ENV_VAR
+
+    monkeypatch.setenv(CLIENT_COMPONENT_ENV_VAR, "runner")
+    headers = databricks_request_headers("http://127.0.0.1:6767")
+    assert classify_surface(headers["User-Agent"]) == "runner"
+
+
+async def test_sdk_client_sends_sdk_user_agent_unless_overridden() -> None:
+    from omnigent_client import OmnigentClient
+
+    async with OmnigentClient(base_url="http://127.0.0.1:1") as client:
+        assert classify_surface(client._http.headers["User-Agent"]) == "sdk"
+    runner_ua = client_user_agent_for("runner")
+    async with OmnigentClient(
+        base_url="http://127.0.0.1:1", headers={"User-Agent": runner_ua}
+    ) as client:
+        assert client._http.headers["User-Agent"] == runner_ua
 
 
 @pytest.fixture(autouse=True)

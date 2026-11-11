@@ -7238,6 +7238,9 @@ def _websocket_connect(
         **session_routing_headers(attach_url),
         "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
     }
+    # websockets adds its own User-Agent on top of the handshake headers; send only ours.
+    user_agent = handshake_headers.pop("User-Agent", None)
+    ua_kwargs: dict[str, Any] = {"user_agent_header": user_agent} if user_agent else {}
     # A remote (https) workspace yields a wss:// attach URL; build a verifying
     # SSL context from a real CA bundle so verification works on interpreters
     # whose OpenSSL default cert path is empty. ws:// passes ssl=None (the
@@ -7251,6 +7254,7 @@ def _websocket_connect(
                 additional_headers=handshake_headers,
                 close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
                 ssl=ssl_ctx,
+                **ua_kwargs,
             ),
         )
     except TypeError:
@@ -7261,6 +7265,7 @@ def _websocket_connect(
                 extra_headers=handshake_headers,
                 close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
                 ssl=ssl_ctx,
+                **ua_kwargs,
             ),
         )
 

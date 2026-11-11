@@ -2273,6 +2273,11 @@ def main() -> None:
 
     install_crash_handler(app_name="omnigent", repo="omnigent-ai/omnigent")
 
+    # Overrides a component inherited from a runner, e.g. in an Omnigent terminal.
+    from omnigent.telemetry.request_headers import set_client_component
+
+    set_client_component("cli")
+
     # Operators can force all use through a wrapper (e.g. `isaac omni`) by
     # setting OMNIGENT_REQUIRE_WRAPPER; the wrapper sets OMNIGENT_WRAPPER_BYPASS
     # to pass through. Refuse naked calls before any work happens.

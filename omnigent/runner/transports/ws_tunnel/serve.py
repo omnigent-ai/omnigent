@@ -1232,6 +1232,8 @@ async def _serve_tunnel_once(
     )
     if tunnel_token:
         headers[RUNNER_TUNNEL_TOKEN_HEADER] = tunnel_token
+    # websockets adds its own User-Agent on top of additional_headers; send only ours.
+    user_agent = headers.pop("User-Agent", None)
     # Verifying SSL context from a real CA bundle for wss:// — a bare default
     # context loads zero roots on uv / python-build-standalone Pythons (no
     # OpenSSL default cert path). Local runners use ws:// and pass ssl=None.
@@ -1268,6 +1270,7 @@ async def _serve_tunnel_once(
         websockets.connect(
             tunnel_url,
             additional_headers=headers,
+            user_agent_header=user_agent,
             open_timeout=_RUNNER_TUNNEL_OPEN_TIMEOUT_S,
             close_timeout=close_timeout,
             max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
