@@ -6777,17 +6777,42 @@ def _start_managed_launch_task(
     """
     # Read before the launch settles, which forgets a superseded entry.
     entry = tracker.get(session_id)
+    superseded_note = (
+        "The message wasn't sent: the session moved to another host before "
+        "its new sandbox was ready. Send it again."
+    )
 
-    async def release_claim() -> None:
-        # The claim is no runner's; left in place after a failed launch it
-        # would refuse every later move and launch.
-        if held_runner_id is not None:
-            with contextlib.suppress(ConversationNotFoundError):
+    async def release_claim() -> bool:
+        """
+        Drop a move's claim on the runner, keeping any host its sandbox bound.
+
+        A claim left behind would refuse every later launch, including the
+        one another replica makes to finish a committed binding.
+
+        :returns: Whether the session is still this launch's to settle;
+            ``False`` when another host took it after the claim was released.
+        """
+        if held_runner_id is None:
+            return True
+        current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if current is None:
+            return True
+        if current.runner_id == held_runner_id:
+            # Compare-and-clear on the exact binding read, so the host stays.
+            with contextlib.suppress(ConversationNotFoundError, ValueError):
                 await asyncio.to_thread(
-                    conversation_store.clear_host_binding,
-                    session_id,
-                    expected_runner_id=held_runner_id,
+                    conversation_store.clear_runner_id, session_id, expected_binding=current
                 )
+            return True
+        return current.host_id is None
+
+    async def settle_superseded() -> None:
+        # Another host runs the session: nothing failed there, but what was
+        # held for this sandbox will never reach it.
+        tracker.finish(session_id)
+        _publish_sandbox_status(session_id, "ready")
+        if startup is not None:
+            await startup.release_held_inputs(session_id, superseded_note)
 
     async def record_unbound_launch_failure() -> None:
         # Shutdown gave up on the launch. Bound, the host's replica finishes
@@ -6800,39 +6825,38 @@ def _start_managed_launch_task(
                 session_id, "the server shut down before the sandbox finished launching"
             )
 
+    async def settle_cancelled() -> None:
+        if not await release_claim():
+            await settle_superseded()
+        elif startup is not None:
+            await record_unbound_launch_failure()
+
     async def launch_and_record_failure() -> None:
         try:
             await launch
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(
-                    release_claim(), timeout=_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S
+                    settle_cancelled(), timeout=_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S
                 )
-            if startup is not None:
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(
-                        record_unbound_launch_failure(),
-                        timeout=_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S,
-                    )
             raise
         except Exception as exc:
-            await release_claim()
-            if startup is not None:
+            if not await release_claim():
+                await settle_superseded()
+            elif startup is not None:
                 await startup.record_launch_failure(
                     session_id, f"managed sandbox failed to launch: {exc}"
                 )
             raise
-        if startup is not None and entry is not None and entry.superseded:
-            await startup.release_held_inputs(
-                session_id,
-                "The message wasn't sent: the session moved to another host before "
-                "its new sandbox was ready. Send it again.",
-            )
+        if entry is not None and entry.superseded:
+            if startup is not None:
+                await startup.release_held_inputs(session_id, superseded_note)
             return
         failed = tracker.get(session_id)
         if failed is not None and failed.error is not None:
-            await release_claim()
-            if startup is not None:
+            if not await release_claim():
+                await settle_superseded()
+            elif startup is not None:
                 await startup.record_launch_failure(session_id, failed.error)
 
     launch_task = asyncio.create_task(launch_and_record_failure())

@@ -5240,7 +5240,27 @@ def register_core_routes(
         # ``WHERE runner_id IS NULL`` bind a host launch uses. A runner bound
         # since the checks above, or a concurrent move, makes the claim fail.
         claim = token_bound_runner_id(secrets.token_urlsafe(32))
-        if not await asyncio.to_thread(conversation_store.set_runner_id, session_id, claim):
+        claiming = asyncio.ensure_future(
+            asyncio.to_thread(conversation_store.set_runner_id, session_id, claim)
+        )
+        try:
+            claimed = await asyncio.shield(claiming)
+        except asyncio.CancelledError:
+            # The worker can still commit the claim after the request is gone;
+            # wait for it and take the claim back off.
+            with contextlib.suppress(Exception):
+                if await claiming:
+                    current = await asyncio.to_thread(
+                        conversation_store.get_conversation, session_id
+                    )
+                    if current is not None and current.runner_id == claim:
+                        await asyncio.to_thread(
+                            conversation_store.clear_runner_id,
+                            session_id,
+                            expected_binding=current,
+                        )
+            raise
+        if not claimed:
             raise OmnigentError(
                 "The session's host or runner changed while moving it. Reload and try again.",
                 code=ErrorCode.CONFLICT,
