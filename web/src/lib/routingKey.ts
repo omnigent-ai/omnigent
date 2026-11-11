@@ -2,7 +2,7 @@
 // route by workspace id onto one replica; this spreads clients across replicas. Stored in
 // localStorage (persistent in the desktop and mobile apps too), so a client stays on one replica.
 
-import { randomUUID } from "@/lib/randomUUID";
+import { randomUUID } from "./randomUUID.ts";
 
 /** Request header carrying the slice key; WebSockets and media URLs use `omnigent_slice_key`. */
 export const SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key";
