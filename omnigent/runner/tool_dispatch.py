@@ -4949,6 +4949,14 @@ async def _project_id_for_name(server_client: httpx.AsyncClient, name: str) -> s
     return project_id
 
 
+_REMINDER_SESSION_PARAMS = {
+    "include_items": "false",
+    "include_usage": "false",
+    "include_liveness": "false",
+    "include_live_status": "false",
+}
+
+
 async def _reminder_schedule_mismatch(
     server_client: httpx.AsyncClient, task: _JsonObject, when: datetime
 ) -> str | None:
@@ -5030,7 +5038,10 @@ async def _execute_reminder_set(
                     "sys_scheduled_task_create task"
                 }
             )
-        session = await server_client.get(_session_url(conversation_id), timeout=30.0)
+        # Only the agent id is needed, so skip the transcript, usage and live probes.
+        session = await server_client.get(
+            _session_url(conversation_id), params=_REMINDER_SESSION_PARAMS, timeout=30.0
+        )
         if session.status_code >= 400:
             return json.dumps(
                 {

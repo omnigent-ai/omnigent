@@ -638,9 +638,13 @@ class _ReminderClient(_RecordingClient):
         )
         self._session = session or _Resp(body={"id": "conv_1", "agent_id": "ag_1"})
         self.delete_response = _Resp(body={"deleted": True})
+        self.get_params: list[dict[str, str] | None] = []
 
-    async def get(self, url: str, *, timeout: object = None) -> _Resp:
+    async def get(
+        self, url: str, *, params: dict[str, str] | None = None, timeout: object = None
+    ) -> _Resp:
         self.calls.append(("GET", url, None))
+        self.get_params.append(params)
         if url == "/v1/info":
             return self._info
         return self._session
@@ -679,6 +683,13 @@ async def test_reminder_creates_a_one_time_task_that_continues_this_session() ->
         ("GET", "/v1/sessions/conv_1"),
         ("POST", "/v1/scheduled-tasks"),
     ]
+    # Only the agent id is needed from the session.
+    assert client.get_params[1] == {
+        "include_items": "false",
+        "include_usage": "false",
+        "include_liveness": "false",
+        "include_live_status": "false",
+    }
     assert client.calls[-1][2] == {
         "name": "Reminder: Check CI on PR #12.",
         "prompt": "[Reminder set for 2026-11-10 23:01 UTC]\nCheck CI on PR #12.",

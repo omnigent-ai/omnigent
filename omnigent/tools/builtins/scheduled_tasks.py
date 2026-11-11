@@ -523,7 +523,8 @@ class SysReminderSetTool(Tool):
             "say what to check or do. The reminder is listed as an automation; "
             "cancel it with sys_scheduled_task_delete and the returned "
             "scheduled_task_id. Works in top-level sessions you own on a "
-            "connected host, not in sub-agent sessions or managed sandboxes. For "
+            "connected host, not in sub-agent sessions, managed sandboxes, or "
+            "sessions running in a permission mode that skips approval. For "
             "a short wait inside an active turn, sys_timer_set (when enabled) is "
             "lighter."
         )
