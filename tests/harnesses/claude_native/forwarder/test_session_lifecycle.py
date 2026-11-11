@@ -163,6 +163,125 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("measured_resume_prefix", [False, True])
+@pytest.mark.parametrize("transcript_delayed", [False, True])
+@pytest.mark.parametrize("transfer_rejected", [False, True])
+async def test_clear_after_resume_preserves_input_recorded_before_cursor_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    measured_resume_prefix: bool,
+    transcript_delayed: bool,
+    transfer_rejected: bool,
+) -> None:
+    """A fresh cleared transcript must not inherit its parent's skip-prefix policy."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_old", bridge_id="bridge_shared", workspace=tmp_path)
+    old_transcript = tmp_path / "old.jsonl"
+    old_transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "old-input",
+                "message": {"role": "user", "content": "old history"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    old_content = old_transcript.read_text(encoding="utf-8")
+    parent_prefix = old_transcript.stat().st_size
+    forwarder._write_forward_state(
+        bridge_dir,
+        forwarder.TranscriptForwardState(
+            transcript_path=old_transcript,
+            line_cursor=0,
+            byte_offset=parent_prefix,
+            cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(old_transcript, parent_prefix),
+        ),
+    )
+    transcript = tmp_path / "new.jsonl"
+    native_record = (
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "after-clear",
+                "message": {"role": "user", "content": "new input"},
+            }
+        )
+        + "\n"
+    )
+    if not transcript_delayed:
+        transcript.write_text(native_record, encoding="utf-8")
+    target_session = "conv_old" if transfer_rejected else "conv_new"
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "SessionStart", "source": "clear", "transcript_path": str(transcript)},
+    )
+    mirrored: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_old",
+                    "agent_id": "agent",
+                    "runner_id": "runner",
+                    "labels": {BRIDGE_ID_LABEL_KEY: "bridge_shared"},
+                },
+            )
+        body = json.loads(request.content) if request.content else {}
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            return httpx.Response(201, json={"id": "conv_new"})
+        if request.url.path.endswith("/transfer") and transfer_rejected:
+            return httpx.Response(400, json={"detail": "terminal transfer rejected"})
+        if (
+            request.method == "POST"
+            and request.url.path == f"/v1/sessions/{target_session}/events"
+        ):
+            assert body["type"] == "external_conversation_item"
+            mirrored.append(body)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://ap"
+    ) as client:
+        hooks = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_old"
+        )
+        rotated_to = await forwarder._maybe_rotate_session_on_clear(
+            client=client, session_id="conv_old", bridge_dir=bridge_dir, state=hooks
+        )
+        assert rotated_to == (None if transfer_rejected else "conv_new")
+        assert read_active_session_id(bridge_dir) == target_session
+        if transcript_delayed:
+            transcript.write_text(native_record, encoding="utf-8")
+        state = await forwarder._ensure_state_for_transcript(
+            bridge_dir=bridge_dir,
+            state=None,
+            transcript_path=transcript,
+            start_at_end=True,
+            start_at_offset=parent_prefix if measured_resume_prefix else None,
+            session_id=target_session,
+        )
+        assert state.byte_offset == 0
+        for _ in range(2):
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id=target_session,
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=forwarder._ForwardDedupeState(),
+            )
+    assert [event["data"]["source_id"] for event in mirrored] == ["after-clear:0:message"]
+    assert transcript.read_text(encoding="utf-8") == native_record
+
+    assert old_transcript.read_text(encoding="utf-8") == old_content
+
+
+@pytest.mark.asyncio
 async def test_clear_hook_rotation_survives_old_runner_clear_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

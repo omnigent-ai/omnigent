@@ -45,11 +45,15 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.runner.session_init_protocol import (
+    SESSION_INIT_PAYLOAD_KEY,
+    SESSION_INIT_PROTOCOL_VERSION,
     RunnerSessionInitEnvelope,
     RunnerSessionInitSnapshot,
 )
+from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.stores.conversation_store import CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY
+from omnigent.terminals import TerminalRegistry
 from tests.budgets import budget
 from tests.runner.conftest import (
     _FakeProcessManager,
@@ -57,7 +61,7 @@ from tests.runner.conftest import (
     _ScriptedHarnessClient,
     _sse,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 # Synthetic id of the session whose Codex bridge a rotated session shares.
 _ROTATED_BRIDGE_ID = "5f1c0a9e7b2d4c36a8e4d1f0b9a72c15"
@@ -939,7 +943,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert build_calls[0]["cwd"] == tmp_path / "workspace"
     assert build_calls[0]["trust_project"] is True
     assert build_calls[0]["reconcile_process_registry"] is False
-    assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
+    assert build_calls[0]["developer_instructions"] == (
+        f"Be a concise, careful coding assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    )
     # Persisted pass-through args must reach launch resolution (--profile layering).
     assert resolve_calls and all(
         call["terminal_launch_args"] == ["--config", "approval_policy=on-request"]
@@ -1911,7 +1917,9 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         "mean the session snapshot workspace was ignored."
     )
     assert build_calls[0]["cwd"] != bundle_dir.resolve()  # never the spec-bundle dir
-    assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
+    assert build_calls[0]["developer_instructions"] == (
+        f"Be a concise, careful coding assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    )
 
     # Sandbox-override regression: the launched Codex terminal must inherit
     # the agent's sandbox: none rather than falling back to the platform
@@ -3891,6 +3899,60 @@ async def test_codex_session_needs_runner_terminal_false_without_client() -> Non
 
 
 @pytest.mark.asyncio
+async def test_codex_child_from_init_envelope_gets_sub_agent_idle_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Codex child identified only by its init envelope's parent is reaped after an hour."""
+    monkeypatch.delenv("OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S", raising=False)
+    terminal_registry = TerminalRegistry()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+        native_pane_idle_timeout_s=86400,
+    )
+    resource_registry = app.state.session_resource_registry
+    async with _runner_client(app) as client:
+        for session_id, parent_id in (("conv_top", None), ("conv_child", "conv_parent")):
+            envelope = RunnerSessionInitEnvelope(
+                protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+                server_version="0.16.0",
+                session_id=session_id,
+                agent_id="ag_worker",
+                snapshot=RunnerSessionInitSnapshot(
+                    created_at=1, updated_at=1, parent_session_id=parent_id
+                ),
+            )
+            response = await client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": session_id,
+                    "agent_id": "ag_worker",
+                    SESSION_INIT_PAYLOAD_KEY: envelope.model_dump(mode="json"),
+                },
+            )
+            assert response.status_code == 201, response.text
+            terminal_registry._by_conversation[session_id] = {
+                ("codex", "main"): make_test_terminal_instance(
+                    "codex", "main", tmp_path / session_id
+                )
+            }
+    monkeypatch.setattr(
+        resource_registry, "terminal_resource_role", lambda *_args: CODEX_NATIVE_TERMINAL_ROLE
+    )
+    reaper = app.state.native_pane_reaper
+    panes = reaper._list_native_panes()
+
+    def reapable_at(now: float) -> set[str]:
+        return {pane.conversation_id for pane in reaper._classify(now, panes, set())}
+
+    assert reapable_at(0.0) == set()
+    assert reapable_at(3599.0) == set()
+    assert reapable_at(3600.0) == {"conv_child"}
+    assert reapable_at(86400.0) == {"conv_top", "conv_child"}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["success", "setup_error", "forward_error", "cancelled"])
 async def test_codex_known_thread_forwarder_closes_retained_subscription(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
@@ -4964,6 +5026,11 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
 
     # A bare subscription default shape, with the real store-backed catalog
     # serving the seeded rows; the re-probe is stubbed off the real CLI.
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.setattr(codex_app_mod, "_find_codex_cli", lambda: sys.executable)
+    monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: sys.executable)
     monkeypatch.setattr(
         codex_app_mod,
         "resolve_native_codex_launch",
