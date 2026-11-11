@@ -55,6 +55,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -416,6 +417,16 @@ def _display_name_model_candidates(display_name: str) -> list[str]:
 
 def _resolve_context_window_sync(model_enum: str, catalog: dict[str, object]) -> int | None:
     """Resolve ``model_enum``'s context window from catalog metadata or shared model tables."""
+    from omnigent.llms.context_window import find_model_context_window
+
+    if os.environ.get("AP_CONTEXT_WINDOW_OVERRIDE") is not None:
+        override = find_model_context_window(model_enum)
+        return (
+            override
+            if isinstance(override, int) and not isinstance(override, bool) and override > 0
+            else None
+        )
+
     entries = _catalog_entries_for_model(model_enum, catalog)
     for _, entry in entries:
         for field_name in _CATALOG_WINDOW_FIELDS:
@@ -440,8 +451,6 @@ def _resolve_context_window_sync(model_enum: str, catalog: dict[str, object]) ->
     if " " in model_enum or "(" in model_enum:
         for slug in _display_name_model_candidates(model_enum):
             _add_candidate(slug)
-
-    from omnigent.llms.context_window import find_model_context_window
 
     for candidate in candidates:
         window = find_model_context_window(candidate)
@@ -2707,7 +2716,11 @@ async def _resolve_model_context_window(
                 exc_info=True,
             )
             return None
-        state.model_context_windows[model_enum] = window
+        # Only cache a miss once GetAvailableModels succeeded so a transient
+        # catalog error on an early turn recovers on later turns.
+        if window is not None or state.model_catalog is not None:
+            state.model_context_windows[model_enum] = window
+        return window
     return state.model_context_windows[model_enum]
 
 
@@ -2846,9 +2859,8 @@ async def _ensure_catalog(state: _ReaderState) -> dict[str, object]:
     """
     Return the cached ``GetAvailableModels`` catalog, fetching it when needed.
 
-    Fetched at most once per reader run; stored in ``state.model_catalog``.
-    Falls back to an empty dict on error so a catalog failure never kills the
-    telemetry path (the display-name resolver falls back to the raw enum).
+    Cached once fetched successfully; transient errors return an empty dict
+    without poisoning the cache so later turns can retry once ``agy`` responds.
 
     :param state: Per-run shared trackers.
     :returns: The catalog dict (possibly empty on fetch failure).
@@ -2863,7 +2875,7 @@ async def _ensure_catalog(state: _ReaderState) -> dict[str, object]:
             "model display names will fall back to raw enums",
             exc_info=True,
         )
-        catalog = {}
+        return {}
     state.model_catalog = catalog
     return catalog
 
@@ -3239,11 +3251,15 @@ async def _rotate_session_for_cascade(
             raise RuntimeError(f"session {old_session_id!r} has no agent_id")
         runner_id = old.get("runner_id")
         raw_labels = old.get("labels")
-        labels = (
+        labels: dict[str, str] = (
             {str(key): str(value) for key, value in raw_labels.items()}
             if isinstance(raw_labels, dict)
             else {}
         )
+        # Drop per-conversation occupancy labels so a fresh /clear session
+        # starts empty instead of inheriting the prior conversation's ring.
+        labels.pop("omnigent.last_context_tokens", None)
+        labels.pop("omnigent.last_context_window", None)
         # Inherit the old session's bridge-id so the new session resolves to the
         # SAME bridge_dir; only fall back to stamping the old session id when the
         # label is somehow absent (keeps a deterministic, non-empty bridge id).
