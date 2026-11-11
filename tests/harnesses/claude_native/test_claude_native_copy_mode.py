@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.harnesses.claude_native import bridge
+from tests._helpers.polling import poll_until
 
 pytestmark = [
     pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required"),
@@ -34,7 +35,7 @@ from pathlib import Path
 
 received, delivered = map(Path, sys.argv[1:3])
 surface = sys.argv[3] if len(sys.argv) > 3 else ""
-panel_open = surface in {"btw", "background", "empty_background", "transcript"}
+panel_open = surface in {"btw", "background", "empty_background", "transcript", "question"}
 tty.setraw(sys.stdin.fileno())
 sys.stdout.write("\x1b[?2004h")
 
@@ -45,7 +46,15 @@ def render(draft=""):
     sys.stdout.flush()
 
 
-if surface == "transcript":
+if surface == "question":
+    rule = "─" * os.get_terminal_size().columns
+    sys.stdout.write("\x1b[H\x1b[2J" + rule + "\r\n"
+        "Which bridge should we use?\r\n❯ 1. Keep overlay\r\n"
+        "  2. Try a different bridge\r\n  3. Type something.\r\n"
+        + rule + "\r\n  4. Chat about this\r\n"
+        "Enter to select · ↑/↓ to navigate · Esc to cancel\r\n")
+    sys.stdout.flush()
+elif surface == "transcript":
     sys.stdout.write("\x1b[H\x1b[2J" + "─" * os.get_terminal_size().columns + "\r\n"
         "  Showing detailed transcript · ctrl+o to toggle · ? for shortcuts\r\n")
     sys.stdout.flush()
@@ -73,7 +82,9 @@ while True:
         log.write(chunk)
     buffer += chunk
     if panel_open:
-        if (b"\x0f" if surface == "transcript" else b"\x1b") in buffer:
+        close_key = b"1\r" if surface == "question" else (
+            b"\x0f" if surface == "transcript" else b"\x1b")
+        if close_key in buffer or (surface == "question" and b"\x1b" in buffer):
             panel_open = False
             buffer = b""
             render()
@@ -152,6 +163,7 @@ def pane(
                         "empty_background": "41",
                         "btw": "48",
                         "transcript": "48",
+                        "question": "46",
                     }.get(panel, "120"),
                     "-y",
                     "24",
@@ -173,7 +185,9 @@ def pane(
             # flushed by tcsetattr(TCSAFLUSH), so wait for its first render.
             deadline = time.monotonic() + 5.0
             marker = (
-                "Showing detailed transcript"
+                "Which bridge"
+                if panel == "question"
+                else "Showing detailed transcript"
                 if panel == "transcript"
                 else "Background"
                 if "background" in panel
@@ -224,6 +238,34 @@ def test_message_leaves_detailed_transcript_before_pasting(pane: _Pane) -> None:
     assert not received.startswith(b"\x1b")
     assert json.loads(pane.delivered.read_text()) == ["SENT_AFTER_TRANSCRIPT"]
     assert not pane.in_mode()
+
+
+@pytest.mark.parametrize("pane", [("emacs", "question")], indirect=True)
+@pytest.mark.parametrize("operation", ["message", "settings"])
+def test_question_with_a_footer_word_split_by_tmux_keeps_waiting(
+    pane: _Pane, operation: str
+) -> None:
+    """A wrapped native question receives no key until the person answers it."""
+    captured = bridge._capture_pane(pane.tmux[-1], "main")
+    assert "Esc to cancel" not in captured
+    assert "Esc to can\ncel" in captured
+    with pytest.raises(bridge.ClaudeUserPromptPending):
+        if operation == "message":
+            bridge.inject_user_message(pane.bridge_dir, content="AFTER_QUESTION", timeout_s=1.0)
+        else:
+            bridge.inject_slash_command(pane.bridge_dir, command="/effort high", timeout_s=1.0)
+    assert not pane.received.exists()
+
+    subprocess.run(
+        [*pane.tmux, "send-keys", "-t", "main", "1", "Enter"],
+        check=True,
+        capture_output=True,
+        timeout=5,
+    )
+    assert _wait_for_bytes(pane.received, b"1\r") == b"1\r"
+    poll_until(lambda: bridge.claude_pane_ready(pane.bridge_dir), timeout_s=5.0, interval_s=0.05)
+    bridge.inject_user_message(pane.bridge_dir, content="AFTER_QUESTION", timeout_s=1.0)
+    assert json.loads(pane.delivered.read_text()) == ["AFTER_QUESTION"]
 
 
 @pytest.mark.parametrize("pane", [("emacs", "btw")], indirect=True, ids=["narrow-quick-answer"])
