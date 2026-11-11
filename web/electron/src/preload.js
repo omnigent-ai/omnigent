@@ -654,7 +654,7 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
   /** Wizard capabilities, e.g. `{v2Forced}` — v2Forced disables "Switch to
    *  legacy" because the env var pins the selector on. */
   getSetupCapabilities: () => ipcRenderer.invoke("omnigent:get-setup-capabilities"),
-  /** Runners the onboarding runner step offers for `url`: `{remote, bundledCli}`.
+  /** Whether the onboarding runner step offers a remote runner for `url`: `{remote}`.
    *  @param {string} url */
   getRunnerOptions: (url) => ipcRenderer.invoke("omnigent:get-runner-options", url),
   /** Connect the onboarding runner ("local" | "remote") to `url`. Resolves

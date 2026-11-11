@@ -485,8 +485,6 @@ export interface CliStatus {
   installCommand: string;
   /** Whether a just-submitted path was accepted (present on pick/set results). */
   accepted?: boolean;
-  /** Policy disables set/browse/reset of custom CLI paths. */
-  customizationDisabled?: boolean;
 }
 
 /** This machine's identity, read from local config (fast — no subprocess). */

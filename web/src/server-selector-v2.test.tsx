@@ -84,7 +84,7 @@ it("a cancel from the shell (workspace picker closed) fails the terminal with Re
   stubBridge({
     getManagedServers: async () => ["https://team.example.com/"],
     getRecentServers: async () => [],
-    getRunnerOptions: async () => ({ remote: false, bundledCli: true }),
+    getRunnerOptions: async () => ({ remote: false }),
     connectRunner: async () => ({ ok: true }),
     setServerUrl: async () => ({ cancelled: true }),
   });

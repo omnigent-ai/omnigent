@@ -35,7 +35,7 @@ const {
 } = require("../src/omnigent_cli");
 
 describe("cliCommandParts", () => {
-  it("keeps plain CLI paths bare and adds fixed isaac argv without a shell", () => {
+  it("keeps plain CLI paths bare and adds fixed launcher argv without a shell", () => {
     assert.deepEqual(cliCommandParts("/bin/omnigent"), {
       executable: "/bin/omnigent",
       prefixArgs: [],
@@ -43,22 +43,24 @@ describe("cliCommandParts", () => {
     });
     assert.deepEqual(
       cliCommandParts({
-        executable: "/usr/local/bin/isaac",
-        prefixArgs: ["omni"],
-        displayName: "isaac omni",
+        executable: "/opt/tools/launcher",
+        prefixArgs: ["omnigent"],
+        displayName: "launcher omnigent",
       }),
       {
-        executable: "/usr/local/bin/isaac",
-        prefixArgs: ["omni"],
-        displayName: "isaac omni",
+        executable: "/opt/tools/launcher",
+        prefixArgs: ["omnigent"],
+        displayName: "launcher omnigent",
       },
     );
   });
 
   it("rejects malformed descriptors", () => {
     assert.throws(() => cliCommandParts(null));
-    assert.throws(() => cliCommandParts({ executable: "", prefixArgs: ["omni"] }));
-    assert.throws(() => cliCommandParts({ executable: "/bin/isaac", prefixArgs: "omni" }));
+    assert.throws(() => cliCommandParts({ executable: "", prefixArgs: ["omnigent"] }));
+    assert.throws(() =>
+      cliCommandParts({ executable: "/opt/tools/launcher", prefixArgs: "omnigent" }),
+    );
   });
 });
 

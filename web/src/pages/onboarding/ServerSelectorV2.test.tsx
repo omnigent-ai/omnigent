@@ -440,17 +440,21 @@ describe("ServerSelectorV2", () => {
     );
     const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
     const onConnect = vi.fn().mockResolvedValue({});
-    await installFromRunnerStep({
-      installed: false,
-      onInstallCli,
-      onConnectRunner,
-      onConnect,
-      onRunnerLog: (cb) => {
-        emit = cb;
-        return () => {};
+    await installFromRunnerStep(
+      {
+        installed: false,
+        onInstallCli,
+        onConnectRunner,
+        onConnect,
+        onRunnerLog: (cb) => {
+          emit = cb;
+          return () => {};
+        },
+        getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
       },
-      getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
-    });
+      undefined,
+      "Open Omnigent",
+    );
     expect(screen.getByText(/connecting your remote environment/i)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
     await waitFor(() =>
@@ -493,7 +497,7 @@ describe("ServerSelectorV2", () => {
       onInstallCli,
       onConnectRunner,
       onConnect,
-      getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
+      getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
     });
     expect(await screen.findByText(errorMessage)).toBeInTheDocument();
     expect(screen.getByText(errorAction)).toHaveClass("text-cyan-700");
@@ -544,7 +548,7 @@ describe("ServerSelectorV2", () => {
       installed: true,
       onConnectRunner: vi.fn().mockResolvedValue({ ok: true }),
       onConnect: vi.fn().mockResolvedValue({ cancelled: true }),
-      getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
+      getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
     });
     expect(await screen.findByText("Connection cancelled.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
@@ -664,7 +668,7 @@ describe("ServerSelectorV2", () => {
     );
   });
 
-  it("the laptop skips the install when its host CLI is bundled", async () => {
+  it("switching from a remote runner to a laptop with no CLI installs before connecting", async () => {
     const onConnectRunner = vi.fn().mockResolvedValue({ ok: true });
     const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
     const onConnect = vi.fn().mockResolvedValue({});
@@ -674,15 +678,14 @@ describe("ServerSelectorV2", () => {
         onInstallCli,
         onConnectRunner,
         onConnect,
-        getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
+        getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
       },
       /my laptop/i,
-      // Nothing is installed, so the action only opens.
-      "Open Omnigent",
+      "Install Omnigent",
     );
     await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
     expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "local");
-    expect(onInstallCli).not.toHaveBeenCalled();
+    expect(onInstallCli).toHaveBeenCalledOnce();
   });
 
   it("the laptop installs a missing CLI before connecting", async () => {

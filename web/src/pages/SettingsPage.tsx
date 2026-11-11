@@ -2531,30 +2531,17 @@ function LocalCliSection() {
               </div>
             )}
 
-            {status.customizationDisabled ? (
-              <p className="text-sm text-muted-foreground">
-                Managed by your organization. Host enrollment uses <code>isaac omni</code>.
-              </p>
-            ) : (
-              <>
-                <p className="text-sm text-muted-foreground">
-                  Set a custom path from Server → Change Server… → settings gear. This keeps
-                  connected servers from changing the app's CLI binary.
-                </p>
+            <p className="text-sm text-muted-foreground">
+              Set a custom path from Server → Change Server… → settings gear. This keeps connected
+              servers from changing the app's CLI binary.
+            </p>
 
-                {status.source === "configured" && (
-                  <div>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      disabled={busy}
-                      onClick={() => void onReset()}
-                    >
-                      Reset to auto-detected
-                    </Button>
-                  </div>
-                )}
-              </>
+            {status.source === "configured" && (
+              <div>
+                <Button variant="ghost" size="sm" disabled={busy} onClick={() => void onReset()}>
+                  Reset to auto-detected
+                </Button>
+              </div>
             )}
           </div>
         )}

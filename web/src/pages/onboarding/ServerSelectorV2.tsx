@@ -114,9 +114,9 @@ export interface ServerSelectorV2Setup {
   onInstallCli?: () => Promise<SetupResult>;
   /** Subscribe to the CLI installer's output lines; returns an unsubscribe. */
   onInstallLog?: (cb: (line: string) => void) => () => void;
-  /** Runners the "Where do you work today?" step offers for `url`, and whether
-   *  its host CLI comes bundled (no CLI install). Absent → this laptop only. */
-  getRunnerOptions?: (url: string) => Promise<{ remote: boolean; bundledCli?: boolean }>;
+  /** Runners the "Where do you work today?" step offers for `url`.
+   *  Absent → this laptop only. */
+  getRunnerOptions?: (url: string) => Promise<{ remote: boolean }>;
   /** Connect the picked runner to `url` before opening it. Absent → the runner
    *  step just opens the server. */
   onConnectRunner?: (url: string, runner: Runner) => Promise<SetupResult>;
@@ -181,11 +181,10 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     setup.initialColorScheme ?? "system",
   );
   // The server picked on the MDM landing, whether its runner step offers the
-  // remote environment, and whether its host CLI is bundled.
+  // remote environment.
   const [runnerTarget, setRunnerTarget] = useState<{
     url: string;
     remote: boolean;
-    bundledCli: boolean;
   } | null>(null);
   const [runnerError, setRunnerError] = useState<string>();
   // Bumped per pick, so a slow lookup can't replace a newer pick's runner step.
@@ -198,7 +197,6 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     setRunnerTarget({
       url,
       remote: options?.remote === true,
-      bundledCli: options?.bundledCli === true,
     });
     setRunnerError(undefined);
     setStep("runner");
@@ -456,8 +454,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
         {step === "runner" && runnerTarget !== null && (
           <RunnerStep
             remoteAvailable={runnerTarget.remote}
-            // A bundled host CLI skips the install, so the action only opens.
-            installed={setup.installed || runnerTarget.bundledCli}
+            installed={setup.installed}
             error={runnerError}
             connection={connection}
             onCancelConnect={cancelConnect}
@@ -465,17 +462,20 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             onInstall={async (runner) => {
               if (!setup.onConnectRunner) {
                 setRunnerError(undefined);
-                const result = await connect(runnerTarget.url, "runner", needsInstall);
+                const result = await connect(
+                  runnerTarget.url,
+                  "runner",
+                  runner === "local" && needsInstall,
+                );
                 if (result.error) setRunnerError(result.error);
                 return;
               }
-              // No local install for a remote runner, or when the host CLI is bundled.
               setTerminalTarget({
                 kind: "connect",
                 back: "runner",
                 url: runnerTarget.url,
                 runner,
-                skipInstall: runner === "remote" || runnerTarget.bundledCli,
+                skipInstall: runner === "remote" || setup.installed === true,
               });
               setStep("terminal");
             }}

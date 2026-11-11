@@ -310,10 +310,9 @@ async function disconnectHost(cliCommand, serverUrl) {
  * server (via {@link module:omnigent_cli.probeServerAuth}) instead of trusting the
  * on-disk token file, which may be stale. When not authed it runs `omnigent login <url>`,
  * which is idempotent and opens the browser only for a dead grant. Hosts started
- * through `isaac omni` always log in, since a legacy token can pass the probe.
  *
- * Returns ok for an already-authed unmanaged CLI, when the server is unreachable (so the connect
- * attempt can raise its own, clearer error), or after a successful login. On
+ * Returns ok when the server is already authenticated, when it is unreachable
+ * (so the connect attempt can raise its own, clearer error), or after a successful login. On
  * login failure returns `{ ok:false, authError:true, error, errorMessage, errorAction, failure? }`
  * so the UI can offer a sign-in/retry affordance instead of a generic failure;
  * `failure` is the process-level {@link import("./omnigent_cli").CliFailure} behind the copy.
@@ -334,10 +333,8 @@ async function disconnectHost(cliCommand, serverUrl) {
 async function ensureServerAuth(cliCommand, serverUrl, { onLogin, loginTimeoutMs } = {}) {
   if (cli.isLoopbackServer(serverUrl)) return { ok: true };
   const probe = await cli.probeServerAuth(serverUrl);
-  const managedOmni = cli.cliCommandParts(cliCommand).prefixArgs[0] === "omni";
-  // A legacy token can pass /v1/me but cannot supply the managed host's OAuth grant.
   // Skip unreachable servers so the connect attempt reports the connectivity error.
-  if ((!managedOmni && probe.authed) || !probe.reachable) return { ok: true };
+  if (probe.authed || !probe.reachable) return { ok: true };
   onLogin?.();
   const loginOptions = loginTimeoutMs === undefined ? [] : [{ timeoutMs: loginTimeoutMs }];
   const res = await cli.loginServer(cliCommand, serverUrl, ...loginOptions);
