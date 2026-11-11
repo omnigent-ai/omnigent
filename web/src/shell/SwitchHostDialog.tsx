@@ -429,8 +429,6 @@ function SupportedSwitchHostDialog({
                   <SelectValue placeholder="Select a host" />
                 </SelectTrigger>
                 <SelectContent>
-                  {/* New sandboxes first, above the connected hosts, as in the
-                      fork dialog. */}
                   {sandboxProviderRows.map((provider) => (
                     <SelectItem
                       key={provider ?? "default"}

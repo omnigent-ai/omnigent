@@ -4918,13 +4918,21 @@ async def _bind_and_launch_managed_runner(
         if (launch_task := asyncio.current_task()) is not None:
             _unbound_managed_launch_tasks.discard(launch_task)
         if (launch := tracker.get(session_id)) is not None:
+            launch.host_id = managed.host_id
             launch.bound.set()
         if relaunch_host is not None:
             await _note_workspace_reset_on_recreate(session_id, conversation_store)
         _publish_sandbox_status(session_id, "connecting")
         runner_id: str | None = None
+        host_conn = host_registry.get(managed.host_id) if host_registry is not None else None
+        if host_conn is None and held_runner_id is not None:
+            # The host's replica starts the runner, and only once none is bound,
+            # so hand the session over without the move's claim on it.
+            with contextlib.suppress(ConversationNotFoundError, ValueError):
+                await asyncio.to_thread(
+                    conversation_store.clear_runner_id, session_id, expected_binding=conv
+                )
         if host_registry is not None:
-            host_conn = host_registry.get(managed.host_id)
             if host_conn is not None:
                 try:
                     launch_attempt = await _launch_runner_on_host(
@@ -4939,6 +4947,9 @@ async def _bind_and_launch_managed_runner(
                         if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
                         else None
                     )
+                    if launch_attempt.error_code == "session_binding_changed":
+                        # Taken after the move's claim was released.
+                        reason, superseded = _SESSION_REBOUND_REASON, True
                 except OmnigentError as exc:
                     reason = str(exc)
                 except Exception as exc:  # noqa: BLE001 — admission can fail after provisioning
@@ -4988,6 +4999,7 @@ async def _bind_and_launch_managed_runner(
                 if reason is None:
                     # The binding committed; the host's replica can finish startup.
                     if (launch := tracker.get(session_id)) is not None:
+                        launch.host_id = managed.host_id
                         launch.bound.set()
                     return
                 try:

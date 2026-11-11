@@ -612,6 +612,8 @@ class ManagedLaunch:
     bound: asyncio.Event = dataclass_field(default_factory=asyncio.Event)
     # Set when another host took the session before its sandbox was ready.
     superseded: bool = False
+    # The sandbox host this launch bound the session to, once it has.
+    host_id: str | None = None
     host_online_failure_hint: Callable[[], str | None] | None = None
 
 

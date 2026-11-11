@@ -940,8 +940,16 @@ def register_core_routes(
                         await asyncio.to_thread(conversation_store.delete_label, session_id, key)
                 if labels:
                     await asyncio.to_thread(conversation_store.set_labels, session_id, labels)
-            # The claim is no runner's; left in place it would refuse every
-            # later move and launch.
+        except Exception:  # Must not replace the refusal being raised.
+            _logger.warning(
+                "Could not restore session %s's host binding after a refused sandbox move",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        # Released even when restoring failed: the claim is no runner's, and
+        # left in place it would refuse every later move and launch.
+        try:
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if current is not None and current.runner_id == claim:
                 await asyncio.to_thread(
@@ -949,7 +957,7 @@ def register_core_routes(
                 )
         except Exception:  # Must not replace the refusal being raised.
             _logger.warning(
-                "Could not restore session %s's host binding after a refused sandbox move",
+                "Could not release session %s's claim after a refused sandbox move",
                 session_id,
                 exc_info=True,
                 extra={"session_id": session_id},

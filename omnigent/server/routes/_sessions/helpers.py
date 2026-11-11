@@ -6581,11 +6581,21 @@ async def _launch_runner_on_host_locked(
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
 
-    bound_conv = await asyncio.to_thread(
-        conversation_store.replace_runner_id,
-        conv.id,
-        new_runner_id,
-    )
+    try:
+        # Against the binding this launch read, so a session that moved in the
+        # meantime (detached onto a new sandbox, say) keeps its new binding.
+        bound_conv = await asyncio.to_thread(
+            conversation_store.replace_runner_id,
+            conv.id,
+            new_runner_id,
+            expected_binding=conv,
+        )
+    except ValueError:
+        return _HostLaunchAttempt(
+            runner_id=conv.runner_id or "",
+            error_code="session_binding_changed",
+            error="the session's host or runner changed before the runner could start",
+        )
     if bound_conv.runner_last_seen is not None:
         # The new token has not reached the host, so this stamp can only
         # belong to the previous runner. Clear it before launching.
@@ -6804,7 +6814,9 @@ def _start_managed_launch_task(
                     conversation_store.clear_runner_id, session_id, expected_binding=current
                 )
             return True
-        return current.host_id is None
+        # Unbound, or bound to this launch's own sandbox (whose runner replaced
+        # the claim), the session is still this launch's; any other host won it.
+        return current.host_id is None or (entry is not None and entry.host_id == current.host_id)
 
     async def settle_superseded() -> None:
         # Another host runs the session: nothing failed there, but what was

@@ -569,6 +569,37 @@ describe("SwitchHostDialog", () => {
       );
     });
 
+    it("waits for the runner release, and doesn't move when it fails", async () => {
+      let release!: (value: Awaited<ReturnType<typeof updateSession>>) => void;
+      updateSessionMock.mockReturnValueOnce(
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+      );
+      renderDialog(SANDBOX_SERVER);
+      fireEvent.change(screen.getByTestId("mock-host-select"), {
+        target: { value: "__sandbox__:modal" },
+      });
+      fireEvent.click(screen.getByTestId("switch-host-button"));
+      await waitFor(() => expect(updateSessionMock).toHaveBeenCalledTimes(1));
+      // The endpoint refuses a session whose runner is still bound.
+      expect(launchManagedHostMock).not.toHaveBeenCalled();
+      await act(async () => {
+        release({} as Awaited<ReturnType<typeof updateSession>>);
+      });
+      await waitFor(() => expect(launchManagedHostMock).toHaveBeenCalledTimes(1));
+      cleanup();
+
+      updateSessionMock.mockRejectedValueOnce(new Error("release failed"));
+      renderDialog(SANDBOX_SERVER);
+      fireEvent.change(screen.getByTestId("mock-host-select"), {
+        target: { value: "__sandbox__:modal" },
+      });
+      fireEvent.click(screen.getByTestId("switch-host-button"));
+      expect(await screen.findByTestId("switch-host-error")).toHaveTextContent("release failed");
+      expect(launchManagedHostMock).toHaveBeenCalledTimes(1);
+    });
+
     it("defaults to an empty sandbox when no other host is online", async () => {
       onlyOriginHostOnline();
       renderDialog({ ...SANDBOX_SERVER, request_managed_sandbox_host_id: false });

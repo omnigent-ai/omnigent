@@ -1537,6 +1537,169 @@ async def test_released_claim_keeps_the_winner_when_the_old_sandbox_fails_to_sta
     assert [item.status for item in env.conv_store.list_pending_inputs(session_id)] == ["failed"]
 
 
+async def test_relaunch_admitted_before_a_move_detaches_keeps_the_claim(
+    managed_session_env: ManagedSessionEnv,
+) -> None:
+    """
+    A relaunch on the old host that was admitted just before the move detached
+    the session can't overwrite the move's claim: its runner replacement is
+    checked against the binding it read, so it is refused instead.
+    """
+    from typing import cast
+
+    from omnigent.server.routes._sessions.helpers import _launch_runner_on_host_locked
+
+    env = managed_session_env
+    session_id = await _session_released_from_laptop(env, agent_name="move-relaunch-race-agent")
+    claim = "runner_token_move_claim"
+    assert env.conv_store.set_runner_id(session_id, claim)
+    seen = env.conv_store.get_conversation(session_id)
+    assert seen is not None
+
+    class _AdmitThenDetach:
+        async def admit_launch(self, conn: object, conversation_id: str, **_: object) -> None:
+            env.conv_store.clear_host_binding(
+                conversation_id, expected_runner_id=claim, keep_runner=True
+            )
+
+    attempt = await _launch_runner_on_host_locked(
+        seen,
+        env.conv_store,
+        cast(Any, _AdmitThenDetach()),
+        cast(Any, SimpleNamespace(host_id=_LAPTOP_HOST_ID)),
+    )
+
+    assert attempt.error_code == "session_binding_changed"
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert (conv.host_id, conv.runner_id) == (None, claim)
+
+
+async def test_shutdown_after_the_sandbox_runner_starts_keeps_held_messages(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Shutdown cancelling a move after its sandbox runner replaced the claim, while
+    the launch waits for that runner's tunnel, leaves the sandbox binding and the
+    held message for the sandbox's replica to finish, rather than treating the
+    move's own runner as another host winning.
+    """
+    import threading
+
+    from omnigent.server.routes.sessions import cancel_managed_launch_tasks
+
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+    )
+    start, host_futures = _fake_host_connector(env, asyncio.get_running_loop())
+    provisioned = threading.Event()
+    fake = FakeSandboxLauncher(on_host_start=start, provision_gate=provisioned)
+    install_fake_modal_launcher(monkeypatch, fake)
+    waiting = asyncio.Event()
+
+    async def runner_never_connects(_runner_id: str, *, timeout_s: float) -> object:
+        waiting.set()
+        await asyncio.Event().wait()
+        return None
+
+    monkeypatch.setattr(env.app.state.tunnel_registry, "wait_for_runner", runner_never_connects)
+    session_id = await _session_released_from_laptop(env, agent_name="move-shutdown-runner-agent")
+
+    resp = await env.client.post(f"/v1/sessions/{session_id}/managed-host", json={})
+    assert resp.status_code == 202, resp.text
+    moving = env.conv_store.get_conversation(session_id)
+    assert moving is not None and moving.runner_id is not None
+    held = await _post_user_message(env, session_id)
+    assert held["queued"] is True
+    provisioned.set()
+    await asyncio.wait_for(waiting.wait(), timeout=15)
+
+    await cancel_managed_launch_tasks(drain_s=0)
+
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.host_id is not None and conv.host_id != _LAPTOP_HOST_ID
+    assert conv.runner_id not in (None, moving.runner_id)
+    assert conv.labels.get(STARTUP_LABEL) == "pending"
+    assert [item.status for item in env.conv_store.list_pending_inputs(session_id)] == [
+        "in_progress"
+    ]
+    for future in host_futures:
+        future.cancel()
+
+
+async def test_sandbox_bound_on_another_replica_hands_over_without_the_claim(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When the sandbox host is online in shared storage but its tunnel is on
+    another replica, the launching replica binds the session and drops the
+    move's claim, so that replica's startup recovery can start the runner.
+    """
+    import threading
+
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    started: list[str] = []
+
+    def online_elsewhere(invocation: HostStartInvocation) -> None:
+        # Registered and live in shared storage; no tunnel on this replica.
+        env.host_store.upsert_on_connect(
+            invocation.host_id, invocation.host_name, RESERVED_USER_LOCAL
+        )
+        started.append(invocation.host_id)
+
+    provisioned = threading.Event()
+    fake = FakeSandboxLauncher(on_host_start=online_elsewhere, provision_gate=provisioned)
+    install_fake_modal_launcher(monkeypatch, fake)
+    session_id = await _session_released_from_laptop(env, agent_name="move-cross-replica-agent")
+
+    resp = await env.client.post(f"/v1/sessions/{session_id}/managed-host", json={})
+    assert resp.status_code == 202, resp.text
+    provisioned.set()
+
+    tracker = env.app.state.managed_launches
+    await poll_until_async(lambda: started and tracker.get(session_id) is None)
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert (conv.host_id, conv.runner_id) == (started[0], None)
+    assert conv.labels.get(STARTUP_LABEL) == "pending"
+
+
+async def test_refused_sandbox_move_releases_its_claim_when_restoring_labels_fails(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A refused move releases its claim even when putting the earlier sandbox's
+    labels back fails, so the session isn't left with a runner nothing holds.
+    """
+    env = managed_session_env
+    session_id = await _session_released_from_laptop(env, agent_name="move-label-restore-agent")
+    env.conv_store.set_labels(session_id, _STALE_SANDBOX_LABELS)
+    set_labels = env.conv_store.set_labels
+
+    def fail_restoring(conversation_id: str, labels: dict[str, str]) -> object:
+        if labels == _STALE_SANDBOX_LABELS:
+            raise RuntimeError("label store unavailable")
+        return set_labels(conversation_id, labels)
+
+    monkeypatch.setattr(env.conv_store, "set_labels", fail_restoring)
+
+    resp = await env.client.post(
+        f"/v1/sessions/{session_id}/managed-host", json={"sandbox_provider": "e2b"}
+    )
+
+    assert resp.status_code == 400, resp.text
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert (conv.host_id, conv.runner_id) == (_LAPTOP_HOST_ID, None)
+
+
 async def test_message_sent_as_the_move_detaches_waits_for_the_sandbox(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,
