@@ -1675,9 +1675,9 @@ def _pr_compare(
     served. The comparison starts at its first parent, and the head is checked before
     and after the reads so the patch describes the revision the panel shows.
     """
-    host = _host_args(root, reference)
-    token = _pr_token(root, reference)
     with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        host = _host_args(root, reference)
+        token = _pr_token(root, reference)
         _check_pr_revision(root, reference, head_sha=head_sha)
         if from_sha not in {entry["sha"] for entry in _pr_commit_entries(root, reference)}:
             raise ValueError("That commit is not part of the selected pull request.")

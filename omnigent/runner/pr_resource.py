@@ -39,6 +39,7 @@ from omnigent.git_providers import (
 from omnigent.runner import pr_reports
 from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
+    CommitCompareFacet,
     CommitsFacet,
     PinnedRevisionFacet,
     ProviderCapabilities,
@@ -1293,6 +1294,8 @@ def pr_compare_diff(
         commits, or when either commit is not a full commit id.
     """
     facet, reference = _commits_target(session_id, pr_url)
+    if not isinstance(facet, CommitCompareFacet):
+        raise ValueError("This provider does not show changes through the head")
     return facet.compare_diff(
         root,
         reference,

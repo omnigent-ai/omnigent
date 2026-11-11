@@ -140,9 +140,9 @@ class ProviderCapabilities:
         through :meth:`PullRequestFacet.edit_details`.
     :ivar attachment_uploads: The user can upload images and videos to embed in
         the description through :meth:`PullRequestFacet.upload_attachment`.
-    :ivar commit_history: The PR's commits can be listed, and each one's patch or the
-        changes from one of them through the head read, through the optional
-        :class:`CommitsFacet`.
+    :ivar commit_history: The PR's commits can be listed and each one's patch read
+        through the optional :class:`CommitsFacet`; the optional
+        :class:`CommitCompareFacet` adds the patch from one of them through the head.
     """
 
     account_switching: bool
@@ -252,6 +252,15 @@ class CommitsFacet(Protocol):
     ) -> dict[str, Any]:
         """Return one commit's patch, a ``session.github.pr_diff``."""
         ...
+
+
+@runtime_checkable
+class CommitCompareFacet(Protocol):
+    """Optional patch from one PR commit through the head, beside :class:`CommitsFacet`.
+
+    Separate so a provider that implements only :class:`CommitsFacet` keeps its commit list
+    and single-commit patches.
+    """
 
     def compare_diff(
         self, root: str, reference: PullRequestRef, *, head_sha: str, from_sha: str
