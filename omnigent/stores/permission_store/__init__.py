@@ -50,6 +50,21 @@ class PermissionStore(ABC):
         """
         ...
 
+    def grant_unless_higher(
+        self, user_id: str, conversation_id: str, level: int
+    ) -> SessionPermission | None:
+        """Grant *level* unless *user_id* already holds it or higher; never lower a grant.
+
+        The default reads then writes, so a concurrent upgrade between the two can
+        be lowered; stores that can should override this with one atomic write.
+
+        :returns: The written grant, or ``None`` when an existing one was kept.
+        """
+        existing = self.get(user_id, conversation_id)
+        if existing is not None and existing.level >= level:
+            return None
+        return self.grant(user_id, conversation_id, level)
+
     @abstractmethod
     def revoke(self, user_id: str, conversation_id: str) -> bool:
         """Remove a permission grant.

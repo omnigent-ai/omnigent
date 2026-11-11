@@ -448,6 +448,15 @@ class FakePermissionStore:
         levels = [lvl for uid, cid, lvl in self.grants if (uid, cid) == (user_id, conversation_id)]
         return SessionPermission(user_id, conversation_id, levels[-1]) if levels else None
 
+    def grant_unless_higher(
+        self, user_id: str, conversation_id: str, level: int
+    ) -> SessionPermission | None:
+        existing = self.get(user_id, conversation_id)
+        if existing is not None and existing.level >= level:
+            return None
+        self.grant(user_id, conversation_id, level)
+        return SessionPermission(user_id, conversation_id, level)
+
     def grant(self, user_id: str, conversation_id: str, level: int) -> Any:
         self.grant_workspace_ids.append(current_workspace_id())
         if self.fail_grant or user_id in self.fail_grant_users:
