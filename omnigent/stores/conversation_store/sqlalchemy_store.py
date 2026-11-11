@@ -2630,17 +2630,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         if not accessible_by:
             return []
         workspace_id = current_workspace_id()
-        acl_pushdown = self._conv_engine is self._engine
-        acl_filter = (
-            "AND EXISTS (SELECT 1 FROM session_permissions AS sp "
-            "WHERE sp.workspace_id = ci.workspace_id "
-            "AND sp.conversation_id = ci.conversation_id "
-            "AND sp.user_id = :user) "
-            if acl_pushdown
-            else ""
-        )
-        conversation_filter = (
-            "AND ci.conversation_id = :cid " if conversation_id is not None else ""
+        conversation_key = (
+            uuid_to_bytes(conversation_id).hex() if conversation_id is not None else None
         )
         with self._conv_session("search_conversations") as session:
             # Dialect-specific search: the SQLite family (SQLite + D1) has
@@ -2649,20 +2640,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             # tsvector indexing is a future optimization (tracked in GAPS.md).
             use_fts = _supports_fts5(self._conv_engine.dialect.name)
             if use_fts:
-                # The FTS mirror stores the original spelling of each id. Decode
-                # its UUID tail on the FTS side so the join probes the item key.
-                stmt = (
-                    "SELECT ci.conversation_id, ci.id "
+                # The FTS mirror has no workspace column and stores ids as text
+                # in any accepted spelling. Ids are normalized in Python, then
+                # checked against conversation_items by primary key.
+                candidate_sql = (
+                    "SELECT f.conversation_id, f.item_id "
                     "FROM conversation_items_fts AS f "
-                    "JOIN conversation_items AS ci "
-                    "ON ci.id = unhex(substr(replace(f.item_id, '-', ''), -32)) "
-                    "AND ci.conversation_id = "
-                    "unhex(substr(replace(f.conversation_id, '-', ''), -32)) "
-                    "WHERE f.search_text MATCH :query AND ci.workspace_id = :ws "
-                    f"{conversation_filter}"
-                    f"{acl_filter}"
-                    "ORDER BY f.rank, ci.conversation_id, ci.id"
+                    "WHERE f.search_text MATCH :query "
+                    "ORDER BY f.rank, f.conversation_id, f.item_id"
                 )
+                params: dict[str, str | int | bytes] = {"query": query}
             else:
                 # Non-FTS fallback: LIKE/ILIKE on the data column.
                 # PostgreSQL: cast MEDIUMBLOB/JSONB to text and use ILIKE.
@@ -2680,21 +2667,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                 else:
                     data_expr = "ci.data::text"
                     like_op = "ILIKE"
-                stmt = (
+                conversation_filter = (
+                    "AND ci.conversation_id = :cid " if conversation_id is not None else ""
+                )
+                candidate_sql = (
                     "SELECT ci.conversation_id, ci.id FROM conversation_items AS ci "
                     "WHERE ci.workspace_id = :ws "
                     f"{conversation_filter}"
                     f"AND {data_expr} {like_op} :query "
-                    f"{acl_filter}"
                     "ORDER BY ci.created_at DESC, ci.conversation_id, ci.id"
                 )
-                query = like_pattern
-            statement = text(f"{stmt} LIMIT :limit OFFSET :offset")
-            params: dict[str, str | int | bytes] = {"query": query, "ws": workspace_id}
-            if acl_pushdown:
-                params["user"] = accessible_by
-            if conversation_id is not None:
-                params["cid"] = uuid_to_bytes(conversation_id)
+                params = {"query": like_pattern, "ws": workspace_id}
+                if conversation_id is not None:
+                    params["cid"] = uuid_to_bytes(conversation_id)
+            statement = text(f"{candidate_sql} LIMIT :limit OFFSET :offset")
 
             def fetch_candidate_keys(window: int, offset: int) -> list[tuple[str, str]]:
                 rows = session.execute(
@@ -2702,26 +2688,47 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ).fetchall()
                 return [(_binary_id_hex(conv), _binary_id_hex(item)) for conv, item in rows]
 
-            if acl_pushdown:
-                # The ACL joins in SQL, so one LIMIT query is exact.
-                item_keys = fetch_candidate_keys(limit, 0)
-            else:
-                # Rank candidates in windows and keep only permitted ones, so
-                # denied matches never count toward the limit.
-                item_keys = []
-                offset = 0
-                while len(item_keys) < limit:
-                    window_keys = fetch_candidate_keys(_SEARCH_CANDIDATE_WINDOW, offset)
-                    if not window_keys:
-                        break
-                    offset += len(window_keys)
+            # Rank candidates in windows and keep only permitted, existing items
+            # in this workspace, so denied or foreign matches never use up the limit.
+            item_keys: list[tuple[str, str]] = []
+            seen: set[tuple[str, str]] = set()
+            offset = 0
+            while len(item_keys) < limit:
+                raw_keys = fetch_candidate_keys(_SEARCH_CANDIDATE_WINDOW, offset)
+                if not raw_keys:
+                    break
+                offset += len(raw_keys)
+                candidates = [
+                    key
+                    for key in dict.fromkeys(raw_keys)
+                    if (conversation_key is None or key[0] == conversation_key) and key not in seen
+                ]
+                if candidates:
                     permitted = self._permitted_conversation_hexes(
-                        {conv for conv, _ in window_keys}, accessible_by
+                        {conv for conv, _ in candidates}, accessible_by
                     )
-                    item_keys.extend(key for key in window_keys if key[0] in permitted)
-                    if len(window_keys) < _SEARCH_CANDIDATE_WINDOW:
-                        break
-                item_keys = item_keys[:limit]
+                    candidates = [key for key in candidates if key[0] in permitted]
+                if candidates:
+                    existing = set(
+                        session.execute(
+                            select(
+                                SqlConversationItem.conversation_id, SqlConversationItem.id
+                            ).where(
+                                SqlConversationItem.workspace_id == workspace_id,
+                                tuple_(
+                                    SqlConversationItem.conversation_id,
+                                    SqlConversationItem.id,
+                                ).in_(candidates),
+                            )
+                        ).all()
+                    )
+                    for key in candidates:
+                        if key in existing:
+                            seen.add(key)
+                            item_keys.append(key)
+                if len(raw_keys) < _SEARCH_CANDIDATE_WINDOW:
+                    break
+            item_keys = item_keys[:limit]
             if not item_keys:
                 return []
             rows = (
