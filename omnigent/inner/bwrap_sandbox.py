@@ -886,7 +886,7 @@ def _resolve_grant(cwd: Path, root: str) -> Path:
     access, so a symlink there must not block the launch.
     """
     resolved = _resolve_root(cwd, root)
-    _check_relative_grant_containment(cwd, root, resolved)
+    _check_relative_grant_containment(cwd, root)
     return resolved
 
 

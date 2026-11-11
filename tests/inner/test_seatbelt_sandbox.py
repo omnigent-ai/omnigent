@@ -2723,4 +2723,3 @@ def test_seatbelt_grant_inside_cwd_resolves_through_contained_symlink(tmp_path: 
     target.mkdir(parents=True)
     (cwd / "linked").symlink_to(target, target_is_directory=True)
     assert _resolve_grant(cwd, "linked/secret") == target / "secret"
-

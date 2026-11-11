@@ -516,30 +516,31 @@ def _resolve_grant_root(cwd: Path, root: str) -> Path:
             root,
         )
     expanded = os.path.expanduser(root)
-    path = Path(expanded)
-    if not path.is_absolute():
-        path = cwd / path
-    resolved = path.resolve(strict=False)
-    _check_relative_grant_containment(cwd, root, resolved)
-    return resolved
+    if Path(expanded).is_absolute() or ".." in Path(root).parts:
+        return Path(os.path.realpath(os.path.join(cwd, expanded)))
+    return Path(_contained_relative_grant(cwd, root, expanded))
 
 
-def _check_relative_grant_containment(cwd: Path, root: str, resolved: Path) -> None:
+def _check_relative_grant_containment(cwd: Path, root: str) -> None:
     """Reject a relative grant whose resolved target leaves *cwd*.
 
-    *cwd* is the directory the grant resolved against, so a relative grant
-    that follows a symlink out of its base directory fails here. Absolute,
-    ``~``, and ``..`` grants are not checked.
+    Absolute, ``~``, and ``..`` grants are not checked here.
     """
-    if Path(os.path.expanduser(root)).is_absolute() or ".." in Path(root).parts:
+    expanded = os.path.expanduser(root)
+    if Path(expanded).is_absolute() or ".." in Path(root).parts:
         return
+    _contained_relative_grant(cwd, root, expanded)
+
+
+def _contained_relative_grant(cwd: Path, root: str, expanded: str) -> str:
+    """Return the real path of a relative grant under *cwd*, or raise when it escapes."""
     base = os.path.realpath(cwd)
-    try:
-        contained = os.path.commonpath([base, os.path.realpath(resolved)]) == base
-    except ValueError:  # Windows paths on different drives
-        contained = False
-    if not contained:
-        raise ValueError(f"relative sandbox grant resolves outside its working directory: {root!r}")
+    resolved = contained_realpath(os.path.join(base, expanded), containment_prefix(base))
+    if resolved is None:
+        raise ValueError(
+            f"relative sandbox grant resolves outside its working directory: {root!r}"
+        )
+    return resolved
 
 
 def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
