@@ -433,6 +433,39 @@ describe("sort order", () => {
       vi.useRealTimers();
     }
   });
+
+  it("prefers the server's next run for recurring tasks, falling back on a bad one", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    try {
+      setTasks([
+        // The browser estimates 06:00, but the server says 23:00: the server wins.
+        task({
+          id: "server-late",
+          name: "Server says late",
+          state: "active",
+          rrule: "FREQ=DAILY;BYHOUR=6",
+          nextRunAt: "2026-01-01T23:00:00+00:00",
+        }),
+        // An unparseable server time falls back to the browser's 12:00 estimate.
+        task({
+          id: "fallback",
+          name: "Bad server time",
+          state: "active",
+          rrule: "FREQ=DAILY;BYHOUR=12",
+          timezone: "UTC",
+          nextRunAt: "not a time",
+        }),
+      ]);
+      renderPage();
+      const names = screen
+        .getAllByTestId("scheduled-task-row")
+        .map((r) => r.querySelector(".font-semibold")?.textContent);
+      expect(names).toEqual(["Bad server time", "Server says late"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("filtering + search", () => {
