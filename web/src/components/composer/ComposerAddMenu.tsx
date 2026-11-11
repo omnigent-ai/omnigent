@@ -71,7 +71,7 @@ export function ComposerAddMenu({
 }) {
   const [open, setOpen] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
-  const pendingGoalRef = useRef(false);
+  const pendingActionRef = useRef<(() => void) | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [geometry, setGeometry] = useState({ width: 456, alignOffset: 0, sideOffset: 6 });
   const measure = useCallback(() => {
@@ -117,6 +117,7 @@ export function ComposerAddMenu({
           className="size-8 mobile-touch-target rounded-lg data-[state=open]:bg-muted data-[state=open]:text-foreground md:size-7"
           disabled={disabled}
           aria-label="Add"
+          data-composer-action="add"
           title="Add"
           data-testid={`${testIdPrefix}-attach`}
           componentId={`${testIdPrefix}.add_menu`}
@@ -130,9 +131,10 @@ export function ComposerAddMenu({
       </DropdownMenuTrigger>
       <DropdownMenuContent
         onCloseAutoFocus={() => {
-          if (pendingGoalRef.current) {
-            pendingGoalRef.current = false;
-            requestAnimationFrame(() => onGoal?.());
+          const action = pendingActionRef.current;
+          pendingActionRef.current = null;
+          if (action !== null) {
+            requestAnimationFrame(action);
           }
         }}
         side="top"
@@ -141,7 +143,7 @@ export function ComposerAddMenu({
         sideOffset={geometry.sideOffset}
         collisionPadding={12}
         aria-label="Add"
-        className="composer-add-menu max-w-[calc(100vw-24px)] rounded-[16px]"
+        className="composer-add-menu max-w-[calc(100vw-24px)] rounded-[16px] max-md:p-1.5"
         style={{ width: geometry.width }}
         data-testid={`${testIdPrefix}-add-menu`}
       >
@@ -191,7 +193,9 @@ export function ComposerAddMenu({
                     <DropdownMenuItem
                       className="mobile-touch-target"
                       data-testid="composer-side-chat-action"
-                      onSelect={onSideChat}
+                      onSelect={() => {
+                        pendingActionRef.current = onSideChat;
+                      }}
                     >
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <MessagesSquareIcon className="size-3.5" />
@@ -210,7 +214,7 @@ export function ComposerAddMenu({
                       data-testid="composer-goal-action"
                       data-active={goalActive || undefined}
                       onSelect={() => {
-                        pendingGoalRef.current = true;
+                        pendingActionRef.current = onGoal ?? null;
                       }}
                     >
                       <span className="flex size-4 shrink-0 items-center justify-center">
