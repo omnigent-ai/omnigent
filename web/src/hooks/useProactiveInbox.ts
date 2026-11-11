@@ -209,6 +209,9 @@ export function useProactiveInbox(
   // confirmed status to the pending one, once. Data older than the change
   // predates it; data fetched since was cancelled at the change and so began
   // after it, and when it lacks the item its total already reflects the move.
+  // A page fetched since the change whose loaded pages never reach the item
+  // may still predate the server's commit; its total then stays one high until
+  // the PATCH settles and writes the server's count. Cards are unaffected.
   for (const [id, change] of state.pending) {
     const stale = query.dataUpdatedAt <= (state.started.get(id) ?? 0);
     pages = applySuggestionUpdate(pages, id, change, stale ? state.confirmed.get(id) : undefined);

@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   agentInstall: false,
   enabledConnections: [] as string[],
   nestedAgents: false,
+  advisor: false,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -39,6 +40,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     agent_install: mocks.agentInstall,
     enabled_connections: mocks.enabledConnections,
     sibling_sessions: mocks.nestedAgents,
+    proactive_agent_available: mocks.advisor,
   }),
 }));
 // Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
@@ -76,6 +78,7 @@ beforeEach(() => {
   mocks.agentInstall = false;
   mocks.enabledConnections = [];
   mocks.nestedAgents = false;
+  mocks.advisor = false;
 });
 afterEach(cleanup);
 
@@ -194,6 +197,22 @@ describe("SettingsSidebarBody", () => {
       const entry = screen.queryByTestId("settings-nav-admin");
       expect(entry !== null).toBe(visible);
       if (entry) expect(entry).toHaveAttribute("href", "/settings/admin");
+    },
+  );
+
+  it.each([
+    [true, false, true],
+    [false, false, false],
+    [false, true, true],
+  ])(
+    "shows Admin General when only Omni Advisor is offered, for admin=%s, single user=%s",
+    (isAdmin, singleUser, visible) => {
+      mocks.isAdmin = isAdmin;
+      mocks.singleUser = singleUser;
+      mocks.nestedAgents = false;
+      mocks.advisor = true;
+      renderBody();
+      expect(screen.queryByTestId("settings-nav-admin") !== null).toBe(visible);
     },
   );
 
@@ -386,6 +405,11 @@ describe("useSettingsRoute", () => {
       inSettings: true,
       section: enabled ? "admin" : "general",
     });
+  });
+
+  it("accepts the admin general route on an Omni Advisor-only deploy", () => {
+    mocks.advisor = true;
+    expect(routeHook("/settings/admin")).toEqual({ inSettings: true, section: "admin" });
   });
 
   it("treats /settings/members and /settings/policies as in-settings sections on an accounts deploy", () => {

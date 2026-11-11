@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 
+import zstandard
 from sqlalchemy import LargeBinary, delete, select, type_coerce
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -43,7 +44,8 @@ def _decode_enabled(raw: bytes | str | memoryview | None) -> bool:
         return True
     try:
         return json.loads(decode(raw, max_decoded_bytes=64) or "true") is not False
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, zstandard.ZstdError):
+        # Not JSON, over the size cap, or a corrupt compressed frame.
         return True
 
 

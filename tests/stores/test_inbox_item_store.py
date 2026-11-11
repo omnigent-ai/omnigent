@@ -318,6 +318,8 @@ def test_mysql_deep_pages_seek_to_the_cursor(store: SqlAlchemyInboxItemStore) ->
         )
     finally:
         event.remove(store._engine, "before_cursor_execute", explain)
+    # One page query per call; a prefix that stopped matching would skip the check.
+    assert len(plans) == 2, plans
     for plan in plans:
         # Rows each step actually read; the planner's estimates are not bounded.
         examined = [int(n) for n in re.findall(r"actual time=[\d.]+\.\.[\d.]+ rows=(\d+)", plan)]
