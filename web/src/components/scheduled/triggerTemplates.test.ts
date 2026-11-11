@@ -1355,6 +1355,10 @@ describe("change-event prompts", () => {
     expect(prompt).toContain("Leave out pull requests merged after the time you noted");
     expect(prompt).toContain('title "GitHub <owner/repo>#<number> merged"');
     expect(prompt).toContain("its base and head branches, when it was merged and by whom");
+    // Search results omit merge details, so each one is read from the pull request.
+    expect(prompt).toContain(
+      "read them from the pull request itself, for example gh api repos/<owner/repo>/pulls/<number>",
+    );
     // Merges from before activation never count, even inside the search overlap.
     expect(prompt).toContain(
       'On the first run, use the current time as both the check time and the "Watching since:" time',

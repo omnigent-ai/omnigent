@@ -1403,7 +1403,7 @@ function sourceText(source: TriggerSource, fields: TriggerFields, shared: boolea
       // A pull request merges once, so its number alone keys the session.
       title: '"GitHub <owner/repo>#<number> merged"',
       details:
-        "the pull request's number, link, title and body, its base and head branches, when it was merged and by whom, and its merge commit",
+        "the pull request's number, link, title and body, its base and head branches, when it was merged and by whom, and its merge commit (search results leave out the branches, who merged it and the merge commit, so read them from the pull request itself, for example gh api repos/<owner/repo>/pulls/<number>)",
       linkBack: (link) => `Comment "${link}" on each pull request ${handled}.`,
       opening: "newly merged pull request",
       watermark: true,
