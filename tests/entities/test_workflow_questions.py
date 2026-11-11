@@ -48,6 +48,7 @@ def test_questions_are_collapsed_and_keep_an_optional_recommendation() -> None:
         ([_question(options=[{"label": "Same"}, {"label": "Same"}])], "different labels"),
         ([_question(recommended="Use dev")], "recommended must be one of its option labels"),
         ([_question(header="")], "header must not be empty"),
+        ([_question(), _question()], "questions must differ"),
         ([_question(colour="red")], "unknown fields: colour"),
         ([_question(options=[{"label": "A", "icon": "x"}, {"label": "B"}])], "unknown fields"),
     ],
@@ -62,7 +63,11 @@ def test_the_form_lists_the_recommendation_first_and_answers_map_back() -> None:
         [_question(recommended="Use prod"), _question(question="Deploy now?", header="Deploy")]
     )
     form = question_form(questions)["questions"]
-    assert [question["id"] for question in form] == ["q1", "q2"]
+    assert [question["question"] for question in form] == [
+        "Which profiles should the release use?",
+        "Deploy now?",
+    ]
+    assert "id" not in form[0]
     assert [option["label"] for option in form[0]["options"]] == [
         "Use prod (recommended)",
         "Use staging",
@@ -70,7 +75,11 @@ def test_the_form_lists_the_recommendation_first_and_answers_map_back() -> None:
     assert form[0]["multiSelect"] is False and form[1]["header"] == "Deploy"
 
     answers = answers_from_content(
-        questions, {"q1": "Use prod (recommended)", "q2": " Wait for the freeze "}
+        questions,
+        {
+            "Which profiles should the release use?": "Use prod (recommended)",
+            "Deploy now?": " Wait for the freeze ",
+        },
     )
     assert answers == [
         {"question": "Which profiles should the release use?", "answer": "Use prod"},

@@ -314,7 +314,6 @@ def create_session_journal_router(
                 mode="form",
                 message=f"Waiting for you on {task['name']}",
                 phase="workflow_request_input",
-                policy_name="workflow_request_input",
                 ask_user_question=question_form(questions),
                 journal_step=step,
             ),

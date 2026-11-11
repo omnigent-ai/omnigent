@@ -4,7 +4,8 @@ The agent asks with ``sys_workflow_request_input``. The server marks the task
 ``needs_input`` and raises an elicitation that the web renders with its shared
 question form (the ``ask_user_question`` extra), and the runner returns the
 answers to the agent. The runner and the server both check questions with
-:func:`normalize_questions`, and agree on each question's ID by its place.
+:func:`normalize_questions`. The form answers each question under its text,
+as it does Claude Code's AskUserQuestion.
 """
 
 from __future__ import annotations
@@ -88,12 +89,12 @@ def normalize_questions(questions: object) -> list[dict[str, Any]]:
     """
     if not isinstance(questions, list) or not 1 <= len(questions) <= QUESTIONS_MAX:
         raise InvalidJournalEntryError(f"questions must list 1 to {QUESTIONS_MAX} questions")
-    return [_question(question, index) for index, question in enumerate(questions)]
-
-
-def question_id(index: int) -> str:
-    """The form's ID for the question at *index*, e.g. ``"q1"``; answers come back under it."""
-    return f"q{index + 1}"
+    normalized = [_question(question, index) for index, question in enumerate(questions)]
+    texts = [question["question"] for question in normalized]
+    if len(set(texts)) != len(texts):
+        # The form answers each question under its text.
+        raise InvalidJournalEntryError("questions must differ from one another")
+    return normalized
 
 
 def question_form(questions: list[dict[str, Any]]) -> dict[str, Any]:
@@ -105,12 +106,11 @@ def question_form(questions: list[dict[str, Any]]) -> dict[str, Any]:
     :param questions: Output of :func:`normalize_questions`.
     """
     form = []
-    for index, question in enumerate(questions):
+    for question in questions:
         recommended = question["recommended"]
         options = sorted(question["options"], key=lambda option: option["label"] != recommended)
         form.append(
             {
-                "id": question_id(index),
                 "question": question["question"],
                 "header": question["header"],
                 "multiSelect": False,
@@ -140,7 +140,7 @@ def answers_from_content(
 ) -> list[dict[str, str]]:
     """Pair each question with the user's answer from the form's ``content``.
 
-    The form answers each question under its ID with an option's label (the
+    The form answers each question under its text with an option's label (the
     recommended one keeps its " (recommended)" mark, which is dropped here) or
     with text the user wrote.
 
@@ -149,8 +149,8 @@ def answers_from_content(
     :returns: ``[{"question": …, "answer": …}]``, ``""`` for one left unanswered.
     """
     answers = []
-    for index, question in enumerate(questions):
-        raw = (content or {}).get(question_id(index))
+    for question in questions:
+        raw = (content or {}).get(question["question"])
         if isinstance(raw, list):
             raw = ", ".join(str(item) for item in raw if isinstance(item, str) and item)
         answer = raw if isinstance(raw, str) else ""

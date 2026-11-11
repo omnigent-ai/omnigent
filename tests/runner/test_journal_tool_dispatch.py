@@ -192,7 +192,9 @@ async def test_a_question_waits_for_the_answer_and_returns_it() -> None:
     published: list[dict[str, object]] = []
     async with _client(handler) as client:
         answer = asyncio.create_task(
-            _answer_when_asked("elicit_journal_1", (True, {"q1": "Wait (recommended)"}))
+            _answer_when_asked(
+                "elicit_journal_1", (True, {"Deploy to prod now?": "Wait (recommended)"})
+            )
         )
         result = await _run(
             client,
@@ -234,7 +236,7 @@ async def test_a_question_is_raised_again_after_the_server_reconnects() -> None:
         pending_approvals.notify_server_reconnect()
         while len(keys) < 2:
             await asyncio.sleep(0.01)
-        await _answer_when_asked("elicit_journal_2", (True, {"q1": "Deploy"}))
+        await _answer_when_asked("elicit_journal_2", (True, {"Deploy to prod now?": "Deploy"}))
 
     async with _client(handler) as client:
         helper = asyncio.create_task(reconnect_then_answer())

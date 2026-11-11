@@ -446,6 +446,7 @@ async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
     params = event["params"]
     assert params["message"] == "Waiting for you on Deploy to prod"
     assert (params["phase"], params["journal_step"]) == ("workflow_request_input", "deploy")
+    assert params.get("policy_name") is None
     [form] = params["ask_user_question"]["questions"]
     assert [option["label"] for option in form["options"]] == ["Hold (recommended)", "Approve"]
     # The task waits for the user, its status the question.
@@ -453,7 +454,9 @@ async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
     assert entry["step"] == "deploy"
     assert entry["payload"] == {"status": "needs_input", "text": "Approve the deploy to prod?"}
 
-    while not pending_approvals.resolve(event["elicitation_id"], True, {"q1": "Approve"}):
+    while not pending_approvals.resolve(
+        event["elicitation_id"], True, {"Approve the deploy to prod?": "Approve"}
+    ):
         await asyncio.sleep(0.01)
     assert await asking == {
         "answered": True,
