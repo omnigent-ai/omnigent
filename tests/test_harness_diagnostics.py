@@ -166,7 +166,7 @@ def test_cookie_redaction_precedes_diagnostic_tail_clipping() -> None:
     ("screen", "expected_url", "expected_code"),
     [
         (
-            "dbexec: launcher 1.2.3\nSign in to continue:\n"
+            "synthetic-launcher: launcher 1.2.3\nSign in to continue:\n"
             "  https://signin.example.com/device\n  code: HQ7M-2KPD\nwaiting for sign-in...",
             "https://signin.example.com/device",
             "HQ7M-2KPD",

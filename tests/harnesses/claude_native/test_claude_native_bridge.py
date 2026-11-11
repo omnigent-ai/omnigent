@@ -11800,7 +11800,7 @@ def test_wait_for_claude_prompt_ready_outlasts_base_budget_while_pane_alive(
 
 
 _SIGN_IN_PANE = (
-    "dbexec: launcher 1.2.3\n"
+    "synthetic-launcher: launcher 1.2.3\n"
     "Logging in via SSO...\n"
     "If the browser does not open automatically, please open the following URL:\n"
     "\thttps://signin.example.com/oauth2/v1/authorize?client_id=abc&state=xyz\n"

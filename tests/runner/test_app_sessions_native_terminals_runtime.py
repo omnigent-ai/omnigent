@@ -4464,7 +4464,7 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
     ("screen", "expected_code", "expected_title"),
     [
         (
-            "dbexec: launcher 1.2.3\nSign in to continue:\n"
+            "synthetic-launcher: launcher 1.2.3\nSign in to continue:\n"
             "  https://signin.example.com/device\n  code: HQ7M-2KPD\nwaiting for sign-in...\n",
             "databricks_sign_in_pending",
             "Codex can't start until you sign in to Databricks",
