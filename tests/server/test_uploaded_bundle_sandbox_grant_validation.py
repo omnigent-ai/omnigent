@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import io
 import json
 import os
-import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +13,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.bwrap_sandbox import _resolve_grant
 from omnigent.inner.sandbox import resolve_sandbox
 from omnigent.server.bundles import validate_agent_bundle
+from tests._helpers.session import bundle_files
 
 _LOCATIONS = ("root", "terminal", "grandchild", "grandchild_terminal")
 _GRANT_FIELDS = ("read_paths", "write_paths", "write_files")
@@ -71,14 +70,7 @@ def _bundle(location: str, field: str, grant: object) -> bytes:
         files["agents/child/config.yaml"] = child
         files["agents/child/agents/grandchild/config.yaml"] = grandchild
 
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-        for path, config in files.items():
-            content = json.dumps(config).encode()
-            info = tarfile.TarInfo(path)
-            info.size = len(content)
-            archive.addfile(info, io.BytesIO(content))
-    return buffer.getvalue()
+    return bundle_files({path: json.dumps(config).encode() for path, config in files.items()})
 
 
 class UploadedBundleSandboxGrantValidationTest(unittest.TestCase):
