@@ -386,7 +386,9 @@ def served_canonical_overrides(model_ids: Iterable[str]) -> dict[str, str]:
     Deriving the map from the gateway's own listing keeps model ids out of
     Omnigent entirely: whichever model the CLI's table names, and whichever
     generation it moves to next, the rewrite covers it as long as the gateway
-    serves that model.
+    serves that model. Decimal and hyphenated major/minor spellings map to
+    the same listed generation, retaining date and context suffixes. Exact
+    listed spellings take precedence over these additional rewrites.
 
     :param model_ids: The ids a gateway's model listing reports.
     :returns: Canonical id → served id, e.g.
@@ -397,10 +399,20 @@ def served_canonical_overrides(model_ids: Iterable[str]) -> dict[str, str]:
         canonical form the first in the listing wins.
     """
     overrides: dict[str, str] = {}
+    served_ids: set[str] = set()
     for model_id in model_ids:
         served = model_id.strip()
+        served_ids.add(served)
         canonical = canonical_claude_id(served)
         if canonical is None or canonical == served:
             continue
         overrides.setdefault(canonical, served)
+    for canonical, served in tuple(overrides.items()):
+        version = re.fullmatch(r"(claude-[a-z][a-z0-9]*-\d+)([.-])(\d+)((?:-|\[).*)?", canonical)
+        if version is None:
+            continue
+        separator = "." if version[2] == "-" else "-"
+        alternate = f"{version[1]}{separator}{version[3]}{version[4] or ''}"
+        if alternate not in served_ids:
+            overrides.setdefault(alternate, served)
     return overrides

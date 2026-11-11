@@ -1009,8 +1009,10 @@ def test_ucode_config_refreshes_live_models_and_builds_picker_options(
     assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in config.env
     assert config.model_overrides == {
         "claude-opus-4-10": "system.ai.claude-opus-4-10",
+        "claude-opus-4.10": "system.ai.claude-opus-4-10",
         "claude-sonnet-5": "system.ai.claude-sonnet-5",
         "claude-sonnet-4-6": "system.ai.claude-sonnet-4-6",
+        "claude-sonnet-4.6": "system.ai.claude-sonnet-4-6",
     }
     assert claude_native.claude_native_model_options(config) == [
         {

@@ -242,10 +242,13 @@ def test_served_canonical_overrides_map_canonical_ids_to_gateway_spellings() -> 
         ]
     ) == {
         "claude-opus-4-8": "databricks-claude-opus-4-8",
+        "claude-opus-4.8": "databricks-claude-opus-4-8",
         "claude-opus-5": "databricks-claude-opus-5",
         "claude-sonnet-5": "anthropic/claude-sonnet-5",
         "claude-haiku-4-5": "gw-claude-haiku-4-5",
+        "claude-haiku-4.5": "gw-claude-haiku-4-5",
         "claude-fable-5-1": "system.ai.claude-fable-5-1",
+        "claude-fable-5.1": "system.ai.claude-fable-5-1",
     }
 
 
@@ -287,8 +290,54 @@ def test_served_canonical_overrides_stay_empty_when_there_is_nothing_to_rewrite(
 def test_served_canonical_overrides_keep_the_first_of_two_equal_spellings() -> None:
     """Two served ids sharing a canonical form resolve deterministically."""
     assert served_canonical_overrides(["databricks-claude-opus-4-8", "gw-claude-opus-4-8"]) == {
-        "claude-opus-4-8": "databricks-claude-opus-4-8"
+        "claude-opus-4-8": "databricks-claude-opus-4-8",
+        "claude-opus-4.8": "databricks-claude-opus-4-8",
     }
+
+
+@pytest.mark.parametrize(
+    ("served", "requested"),
+    [
+        ("gateway-claude-fable-5-2", "claude-fable-5.2"),
+        ("gateway-claude-opus-5-5", "claude-opus-5.5"),
+        ("gateway-claude-opus-4-8[1m]", "claude-opus-4.8[1m]"),
+        ("gateway-claude-sonnet-4-5-20250929", "claude-sonnet-4.5-20250929"),
+        ("gateway-claude-mythos-6-12", "claude-mythos-6.12"),
+        ("gateway-claude-opus-5.5", "claude-opus-5-5"),
+    ],
+)
+def test_served_canonical_overrides_cover_decimal_version_spellings(
+    served: str, requested: str
+) -> None:
+    overrides = served_canonical_overrides([served])
+    assert overrides[requested] == served
+    assert overrides[requested].removeprefix("gateway-") != requested
+    assert len(overrides) == 2
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_served_canonical_overrides_do_not_replace_an_exact_spelling(reverse: bool) -> None:
+    served = ["gateway-claude-opus-5-5", "other-claude-opus-5.5"]
+    if reverse:
+        served.reverse()
+    overrides = served_canonical_overrides(served)
+    assert overrides["claude-opus-5.5"] == "other-claude-opus-5.5"
+    assert overrides["claude-opus-5-5"] == "gateway-claude-opus-5-5"
+
+
+def test_served_canonical_overrides_preserve_direct_served_ids() -> None:
+    overrides = served_canonical_overrides(["gateway-claude-opus-5-5", "claude-opus-5.5"])
+    assert "claude-opus-5.5" not in overrides
+    assert overrides["claude-opus-5-5"] == "gateway-claude-opus-5-5"
+
+
+@pytest.mark.parametrize(
+    "served",
+    ["gateway-claude-opus-5", "gateway-claude-opus-20260929", "gateway-gpt-5-5"],
+)
+def test_served_canonical_overrides_do_not_invent_minor_versions(served: str) -> None:
+    overrides = served_canonical_overrides([served])
+    assert all("." not in requested for requested in overrides)
 
 
 # A gateway that manages the picker names every row by the id it serves,
