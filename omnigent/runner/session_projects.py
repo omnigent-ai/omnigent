@@ -328,6 +328,8 @@ def _refusal(response: httpx.Response) -> str:
         detail = None
     if not isinstance(detail, str) or not detail:
         detail = response.text[:300]
+    if response.status_code == 404 and detail == "Project not found":
+        return "the project no longer exists; nothing was changed"
     if response.status_code == 404:
         return f"session not found or not visible to you ({detail})"
     if response.status_code == 409 and "representative" in detail:
@@ -579,7 +581,10 @@ async def execute_session_update(
                         "file it into a new project in separate calls",
                     }
                 )
-        if name:
+            # Never fall through to create-if-missing: a project deleted after
+            # this read must fail the PATCH, not be recreated.
+            project_id = str(existing["id"])
+        elif name:
             try:
                 project_id, created = await resolve_project_id(client, name, headers=headers)
             except (httpx.HTTPError, ValueError) as exc:
@@ -648,16 +653,7 @@ async def _promote_label_folder(
     return None, _project_refusal(created, name)
 
 
-async def _owned_project(
-    client: httpx.AsyncClient, tool_name: str, name: str
-) -> tuple[dict[str, Any] | None, str | None]:
-    try:
-        project = await _find_project(client, name)
-    except (httpx.HTTPError, ValueError) as exc:
-        return None, f"{tool_name}: {exc}"
-    if project is None:
-        return None, f"no project named {name!r}; sys_project_list shows the user's projects"
-    return project, None
+_NO_SUCH_PROJECT = "no project named {name!r}; sys_project_list shows the user's projects"
 
 
 async def execute_project_update(
@@ -709,7 +705,13 @@ async def execute_project_update(
     if not await _server_checks_source(client, _ORGANIZE_SOURCE_CHECKS):
         return _unchecked_server_error("sys_project_update", "a project")
     headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
-    project, error = await _owned_project(client, "sys_project_update", current_name)
+    try:
+        project = await _find_project(client, current_name)
+    except (httpx.HTTPError, ValueError) as exc:
+        # Only a lookup that finished may conclude the project is missing; a
+        # failed one must not promote a label folder over a real project.
+        return json.dumps({"project": current_name, "error": f"sys_project_update: {exc}"})
+    error = _NO_SUCH_PROJECT.format(name=current_name)
     promoted = False
     if project is None:
         # A folder can exist only through its sessions' legacy label. Like the

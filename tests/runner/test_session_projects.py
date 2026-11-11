@@ -700,3 +700,61 @@ async def test_update_sends_title_archive_and_an_existing_project_in_one_patch()
         "labels": {"omni_project": ""},
     }
     assert not [r for r in requests if r.method == "POST"]
+
+
+@pytest.mark.parametrize("failure", ["http-503", "page-cap"])
+async def test_project_update_writes_nothing_when_project_discovery_fails(failure, monkeypatch):
+    from omnigent.runner import session_projects
+
+    monkeypatch.setattr(session_projects, "_MAX_LOOKUP_PAGES", 2)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        path = request.url.path
+        if path == "/v1/info":
+            return httpx.Response(200, json=ORGANIZE_INFO)
+        if path == "/v1/projects" and request.method == "GET":
+            if failure == "http-503":
+                return httpx.Response(503, text="unavailable")
+            page = {"data": [{"id": "1" * 32, "name": "Other"}], "has_more": True}
+            return httpx.Response(200, json={**page, "last_id": "1" * 32})
+        if path == "/v1/sessions":
+            row = {"id": PARENT, "labels": {"omni_project": "Q3"}}
+            return httpx.Response(200, json={"data": [row], "has_more": False})
+        return httpx.Response(200, json={})
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_project_update({"project": "Q3", "name": "Q4"}, client, SOURCE)
+        )
+    assert "could not list projects" in result["error"]
+    assert [r.method for r in requests if r.method != "GET"] == []
+
+
+async def test_archive_never_recreates_a_project_deleted_after_its_preflight():
+    requests: list[httpx.Request] = []
+    snapshot = {"id": PARENT, "labels": {}}
+    base = _organize_server(requests, snapshot)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/projects":
+            requests.append(request)
+            return httpx.Response(200, json={"data": [{"id": PROJECT_ID, "name": "Q3"}]})
+        if request.method == "PATCH":
+            requests.append(request)
+            error = {"code": "not_found", "message": "Project not found"}
+            return httpx.Response(404, json={"error": error})
+        return base(request)
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_session_update(
+                {"session_id": PARENT, "archived": True, "project": "Q3"}, client, SOURCE
+            )
+        )
+    assert result["error"] == "the project no longer exists; nothing was changed"
+    assert [r.url.path for r in requests if r.url.path == "/v1/projects"] == ["/v1/projects"]
+    assert not [r for r in requests if r.method == "POST"]
+    (patched,) = [r for r in requests if r.method == "PATCH"]
+    assert json.loads(patched.content)["project_id"] == PROJECT_ID
