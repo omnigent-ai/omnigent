@@ -408,11 +408,13 @@ async def test_session_change_live_pane_does_not_recreate(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("advertisement_state", ["missing", "undecodable", "read-error", "stale"])
 async def test_live_claude_pane_readvertises_missing_tmux_target(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    advertisement_state: str,
 ) -> None:
-    """A live pane must restore its missing injection target before input."""
+    """A live pane must restore an unusable injection target before input."""
     conv_id = "d5e6f708192a3b4c5d6e7f8091a2b3c4"
     auto_create_calls: list[str] = []
     app, registry = await _open_claude_native_session(
@@ -421,7 +423,25 @@ async def test_live_claude_pane_readvertises_missing_tmux_target(
     auto_create_calls.clear()
     bridge_dir = bridge_dir_for_conversation_id(conv_id)
     _plant_live_claude_pane(registry, conv_id, tmp_path, bridge_dir)
-    (bridge_dir / "tmux.json").unlink()
+    advertisement = bridge_dir / "tmux.json"
+    if advertisement_state == "missing":
+        advertisement.unlink()
+    elif advertisement_state == "undecodable":
+        advertisement.write_bytes(b"\xff")
+    elif advertisement_state == "read-error":
+        real_read = claude_native_bridge.read_tmux_target
+        reads = 0
+
+        def _fail_first_read(read_bridge_dir: Path) -> dict[str, str] | None:
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                raise PermissionError("synthetic unreadable advertisement")
+            return real_read(read_bridge_dir)
+
+        monkeypatch.setattr(claude_native_bridge, "read_tmux_target", _fail_first_read)
+    else:
+        assert advertisement_state == "stale"
 
     captured: list[tuple[str, dict[str, str] | None]] = []
 
@@ -453,6 +473,40 @@ async def test_live_claude_pane_readvertises_missing_tmux_target(
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_live_claude_pane_keeps_matching_tmux_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A correct advertisement is not rewritten on every live-pane input."""
+    conv_id = "e6f708192a3b4c5d6e7f8091a2b3c4d5"
+    auto_create_calls: list[str] = []
+    app, registry = await _open_claude_native_session(
+        monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls
+    )
+    auto_create_calls.clear()
+    bridge_dir = bridge_dir_for_conversation_id(conv_id)
+    _plant_live_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+    write_tmux_target(
+        bridge_dir,
+        socket_path=tmp_path / "omnigent-terminal-live" / "tmux.sock",
+        tmux_target="main",
+    )
+    advertisement = bridge_dir / "tmux.json"
+    before = advertisement.read_bytes()
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", lambda *_a, **_k: None)
+    async with _runner_client(app) as client:
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "effort_change", "effort": "high"},
+        )
+
+    assert response.status_code == 204, response.text
+    assert auto_create_calls == []
+    assert advertisement.read_bytes() == before
 
 
 def _plant_live_claude_pane(

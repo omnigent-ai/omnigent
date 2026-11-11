@@ -681,7 +681,11 @@ def register_resource_routes(
             "socket_path": str(instance.socket_path),
             "tmux_target": instance.tmux_target,
         }
-        if read_tmux_target(bridge_dir) == expected:
+        try:
+            current = read_tmux_target(bridge_dir)
+        except (OSError, ValueError):
+            current = None
+        if current == expected:
             return
         if terminal_registry.get(conv_id, instance.name, instance.session_key) is not instance:
             return

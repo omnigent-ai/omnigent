@@ -5845,6 +5845,13 @@ def test_read_tmux_target_returns_only_a_complete_advertisement(tmp_path: Path) 
     bridge_dir = tmp_path / "bridge"
     assert claude_native_bridge.read_tmux_target(bridge_dir) is None
 
+    bridge_dir.mkdir()
+    advertisement = bridge_dir / "tmux.json"
+    advertisement.write_text('{"socket_path": "/tmp/example/tmux.sock"}', encoding="utf-8")
+    assert claude_native_bridge.read_tmux_target(bridge_dir) is None
+    advertisement.write_text('{"socket_path": 3, "tmux_target": ["main"]}', encoding="utf-8")
+    assert claude_native_bridge.read_tmux_target(bridge_dir) is None
+
     write_tmux_target(
         bridge_dir,
         socket_path=Path("/tmp/example/tmux.sock"),
