@@ -90,7 +90,7 @@ describe("listScheduledTasks", () => {
         mockResponse({ scheduled_tasks: [{ ...TASK_WIRE, ...extra }] }),
       );
       const tasks = await listScheduledTasks();
-      expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks");
+      expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks?event_triggers=1");
       expect(tasks).toHaveLength(1);
       expect(tasks[0]).toMatchObject({
         id: "st_1",
@@ -116,7 +116,7 @@ describe("getScheduledTask", () => {
   it("GETs /v1/scheduled-tasks/{id} and encodes the id", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
     const task = await getScheduledTask("st 1");
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks/st%201");
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks/st%201?event_triggers=1");
     expect(task.id).toBe("st_1");
   });
 });

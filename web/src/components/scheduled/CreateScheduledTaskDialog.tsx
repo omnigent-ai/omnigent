@@ -317,6 +317,10 @@ export function CreateScheduledTaskDialog({
   const createMutation = useCreateScheduledTask();
   const updateMutation = useUpdateScheduledTask();
   const isEdit = editingTask !== null;
+  // A task without a rule and without a session trigger runs on another provider's
+  // events, which this form has no fields for.
+  const editsEventTrigger =
+    editingTask !== null && editingTask.rrule === null && editingTask.sessionTrigger == null;
   // Runs start from a copy of a session: the one being copied on create, or the
   // saved session copy on edit. They use a schedule and start each run in a new
   // session.
@@ -941,6 +945,7 @@ export function CreateScheduledTaskDialog({
   const unsupportedByScheduler = !anchoredScheduling && requiresAnchoredScheduling;
   const scheduleInvalid =
     !sessionTriggerMode &&
+    !editsEventTrigger &&
     (scheduleUnsupported ||
       unsupportedByScheduler ||
       validateSchedule(schedule, {
@@ -1227,7 +1232,10 @@ export function CreateScheduledTaskDialog({
                 titleContains: sessionTrigger.titleContains?.trim() || null,
               },
             }
-          : { rrule: buildRRule(schedule) }),
+          : // Another provider's event trigger has no fields here; saving keeps it.
+            editsEventTrigger
+            ? {}
+            : { rrule: buildRRule(schedule) }),
         timezone,
         ...(executionTargetChanged ? { executionTarget } : {}),
         ...(worktreesSupported && baseBranch !== (editingTask?.baseBranch ?? null)
@@ -1719,6 +1727,13 @@ export function CreateScheduledTaskDialog({
                       </p>
                     )}
                   </>
+                ) : editsEventTrigger ? (
+                  <p
+                    className="text-sm text-muted-foreground"
+                    data-testid="task-event-trigger-note"
+                  >
+                    This automation runs on events. Saving keeps its trigger.
+                  </p>
                 ) : (
                   !triggerMode && recurrenceFields
                 )}
@@ -2117,7 +2132,7 @@ export function CreateScheduledTaskDialog({
                         </>
                       )}
                     </div>
-                    {!triggerMode && !sessionTriggerMode && endingFields}
+                    {!triggerMode && !sessionTriggerMode && !editsEventTrigger && endingFields}
                   </CollapsibleContent>
                 </Collapsible>
               </>

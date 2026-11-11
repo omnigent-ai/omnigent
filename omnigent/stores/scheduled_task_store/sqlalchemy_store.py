@@ -52,6 +52,7 @@ from omnigent.server.scheduled.run_reconciler import (
 )
 from omnigent.server.scheduled.schedule import (
     EVENT_TRIGGER_KEY_PREFIX,
+    EVENT_TRIGGERED_NEXT_RUN_AT,
     continued_sandbox_host_id,
     is_event_trigger_key,
     is_trigger_automation,
@@ -95,6 +96,10 @@ _MAX_COALESCED_EVENTS = 20
 _EVENT_RATE_WINDOW_SECONDS = 60
 # JSON documents stay well below the columns' 16,383 stored bytes before compression.
 _MAX_JSON_DOCUMENT_CHARS = 12_000
+# Room a coalesced document keeps for its ``"omitted": <count>`` field.
+_OMITTED_FIELD_RESERVE = 32
+# Every event key sorts in [EVENT_TRIGGER_KEY_PREFIX, this): ";" follows ":".
+_EVENT_TRIGGER_KEY_END = EVENT_TRIGGER_KEY_PREFIX[:-1] + ";"
 # How long an occurrence receipt keeps a repeated delivery from recording again.
 _EVENT_RECEIPT_RETENTION_SECONDS = 7 * 24 * 3600
 # Expired receipts removed per accepted event, so cleanup keeps pace with intake.
@@ -205,7 +210,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         last_run_at=row.last_run_at,
         last_run_conversation_id=row.last_run_conversation_id,
         updated_at=row.updated_at,
-        next_run_at=row.next_run_at,
+        next_run_at=None if row.next_run_at == EVENT_TRIGGERED_NEXT_RUN_AT else row.next_run_at,
         project_id=row.project_id,
         delegation_ref=row.delegation_ref,
         trigger_config=_load_json(row.trigger_config),
@@ -1175,9 +1180,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         if row.state == encode_scheduled_task_state("completed"):
             # A schedule edit or resume re-evaluates a finished schedule.
             row.state = encode_scheduled_task_state("active")
-        if not self._dispatch_enabled or row.trigger_config is not None:
-            # Event-triggered tasks run only when an event records a pending run.
+        if not self._dispatch_enabled:
             row.next_run_at = None
+            return
+        if row.trigger_config is not None:
+            # Event-triggered tasks run only when an event records a pending run.
+            row.next_run_at = EVENT_TRIGGERED_NEXT_RUN_AT
             return
         task = _to_entity(row)
         row.next_run_at = next_scheduled_time(task, after)
@@ -1295,8 +1303,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 .where(
                     SqlScheduledTask.state == encode_scheduled_task_state("active"),
                     SqlScheduledTask.next_run_at.is_(None),
-                    # Event-triggered tasks have no rule and never get a next run time.
-                    SqlScheduledTask.rrule.is_not(None),
                 )
                 .order_by(
                     *(
@@ -1521,8 +1527,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     ) -> builtins.list[ScheduledTask]:
         """One page of the current workspace's active event-triggered tasks, by id.
 
-        Such a task is active with no rule and no next run time, so the page seeks
-        the due-task index on ``(state, next_run_at, workspace_id, id)``.
+        Such a task is active with the event-trigger next run time, so the page is an
+        equality seek on the due-task index ``(state, next_run_at, workspace_id, id)``.
         """
         if limit < 1:
             raise ValueError("The event-triggered task page size must be at least 1.")
@@ -1531,9 +1537,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 select(SqlScheduledTask)
                 .where(
                     SqlScheduledTask.state == encode_scheduled_task_state("active"),
-                    SqlScheduledTask.next_run_at.is_(None),
+                    SqlScheduledTask.next_run_at == EVENT_TRIGGERED_NEXT_RUN_AT,
                     SqlScheduledTask.workspace_id == current_workspace_id(),
-                    SqlScheduledTask.rrule.is_(None),
                 )
                 .order_by(SqlScheduledTask.id)
                 .limit(limit)
@@ -1565,6 +1570,13 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 f"An event run's trigger key must start with {EVENT_TRIGGER_KEY_PREFIX!r}."
             )
         entry = {**event, "key": trigger_key}
+        first_document = {"events": [entry]}
+        if (
+            len(_dump_json(first_document) or "")
+            > _MAX_JSON_DOCUMENT_CHARS - _OMITTED_FIELD_RESERVE
+        ):
+            # An event too large to list is still counted.
+            first_document = {"events": [], "omitted": 1}
         workspace_id = task.workspace_id
 
         def receipt(session: Session, run_id: str | None) -> None:
@@ -1627,16 +1639,16 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             ):
                 return "duplicate"
             if coalesce:
-                # The task-status index finds the unclaimed run among the task's
-                # pending runs, not its whole history.
+                # A key range on the task-status index reaches only the task's
+                # pending event runs, of which coalescing leaves at most one.
                 pending = session.scalar(
                     select(SqlScheduledTaskRun)
                     .where(
                         *task_runs,
                         *_PENDING_RUN_FILTER,
-                        SqlScheduledTaskRun.trigger_key.startswith(EVENT_TRIGGER_KEY_PREFIX),
+                        SqlScheduledTaskRun.trigger_key >= EVENT_TRIGGER_KEY_PREFIX,
+                        SqlScheduledTaskRun.trigger_key < _EVENT_TRIGGER_KEY_END,
                     )
-                    .order_by(SqlScheduledTaskRun.scheduled_at, SqlScheduledTaskRun.id)
                     .limit(1)
                     .with_for_update()
                 )
@@ -1647,7 +1659,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     listed = {**document, "events": [*events, entry]}
                     if (
                         len(events) < _MAX_COALESCED_EVENTS
-                        and len(_dump_json(listed) or "") <= _MAX_JSON_DOCUMENT_CHARS
+                        and len(_dump_json(listed) or "")
+                        <= _MAX_JSON_DOCUMENT_CHARS - _OMITTED_FIELD_RESERVE
                     ):
                         document = listed
                     else:
@@ -1688,7 +1701,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                                 "later events in this minute were dropped."
                             ),
                             error_code="rate_limited",
-                            event=_dump_bounded_json({"events": [entry]}),
+                            event=_dump_bounded_json(first_document),
                         )
                     )
                 return "rate_limited"
@@ -1702,7 +1715,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     scheduled_at=now,
                     trigger_key=trigger_key,
                     host_id=host_id,
-                    event=_dump_bounded_json({"events": [entry]}),
+                    event=_dump_bounded_json(first_document),
                 )
             )
             receipt(session, run_id)

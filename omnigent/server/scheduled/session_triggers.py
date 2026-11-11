@@ -13,7 +13,9 @@ import contextvars
 import hashlib
 import json
 import logging
+import threading
 import time
+import uuid
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -54,6 +56,10 @@ MAX_EVENT_RUNS_PER_MINUTE = 10
 _TASK_PAGE_SIZE = 500
 # Longer occurrence IDs are hashed so the occurrence key fits its column.
 _MAX_OCCURRENCE_CHARS = 128
+# Longer IDs passed to a run are replaced by their hash, keeping its event document small.
+_MAX_ID_CHARS = 256
+# Events waiting for the worker; past this, new events are dropped and logged.
+_MAX_QUEUED_EVENTS = 1_000
 # How long a replica reuses its list of a workspace's session-triggered tasks.
 # A task created on another replica starts receiving events within this time.
 _TASK_LIST_TTL_SECONDS = 15.0
@@ -217,15 +223,16 @@ def notify(
     :param event_type: What happened.
     :param session_id: The session it happened on.
     :param occurrence: Distinguishes this event from others of its type on the
-        session, e.g. a response ID. ``None`` uses the current time in
-        milliseconds, which never deduplicates.
+        session, e.g. a response ID. ``None`` makes the event unique, so it never
+        deduplicates.
     :param conversation: The session as the caller already has it. Required for
         ``session.deleted``, since the row is gone by the time the worker runs.
     :param readers: The result of :func:`readers_of`, captured before a deletion
         removed the session's grants. ``None`` checks each task owner's grant.
     :param ids: Extra IDs for the run, e.g. ``response_id="resp_1"``. ``None``
         values are dropped.
-    :returns: The queued work, for tests, or ``None`` when triggers are off.
+    :returns: The queued work, for tests, or ``None`` when triggers are off or
+        the queue is full.
     """
     if _wiring is None:
         return None
@@ -233,9 +240,11 @@ def notify(
     event = SessionEvent(
         type=event_type,
         session_id=session_id,
-        occurrence=occurrence or str(int(now * 1000)),
+        occurrence=occurrence or uuid.uuid4().hex,
         occurred_at=int(now),
-        ids=tuple((key, value) for key, value in sorted(ids.items()) if value is not None),
+        ids=tuple(
+            (key, _bounded_id(value)) for key, value in sorted(ids.items()) if value is not None
+        ),
     )
     return _submit(_record, event, conversation, readers)
 
@@ -267,21 +276,42 @@ def _holds_grant(wiring: _Wiring, user_id: str, session_id: str) -> bool:
     return wiring.permission_store.get(user_id, session_id) is not None
 
 
-def _submit(fn: Callable[..., None], *args: object) -> Future[None]:
-    global _executor
-    if _executor is None:
-        # One worker keeps events of a session in the order they happened.
-        _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="session-triggers")
+def _bounded_id(value: str) -> str:
+    """An ID as given, or its hash when it is too long to pass to a run."""
+    if len(value) <= _MAX_ID_CHARS:
+        return value
+    return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
+
+
+_queued = 0
+_queued_lock = threading.Lock()
+
+
+def _submit(fn: Callable[..., None], *args: object) -> Future[None] | None:
+    global _executor, _queued
+    with _queued_lock:
+        if _queued >= _MAX_QUEUED_EVENTS:
+            _logger.warning("Dropped a session event: %d are already waiting", _queued)
+            return None
+        _queued += 1
+        if _executor is None:
+            # One worker keeps events of a session in the order they happened.
+            _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="session-triggers")
+        executor = _executor
     # The worker runs in the caller's workspace scope, as every store read filters on it.
     ctx = contextvars.copy_context()
 
     def run() -> None:
+        global _queued
         try:
             fn(*args)
         except Exception:
             _logger.exception("Could not record session-triggered runs")
+        finally:
+            with _queued_lock:
+                _queued -= 1
 
-    return _executor.submit(ctx.run, run)
+    return executor.submit(ctx.run, run)
 
 
 def _session_triggered_tasks(wiring: _Wiring) -> list[ScheduledTask]:

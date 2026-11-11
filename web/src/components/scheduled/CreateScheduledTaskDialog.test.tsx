@@ -5895,3 +5895,23 @@ describe("session events trigger", () => {
     expect(input).not.toHaveProperty("rrule");
   });
 });
+
+describe("editing an automation that runs on events", () => {
+  it("saves other fields and keeps its trigger", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ rrule: null })}
+      />,
+    );
+    expect(screen.getByTestId("task-event-trigger-note")).toBeVisible();
+    expect(screen.queryByTestId("schedule-preset-trigger")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input.name).toBe("Renamed");
+    expect(input).not.toHaveProperty("rrule");
+  });
+});

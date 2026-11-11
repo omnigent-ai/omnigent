@@ -77,10 +77,16 @@ async def test_create_a_session_triggered_automation(client: httpx.AsyncClient) 
         "events": ["session.created", "turn.completed"],
         "include_own_sessions": False,
     }
-    listed = (await client.get("/v1/scheduled-tasks", headers=_headers())).json()[
+    listed = (await client.get("/v1/scheduled-tasks?event_triggers=1", headers=_headers())).json()[
         "scheduled_tasks"
     ]
     assert [t["trigger_config"] for t in listed] == [task["trigger_config"]]
+    url = f"/v1/scheduled-tasks/{task['id']}"
+    assert (await client.get(f"{url}?event_triggers=1", headers=_headers())).status_code == 200
+    # Clients that predate event triggers expect a rule on every task, so they don't see it.
+    older = (await client.get("/v1/scheduled-tasks", headers=_headers())).json()
+    assert older["scheduled_tasks"] == []
+    assert (await client.get(url, headers=_headers())).status_code == 404
 
 
 @pytest.mark.parametrize(

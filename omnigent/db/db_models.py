@@ -1774,13 +1774,14 @@ class SqlScheduledTaskRun(OmnigentBase):
             "scheduled_at",
             "id",
         ),
-        # A task's runs in one status, e.g. its unclaimed pending event run.
+        # A task's runs in one status by key prefix, e.g. its unclaimed pending
+        # event run among pending Run now requests.
         Index(
             "ix_scheduled_task_runs_task_status",
             "workspace_id",
             "scheduled_task_id",
             "status",
-            "scheduled_at",
+            "trigger_key",
             "id",
         ),
         # Reverse lookup conversation_id -> run for the event-driven completion
@@ -1826,12 +1827,12 @@ class SqlScheduledTaskEventReceipt(OmnigentBase):
 
     __tablename__ = "scheduled_task_event_receipts"
 
-    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    # Tenant partition key: Databricks workspace id owning this row. Part of the PK.
+    # A new table, so writers always supply it and the database has no default.
     workspace_id: Mapped[int] = mapped_column(
         BigInteger,
         primary_key=True,
         nullable=False,
-        server_default="0",
         default=current_workspace_id,
     )
     id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
@@ -1852,6 +1853,11 @@ class SqlScheduledTaskEventReceipt(OmnigentBase):
             "trigger_key",
             name="uq_scheduled_task_event_receipts_occurrence",
         ),
+        # SQLite ignores VARCHAR lengths: 256 characters at up to four bytes each.
+        CheckConstraint(
+            "length(CAST(trigger_key AS BLOB)) <= 1024",
+            name="ck_scheduled_task_event_receipts_key_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
         Index(
             "ix_scheduled_task_event_receipts_age",
             "workspace_id",

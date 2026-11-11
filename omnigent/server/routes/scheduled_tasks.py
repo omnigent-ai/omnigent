@@ -384,6 +384,16 @@ def _validate_trigger_or_400(
     return config.model_dump(exclude_none=True)
 
 
+def _reads_event_triggers(request: Request) -> bool:
+    """Whether the caller asked for event-triggered tasks, which have no ``rrule``.
+
+    Clients loaded before event triggers existed expect every task to have a rule
+    and cannot show one without it, so lists and reads omit such tasks unless the
+    client sends ``event_triggers=1``.
+    """
+    return request.query_params.get("event_triggers") in {"1", "true"}
+
+
 def _validate_timezone_or_400(timezone: str) -> None:
     """Raise a 400 ``OmnigentError`` if *timezone* is not a valid IANA timezone."""
     try:
@@ -1062,6 +1072,8 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         tasks = [t for t in store.list(owner_user_id=owner_id) if _owns_task(t, owner_id)]
+        if not _reads_event_triggers(request):
+            tasks = [t for t in tasks if t.rrule is not None]
         task_ids = [t.id for t in tasks]
         running = store.list_running_runs_for_tasks(task_ids)
         # Force-fail stale orphans FIRST so the completion badge below reports a
@@ -1120,6 +1132,8 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         task = _require_owned(scheduled_task_id, owner_id)
+        if task.rrule is None and not _reads_event_triggers(request):
+            raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         running = store.list_running_runs_for_tasks([task.id])
         force_fail_stale_runs(store, running)
         latest_status = store.list_latest_run_status_for_tasks([task.id])

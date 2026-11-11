@@ -284,9 +284,12 @@ wrong:
 ## Event triggers
 
 A task with a `trigger_config` runs on events instead of a schedule. It has no
-`rrule` (`rrule IS NULL` is how SQL tells it apart) and no `next_run_at`: the
-scheduler never lists it as due or fills in its next run time, and legacy timers
-never arm it. The JSON names a `provider`;
+`rrule`, and while active it saves `next_run_at` as a fixed marker that no
+schedule reaches (`EVENT_TRIGGERED_NEXT_RUN_AT`; the API reports `null`). So it
+never comes due, it is not a task waiting for a next run time, and the due-task
+index finds a workspace's event-triggered tasks with an equality seek. Legacy
+timers clear the marker and never arm such a task; the next poll of the
+database scheduler puts the marker back. The JSON names a `provider`;
 each provider validates its own shape. An event records a `scheduled` run with
 the event's IDs in the run's `event` column, keyed `event:<provider>:<occurrence>`
 in `trigger_key`. Every accepted occurrence also gets a row in
@@ -298,7 +301,9 @@ on a later poll like a Run now request, and the run sends the task's prompt
 followed by the events as JSON lines. A run whose task was paused, or lost its
 trigger, before the claim is recorded as `skipped` (`trigger_inactive`).
 
-Event triggers need the database scheduler and the `session_triggers` feature;
+Lists and reads return event-triggered tasks only to clients that pass
+`event_triggers=1`, since clients loaded before them expect every task to have
+a rule. Event triggers need the database scheduler and the `session_triggers` feature;
 the API rejects them otherwise and advertises `scheduled_task_session_triggers`
 when it accepts them. Turn the feature on only once no server older than this
 change runs against the database: an older server reads a task with no `rrule`

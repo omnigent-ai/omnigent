@@ -20,6 +20,7 @@ from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.scheduled.config import DEFAULT_SCHEDULER_CONFIG, ScheduledTaskSchedulerConfig
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.schedule import (
+    EVENT_TRIGGERED_NEXT_RUN_AT,
     host_ownership_key,
     is_event_trigger_key,
     is_trigger_automation,
@@ -670,6 +671,13 @@ class PersistentTaskScheduler:
         for task in tasks:
             self._initialization_cursor = (task.workspace_id, task.id)
             try:
+                if task.rrule is None:
+                    # An event-triggered task cleared by legacy timers gets its marker back.
+                    with workspace_scope(task.workspace_id):
+                        await asyncio.to_thread(
+                            self._store.initialize_next_run_at, task, EVENT_TRIGGERED_NEXT_RUN_AT
+                        )
+                    continue
                 if not await self._validate_schedule(task):
                     continue
                 next_run = await self._next_occurrence(task, int(self._now()))

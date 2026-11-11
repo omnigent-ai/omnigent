@@ -78,6 +78,16 @@ def test_an_event_task_has_no_rule_and_no_next_run(store: SqlAlchemyScheduledTas
     assert (task.state, task.next_run_at) == ("active", None)
     assert store.list_uninitialized_tasks() == []
     assert store.list_event_triggered_tasks() == [task]
+    # Stored with a marker no schedule reaches, which the due-task index finds by equality.
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlScheduledTask
+    from omnigent.server.scheduled.schedule import EVENT_TRIGGERED_NEXT_RUN_AT
+
+    with store._session("read_marker") as session:
+        stored = session.scalar(select(SqlScheduledTask.next_run_at))
+    assert stored == EVENT_TRIGGERED_NEXT_RUN_AT
+    assert store.list_due_tasks(EVENT_TRIGGERED_NEXT_RUN_AT - 1) == []
     assert store.update(task.id, state="paused").state == "paused"
     assert store.list_event_triggered_tasks() == []
 
@@ -165,6 +175,72 @@ def test_a_coalesced_run_stays_within_its_column(store: SqlAlchemyScheduledTaskS
     # Entries that would push the document past its bound are counted instead.
     assert len(pending.event["events"]) == 2
     assert pending.event["omitted"] == 3
+
+
+def test_a_document_at_its_bound_still_takes_the_omitted_count(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    task = _event_task(store, session_mode="continue")
+    limit = sqlalchemy_store._MAX_JSON_DOCUMENT_CHARS - sqlalchemy_store._OMITTED_FIELD_RESERVE
+
+    def record(key: str, filler: int) -> str:
+        return store.record_event_run(
+            task,
+            now=1_000,
+            trigger_key=event_trigger_key("omnigent", key),
+            host_id=task.host_id,
+            event={"type": "turn.completed", "session_id": "x" * filler},
+            coalesce=True,
+            max_runs_per_minute=10,
+        )
+
+    assert record("first", 10) == "recorded"
+    [pending] = store.list_pending_runs()
+    used = len(sqlalchemy_store._dump_json(pending.event) or "")
+    # An entry that fills the listed document exactly to its limit is listed...
+    entry_overhead = len(
+        sqlalchemy_store._dump_json(
+            {
+                "events": [
+                    *pending.event["events"],
+                    {
+                        "type": "turn.completed",
+                        "session_id": "",
+                        "key": event_trigger_key("omnigent", "second"),
+                    },
+                ]
+            }
+        )
+        or ""
+    )
+    assert record("second", limit - entry_overhead) == "coalesced"
+    [pending] = store.list_pending_runs()
+    assert len(sqlalchemy_store._dump_json(pending.event) or "") == limit > used
+    # ...and the next one is counted, which still fits within the column.
+    for index in range(50):
+        assert record(f"more{index}", 10) == "coalesced"
+    [pending] = store.list_pending_runs()
+    assert pending.event["omitted"] == 50
+
+
+def test_an_event_too_large_to_list_is_counted(store: SqlAlchemyScheduledTaskStore) -> None:
+    task = _event_task(store)
+    assert (
+        store.record_event_run(
+            task,
+            now=1_000,
+            trigger_key=event_trigger_key("omnigent", "huge"),
+            host_id=task.host_id,
+            event={"type": "turn.completed", "session_id": "x" * 20_000},
+            coalesce=False,
+            max_runs_per_minute=10,
+        )
+        == "recorded"
+    )
+    [pending] = store.list_pending_runs()
+    assert pending.event == {"events": [], "omitted": 1}
 
 
 def test_an_oversized_trigger_is_refused(store: SqlAlchemyScheduledTaskStore) -> None:
