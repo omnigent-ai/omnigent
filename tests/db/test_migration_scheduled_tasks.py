@@ -348,11 +348,8 @@ def test_share_with_stores_at_most_8192_bytes(db_engine: Engine) -> None:
     assert stored == widest
     # Each is wider in characters and in bytes, so every engine refuses it.
     for row_id, too_wide in ((b"m", widest + "x"), (b"a", "x" * 8193)):
-        # MySQL reports CHECK violations as OperationalError and long values as DataError.
-        with (
-            pytest.raises((IntegrityError, sa.exc.DataError, sa.exc.OperationalError)),
-            db_engine.begin() as conn,
-        ):
+        # SQLite fails the byte CHECK; engines enforcing the length report a DataError.
+        with pytest.raises((IntegrityError, sa.exc.DataError)), db_engine.begin() as conn:
             conn.execute(tasks.insert().values(id=row_id * 16, share_with=too_wide, **values))
 
 
