@@ -1,5 +1,6 @@
 import { conversationPage } from "@/test/sidebarMockHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { type ReactNode, Suspense } from "react";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
@@ -11,8 +12,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { type ReactNode, Suspense } from "react";
-import { MemoryRouter, Outlet, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { sessionNumberAriaShortcut } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
@@ -59,27 +59,16 @@ function mockConversations(convs: Conversation[]) {
   useConvMock.mockReturnValue(conversationPage(convs, { first_id: null, last_id: null }));
 }
 
-// Like the app shell, the sidebar is a layout route that stays mounted across navigation.
-function renderAt(initialEntry: string, config = sidebarConfig, chatPage: ReactNode = null) {
+function renderAt(initialEntry: string, config = sidebarConfig) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const shell = (
-    <>
-      <Sidebar open onClose={vi.fn()} />
-      <Suspense fallback={null}>
-        <Outlet />
-      </Suspense>
-    </>
-  );
   const tree = () => (
     <QueryClientProvider client={qc}>
       <SidebarDataProvider config={config}>
         <TooltipProvider>
           <MemoryRouter initialEntries={[initialEntry]}>
             <Routes>
-              <Route element={shell}>
-                <Route path="/" element={null} />
-                <Route path="/c/:conversationId" element={chatPage} />
-              </Route>
+              <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
+              <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
             </Routes>
           </MemoryRouter>
         </TooltipProvider>
@@ -243,6 +232,31 @@ describe("collapsing the project that holds the open session", () => {
     expect(screen.queryByRole("link", { name: /sibling_b/ })).not.toBeInTheDocument();
   });
 
+  // The chat page suspends until released, holding the route commit as a loading chat does.
+  function renderWithChatPage(chatPage: ReactNode) {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const shell = (page: ReactNode) => (
+      <>
+        <Sidebar open onClose={vi.fn()} />
+        <Suspense fallback={null}>{page}</Suspense>
+      </>
+    );
+    return render(
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider config={sidebarConfig}>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Routes>
+                <Route path="/" element={shell(null)} />
+                <Route path="/c/:conversationId" element={shell(chatPage)} />
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>,
+    );
+  }
+
   it("stays collapsed when the route commits after the collapse", async () => {
     openFiledSession();
     localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Repro 2506"]));
@@ -258,7 +272,7 @@ describe("collapsing the project that holds the open session", () => {
       if (!routeReleased) throw routeGate;
       return <div data-testid="chat-page" />;
     }
-    renderAt("/", sidebarConfig, <SlowChatPage />);
+    renderWithChatPage(<SlowChatPage />);
 
     fireEvent.click(screen.getByRole("link", { name: /sibling_b/ }));
     fireEvent.click(screen.getByRole("button", { name: "Repro 2506" }));
