@@ -1614,8 +1614,8 @@ class SqlScheduledTask(OmnigentBase):
     # JSON list of MCP service names every fired session starts with. NULL = none.
     mcp_services: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     # JSON list of {"user_id", "level"} grants added to every session a run
-    # creates. NULL = runs stay private to the owner. The store caps it in bytes.
-    share_with: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    # creates. NULL = runs stay private to the owner. At most 8,192 bytes.
+    share_with: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     # Per-firing cost budget in USD. When set, the fire path attaches a
     # cost_budget policy to each spawned session. NULL = no per-firing cap.
     max_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -1661,6 +1661,11 @@ class SqlScheduledTask(OmnigentBase):
         CheckConstraint("state IN (1, 2, 3, 4)", name="ck_scheduled_tasks_lifecycle_state"),
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
         CheckConstraint("session_mode IN (1, 2)", name="ck_scheduled_tasks_session_mode"),
+        # SQLite ignores VARCHAR lengths: 2,048 characters at up to four bytes each.
+        CheckConstraint(
+            "share_with IS NULL OR length(CAST(share_with AS BLOB)) <= 8192",
+            name="ck_scheduled_tasks_share_with_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
         Index("ix_scheduled_tasks_due", "state", "next_run_at", "workspace_id", "id"),
         # Covers a user's task listing ordered by creation time.
         Index(

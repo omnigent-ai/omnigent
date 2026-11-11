@@ -325,6 +325,38 @@ def test_session_mode_check_rejects_bad_code(db_engine: Engine) -> None:
 
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_share_with_stores_at_most_8192_bytes(db_engine: Engine) -> None:
+    """Every schema holds 2,048 four-byte characters in ``share_with`` and nothing wider.
+
+    Engines that enforce VARCHAR lengths cap it at 2,048 characters; SQLite, which
+    does not, caps the encoded value at 8,192 bytes with a CHECK.
+    """
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
+    values = {
+        "name": "shared",
+        "prompt": b"p",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    # 2,048 four-byte characters are exactly 8,192 UTF-8 bytes.
+    widest = "\U0001f600" * 2048
+    with db_engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"w" * 16, share_with=widest, **values))
+        stored = conn.execute(sa.select(tasks.c.share_with)).scalar_one()
+    assert stored == widest
+    # Each is wider in characters and in bytes, so every engine refuses it.
+    for row_id, too_wide in ((b"m", widest + "x"), (b"a", "x" * 8193)):
+        # MySQL reports CHECK violations as OperationalError and long values as DataError.
+        with (
+            pytest.raises((IntegrityError, sa.exc.DataError, sa.exc.OperationalError)),
+            db_engine.begin() as conn,
+        ):
+            conn.execute(tasks.insert().values(id=row_id * 16, share_with=too_wide, **values))
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_session_mode_accepts_a_continued_session(db_engine: Engine) -> None:
     """Migrated and model-built schemas both store a continued session."""
     tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
@@ -939,15 +971,15 @@ def test_session_mode_migration_defaults_existing_tasks_and_round_trips(
 
 
 @pytest.mark.parametrize(
-    ("previous", "revision", "column"),
+    ("previous", "revision", "column", "width"),
     [
-        (_MCP_SERVICES_PREVIOUS, _MCP_SERVICES_REVISION, "mcp_services"),
-        (_MCP_SERVICES_MERGE_REVISION, _SHARE_WITH_REVISION, "share_with"),
+        (_MCP_SERVICES_PREVIOUS, _MCP_SERVICES_REVISION, "mcp_services", 4096),
+        (_MCP_SERVICES_MERGE_REVISION, _SHARE_WITH_REVISION, "share_with", 2048),
     ],
     ids=["mcp_services", "share_with"],
 )
 def test_json_list_migration_keeps_existing_tasks_and_round_trips(
-    dispatch_migration_engine: Engine, previous: str, revision: str, column: str
+    dispatch_migration_engine: Engine, previous: str, revision: str, column: str, width: int
 ) -> None:
     """A nullable JSON-list column leaves existing tasks NULL and holds its widest value."""
     engine = dispatch_migration_engine
@@ -970,7 +1002,7 @@ def test_json_list_migration_keeps_existing_tasks_and_round_trips(
         config.attributes["connection"] = conn
         command.upgrade(config, revision)
     tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
-    widest = '["' + "x" * 4092 + '"]'
+    widest = '["' + "x" * (width - 4) + '"]'
     with engine.begin() as conn:
         # A task saved before the migration keeps the column NULL (no selection, no shares).
         assert conn.execute(sa.select(tasks.c[column])).scalar_one() is None
