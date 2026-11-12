@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { type ToolView, toolViewFor } from "./toolViews";
 
 describe("toolViewFor", () => {
-  const plan: ToolView = { summary: () => null };
+  const plan: ToolView = { lineCounts: () => null };
   const views = new Map<string, ToolView>([["manage_todo_list", plan]]);
 
   it("finds a view by the tool name the harness reports", () => {
@@ -18,7 +18,22 @@ describe("toolViewFor", () => {
     expect(toolViewFor("linear__manage_todo_list", views)).toBeUndefined();
   });
 
-  it("ships with no views registered", () => {
+  it("registers one edit view under every harness's edit and write tool name", () => {
+    const editView = toolViewFor("Edit");
+    expect(editView?.bodyLabel).toBe("Diff");
+    for (const name of [
+      "MultiEdit",
+      "apply_patch",
+      "sys_os_edit",
+      "mcp__omnigent__sys_os_edit",
+      "edit",
+      "Write",
+      "sys_os_write",
+      "mcp__omnigent__sys_os_write",
+      "write",
+    ]) {
+      expect(toolViewFor(name)).toBe(editView);
+    }
     expect(toolViewFor("manage_todo_list")).toBeUndefined();
   });
 });

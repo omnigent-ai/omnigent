@@ -1,6 +1,7 @@
 """Tests for PiExecutor."""
 
 import asyncio
+import base64
 import contextlib
 import itertools
 import json
@@ -12,6 +13,7 @@ import socket
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,6 +26,7 @@ import pytest
 from omnigent.debug_logging import record_to_row
 from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.inner.executor import (
+    CompactionComplete,
     ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
@@ -1859,7 +1862,12 @@ class TestPiExecutorConstructor(unittest.TestCase):
             _run(executor._get_gateway_token())
 
         read_cfg.assert_not_called()
-        fetch_command_token.assert_awaited_once_with("printf token")
+        from omnigent.inner.pi_executor import _GATEWAY_TURN_AUTH_TIMEOUT_S
+
+        # The refresh owns its task, so a bridge request's short wait does not bound the helper.
+        fetch_command_token.assert_awaited_once_with(
+            "printf token", timeout_s=_GATEWAY_TURN_AUTH_TIMEOUT_S
+        )
         self.assertEqual(executor._databricks_host, "https://example.databricks.com")
         self.assertEqual(executor._databricks_token, "command-token")
         self.assertEqual(
@@ -2139,6 +2147,54 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         shutil.rmtree(config.tmp_dir, ignore_errors=True)
 
 
+def test_gateway_managed_dir_adds_host_mcp_servers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pi_host_mcp_servers: None,
+) -> None:
+    """The gateway's temporary agent dir merges host MCP servers into a private copy."""
+    from omnigent.host.mcp_inventory import ConfiguredMcpServer
+    from omnigent.inner import pi_mcp
+
+    global_agent = tmp_path / "pi-agent"
+    global_agent.mkdir()
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(global_agent))
+    # Pi's filtered env drops this variable, so a server needing it is skipped.
+    monkeypatch.setenv("RUNNER_ONLY_SECRET", "sentinel-runner-only")
+    host_servers = [
+        ConfiguredMcpServer(
+            summary={"name": "docs", "harness": "codex"}, config={"command": "docs-mcp"}
+        ),
+        ConfiguredMcpServer(
+            summary={"name": "leaky", "harness": "claude"},
+            config={"command": "tool", "args": ["${RUNNER_ONLY_SECRET}"]},
+        ),
+    ]
+    monkeypatch.setattr(pi_mcp, "_host_mcp_servers", lambda: host_servers)
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+    ):
+        executor = PiExecutor(gateway=True)
+        _run(executor._get_gateway_token())
+
+    config = executor._build_env_and_dir(
+        [], 12345, "bridge-token", _build_models_json("https://h.example.com", "tok")
+    )
+    try:
+        assert "RUNNER_ONLY_SECRET" not in config.env
+        managed_config = Path(config.env["PI_CODING_AGENT_DIR"]) / "mcp.json"
+        assert json.loads(managed_config.read_text(encoding="utf-8")) == {
+            "mcpServers": {"docs": {"command": "docs-mcp"}}
+        }
+        assert not (global_agent / "mcp.json").exists()
+    finally:
+        shutil.rmtree(config.tmp_dir, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # Pi tool allowlist (--no-tools + --tools) tests — function-based per
 # the project's testing rules. ``--no-tools`` alone disables every tool
@@ -2265,7 +2321,7 @@ async def test_gateway_refresh_reuses_process_and_fails_closed(
     monkeypatch.setattr(tempfile, "tempdir", str(private_dir))
     current_token = "initial-token"
 
-    async def fetch_token(_):
+    async def fetch_token(_, **_kwargs):
         return current_token
 
     monkeypatch.setattr(pi_executor, "_fetch_shell_command_token", fetch_token)
@@ -2394,6 +2450,209 @@ async def test_gateway_helper_failure_is_bounded_and_redacted(monkeypatch, comma
     assert "secret" not in str(failure.value)
 
 
+async def test_gateway_refresh_before_turn_outlasts_the_bridge_deadline(monkeypatch):
+    # A helper slower than Pi's bridge budget (a host busy starting other agents)
+    # must not fail the turn: the refresh before Pi starts has no Pi deadline.
+    from omnigent.inner import pi_executor
+
+    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(pi_executor, "_GATEWAY_BRIDGE_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(pi_executor, "_GATEWAY_TURN_AUTH_TIMEOUT_S", 5)
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command="sleep 0.5; printf slow-token",
+        gateway_auth_refresh_interval_ms="0",
+    )
+    with pytest.raises(OSError, match="timed out"):
+        await executor._get_gateway_token()
+    assert await executor._get_gateway_token(before_turn=True) == "slow-token"
+
+
+def _jwt_expiring_in(seconds: float) -> str:
+    claims = base64.urlsafe_b64encode(json.dumps({"exp": time.time() + seconds}).encode())
+    return f"unsigned.{claims.rstrip(b'=').decode()}.not-verified"
+
+
+@pytest.mark.parametrize(("old_lifetime_s", "reused"), [(600, True), (10, False), (None, False)])
+async def test_gateway_slow_refresh_reuses_only_an_unexpired_token(
+    tmp_path, monkeypatch, old_lifetime_s, reused
+):
+    # A workspace too slow to renew the token within Pi's command deadline must not fail
+    # the request while the cached token's exp claim leaves it valid.
+    from omnigent.inner import pi_executor
+
+    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(pi_executor, "_GATEWAY_TURN_AUTH_TIMEOUT_S", 5)
+    old = "opaque-token" if old_lifetime_s is None else _jwt_expiring_in(old_lifetime_s)
+    new = _jwt_expiring_in(3600)
+    token_file, delay_file, runs_file = tmp_path / "token", tmp_path / "delay", tmp_path / "runs"
+    token_file.write_text(old)
+    delay_file.write_text("0")
+    files = {
+        name: shlex.quote(str(path))
+        for name, path in [("token", token_file), ("delay", delay_file), ("runs", runs_file)]
+    }
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command=(
+            f"echo run >> {files['runs']}; sleep $(cat {files['delay']}); cat {files['token']}"
+        ),
+        gateway_auth_refresh_interval_ms="0",
+    )
+    try:
+        assert await executor._get_gateway_token(before_turn=True) == old
+        token_file.write_text(new)
+        delay_file.write_text("1")
+        if reused:
+            assert await executor._get_gateway_token() == old
+        else:
+            with pytest.raises(OSError, match="timed out"):
+                await executor._get_gateway_token()
+        # The slow helper was not killed: its token answers the next request.
+        assert await executor._get_gateway_token(before_turn=True) == new
+        assert runs_file.read_text().count("run") == 2
+    finally:
+        await executor.close()
+
+
+async def test_gateway_slow_refresh_rechecks_expiry_after_the_host_sleeps(tmp_path, monkeypatch):
+    # The monotonic clock stops while a host sleeps, so only the token's exp claim, read
+    # against wall time, can tell that the cached token expired in the meantime.
+    from omnigent.inner import pi_executor
+
+    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(pi_executor, "_GATEWAY_TURN_AUTH_TIMEOUT_S", 5)
+    token = _jwt_expiring_in(600)
+    delay_file = tmp_path / "delay"
+    delay_file.write_text("0")
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command=f"sleep $(cat {shlex.quote(str(delay_file))}); printf %s {token}",
+        gateway_auth_refresh_interval_ms="0",
+    )
+    try:
+        assert await executor._get_gateway_token(before_turn=True) == token
+        delay_file.write_text("1")
+        monkeypatch.setattr(
+            pi_executor,
+            "time",
+            SimpleNamespace(monotonic=time.monotonic, time=lambda: time.time() + 1000),
+        )
+        with pytest.raises(OSError, match="timed out"):
+            await executor._get_gateway_token()
+    finally:
+        await executor.close()
+
+
+@pytest.mark.parametrize(
+    ("broken_helper", "cached", "outcome"),
+    [
+        ("exit 1", "jwt", "command failed"),
+        ("sleep 30", "jwt", None),
+        ("sleep 30", "opaque", "timed out"),
+    ],
+    ids=["failing-helper", "hung-helper", "hung-helper-opaque-token"],
+)
+async def test_gateway_refresh_falls_back_only_for_a_slow_helper(
+    tmp_path, monkeypatch, broken_helper, cached, outcome
+):
+    # A helper that exits with an error (signed out, revoked) fails the request even while
+    # the cached token has plenty of lifetime left. One that outlives its own budget only
+    # ran slow, so an unexpired token still covers it, on both waiting paths.
+    from omnigent.inner import pi_executor
+
+    # The helper's budget ends before the bridge stops waiting, so both paths see it lapse.
+    monkeypatch.setattr(pi_executor, "_GATEWAY_TURN_AUTH_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 5)
+    token = _jwt_expiring_in(600) if cached == "jwt" else "opaque-token"
+    broken_flag = tmp_path / "broken"
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command=(
+            f"if [ -e {shlex.quote(str(broken_flag))} ]; then {broken_helper}; fi; "
+            f"printf %s {token}"
+        ),
+        gateway_auth_refresh_interval_ms="0",
+    )
+    try:
+        assert await executor._get_gateway_token(before_turn=True) == token
+        broken_flag.touch()
+        for before_turn in (False, True):
+            if outcome is None:
+                assert await executor._get_gateway_token(before_turn=before_turn) == token
+            else:
+                with pytest.raises(OSError, match=outcome):
+                    await executor._get_gateway_token(before_turn=before_turn)
+    finally:
+        await executor.close()
+
+
+async def test_gateway_close_reaps_a_refresh_no_request_awaits(tmp_path, monkeypatch):
+    # Once a request reuses the old token, the slow helper runs on with nothing waiting
+    # for it; closing the executor must still kill it.
+    from omnigent.inner import pi_executor
+
+    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.2)
+    token = _jwt_expiring_in(600)
+    marker, pid_file = (shlex.quote(str(tmp_path / name)) for name in ("ran", "helper pid"))
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command=(
+            f"if [ -e {marker} ]; then echo $$ > {pid_file}; sleep 30 & wait; fi; "
+            f"touch {marker}; printf %s {token}"
+        ),
+        gateway_auth_refresh_interval_ms="0",
+    )
+    try:
+        assert await executor._get_gateway_token(before_turn=True) == token
+        assert await executor._get_gateway_token() == token
+        async with asyncio.timeout(3):
+            while not (tmp_path / "helper pid").exists():
+                await asyncio.sleep(0.01)
+        pid = int((tmp_path / "helper pid").read_text())
+    finally:
+        await asyncio.wait_for(executor.close(), 3)
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+@pytest.mark.parametrize(("lifetime_s", "renew_after_s"), [(600, 300), (120, 30), (7200, 900)])
+async def test_gateway_renews_a_token_before_it_expires(monkeypatch, lifetime_s, renew_after_s):
+    # The Databricks CLI renews a token only near its expiry, so a fixed cache interval
+    # could outlive the token and leave a slow renewal nothing valid to reuse.
+    from omnigent.inner import pi_executor
+
+    fetch = AsyncMock(return_value=_jwt_expiring_in(lifetime_s))
+    monkeypatch.setattr(pi_executor, "_fetch_shell_command_token", fetch)
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command="get-token",
+    )
+    monkeypatch.setattr(
+        pi_executor, "time", SimpleNamespace(monotonic=lambda: now, time=time.time)
+    )
+    now = 100.0
+    await executor._get_gateway_token()
+    now += renew_after_s - 1
+    await executor._get_gateway_token()
+    assert fetch.await_count == 1
+    now += 2
+    await executor._get_gateway_token()
+    assert fetch.await_count == 2
+
+
 async def test_gateway_bridge_authenticates_and_cancels_helper_on_shutdown(tmp_path):
     pid_file = tmp_path / "helper pid"
     executor = PiExecutor(
@@ -2445,7 +2704,8 @@ async def test_gateway_profile_timeout_does_not_publish_a_late_result(monkeypatc
         return DatabricksCredentials(host="https://example.test", token="late-token")
 
     monkeypatch.setattr(pi_executor, "_read_databrickscfg", resolve)
-    monkeypatch.setattr(pi_executor, "_GATEWAY_BRIDGE_TIMEOUT_S", 0.05)
+    # run_turn refreshes with the before-turn budget (this + 1s), still short of resolve's 2s.
+    monkeypatch.setattr(pi_executor, "_GATEWAY_TURN_AUTH_TIMEOUT_S", 0.05)
     executor = PiExecutor(pi_path="/usr/bin/pi", gateway=True, model="mock-model")
     try:
         events = [e async for e in executor.run_turn([], [], "")]
@@ -4527,8 +4787,12 @@ def test_models_json_lists_only_live_gateway_models() -> None:
     ]
 
 
-def test_models_json_attributes_only_unity_gateway_providers() -> None:
+def test_models_json_attributes_only_unity_gateway_providers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Providers on ``/ai-gateway/`` paths name Pi and Omnigent; serving endpoints don't."""
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
     providers = _build_models_json("https://dbc-1.cloud.databricks.com", "tok")["providers"]
 
     attributed = {name for name, provider in providers.items() if "headers" in provider}
@@ -6339,43 +6603,252 @@ def test_settled_eof_before_settlement_is_an_error() -> None:
     _run(_test())
 
 
-def test_settled_overflow_compaction_retry_returns_recovered_answer() -> None:
-    """A context-overflow error that pi repairs by compacting and re-running
-    the prompt completes with the recovered answer."""
+def _overflow_compaction_frames(
+    compaction_end: dict, *after_settled: str, retry: list[str] | None = None
+) -> list[str]:
+    """pi's frames for an overflow it compacts and retries, by default into "RECOVERED"."""
+    overflow = _assistant_message(
+        stop_reason="error", error_message="Context overflow: prompt is too long"
+    )
+    return [
+        _rpc_frame(type="response", success=True),
+        _rpc_frame(type="message_start", message={"role": "assistant"}),
+        _rpc_frame(type="message_end", message=overflow),
+        _rpc_frame(type="agent_end", messages=[overflow], willRetry=False),
+        _rpc_frame(type="compaction_start", reason="overflow"),
+        _rpc_frame(type="compaction_end", reason="overflow", **compaction_end),
+        *(retry if retry is not None else _plain_answer_frames("RECOVERED")[1:]),
+        *after_settled,
+    ]
+
+
+@pytest.mark.parametrize("exported_context", ["with-tools", "without-tools", None])
+def test_settled_overflow_compaction_retry_reports_compacted_context(
+    exported_context: str | None,
+) -> None:
+    """Export kept text before completion, excluding tools, thinking and the final reply."""
+    pi_context = [
+        {"role": "compactionSummary", "summary": "SUMMARY"},
+        {"role": "user", "content": [{"type": "text", "text": "kept question"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "private"},
+                {"type": "toolCall", "id": "c1", "name": "read", "arguments": {}},
+            ],
+        },
+        {"role": "toolResult", "toolCallId": "c1", "content": [{"type": "text", "text": "x"}]},
+        _assistant_message("kept answer"),
+        {"role": "user", "content": "hello"},
+    ]
+    if exported_context == "with-tools":
+        pi_context += [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Reading notes."},
+                    {"type": "toolCall", "id": "c2", "name": "read", "arguments": {}},
+                ],
+            },
+            {"role": "toolResult", "toolCallId": "c2", "content": [{"type": "text", "text": "y"}]},
+        ]
+    pi_context.append(_assistant_message("RECOVERED"))
+    result: dict = {"summary": "SUMMARY"}
+    if exported_context:
+        result["estimatedTokensAfter"] = 1200
+    executor, rpc = _session_executor(
+        _overflow_compaction_frames(
+            {"result": result, "aborted": False, "willRetry": True},
+            _rpc_frame(
+                type="response",
+                command="get_messages",
+                success=exported_context is not None,
+                **({"data": {"messages": pi_context}} if exported_context else {"error": "busy"}),
+            ),
+        )
+    )
+
+    events = _run(_run_session_turn(executor, "hello"))
+
+    assert [type(e) for e in events] == [TextChunk, CompactionComplete, TurnComplete]
+    _, compaction, turn_complete = events
+    assert turn_complete.response == "RECOVERED"
+    assert compaction.summary == "SUMMARY"
+    assert compaction.token_count == (1200 if exported_context else 0)
+    expected = [
+        (
+            "user",
+            "input_text",
+            "The conversation history before this point was compacted into "
+            "the following summary:\n\n<summary>\nSUMMARY\n</summary>",
+        ),
+        ("user", "input_text", "kept question"),
+        ("assistant", "output_text", "kept answer"),
+        ("user", "input_text", "hello"),
+    ]
+    if exported_context == "with-tools":
+        expected.append(("assistant", "output_text", "Reading notes."))
+    assert compaction.compacted_messages == (
+        [
+            {"type": "message", "role": role, "content": [{"type": block_type, "text": text}]}
+            for role, block_type, text in expected
+        ]
+        if exported_context
+        else None
+    )
+    assert [cmd["type"] for cmd in _sent_commands(rpc)] == ["prompt", "get_messages"]
+    assert rpc._line_queue.empty()
+    assert _SESSION_KEY in executor._session_states
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "partial_text", "settlement"),
+    [
+        pytest.param("error", "", "settled", id="before-text"),
+        pytest.param("error", "partial", "settled", id="partial-error"),
+        pytest.param("aborted", "partial", "settled", id="partial-abort"),
+        pytest.param("aborted", "", "settled", id="abort-before-text"),
+        pytest.param("error", "partial", "eof", id="exit-before-settlement"),
+        pytest.param("aborted", "partial", "timeout", id="settlement-timeout"),
+        pytest.param("error", "partial", "abort-error", id="abort-write-failure"),
+    ],
+)
+def test_settled_compaction_then_failed_retry_reports_compaction_before_error(
+    stop_reason: str, partial_text: str, settlement: str
+) -> None:
+    """Preserve compaction before the original error, exporting only after settlement."""
 
     async def _test() -> None:
-        overflow = _assistant_message(
-            stop_reason="error", error_message="Context overflow: prompt is too long"
+        failed_retry = _assistant_message(
+            partial_text, stop_reason=stop_reason, error_message="upstream interrupted"
         )
-        executor, rpc = _session_executor(
-            [
-                _rpc_frame(type="response", success=True),
-                _rpc_frame(type="message_start", message={"role": "assistant"}),
-                _rpc_frame(type="message_end", message=overflow),
-                _rpc_frame(type="agent_end", messages=[overflow], willRetry=False),
-                _rpc_frame(type="compaction_start", reason="overflow"),
+        settled_frames = []
+        if settlement == "settled":
+            if partial_text:
+                settled_frames.append(_text_delta_frame("DO NOT REPLAY"))
+            settled_frames += [
+                _rpc_frame(type="agent_settled"),
                 _rpc_frame(
-                    type="compaction_end",
-                    reason="overflow",
-                    result={"summary": "..."},
-                    aborted=False,
-                    willRetry=True,
+                    type="response",
+                    command="get_messages",
+                    success=True,
+                    data={
+                        "messages": [
+                            {"role": "compactionSummary", "summary": "SUMMARY"},
+                            {"role": "user", "content": "hello"},
+                            failed_retry,
+                        ]
+                    },
                 ),
-                *_plain_answer_frames("RECOVERED")[1:],
             ]
+        executor, rpc = _session_executor(
+            _overflow_compaction_frames(
+                {"result": {"summary": "SUMMARY"}, "aborted": False, "willRetry": True},
+                retry=[
+                    _rpc_frame(type="agent_start"),
+                    _rpc_frame(type="message_start", message={"role": "assistant"}),
+                    *([_text_delta_frame(partial_text)] if partial_text else []),
+                    _rpc_frame(type="message_end", message=failed_retry),
+                    _rpc_frame(type="agent_end", messages=[failed_retry], willRetry=False),
+                    *settled_frames,
+                ],
+            )
         )
+        if settlement == "eof":
+            rpc._line_queue.put_nowait(None)
+        # An empty queue exercises the real drain deadline in the timeout case.
+        stdin = rpc.process.stdin
+        settled = False
+        read_line, send_command = rpc.read_line, rpc.send_command
 
-        events = await _run_session_turn(executor, "hello")
+        async def read_frame(*args, **kwargs):
+            nonlocal settled
+            line = await read_line(*args, **kwargs)
+            if line is not None and json.loads(line).get("type") == "agent_settled":
+                settled = True
+            return line
 
-        assert [e.message for e in events if isinstance(e, ExecutorError)] == []
-        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
-        assert turn_complete.response == "RECOVERED"
-        assert rpc._line_queue.empty()
+        async def send_checked(command):
+            if command["type"] == "get_messages":
+                assert settled, "context export must wait for agent_settled"
+            if command["type"] == "abort" and settlement == "abort-error":
+                raise BrokenPipeError("Pi exited before abort")
+            await send_command(command)
+
+        with (
+            patch.object(rpc, "read_line", side_effect=read_frame),
+            patch.object(rpc, "send_command", side_effect=send_checked),
+            patch("omnigent.inner.pi_executor._TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S", 0.05),
+        ):
+            events = await asyncio.wait_for(_run_session_turn(executor, "hello"), timeout=1)
+
+        assert [type(e) for e in events if not isinstance(e, TextChunk)] == [
+            CompactionComplete,
+            ExecutorError,
+        ]
+        compaction, error = events[-2:]
+        assert error.message == "upstream interrupted"
+        assert compaction.summary == "SUMMARY"
+        assert [e.text for e in events if isinstance(e, TextChunk)] == (
+            [partial_text] if partial_text else []
+        )
+        commands = [json.loads(line)["type"] for line in stdin.data]
+        if settlement == "settled":
+            assert [m["content"][0]["text"] for m in compaction.compacted_messages][1:] == [
+                "hello"
+            ]
+            assert rpc._line_queue.empty()
+        else:
+            assert compaction.compacted_messages is None
+        evicted = bool(partial_text) or stop_reason == "aborted"
+        assert commands == (
+            ["prompt"]
+            + (["abort"] if evicted and settlement != "abort-error" else [])
+            + (["get_messages"] if settlement == "settled" else [])
+        )
+        if evicted:
+            _assert_session_evicted(executor, rpc)
+        else:
+            assert _SESSION_KEY in executor._session_states
 
     _run(_test())
 
 
-def test_settled_compaction_retry_after_streamed_truncation_stops_and_evicts() -> None:
+@pytest.mark.parametrize(
+    "compaction_end",
+    [
+        {"aborted": False, "errorMessage": "Auto-compaction failed: timeout"},
+        {"aborted": True},
+    ],
+    ids=["failed", "aborted"],
+)
+def test_settled_failed_compaction_reports_no_compaction(compaction_end: dict) -> None:
+    """Failed or aborted compaction does not replace history or request an export."""
+    answer_frames = _plain_answer_frames("ANSWER")
+    executor, rpc = _session_executor(
+        [
+            *answer_frames[:-1],
+            _rpc_frame(type="compaction_start", reason="threshold"),
+            _rpc_frame(
+                type="compaction_end", reason="threshold", willRetry=False, **compaction_end
+            ),
+            answer_frames[-1],
+        ]
+    )
+
+    events = _run(_run_session_turn(executor, "hello"))
+
+    assert not any(isinstance(e, CompactionComplete) for e in events)
+    (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+    assert turn_complete.response == "ANSWER"
+    assert [cmd["type"] for cmd in _sent_commands(rpc)] == ["prompt"]
+    assert rpc._line_queue.empty()
+
+
+@pytest.mark.parametrize("settled", [True, False], ids=["settled", "exited"])
+def test_settled_compaction_retry_after_streamed_truncation_stops_and_evicts(
+    settled: bool,
+) -> None:
     """A truncated answer that already streamed is not followed by the
     regenerated one pi produces after overflow compaction."""
 
@@ -6396,15 +6869,38 @@ def test_settled_compaction_retry_after_streamed_truncation_stops_and_evicts() -
                     aborted=False,
                     willRetry=True,
                 ),
-                *_plain_answer_frames("REGENERATED")[1:],
             ]
         )
+        if settled:
+            for frame in _plain_answer_frames("REGENERATED")[1:]:
+                rpc._line_queue.put_nowait(frame)
+            rpc._line_queue.put_nowait(
+                _rpc_frame(
+                    type="response",
+                    command="get_messages",
+                    success=True,
+                    data={
+                        "messages": [
+                            {"role": "compactionSummary", "summary": "..."},
+                            {"role": "user", "content": "hello"},
+                            _assistant_message("REGENERATED"),
+                        ]
+                    },
+                )
+            )
+        else:
+            rpc._line_queue.put_nowait(None)
 
         events = await _run_session_turn(executor, "hello")
 
         assert [e.text for e in events if isinstance(e, TextChunk)] == ["partial"]
         assert not any(isinstance(e, TurnComplete) for e in events)
         assert len([e for e in events if isinstance(e, ExecutorError)]) == 1
+        compaction, error = events[-2:]
+        assert isinstance(compaction, CompactionComplete)
+        assert compaction.summary == "..."
+        assert bool(compaction.compacted_messages) is settled
+        assert "partial response was already streamed" in error.message
         _assert_session_evicted(executor, rpc)
 
     _run(_test())

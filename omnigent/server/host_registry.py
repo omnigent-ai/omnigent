@@ -48,12 +48,14 @@ from omnigent.host.frames import (
     HostMcpToolsResultFrame,
     HostPluginsResultFrame,
     HostProbeAccountsFrame,
+    HostSetMcpServerEnabledResultFrame,
     HostSkillContentResultFrame,
     HostSkillsResultFrame,
     encode_host_frame,
 )
 from omnigent.host.harness_startup import HarnessStartup
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
+from omnigent.server.feature_flags import FeatureFlags, McpDisabledServersGate, active_harnesses
 
 _logger = logging.getLogger(__name__)
 
@@ -189,6 +191,7 @@ def _fail_pending_skills(conn: HostConnection) -> None:
 def _fail_pending_mcp_servers(conn: HostConnection) -> None:
     """Fail MCP inventory requests as soon as their host disappears."""
     _fail_pending_inventory(conn.pending_mcp_servers, conn.host_id)
+    _fail_pending_inventory(conn.pending_mcp_server_enabled, conn.host_id)
 
 
 def _fail_pending_worktrees(conn: HostConnection) -> None:
@@ -580,6 +583,9 @@ class HostConnection:
     pending_skill_content: dict[str, asyncio.Future[HostSkillContentResultFrame]] = field(
         default_factory=dict
     )
+    pending_mcp_server_enabled: dict[str, asyncio.Future[HostSetMcpServerEnabledResultFrame]] = (
+        field(default_factory=dict)
+    )
     pending_mcp_tools: dict[str, asyncio.Future[HostMcpToolsResultFrame]] = field(
         default_factory=dict
     )
@@ -612,8 +618,15 @@ class HostRegistry:
     don't race.
     """
 
-    def __init__(self) -> None:
-        """Initialize an empty host registry."""
+    def __init__(
+        self,
+        *,
+        mcp_disabled_servers: McpDisabledServersGate = False,
+        feature_flags: FeatureFlags | None = None,
+    ) -> None:
+        """Initialize an empty host registry with fail-closed launch activation."""
+        self._mcp_disabled_servers = mcp_disabled_servers
+        self._feature_flags = feature_flags or FeatureFlags()
         self._lock = threading.RLock()
         # Keyed by (workspace_id, host_id) to mirror the hosts-table PK:
         # one stable host_id can be live in more than one workspace.
@@ -629,6 +642,10 @@ class HostRegistry:
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
+
+    def mcp_disabled_servers_active_harnesses(self) -> list[str] | None:
+        """Resolve launch activation; omit the wire field when no harness is active."""
+        return active_harnesses(self._mcp_disabled_servers, self._feature_flags) or None
 
     def register(
         self,
@@ -841,10 +858,27 @@ class HostRegistry:
         :returns: ``False`` only for a connected host that did not advertise the
             codex side-chat capability.
         """
+        return self.host_may_support(host_id, CAP_CODEX_SIDE_CHAT, workspace_id)
+
+    def host_may_support(
+        self, host_id: str, capability: str, workspace_id: int | None = None
+    ) -> bool:
+        """Whether a host is not known to lack a capability token.
+
+        Fails OPEN (``True``) when the host is offline/unknown: we then can't
+        prove it's too old, and the launch surfaces any real failure itself.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param capability: Capability token, e.g. ``"codex_plan_at_launch"``.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
+        :returns: ``False`` only for a connected host that did not advertise
+            ``capability``.
+        """
         conn = self.get(host_id, workspace_id)
         if conn is None:
             return True
-        return CAP_CODEX_SIDE_CHAT in conn.hello.capabilities
+        return capability in conn.hello.capabilities
 
     def record_gateway_inference(
         self,

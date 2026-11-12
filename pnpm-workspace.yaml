@@ -9,10 +9,11 @@ packages:
 
 # 7-day dependency cooldown, mirroring the Python-side exclude-newer = "P7D" in uv.toml.
 minimumReleaseAge: 10080
-# electron 42.11.16 distrusts the compromised eMudhra intermediate CAs.
-# Drop once aged past the cooldown (2026-10-27).
+# electron 42 is end-of-life; 45.2.1 is the newest stable release and carries
+# Chromium security fixes that 45.0.0 lacks. Drop once aged past the cooldown
+# (2026-11-07).
 minimumReleaseAgeExclude:
-  - electron@42.11.16
+  - electron@45.2.1
 
 settings:
   autoInstallPeers: false
@@ -64,7 +65,7 @@ overrides:
   browserslist: 4.28.8
   fast-uri: 3.1.9
   '@xmldom/xmldom': 0.8.15
-  qs: 6.16.0
+  qs: 6.16.1
   query-string: 9.5.0
   '@hono/node-server': 1.19.15
   hono: 4.13.13

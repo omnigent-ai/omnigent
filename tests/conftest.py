@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import sys
@@ -325,14 +326,14 @@ def _no_workspace_probe(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def frozen_recurrence_clock(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep a runner stall from tripping the RRULE search's elapsed-time limit.
+    """Keep a slow runner from tripping the RRULE search's CPU-time limit.
 
     Searches then end only on the deterministic work budget. Tests of the time
     limit patch this clock themselves, which overrides the frozen one.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.monotonic", lambda: 0.0)
+    monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.thread_time", lambda: 0.0)
 
 
 @pytest.fixture(autouse=True)
@@ -354,6 +355,28 @@ def _reset_runner_catalog_cache() -> Generator[None, None, None]:
     module = sys.modules.get("omnigent.server.smart_routing")
     if module is not None:
         module._runner_catalog_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_databricks_auth_memory() -> None:
+    """
+    Start every test without shared Databricks token sources or remembered profiles.
+
+    Both are meant to outlive a single client: the token sources are
+    process-global and keyed by server URL, which tests reuse, and the
+    remembered profiles live in the shared test data dir. Either would let one
+    test's resolution answer another's. The reset runs before the test, not
+    at teardown, where a test's ``Path.unlink`` patch can still be active.
+
+    :returns: None.
+    """
+    chat = sys.modules.get("omnigent.chat")
+    if chat is not None:
+        chat._databricks_auth_cache.clear()
+    executor = sys.modules.get("omnigent.inner.databricks_executor")
+    if executor is not None:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(_TEST_OMNIGENT_DATA_DIR / executor._REMEMBERED_PROFILES_FILE)
 
 
 @pytest.fixture(autouse=True)
@@ -481,6 +504,35 @@ def _isolate_claude_managed_settings(
     if "claude_managed_settings" in request.fixturenames:
         return
     monkeypatch.setattr("omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+
+
+@pytest.fixture()
+def pi_host_mcp_servers() -> None:
+    """Opt back in to adding the host's MCP inventory to managed Pi agent dirs.
+
+    :returns: None.
+    """
+
+
+@pytest.fixture(autouse=True)
+def _isolate_pi_host_mcp_servers(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the machine's Claude, Codex, and Cursor MCP servers out of managed Pi dirs.
+
+    Every managed Pi launch reads the host MCP inventory from the real ``$HOME``,
+    so without this a developer's configured servers would change which
+    ``mcp.json`` a test sees. Tests of that behavior request
+    :func:`pi_host_mcp_servers` and point the inventory at a temporary home.
+
+    :param request: Pytest request, inspected for the opt-in fixture.
+    :param monkeypatch: Pytest monkeypatch fixture; restores the reader at teardown.
+    :returns: None.
+    """
+    if "pi_host_mcp_servers" in request.fixturenames:
+        return
+    monkeypatch.setattr("omnigent.inner.pi_mcp._host_mcp_servers", list)
 
 
 @pytest.fixture()

@@ -112,7 +112,10 @@ vi.mock("./TipTapHtmlPassthrough", () => ({ HtmlPassthrough: {} }));
 vi.mock("./tiptapMarkdownPatches", () => ({
   installMarkdownSerializerPatch: vi.fn(),
   installMarkdownParserPatch: vi.fn(),
+  // The fake editor has no source blocks, so a save serialises everything.
+  markdownKeepingSource: vi.fn((editor: { getMarkdown: () => string }) => editor.getMarkdown()),
 }));
+vi.mock("./markdownSourceBlocks", () => ({ rememberSourceBlocks: vi.fn() }));
 vi.mock("./TipTapWorkspaceImage", () => ({
   createWorkspaceImageExtension: vi.fn().mockReturnValue({}),
   ImageAwareLink: { configure: vi.fn().mockReturnValue({}) },
@@ -153,10 +156,15 @@ import { CODE_BLOCK_LANGUAGE_EDIT_META } from "./codeBlockLanguageEdit";
 import * as writeHook from "@/hooks/useWriteFileContent";
 import * as runnerHook from "@/hooks/RunnerHealthProvider";
 import { fetchFileContent } from "@/hooks/useFileContent";
+import { rememberSourceBlocks } from "./markdownSourceBlocks";
+import { markdownKeepingSource } from "./tiptapMarkdownPatches";
 
 const PATH = "/doc.md";
 const INITIAL = "# Doc\n\ninitial body\n";
 const EDITED = "# Doc\n\nedited body\n";
+// Round-trip drift with no user edit. It sits inside the document, so saving's
+// final-newline normalization can't hide it.
+const DRIFTED = INITIAL.replace("\n\n", "\n\n\n");
 
 let mutateAsync: ReturnType<typeof vi.fn>;
 
@@ -227,10 +235,35 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
       vi.advanceTimersByTime(1000);
     });
     expect(serialize).toHaveBeenCalledTimes(1);
-    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({ path: PATH, content: INITIAL + "abc" });
+    // The file ended with a newline, so the save keeps one.
+    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({ path: PATH, content: `${INITIAL}abc\n` });
     await act(async () => fakeEditor!.emit("blur"));
     expect(serialize).toHaveBeenCalledTimes(1);
     expect(screen.queryByText(/Unsaved changes/)).toBeNull();
+  });
+
+  it("saves one final newline when the editor serialises trailing blank lines", async () => {
+    render(makeViewer());
+    await act(async () => {
+      fakeEditor!.setMarkdown(`${EDITED}\n\n`);
+      fakeEditor!.emit("update");
+      vi.advanceTimersByTime(1000);
+    });
+    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({ path: PATH, content: EDITED });
+  });
+
+  it("does not add a final newline the file did not have", async () => {
+    const withoutNewline = INITIAL.replace(/\n$/, "");
+    render(makeViewer(withoutNewline));
+    await act(async () => {
+      fakeEditor!.setMarkdown(`${withoutNewline} more`);
+      fakeEditor!.emit("update");
+      vi.advanceTimersByTime(1000);
+    });
+    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({
+      path: PATH,
+      content: `${withoutNewline} more`,
+    });
   });
 
   it("undo to an equivalent baseline document clears dirty without serializing or writing", async () => {
@@ -291,7 +324,7 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
     expect(mutateAsync).toHaveBeenCalledTimes(1);
     expect(serialize).toHaveBeenCalledTimes(1);
     await act(async () => resolveWrite());
-    expect(mutateAsync).toHaveBeenNthCalledWith(2, { path: PATH, content: EDITED + "newer" });
+    expect(mutateAsync).toHaveBeenNthCalledWith(2, { path: PATH, content: `${EDITED}newer\n` });
     expect(serialize).toHaveBeenCalledTimes(2);
     await act(async () => fakeEditor!.emit("blur"));
     expect(mutateAsync).toHaveBeenCalledTimes(2);
@@ -344,6 +377,35 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
     expect(screen.queryByText(/Unsaved changes/)).toBeNull();
     expect(serialize).not.toHaveBeenCalled();
     expect(mutateAsync).not.toHaveBeenCalled();
+  });
+
+  it("records the loaded source and saves the source-keeping Markdown", async () => {
+    const { rerender } = render(makeViewer());
+    expect(rememberSourceBlocks).toHaveBeenLastCalledWith(fakeEditor, INITIAL);
+    await act(async () => rerender(makeViewer(EDITED)));
+    expect(rememberSourceBlocks).toHaveBeenLastCalledWith(fakeEditor, EDITED);
+    // The server now holds the external update, so the pre-write check passes.
+    vi.mocked(fetchFileContent).mockResolvedValue({
+      object: "session.environment.filesystem.file_content",
+      path: PATH,
+      content_type: "text/markdown",
+      encoding: "utf-8",
+      content: EDITED,
+      bytes: EDITED.length,
+    });
+    vi.mocked(markdownKeepingSource).mockReturnValue("kept source\n");
+    try {
+      await act(async () => {
+        fakeEditor!.setMarkdown(`${EDITED}more`);
+        fakeEditor!.emit("update");
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({ path: PATH, content: "kept source\n" });
+    } finally {
+      vi.mocked(markdownKeepingSource).mockImplementation((editor) => editor.getMarkdown());
+    }
   });
 
   it("debounced save fires after an edit (update → schedule → write)", async () => {
@@ -399,7 +461,7 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
     // then closing a file silently rewrites it with the normalised serialisation.
     const { unmount } = render(makeViewer());
     fakeEditor!.isFocused = false; // user never clicked in
-    fakeEditor!.setMarkdown(INITIAL + "\n"); // drift, but no "update" emitted
+    fakeEditor!.setMarkdown(DRIFTED); // drift, but no "update" emitted
     // Unmount (panel close / file switch) flushes — it must find nothing to
     // save. Before the fix the live dirty check (getMarkdown ≠ baseline) fired a
     // PUT of the normalised content here.
@@ -446,7 +508,7 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
       reset: vi.fn(),
       mutateAsync: vi.fn(async ({ content }: { content: string }) => {
         saved.push(content);
-        vi.spyOn(fakeEditor!, "getMarkdown").mockReturnValue(content + "\n");
+        vi.spyOn(fakeEditor!, "getMarkdown").mockReturnValue(content.replace("\n\n", "\n\n\n"));
       }),
     } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
 
@@ -473,7 +535,7 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
     // rewrite it. Regression for the silent normalize-on-open writes.
     render(makeViewer());
     fakeEditor!.isFocused = false; // user hasn't clicked in yet
-    fakeEditor!.setMarkdown(INITIAL + "\n"); // round-trip drift, not a user edit
+    fakeEditor!.setMarkdown(DRIFTED); // round-trip drift, not a user edit
     await act(async () => {
       fakeEditor!.emit("update");
     });

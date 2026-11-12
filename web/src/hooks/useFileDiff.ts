@@ -3,13 +3,14 @@
 //
 // Returns `before` (content at first observed modification) and `after`
 // (current content) as strings — either may be null:
-//   before=null → new file (no pre-session snapshot available)
+//   before=null → new file, or unavailable original when baseline_state is unknown
 //   after=null  → deleted file
 //
 // Requested diffs can start while the changed-files list is loading. Known
 // unchanged files and unavailable workspaces keep the query disabled.
 
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
 import {
@@ -24,8 +25,9 @@ const DEFAULT_ENVIRONMENT_ID = "default";
 export interface FileDiffResponse {
   object: "session.environment.filesystem.file_diff";
   path: string;
-  /** File content at the time of the first modification, or null for new files. */
+  /** Original content, or null for new files and unavailable originals. */
   before: string | null;
+  baseline_state?: "unknown";
   /** Current file content, or null for deleted files. */
   after: string | null;
 }
@@ -77,6 +79,19 @@ export function useFileDiff(
 ) {
   const serveable = useWorkspaceServeable(conversationId);
   const changedFiles = useWorkspaceChangedFiles(conversationId);
+  const queryClient = useQueryClient();
+  const previousUpdate = useRef(changedFiles.dataUpdatedAt);
+  useEffect(() => {
+    const refreshed =
+      previousUpdate.current > 0 && previousUpdate.current !== changedFiles.dataUpdatedAt;
+    previousUpdate.current = changedFiles.dataUpdatedAt;
+    if (refreshed && changedFiles.isSuccess && path) {
+      void queryClient.invalidateQueries({
+        queryKey: ["file-diff", conversationId, path],
+        exact: true,
+      });
+    }
+  }, [changedFiles.dataUpdatedAt, changedFiles.isSuccess, conversationId, path, queryClient]);
   const environment = useWorkspaceEnvironment(conversationId);
   const isInChangedFiles = changedFiles.data?.data.some((f) => f.path === path) ?? false;
 

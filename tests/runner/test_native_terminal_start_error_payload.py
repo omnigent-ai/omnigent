@@ -22,6 +22,7 @@ import pytest
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.debug_logging import record_to_row
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harnesses.codex_native.app_server import CodexModelProviderMissingError
 from omnigent.harnesses.codex_native.launch_args import CodexTransportArgsError
 from omnigent.inference_config import ModelNotAllowedError, inference_config_scope
 from omnigent.inner.terminal import TerminalInstance, TmuxUnavailableError
@@ -116,6 +117,7 @@ def test_other_causes_keep_generic_startup_failure_code(cause: Exception) -> Non
         ),
         (TmuxUnavailableError("tmux is not installed or not on PATH."), "config"),
         (CodexTransportArgsError("app-server"), "config"),
+        (CodexModelProviderMissingError("Databricks", Path("/codex/config.toml")), "config"),
         (_MODEL_OUTSIDE_ALLOWLIST, "config"),
     ],
 )
@@ -294,6 +296,7 @@ def test_outdated_pi_cli_surfaces_its_actionable_message() -> None:
             "Claude",
         ),
         (CodexTransportArgsError("app-server"), "Codex"),
+        (CodexModelProviderMissingError("Databricks", Path("/codex/config.toml")), "Codex"),
         (_MODEL_OUTSIDE_ALLOWLIST, "Codex"),
     ],
 )

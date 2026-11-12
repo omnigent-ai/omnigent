@@ -456,7 +456,8 @@ function runPhrase(category: RunCategory, n: number): string {
   }
 }
 
-function stripOmnigentPrefix(name: string): string {
+/** A tool name without Omnigent's `mcp__omnigent__` prefix. */
+export function stripOmnigentPrefix(name: string): string {
   return name.startsWith("mcp__omnigent__") ? name.slice("mcp__omnigent__".length) : name;
 }
 

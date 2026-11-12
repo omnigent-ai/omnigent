@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   DownloadIcon,
   ExternalLinkIcon,
@@ -18,14 +18,21 @@ import {
 } from "@/components/ui/dropdown-menu";
 import {
   downloadWorkspaceFile,
-  fetchWorkspaceFileBlob,
+  fetchWorkspaceVideoBlob,
   useFileContent,
+  workspaceFileMediaUrl,
 } from "@/hooks/useFileContent";
 import { showToast } from "@/components/ui/toast";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import { formatVideoTime } from "@/lib/video";
 import { parseVideoChapters, type VideoChapter } from "@/lib/videoChapters";
+import { VideoTooLargeError } from "@/lib/videoFetch";
+
+const TOO_LARGE_MESSAGE =
+  "This video is larger than 200 MB, so it can't be played here. Download it to watch it in another app.";
+const LOCAL_FAILURE_MESSAGE =
+  "This video couldn't be played. Download the file to open it in another app.";
 
 type VideoSource = { conversationId: string; path: string } | { src: string };
 export type VideoPlayerProps = VideoSource & {
@@ -48,8 +55,15 @@ function VideoPlayerContent(props: VideoPlayerProps) {
   const path = "path" in props ? props.path : undefined;
   const [requested, setRequested] = useState(false);
   const [blobSrc, setBlobSrc] = useState<string>();
-  const src = requested ? (remoteSrc ?? blobSrc) : undefined;
+  // Resolved once per Play so a later routing-key change can't swap the source mid-playback.
+  const directSrc = useMemo(
+    () =>
+      requested && conversationId && path ? workspaceFileMediaUrl(conversationId, path) : null,
+    [requested, conversationId, path],
+  );
+  const src = requested ? (remoteSrc ?? directSrc ?? blobSrc) : undefined;
   const [failed, setFailed] = useState(false);
+  const [tooLarge, setTooLarge] = useState(false);
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState<number | null>(null);
   const [wide, setWide] = useState(false);
@@ -95,23 +109,26 @@ function VideoPlayerContent(props: VideoPlayerProps) {
 
   // Recordings can be large. Fetch only on Play, and release bytes on close.
   useEffect(() => {
-    if (!requested || !conversationId || !path) return;
+    if (!requested || !conversationId || !path || directSrc) return;
     const controller = new AbortController();
     let objectUrl: string | undefined;
-    void fetchWorkspaceFileBlob(conversationId, path, controller.signal)
+    void fetchWorkspaceVideoBlob(conversationId, path, controller.signal)
       .then((blob) => {
+        // A completion after the source changed or the player closed is dropped.
         if (controller.signal.aborted) return;
         objectUrl = URL.createObjectURL(blob);
         setBlobSrc(objectUrl);
       })
-      .catch(() => {
-        if (!controller.signal.aborted) setFailed(true);
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        setTooLarge(error instanceof VideoTooLargeError);
+        setFailed(true);
       });
     return () => {
       controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [requested, conversationId, path]);
+  }, [requested, conversationId, path, directSrc]);
 
   useEffect(() => {
     // Capture the element before React clears its ref on unmount.
@@ -120,6 +137,13 @@ function VideoPlayerContent(props: VideoPlayerProps) {
   }, [src, failed]);
 
   const loading = requested && !src && !failed;
+  const downloadVideo = () => {
+    if (conversationId && path) {
+      void downloadWorkspaceFile(conversationId, path).catch(() =>
+        showToast("Unable to download video."),
+      );
+    }
+  };
 
   return (
     <span
@@ -203,13 +227,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
               type="button"
               aria-label={`Download video: ${title}`}
               className="rounded p-1 hover:bg-accent"
-              onClick={() => {
-                if (conversationId && path) {
-                  void downloadWorkspaceFile(conversationId, path).catch(() =>
-                    showToast("Unable to download video."),
-                  );
-                }
-              }}
+              onClick={downloadVideo}
             >
               <DownloadIcon className="size-4" />
             </button>
@@ -292,25 +310,40 @@ function VideoPlayerContent(props: VideoPlayerProps) {
               {failed ? (
                 <>
                   <VideoIcon className="size-8" />
-                  <span role="status">
+                  <span role="status" className="text-center">
                     {remoteSrc
                       ? "Unable to play this video here. Try opening it in a new tab."
-                      : "Unable to play this video. Download it to watch locally."}
+                      : tooLarge
+                        ? TOO_LARGE_MESSAGE
+                        : LOCAL_FAILURE_MESSAGE}
                   </span>
-                  <button
-                    type="button"
-                    className="rounded-md border px-3 py-1.5 hover:bg-accent"
-                    onClick={() => {
-                      setFailed(false);
-                      setRequested(false);
-                      setBlobSrc(undefined);
-                      setTime(0);
-                      setDuration(null);
-                      pendingSeek.current = null;
-                    }}
-                  >
-                    Retry
-                  </button>
+                  <span className="flex gap-2">
+                    {!remoteSrc && (
+                      <button
+                        type="button"
+                        className="rounded-md border px-3 py-1.5 hover:bg-accent"
+                        onClick={downloadVideo}
+                      >
+                        Download
+                      </button>
+                    )}
+                    {!tooLarge && (
+                      <button
+                        type="button"
+                        className="rounded-md border px-3 py-1.5 hover:bg-accent"
+                        onClick={() => {
+                          setFailed(false);
+                          setRequested(false);
+                          setBlobSrc(undefined);
+                          setTime(0);
+                          setDuration(null);
+                          pendingSeek.current = null;
+                        }}
+                      >
+                        Retry
+                      </button>
+                    )}
+                  </span>
                 </>
               ) : loading ? (
                 <span role="status" className="flex items-center gap-2">

@@ -52,7 +52,8 @@ function splitTopLevel(selectorList: string): string[] {
 }
 
 function prefixSelector(selector: string): string {
-  const s = selector.trim();
+  // Tailwind's dark variants must not inherit a dark ancestor from the host.
+  const s = selector.trim().replaceAll(":is(.dark *)", `:is(${SCOPE} .dark *)`);
   if (s === "" || s.startsWith(SCOPE)) return s;
   // Root-level selectors collapse onto the scope element itself.
   const rootMatch = s.match(/^(?::root|html|body)\b(.*)$/);

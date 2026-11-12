@@ -89,6 +89,36 @@ session impact or changes KPI eligibility.
   `resume_interrupted_turn`, `suppress_recovery_turn`, `execution_seen`,
   `history_len`, `last_item_type`, and the resulting `status`.
 
+### Native status publication
+
+`codex_turn_status` records the intended native status before posting it.
+`codex_turn_status_publication_failed` warns when an exception interrupts that
+publication, with the session and native `turn_id`, `intended_status`,
+`protocol_source`, `delivery_phase`, `exception_type`, and
+`exception_cause_type`. `delivery_phase = before_status` covers output and other
+preparatory flushes; `status_post` covers the status-post operation. Exceptions
+after that operation returns do not emit this warning. Existing HTTP rejection
+diagnostics remain separate.
+
+If a preparatory flush raises, the forwarder still attempts the known terminal
+status in the same handler before re-raising the original error. Cancellation
+skips that attempt. A `before_status` warning alone therefore does not establish
+that the terminal status was lost; check the following status-post observations.
+
+These events add metadata, without terminal text or exception messages, and do
+not require stderr capture. A local terminal completion does not establish that
+its status reached the server. Conversely, a failed post may have reached the
+server before its exception; compare the matching server status and input
+events. An absent warning is inconclusive when client telemetry is disabled or
+cannot be uploaded.
+
+When all client records are missing, inspect that process's local log for
+`debug-log sink enabled`, `first batch delivered`, and `debug-log sink:` warnings.
+The uploader already reports credential, insert, and dropped-batch failures at
+most once per category per minute. Its own thread's warnings stay local to avoid
+recursive uploads, so the remote table cannot establish that the uploader was
+healthy. Collect those local diagnostics before adding more remote events.
+
 ### Stack capture during runner event-loop stalls
 
 The runner starts the same dedicated-thread watchdog used by the server while
@@ -261,7 +291,10 @@ when the context exits.
   the outage still fails the turn. `held_host_offline` means the session's
   user-run host went offline too; the disconnect sweep holds the turn
   (`runner_disconnect_held_host_offline` / `runner_disconnect_hold_ended`) and
-  the reconnect restarts the relay. The
+  the reconnect restarts the relay. When the host returns without the runner,
+  the hold ends `host_back_without_runner`. On the host's replica, the
+  interrupted turn is settled as `runner_interrupted` before the server
+  relaunches its runner; the interrupted input is not redelivered. The
   `runner_disconnected` row carries the same two attributes. `outage_s` is the
   time since the current grace window opened; a reconnect that dropped again
   within the window does not reset it, so it includes that brief connected
@@ -369,6 +402,10 @@ The disconnect grace task rechecks the local tunnel after loading bound
 sessions. A reconnect during that read logs `reconnected during offline
 lookup; skipping offline-marking`; an older database snapshot must not turn
 the live runner's sessions into disconnect failures.
+The per-session sweep also checks the final ownership read for a fresh heartbeat
+newer than its conversation snapshot. When another replica renewed that runner,
+the departing replica drops its stale local status and leaves the turn alone.
+An unchanged or expired heartbeat does not establish a takeover.
 
 Join the runner's and server's rows for one socket on
 `attributes['connection_id']`. A `runner_connected` row with `reconnect =

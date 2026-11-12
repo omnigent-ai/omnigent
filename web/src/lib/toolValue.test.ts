@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  contentEnvelopeText,
   humanizeKey,
   isProseText,
   isoTimestampMs,
@@ -7,6 +8,7 @@ import {
   pickTitleField,
   statusLabel,
   statusTone,
+  editErrorMessage,
   toolErrorMessage,
 } from "./toolValue";
 
@@ -98,6 +100,11 @@ describe("toolErrorMessage", () => {
     ['{"error": true}', "The tool reported an error."],
     ['{"error": {"code": 500}}', "The tool reported an error."],
     ["<tool_use_error></tool_use_error>", "The tool reported an error."],
+    [
+      '{"content": [{"type": "text", "text": "Could not find the text in a.py."}], "details": {}, "isError": true}',
+      "Could not find the text in a.py.",
+    ],
+    ['{"content": [], "isError": true}', "The tool reported an error."],
   ])("reports %s as a failure", (output, message) => {
     expect(toolErrorMessage(parseToolOutput(output))).toBe(message);
   });
@@ -106,8 +113,60 @@ describe("toolErrorMessage", () => {
     "Error handling in the parser works as expected.",
     '{"errors": []}',
     '{"error": null}',
+    '{"content": [{"type": "text", "text": "Done."}], "isError": false}',
     "Task plan updated (2 tasks).",
   ])("treats %s as a success", (output) => {
+    expect(toolErrorMessage(parseToolOutput(output))).toBeNull();
+  });
+});
+
+describe("contentEnvelopeText", () => {
+  it("joins the text blocks of a content envelope", () => {
+    const value = {
+      content: [
+        { type: "text", text: "Successfully replaced text in a.py." },
+        { type: "text", text: "Lines 3-4 changed." },
+      ],
+      details: { diff: "+x" },
+    };
+    expect(contentEnvelopeText(value)).toBe(
+      "Successfully replaced text in a.py.\n\nLines 3-4 changed.",
+    );
+  });
+
+  it.each([
+    [{ content: [{ type: "text", text: "Failed." }], isError: true }],
+    [{ content: "Done." }],
+    [[{ type: "text", text: "Done." }]],
+  ])("returns null for %j", (value) => {
+    expect(contentEnvelopeText(value)).toBeNull();
+  });
+});
+
+describe("editErrorMessage", () => {
+  it.each([
+    ["[error] Error: oldString not found in content", "Error: oldString not found in content"],
+    ["[error]", "The tool reported an error."],
+    [
+      "<tool_use_error>String to replace not found.</tool_use_error>",
+      "String to replace not found.",
+    ],
+  ])("reports %s as a failure", (output, message) => {
+    expect(editErrorMessage(output)).toBe(message);
+  });
+
+  it.each([
+    "[errors] none",
+    "[ERROR] plugin missing; continuing.",
+    "Edit applied.",
+    '{"content": [{"type": "text", "text": "Successfully replaced text in a.py."}]}',
+  ])("treats %s as a success", (output) => {
+    expect(editErrorMessage(output)).toBeNull();
+  });
+
+  it('matches "[error]" only on the edit path, not in toolErrorMessage', () => {
+    const output = "[error] recovered cache entry";
+    expect(editErrorMessage(output)).toBe("recovered cache entry");
     expect(toolErrorMessage(parseToolOutput(output))).toBeNull();
   });
 });

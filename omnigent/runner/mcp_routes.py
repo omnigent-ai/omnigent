@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, cast
 if TYPE_CHECKING:
     from omnigent.llms.client import Client as LLMClient
     from omnigent.runner.mcp_manager import RunnerMcpManager
+    from omnigent.runner.tool_dispatch import AsyncResultWake
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
     from omnigent.terminals.registry import TerminalRegistry
 
@@ -100,6 +101,7 @@ def register_mcp_routes(
     server_client: httpx.AsyncClient,
     spec_resolver: SpecResolver | None,
     terminal_registry: TerminalRegistry | None,
+    wake_on_async_result: AsyncResultWake | None,
 ) -> None:
     """Register ``/mcp/execute``, ``/v1/summarize``, and ``/v1/elicitations`` on *app*.
 
@@ -351,6 +353,7 @@ def register_mcp_routes(
                         publish_event=_publish_event,
                         filesystem_registry=filesystem_registry,
                         effective_harness=_session_harness_name(session_id),
+                        wake_on_async_result=wake_on_async_result,
                     )
                 except Exception as exc:
                     _logger.exception(

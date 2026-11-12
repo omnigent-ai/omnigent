@@ -22,13 +22,16 @@ from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseErr
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_APP_SERVER_STOPPED,
     CodexNativeBridgeState,
+    clear_active_turn_id_if_matches,
     read_bridge_state,
     read_codex_config_effort,
     read_codex_config_model,
+    update_active_turn_id,
     write_bridge_startup_error,
     write_bridge_startup_timeout,
     write_bridge_state,
 )
+from omnigent.harnesses.codex_native.shell_input import native_shell_authorization
 from omnigent.inner.codex_native_executor import CodexNativeExecutor
 from omnigent.inner.executor import (
     ExecutorConfig,
@@ -69,6 +72,7 @@ class _FakeCodexNativeClient:
     requests: list[tuple[str, dict[str, Any]]] = []
     created: list[tuple[Path | None, str | None, str]] = []
     next_turn = 1
+    native_active_turn_id: str | None = None
 
     def __init__(
         self,
@@ -123,6 +127,15 @@ class _FakeCodexNativeClient:
             type(self).next_turn += 1
             return {"result": {"turn": {"id": turn_id}}}
         if method == "turn/steer":
+            if params["input"] == []:
+                active_turn = type(self).native_active_turn_id
+                expected_turn = params["expectedTurnId"]
+                message = (
+                    f"expected active turn id `{expected_turn}` but found `{active_turn}`"
+                    if active_turn is not None
+                    else "no active turn to steer"
+                )
+                raise CodexAppServerResponseError({"code": -32600, "message": message})
             return {"result": {"turnId": "turn_steered"}}
         return {"result": {}}
 
@@ -139,12 +152,15 @@ class _FakeCodexNativeClient:
         yield {}
 
 
-def _collect_turn_events(executor: CodexNativeExecutor, text: str) -> list[Any]:
+def _collect_turn_events(
+    executor: CodexNativeExecutor, text: str, *, shell_authorized: bool = False
+) -> list[Any]:
     """
     Run one native executor turn and collect its events.
 
     :param executor: Native Codex executor under test.
     :param text: User text to send, e.g. ``"hello"``.
+    :param shell_authorized: Whether the test's trusted delivery authorizes this shell body.
     :returns: Events yielded by :meth:`CodexNativeExecutor.run_turn`.
     """
 
@@ -154,16 +170,55 @@ def _collect_turn_events(executor: CodexNativeExecutor, text: str) -> list[Any]:
 
         :returns: Events yielded by the turn.
         """
-        events: list[Any] = []
-        async for event in executor.run_turn(
-            [{"role": "user", "content": [{"type": "input_text", "text": text}]}],
-            [],
-            "",
-        ):
-            events.append(event)
-        return events
+        command = codex_native_executor._shell_command_from_content(text)
+        with native_shell_authorization(command if shell_authorized else None):
+            return [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": [{"type": "input_text", "text": text}]}],
+                    [],
+                    "",
+                )
+            ]
 
     return asyncio.run(run())
+
+
+@pytest.mark.asyncio
+async def test_side_command_attachment_is_undelivered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "/side explain this"},
+                        {"type": "input_image", "image_url": _PNG_DATA_URI},
+                    ],
+                }
+            ],
+            [],
+            "",
+        )
+    ]
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert "attachments" in error.message
+    assert error.undelivered is True
+    assert error.preserve_session is True
+    assert _FakeCodexNativeClient.requests == []
+    assert codex_native_executor.side_chat.peek_side_chat_requests(tmp_path) == []
 
 
 @pytest.fixture
@@ -323,6 +378,86 @@ def test_compact_steer_timeout_keeps_input_undelivered_and_bridge_turn(
     assert draining_client.accepted_inputs == []
     state = read_bridge_state(tmp_path)
     assert state is not None and state.active_turn_id == "turn_compact"
+
+
+@pytest.mark.parametrize(
+    "changed_field", ["session_id", "thread_id", "socket_path", "codex_home", "missing"]
+)
+@pytest.mark.parametrize(
+    ("delivery", "change_stage"),
+    [
+        ("start", "connect"),
+        ("steer", "connect"),
+        ("live-steer", "connect"),
+        ("start", "thread/settings/update"),
+        ("start", "model/list"),
+    ],
+)
+async def test_delivery_does_not_submit_after_bridge_binding_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_field: str,
+    delivery: str,
+    change_stage: str,
+) -> None:
+    """Connection and settings awaits can outlive the owned session binding."""
+    _seed_bridge(tmp_path, active_turn_id=None if delivery == "start" else "turn_existing")
+    original = read_bridge_state(tmp_path)
+    assert original is not None
+    replacement = (
+        None
+        if changed_field == "missing"
+        else replace(original, **{changed_field: "replacement"}, active_turn_id="turn_new")
+    )
+
+    def change_binding() -> None:
+        if replacement is None:
+            (tmp_path / "state.json").unlink()
+        else:
+            write_bridge_state(tmp_path, replacement)
+
+    class RotatingClient(_FakeCodexNativeClient):
+        requests = []
+        created = []
+
+        async def connect(self) -> None:
+            await super().connect()
+            if change_stage == "connect":
+                change_binding()
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            response = await super().request(method, params)
+            if method == change_stage:
+                change_binding()
+            return response
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", RotatingClient
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    if delivery == "live-steer":
+        assert await executor.enqueue_session_message("main", "keep this input") is False
+    else:
+        config = (
+            ExecutorConfig(
+                model="example-model",
+                extra={"reasoning_effort": "low"} if change_stage == "model/list" else {},
+            )
+            if change_stage != "connect"
+            else None
+        )
+        [failure] = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "keep this input"}], [], "", config
+            )
+        ]
+        assert isinstance(failure, ExecutorError)
+        assert failure.undelivered is True
+        assert failure.preserve_session is True
+        assert "changed" in failure.message
+    assert all(method not in {"turn/start", "turn/steer"} for method, _ in RotatingClient.requests)
+    assert read_bridge_state(tmp_path) == replacement
 
 
 @pytest.mark.parametrize("changed_field", ["session_id", "thread_id", "socket_path", "missing"])
@@ -560,6 +695,147 @@ def test_persistent_draining_delivery_is_bounded_and_keeps_input_undelivered(
     assert state.active_turn_id == active_turn_id
 
 
+_PROJECT_CONFIG_REFUSAL = (
+    "failed to load configuration: Failed to read project hooks config file "
+    "/workspace/project/.codex/config.toml: Not a directory (os error 20)"
+)
+
+
+@pytest.mark.parametrize(
+    ("rpc_code", "data", "message", "failure_code"),
+    [
+        (
+            -32600,
+            {"type": "modelProviderMismatch", "currentModelProvider": "gateway"},
+            "provider unavailable",
+            "codex_provider_changed",
+        ),
+        (
+            -32600,
+            {"type": "modelProviderNotConfigured", "modelProvider": "previous"},
+            "provider unavailable",
+            "codex_provider_changed",
+        ),
+        (-32600, {"type": "modelProviderMismatch"}, "provider unavailable", None),
+        (
+            -32600,
+            {"type": "anotherError", "currentModelProvider": "gateway"},
+            "provider unavailable",
+            None,
+        ),
+        (
+            -32603,
+            {"type": "modelProviderMismatch", "currentModelProvider": "gateway"},
+            "provider unavailable",
+            None,
+        ),
+        (-32600, {}, _PROJECT_CONFIG_REFUSAL, "codex_project_config_invalid"),
+        (-32603, {}, _PROJECT_CONFIG_REFUSAL, None),
+        (-32600, {}, "other failure: " + _PROJECT_CONFIG_REFUSAL, None),
+        (
+            -32600,
+            {},
+            _PROJECT_CONFIG_REFUSAL.replace("Not a directory (os error 20)", "permission denied"),
+            None,
+        ),
+        (
+            -32600,
+            {},
+            _PROJECT_CONFIG_REFUSAL.replace("/.codex/config.toml", "/unrelated.toml"),
+            None,
+        ),
+    ],
+    ids=[
+        "mismatch",
+        "missing-provider",
+        "missing-detail",
+        "unrelated-type",
+        "internal-error",
+        "project-config",
+        "config-internal-error",
+        "config-quoted-error",
+        "config-other-cause",
+        "config-other-path",
+    ],
+)
+@pytest.mark.parametrize(
+    ("active_turn_id", "refusal_stage"),
+    [(None, "turn_input"), ("turn_existing", "turn_input"), (None, "settings_update")],
+    ids=["start", "steer", "settings"],
+)
+def test_configuration_refusal_retains_input_without_changing_routing(
+    draining_client,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    rpc_code: int,
+    data: dict[str, str],
+    message: str,
+    failure_code: str | None,
+    active_turn_id: str | None,
+    refusal_stage: str,
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    before = read_bridge_state(tmp_path)
+    error = CodexAppServerResponseError({"code": rpc_code, "message": message, "data": data})
+    draining_client.delivery_errors = [error]
+
+    if refusal_stage == "settings_update":
+        request = draining_client.request
+
+        async def reject_settings(self, method, params):
+            if method == "thread/settings/update":
+                draining_client.requests.append((method, params))
+                raise error
+            return await request(self, method, params)
+
+        monkeypatch.setattr(draining_client, "request", reject_settings)
+
+        async def run():
+            return [
+                event
+                async for event in CodexNativeExecutor(bridge_dir=tmp_path).run_turn(
+                    [{"role": "user", "content": "keep this input"}],
+                    [],
+                    "",
+                    ExecutorConfig(model="model-new"),
+                )
+            ]
+
+        [failure] = asyncio.run(run())
+    else:
+        [failure] = _collect_turn_events(
+            CodexNativeExecutor(bridge_dir=tmp_path), "keep this input"
+        )
+
+    expected_code = failure_code or (
+        "codex_settings_update_failed" if refusal_stage == "settings_update" else None
+    )
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is (expected_code is not None)
+    assert failure.preserve_session is (expected_code is not None)
+    assert failure.retryable is False
+    assert failure.code == expected_code
+    if failure_code is not None:
+        assert failure.remediation is not None
+        if failure_code == "codex_provider_changed":
+            assert "provider" in failure.remediation
+            assert "restart" in failure.remediation.lower()
+        else:
+            assert ".codex" in failure.remediation
+            assert "directory" in failure.remediation
+    assert draining_client.accepted_inputs == []
+    assert draining_client.connections == draining_client.closes == 1
+    assert [method for method, _ in draining_client.requests] == [
+        "thread/settings/update"
+        if refusal_stage == "settings_update"
+        else "turn/steer"
+        if active_turn_id
+        else "turn/start"
+    ]
+    assert read_bridge_state(tmp_path) == before
+
+
 @pytest.mark.parametrize(
     "error",
     [
@@ -623,6 +899,70 @@ def test_similar_draining_errors_are_not_retried(
     assert draining_client.connections == 1
     assert len(draining_client.requests) == 1
     assert draining_client.accepted_inputs == []
+
+
+@pytest.mark.parametrize(
+    ("data", "expected_message"),
+    [
+        pytest.param(
+            {"input_error_code": "input_too_large", "max_chars": 1048576, "actual_chars": 1271319},
+            "This message is too long for Codex (1,271,319 characters; the limit is "
+            "1,048,576), so it was not delivered.",
+            id="with-sizes",
+        ),
+        pytest.param(
+            {"input_error_code": "input_too_large"},
+            "This message is too long for Codex, so it was not delivered.",
+            id="without-sizes",
+        ),
+    ],
+)
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["start", "steer"])
+def test_input_too_large_refusal_is_undelivered(
+    draining_client,
+    data: dict[str, object],
+    expected_message: str,
+    active_turn_id: str | None,
+    tmp_path: Path,
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    draining_client.delivery_errors = [
+        CodexAppServerResponseError(
+            {
+                "code": -32602,
+                "message": "Input exceeds the maximum length of 1048576 characters.",
+                "data": data,
+            }
+        )
+    ]
+
+    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "huge paste")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is True
+    assert failure.preserve_session is True
+    assert failure.code == "codex_input_too_large"
+    assert failure.message == expected_message
+    assert len(draining_client.requests) == 1
+    assert draining_client.accepted_inputs == []
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == active_turn_id
+
+
+def test_other_invalid_params_error_is_not_undelivered(draining_client, tmp_path: Path) -> None:
+    _seed_bridge(tmp_path)
+    draining_client.delivery_errors = [
+        CodexAppServerResponseError(
+            {"code": -32602, "message": "invalid params", "data": {"input_error_code": "other"}}
+        )
+    ]
+
+    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is False
+    assert failure.code is None
 
 
 @pytest.mark.parametrize(
@@ -1007,6 +1347,568 @@ def test_goal_command_sets_goal_before_starting_objective_turn(
     ]
 
 
+@pytest.mark.parametrize(
+    ("active_turn_id", "live_injection", "completed"),
+    [
+        (None, False, False),
+        (None, False, True),
+        ("turn_existing", False, False),
+        ("turn_existing", True, False),
+    ],
+    ids=["idle", "short-command", "active-turn", "live-queue"],
+)
+def test_shell_input_runs_through_thread_shell_command(
+    active_turn_id: str | None,
+    live_injection: bool,
+    completed: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A web ``!command`` runs in Codex's shell instead of prompting the model."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+
+    class _ShellClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            response = await super().request(method, params)
+            if method == "thread/shellCommand":
+                turn_id = active_turn_id or "turn_shell"
+                type(self).native_active_turn_id = None if completed else turn_id
+                update_active_turn_id(tmp_path, turn_id)
+                if completed:
+                    clear_active_turn_id_if_matches(tmp_path, turn_id)
+            return response
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _ShellClient
+    )
+    monkeypatch.setattr(codex_native_executor, "_SHELL_TURN_WAIT_SECONDS", 0.01)
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    if live_injection:
+        with native_shell_authorization("gcloud auth login"):
+            assert asyncio.run(executor.enqueue_session_message("main", "  !gcloud auth login\n"))
+    else:
+        events = _collect_turn_events(executor, "  !gcloud auth login\n", shell_authorized=True)
+        assert [type(event) for event in events] == [TurnComplete]
+
+    assert [
+        (method, params)
+        for method, params in _FakeCodexNativeClient.requests
+        if params.get("input") != []
+    ] == [("thread/shellCommand", {"threadId": "thread_123", "command": "gcloud auth login"})]
+    # The ack carries no turn id; the executor leaves the recorded turn alone.
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == (None if completed else active_turn_id or "turn_shell")
+    assert (state.pending_shell_command_id is None) == (active_turn_id is not None or completed)
+    assert state.active_shell_turn_id is None
+    if active_turn_id is not None:
+        assert asyncio.run(executor.enqueue_session_message("main", "follow up"))
+        assert _FakeCodexNativeClient.requests[-1][0] == "turn/steer"
+    elif completed:
+        _collect_turn_events(executor, "follow up")
+        assert _FakeCodexNativeClient.requests[-1][0] == "turn/start"
+
+
+@pytest.mark.parametrize("restart", [False, True], ids=["same-executor", "restarted-executor"])
+@pytest.mark.parametrize("live_injection", [False, True], ids=["run-turn", "live-queue"])
+def test_shell_followup_waits_for_a_model_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restart: bool, live_injection: bool
+) -> None:
+    """An accepted shell turn must finish before ordinary input starts inference."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    monkeypatch.setattr(codex_native_executor, "_SHELL_TURN_WAIT_SECONDS", 0)
+    _seed_bridge(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def run() -> list[Any]:
+        shell_observed = asyncio.Event()
+
+        class _RunningShellClient(_FakeCodexNativeClient):
+            native_active_turn_id = "turn_shell"
+
+            async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+                if method == "turn/steer" and params["input"] == []:
+                    shell_observed.set()
+                return await super().request(method, params)
+
+        monkeypatch.setattr(
+            "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+            _RunningShellClient,
+        )
+        with native_shell_authorization("sleep 1"):
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": [{"type": "input_text", "text": "!sleep 1"}]}],
+                    [],
+                    "",
+                )
+            ]
+        update_active_turn_id(tmp_path, "turn_shell")
+        followup_executor = CodexNativeExecutor(bridge_dir=tmp_path) if restart else executor
+
+        async def followup() -> None:
+            if live_injection:
+                assert await followup_executor.enqueue_session_message("main", "and then?")
+            else:
+                results = [
+                    event
+                    async for event in followup_executor.run_turn(
+                        [{"role": "user", "content": "and then?"}], [], ""
+                    )
+                ]
+                assert [type(event) for event in results] == [TurnComplete]
+
+        pending = asyncio.create_task(followup())
+        await asyncio.wait_for(shell_observed.wait(), 2)
+        assert not pending.done()
+        assert [
+            method
+            for method, params in _FakeCodexNativeClient.requests
+            if params.get("input") != []
+        ] == ["thread/shellCommand"]
+        _RunningShellClient.native_active_turn_id = None
+        clear_active_turn_id_if_matches(tmp_path, "turn_shell")
+        await asyncio.wait_for(pending, 2)
+        return events
+
+    events = asyncio.run(run())
+    assert [type(event) for event in events] == [TurnComplete]
+    assert [
+        method for method, params in _FakeCodexNativeClient.requests if params.get("input") != []
+    ] == [
+        "thread/shellCommand",
+        "turn/start",
+    ]
+
+
+def test_shell_input_wait_for_its_turn_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A shell command whose turn is never observed still returns promptly."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    monkeypatch.setattr(codex_native_executor, "_SHELL_TURN_WAIT_SECONDS", 0.1)
+    _seed_bridge(tmp_path)
+
+    class _UnresponsiveFenceClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "turn/steer":
+                await asyncio.Event().wait()
+            return await super().request(method, params)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _UnresponsiveFenceClient
+    )
+
+    async def run() -> list[Any]:
+        async with asyncio.timeout(1):
+            with native_shell_authorization("true"):
+                return [
+                    event
+                    async for event in CodexNativeExecutor(bridge_dir=tmp_path).run_turn(
+                        [{"role": "user", "content": "!true"}], [], ""
+                    )
+                ]
+
+    events = asyncio.run(run())
+
+    assert [type(event) for event in events] == [TurnComplete]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
+    assert state.pending_shell_command_id is not None
+
+
+@pytest.mark.parametrize("previous_turn", [None, "turn_finishing"])
+@pytest.mark.parametrize(
+    "replacement_field", [None, "codex_home", "socket_path", "thread_id", "session_id"]
+)
+def test_unobserved_shell_blocks_followup_after_executor_restart(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    previous_turn: str | None,
+    replacement_field: str | None,
+) -> None:
+    """An old turn finishing cannot erase a shell RPC awaiting its first item."""
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    monkeypatch.setattr(codex_native_executor, "_SHELL_TURN_WAIT_SECONDS", 0)
+    _seed_bridge(tmp_path, active_turn_id=previous_turn)
+    _collect_turn_events(
+        CodexNativeExecutor(bridge_dir=tmp_path), "!sleep 1", shell_authorized=True
+    )
+    if previous_turn is not None:
+        clear_active_turn_id_if_matches(tmp_path, previous_turn)
+
+    async def run() -> None:
+        fence_submitted = asyncio.Event()
+        shell_started = asyncio.Event()
+        shell_observed = asyncio.Event()
+
+        class _QueuedShellClient(_FakeCodexNativeClient):
+            native_active_turn_id = "turn_shell"
+
+            async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+                if method == "turn/steer" and params["input"] == []:
+                    fence_submitted.set()
+                    await shell_started.wait()
+                    shell_observed.set()
+                return await super().request(method, params)
+
+        monkeypatch.setattr(
+            "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _QueuedShellClient
+        )
+
+        async def followup() -> list[Any]:
+            return [
+                event
+                async for event in CodexNativeExecutor(bridge_dir=tmp_path).run_turn(
+                    [{"role": "user", "content": "answer now"}], [], ""
+                )
+            ]
+
+        pending = asyncio.create_task(followup())
+        await asyncio.wait_for(fence_submitted.wait(), 2)
+        assert not pending.done()
+        # A passive idle snapshot can precede queued shell startup; the fence cannot.
+        idle_bridge = read_bridge_state(tmp_path)
+        assert idle_bridge is not None and idle_bridge.active_turn_id is None
+        if replacement_field is not None:
+            replacement = replace(
+                idle_bridge,
+                **{
+                    replacement_field: str(tmp_path / f"replacement-{replacement_field}"),
+                    "active_turn_id": "replacement_turn",
+                    "pending_shell_command_id": None,
+                    "active_shell_turn_id": None,
+                },
+            )
+            write_bridge_state(tmp_path, replacement)
+            replacement_snapshot = read_bridge_state(tmp_path)
+            assert replacement_snapshot is not None
+            shell_started.set()
+            [error] = await asyncio.wait_for(pending, 2)
+            assert isinstance(error, ExecutorError)
+            assert error.undelivered is True
+            assert error.preserve_session is True
+            assert "session changed" in error.message
+            assert read_bridge_state(tmp_path) == replacement_snapshot
+            return
+        update_active_turn_id(tmp_path, "turn_shell")
+        shell_started.set()
+        await asyncio.wait_for(shell_observed.wait(), 2)
+        assert not pending.done()
+        assert [
+            method
+            for method, params in _FakeCodexNativeClient.requests
+            if params.get("input") != []
+        ] == ["thread/shellCommand"]
+        _QueuedShellClient.native_active_turn_id = None
+        clear_active_turn_id_if_matches(tmp_path, "turn_shell")
+        assert [type(event) for event in await asyncio.wait_for(pending, 2)] == [TurnComplete]
+
+    asyncio.run(run())
+    assert [
+        method for method, params in _FakeCodexNativeClient.requests if params.get("input") != []
+    ] == [
+        "thread/shellCommand",
+    ] + (["turn/start"] if replacement_field is None else [])
+
+
+@pytest.mark.parametrize("ambiguous", [False, True], ids=["rejected", "connection-lost"])
+def test_shell_submission_failure_retains_only_ambiguous_pending_input(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ambiguous: bool
+) -> None:
+    _FakeCodexNativeClient.requests = []
+
+    class FailingShellClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method != "thread/shellCommand":
+                return await super().request(method, params)
+            type(self).requests.append((method, params))
+            if ambiguous:
+                raise OSError("connection closed after submission")
+            raise CodexAppServerResponseError(
+                {"code": -32600, "message": "shell command rejected"}
+            )
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", FailingShellClient
+    )
+    _seed_bridge(tmp_path)
+    events = _collect_turn_events(
+        CodexNativeExecutor(bridge_dir=tmp_path), "!true", shell_authorized=True
+    )
+    assert isinstance(events[0], ExecutorError)
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert (state.pending_shell_command_id is not None) == ambiguous
+    if ambiguous:
+        assert events[0].code == "codex_delivery_unconfirmed"
+        assert events[0].undelivered is False
+    recovered = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "answer now")
+    assert [type(event) for event in recovered] == [TurnComplete]
+    current = read_bridge_state(tmp_path)
+    assert current is not None and current.pending_shell_command_id is None
+    assert [
+        method for method, params in _FakeCodexNativeClient.requests if params.get("input") != []
+    ] == ["thread/shellCommand", "turn/start"]
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        {"code": -32600, "message": "input must not be empty"},
+        {"code": -32600, "message": "expected active turn id `other` but found `turn_parent`"},
+        {"code": -32000, "message": "no active turn to steer"},
+        {"code": -32600, "message": "Server is draining; retry after reconnecting"},
+        None,
+    ],
+    ids=["input-validation", "wrong-probe-id", "wrong-code", "draining", "unexpected-success"],
+)
+def test_shell_reconciliation_requires_a_core_fence_refusal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, refusal: dict[str, object] | None
+) -> None:
+    """Transport and validation responses cannot prove a queued shell was processed."""
+    _seed_bridge(tmp_path)
+    initial = read_bridge_state(tmp_path)
+    assert initial is not None
+    pending = replace(
+        initial,
+        pending_shell_command_id="unconfirmed",
+        pending_shell_parent_turn_id="turn_parent",
+    )
+    write_bridge_state(tmp_path, pending)
+    monkeypatch.setattr(codex_native_executor, "_SHELL_COMPLETION_WAIT_SECONDS", 0.01)
+
+    class _NonFenceClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "turn/steer" and params["input"] == []
+            if refusal is not None:
+                raise CodexAppServerResponseError(refusal)
+            return {"result": {}}
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _NonFenceClient
+    )
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "answer now")
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert events[0].code == "codex_shell_busy"
+    assert events[0].undelivered is True
+    assert read_bridge_state(tmp_path) == pending
+
+
+def test_accepted_shell_remains_delivered_when_the_native_thread_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Post-acceptance reconciliation must never invite a retry of the original command."""
+    _seed_bridge(tmp_path)
+    initial = read_bridge_state(tmp_path)
+    assert initial is not None
+    replacement = replace(initial, thread_id="replacement_thread")
+
+    class _RotatingShellClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "thread/shellCommand"
+            write_bridge_state(tmp_path, replacement)
+            return {"result": {}}
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _RotatingShellClient
+    )
+    events = _collect_turn_events(
+        CodexNativeExecutor(bridge_dir=tmp_path), "!printf once", shell_authorized=True
+    )
+
+    assert [type(event) for event in events] == [TurnComplete]
+    assert read_bridge_state(tmp_path) == replacement
+
+
+@pytest.mark.parametrize("observed", [False, True], ids=["unobserved-shell", "observed-shell"])
+def test_shell_wait_timeout_and_cancellation_do_not_consume_followup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, observed: bool
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id="turn_shell" if observed else None)
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    write_bridge_state(
+        tmp_path,
+        replace(
+            state,
+            active_shell_turn_id="turn_shell" if observed else None,
+            pending_shell_command_id=None if observed else "unobserved_submission",
+        ),
+    )
+    monkeypatch.setattr(codex_native_executor, "_SHELL_COMPLETION_WAIT_SECONDS", 0.01)
+    _FakeCodexNativeClient.requests = []
+
+    class _RunningShellClient(_FakeCodexNativeClient):
+        native_active_turn_id = "turn_shell"
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "turn/steer":
+                if type(self).native_active_turn_id is not None:
+                    update_active_turn_id(tmp_path, "turn_shell")
+                elif params["input"]:
+                    raise CodexAppServerResponseError(
+                        {"code": -32600, "message": "no active turn to steer"}
+                    )
+            return await super().request(method, params)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _RunningShellClient
+    )
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "answer now")
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert events[0].code == "codex_shell_busy"
+    assert events[0].undelivered is True
+    assert events[0].preserve_session is True
+    assert all(params.get("input") == [] for _, params in _FakeCodexNativeClient.requests)
+
+    async def run() -> None:
+        probe_started = asyncio.Event()
+
+        class _BlockedProbeClient(_RunningShellClient):
+            async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+                probe_started.set()
+                await asyncio.Event().wait()
+                return {}
+
+        pending = asyncio.create_task(
+            codex_native_executor._wait_for_shell_completion(
+                _BlockedProbeClient(), tmp_path, state
+            )
+        )
+        await asyncio.wait_for(probe_started.wait(), 1)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+    asyncio.run(run())
+    current = read_bridge_state(tmp_path)
+    assert current is not None
+    assert current.active_turn_id == "turn_shell"
+    assert current.active_shell_turn_id == ("turn_shell" if observed else None)
+    assert current.pending_shell_command_id == (None if observed else "unobserved_submission")
+    _RunningShellClient.native_active_turn_id = None
+    recovered = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "answer now")
+    assert [type(event) for event in recovered] == [TurnComplete]
+    assert _FakeCodexNativeClient.requests[-1][0] == "turn/start"
+    settled = read_bridge_state(tmp_path)
+    assert settled is not None and settled.active_shell_turn_id is None
+
+
+@pytest.mark.parametrize(
+    ("text", "command"),
+    [
+        ("!printf '<%s>' foo\\ \n", "printf '<%s>' foo\\ "),
+        ("!cat <<EOF\nhi\nEOF\n", "cat <<EOF\nhi\nEOF"),
+        ("  !  ls -la  ", "ls -la  "),
+    ],
+    ids=["escaped-trailing-space", "heredoc", "padding"],
+)
+def test_shell_command_keeps_its_body(text: str, command: str) -> None:
+    assert (
+        codex_native_executor._shell_command_from_content([{"type": "input_text", "text": text}])
+        == command
+    )
+
+
+@pytest.mark.parametrize("text", ["!!not a command", "!", "!  \n", "say !hi"])
+def test_non_shell_bang_text_is_sent_as_a_prompt(
+    text: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Only a lone ``!command`` is shell input; anything else reaches the model."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path)
+
+    _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), text)
+
+    assert [method for method, _params in _FakeCodexNativeClient.requests] == ["turn/start"]
+
+
+@pytest.mark.parametrize("delivery", ["idle", "active-turn", "live-queue"])
+@pytest.mark.parametrize("attachment", ["shell-text-file", "text-file", "image"])
+def test_attachment_bang_content_is_never_a_shell_command(
+    delivery: str,
+    attachment: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Attachment bytes and attachment-bearing prompts must go to the model."""
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id=None if delivery == "idle" else "turn_existing")
+    text = "!echo attachment-test"
+    content: list[dict[str, Any]]
+    if attachment == "shell-text-file":
+        content = [
+            {
+                "type": "input_file",
+                "filename": "example.txt",
+                "file_data": "data:text/plain;base64," + base64.b64encode(text.encode()).decode(),
+            }
+        ]
+    elif attachment == "text-file":
+        content = [
+            {"type": "input_text", "text": text},
+            {
+                "type": "input_file",
+                "filename": "notes.txt",
+                "file_data": "data:text/plain;base64,bm90ZXM=",
+            },
+        ]
+    else:
+        content = [
+            {"type": "input_text", "text": text},
+            {"type": "input_image", "image_url": _PNG_DATA_URI},
+        ]
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def run() -> None:
+        if delivery == "live-queue":
+            assert await executor.enqueue_session_message("main", content)
+        else:
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": content}], [], ""
+                )
+            ]
+            assert [type(event) for event in events] == [TurnComplete]
+
+    asyncio.run(run())
+
+    assert [method for method, _ in _FakeCodexNativeClient.requests] == [
+        "turn/start" if delivery == "idle" else "turn/steer"
+    ]
+    items = _FakeCodexNativeClient.requests[-1][1]["input"]
+    assert items[0] == {"type": "text", "text": text}
+    assert len(items) == (1 if attachment == "shell-text-file" else 2)
+
+
 def test_overlong_goal_command_fails_clearly_without_reaching_app_server(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1351,6 +2253,167 @@ def test_input_file_text_is_inlined_as_a_text_item(
     # No image channel item for a file, and no uploads dir written.
     assert all(item["type"] != "localImage" for item in items)
     assert not (attachment_cache_dir(tmp_path)).exists()
+
+
+@pytest.mark.parametrize("delivery", ["idle", "active-turn", "live-queue"])
+@pytest.mark.parametrize(
+    ("prompt_chars", "file_sizes"),
+    [
+        pytest.param(20, [1048577], id="one-large-file"),
+        pytest.param(20, [600000, 600000], id="aggregate-files"),
+        pytest.param(700000, [400000], id="prompt-and-file"),
+    ],
+)
+def test_text_attachments_over_input_limit_are_referenced_without_losing_bytes(
+    delivery: str,
+    prompt_chars: int,
+    file_sizes: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """File contents must not push an otherwise valid prompt past Codex's cap."""
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id=None if delivery == "idle" else "turn_existing")
+    files = [(chr(ord("a") + index) * size).encode() for index, size in enumerate(file_sizes)]
+    content: list[dict[str, Any]] = [
+        {
+            "type": "input_file",
+            "filename": f"notes-{index}.txt",
+            "file_data": "data:text/plain;base64," + base64.b64encode(data).decode(),
+        }
+        for index, data in enumerate(files)
+    ]
+    prompt = "p" * prompt_chars
+    content.append({"type": "input_text", "text": prompt})
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def run() -> None:
+        if delivery == "live-queue":
+            assert await executor.enqueue_session_message("main", content)
+        else:
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": content}], [], ""
+                )
+            ]
+            assert [type(event) for event in events] == [TurnComplete]
+
+    asyncio.run(run())
+
+    method, params = _FakeCodexNativeClient.requests[-1]
+    assert method == ("turn/start" if delivery == "idle" else "turn/steer")
+    items = params["input"]
+    assert sum(len(item.get("text", "")) for item in items) <= 1048576
+    assert items[-1] == {"type": "text", "text": prompt}
+    for item, data in zip(items[:-1], files, strict=True):
+        reference = item["text"]
+        assert reference.startswith("[Attached file: ") and reference.endswith("]")
+        assert (
+            Path(reference.removeprefix("[Attached file: ").removesuffix("]")).read_bytes() == data
+        )
+
+
+@pytest.mark.parametrize(
+    "write_errno", [errno.ENOSPC, errno.EACCES], ids=["disk-full", "cache-denied"]
+)
+@pytest.mark.parametrize("delivery", ["idle", "active-turn", "live-queue"])
+def test_failed_text_attachment_spill_preserves_original_for_native_refusal(
+    draining_client,
+    write_errno: int,
+    delivery: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active_turn_id = None if delivery == "idle" else "turn_existing"
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    text = "a" * 1048577
+    prompt = "inspect the original file"
+    content = [
+        {"type": "input_text", "text": prompt},
+        {
+            "type": "input_file",
+            "filename": "notes.txt",
+            "file_data": "data:text/plain;base64," + base64.b64encode(text.encode()).decode(),
+        },
+    ]
+    draining_client.delivery_errors = [
+        CodexAppServerResponseError(
+            {
+                "code": -32602,
+                "message": "Input exceeds the maximum length of 1048576 characters.",
+                "data": {"input_error_code": "input_too_large"},
+            }
+        )
+    ]
+
+    def fail_cache_write(*args, **kwargs):
+        raise OSError(write_errno, "attachment cache unavailable")
+
+    monkeypatch.setattr("omnigent.inner.native_attachments._place_no_follow", fail_cache_write)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def run() -> None:
+        if delivery == "live-queue":
+            assert not await executor.enqueue_session_message("main", content)
+        else:
+            [failure] = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": content}], [], ""
+                )
+            ]
+            assert isinstance(failure, ExecutorError)
+            assert failure.undelivered is True
+            assert failure.preserve_session is True
+            assert failure.code == "codex_input_too_large"
+
+    asyncio.run(run())
+
+    assert draining_client.accepted_inputs == []
+    [(_, params)] = draining_client.requests
+    items = params["input"]
+    assert items[0] == {"type": "text", "text": prompt}
+    assert len(items[1]["text"]) == len(text)
+    assert items[1] == {"type": "text", "text": text}
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == active_turn_id
+
+
+def test_text_attachment_at_input_limit_stays_inline(tmp_path: Path) -> None:
+    prompt = "inspect this file"
+    text = "a" * (1048576 - len(prompt))
+    content = [
+        {"type": "input_text", "text": prompt},
+        {
+            "type": "input_file",
+            "file_data": "data:text/plain;base64," + base64.b64encode(text.encode()).decode(),
+        },
+    ]
+
+    assert codex_native_executor._content_to_input_items(content, tmp_path) == [
+        {"type": "text", "text": prompt},
+        {"type": "text", "text": text},
+    ]
+    assert not attachment_cache_dir(tmp_path).exists()
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_oversized_authored_text_is_preserved_for_native_refusal(
+    structured: bool, tmp_path: Path
+) -> None:
+    text = "p" * 1048577
+    content = [{"type": "input_text", "text": text}] if structured else text
+
+    assert codex_native_executor._content_to_input_items(content, tmp_path) == [
+        {"type": "text", "text": text}
+    ]
+    assert not attachment_cache_dir(tmp_path).exists()
 
 
 def test_input_file_binary_is_materialized_and_referenced_by_path(
@@ -2030,6 +3093,39 @@ def test_stale_active_turn_mismatch_steer_recovers_to_newer_turn(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == "turn_b"
+
+
+def test_steer_ack_does_not_restore_a_turn_completed_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A steer accepted just before its turn ended leaves the bridge idle."""
+
+    class _CompletingSteerClient(_FakeCodexNativeClient):
+        """Complete the steered turn before acknowledging the steer."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """Model the forwarder recording ``turn/completed`` ahead of the ack."""
+            type(self).requests.append((method, params))
+            assert method == "turn/steer", method
+            assert clear_active_turn_id_if_matches(tmp_path, "turn_a")
+            return {"result": {"turnId": "turn_a"}}
+
+    _CompletingSteerClient.requests = []
+    _CompletingSteerClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _CompletingSteerClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_a")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "follow up")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
 
 
 async def test_concurrent_steering_during_turn_start_is_not_dropped(
@@ -2849,18 +3945,38 @@ def test_run_turn_error_after_submit_is_not_marked_undelivered(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("submission", ["turn/start", "turn/steer", "live-steer", "before-send"])
+@pytest.mark.parametrize(
+    "submission",
+    [
+        "turn/start",
+        "turn/steer",
+        "live-steer",
+        "before-send",
+        "binding-change",
+        "settings-rejected",
+        "settings-disconnected",
+        "settings-timeout",
+        "settings-replaced",
+    ],
+)
 async def test_transport_failure_keeps_native_work_running(
-    tmp_path: Path, submission: str
+    tmp_path: Path, submission: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A failed submission cannot interrupt existing work or resend accepted input."""
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from omnigent.runtime.harnesses._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
 
-    method = "turn/start" if submission == "turn/start" else "turn/steer"
+    settings_failure = submission.startswith("settings-")
+    method = (
+        "turn/start"
+        if submission in {"turn/start", "binding-change"} or settings_failure
+        else "turn/steer"
+    )
     requests: list[str] = []
     native_running = submission == "before-send"
+    if settings_failure:
+        monkeypatch.setattr(codex_native_executor, "_DELIVERY_RPC_TIMEOUT_SECONDS", 1.0)
 
     async def handle(websocket: ServerConnection) -> None:
         nonlocal native_running
@@ -2870,9 +3986,45 @@ async def test_transport_failure_keeps_native_work_running(
             if "id" not in request:
                 continue
             requests.append(rpc_method)
+            if rpc_method == "thread/settings/update":
+                native_running = True
+                state = read_bridge_state(tmp_path)
+                assert state is not None
+                state = replace(state, active_turn_id="turn_accepted")
+                if submission == "settings-replaced":
+                    state = replace(state, session_id="conv_new", thread_id="thread_new")
+                write_bridge_state(tmp_path, state)
+                if submission == "settings-disconnected":
+                    websocket.transport.abort()
+                    return
+                if submission == "settings-timeout":
+                    await websocket.wait_closed()
+                    return
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "id": request["id"],
+                            "error": {"code": -32602, "message": "requested model unavailable"},
+                        }
+                    )
+                )
+                continue
             if submission == "before-send" and requests == ["initialize"]:
                 websocket.transport.abort()
                 return
+            if submission == "binding-change" and requests == ["initialize"]:
+                state = read_bridge_state(tmp_path)
+                assert state is not None
+                write_bridge_state(
+                    tmp_path,
+                    replace(
+                        state,
+                        session_id="conv_replacement",
+                        thread_id="thread_replacement",
+                        active_turn_id="turn_accepted",
+                    ),
+                )
+                native_running = True
             if rpc_method == method:
                 native_running = True
                 state = read_bridge_state(tmp_path)
@@ -2899,7 +4051,11 @@ async def test_transport_failure_keeps_native_work_running(
         )
         executor = CodexNativeExecutor(bridge_dir=tmp_path)
         adapter = ExecutorAdapter(executor_factory=lambda: executor)
-        request = CreateResponseRequest(model="test-agent", input="keep working")
+        request = CreateResponseRequest(
+            model="test-agent",
+            input="keep working",
+            model_override="model-new" if settings_failure else None,
+        )
         ctx = TurnContext(
             response_id="resp_delivery", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
         )
@@ -2922,10 +4078,22 @@ async def test_transport_failure_keeps_native_work_running(
             if submission == "before-send":
                 assert str(caught.value) == CODEX_APP_SERVER_STOPPED.message
                 assert caught.value.undelivered is True
+            elif submission == "binding-change":
+                assert "changed" in str(caught.value)
+                assert caught.value.undelivered is True
+            elif settings_failure:
+                assert caught.value.undelivered is True
+                assert caught.value.code == "codex_settings_update_failed"
+                if submission != "settings-timeout" and submission != "settings-disconnected":
+                    assert "requested model unavailable" in str(caught.value)
             else:
                 assert "may already be running" in str(caught.value)
 
-        assert requests.count(method) == (0 if submission == "before-send" else 1)
+        assert requests.count(method) == (
+            0 if submission in {"before-send", "binding-change"} or settings_failure else 1
+        )
+        if settings_failure:
+            assert requests.count("thread/settings/update") == 1
         assert "turn/interrupt" not in requests
         assert native_running
         if submission != "live-steer":

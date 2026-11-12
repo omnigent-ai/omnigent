@@ -28,7 +28,7 @@ from typing import cast
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
-from omnigent.debug_logging import debug_event
+from omnigent.debug_logging import add_audit_attrs, debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.diagnostics import (
@@ -235,6 +235,7 @@ def create_runner_tunnel_router(
     auth_provider: AuthProvider | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
+    admit_managed_runner: Callable[[str], bool] | None = None,
     mint_managed_runner_token: Callable[[str, int], str | None] | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/runners/{id}/tunnel`` WS endpoint.
@@ -255,6 +256,8 @@ def create_runner_tunnel_router(
     :param on_runner_connect: Optional async callback fired when a
         runner tunnel is established. Receives the ``runner_id`` and connection.
         Used to re-assign sessions on runner reconnect.
+    :param admit_managed_runner: Optional binding-token admission check before
+        registration, used by sandbox profiles to fence stale-runner replacement.
     :param auth_provider: Optional auth provider for user identity
         extraction. When set, runner listing is scoped to the
         caller's own runners and tunnel registration records
@@ -350,6 +353,7 @@ def create_runner_tunnel_router(
             and session.owner != user_id
         ):
             online = False
+        add_audit_attrs(runner_id=runner_id, runner_online=online)
         result: dict[str, str | bool] = {"runner_id": runner_id, "online": online}
         if not online and runner_exit_reports is not None:
             # Host-daemon report that the runner process died (exit code
@@ -499,6 +503,7 @@ def create_runner_tunnel_router(
             auth_provider=auth_provider,
             is_loopback=is_loopback,
         )
+        binding_token_owner = tunnel_owner is None and auth_provider is not None
         if tunnel_owner is None and auth_provider is not None:
             # A server-managed sandbox runner authenticates with a
             # server-minted binding token (the token-binding gate above
@@ -519,10 +524,15 @@ def create_runner_tunnel_router(
                 await ws.close(code=RUNNER_ID_MISMATCH_CLOSE_CODE, reason="unauthenticated")
                 return
 
+        # Attribute debug-log records for this tunnel to its owner, as the host
+        # tunnel does. The handler task is per-connection, so this cannot bleed
+        # across concurrent runners.
+        set_current_user_id(tunnel_owner)
         await ws.accept()
         session: RunnerSession | None = None
         ended_by: str | None = None
         peer_close_code: int | None = None
+        receive_task: asyncio.Task[None] | None = None
         owned: list[asyncio.Task[None]] = []
 
         def _connection_attrs() -> _TunnelConnectionAttrs:
@@ -586,6 +596,13 @@ def create_runner_tunnel_router(
             #    (and an unauthenticated non-loopback peer already
             #    rejected) before ``accept()`` above, so runner-binding
             #    checks can enforce ownership.
+            if (
+                binding_token_owner
+                and admit_managed_runner is not None
+                and not await asyncio.to_thread(admit_managed_runner, runner_id)
+            ):
+                await ws.close(code=4004, reason="runner binding was replaced")
+                return
             session = registry.register(runner_id, ws, frame, owner=tunnel_owner)
             session.diagnostics.settings.update(
                 tunnel_side="server",
@@ -747,6 +764,14 @@ def create_runner_tunnel_router(
                 task.cancel()
             await asyncio.gather(*owned, return_exceptions=True)
             if session is not None:
+                # A sender failure can win exception handling while receive has the
+                # actual peer close. Preserve it for lifecycle reconciliation.
+                if receive_task is not None and not receive_task.cancelled():
+                    receive_error = receive_task.exception()
+                    if isinstance(receive_error, WebSocketDisconnect):
+                        peer_close_code = receive_error.code
+                        session.peer_close_reason = receive_error.reason or None
+                        shutdown_state.note_tunnel_close_code(peer_close_code)
                 # Snapshot before deregister records its own cleanup close on the session.
                 session.ended = TunnelEnd(
                     at=ended_at,
@@ -979,6 +1004,8 @@ async def _receive_loop(
                     runner_id,
                     int(time.time() * 1000) - resp_frame.ts,
                 )
+                # Gates managed-sandbox refreshes on the runner's own report.
+                managed_host_keepalive.record_pong(runner_id, resp_frame.keep_warm)
                 continue
             if isinstance(resp_frame, (WSFrame, WSCloseFrame)):
                 registry.route_ws_inbound(runner_id, resp_frame, session=session)
@@ -999,24 +1026,48 @@ async def _keepalive_loop(runner_id: str) -> None:
     Separate from :func:`_ping_loop` (fixed ``PING_INTERVAL_S``) so a deployment
     can refresh a managed sandbox faster than the 30s liveness ping (which is
     what lets the sandbox's shutdown window be short) or slower to save calls.
-    Fires once immediately so a freshly connected (or reconnected) runner
-    extends its sandbox right away, then every
-    :func:`managed_host_keepalive.keepalive_interval_s`. Best-effort:
-    :func:`managed_host_keepalive.touch` swallows its own errors and no-ops when
-    the host has no extendable sandbox, so this loop only ever ends when it is
-    cancelled at tunnel teardown.
+    Ticks at once, then every :func:`managed_host_keepalive.keepalive_interval_s`;
+    :func:`managed_host_keepalive.touch` refreshes only once the runner's pongs
+    allow it (see :func:`managed_host_keepalive.record_pong`). A pong that makes
+    a refresh due wakes the loop early; a refresh it makes restarts the
+    schedule, so the next one is still a full interval later. Best-effort:
+    ``touch`` swallows its own errors and no-ops when the host has no extendable
+    sandbox, so this loop only ever ends when it is cancelled at tunnel teardown.
 
     :param runner_id: Runner whose bound sandbox to keep warm.
     :returns: None (runs until cancelled).
     """
-    while True:
-        try:
-            managed_host_keepalive.touch(runner_id)
-        except Exception:
-            # touch is already fail-safe, but a bug here must not silently stop
-            # refreshes for the tunnel's remaining life.
-            _logger.exception("managed keepalive touch failed for runner %s", runner_id)
-        await asyncio.sleep(managed_host_keepalive.keepalive_interval_s(runner_id))
+    report = managed_host_keepalive.open_report(runner_id)
+    loop = asyncio.get_running_loop()
+    try:
+        while True:
+            _touch_keepalive(runner_id)
+            deadline = loop.time() + managed_host_keepalive.keepalive_interval_s(runner_id)
+            while (remaining := deadline - loop.time()) > 0:
+                try:
+                    await asyncio.wait_for(report.wake.wait(), remaining)
+                except TimeoutError:
+                    break
+                report.wake.clear()
+                if _touch_keepalive(runner_id):
+                    deadline = loop.time() + managed_host_keepalive.keepalive_interval_s(runner_id)
+    finally:
+        managed_host_keepalive.close_report(runner_id, report)
+
+
+def _touch_keepalive(runner_id: str) -> bool:
+    """Call :func:`managed_host_keepalive.touch`, never raising.
+
+    :param runner_id: Runner whose bound sandbox to keep warm.
+    :returns: Whether a refresh was submitted.
+    """
+    try:
+        return managed_host_keepalive.touch(runner_id)
+    except Exception:
+        # touch is already fail-safe, but a bug here must not silently stop
+        # refreshes for the tunnel's remaining life.
+        _logger.exception("managed keepalive touch failed for runner %s", runner_id)
+        return False
 
 
 async def _ping_loop(
@@ -1026,6 +1077,10 @@ async def _ping_loop(
     registry: TunnelRegistry,
 ) -> None:
     """Send pings every PING_INTERVAL_S; declare dead after misses.
+
+    With managed sandboxes configured the first ping goes out at once: its pong
+    carries the runner's first keep-warm report, which the keepalive waits for
+    before refreshing, and a short sandbox window cannot wait 30s for it.
 
     Each tick that the runner is still alive also re-stamps
     ``runner_last_seen`` (``session_live_state.touch_runner_liveness``)
@@ -1046,8 +1101,9 @@ async def _ping_loop(
     :returns: None when the session goes stale or the runner is
         declared dead.
     """
-    while True:
+    if not managed_host_keepalive.is_enabled():
         await asyncio.sleep(PING_INTERVAL_S)
+    while True:
         # Check if any frame arrived recently (not just pongs).
         elapsed = registry.seconds_since_last_frame(session)
         if elapsed is None:
@@ -1101,3 +1157,4 @@ async def _ping_loop(
             )
         except Exception:  # noqa: BLE001 -- any send failure ends the ping loop cleanly.
             return
+        await asyncio.sleep(PING_INTERVAL_S)

@@ -56,8 +56,12 @@ function useMenuInteractionProps(configOpen = false) {
     "data-initial-selection": interaction.showInitialSelection || undefined,
     onPointerEnter: interaction.onPointerInteraction,
     onPointerLeave: interaction.onPointerInteraction,
+    onPointerOutCapture: (event: SyntheticEvent<HTMLElement>) => {
+      if (event.currentTarget.dataset.state === "closed") event.preventDefault();
+    },
     onPointerDownCapture: interaction.onPointerInteraction,
     onPointerMoveCapture: (event: SyntheticEvent<HTMLElement>) => {
+      if (event.currentTarget.dataset.state === "closed") return event.preventDefault();
       interaction.onPointerInteraction();
       if (configOpen && event.currentTarget.contains(event.target as Node)) event.preventDefault();
     },
@@ -162,7 +166,7 @@ function CyclePreview({ section, hint }: { section: ComposerConfigSection; hint?
       <span role="status" className="sr-only">
         {section.header}: {selected?.label}
       </span>
-      <ComposerConfigSections models={section} />
+      <ComposerConfigSections models={section} browseModels={false} />
       {hint && (
         <div className="whitespace-normal px-2 py-1.5 text-xs text-muted-foreground">{hint}</div>
       )}
@@ -395,7 +399,7 @@ export function HarnessPickerEntry({
     target instanceof Element && target.closest("[data-harness-edit]") !== null;
   const rowProps = {
     className: cn(
-      "composer-agent-select min-w-0 flex-1 [&>svg]:hidden",
+      "composer-agent-select mobile-touch-target min-w-0 flex-1 [&>svg]:hidden",
       disabled && "cursor-not-allowed opacity-60",
     ),
     "data-testid": testId,
@@ -420,7 +424,7 @@ export function HarnessPickerEntry({
           data-testid={editTestId}
           aria-hidden="true"
           className={cn(
-            "composer-agent-edit flex h-8 shrink-0 cursor-pointer items-center text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline",
+            "composer-agent-edit mobile-touch-target mobile-app:justify-center flex h-8 shrink-0 cursor-pointer items-center text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline",
             row.active || showDetails || isMobile
               ? "opacity-100"
               : cn(
@@ -590,7 +594,7 @@ export function HarnessPickerConfigRow({
   );
   const rowProps = {
     className:
-      "min-h-8 cursor-pointer rounded-lg px-2 text-13 data-disabled:pointer-events-none data-disabled:cursor-default data-disabled:opacity-50",
+      "mobile-touch-target min-h-8 cursor-pointer rounded-lg px-2 text-13 data-disabled:pointer-events-none data-disabled:cursor-default data-disabled:opacity-50",
     "data-testid": testId,
     "aria-label": `${label}: ${value}`,
     textValue: label,
@@ -653,7 +657,7 @@ export function HarnessPickerConfigPage({
     <div className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
       <DropdownMenuItem
         data-testid={backTestId}
-        className="items-center font-medium"
+        className="mobile-touch-target items-center font-medium"
         onSelect={(event) => {
           event.preventDefault();
           onBack();

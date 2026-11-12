@@ -4137,6 +4137,45 @@ def test_databricks_token_auth_re_resolves_when_reused_sdk_auth_goes_stale(
     assert len(cfgs) == 2
 
 
+def test_databricks_clients_share_the_preflight_token_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-flight headers and every later client for a server resolve credentials once."""
+    import omnigent.inner.databricks_executor as dbx
+
+    class _Cfg:
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer tok"}
+
+    resolved: list[str | None] = []
+
+    def _fake_resolve(
+        profile: str | None = None, *, host: str | None = None
+    ) -> tuple[object, str]:
+        resolved.append(host)
+        return dbx._DatabricksBearerAuth(_Cfg(), profile_name=None), "https://ex.databricks.com"
+
+    server = "https://ex.databricks.com/api/2.0/omnigent"
+    monkeypatch.setattr(dbx, "_resolve_databricks_auth", _fake_resolve)
+    monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host",
+        lambda _url: "https://ex.databricks.com",
+    )
+
+    assert chat_module._stored_databricks_record_token(server) == "tok"
+    for _ in range(3):
+        auth = chat_module._DatabricksTokenAuth(server_url=server)
+        assert _first_auth_header(auth, f"{server}/v1/sessions") == "Bearer tok"
+    assert resolved == ["https://ex.databricks.com"]
+
+    chat_module._forget_refused_credential(server)
+    auth = chat_module._DatabricksTokenAuth(server_url=server)
+    assert _first_auth_header(auth, f"{server}/v1/sessions") == "Bearer tok"
+    assert len(resolved) == 2
+
+
 def test_databricks_token_auth_sets_org_header(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every SDK-client request carries the workspace-routing header.
 
@@ -4822,6 +4861,7 @@ def _fake_sessions_chat_cls(
     query_impl: Callable[[str], object],
     *,
     extra_turns: list[str] | None = None,
+    pending_status: str = "running",
 ) -> type:
     """
     Build a ``SessionsChat`` replacement whose ``query`` is ``query_impl``.
@@ -4838,6 +4878,8 @@ def _fake_sessions_chat_cls(
         successive ``await_turn()`` calls, simulating async orchestrator
         auto-wakes. When exhausted ``await_turn`` returns empty text and
         ``last_turn_saw_waiting`` returns ``False``.
+    :param pending_status: Snapshot status while extra turns remain, e.g.
+        ``"waiting"`` for a claude-native turn whose background agent runs.
     :returns: A class usable as a drop-in for ``SessionsChat``.
     """
     _extra = list(extra_turns or [])
@@ -4851,7 +4893,7 @@ def _fake_sessions_chat_cls(
             # Mirrors the real snapshot: "running" while sub-agents are pending
             # (the runner emits "waiting" → relay collapses to "running"),
             # "idle" when done.
-            return "running" if self._pending else "idle"
+            return pending_status if self._pending else "idle"
 
         async def refresh(self) -> None:
             pass  # status is derived from _pending; no fetch needed.
@@ -5039,6 +5081,36 @@ async def test_query_sessions_once_multi_turn_async_orchestrator(
     assert "direct answer" in result
     assert "<!-- POLLY_REVIEW_START -->" in result
     assert "Looks good." in result
+
+
+async def test_query_sessions_once_keeps_waiting_on_a_background_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A snapshot that reads ``waiting`` keeps headless ``-p`` going.
+
+    A claude-native turn that ends with a background agent running reads
+    ``waiting`` until the agent finishes and Claude reports on it. If this
+    fails, ``-p`` prints only the turn that launched the agent.
+    """
+    monkeypatch.setattr(
+        "omnigent_client.SessionsChat",
+        _fake_sessions_chat_cls(
+            _return_text,
+            extra_turns=["", "The audit found nothing."],
+            pending_status="waiting",
+        ),
+    )
+    client = _FakeAPClient([], list_items_must_not_be_called=True)
+    result = await _query_sessions_once(
+        client=client,
+        agent_name="claude-native-ui",
+        tool_handler=None,
+        prompt="audit this in the background",
+        session_bundle=b"bundle-bytes",
+        session_bundle_filename="agent.tar.gz",
+        runner_id="runner_test",
+    )
+    assert result == "direct answer\n\nThe audit found nothing."
 
 
 async def _never_return(_prompt: str) -> QueryResult:

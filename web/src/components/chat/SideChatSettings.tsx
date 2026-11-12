@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useIsMutating, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
@@ -11,6 +11,7 @@ import { ComposerConfigSections } from "@/components/composer/ComposerConfigSect
 import {
   compactModelTriggerLabel,
   defaultModelLabel,
+  findModelLabelOption,
   formatStatusEffortLabel,
   formatStatusModelLabel,
   nativeModelLabel,
@@ -21,6 +22,7 @@ import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useSession } from "@/hooks/useSession";
+import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostModelOptions } from "@/hooks/useHosts";
 import { useHarnessEffortFamilies } from "@/lib/agentLabels";
 import {
@@ -31,7 +33,6 @@ import {
   modelPickerKindForConv,
   shouldShowEffortPicker,
 } from "@/lib/composerCapabilities";
-import { findNativeModelOption } from "@/lib/codexNativeModels";
 import { isEditorLevel } from "@/lib/permissionsApi";
 import { updateSession } from "@/lib/sessionsApi";
 import { parentIdFromLabels } from "@/lib/sessionHost";
@@ -53,12 +54,27 @@ export function SideChatSettings({
   const queryClient = useQueryClient();
   const state = useConversationEntryState(session.id);
   const nativeSide = session.labels?.["omnigent.codex_native.agent_nickname"] === "Side chat";
-  const settingsSupported =
-    !nativeSide &&
-    session.harness !== "codex-native" &&
-    session.labels?.["omnigent.wrapper"] !== "codex-native-ui";
   const sourceId = session.parentSessionId ?? parentIdFromLabels(session.labels);
+  const nativeSession =
+    nativeSide ||
+    session.harness === "codex-native" ||
+    session.labels?.["omnigent.wrapper"] === "codex-native-ui";
+  const settingsSupported = !nativeSession || session.sideChatSettingsSupported === true;
+  const settingsParentId = nativeSide && !draft ? sourceId : null;
+  const healthSessions = useMemo(
+    () => (settingsParentId ? [{ id: settingsParentId }] : []),
+    [settingsParentId],
+  );
+  const runnerHealth = useRunnerHealthRegistration(healthSessions);
+  const runnerOnline = settingsParentId ? runnerHealth.get(settingsParentId) : undefined;
+  useEffect(() => {
+    // The parent runner can reconnect without interrupting the child's browser stream.
+    if (runnerOnline !== undefined) {
+      void queryClient.invalidateQueries({ queryKey: ["session", session.id] });
+    }
+  }, [queryClient, session.id, runnerOnline]);
   const { session: parent } = useSession(sourceId);
+  const parentState = useConversationEntryState(nativeSide ? sourceId : null);
   const families = useHarnessEffortFamilies();
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -83,8 +99,12 @@ export function SideChatSettings({
     },
   });
   const catalogs = [state.codexModelOptions, session.codexModelOptions];
+  if (nativeSide) catalogs.push(parentState.codexModelOptions, parent?.codexModelOptions);
+  const capabilities = nativeSide
+    ? { ...session, labels: { ...session.labels, "omnigent.wrapper": "codex-native-ui" } }
+    : session;
   const sessionOptions = catalogs.find((catalog) => catalog?.length) ?? [];
-  const kind = modelPickerKindForConv(session, sessionOptions);
+  const kind = modelPickerKindForConv(capabilities, sessionOptions);
   const probeHarness =
     kind === "codex" || kind === "claude" || kind === "devin" ? `${kind}-native` : null;
   const { data: hostOptions } = useHostModelOptions(
@@ -108,24 +128,25 @@ export function SideChatSettings({
     reportedModel;
   const fusionModel =
     kind === "devin" && isFusionModelUid(model) ? fusionOption(options) : undefined;
-  const selectedModel = fusionModel ?? findNativeModelOption(options, model);
+  const selectedModel = fusionModel ?? findModelLabelOption(options, model);
   const nativeAgent =
     nativeCodingAgentForHarness(session.harness) ??
     (kind ? nativeCodingAgentForHarness(`${kind}-native`) : undefined);
   const harnessLabel = nativeAgent?.displayName ?? session.agentName ?? "Session";
-  const modelLabel =
-    (fusionModel ? formatStatusModelLabel(model, options) : null) ??
-    (selectedModel ? nativeModelLabel(selectedModel) : null) ??
-    model ??
-    defaultModelLabel(options);
+  const modelLabel = formatStatusModelLabel(model, options) ?? defaultModelLabel(options);
   const effort =
     draft?.settings?.reasoningEffort !== undefined
       ? draft.settings.reasoningEffort
       : (session.reasoningEffort ?? null);
-  const supportsEffort = shouldShowEffortPicker(session, family);
-  const efforts = supportsEffort ? effortLevelsForConv(session, options, model, family) : [];
+  const supportsEffort = shouldShowEffortPicker(capabilities, family);
+  const efforts = supportsEffort ? effortLevelsForConv(capabilities, options, model, family) : [];
   const showModels = kind !== null && options.length > 0;
-  if (!settingsSupported || (!showModels && efforts.length === 0)) return null;
+  if (
+    !settingsSupported ||
+    (nativeSession && (!nativeSide || draft)) ||
+    (!showModels && efforts.length === 0)
+  )
+    return null;
   const disabled =
     saving ||
     draft?.disabled ||
@@ -168,7 +189,7 @@ export function SideChatSettings({
                       ? currentFusionCombo(option.fusion, model ?? "").modelUid
                       : option.id;
                     const nextEfforts = supportsEffort
-                      ? effortLevelsForConv(session, options, nextModel, family)
+                      ? effortLevelsForConv(capabilities, options, nextModel, family)
                       : [];
                     const nextEffort = effortAfterModelChange(effort, nextEfforts);
                     void save({
@@ -179,6 +200,7 @@ export function SideChatSettings({
                     });
                   },
                   data: { "data-model-id": option.id },
+                  modelOption: option,
                 })),
               }
             : undefined

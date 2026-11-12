@@ -254,8 +254,11 @@ def test_cancelled_claude_probe_kills_descendants(
         bin_dir / "claude",
         """import os, subprocess, sys, time
 child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
-with open(os.environ['CHILD_PID_PATH'], 'w') as stream:
+pid_path = os.environ['CHILD_PID_PATH']
+# Publish atomically so the polling test never reads a created-but-empty file.
+with open(pid_path + '.tmp', 'w') as stream:
     stream.write(str(child.pid))
+os.replace(pid_path + '.tmp', pid_path)
 time.sleep(60)
 """,
     )

@@ -225,20 +225,32 @@ def test_record_then_snapshot_preserves_order_and_content() -> None:
     assert snap[1]["content"] == [_text_block("second")]
 
 
-def test_snapshot_returns_deep_copies() -> None:
+@pytest.mark.parametrize("content_source", ["enqueue", "snapshot", "held_drain"])
+def test_snapshot_returns_deep_copies(content_source: str) -> None:
     """
-    Mutating a snapshot entry must not corrupt the stored content.
+    Mutating caller-owned or returned content must not corrupt the queue.
 
     The snapshot is serialized onto the wire; a shallow copy would let
     a caller's mutation leak back into the index and poison a later
     replay. Asserts the stored content is unchanged after mutation.
     """
-    pending_inputs.record("conv_a", [_text_block("orig")])
-    snap = pending_inputs.snapshot_for("conv_a")
-    snap[0]["content"][0]["text"] = "mutated"
+    content = [_text_block("orig"), {"type": "input_image", "file_id": "file_original"}]
+    pending_id = pending_inputs.record("conv_a", content)
+    if content_source == "snapshot":
+        content = pending_inputs.snapshot_for("conv_a")[0]["content"]
+    elif content_source == "held_drain":
+        pending = pending_inputs.resolve_oldest("conv_a", hold=True)
+        assert pending is not None
+        content = pending.content
+    content[0]["text"] = "mutated"
+    content[1]["file_id"] = "file_replaced"
+    content.append(_text_block("added later"))
 
     # Re-read: the index still holds the original text, not "mutated".
-    assert pending_inputs.snapshot_for("conv_a")[0]["content"] == [_text_block("orig")]
+    expected = [_text_block("orig"), {"type": "input_image", "file_id": "file_original"}]
+    assert pending_inputs.snapshot_for("conv_a")[0]["content"] == expected
+    drained = pending_inputs.resolve("conv_a", pending_id)
+    assert drained is not None and drained.content == expected
 
 
 def test_resolve_oldest_drains_fifo_and_returns_entry() -> None:
@@ -1110,3 +1122,49 @@ def test_interrupted_entries_expire_with_the_ttl(monkeypatch: pytest.MonkeyPatch
 
     clock["t"] = 1000.0 + pending_inputs._TTL_S + 0.1
     assert pending_inputs.pending_ids("conv_a") == []
+
+
+@pytest.mark.parametrize("command", ["/probe-cmd", "!git status", "exit", "QUIT", ":wq"])
+def test_queued_command_recorded_after_a_plain_follow_up_is_not_lost(command: str) -> None:
+    """
+    A command queued before a plain prompt can be recorded after it, or never.
+
+    Claude folds the plain prompt in at the next tool call but holds a "/" or
+    "!" command until the turn ends; an exit word quits without a record. So
+    the older entry is not known lost.
+    """
+    pending_inputs.record("conv", [_text_block(command)], stable_id="a" * 32)
+    pending_inputs.record("conv", [_text_block("plain follow-up")], stable_id="b" * 32)
+
+    match = pending_inputs.resolve_matching_text("conv", "plain follow-up", claude_commands=True)
+
+    assert match.matched is not None
+    assert match.skipped == []
+    [uncertain] = match.uncertain
+    assert uncertain.content == [_text_block(command)]
+
+
+@pytest.mark.parametrize(
+    ("older", "claude_commands"),
+    [
+        ("first plain", True),
+        ("exit the loop early", True),
+        # Only Claude Code runs these itself; another harness records them in order.
+        ("!git status", False),
+        ("exit", False),
+    ],
+)
+def test_queued_plain_prompt_recorded_after_a_later_one_is_still_lost(
+    older: str, claude_commands: bool
+) -> None:
+    """A plain older entry jumped over is still reported as lost."""
+    pending_inputs.record("conv", [_text_block(older)], stable_id="a" * 32)
+    pending_inputs.record("conv", [_text_block("second plain")], stable_id="b" * 32)
+
+    match = pending_inputs.resolve_matching_text(
+        "conv", "second plain", claude_commands=claude_commands
+    )
+
+    [skipped] = match.skipped
+    assert skipped.content == [_text_block(older)]
+    assert match.uncertain == []

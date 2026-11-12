@@ -19,11 +19,15 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
 )
 from tests.harnesses.codex_native.session._support import (
+    _agent_message_event,
+    _capture_handler,
+    _completed_event,
     _elicitation_tracker,
     _expected_status_data,
     _FakeCodexAppServerClient,
     _forwarder_context,
     _recording_forwarder_client,
+    _started_event,
     _usage_coalescer,
     _write_forwarder_bridge,
 )
@@ -321,10 +325,15 @@ def test_supervise_forwarder_subscribes_without_replaying_dead_letters(
     asyncio.run(run())
 
     assert fake_client.requests == [
-        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
+        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
+        ("thread/goal/get", {"threadId": "thread_123"}),
+        ("thread/backgroundTerminals/list", {"threadId": "thread_123"}),
     ]
     assert fake_client.closed
-    assert ap_requests == []
+    # Only the startup background-work sync reaches the server; no dead letter is replayed.
+    assert [json.loads(request.content)["type"] for request in ap_requests] == [
+        "external_background_work"
+    ]
     assert (tmp_path / "dead_letter.jsonl").exists()
 
 
@@ -371,9 +380,150 @@ def test_supervise_forwarder_resumes_when_it_opens_client(
 
     assert fake_client.connected
     assert fake_client.requests == [
-        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
+        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
+        ("thread/goal/get", {"threadId": "thread_123"}),
+        ("thread/backgroundTerminals/list", {"threadId": "thread_123"}),
     ]
     assert fake_client.closed
+
+
+@pytest.mark.parametrize(
+    ("failure_source", "close_fails"),
+    [
+        ("subscriber", False),
+        ("side_chat", False),
+        ("mcp_timer", False),
+        ("event_stream", False),
+        ("cancellation", False),
+        ("event_stream", True),
+        ("cancellation", True),
+        ("subscriber", True),
+        ("none", True),
+    ],
+)
+async def test_supervise_forwarder_finishes_cleanup_after_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_source: str, close_fails: bool
+) -> None:
+    """Shutdown drains resources without replacing the original failure or cancellation."""
+    failure = (
+        asyncio.CancelledError("synthetic cancellation")
+        if failure_source == "cancellation"
+        else TypeError("synthetic forwarder failure")
+    )
+    background_failure = ValueError("synthetic secondary background failure")
+    close_failure = RuntimeError("synthetic close failure")
+    child_ready = asyncio.Event()
+    side_chat_started = asyncio.Event()
+    timer_started = asyncio.Event()
+    tasks: list[asyncio.Task[Any]] = []
+    states: list[codex_native_forwarder._CodexForwarderState] = []
+    http_clients: list[httpx.AsyncClient] = []
+
+    async def subscribe(
+        _client: object,
+        ap_client: httpx.AsyncClient,
+        *,
+        forwarder_state: codex_native_forwarder._CodexForwarderState,
+        **_kwargs: object,
+    ) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        tasks.append(task)
+        states.append(forwarder_state)
+        http_clients.append(ap_client)
+        stream = forwarder_state.child_stream(ap_client, "thread_child", "conv_child")
+        await stream.delta_coalescer.append("synthetic child output", message_id="child-message")
+        worker = stream.delta_coalescer._worker_task
+        assert worker is not None
+        tasks.append(worker)
+        child_ready.set()
+        if failure_source == "subscriber":
+            raise failure
+        if failure_source in {"event_stream", "cancellation"}:
+            raise background_failure
+        await asyncio.Event().wait()
+
+    async def drive_side_chat(*_args: object, **_kwargs: object) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        tasks.append(task)
+        await child_ready.wait()
+        side_chat_started.set()
+        if failure_source == "side_chat":
+            raise failure
+        await asyncio.Event().wait()
+
+    async def settle_mcp() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        tasks.append(task)
+        await side_chat_started.wait()
+        timer_started.set()
+        if failure_source == "mcp_timer":
+            raise failure
+        await asyncio.Event().wait()
+
+    async def seed_mcp(*_args: object, **_kwargs: object) -> asyncio.Task[None]:
+        return asyncio.create_task(settle_mcp())
+
+    class Client(_FakeCodexAppServerClient):
+        async def iter_events(self) -> Any:
+            await timer_started.wait()
+            if failure_source in {"event_stream", "cancellation"}:
+                raise failure
+            for event in self.events:
+                yield event
+
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    monkeypatch.setattr(codex_native_forwarder, "_subscribe_until_ready", subscribe)
+    monkeypatch.setattr(codex_native_forwarder, "_drive_side_chat_requests", drive_side_chat)
+    monkeypatch.setattr(codex_native_forwarder, "_seed_mcp_startup_round", seed_mcp)
+    if close_fails:
+        usage_close = codex_native_forwarder._SessionUsageCoalescer.close
+
+        async def fail_usage_close(
+            coalescer: codex_native_forwarder._SessionUsageCoalescer,
+        ) -> None:
+            await usage_close(coalescer)
+            raise close_failure
+
+        monkeypatch.setattr(
+            codex_native_forwarder._SessionUsageCoalescer, "close", fail_usage_close
+        )
+    client = Client()
+    expected_failure = close_failure if failure_source == "none" else failure
+    try:
+        with pytest.raises(type(expected_failure)) as raised:
+            await codex_native_forwarder.supervise_forwarder(
+                base_url="http://127.0.0.1:1",
+                headers={},
+                session_id="conv_123",
+                bridge_dir=tmp_path,
+                app_server_url=str(tmp_path / "app-server.sock"),
+                thread_id="thread_123",
+                client=client,  # type: ignore[arg-type]
+                ap_transport=httpx.MockTransport(handler),
+            )
+
+        assert raised.value is expected_failure
+        assert all(task.done() for task in tasks)
+        assert not states[0].child_streams
+        assert client.closed
+        assert http_clients[0].is_closed
+        assert any(
+            event["type"] == "external_output_text_delta"
+            and event["data"]["delta"] == "synthetic child output"
+            for event in posted
+        )
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @pytest.mark.parametrize(
@@ -701,7 +851,10 @@ def _replay_then_live_user_posts(
 
     asyncio.run(run())
 
-    assert fake_client.requests == [("thread/resume", {"threadId": "thread_123"})]
+    assert fake_client.requests == [
+        ("thread/resume", {"threadId": "thread_123"}),
+        ("thread/goal/get", {"threadId": "thread_123"}),
+    ]
     return [
         payload
         for payload in posted
@@ -1146,3 +1299,170 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.thread_id == "thread_after_signin"
+
+
+class _FreshThreadRaceClient(_FakeCodexAppServerClient):
+    """App-server double for the fresh-thread resume race.
+
+    A freshly created thread has no rollout, so the first ``thread/resume``
+    fails and the subscribe task parks. The thread's first turn then starts
+    live, releasing the park; the retry ``thread/resume`` lands inside the
+    MCP-startup window, where Codex returns the still-running *just-started*
+    turn with a terminal status (``active_turn_present=false``).
+    """
+
+    def __init__(self, resume_turn_status: str) -> None:
+        super().__init__()
+        self.resume_turn_status = resume_turn_status
+        self._resume_calls = 0
+        self.resume_backfill_decided = asyncio.Event()
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method != "thread/resume":
+            return {"result": {}}
+        self._resume_calls += 1
+        if self._resume_calls == 1:
+            raise RuntimeError(
+                "{'code': -32600, 'message': 'no rollout found for thread id thread_123'}"
+            )
+        # Codex returns the just-started turn as terminal under
+        # active_turn_present=false; the forwarder keys off turn status.
+        return {
+            "result": {
+                "active_turn_present": False,
+                "thread": {
+                    "id": "thread_123",
+                    "turns": [{"id": "turn_abc", "status": self.resume_turn_status, "items": []}],
+                },
+            }
+        }
+
+    def is_subscribed_to_thread(self, _thread_id: str) -> bool:
+        return self._resume_calls >= 2
+
+    async def iter_events(self):
+        yield _started_event("turn_abc")
+        # Deliver the live turn end only after the resume terminal-status
+        # decision has actually run, so ordering is deterministic without a
+        # magic scheduler-pass count or wall-clock wait.
+        await self.resume_backfill_decided.wait()
+        yield _agent_message_event("turn_abc", "item_agent", "the real worker answer")
+        yield _completed_event("turn_abc", thread_id="thread_123")
+
+
+@pytest.mark.parametrize("resume_turn_status", ["completed", "interrupted", "cancelled"])
+def test_supervise_forwarder_resume_does_not_finish_a_just_started_turn(
+    resume_turn_status: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resume metadata must not finish a live turn before its real output.
+
+    The forwarder observes this turn's live start and real completion, so the
+    fresh-thread retry ``thread/resume`` reporting it terminal must not publish
+    a premature ``idle``; the real end delivers the result instead.
+    """
+    _write_forwarder_bridge(tmp_path, active_turn_id=None, thread_id="thread_123")
+    client = _FreshThreadRaceClient(resume_turn_status)
+    # Signal iter_events once the resume terminal-status decision has run.
+    original_post = codex_native_forwarder._post_resume_turn_status
+
+    async def _tracked_post(*args: Any, **kwargs: Any) -> None:
+        try:
+            await original_post(*args, **kwargs)
+        finally:
+            client.resume_backfill_decided.set()
+
+    monkeypatch.setattr(codex_native_forwarder, "_post_resume_turn_status", _tracked_post)
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        await codex_native_forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:8000",
+            headers={},
+            session_id="conv_123",
+            bridge_dir=tmp_path,
+            app_server_url=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            client=client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(_capture_handler(posted)),
+        )
+
+    asyncio.run(asyncio.wait_for(run(), timeout=30))
+
+    status_edges = [
+        (index, payload["data"].get("status"))
+        for index, payload in enumerate(posted)
+        if payload.get("type") == "external_session_status"
+        and payload["data"].get("response_id") == "codex_turn_abc"
+    ]
+    first_output_index = next(
+        (
+            index
+            for index, payload in enumerate(posted)
+            if payload.get("type") in ("external_conversation_item", "external_output_text_delta")
+            and "turn_abc" in json.dumps(payload.get("data", {}))
+        ),
+        None,
+    )
+
+    assert first_output_index is not None, "the live turn's real output was never delivered"
+    idle_before_output = [
+        index for index, status in status_edges if status == "idle" and index < first_output_index
+    ]
+    assert not idle_before_output, (
+        "forwarder reported the turn idle before it produced any output "
+        f"(premature thread/resume terminal edge for a still-live turn); "
+        f"status edges={status_edges} first_output_index={first_output_index}"
+    )
+    idle_after_output = [
+        index for index, status in status_edges if status == "idle" and index > first_output_index
+    ]
+    assert idle_after_output, (
+        "forwarder never reported the turn idle after its real output "
+        "(the live turn/completed terminal edge must still finish the turn); "
+        f"status edges={status_edges} first_output_index={first_output_index}"
+    )
+
+
+def test_resume_terminal_status_closes_only_the_recovered_turn(
+    tmp_path: Path,
+) -> None:
+    """A reconnect must not close a newer turn that started live during recovery.
+
+    While recovering a persisted interrupted turn (``replay_from_turn_id``), a
+    newer turn can start live and advance ``active_turn_id``. If that newer turn
+    also appears terminal in the resume payload (the same MCP-startup artifact),
+    the forwarder must not publish its terminal edge or clear its active id: the
+    live event stream still owns it. Backfill closes only the recovered turn.
+    """
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_new", thread_id="thread_123")
+    turns = [
+        {"id": "turn_old", "status": "completed", "items": []},
+        {"id": "turn_new", "status": "completed", "items": []},
+    ]
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with _recording_forwarder_client(posted) as client:
+            await codex_native_forwarder._replay_resume_response(
+                client,
+                **_forwarder_context(client, tmp_path),
+                response={"result": {"thread": {"id": "thread_123", "turns": turns}}},
+                replay_from_turn_id="turn_old",
+            )
+
+    asyncio.run(run())
+
+    status_edges = [
+        payload for payload in posted if payload.get("type") == "external_session_status"
+    ]
+    assert not status_edges, (
+        "forwarder closed a newer live turn from resume metadata while "
+        f"recovering turn_old; posted={posted}"
+    )
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == "turn_new", (
+        "recovering turn_old must not clear the newer live turn's active id"
+    )

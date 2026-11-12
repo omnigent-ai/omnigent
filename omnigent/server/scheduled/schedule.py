@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -59,13 +60,43 @@ def sandbox_host_id(task_id: str, workspace_id: int, trigger_key: str) -> str:
     return uuid.uuid5(uuid.UUID(task_id), f"{workspace_id}:{trigger_key}").hex
 
 
+def continued_sandbox_host_id(task_id: str, workspace_id: int) -> str:
+    """The one sandbox identity every run of a task that continues a session uses.
+
+    Derived only from fields no task edit changes, so every run routes to the
+    replica holding that sandbox's connection, and a session reset keeps it.
+    """
+    return uuid.uuid5(uuid.UUID(task_id), f"{workspace_id}:continue").hex
+
+
 def occurrence_host_id(task: ScheduledTask, trigger_key: str) -> str | None:
-    """Pin a host, or derive a fresh sandbox identity from tenant, task and occurrence."""
+    """Pin a host, or derive the occurrence's sandbox identity from tenant and task."""
     if task.execution_target != "managed_sandbox":
         return task.host_id
+    if task.session_mode == "continue":
+        return continued_sandbox_host_id(task.id, task.workspace_id)
     return sandbox_host_id(task.id, task.workspace_id, trigger_key)
 
 
 def host_ownership_key(workspace_id: int, host_id: str | None) -> str:
     """Key a replica's ownership check by host, or by workspace for a task with no host."""
     return host_id if host_id is not None else str(workspace_id)
+
+
+# A task doesn't record its template, so, like the web form (``isTriggerPrompt`` in
+# web/src/components/scheduled/triggerTemplates.ts), recognize the opening sentence.
+_TRIGGER_PROMPT_OPENINGS = tuple(
+    f"This automation watches {source} and starts one Omnigent session"
+    for source in ("Jira", "Slack", "GitHub", "Linear", "PagerDuty")
+)
+# A trigger form can save its state as the prompt's first line, before the opening sentence.
+_TRIGGER_HEADER = re.compile(r"<!-- omnigent-trigger v\d+ [^\n]* -->\n")
+
+
+def is_trigger_automation(task: ScheduledTask) -> bool:
+    """Whether a task was set up from a trigger template and polls for new items."""
+    if task.session_mode != "continue":
+        return False
+    header = _TRIGGER_HEADER.match(task.prompt)
+    body = task.prompt[header.end() :] if header else task.prompt
+    return body.startswith(_TRIGGER_PROMPT_OPENINGS)

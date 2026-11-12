@@ -36,7 +36,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native import owner_claim
 from omnigent.process_logging import redact_log_text
 from omnigent.runner.identity import strip_runner_auth_secrets
-from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
+from omnigent.util.tmux_compat import tmux_unavailable_reason
 
 if TYPE_CHECKING:
     from omnigent.terminals.program_status import ProgramStatusReader
@@ -382,6 +382,16 @@ def _tmux_process_start_error(cmd: list[str], exc: OSError) -> RuntimeError:
         return _TmuxProcessStartError(detail)
     return RuntimeError(detail)
 
+
+# has-session stderr when tmux answered but the session no longer exists, or when
+# the socket is still there but its server is gone (``kill-server``, ``killall tmux``).
+_TMUX_SESSION_KILLED_MARKERS = (
+    "no current target",
+    "can't find session",
+    "session not found",
+    "no such session",
+    "no server running on",
+)
 
 # Unrecognized failures leave liveness unknown and are retried.
 _TMUX_TARGET_GONE_STDERR_MARKERS = (
@@ -830,25 +840,9 @@ class TmuxUnavailableError(OmnigentError, RuntimeError):
 
 def _require_supported_tmux() -> None:
     """Fail before terminal setup when tmux is missing, unknown, or too old."""
-    tmux = shutil.which("tmux")
-    if tmux is None:
-        raise TmuxUnavailableError(
-            "tmux is not installed or not on PATH. Native terminals need tmux "
-            f"{MIN_TMUX_VERSION_HINT} or newer: install it (macOS: `brew install tmux`), "
-            "or restart the Omnigent host from a shell where `tmux -V` works."
-        )
-    version = tmux_version(tmux)
-    if version is None:
-        raise TmuxUnavailableError(
-            "Could not determine the installed tmux version; managed terminals require "
-            f"tmux {MIN_TMUX_VERSION_HINT} or newer"
-        )
-    if version < MIN_TMUX_VERSION:
-        detected = f"{version[0]}.{version[1]}"
-        raise TmuxUnavailableError(
-            f"tmux {detected} is too old; managed terminals require "
-            f"tmux {MIN_TMUX_VERSION_HINT} or newer"
-        )
+    reason = tmux_unavailable_reason()
+    if reason is not None:
+        raise TmuxUnavailableError(reason)
 
 
 def _process_alive(pid: int) -> bool:
@@ -1499,6 +1493,17 @@ class TerminalInstance:
     def last_exit_signal(self) -> str | None:
         """Return tmux's observed signal, without attributing who sent it."""
         return self._last_exit_signal
+
+    def session_killed_by_tmux(self) -> bool:
+        """Whether tmux reported this terminal's session, or its whole server, gone.
+
+        With ``keep_alive_after_exit`` an inner-CLI exit leaves a dead pane, so a
+        missing session or server means a tmux kill command (or a killed tmux) ended it.
+        """
+        error = (self._last_session_probe_error or "").lower()
+        return self.keep_alive_after_exit and any(
+            marker in error for marker in _TMUX_SESSION_KILLED_MARKERS
+        )
 
     def _remember_exit_status(self, fields: str) -> None:
         """Record the exit code from a ``#{pane_dead} #{pane_dead_status}`` row.

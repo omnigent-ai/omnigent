@@ -1187,13 +1187,89 @@ def test_assistant_delivery_failure_is_reported_and_400_is_not_retried(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("kind", ["tool_call", "tool_result", "reasoning", "user"])
+@pytest.mark.parametrize(
+    "path", ["interactive", "extension", "queued-without-input", "expanded-template"]
+)
+def test_terminal_prompts_appear_in_chat_exactly_once(tmp_path: Path, path: str) -> None:
+    """A prompt appears once whether Pi fired ``input``, skipped it, or expanded the text."""
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const path = process.argv[3];
+  const typed = path === 'expanded-template' ? '/review same prompt' : 'same prompt';
+  const consumed = 'same prompt';
+  const hasInputEvent = path !== 'queued-without-input';
+  const source = path === 'extension' ? 'extension' : 'interactive';
+  for (let timestamp = 1; timestamp <= 2; timestamp++) {
+    if (hasInputEvent) await handlers.input({text: typed, source}, ctx);
+    const message = {role: 'user', timestamp, content: [{type: 'text', text: consumed}]};
+    await handlers.message_start({message}, ctx);
+    await handlers.message_end({message}, ctx);
+  }
+  // Assistant starts never create user bubbles.
+  await handlers.message_start({message: {role: 'assistant',
+    content: [{type: 'text', text: 'answer'}]}}, ctx);
+  await handlers.session_shutdown();
+  const users = posted.filter(event => event.type === 'external_conversation_item' &&
+    event.data.item_data.role === 'user');
+  assert.equal(users.length, 2, 'every prompt must appear exactly once');
+  assert.deepEqual(users.map(event => event.data.item_data.content), [
+    [{type: 'input_text', text: typed}],
+    [{type: 'input_text', text: typed}],
+  ]);
+  assert.notEqual(users[0].data.source_id, users[1].data.source_id);
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), path)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_unconsumed_prompts_reset_when_pi_goes_idle(tmp_path: Path) -> None:
+    """A prompt Pi accepted but never consumed must not hide a later prompt."""
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  // Accepted, then discarded from Pi's queue (or handled as an extension command).
+  await handlers.input({text: 'discarded prompt', source: 'interactive'}, ctx);
+  await handlers.agent_start({}, ctx);
+  await handlers.agent_end({}, ctx);
+  await handlers.message_start({message: {role: 'user',
+    content: [{type: 'text', text: 'later prompt'}]}}, ctx);
+  // A queued follow-up at agent_end is still pending, so it is not forgotten.
+  await handlers.input({text: 'queued follow-up', source: 'interactive'}, ctx);
+  await handlers.agent_start({}, ctx);
+  ctx.hasPendingMessages = () => true;
+  await handlers.agent_end({}, ctx);
+  await handlers.message_start({message: {role: 'user',
+    content: [{type: 'text', text: 'queued follow-up'}]}}, ctx);
+  await handlers.session_shutdown();
+  const users = posted.filter(event => event.type === 'external_conversation_item' &&
+    event.data.item_data.role === 'user').map(event => event.data.item_data.content[0].text);
+  assert.deepEqual(users, ['discarded prompt', 'later prompt', 'queued follow-up']);
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("kind", ["tool_call", "tool_result", "reasoning", "user", "compaction"])
 def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) -> None:
     script = (
         _ASSISTANT_DURABILITY_HARNESS
         + r"""
 (async () => {
   const kind = process.argv[3];
+  ctx.sessionManager = {
+    getSessionId: () => "native-1",
+    buildSessionProjection: () => ({
+      entries: [{ sourceEntry: { type: "compaction", id: "boundary", summary: "checkpoint" } }],
+      messages: [{ role: "compactionSummary", summary: "checkpoint", tokensBefore: 100 }],
+    }),
+  };
   const events = {
     tool_call: ["message_update", { assistantMessageEvent: {
       type: "toolcall_end", toolCall: { id: "call-1", name: "read", arguments: { path: "a" } },
@@ -1205,6 +1281,7 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
       type: "thinking_end", contentIndex: 0, content: "plan",
     } }],
     user: ["input", { text: "terminal prompt", source: "extension" }],
+    compaction: ["session_compact", {}],
   };
   if (kind === "tool_result") {
     await handlers.message_update(events.tool_call[1], ctx);
@@ -1224,6 +1301,9 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
   await settleHistory();
   assert.match(diagnostics.join("\n"), /Failed to persist.*HTTP 503/);
   assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
+  assert.deepEqual(
+    notices, kind === "compaction" ? ["Omnigent could not save the compaction checkpoint."] : [],
+  );
   let items = posted.filter((body) => body.type === "external_conversation_item");
   assert.equal(items.length, 5);
   assert.ok(items[0].data.source_id);
@@ -1234,7 +1314,8 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
   await settleHistory();
   items = posted.filter((body) => body.type === "external_conversation_item");
   assert.equal(items.length, 6);
-  if (kind !== "user") {
+  if (kind === "compaction") assert.equal(items[5].data.source_id, items[0].data.source_id);
+  if (kind !== "user" && kind !== "compaction") {
     // A rejected delivery remains eligible; accepted callbacks are suppressed.
     assert.deepEqual(items[0], items[5]);
     await invoke();
@@ -1249,6 +1330,214 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path), kind)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("receipt", ["valid", "unreadable", "absent", "timeout"])
+def test_compaction_snapshot_orders_history_and_tolerates_receipts(
+    tmp_path: Path, receipt: str
+) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const receiptMode = process.argv[3];
+  const messages = [
+    { role: "system", content: "", sections: {tools: "read"} },
+    { role: "compactionSummary", summary: "checkpoint", tokensBefore: 9000 },
+    { role: "branchSummary", summary: "branch work", fromId: "branch-1" },
+    { role: "user", content: [
+      {type: "text", text: "look"}, {type: "image", data: "SU1BR0U=", mimeType: "image/png"},
+    ] },
+    { role: "custom", customType: "note", content: "extension note", display: true },
+    { role: "assistant", content: [
+      { type: "thinking", thinking: "hidden reasoning" },
+      { type: "text", text: "reading" },
+      { type: "toolCall", id: "read-1", name: "read", arguments: {path: "a"} },
+    ] },
+    { role: "toolResult", toolCallId: "read-1", toolName: "read",
+      content: [{type: "text", text: "retained result"}] },
+    { role: "bashExecution", command: "ls", output: "in context", exitCode: 0 },
+    { role: "bashExecution", command: "make", output: "", exitCode: 2 },
+    { role: "bashExecution", command: "sleep 9", output: "partial", exitCode: null,
+      cancelled: true },
+    { role: "bashExecution", command: "cat big", output: "head", exitCode: 0, truncated: true,
+      fullOutputPath: "/tmp/full.log" },
+    { role: "bashExecution", command: "cat .env", output: "excluded", excludeFromContext: true },
+  ];
+  const userText = (text) => ({
+    type: "message", role: "user", content: [{type: "input_text", text}],
+  });
+  const expectedSnapshot = [
+    userText(
+      "The conversation history before this point was compacted into the following summary:" +
+      "\n\n<summary>\ncheckpoint\n</summary>",
+    ),
+    userText(
+      "The following is a summary of a branch that this conversation came back from:" +
+      "\n\n<summary>\nbranch work</summary>",
+    ),
+    userText("look"),
+    userText("extension note"),
+    { type: "message", role: "assistant", content: [{type: "output_text", text: "reading"}] },
+    { type: "function_call", call_id: "read-1", name: "read", arguments: '{"path":"a"}' },
+    { type: "function_call_output", call_id: "read-1", output: "retained result" },
+    userText("Ran `ls`\n```\nin context\n```"),
+    userText("Ran `make`\n(no output)\n\nCommand exited with code 2"),
+    userText("Ran `sleep 9`\n```\npartial\n```\n\n(command cancelled)"),
+    userText("Ran `cat big`\n```\nhead\n```\n\n[Output truncated. Full output: /tmp/full.log]"),
+  ];
+  ctx.sessionManager = {
+    getSessionId: () => "native-1",
+    buildSessionProjection: () => ({
+      entries: [{ sourceEntry: { type: "compaction", id: "latest", summary: "checkpoint" } }],
+      messages,
+    }),
+  };
+  let release;
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    posted.push(body);
+    if (body.data.item_type === "message") {
+      await new Promise(resolve => { release = resolve; });
+    }
+    const response = { ok: true, status: 200 };
+    if (receiptMode !== "absent") response.json = async () => {
+      if (receiptMode === "unreadable") throw new Error("receipt truncated after commit");
+      if (receiptMode === "timeout") await new Promise((_resolve, reject) => {
+        const fail = () => reject(new Error("receipt timed out"));
+        if (request.signal.aborted) return fail();
+        request.signal.addEventListener("abort", fail);
+      });
+      return { item_id: "persisted-user" };
+    };
+    return response;
+  };
+  await handlers.input({text: "covered input", source: "extension"}, ctx);
+  // Repeated summary text can make Pi's event point at an older checkpoint.
+  const compacting = handlers.session_compact(
+    {compactionEntry: {id: "old", summary: "checkpoint"}}, ctx,
+  );
+  messages[6].content[0].text = "later mutation";
+  assert.equal(posted.length, 1, "checkpoint cannot overtake pending history");
+  release();
+  await compacting;
+  assert.equal(posted.length, 2);
+  const compact = posted[1].data;
+  assert.equal(compact.item_type, "compaction");
+  assert.equal(compact.source_id, "pi:compaction:native-1:latest");
+  assert.equal(compact.item_data.window_id, "latest");
+  assert.equal(compact.item_data.summary, "checkpoint");
+  assert.equal(compact.item_data.last_item_id,
+    receiptMode === "valid" ? "persisted-user" : "compact_boundary_session-1");
+  assert.deepEqual(compact.item_data.compacted_messages, expectedSnapshot);
+  assert.deepEqual(retryDelays, []);
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(notices, []);
+  // After compaction Pi flushes the prompts it held back. The accepted prompt
+  // is consumed first and must not be persisted twice. The first flushed
+  // prompt arrives through ``input``; older Pi delivers the rest with
+  // steer()/followUp(), which never fire ``input``. Each must appear once,
+  // after the checkpoint, in consumption order.
+  const consume = (text) => handlers.message_start(
+    {message: {role: "user", content: [{type: "text", text}]}}, ctx,
+  );
+  await consume("covered input");
+  await settleHistory();
+  assert.equal(posted.length, 2, "an accepted prompt is not persisted again when consumed");
+  const items = () => posted.filter((event) => event.type === "external_conversation_item");
+  const releaseOnce = async (count) => {
+    while (items().length < count) await settleHistory();
+    release();
+  };
+  await handlers.input({text: "flushed via prompt", source: "interactive"}, ctx);
+  await releaseOnce(3);
+  await consume("flushed via prompt");
+  await consume("flushed via steer");
+  await releaseOnce(4);
+  await settleHistory();
+  const flushed = items().slice(2);
+  assert.deepEqual(
+    flushed.map((event) => [event.data.item_type, event.data.item_data.content[0].text]),
+    [["message", "flushed via prompt"], ["message", "flushed via steer"]],
+    JSON.stringify(posted.map((event) => [event.type, event.data && event.data.item_type])),
+  );
+  assert.notEqual(flushed[0].data.source_id, flushed[1].data.source_id);
+})().catch((error) => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), receipt)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "unsupported",
+        "projection_error",
+        "unreadable_message",
+        "no_checkpoint",
+        "session_id_error",
+        "stalled",
+    ],
+)
+def test_compaction_snapshot_failures_do_not_block_pi(tmp_path: Path, failure: str) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const failure = process.argv[3];
+  const projection = {
+    entries: [{ sourceEntry: { type: "compaction", id: "latest", summary: "checkpoint" } }],
+    messages: [{ role: "compactionSummary", summary: "checkpoint", tokensBefore: 1 }],
+  };
+  ctx.sessionManager = { getSessionId: () => {
+    if (failure === "session_id_error") throw new Error("session id unavailable");
+    return "native-1";
+  } };
+  if (failure === "no_checkpoint") projection.entries = [{ sourceEntry: { type: "message" } }];
+  if (failure !== "unsupported") {
+    ctx.sessionManager.buildSessionProjection = () => {
+      if (failure === "projection_error") throw new Error("projection failed");
+      return projection;
+    };
+  }
+  if (failure === "unreadable_message") {
+    projection.messages.push({ role: "custom", get content() { throw new Error("unreadable"); } });
+  }
+  let budgetWaits = 0;
+  if (failure === "stalled") {
+    global.fetch = async (_url, request) => {
+      posted.push(JSON.parse(request.body));
+      return new Promise(() => {});
+    };
+    await handlers.input({ text: "stuck input", source: "extension" }, ctx);
+    const harnessSetTimeout = global.setTimeout;
+    global.setTimeout = (callback, delay, ...args) => {
+      if (delay !== 30000) return harnessSetTimeout(callback, delay, ...args);
+      budgetWaits += 1;
+      queueMicrotask(() => callback(...args));
+      return {};
+    };
+  }
+  let guard;
+  await Promise.race([
+    handlers.session_compact({}, ctx),
+    new Promise((_resolve, reject) => {
+      guard = originalSetTimeout(() => reject(new Error("session_compact blocked Pi")), 2000);
+    }),
+  ]).finally(() => clearTimeout(guard));
+  const items = posted.filter((body) => body.type === "external_conversation_item");
+  const itemTypes = items.map((body) => body.data.item_type);
+  assert.deepEqual(itemTypes, failure === "stalled" ? ["message"] : []);
+  assert.equal(budgetWaits, failure === "stalled" ? 1 : 0);
+  const failed = failure !== "unsupported" && failure !== "stalled";
+  assert.deepEqual(notices, failed ? ["Omnigent could not save the compaction checkpoint."] : []);
+  if (failed) assert.match(diagnostics.join("\n"), /Compaction snapshot failed/);
+})().catch((error) => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), failure)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -3908,7 +4197,10 @@ def test_inbox_model_change_unknown_model_posts_error(tmp_path: Path) -> None:
     _run_extension_script(node, _extension_path(), script)
 
 
-def test_input_waits_for_inbox_model_change_to_settle(tmp_path: Path) -> None:
+@pytest.mark.parametrize("next_change", [None, "effort", "model"])
+def test_input_waits_for_inbox_model_change_to_settle(
+    tmp_path: Path, next_change: str | None
+) -> None:
     """A routed web turn runs on the routed model, not the old one.
 
     The executor queues ``model_change`` then ``user_message``; the poller
@@ -3922,25 +4214,46 @@ def test_input_waits_for_inbox_model_change_to_settle(tmp_path: Path) -> None:
 
     script = (
         _MODEL_SWITCH_HARNESS
+        + f"const nextChange = {json.dumps(next_change)};\n"
         + r"""
 (async () => {
   let committed = null;
+  let thinking = "off";
+  pi.setThinkingLevel = async (level) => {
+    await sleep(20);
+    thinking = committed ? level : "off";
+  };
   pi.setModel = async (model) => {
     setModelCalls.push(model);
     await sleep(150); // Pi's checkAuth before agent.state.model is set
     committed = model.id;
+    thinking = "off"; // Pi may restore the target model's own default.
     return true;
   };
   await handlers.session_start({}, ctx);
   const file = path.join(inboxDir, "000-model.json");
   fs.writeFileSync(
     file,
-    JSON.stringify({ id: "m1", type: "model_change", model: "databricks-claude-opus-4-1" }),
+    JSON.stringify({
+      id: "m1", type: "model_change",
+      model: "databricks-claude-opus-4-1", thinkingLevel: "medium",
+    }),
   );
+  if (nextChange) {
+    fs.writeFileSync(path.join(inboxDir, "001-settings.json"), JSON.stringify(
+      nextChange === "effort"
+        ? {id: "e2", type: "thinking_level_change", thinkingLevel: "high"}
+        : {id: "m2", type: "model_change",
+           model: "databricks-claude-sonnet-4-6", thinkingLevel: "low"}
+    ));
+  }
   while (fs.existsSync(file)) await sleep(10);
   assert.equal(committed, null); // still in flight
   await handlers.input({ text: "routed turn", source: "extension" }, ctx);
-  assert.equal(committed, "databricks-claude-opus-4-1");
+  assert.equal(committed, nextChange === "model"
+    ? "databricks-claude-sonnet-4-6" : "databricks-claude-opus-4-1");
+  assert.equal(thinking,
+    nextChange === "model" ? "low" : nextChange === "effort" ? "high" : "medium");
   finish();
 })().catch((error) => {
   finish();
@@ -4045,6 +4358,46 @@ def test_tui_prompt_route_turn_failure_fails_open(tmp_path: Path) -> None:
       (e) => e.type === "external_conversation_item" && e.data.item_data.role === "user",
     ),
   );
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_tui_prompt_is_mirrored_before_route_turn_settles(tmp_path: Path) -> None:
+    """Chat shows the prompt while turn routing is still in flight or hung."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  let routeCalls = 0;
+  global.fetch = async (url, request) => {
+    if (url.endsWith("/hooks/route-turn")) {
+      routeCalls += 1;
+      return new Promise(() => {});
+    }
+    posted.push(JSON.parse(request.body));
+    return { ok: true };
+  };
+  await handlers.session_start({}, ctx);
+  const pending = handlers.input({ text: "one", source: "interactive" }, ctx);
+  await new Promise(setImmediate);
+  assert.equal(routeCalls, 1);
+  const users = posted.filter(
+    (e) => e.type === "external_conversation_item" && e.data.item_data.role === "user",
+  );
+  assert.equal(users.length, 1, "the prompt must be mirrored before routing settles");
+  assert.deepEqual(users[0].data.item_data.content, [{ type: "input_text", text: "one" }]);
+  void pending;
   finish();
 })().catch((error) => {
   finish();

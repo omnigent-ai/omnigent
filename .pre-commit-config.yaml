@@ -12,6 +12,13 @@ default_install_hook_types: [pre-commit, pre-push]
 repos:
   - repo: local
     hooks:
+      - id: reference-policy
+        name: reference policy
+        language: system
+        entry: python3 dev/lint/lint_reference_policy.py
+        pass_filenames: false
+        always_run: true
+
       - id: ruff-check
         name: ruff check
         language: system
@@ -64,7 +71,7 @@ repos:
           bash -c '.venv/bin/python -m dev.lint.custom_lint &&
           node --test dev/lint/session_list_visibility.test.mjs'
         pass_filenames: false
-        files: \.(py|[cm]?[jt]sx?|sh)$|^(\.pre-commit-config\.yaml|\.github/.*\.ya?ml|pyproject\.toml|uv\.lock)$
+        files: \.(py|[cm]?[jt]sx?|sh)$|^(\.pre-commit-config\.yaml|\.github/.*\.ya?ml|pyproject\.toml|uv\.lock|dev/lint/sleep_then_assert_baseline\.json)$
 
       - id: web-prettier
         name: web prettier

@@ -46,6 +46,7 @@ class _PromptDeliveryTrace:
     attempts: list[dict[str, object]] = field(default_factory=list)
     input_attributes: dict[str, object] = field(default_factory=dict)
     tmux_failure: dict[str, object] = field(default_factory=dict)
+    readiness: dict[str, object] = field(default_factory=dict)
     input_guard: dict[str, object] = field(default_factory=dict)
 
 
@@ -75,6 +76,14 @@ def record_details(**attributes: object) -> None:
 
 
 @_best_effort
+def record_readiness(**attributes: object) -> None:
+    """Retain readiness-wait counters, which precede the first attempt."""
+    trace = _prompt_delivery_trace.get()
+    if trace is not None:
+        trace.readiness.update(attributes)
+
+
+@_best_effort
 def record_restore_observation(*, pane: str, surface: str | None) -> None:
     """Keep bounded restoration evidence even before a paste attempt exists."""
     trace = _prompt_delivery_trace.get()
@@ -87,6 +96,7 @@ def record_restore_observation(*, pane: str, surface: str | None) -> None:
         "an overlay": "overlay",
         "the prompt-history search": "history_search",
         "a draft taller than the terminal": "scrolled_draft",
+        "the detailed transcript view": "detailed_transcript",
     }.get(surface, "other")
     fields.setdefault("restore_first_surface", label)
     fields["restore_last_surface"] = label
@@ -101,7 +111,7 @@ def record_restore_observation(*, pane: str, surface: str | None) -> None:
 
 @_best_effort
 def record_restore_action(
-    action: Literal["escape", "shell_clear", "scrolled_draft_clear"],
+    action: Literal["escape", "shell_clear", "scrolled_draft_clear", "transcript_toggle"],
 ) -> None:
     trace = _prompt_delivery_trace.get()
     if trace is not None:
@@ -253,6 +263,7 @@ def trace_delivery(
                                 for stage, seconds in trace.stage_seconds.items()
                             },
                             **trace.tmux_failure,
+                            **trace.readiness,
                             **trace.input_guard,
                         }
                         if error_type is not None:

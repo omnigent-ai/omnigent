@@ -39,15 +39,20 @@ export interface ResolvedSetupStep {
 
 export type HarnessReadinessState = "available" | "unavailable" | "broken" | "setup-required";
 
+/** Oldest tmux native terminals accept (mirrors `MIN_TMUX_VERSION` in `omnigent/util/tmux_compat.py`). */
+export const MIN_TMUX_VERSION = "3.3";
+
 export type HarnessReadinessReason =
   | "ready"
   | "readiness-unknown"
   | "harness-unavailable"
   | "host-unavailable"
   | "binary-missing"
+  | "cli-unresponsive"
   | "needs-auth"
   | "unconfigured"
   | "version-too-low"
+  | "tmux-unavailable"
   | "readiness-error";
 
 export interface HarnessReadinessExplanation {
@@ -142,10 +147,26 @@ export function harnessReadinessOnHost(
       description: "Update this harness before starting a session with it.",
     });
   }
+  if (availability === "tmux-unavailable") {
+    return harnessReadinessResult("setup-required", "tmux-unavailable", true, {
+      label: "tmux is required",
+      description: `Install tmux ${MIN_TMUX_VERSION} or newer on the selected host, then check again.`,
+    });
+  }
   if (availability === "binary-missing") {
     return harnessReadinessResult("setup-required", "binary-missing", true, {
       label: "Harness is not installed",
       description: "Install this harness on the selected host before using it.",
+    });
+  }
+  // The host found the CLI but its version check timed out; the host still
+  // launches it, so warn without blocking selection.
+  if (availability === "cli-unresponsive") {
+    return harnessReadinessResult("available", "cli-unresponsive", false, {
+      label: "Harness CLI did not respond",
+      description:
+        "The selected host found this harness's CLI, but it did not answer a version check. " +
+        "Sessions may fail to start until the CLI responds.",
     });
   }
   if (availability === "needs-auth") {
@@ -216,6 +237,11 @@ export function isNativeCursorHarness(harness: string): boolean {
   return harness === "cursor-native" || harness === "native-cursor";
 }
 
+/** Whether *harness* is an OpenCode spelling (bare, native, or reversed). */
+export function isNativeOpenCodeHarness(harness: string): boolean {
+  return harness === "opencode-native" || harness === "native-opencode" || harness === "opencode";
+}
+
 /**
  * Why *harness* can't run on *host* right now, or ``null`` when it's ready
  * (or readiness is unknown / no host selected). Drives the picker "needs setup"
@@ -232,13 +258,15 @@ export function harnessUnavailableReasonOnHost(
     if (isCodexHarness(harness)) return "binary-missing";
     return "unconfigured";
   }
-  // Auth-aware CLI harnesses (codex, claude, opencode) report a structured
-  // string when installed-but-not-ready. "version-too-low" can surface for
-  // any CLI-backed harness whose binary is present but too old.
+  // Installed-but-not-ready CLI harnesses report a structured string;
+  // "version-too-low" and "cli-unresponsive" can surface for any CLI harness,
+  // and "tmux-unavailable" for a native harness on a host without a usable tmux.
   if (
     availability === "binary-missing" ||
+    availability === "cli-unresponsive" ||
     availability === "needs-auth" ||
-    availability === "version-too-low"
+    availability === "version-too-low" ||
+    availability === "tmux-unavailable"
   ) {
     return availability;
   }
@@ -291,6 +319,8 @@ export function harnessWarningBadgeText(reason: string | null, collapsed = false
   if (reason === "binary-missing") return "binary missing";
   if (reason === "needs-auth") return "needs auth";
   if (reason === "version-too-low") return "outdated";
+  if (reason === "cli-unresponsive") return "not responding";
+  if (reason === "tmux-unavailable") return "needs tmux";
   return "needs setup";
 }
 
@@ -380,8 +410,10 @@ export function harnessAuthableOnHost(
  * ``"needs-auth"`` (installed, not signed in), ``"binary-missing"`` / ``false``
  * (not installed). Each step's ``status_key`` says which sub-state it tracks:
  * ``"installed"`` is done once the binary is present (anything but not-installed);
- * ``"authed"`` is done only when fully ready. A ``null`` key isn't locally
- * determinable → ``"unknown"`` (informational).
+ * ``"authed"`` is done only when fully ready, or when the only thing missing is
+ * tmux (the host reports ``"tmux-unavailable"`` only for an otherwise ready
+ * harness). A ``null`` key isn't locally determinable → ``"unknown"``
+ * (informational).
  */
 function stepStatus(
   statusKey: string | null,
@@ -393,7 +425,9 @@ function stepStatus(
     availability === "binary-missing" ||
     availability === "version-too-low";
   if (statusKey === "installed") return notInstalled ? "todo" : "done";
-  if (statusKey === "authed") return availability === true ? "done" : "todo";
+  if (statusKey === "authed") {
+    return availability === true || availability === "tmux-unavailable" ? "done" : "todo";
+  }
   return "unknown";
 }
 
@@ -411,9 +445,9 @@ export function resolveSetupSteps(
   harness: string | null | undefined,
   host: Host | undefined | null,
 ): ResolvedSetupStep[] {
-  if (!serverSteps || !harness) return [];
+  if (!harness) return [];
   const availability = host?.configured_harnesses?.[harness];
-  const resolved = serverSteps.map((step) => ({
+  const resolved: ResolvedSetupStep[] = (serverSteps ?? []).map((step) => ({
     kind: step.kind,
     title: step.title,
     detail: step.detail,
@@ -422,6 +456,20 @@ export function resolveSetupSteps(
     status: stepStatus(step.status_key, availability),
     harness,
   }));
+  // tmux is a host prerequisite with no server step, so add it while it's the blocker.
+  if (availability === "tmux-unavailable") {
+    resolved.push({
+      kind: "tmux",
+      title: `Install tmux ${MIN_TMUX_VERSION} or newer`,
+      detail:
+        "Native terminals run in tmux on the host. On Linux, use your package manager. " +
+        "If Omnigent still can't find tmux after you install it, quit and reopen the Omnigent app.",
+      action: "command",
+      command: "brew install tmux",
+      status: "todo",
+      harness,
+    });
+  }
   // Drop steps whose status the host can't determine (status_key: null, e.g.
   // Pi/Qwen's credential step) WHEN there's a trackable step to anchor on.
   // Showing an untrackable step pre-install and then having it vanish once the

@@ -61,6 +61,7 @@ from typing import Any, Protocol, TypeAlias
 
 from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
+from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentStart, read_subagent_events
@@ -88,6 +89,13 @@ from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.process_logging import current_process_log_path, display_log_path
 
 logger = logging.getLogger(__name__)
+
+ACP_CANCEL_GRACE_SECONDS = 1.0
+_ACP_TERMINATION_TIMEOUT_SECONDS = 5.0
+_ACP_CLEANUP_HEADROOM_SECONDS = 1.0
+ACP_REAP_TIMEOUT_SECONDS = (
+    ACP_CANCEL_GRACE_SECONDS + _ACP_TERMINATION_TIMEOUT_SECONDS + _ACP_CLEANUP_HEADROOM_SECONDS
+)
 
 # ACP's JSON-RPC schema is agent-owned and extensible; consumers narrow fields
 # before use.
@@ -503,6 +511,8 @@ class AcpExecutor(Executor):
 
         self._rpc_id: int = 0
         self._pending: dict[int, asyncio.Future[_AcpJsonObject]] = {}
+        self._active_prompt_request_id: int | None = None
+        self._cancel_grace_deadline: float | None = None
 
         self._session_id: str | None = None
         self._initialized: bool = False
@@ -721,6 +731,26 @@ class AcpExecutor(Executor):
                 # check prevents a colliding request from mis-resolving our future.
                 if msg_id is not None and "method" not in msg and msg_id in self._pending:
                     fut = self._pending.pop(msg_id)
+                    if msg_id == self._active_prompt_request_id:
+                        # run_turn may already be cancelled when the response arrives.
+                        error = msg.get("error")
+                        if isinstance(error, dict):
+                            logger.debug(
+                                "acp[%s] session/prompt %s error code=%s message=%s",
+                                self._config.name,
+                                msg_id,
+                                error.get("code"),
+                                error.get("message"),
+                            )
+                        else:
+                            result = msg.get("result", {})
+                            reason = result.get("stopReason") if isinstance(result, dict) else None
+                            logger.debug(
+                                "acp[%s] session/prompt %s stopReason=%s",
+                                self._config.name,
+                                msg_id,
+                                reason,
+                            )
                     if not fut.done():
                         fut.set_result(msg)
                 else:
@@ -1424,6 +1454,10 @@ class AcpExecutor(Executor):
     def supports_streaming(self) -> bool:
         return True
 
+    def preserves_empty_initiating_message(self) -> bool:
+        """Keep the initiating item identity even when its ACP prompt is empty."""
+        return True
+
     def max_context_tokens(self) -> int | None:
         """Return the agent's reported context-window size, if observed yet."""
         return self._context_window
@@ -1831,6 +1865,9 @@ class AcpExecutor(Executor):
         ``session/request_permission`` mid-turn, until the final response
         (``stopReason``) arrives — then yields ``TurnComplete`` with usage.
 
+        Every prompt carries ``_meta["ai.omnigent/inputItemId"]``: the persisted
+        user item delivered by this turn, or null for synthetic/tool recovery.
+
         ``tools`` (Omnigent's builtin tool schemas) are captured for the Omnigent
         MCP relay set up at ``session/new`` — the agent still runs its OWN tools.
         When ``omnigent_mcp`` is ``False`` the relay is disabled, so the schemas
@@ -1884,6 +1921,8 @@ class AcpExecutor(Executor):
         user_text = ""
         image_blocks: list[_AcpJsonObject] = []
         latest_user_idx: int | None = None
+        candidate_id = messages[-1].get("input_item_id") if messages else None
+        input_item_id = candidate_id if isinstance(candidate_id, str) else None
         for idx in range(len(messages) - 1, -1, -1):
             msg = messages[idx]
             role = msg.get("role", "") if isinstance(msg, dict) else ""
@@ -1932,13 +1971,19 @@ class AcpExecutor(Executor):
         loop = asyncio.get_event_loop()
         fut: asyncio.Future[_AcpJsonObject] = loop.create_future()
         self._pending[req_id] = fut
+        self._active_prompt_request_id = req_id
+        self._cancel_grace_deadline = None
 
         await self._send(
             {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "method": _AGENT_METHOD_SESSION_PROMPT,
-                "params": {"sessionId": session_id, "prompt": prompt_blocks},
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": prompt_blocks,
+                    "_meta": {_META_INPUT_ITEM_ID: input_item_id},
+                },
             }
         )
 
@@ -2013,6 +2058,11 @@ class AcpExecutor(Executor):
                     "params": {"sessionId": self._session_id},
                 }
             )
+            # Duplicate interrupts share the original deadline, even during reap.
+            if self._cancel_grace_deadline is None:
+                self._cancel_grace_deadline = (
+                    asyncio.get_running_loop().time() + ACP_CANCEL_GRACE_SECONDS
+                )
             return True
         except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
             logger.debug("acp[%s] session/cancel failed: %s", self._config.name, exc)
@@ -2021,8 +2071,26 @@ class AcpExecutor(Executor):
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; the ACP session is per-process)."""
 
+    def close_timeout(self) -> float:
+        return ACP_REAP_TIMEOUT_SECONDS
+
     async def close(self) -> None:
-        """Terminate the agent subprocess and clean up."""
+        """Allow a cancelled prompt to answer, then terminate the agent subprocess."""
+        if self._cancel_grace_deadline is not None and self._active_prompt_request_id is not None:
+            response = self._pending.get(self._active_prompt_request_id)
+            remaining = self._cancel_grace_deadline - asyncio.get_running_loop().time()
+            if response is not None and not response.done():
+                # Keep the reader and stdin alive while the cancelled prompt answers.
+                if remaining > 0:
+                    await asyncio.wait({response}, timeout=remaining)
+                if not response.done():
+                    logger.debug(
+                        "acp[%s] session/prompt %s cancel grace expired without a response",
+                        self._config.name,
+                        self._active_prompt_request_id,
+                    )
+        self._cancel_grace_deadline = None
+        self._active_prompt_request_id = None
         self._reset_session_state()
         # Tear down the Omnigent MCP relay HTTP server + its bridge dir first.
         with contextlib.suppress(Exception):
@@ -2048,7 +2116,7 @@ class AcpExecutor(Executor):
                 # Tree-aware: the handle is the sandbox launcher, not the
                 # agent it forked. A bare terminate() orphans the agent.
                 _proc.terminate_tree(self._proc)
-                await asyncio.wait_for(self._proc.wait(), timeout=5)
+                await asyncio.wait_for(self._proc.wait(), timeout=_ACP_TERMINATION_TIMEOUT_SECONDS)
             except Exception:  # noqa: BLE001
                 with contextlib.suppress(Exception):
                     _proc.kill_tree(self._proc)

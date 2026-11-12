@@ -1,4 +1,5 @@
 import { SelectionPopup } from "./SelectionPopup";
+import { EditSentMessageContext, useEditSentMessage } from "./editSentMessage";
 import { SideChatSettings } from "./SideChatSettings";
 import {
   useCallback,
@@ -23,15 +24,14 @@ import {
 } from "@/lib/renderItems";
 import {
   BubbleView,
-  WorkingIndicator,
+  WorkingIndicatorRow,
   bubbleKey,
-  buildPendingBubbles,
   computeIsWorking,
   computeIsTurnActive,
-  mergePendingBubbles,
   reorderCommittedRequestElicitations,
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
+  withUncommittedUserBubbles,
 } from "@/components/chat/chatBubbleParts";
 import {
   ChatComposer,
@@ -69,6 +69,7 @@ import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
 import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
+import { insertPastedText } from "@/lib/composerText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
@@ -92,9 +93,29 @@ import {
 import { interrupt } from "@/lib/sessionsApi";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 
+/** The block field that marks it as copied into a side chat. */
+interface CopiedBlock {
+  ctx?: { itemId?: string | null };
+}
+
+/** Leading side-chat id characters on items it copied; the server's `SIDE_CHAT_COPY_ID_PREFIX_LEN`. */
+const SIDE_CHAT_COPY_ID_PREFIX_LEN = 12;
+
 /** A `pending:` tab has no child session yet; its first send creates the fork. */
 function isPendingSideChat(id: string): boolean {
   return id.startsWith("pending:");
+}
+
+const TEXT_INPUT_TYPES = new Set(["text", "search", "email", "url", "password", "number", "tel"]);
+
+/** A text field other than `own`: typing there must not be interrupted by a focus request. */
+function isOtherTextInput(target: EventTarget | null, own: HTMLElement | null): boolean {
+  if (!(target instanceof HTMLElement) || target === own) return false;
+  if (target instanceof HTMLInputElement) return TEXT_INPUT_TYPES.has(target.type);
+  return (
+    target instanceof HTMLTextAreaElement ||
+    target.matches('[contenteditable]:not([contenteditable="false"])')
+  );
 }
 
 // The forked-in item ids to hide are captured once per child and PERSISTED, so
@@ -161,7 +182,11 @@ export function SideChatPane({
   const pending = isPendingSideChat(childId);
   const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
   // The server seals a side chat whose fork died with its runner.
-  const { session } = useSession(pending ? null : childId);
+  const {
+    session,
+    isLoading: sessionLoading,
+    error: sessionError,
+  } = useSession(pending ? null : childId);
   const { session: draftSource } = useSession(pending ? (selectionParentId ?? null) : null);
   const readOnly = restoredReadOnly || session?.labels?.["omnigent.closed"] === "true";
   useLayoutEffect(() => {
@@ -187,6 +212,7 @@ export function SideChatPane({
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedInputs,
     subagentRoutingOverride,
     sessionStatus,
     sessionHarness,
@@ -194,6 +220,29 @@ export function SideChatPane({
     loadingConversation,
     conversationLoadError,
   } = state;
+  // Edit on this tab's own messages copies their text into this tab's composer. It
+  // has no "@"-mention picker, so mentions come back as their attachment markers.
+  const { editMessage: editSentMessage, confirmDialog: replaceDraftDialog } = useEditSentMessage({
+    target: childId,
+    canAccept: () => !readOnly && !starting,
+    hasDraft: () => {
+      const draft = useChatStore.getState().sideChatComposers[childId];
+      return Boolean(draft && (draft.text.trim() || draft.files.length || draft.quotes?.length));
+    },
+    loadText: (text) =>
+      useChatStore.getState().updateSideChatComposer(childId, (current) => ({
+        ...current,
+        text,
+        files: [],
+        quotes: [],
+        autoFocus: true,
+      })),
+    focusComposer: () =>
+      useChatStore.getState().updateSideChatComposer(childId, (current) => ({
+        ...current,
+        autoFocus: true,
+      })),
+  });
 
   // Hide the forked-in history: snapshot the item ids present once hydration
   // settles, then render only what arrives after (the side chat's own turns).
@@ -201,54 +250,69 @@ export function SideChatPane({
   // already holds only its own turns (context lives in the native thread), so
   // filtering there would wrongly hide the side chat's first question.
   const filterHistory = !fullSession && !usesNativeSideChatFork(sessionHarness);
+  // A newer side chat's copied items have ids starting with its own id's first 12
+  // characters, so every device hides exactly the copied history; older ones use
+  // this browser's snapshot.
+  const copiedIdPrefix = childId.slice(0, SIDE_CHAT_COPY_ID_PREFIX_LEN);
+  // Until the snapshot says which rule applies, show nothing and persist nothing.
+  const awaitingRule = filterHistory && !pending && sessionLoading;
+  const useLocalBoundary =
+    filterHistory &&
+    !pending &&
+    !sessionLoading &&
+    !sessionError &&
+    session !== null &&
+    !session.sideChatParentId;
   // Load the persisted boundary when the child changes (mount / rekey); the
   // in-mount ref avoids re-reading storage every render and tracks whether we've
   // actually observed a load run, so we don't capture a boundary on the initial
   // pre-load render.
   const boundaryRef = useRef<{
     childId: string;
-    ids: Set<string> | null;
+    // `undefined` until this browser's stored boundary has been read.
+    ids: Set<string> | null | undefined;
     loadSeen: boolean;
+    loadedIds: Set<string> | null;
   } | null>(null);
   if (boundaryRef.current === null || boundaryRef.current.childId !== childId) {
-    boundaryRef.current = {
-      childId,
-      ids: filterHistory && !pending ? readInheritedBoundary(childId) : null,
-      loadSeen: false,
-    };
+    boundaryRef.current = { childId, ids: undefined, loadSeen: false, loadedIds: null };
+  }
+  if (filterHistory && !pending && boundaryRef.current.ids === undefined) {
+    boundaryRef.current.ids = readInheritedBoundary(childId);
   }
   if (loadingConversation) boundaryRef.current.loadSeen = true;
-  // Capture once, when the fork's load has actually completed — even if it is
-  // EMPTY (a parent with no history), so the side chat's first message isn't
-  // mistaken for inherited history and hidden. Snapshot the inherited item ids
-  // and persist so later mounts/reloads hide the same set, not new turns.
+  // Snapshot at hydration, before a slow metadata lookup can include new turns.
   if (
-    boundaryRef.current.ids === null &&
-    !pending &&
     filterHistory &&
+    !pending &&
+    boundaryRef.current.loadedIds === null &&
     boundaryRef.current.loadSeen &&
     !loadingConversation &&
     conversationLoadError === null
   ) {
-    const ids = new Set(
+    boundaryRef.current.loadedIds = new Set(
       blocks
-        .map((b) => (b as { ctx?: { itemId?: string | null } }).ctx?.itemId)
+        .map((b) => (b as CopiedBlock).ctx?.itemId)
         .filter((id): id is string => typeof id === "string"),
     );
-    boundaryRef.current.ids = ids;
-    writeInheritedBoundary(childId, ids);
   }
-  const inherited = boundaryRef.current.ids;
-  const visibleBlocks = useMemo(
-    () =>
-      inherited === null
-        ? blocks
-        : blocks.filter((b) => {
-            const id = (b as { ctx?: { itemId?: string | null } }).ctx?.itemId;
-            return !(typeof id === "string" && inherited.has(id));
-          }),
-    [blocks, inherited],
-  );
+  if (
+    useLocalBoundary &&
+    boundaryRef.current.ids === null &&
+    boundaryRef.current.loadedIds !== null
+  ) {
+    boundaryRef.current.ids = boundaryRef.current.loadedIds;
+    writeInheritedBoundary(childId, boundaryRef.current.ids);
+  }
+  const inherited = session?.sideChatParentId ? null : (boundaryRef.current.ids ?? null);
+  const visibleBlocks = useMemo(() => {
+    if (awaitingRule) return [];
+    if (!filterHistory) return blocks;
+    return blocks.filter((b) => {
+      const id = (b as CopiedBlock).ctx?.itemId;
+      return !(typeof id === "string" && (id.startsWith(copiedIdPrefix) || inherited?.has(id)));
+    });
+  }, [blocks, inherited, filterHistory, copiedIdPrefix, awaitingRule]);
 
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
   const bubbles = useMemo<Bubble[]>(() => {
@@ -264,16 +328,19 @@ export function SideChatPane({
       ),
       subagentRoutingOverride,
     );
-    if (pendingUserMessages.length === 0) return committed;
-    return mergePendingBubbles(
+    // A session opened in a grid shows its undelivered startup messages too.
+    return withUncommittedUserBubbles(
       committed,
-      buildPendingBubbles(pendingUserMessages, getCurrentAuthorId()),
+      pendingUserMessages,
+      failedInputs,
+      getCurrentAuthorId(),
     );
   }, [
     visibleBlocks,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedInputs,
     subagentRoutingOverride,
     sessionStatus,
   ]);
@@ -282,21 +349,47 @@ export function SideChatPane({
   const showsWorking =
     (!readOnly || fullSession) &&
     (starting || computeIsTurnActive(sessionStatus, state.status === "streaming"));
+  // Background shells can outlive the child's turn; the indicator shows them.
+  const showsBackgroundTasks = (!readOnly || fullSession) && state.backgroundTaskCount > 0;
   // Native interruption needs an observed turn; local streaming can start before one exists.
   const interruptReady =
     !usesNativeSideChatFork(sessionHarness) || activeResponse?.state === "streaming";
 
-  // Keep the newest content in view. A side chat is short and non-virtualized,
-  // so a bottom sentinel scrolled on each change is enough.
+  // Keep the newest content in view until the reader scrolls up; sending
+  // follows the tail again. A side chat is short and non-virtualized, so a
+  // bottom sentinel scrolled on each change is enough.
   const transcriptRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const followTail = useRef(true);
   useEffect(() => {
-    if (!fullSession || followTail.current) bottomRef.current?.scrollIntoView({ block: "end" });
-  }, [bubbles.length, activeResponse, fullSession]);
+    if (followTail.current) bottomRef.current?.scrollIntoView({ block: "end" });
+  }, [bubbles.length, activeResponse]);
+  const followSentMessage = useCallback(() => {
+    followTail.current = true;
+    bottomRef.current?.scrollIntoView({ block: "end" });
+  }, []);
 
   const loadFailed = !pending && conversationLoadError !== null && bubbles.length === 0;
-  const isEmpty = bubbles.length === 0 && !loadingConversation && !loadFailed && !showsWorking;
+  const isEmpty =
+    bubbles.length === 0 &&
+    !loadingConversation &&
+    !loadFailed &&
+    !showsWorking &&
+    !showsBackgroundTasks;
+  const showsList =
+    !loadFailed && !(fullSession && loadingConversation && bubbles.length === 0) && !isEmpty;
+  // A reply's markdown can grow after the render that changed it (streaming
+  // updates commit in a transition), so follow the list's size too.
+  useEffect(() => {
+    const list = listRef.current;
+    if (!list || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (followTail.current) bottomRef.current?.scrollIntoView({ block: "end" });
+    });
+    observer.observe(list);
+    return () => observer.disconnect();
+  }, [showsList]);
 
   const startSideChat = async (text: string) => {
     if (!onStart) return;
@@ -320,7 +413,9 @@ export function SideChatPane({
 
   return (
     <ConversationScopeContext.Provider value={childId}>
-      <div className="side-chat-backdrop flex h-full min-h-0 flex-col">
+      {/* Keys pressed in here belong to the side chat, not the parent's question. */}
+      <div className="side-chat-backdrop flex h-full min-h-0 flex-col" data-side-chat-pane="">
+        {replaceDraftDialog}
         <div
           ref={transcriptRef}
           className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4"
@@ -376,17 +471,24 @@ export function SideChatPane({
               )}
             </div>
           ) : (
-            <div className="flex flex-col gap-4">
-              {bubbles.map((bubble, index) => (
-                <BubbleView
-                  key={bubbleKey(bubble)}
-                  bubble={bubble}
-                  isLastAssistant={index === lastAssistantIndex}
-                  showsWorking={showsWorking}
-                  recoveryDisabled={readOnly}
-                />
-              ))}
-              {shouldShowWorkingIndicator(showsWorking, bubbles) && <WorkingIndicator />}
+            <div ref={listRef} className="flex flex-col gap-4">
+              <EditSentMessageContext.Provider
+                value={readOnly || starting ? null : editSentMessage}
+              >
+                {bubbles.map((bubble, index) => (
+                  <BubbleView
+                    key={bubbleKey(bubble)}
+                    bubble={bubble}
+                    isLastAssistant={index === lastAssistantIndex}
+                    showsWorking={showsWorking}
+                    recoveryDisabled={readOnly}
+                  />
+                ))}
+              </EditSentMessageContext.Provider>
+              <WorkingIndicatorRow
+                key={childId}
+                show={shouldShowWorkingIndicator(showsWorking || showsBackgroundTasks, bubbles)}
+              />
               <div ref={bottomRef} />
             </div>
           )}
@@ -422,6 +524,7 @@ export function SideChatPane({
                 pending={pending}
                 starting={starting}
                 onStart={onStart ? startSideChat : undefined}
+                onSend={followSentMessage}
               />
             )}
           </div>
@@ -451,6 +554,7 @@ function SideChatComposer({
   pending,
   starting,
   onStart,
+  onSend,
 }: {
   fullSession: boolean;
   childId: string;
@@ -464,6 +568,8 @@ function SideChatComposer({
   pending: boolean;
   starting: boolean;
   onStart?: (text: string) => Promise<void>;
+  /** Called when a live tab sends or queues a follow-up. */
+  onSend: () => void;
 }) {
   const send = useChatStore((s) => s.send);
   const sendSlashCommand = useChatStore((s) => s.sendSlashCommand);
@@ -658,6 +764,33 @@ function SideChatComposer({
   }, [autoSend, agentId, send, childId, clearSideChatDraft, refreshLabels, settingsSaving]);
 
   const ready = (pending ? !starting : agentId !== null) && !settingsSaving;
+  // A tab opened from a "+" is ready to type without a click. A live fork's
+  // input stays disabled until the child's agent binding arrives, so wait for it.
+  const autoFocus = composer?.autoFocus === true;
+  const dropFocusRequest = useCallback(() => {
+    // The tab may have been closed or its draft sent meanwhile; don't recreate it.
+    if (!useChatStore.getState().sideChatComposers[childId]) return;
+    updateComposer(childId, (current) => ({ ...current, autoFocus: false }));
+  }, [childId, updateComposer]);
+  useEffect(() => {
+    if (!autoFocus || !ready) return;
+    // The user may already be typing elsewhere, e.g. during a slow fork before
+    // this pane mounted; leave that field alone and just drop the request.
+    if (!isOtherTextInput(document.activeElement, tailTextareaRef.current)) {
+      tailTextareaRef.current?.focus();
+    }
+    dropFocusRequest();
+  }, [autoFocus, ready, dropFocusRequest]);
+  // Typing elsewhere while the fork binds cancels the request so focus is not
+  // pulled away later; a closing menu returning focus to its button does not.
+  useEffect(() => {
+    if (!autoFocus || ready) return;
+    const cancelOnOtherInput = (event: FocusEvent) => {
+      if (isOtherTextInput(event.target, tailTextareaRef.current)) dropFocusRequest();
+    };
+    document.addEventListener("focusin", cancelOnOtherInput);
+    return () => document.removeEventListener("focusin", cancelOnOtherInput);
+  }, [autoFocus, ready, dropFocusRequest]);
   const canSend =
     serializeReplyDraft({ quotes, text }).trim().length > 0 || (!pending && files.length > 0);
   const addFiles = (incoming: File[]) => {
@@ -667,7 +800,10 @@ function SideChatComposer({
   };
   const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
     const pasted = clipboardFiles(event.clipboardData);
-    if (!pasted.length) return;
+    if (!pasted.length) {
+      insertPastedText(event);
+      return;
+    }
     event.preventDefault();
     if (!ready) return;
     if (pending) {
@@ -813,6 +949,7 @@ function SideChatComposer({
       : null;
     const runSkill = (match: { command: string; args: string }) => {
       clearComposer(childId);
+      onSend();
       void sendSlashCommand(match.command.slice(1), match.args, agentId, {
         pinnedConversationId: childId,
       }).finally(refreshLabels);
@@ -850,12 +987,14 @@ function SideChatComposer({
       )
     ) {
       clearComposer(childId);
+      onSend();
       enqueueMessage(message, outgoing, snapshotReplyDraft({ quotes, text: trimmed }), childId);
       return;
     }
     // A running Codex chat refuses a steered /compact; keep the draft as the main composer does.
     if (isCompactControl(harness, message, outgoing) && rejectBusyCompact(childId)) return;
     clearComposer(childId);
+    onSend();
     void send(message, agentId, outgoing, { pinnedConversationId: childId }).finally(refreshLabels);
   };
 
@@ -934,6 +1073,8 @@ function SideChatComposer({
         </TooltipProvider>
       )}
       <ChatComposer
+        hasContent={!pending && files.length > 0}
+        data-side-chat="true"
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
         input={{
           ref: tailTextareaRef,
@@ -1045,6 +1186,7 @@ function SideChatComposer({
                   voiceEditsRef.current.clear();
                   for (const [id, edit] of edits) editText(id, edit.before);
                 }}
+                inputRef={textareaRef}
                 onTranscript={(spoken) => dictation.appendFinal(spoken)}
                 onInterim={(spoken) => dictation.replaceInterim(spoken)}
               />

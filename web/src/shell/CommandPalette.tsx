@@ -5,6 +5,7 @@
 import type React from "react";
 import { defaultFilter } from "cmdk";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   CalendarClockIcon,
   InboxIcon,
@@ -22,9 +23,18 @@ import {
   useSessionSearch,
 } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { rememberOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
+import { Badge } from "@/components/ui/badge";
+import {
+  CompactShortcutKeys,
+  newSessionShortcutKeys,
+  rightSidebarToggleShortcutKeys,
+  settingsShortcutKeys,
+  sidebarToggleShortcutKeys,
+} from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
@@ -45,6 +55,8 @@ export interface CommandPaletteProps {
   onToggleLeftSidebar: () => void;
   /** Flip the right (Workspace) sidebar — owned by AppShell. */
   onToggleRightSidebar: () => void;
+  /** False on grid routes, where ⌘⌥] belongs to the grid's own workspace. */
+  rightSidebarShortcutEnabled?: boolean;
 }
 
 interface ActionCommand {
@@ -55,6 +67,8 @@ interface ActionCommand {
   /** Extra terms the client-side filter matches against (beyond the label). */
   keywords: string[];
   run: () => void;
+  /** Chord shown beside the row when the same action has a shortcut. */
+  shortcut?: readonly string[];
 }
 
 /** Debounce matches the sidebar search (300ms) so keystrokes don't each fetch. */
@@ -102,29 +116,38 @@ interface PaletteSession {
   id: string;
   label: string;
   agent: string;
+  archived: boolean;
   snippet: string | null;
 }
 
-/** Flatten list pages into palette rows, dropping archived and repeated ids. */
+/** Flatten list pages into palette rows, dropping repeated ids and, unless
+    `includeArchived`, archived sessions. `newestFirst` re-sorts the rows by
+    `updated_at`, because pushed updates reorder sessions without a refetch. */
 function paletteSessions(
   pages: readonly ConversationsPage[],
-  excludeIds: ReadonlySet<string> = new Set(),
+  {
+    includeArchived = false,
+    excludeIds = new Set(),
+    newestFirst = false,
+  }: { includeArchived?: boolean; excludeIds?: ReadonlySet<string>; newestFirst?: boolean } = {},
 ): PaletteSession[] {
   const seen = new Set(excludeIds);
   const out: PaletteSession[] = [];
-  for (const page of pages) {
-    for (const c of page.data) {
-      if (c.archived || seen.has(c.id)) continue;
-      seen.add(c.id);
-      out.push({
-        id: c.id,
-        label: conversationDisplayLabel(c),
-        agent: getConversationAgentType(c),
-        // Present only when the match was in chat content (not the title);
-        // the server omits it otherwise. Shown as a dimmed second line.
-        snippet: c.search_snippet ?? null,
-      });
-    }
+  const rows = pages.flatMap((page) => page.data);
+  // Stable, so rows with the same timestamp keep the server's order.
+  if (newestFirst) rows.sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0));
+  for (const c of rows) {
+    if ((c.archived && !includeArchived) || seen.has(c.id)) continue;
+    seen.add(c.id);
+    out.push({
+      id: c.id,
+      label: conversationDisplayLabel(c),
+      agent: getConversationAgentType(c),
+      archived: c.archived === true,
+      // Present only when the match was in chat content (not the title);
+      // the server omits it otherwise. Shown as a dimmed second line.
+      snippet: c.search_snippet ?? null,
+    });
   }
   return out;
 }
@@ -135,6 +158,7 @@ export function CommandPalette({
   onOpenChange,
   onToggleLeftSidebar,
   onToggleRightSidebar,
+  rightSidebarShortcutEnabled = true,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
@@ -166,6 +190,7 @@ export function CommandPalette({
         icon: SquarePenIcon,
         keywords: ["compose", "start", "new session"],
         run: () => navigate("/"),
+        shortcut: newSessionShortcutKeys(),
       },
       {
         id: "go-inbox",
@@ -187,6 +212,7 @@ export function CommandPalette({
         icon: SettingsIcon,
         keywords: ["preferences", "configuration", "account"],
         run: () => navigate("/settings"),
+        shortcut: settingsShortcutKeys(),
       },
       {
         id: "toggle-left-sidebar",
@@ -194,6 +220,7 @@ export function CommandPalette({
         icon: PanelLeftIcon,
         keywords: ["panel", "left", "sessions list"],
         run: onToggleLeftSidebar,
+        shortcut: sidebarToggleShortcutKeys(),
       },
       {
         id: "toggle-right-sidebar",
@@ -201,9 +228,10 @@ export function CommandPalette({
         icon: PanelRightIcon,
         keywords: ["panel", "right", "files", "terminal"],
         run: onToggleRightSidebar,
+        shortcut: rightSidebarShortcutEnabled ? rightSidebarToggleShortcutKeys() : undefined,
       },
     ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar],
+    [navigate, onToggleLeftSidebar, onToggleRightSidebar, rightSidebarShortcutEnabled],
   );
 
   const filteredActions = useMemo(() => {
@@ -271,8 +299,9 @@ export function CommandPalette({
   ]);
 
   const sessions = useMemo(() => {
-    if (searching) return paletteSessions(titleSearch.data?.pages ?? []);
-    const out = paletteSessions(data?.pages ?? []);
+    if (searching) return paletteSessions(titleSearch.data?.pages ?? [], { includeArchived: true });
+    // Rows archived after they loaded are still cached here, so drop them.
+    const out = paletteSessions(data?.pages ?? [], { newestFirst: true });
     if (sessionsOnly) {
       if (!query.trim()) return out;
       return out
@@ -288,7 +317,10 @@ export function CommandPalette({
   const contentSessions = useMemo(
     () =>
       searching
-        ? paletteSessions(contentSearch.data?.pages ?? [], new Set(sessions.map((s) => s.id)))
+        ? paletteSessions(contentSearch.data?.pages ?? [], {
+            includeArchived: true,
+            excludeIds: new Set(sessions.map((s) => s.id)),
+          })
         : [],
     [contentSearch.data, searching, sessions],
   );
@@ -342,7 +374,15 @@ export function CommandPalette({
     action.run();
   };
 
+  const queryClient = useQueryClient();
   const goToSession = (id: string): void => {
+    // Search results are dropped when the palette closes; the sidebar lists
+    // the opened session from this copy, which keeps its owner.
+    const searchRow = [titleSearch.data, contentSearch.data]
+      .flatMap((results) => results?.pages ?? [])
+      .flatMap((page) => page.data)
+      .find((row) => row.id === id);
+    if (searchRow) rememberOpenSessionRow(queryClient, searchRow);
     close();
     navigate(`/c/${id}`);
   };
@@ -368,6 +408,11 @@ export function CommandPalette({
           </span>
         )}
       </div>
+      {s.archived && (
+        <Badge variant="outline" className="ml-2 text-muted-foreground">
+          Archived
+        </Badge>
+      )}
       <span className="ml-2 shrink-0 text-sm text-muted-foreground">{s.agent}</span>
     </CommandItem>
   );
@@ -538,6 +583,7 @@ export function CommandPalette({
                     <CommandItem key={a.id} value={`action:${a.id}`} onSelect={() => runAction(a)}>
                       <Icon />
                       <span className="flex-1 truncate text-left">{a.label}</span>
+                      {a.shortcut && <CompactShortcutKeys keys={a.shortcut} />}
                     </CommandItem>
                   );
                 })}
