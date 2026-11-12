@@ -32,6 +32,15 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     """Create the ``scheduled_task_shares`` table."""
+    constraints: list[sa.CheckConstraint] = []
+    # SQLite ignores VARCHAR lengths: 128 characters at up to four bytes each.
+    if op.get_bind().dialect.name == "sqlite":
+        constraints.append(
+            sa.CheckConstraint(
+                "length(CAST(user_id AS BLOB)) <= 512",
+                name="ck_scheduled_task_shares_user_id_bytes",
+            )
+        )
     op.create_table(
         "scheduled_task_shares",
         sa.Column("workspace_id", sa.BigInteger(), nullable=False, server_default="0"),
@@ -42,6 +51,7 @@ def upgrade() -> None:
         sa.Column("level", sa.SmallInteger(), nullable=False),
         # Leads with workspace_id; the prefix serves per-task reads and deletes.
         sa.PrimaryKeyConstraint("workspace_id", "scheduled_task_id", "user_id"),
+        *constraints,
     )
 
 

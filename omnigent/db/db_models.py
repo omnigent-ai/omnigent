@@ -1814,3 +1814,11 @@ class SqlScheduledTaskShare(OmnigentBase):
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True, nullable=False)
     # Permission level code, stored as a small integer like scheduled_task_runs.status.
     level: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+
+    __table_args__ = (
+        # SQLite ignores VARCHAR lengths: 128 characters at up to four bytes each.
+        CheckConstraint(
+            "length(CAST(user_id AS BLOB)) <= 512",
+            name="ck_scheduled_task_shares_user_id_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+    )

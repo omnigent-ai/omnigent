@@ -21,7 +21,7 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from omnigent.db.db_models import SqlScheduledTask, SqlScheduledTaskRun, SqlScheduledTaskShare
 from omnigent.db.utils import (
@@ -217,6 +217,26 @@ def test_scheduled_task_shares_rejects_duplicate_grantee(db_engine: Engine) -> N
         conn.execute(share("alice@example.com", 2))
     with db_engine.begin() as conn:
         conn.execute(share("bob@example.com", 2))
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_scheduled_task_shares_bounds_grantee_bytes(db_engine: Engine) -> None:
+    """A grantee over 128 characters is rejected on every engine, SQLite included.
+
+    SQLite ignores VARCHAR(128), so its CHECK caps the stored bytes; 128 characters
+    of multibyte text must still be accepted.
+    """
+    shares = sa.Table("scheduled_task_shares", sa.MetaData(), autoload_with=db_engine)
+
+    def share(user_id: str) -> sa.Insert:
+        return shares.insert().values(
+            workspace_id=1, scheduled_task_id=b"a" * 16, user_id=user_id, level=1
+        )
+
+    with pytest.raises(DBAPIError), db_engine.begin() as conn:
+        conn.execute(share("a" * 513))
+    with db_engine.begin() as conn:
+        conn.execute(share("é" * 128))
 
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
