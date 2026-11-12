@@ -99,7 +99,7 @@ function renderDialog(
   });
   client.setQueryData(
     ["detected-credentials", props.host.host_id],
-    [{ family: "databricks", source: "isaac CLI", env_var: null }],
+    [{ family: "databricks", source: "Databricks profile engineering", env_var: null }],
   );
   configureClient?.(client);
   dialogQueryClient = client;
@@ -119,7 +119,9 @@ beforeEach(() => {
     if (url === "/v1/harnesses") return json(catalog);
     if (url.endsWith("/credentials/detected")) {
       return json({
-        credentials: [{ family: "databricks", source: "isaac CLI", env_var: null }],
+        credentials: [
+          { family: "databricks", source: "Databricks profile engineering", env_var: null },
+        ],
       });
     }
     throw new Error(`Unexpected URL: ${String(input)}`);
@@ -163,7 +165,7 @@ describe("HarnessFixDialog", () => {
     },
   );
 
-  it("shows the Isaac setup fallback without calling the credential endpoint", async () => {
+  it("shows the Unity Gateway setup fallback without calling the credential endpoint", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
       const url = String(input);
       if (url === "/v1/harnesses") return json(catalog);
@@ -173,11 +175,14 @@ describe("HarnessFixDialog", () => {
     const user = userEvent.setup();
 
     expect(screen.getByRole("heading", { name: "Reconfigure Codex" })).toBeVisible();
-    expect(screen.getByRole("radio", { name: /Isaac/ })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("radio", { name: /Unity Gateway/ })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
     await user.click(screen.getByRole("button", { name: "Authenticate" }));
 
     expect(
-      screen.getByRole("heading", { name: "Set up Isaac for Codex on Local laptop" }),
+      screen.getByRole("heading", { name: "Set up Unity Gateway for Codex on Local laptop" }),
     ).toBeVisible();
     expect(
       screen.getByText("Run this in a terminal on Local laptop, then come back."),
@@ -195,7 +200,7 @@ describe("HarnessFixDialog", () => {
     ).toBe(true);
   });
 
-  it("finishes Isaac setup when Check again reports gateway readiness", async () => {
+  it("finishes Unity Gateway setup when Check again reports gateway readiness", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
       const url = String(input);
       if (url === "/v1/harnesses") return json(catalog);
@@ -217,7 +222,7 @@ describe("HarnessFixDialog", () => {
     await waitFor(() =>
       expect(props.onFixed).toHaveBeenCalledWith({
         configuredHarnesses: { "codex-native": true },
-        credentialKind: "isaac",
+        credentialKind: "gateway",
         gatewayInference: { "codex-native": true },
       }),
     );
@@ -225,7 +230,7 @@ describe("HarnessFixDialog", () => {
     expect(props.onOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("keeps Isaac setup open when Check again is not ready", async () => {
+  it("keeps Unity Gateway setup open when Check again is not ready", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
       const url = String(input);
       if (url === "/v1/harnesses") return json(catalog);
@@ -1130,7 +1135,7 @@ describe("HarnessFixDialog", () => {
     );
   });
 
-  it("labels a gateway-backed refresh as Isaac even from the personal phase", async () => {
+  it("labels a gateway-backed refresh as Unity Gateway even from the personal phase", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
       const url = String(input);
       if (url === "/v1/harnesses") return json(catalog);
@@ -1152,7 +1157,7 @@ describe("HarnessFixDialog", () => {
     await waitFor(() =>
       expect(props.onFixed).toHaveBeenCalledWith({
         configuredHarnesses: { "claude-native": true },
-        credentialKind: "isaac",
+        credentialKind: "gateway",
         gatewayInference: { "claude-native": true },
       }),
     );
@@ -1219,7 +1224,7 @@ describe("HarnessFixDialog", () => {
     );
   });
 
-  it("installs without a body and then shows the selected Isaac setup", async () => {
+  it("installs without a body and then shows the selected Unity Gateway setup", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
       const url = String(input);
       if (url === "/v1/harnesses") return json(catalog);
@@ -1246,13 +1251,15 @@ describe("HarnessFixDialog", () => {
 
     await user.click(screen.getByRole("button", { name: "Install" }));
     expect(
-      await screen.findByRole("heading", { name: "Set up Isaac for Codex on Local laptop" }),
+      await screen.findByRole("heading", {
+        name: "Set up Unity Gateway for Codex on Local laptop",
+      }),
     ).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Check again" }));
     await waitFor(() => expect(props.onFixed).toHaveBeenCalled());
     expect(props.onFixed).toHaveBeenCalledWith({
       configuredHarnesses: { "codex-native": true },
-      credentialKind: "isaac",
+      credentialKind: "gateway",
       gatewayInference: { "codex-native": true },
     });
   });
@@ -1261,21 +1268,27 @@ describe("HarnessFixDialog", () => {
     ["claude-native", "Claude Code"],
     ["codex-native", "Codex"],
     ["pi-native", "Pi"],
-  ])("offers and preselects Isaac for %s when Databricks is detected", (harness, harnessLabel) => {
-    renderDialog({ harness, harnessLabel });
+  ])(
+    "offers and preselects Unity Gateway for %s when Databricks is detected",
+    (harness, harnessLabel) => {
+      renderDialog({ harness, harnessLabel });
 
-    expect(screen.getByRole("radio", { name: /Isaac/ })).toHaveAttribute("aria-checked", "true");
-    if (harness === "pi-native") {
-      expect(screen.queryByRole("radio", { name: /Personal subscription/ })).toBeNull();
-    }
-  });
+      expect(screen.getByRole("radio", { name: /Unity Gateway/ })).toHaveAttribute(
+        "aria-checked",
+        "true",
+      );
+      if (harness === "pi-native") {
+        expect(screen.queryByRole("radio", { name: /Personal subscription/ })).toBeNull();
+      }
+    },
+  );
 
   it.each([
     ["without a Databricks entry", [], "Personal subscription"],
     [
       "with a Databricks entry",
-      [{ family: "databricks", source: "isaac CLI", env_var: null }],
-      "Isaac",
+      [{ family: "databricks", source: "Databricks profile engineering", env_var: null }],
+      "Unity Gateway",
     ],
   ])(
     "settles the default %s without starting a duplicate update",
@@ -1309,7 +1322,7 @@ describe("HarnessFixDialog", () => {
       expect(
         screen.getByText("Checking which credentials are available on Local laptop…"),
       ).toBeVisible();
-      expect(screen.queryByRole("radio", { name: /Isaac/ })).toBeNull();
+      expect(screen.queryByRole("radio", { name: /Unity Gateway/ })).toBeNull();
       await act(async () => resolveDetection?.(json({ credentials })));
 
       expect(
@@ -1360,7 +1373,9 @@ describe("HarnessFixDialog", () => {
     await act(async () =>
       resolveDetection?.(
         json({
-          credentials: [{ family: "databricks", source: "isaac CLI", env_var: null }],
+          credentials: [
+            { family: "databricks", source: "Databricks profile engineering", env_var: null },
+          ],
         }),
       ),
     );
@@ -1401,7 +1416,7 @@ describe("HarnessFixDialog", () => {
     await act(async () => resolveCatalog?.(json(catalog)));
   });
 
-  it("does not flash an Isaac choice for Pi while detection is pending", async () => {
+  it("does not flash a Unity Gateway choice for Pi while detection is pending", async () => {
     let resolveDetection: ((response: Response) => void) | undefined;
     const detection = new Promise<Response>((resolve) => {
       resolveDetection = resolve;
@@ -1419,11 +1434,11 @@ describe("HarnessFixDialog", () => {
     expect(
       screen.getByText("Checking which credentials are available on Local laptop…"),
     ).toBeVisible();
-    expect(screen.queryByRole("radio", { name: /Isaac/ })).toBeNull();
+    expect(screen.queryByRole("radio", { name: /Unity Gateway/ })).toBeNull();
     await act(async () => resolveDetection?.(json({ credentials: [] })));
 
     expect(await screen.findByText("Use an API key")).toBeVisible();
-    expect(screen.queryByRole("radio", { name: /Isaac/ })).toBeNull();
+    expect(screen.queryByRole("radio", { name: /Unity Gateway/ })).toBeNull();
   });
 
   it("preselects Personal subscription when Databricks is not detected", async () => {
@@ -1435,10 +1450,10 @@ describe("HarnessFixDialog", () => {
       "aria-checked",
       "true",
     );
-    expect(screen.queryByRole("radio", { name: /Isaac/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("radio", { name: /Unity Gateway/ })).not.toBeInTheDocument();
   });
 
-  it("falls back to Isaac when detection is unavailable", async () => {
+  it("falls back to Unity Gateway when detection is unavailable", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
       const url = String(input);
       if (url === "/v1/harnesses") return json(catalog);
@@ -1451,13 +1466,13 @@ describe("HarnessFixDialog", () => {
       client.removeQueries({ queryKey: ["detected-credentials"] });
     });
 
-    expect(await screen.findByRole("radio", { name: /Isaac/ })).toHaveAttribute(
+    expect(await screen.findByRole("radio", { name: /Unity Gateway/ })).toHaveAttribute(
       "aria-checked",
       "true",
     );
   });
 
-  it("keeps Isaac available when an older host cannot report accounts", async () => {
+  it("keeps Unity Gateway available when an older host cannot report accounts", async () => {
     const olderHost = { ...baseProps.host };
     delete olderHost.harness_accounts_supported;
 
@@ -1465,7 +1480,7 @@ describe("HarnessFixDialog", () => {
       client.setQueryData(["detected-credentials", olderHost.host_id], []);
     });
 
-    expect(await screen.findByRole("radio", { name: /Isaac/ })).toHaveAttribute(
+    expect(await screen.findByRole("radio", { name: /Unity Gateway/ })).toHaveAttribute(
       "aria-checked",
       "true",
     );
@@ -1474,7 +1489,7 @@ describe("HarnessFixDialog", () => {
   it("does not offer credential forms before installing a harness", () => {
     renderDialog({ mode: "install", harness: "pi-native", harnessLabel: "Pi" });
 
-    expect(screen.getByRole("radio", { name: /Isaac/ })).toBeVisible();
+    expect(screen.getByRole("radio", { name: /Unity Gateway/ })).toBeVisible();
     expect(
       screen.queryByRole("button", { name: "Use an API key or gateway URL instead" }),
     ).not.toBeInTheDocument();
@@ -1560,7 +1575,7 @@ describe("HarnessFixDialog", () => {
     expect(
       await screen.findByText("Codex was updated but still needs to be set up on Local laptop."),
     ).toBeVisible();
-    expect(screen.getByRole("radio", { name: /Isaac/ })).toBeVisible();
+    expect(screen.getByRole("radio", { name: /Unity Gateway/ })).toBeVisible();
     expect(props.onFixed).not.toHaveBeenCalled();
   });
 
@@ -1694,7 +1709,7 @@ describe("HarnessFixDialog", () => {
 
   it("includes reversed native aliases in credential families", async () => {
     renderDialog({ harness: "native-codex", harnessLabel: "Codex" });
-    expect(screen.getByRole("radio", { name: /Isaac/ })).toBeVisible();
+    expect(screen.getByRole("radio", { name: /Unity Gateway/ })).toBeVisible();
     expect(screen.getByRole("radio", { name: /Personal subscription/ })).toBeVisible();
   });
 });

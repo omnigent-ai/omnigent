@@ -190,7 +190,7 @@ vi.mock("./HarnessFixDialog", () => ({
     host: Host;
     onFixed: (result: {
       configuredHarnesses: Record<string, boolean | string>;
-      credentialKind?: "isaac" | "personal";
+      credentialKind?: "gateway" | "personal";
       gatewayInference?: Record<string, boolean> | null;
     }) => void;
   }) => {
@@ -207,7 +207,7 @@ vi.mock("./HarnessFixDialog", () => ({
           onClick={() =>
             props.onFixed({
               configuredHarnesses: { [props.harness]: true },
-              credentialKind: "isaac",
+              credentialKind: "gateway",
               gatewayInference: { [props.harness]: true },
             })
           }
@@ -527,7 +527,7 @@ describe("Harness details", () => {
 
     // The credential lives under the Settings tab.
     selectTab("Settings");
-    expect(screen.getByText("Isaac")).toBeTruthy();
+    expect(screen.getByText("Unity Gateway")).toBeTruthy();
     expect(screen.getByText("Databricks-managed credential via the Unity Gateway")).toBeTruthy();
     expect(screen.getByText("/opt/bin/claude")).toBeTruthy();
     for (const arg of STARTUP.args ?? []) expect(screen.getAllByText(arg)).toHaveLength(1);
@@ -535,14 +535,14 @@ describe("Harness details", () => {
     expect(screen.getByText(/harness.claude-native in ~\/.omnigent\/config.yaml/)).toBeTruthy();
   });
 
-  it("keeps the Isaac label when databricks_features is false", () => {
+  it("keeps the Unity Gateway label when databricks_features is false", () => {
     databricksFeatures = false;
     hosts = [{ ...ONLINE, gateway_inference: { "claude-native": true } }];
     renderHarnesses();
 
-    expect(within(card("claude-native")).getByText("· Isaac")).toBeTruthy();
+    expect(within(card("claude-native")).getByText("· Unity Gateway")).toBeTruthy();
     fireEvent.click(screen.getByTestId("harness-settings-claude-native"));
-    expect(screen.getByText("Isaac")).toBeTruthy();
+    expect(screen.getByText("Unity Gateway")).toBeTruthy();
     expect(screen.getByText("Databricks-managed credential via the Unity Gateway")).toBeTruthy();
   });
 
@@ -756,7 +756,7 @@ describe("Harness details", () => {
     renderHarnesses("codex-native");
     selectTab("Settings");
 
-    expect(screen.getAllByText("Isaac").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Unity Gateway").length).toBeGreaterThan(0);
     expect(screen.queryByText("Not signed in")).toBeNull();
     expect(screen.queryByText("Sign-in expired")).toBeNull();
   });
@@ -961,7 +961,7 @@ describe("Harness details", () => {
     fireEvent.click(screen.getByRole("button", { name: "Complete fix" }));
 
     expect(screen.getByText("Codex is ready on my-laptop. Checked just now.")).toBeTruthy();
-    expect(screen.getByText("· Isaac")).toBeTruthy();
+    expect(screen.getByText("· Unity Gateway")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Reconfigure" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Reconfigure credential" })).toBeNull();
     expect(queryClient.getQueryData<Host[]>(hostsKey)?.[0].configured_harnesses).toEqual({
@@ -992,7 +992,6 @@ describe("Harness details", () => {
 
     selectTab("Settings");
     expect(screen.getByText("Unity Gateway")).toBeTruthy();
-    expect(screen.queryByText("Isaac")).toBeNull();
     expect(screen.queryByText("Machine")).toBeNull();
   });
 
@@ -1034,8 +1033,8 @@ describe("Launch settings compatibility", () => {
       hosts = [{ ...ONLINE, configured_harnesses: { [harness]: true } }];
       startupData = {
         ...STARTUP,
-        command: "isaac",
-        resolved_path: "/opt/bin/isaac",
+        command: "example-wrapper",
+        resolved_path: "/opt/bin/example-wrapper",
         args: ["codex", "--", ""],
         configured_command: "/usr/bin/env",
         configured_args: [
@@ -1044,7 +1043,7 @@ describe("Launch settings compatibility", () => {
           "REMOVED",
           "TOKEN=synthetic-secret=with spaces",
           "EMPTY=",
-          "isaac",
+          "example-wrapper",
           "codex",
           "--",
           "",
@@ -1065,7 +1064,7 @@ describe("Launch settings compatibility", () => {
           .getAllByRole("heading", { level: 3 })
           .map((heading) => heading.textContent),
       ).toEqual(["Command", "Environment", "Arguments"]);
-      expect(within(startupSection).getByText("/opt/bin/isaac")).toBeTruthy();
+      expect(within(startupSection).getByText("/opt/bin/example-wrapper")).toBeTruthy();
       const envSection = within(startupSection)
         .getByRole("heading", { name: "Environment" })
         .closest("div")!;
@@ -1099,9 +1098,9 @@ describe("Launch settings compatibility", () => {
       ...STARTUP,
       command: "/usr/bin/env",
       resolved_path: "/usr/bin/env",
-      args: ["-S", "TOKEN=synthetic-secret isaac codex --"],
+      args: ["-S", "TOKEN=synthetic-secret example-wrapper codex --"],
       configured_command: "/usr/bin/env",
-      configured_args: ["-S", "TOKEN=synthetic-secret isaac codex --"],
+      configured_args: ["-S", "TOKEN=synthetic-secret example-wrapper codex --"],
       environment: null,
     };
     renderHarnesses("claude-native");
@@ -1110,7 +1109,7 @@ describe("Launch settings compatibility", () => {
     expect(screen.getByText("/usr/bin/env")).toBeTruthy();
     expect(screen.getAllByRole("listitem").map((item) => item.textContent)).toEqual([
       "-S",
-      "TOKEN=synthetic-secret isaac codex --",
+      "TOKEN=synthetic-secret example-wrapper codex --",
     ]);
     expect(screen.queryByText("Inherited values are not listed.")).toBeNull();
     expect(screen.queryByText("Configured invocation")).toBeNull();

@@ -104,13 +104,13 @@ describe("HarnessCredentialForm", () => {
 
   it("never offers a Databricks detection result for adopt", () => {
     detected = [
-      { family: "databricks", source: "isaac CLI", env_var: null },
+      { family: "databricks", source: "Databricks profile engineering", env_var: null },
       { family: "databricks", source: "Databricks profile DEFAULT", env_var: "DATABRICKS_TOKEN" },
     ];
     render(<HarnessCredentialForm harness="codex" host={HOST} command={null} onDone={vi.fn()} />);
 
     expect(screen.queryByTestId("harness-credential-adopt")).toBeNull();
-    expect(screen.queryByText(/isaac CLI|Databricks profile/)).toBeNull();
+    expect(screen.queryByText(/Databricks profile engineering|Databricks profile/)).toBeNull();
   });
 
   it("offers a Pi (anthropic-family) credential to adopt", () => {

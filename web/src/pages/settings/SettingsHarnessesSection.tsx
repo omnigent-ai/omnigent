@@ -386,8 +386,8 @@ function credentialPresentation(
   if (override === "personal") {
     return HARNESS_CREDENTIAL_COPY.personal;
   }
-  if (override === "isaac" || host?.gateway_inference?.[harness] === true) {
-    return HARNESS_CREDENTIAL_COPY.isaac;
+  if (override === "gateway" || host?.gateway_inference?.[harness] === true) {
+    return HARNESS_CREDENTIAL_COPY.gateway;
   }
   const account = host?.harness_accounts?.[harnessAccountKey(harness)];
   if (account) {
@@ -427,7 +427,7 @@ function providerDetails(account: HarnessAccount): string {
 
 function configuredAccountLabel(host: Host | null, harness: string): string | undefined {
   if (host?.gateway_inference?.[harness] === true) {
-    return HARNESS_CREDENTIAL_COPY.isaac.label;
+    return HARNESS_CREDENTIAL_COPY.gateway.label;
   }
   const account = host?.harness_accounts?.[harnessAccountKey(harness)];
   if (!account) return undefined;
