@@ -1,11 +1,11 @@
 """Tests for scheduled-task schemas and the dispatch-field migration.
 
-Verifies the migration creates both tables with the expected shape, that
-neither carries a database-level foreign key (schema Rule R032 — the
-``agent_id`` / ``conversation_id`` / ``scheduled_task_id`` relationships are
-application-owned), that ``scheduled_tasks.rrule`` is NOT NULL and the
-``scheduled_task_runs.status`` CHECK is enforced, and that a downgrade drops both
-tables cleanly. Dispatch coverage includes occurrence deduplication,
+Verifies the migrations create the task tables and the ``scheduled_task_shares``
+table with the expected shape, that none carries a database-level foreign key
+(schema Rule R032 — the ``agent_id`` / ``conversation_id`` / ``scheduled_task_id``
+relationships are application-owned), that ``scheduled_tasks.rrule`` is NOT NULL
+and the ``scheduled_task_runs.status`` CHECK is enforced, and that a downgrade
+drops the task tables cleanly. Dispatch coverage includes occurrence deduplication,
 legacy writers, history preservation, and guarded rollback.
 """
 
@@ -23,7 +23,7 @@ from alembic import command
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
-from omnigent.db.db_models import SqlScheduledTask, SqlScheduledTaskRun
+from omnigent.db.db_models import SqlScheduledTask, SqlScheduledTaskRun, SqlScheduledTaskShare
 from omnigent.db.utils import (
     _build_alembic_config,
     clear_engine_cache,
@@ -40,6 +40,8 @@ _MCP_SERVICES_PREVIOUS = "1ad1db53f99d"
 _MCP_SERVICES_REVISION = "f2c6a9d1b3e8"
 _COMMENT_ANCHOR_REVISION = "f9b3e6c2a401"
 _MCP_SERVICES_MERGE_REVISION = "a7d4c2e9f610"
+_SHARES_PREVIOUS = "a7d4c2e9f610"
+_SHARES_REVISION = "a8be64286ffc"
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -64,6 +66,7 @@ def db_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[Engine
         engine = sa.create_engine(uri)
         SqlScheduledTask.__table__.create(engine)
         SqlScheduledTaskRun.__table__.create(engine)
+        SqlScheduledTaskShare.__table__.create(engine)
     else:
         engine = get_or_create_engine(uri)
     try:
@@ -168,7 +171,7 @@ def test_workspace_id_leads_primary_keys(db_engine: Engine) -> None:
 
 
 def test_no_foreign_keys(db_engine: Engine) -> None:
-    """Neither table carries a DB-level FK (schema Rule R032).
+    """None of the scheduled-task tables carries a DB-level FK (schema Rule R032).
 
     ``agent_id`` / ``last_run_conversation_id`` / ``scheduled_task_id`` /
     ``conversation_id`` are plain columns; referential cleanup is
@@ -178,6 +181,42 @@ def test_no_foreign_keys(db_engine: Engine) -> None:
     insp = sa.inspect(db_engine)
     assert insp.get_foreign_keys("scheduled_tasks") == []
     assert insp.get_foreign_keys("scheduled_task_runs") == []
+    assert insp.get_foreign_keys("scheduled_task_shares") == []
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_scheduled_task_shares_columns(db_engine: Engine) -> None:
+    """``scheduled_task_shares`` has the expected columns, all NOT NULL."""
+    columns = {c["name"]: c for c in sa.inspect(db_engine).get_columns("scheduled_task_shares")}
+    assert set(columns) == {"workspace_id", "scheduled_task_id", "user_id", "level"}
+    assert all(column["nullable"] is False for column in columns.values())
+    assert columns["user_id"]["type"].length == 128
+    assert "INT" in str(columns["level"]["type"]).upper()
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_scheduled_task_shares_primary_key(db_engine: Engine) -> None:
+    """The PK is (workspace_id, scheduled_task_id, user_id): one row per grantee per task."""
+    pk = sa.inspect(db_engine).get_pk_constraint("scheduled_task_shares")
+    assert pk["constrained_columns"] == ["workspace_id", "scheduled_task_id", "user_id"]
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_scheduled_task_shares_rejects_duplicate_grantee(db_engine: Engine) -> None:
+    """A second share for the same (workspace, task, user) is rejected; another user is ok."""
+    shares = sa.Table("scheduled_task_shares", sa.MetaData(), autoload_with=db_engine)
+
+    def share(user_id: str, level: int) -> sa.Insert:
+        return shares.insert().values(
+            workspace_id=1, scheduled_task_id=b"a" * 16, user_id=user_id, level=level
+        )
+
+    with db_engine.begin() as conn:
+        conn.execute(share("alice@example.com", 1))
+    with pytest.raises(IntegrityError), db_engine.begin() as conn:
+        conn.execute(share("alice@example.com", 2))
+    with db_engine.begin() as conn:
+        conn.execute(share("bob@example.com", 2))
 
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
@@ -806,6 +845,27 @@ def test_downgrade_drops_both_tables(tmp_path: Path) -> None:
         command.upgrade(config, "z6a2b3c4d5e6")
     tables = set(sa.inspect(engine).get_table_names())
     assert {"scheduled_tasks", "scheduled_task_runs"} <= tables
+
+    engine.dispose()
+    clear_engine_cache()
+
+
+def test_scheduled_task_shares_downgrade_and_reupgrade(tmp_path: Path) -> None:
+    """Downgrading the shares migration drops its table; re-upgrading restores it."""
+    uri = f"sqlite:///{tmp_path / 'shares.db'}"
+    engine = get_or_create_engine(uri)
+    assert "scheduled_task_shares" in sa.inspect(engine).get_table_names()
+
+    config = _build_alembic_config(uri)
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _SHARES_PREVIOUS)
+    assert "scheduled_task_shares" not in sa.inspect(engine).get_table_names()
+
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _SHARES_REVISION)
+    assert "scheduled_task_shares" in sa.inspect(engine).get_table_names()
 
     engine.dispose()
     clear_engine_cache()

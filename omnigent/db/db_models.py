@@ -1781,3 +1781,36 @@ class SqlScheduledTaskRun(OmnigentBase):
             "id",
         ),
     )
+
+
+class SqlScheduledTaskShare(OmnigentBase):
+    """
+    SQLAlchemy model for the ``scheduled_task_shares`` table.
+
+    One row per user or group that an automation's runs are shared with. These
+    rows are the automation's instructions for the sessions it creates. They are
+    not an access-control list, and no access check reads them.
+
+    :param scheduled_task_id: The automation this share belongs to (relates to
+        ``scheduled_tasks.id``). Rows are deleted with their task by the
+        application; there is no DB foreign key (schema Rule R032).
+    :param user_id: The grantee, a user or group ID, e.g. ``"alice@example.com"``.
+        String(128) matches ``session_permissions.user_id``.
+    :param level: The permission level granted on each run's session. No CHECK
+        constraint: the permission store owns the set of valid levels.
+    """
+
+    __tablename__ = "scheduled_task_shares"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    scheduled_task_id: Mapped[str] = mapped_column(Uuid16, primary_key=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True, nullable=False)
+    # Permission level code, stored as a small integer like scheduled_task_runs.status.
+    level: Mapped[int] = mapped_column(SmallInteger, nullable=False)
