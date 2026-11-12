@@ -13,6 +13,7 @@ import type { InfiniteData, QueryClient } from "@tanstack/react-query";
 import { scopeBoundaryRow } from "@/lib/sidebarData";
 import type { Conversation, ConversationsPage, SessionSortBy } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
+import { sessionVisibility } from "@/lib/sessionVisibility";
 
 /** Cache value shape for a `useConversations` infinite query. */
 export type ConversationsInfiniteData = InfiniteData<ConversationsPage, string | undefined>;
@@ -467,12 +468,10 @@ export function insertNewRowsIntoPages(
       id,
     };
     if (conv.parent_session_id != null || violatesKnownMembership(conv, filters)) continue;
-    // Ownership-aware insertion for scoped caches. `conv.owner` is null/absent
-    // when the row is owned by the viewer (single-user / legacy shape) or
-    // explicitly set to another user's id when the session was shared.
-    const ownedByViewer = conv.owner == null || conv.owner === viewerId;
-    if (filters.visibility === "mine" && !ownedByViewer) continue;
-    if (filters.visibility === "shared" && ownedByViewer) continue;
+    // Same ownership inference as the sidebar scopes and the targeted reconcile.
+    const visibility = sessionVisibility(conv, viewerId ?? null);
+    if (filters.visibility === "mine" && visibility !== "mine") continue;
+    if (filters.visibility === "shared" && visibility !== "shared") continue;
     rows.push(conv);
   }
   if (rows.length === 0) return { data, inserted: [] };

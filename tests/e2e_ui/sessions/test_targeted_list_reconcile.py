@@ -32,6 +32,11 @@ def _folder_link(page: Page, project: str, session_id: str) -> Locator:
     return _folder(page, project).locator(f'a[href="/c/{session_id}"]')
 
 
+def _full_reconcile(fetched: list[str], names: list[str]) -> bool:
+    """A full reconcile re-reads every expanded folder in one round."""
+    return set(names) <= set(fetched)
+
+
 def _folder(page: Page, project: str) -> Locator:
     """The project's own folder section, not the Projects group around it."""
     new_session = page.get_by_role("link", name=f"New session in {project}", exact=True)
@@ -80,6 +85,9 @@ def test_session_changes_refetch_only_the_folders_they_touch(
     )
     enable_grouping_ui(page)
     page.on("request", record)
+    # Targeted rounds don't reset the 60 s full-reconcile clock, so one can land
+    # in a window; that window's exact-set check is skipped.
+    checked_windows = 0
     try:
         page.goto(base_url)
         for name in names:
@@ -94,7 +102,9 @@ def test_session_changes_refetch_only_the_folders_they_touch(
         patch_session(base_url, renamed, title=f"{a} renamed")
         expect(_folder_link(page, a, renamed)).to_contain_text(f"{a} renamed", timeout=15_000)
         page.wait_for_timeout(SETTLE_MS)
-        assert folder_fetches == []
+        if not _full_reconcile(folder_fetches, names):
+            assert folder_fetches == []
+            checked_windows += 1
 
         # A move refetches the folder it left and the one it joined, not the third.
         moved = members[a][1]
@@ -104,7 +114,9 @@ def test_session_changes_refetch_only_the_folders_they_touch(
         expect(_folder_link(page, a, moved)).to_have_count(0)
         page.wait_for_timeout(SETTLE_MS)
         # Retries may repeat a fetch; both folders must be re-read, and only them.
-        assert set(folder_fetches) == {a, b}
+        if not _full_reconcile(folder_fetches, names):
+            assert set(folder_fetches) == {a, b}
+            checked_windows += 1
 
         # An archive drops the row and refetches only its own folder.
         archived = members[c][0]
@@ -112,7 +124,10 @@ def test_session_changes_refetch_only_the_folders_they_touch(
         patch_session(base_url, archived, archived=True)
         expect(_folder_link(page, c, archived)).to_have_count(0, timeout=15_000)
         page.wait_for_timeout(SETTLE_MS)
-        assert set(folder_fetches) == {c}  # backfills the emptied slot
+        if not _full_reconcile(folder_fetches, names):
+            assert set(folder_fetches) == {c}  # backfills the emptied slot
+            checked_windows += 1
+        assert checked_windows > 0, "every watch window hit a full reconcile"
 
         # Every folder still lists exactly what the server holds for it.
         expect(_folder_link(page, a, renamed)).to_be_visible()

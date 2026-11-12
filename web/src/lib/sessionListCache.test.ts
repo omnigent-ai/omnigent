@@ -669,6 +669,39 @@ describe("insertNewRowsIntoPages", () => {
     );
     expect(inserted).toHaveLength(0);
   });
+
+  it("infers ownership from the row when no viewer id is known", () => {
+    const before = data([conv("a")]);
+    const owned = candidate("new", { owner: "alice" });
+    const mine = insertNewRowsIntoPages(before, owned, { ...DEFAULT_FILTERS, visibility: "mine" });
+    expect(mine.inserted.map((c) => c.id)).toEqual(["new"]);
+    const shared = insertNewRowsIntoPages(before, owned, {
+      ...DEFAULT_FILTERS,
+      visibility: "shared",
+    });
+    expect(shared.inserted).toHaveLength(0);
+  });
+
+  it("treats an ownerless row with a shared grant as shared, not mine", () => {
+    const before = data([conv("a")]);
+    const granted = candidate("new", { permission_level: 1 });
+    const shared = insertNewRowsIntoPages(
+      before,
+      granted,
+      { ...DEFAULT_FILTERS, visibility: "shared" },
+      undefined,
+      "alice",
+    );
+    expect(shared.inserted.map((c) => c.id)).toEqual(["new"]);
+    const mine = insertNewRowsIntoPages(
+      before,
+      granted,
+      { ...DEFAULT_FILTERS, visibility: "mine" },
+      undefined,
+      "alice",
+    );
+    expect(mine.inserted).toHaveLength(0);
+  });
 });
 
 describe("settleOpenSessionRow", () => {
