@@ -389,7 +389,7 @@ function resolveCliPath(configuredPath, deps = {}) {
 /**
  * Normalize a CLI invocation. A plain path passes a string (`/path/omnigent`);
  * managed host enrollment passes an executable + fixed argv prefix
- * (`/usr/local/bin/isaac`, `["omni"]`). Both stay shell-free.
+ * (`/usr/local/bin/tool-wrapper`, `["omni"]`). Both stay shell-free.
  *
  * @param {string | {
  *   executable: string,

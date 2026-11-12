@@ -91,7 +91,6 @@ const {
 const arca = require("./arca");
 const arcaOnboarding = require("./arca_onboarding");
 const cliInstall = require("./cli_install");
-const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { createArcaAutoConnect } = require("./arca_autoconnect");
 const sshConnect = require("./ssh_connect");
@@ -1866,28 +1865,17 @@ function resolvedCliPath() {
   return cachedCli.path;
 }
 
-/**
- * What to tell the user when hostCliCommand(serverUrl) found no launcher.
- *
- * @param {string} serverUrl
- * @returns {string}
- */
-function missingHostCliError(serverUrl) {
-  const { errorMessage, errorAction } = missingHostCliErrorParts(serverUrl);
+/** Explain how to make the local host CLI available. */
+function missingHostCliError() {
+  const { errorMessage, errorAction } = missingHostCliErrorParts();
   return `${errorMessage} ${errorAction}`;
 }
 
-/** @param {string} serverUrl */
-function missingHostCliErrorParts(serverUrl) {
-  return databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl)
-    ? {
-        errorMessage: "The isaac CLI was not found.",
-        errorAction: "Install it before connecting this machine.",
-      }
-    : {
-        errorMessage: "The omnigent CLI was not found.",
-        errorAction: "Install it or set its path.",
-      };
+function missingHostCliErrorParts() {
+  return {
+    errorMessage: "The omnigent CLI was not found.",
+    errorAction: "Install it or set its path.",
+  };
 }
 
 /**
@@ -1921,28 +1909,6 @@ function rememberOnboardingRunner(serverUrl, runner) {
 
 /** How long a recorded onboarding runner waits for its server page to take it. */
 const ONBOARDING_RUNNER_TTL_MS = 10 * 60 * 1000;
-
-/**
- * CLI command for desktop host enrollment on `serverUrl`. Managed
- * windows use `isaac omni` behind the same effective gate as Arca (managed
- * features flag + managed HTTPS server); every other window keeps the configured
- * or auto-detected Omnigent CLI. Returns null when the selected launcher is
- * unavailable.
- *
- * @param {string | null | undefined} serverUrl
- * @returns {string | {
- *   executable: string,
- *   prefixArgs: string[],
- *   displayName: string,
- * } | null}
- */
-function hostCliCommand(serverUrl) {
-  const useIsaac = databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl);
-  if (!useIsaac) return resolvedCliPath();
-  const isaacPath = isaac.resolveIsaacPath();
-  if (!isaacPath) return null;
-  return { executable: isaacPath, prefixArgs: ["omni"], displayName: "isaac omni" };
-}
 
 /**
  * Validate `configuredPath` as a runnable CLI and persist it as the override
@@ -4611,9 +4577,9 @@ function registerIpc() {
       if (result.ok) rememberOnboardingRunner(target, runner);
       return result;
     }
-    const cliCommand = hostCliCommand(target);
+    const cliCommand = resolvedCliPath();
     if (!cliCommand) {
-      const missingCli = missingHostCliErrorParts(target);
+      const missingCli = missingHostCliErrorParts();
       return {
         ok: false,
         error: `${missingCli.errorMessage} ${missingCli.errorAction}`,
@@ -4977,7 +4943,7 @@ function registerIpc() {
     ]);
     return {
       ...status,
-      customizationDisabled: databricksInternalFeaturesEnabled(),
+      customizationDisabled: false,
       // In-app install is macOS-only; the renderer must not route connect/local
       // through an install step on platforms where it can't run.
       installSupported: process.platform === "darwin",
@@ -4994,13 +4960,6 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("set-cli-path is only available to the setup page");
     }
-    if (databricksInternalFeaturesEnabled()) {
-      return {
-        ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
-        customizationDisabled: true,
-        accepted: false,
-      };
-    }
     return applyCliPath(configuredPath);
   });
 
@@ -5010,7 +4969,6 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("browse-cli-path is only available to the setup page");
     }
-    if (databricksInternalFeaturesEnabled()) return null;
     const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
     const result = await dialog.showOpenDialog(win ?? undefined, {
       title: "Locate the Omnigent CLI binary",
@@ -5095,7 +5053,7 @@ function registerIpc() {
       return null;
     }
     return {
-      cliInstalled: Boolean(hostCliCommand(senderServerUrl(event))),
+      cliInstalled: Boolean(resolvedCliPath()),
       hostId: omnigentCli.localHostId(),
     };
   });
@@ -5125,7 +5083,7 @@ function registerIpc() {
     }
     return {
       ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
-      customizationDisabled: databricksInternalFeaturesEnabled(),
+      customizationDisabled: false,
     };
   });
 
@@ -5138,12 +5096,6 @@ function registerIpc() {
   ipcMain.handle("omnigent:cli-reset-path", async (event) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("cli-reset-path is only available to a connected server page");
-    }
-    if (databricksInternalFeaturesEnabled()) {
-      return {
-        ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
-        customizationDisabled: true,
-      };
     }
     return clearCliPath();
   });
@@ -5215,8 +5167,8 @@ function registerIpc() {
     }
     const serverUrl = senderServerUrl(event);
     if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
-    const cliCommand = hostCliCommand(serverUrl);
-    if (!cliCommand) return { ok: false, error: missingHostCliError(serverUrl) };
+    const cliCommand = resolvedCliPath();
+    if (!cliCommand) return { ok: false, error: missingHostCliError() };
     let result;
     if (action === "start" || action === "restart") {
       // Enrolling this machine as a runner executes agent code locally, so it
