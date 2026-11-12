@@ -198,6 +198,30 @@ Each new entry is also published as `session.journal.appended` on
 `GET /v1/sessions/{id}/stream`. `GET /v1/info` reports `session_journal: true` on
 servers that keep journals.
 
+## Saved workflows
+
+A saved workflow is a named plan its owner can run, private to that owner, with
+steps in the plan's step format. Running one will copy its steps into the
+session's journal as the plan, and the entries written under it carry its ID in
+`workflow_id`. Workflows have no versions: an edit rewrites the workflow, and
+each run's journal keeps the plan it ran.
+
+- `GET /v1/workflows`: the caller's workflows by name, without their steps.
+  `limit` (1–200, default 50), `after` (the previous page's `last_id`) and
+  `name` (an exact name).
+- `POST /v1/workflows`: `name` (one line of at most 80 characters, unique among
+  the caller's workflows; 409 otherwise), `description` (at most 2,000
+  characters) and `steps`.
+- `GET /v1/workflows/{id}`: one workflow, with its steps. Another user's
+  workflow is 404.
+- `PATCH /v1/workflows/{id}`: any of `name`, `description` and `steps`; fields
+  left out keep their values.
+- `DELETE /v1/workflows/{id}`: deletes it.
+
+Workflows live in `workflows`, keyed by workspace and ID, with the steps as
+compressed JSON of at most 16,383 bytes stored. `GET /v1/info` reports
+`workflows: true` on servers that store them.
+
 ## Storage
 
 Entries live in `session_journal_entries`, beside the session metadata, keyed by
