@@ -152,6 +152,26 @@ export function PermissionsModal({
   const publicGrant = (permissions ?? []).find((p) => p.user_id === PUBLIC_USER);
   const publicLevel = publicGrant ? Math.min(publicGrant.level, publicMaxLevel) : 0;
 
+  async function grantAccess(userId: string, level: number, existingLevel = 0) {
+    let accessGranted = existingLevel >= level;
+    try {
+      if (!accessGranted) {
+        await grant.mutateAsync({ userId, level });
+        accessGranted = true;
+      }
+      await prepareFileShare();
+      return true;
+    } catch (err) {
+      const message = (err as Error).message;
+      setError(
+        filePath && accessGranted
+          ? `Session access is granted, but file sharing failed: ${message}`
+          : message,
+      );
+      return false;
+    }
+  }
+
   async function handleGrant(e: FormEvent) {
     e.preventDefault();
     const trimmed = newUserId.trim();
@@ -163,29 +183,11 @@ export function PermissionsModal({
     )
       return;
     setError(null);
-    if (filePath) {
-      try {
-        await prepareFileShare();
-      } catch {
-        return;
-      }
-    }
-    const resetForm = () => {
+    const existingGrant = filePath ? userGrants.find((p) => p.user_id === trimmed) : undefined;
+    if (await grantAccess(trimmed, parseInt(newLevel, 10), existingGrant?.level)) {
       setNewUserId("");
       setNewLevel("1");
-    };
-    const existingGrant = filePath ? userGrants.find((p) => p.user_id === trimmed) : undefined;
-    if (existingGrant && existingGrant.level >= parseInt(newLevel, 10)) {
-      resetForm();
-      return;
     }
-    grant.mutate(
-      { userId: trimmed, level: parseInt(newLevel, 10) },
-      {
-        onSuccess: resetForm,
-        onError: (err) => setError(err.message),
-      },
-    );
   }
 
   function handleRevoke(userId: string) {
@@ -206,19 +208,20 @@ export function PermissionsModal({
     if (level > 0 && (workspaceBlocked || !publicSharingEnabled)) return;
     setError(null);
     if (level > 0) {
-      if (filePath) {
-        try {
-          await prepareFileShare();
-        } catch {
-          return;
-        }
-      }
-      grant.mutate({ userId: PUBLIC_USER, level }, { onError: (err) => setError(err.message) });
+      await grantAccess(PUBLIC_USER, level);
     } else {
       revoke.mutate(PUBLIC_USER, {
         onError: (err) => setError(err.message),
       });
     }
+  }
+
+  let description = "Invite others to view or collaborate on this session.";
+  if (filePath) {
+    description =
+      "This link opens the file in full screen. Sharing grants access to the entire session, including its messages and other files.";
+  } else if (sharingReadOnly) {
+    description = "This server allows read-only sharing — invite others to view this session.";
   }
 
   // "off" short-circuit: sharing is disabled server-wide, so skip the whole
@@ -252,13 +255,7 @@ export function PermissionsModal({
           </DialogTitle>
           <DialogDescription asChild>
             <div className="space-y-3">
-              <p>
-                {filePath
-                  ? "This link opens the file in full screen. Sharing grants access to the entire session, including its messages and other files."
-                  : sharingReadOnly
-                    ? "This server allows read-only sharing — invite others to view this session."
-                    : "Invite others to view or collaborate on this session."}
-              </p>
+              <p>{description}</p>
               {filePath && (
                 <p>
                   Granting access, copying the link, or opening the mobile link enables Workspace
@@ -453,12 +450,13 @@ export function PermissionsModal({
               sessionId={sessionId}
               filePath={filePath}
               beforeCopy={filePath ? prepareFileShare : undefined}
-              disabled={fileShareUnavailable || shareBusy}
+              onError={setError}
+              disabled={!!filePath && (fileShareUnavailable || shareBusy)}
             />
             <Button
               variant="ghost"
               onClick={openMobileLink}
-              disabled={fileShareUnavailable || shareBusy}
+              disabled={!!filePath && (fileShareUnavailable || shareBusy)}
               className="gap-1.5 text-primary"
             >
               <QrCodeIcon className="size-3.5" />
@@ -689,11 +687,13 @@ function CopyLinkButton({
   sessionId,
   filePath,
   beforeCopy,
+  onError,
   disabled,
 }: {
   sessionId: string;
   filePath?: string;
   beforeCopy?: () => Promise<void>;
+  onError: (message: string | null) => void;
   disabled?: boolean;
 }) {
   const [copied, setCopied] = useState(false);
@@ -708,6 +708,7 @@ function CopyLinkButton({
   const handleCopy = useCallback(async () => {
     const url = getShareableSessionLink(sessionId, rebasePath, filePath);
     setCopied(false);
+    onError(null);
     const prepared = beforeCopy?.().then(
       () => true,
       (err) => {
@@ -719,10 +720,11 @@ function CopyLinkButton({
       await copyText(url);
     } catch (err) {
       console.warn("Failed to copy link to clipboard", err);
+      onError("Could not copy the link. Please try again or use the mobile QR code.");
       return;
     }
     if ((await prepared) ?? true) setCopied(true);
-  }, [sessionId, rebasePath, filePath, beforeCopy]);
+  }, [sessionId, rebasePath, filePath, beforeCopy, onError]);
 
   return (
     <Button

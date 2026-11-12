@@ -606,6 +606,7 @@ function AppShellImpl() {
   const workspaceTabListRef = useRef<HTMLDivElement>(null);
   const focusWorkspaceTabsOnOpenRef = useRef(false);
   const rightPanelOpenRef = useRef(rightPanelOpen);
+  const localFileUrlRef = useRef<URLSearchParams | null>(null);
   rightPanelOpenRef.current = rightPanelOpen;
   const [rightPanelVisibilityAnimating, setRightPanelVisibilityAnimating] = useState(false);
   const rightPanelMotionTimerRef = useRef<number | null>(null);
@@ -985,6 +986,7 @@ function AppShellImpl() {
     subagentsPanelOpen,
     shellsPanelOpen,
     rightPanelOpen,
+    rightPanelMaximized,
   };
   const railSelectionRef = useRef(railSelection);
   railSelectionRef.current = railSelection;
@@ -1016,6 +1018,9 @@ function AppShellImpl() {
           (prev) => {
             const params = new URLSearchParams(prev);
             params.set("file", filePath);
+            if (now.rightPanelMaximized) params.set("fullscreen", "1");
+            else params.delete("fullscreen");
+            localFileUrlRef.current = params;
             return params;
           },
           { replace: true },
@@ -1445,7 +1450,6 @@ function AppShellImpl() {
   const urlFilePath = searchParams.get("file") || null;
   const urlFileFullscreen = searchParams.get("fullscreen") === "1";
   const fullscreenRestoreRef = useRef<typeof restoredWorkspace>(null);
-  const localFileUrlRef = useRef<URLSearchParams | null>(null);
   // Honor incoming links even when the current session is already open.
   useEffect(() => {
     const sessionJustRestored = fullscreenRestoreRef.current !== restoredWorkspace;

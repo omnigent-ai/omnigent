@@ -1306,7 +1306,7 @@ describe("FileViewer file sharing", () => {
     const reason = "Sharing has been disabled for this Omnigent server.";
     renderViewer({ open: true, onShare, shareDisabledReason: reason });
 
-    const button = screen.getByRole("button", { name: "Share file" });
+    const button = screen.getByRole("button", { name: `Share file disabled: ${reason}` });
     expect(button).toBeDisabled();
     fireEvent.click(button);
     expect(onShare).not.toHaveBeenCalled();
@@ -1332,7 +1332,7 @@ describe("FileViewer file sharing", () => {
     renderViewer({ open: true, onShare, shareDisabledReason: reason });
 
     fireEvent.pointerDown(screen.getByRole("button", { name: "More actions" }), { button: 0 });
-    const item = screen.getByRole("menuitem", { name: "Share file" });
+    const item = screen.getByRole("menuitem", { name: `Share file disabled: ${reason}` });
     expect(item).toHaveAttribute("aria-disabled", "true");
     fireEvent.click(item);
     expect(onShare).not.toHaveBeenCalled();

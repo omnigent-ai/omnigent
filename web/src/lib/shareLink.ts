@@ -35,7 +35,7 @@ export function getShareableSessionLink(
 
   let url: URL;
   try {
-    url = new URL(link);
+    url = new URL(link, window.location.origin);
   } catch {
     url = new URL(fallbackLink);
   }

@@ -174,6 +174,7 @@ def test_share_file_grants_read_access_and_opens_fullscreen(
         ) as grant_response:
             dialog.get_by_role("button", name="Grant", exact=True).click()
         assert grant_response.value.status == 200
+        expect(dialog.get_by_placeholder("alice@example.com")).to_have_value("")
         assert httpx.get(session_url, timeout=10.0).json()["share_workspace_files"] is True
         expect(dialog.get_by_title(grantee)).to_be_visible()
 

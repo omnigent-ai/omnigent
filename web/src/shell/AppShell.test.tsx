@@ -6760,38 +6760,61 @@ describe("AppShell desktop Close", () => {
     expect(createShell).toHaveBeenCalledWith("zsh", expect.anything());
   });
 
-  it("restores the open file when a shell opened early fails to create", () => {
-    const shell = { id: "terminal_zsh_u-fail1", name: "zsh", session: "u-fail1", running: true };
-    let callbacks: TerminalLaunchCallbacks = {};
-    vi.mocked(useCreateTerminal).mockReturnValue({
-      launch: (_name: string, next: TerminalLaunchCallbacks) => {
-        callbacks = next;
-      },
-      isPending: false,
-    } as unknown as ReturnType<typeof useCreateTerminal>);
-    useSessionAgentMock.mockReturnValue({
-      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
-    } as ReturnType<typeof useSessionAgent>);
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null, home: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    writeSessionWorkspaceState("conv_shell_fail", {
-      open: true,
-      openFiles: ["a.ts", "b.ts"],
-      selectedFilePath: "b.ts",
-    });
-    mockConversations([{ id: "conv_shell_fail", permission_level: null }]);
-    renderShell("/c/conv_shell_fail");
-    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
+  it.each(["docked", "fullscreen", "collapsed"])(
+    "restores the file and %s rail when a shell opened early fails to create",
+    (layout) => {
+      const shell = { id: "terminal_zsh_u-fail1", name: "zsh", session: "u-fail1", running: true };
+      let callbacks: TerminalLaunchCallbacks = {};
+      vi.mocked(useCreateTerminal).mockReturnValue({
+        launch: (_name: string, next: TerminalLaunchCallbacks) => {
+          callbacks = next;
+        },
+        isPending: false,
+      } as unknown as ReturnType<typeof useCreateTerminal>);
+      useSessionAgentMock.mockReturnValue({
+        data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+      } as ReturnType<typeof useSessionAgent>);
+      useEnvironmentMock.mockReturnValue({
+        data: { available: true, root: null, home: null },
+        isLoading: false,
+      } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+      writeSessionWorkspaceState("conv_shell_fail", {
+        open: true,
+        openFiles: ["a.ts", "b.ts"],
+        selectedFilePath: "b.ts",
+      });
+      mockConversations([{ id: "conv_shell_fail", permission_level: null }]);
+      renderShell("/c/conv_shell_fail");
+      expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
+      if (layout === "fullscreen") {
+        fireEvent.click(screen.getByRole("button", { name: "Open sidebar" }));
+        fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+      } else if (layout === "collapsed") {
+        fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+      }
 
-    act(() => sendCommand({ command: "new-terminal", browserViewId: null, closingQuits: false }));
-    act(() => callbacks.onOpen?.(shell));
-    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+      act(() => sendCommand({ command: "new-terminal", browserViewId: null, closingQuits: false }));
+      act(() => callbacks.onOpen?.(shell));
+      expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
 
-    act(() => callbacks.onError?.(new Error("launch failed"), shell));
-    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
-  });
+      act(() => callbacks.onError?.(new Error("launch failed"), shell));
+      expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
+      if (layout === "collapsed") {
+        expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+      } else {
+        expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+      }
+      if (layout === "fullscreen") {
+        expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveClass("md:absolute");
+        expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+        expect(screen.getByTestId("url-params")).toHaveTextContent("fullscreen=1");
+        fireEvent.click(screen.getByRole("button", { name: "Exit full screen" }));
+        expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+      } else {
+        expect(screen.getByTestId("url-params").textContent).not.toContain("fullscreen");
+      }
+    },
+  );
 
   it("keeps a newer selection when a shell opened early fails to create", () => {
     const shell = { id: "terminal_zsh_u-fail2", name: "zsh", session: "u-fail2", running: true };

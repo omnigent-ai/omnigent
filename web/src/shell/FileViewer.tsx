@@ -1220,6 +1220,7 @@ function FileViewerBody({
     onSelect?: () => void;
     active?: boolean;
     disabled?: boolean;
+    disabledLabel?: string;
     /** When set, render a picker (dropdown/submenu) over these mutually
      * exclusive choices instead of a single button. `onSelect` is ignored. */
     options?: ToolbarOption[];
@@ -1473,6 +1474,9 @@ function FileViewerBody({
       key: "share-file",
       label: "Share file",
       tooltip: shareDisabledReason ?? "Share file",
+      disabledLabel: shareDisabledReason
+        ? `Share file disabled: ${shareDisabledReason}`
+        : undefined,
       icon: <Share2Icon className="size-4" />,
       disabled: !!shareDisabledReason,
       onSelect: onShare,
@@ -1612,7 +1616,7 @@ function FileViewerBody({
                   type="button"
                   variant={action.active ? "default" : "ghost"}
                   size="icon-sm"
-                  aria-label={action.label}
+                  aria-label={action.disabledLabel ?? action.label}
                   disabled={action.disabled}
                   tabIndex={interactive ? undefined : -1}
                   onClick={interactive ? action.onSelect : undefined}
@@ -1842,7 +1846,11 @@ function FileViewerBody({
                             <Tooltip>
                               <TooltipTrigger asChild>
                                 <span className="block">
-                                  <DropdownMenuItem disabled className="whitespace-nowrap">
+                                  <DropdownMenuItem
+                                    disabled
+                                    aria-label={action.disabledLabel ?? action.label}
+                                    className="whitespace-nowrap"
+                                  >
                                     {action.icon}
                                     {action.label}
                                   </DropdownMenuItem>
