@@ -26,6 +26,7 @@ import pytest
 from omnigent.runner import mcp_execution_registry as mcp_execution_registry_mod
 from omnigent.runner import pending_approvals
 from omnigent.runner.mcp_execution_registry import (
+    MCP_ATTACH_ONLY_PARAM,
     MCP_OPERATION_ID_PARAM,
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
     McpExecutionRegistry,
@@ -544,10 +545,6 @@ async def test_call_tool_reattaches_expired_execution_after_server_disconnect(
     assert first_params[MCP_OPERATION_ID_PARAM].startswith("mcpop_")
 
 
-async def _runner_step_result() -> McpExecutionResult:
-    return McpExecutionResult(status_code=200, content={})
-
-
 class _HeldResponseTransport(httpx.AsyncBaseTransport):
     """Return scripted responses, advancing a fake clock by each response's hold."""
 
@@ -556,6 +553,7 @@ class _HeldResponseTransport(httpx.AsyncBaseTransport):
         responses: list[tuple[float, httpx.Response | Exception]],
         *,
         runner_registry: McpExecutionRegistry | None = None,
+        runner_content: dict[str, Any] | None = None,
     ) -> None:
         self.now = 0.0
         self.calls: list[_Call] = []
@@ -563,6 +561,10 @@ class _HeldResponseTransport(httpx.AsyncBaseTransport):
         self._responses = list(responses)
         # Each call first reaches the runner's initial step, as a server forward would.
         self._runner_registry = runner_registry
+        self._runner_content = runner_content or {}
+
+    async def _runner_step_result(self) -> McpExecutionResult:
+        return McpExecutionResult(status_code=200, content=self._runner_content)
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
@@ -573,7 +575,7 @@ class _HeldResponseTransport(httpx.AsyncBaseTransport):
                 operation_id=body["params"][MCP_OPERATION_ID_PARAM],
                 step="initial",
                 params={},
-                run=_runner_step_result,
+                run=self._runner_step_result,
             )
         read_timeout = request.extensions["timeout"]["read"]
         self.read_timeouts.append(read_timeout)
@@ -655,25 +657,37 @@ async def test_call_tool_reattaches_after_gateway_severs_held_request(
     assert external_invocations == 1
     assert [call.body["id"] for call in transport.calls] == [1, 2]
     first_params, retry_params = [call.body["params"] for call in transport.calls]
-    assert retry_params == first_params
+    assert retry_params == {**first_params, MCP_ATTACH_ONLY_PARAM: True}
+    assert MCP_ATTACH_ONLY_PARAM not in first_params
+
+
+_INPUT_REQUESTED = {"result": {"input_required": {"inputRequests": {}, "requestState": "s"}}}
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("tool_name", "status", "held_s", "call_budget_s", "runner_executes"),
+    ("tool_name", "status", "held_s", "call_budget_s", "runner_content"),
     [
-        pytest.param("sys_os_shell", 504, 1.0, 7260.0, True, id="fast-failure"),
-        pytest.param("sys_os_shell", 500, 300.0, 7260.0, True, id="server-error"),
-        pytest.param("tracker__read_ticket", 504, 300.0, 7260.0, True, id="registry-route"),
-        pytest.param("sys_os_shell", 504, 300.0, 300.0, True, id="call-budget-spent"),
-        pytest.param("sys_advise_models", 504, 300.0, 7260.0, False, id="server-side-tool"),
+        pytest.param("sys_os_shell", 504, 1.0, 7260.0, {}, id="fast-failure"),
+        pytest.param("sys_os_shell", 500, 300.0, 7260.0, {}, id="server-error"),
+        pytest.param("tracker__read_ticket", 504, 300.0, 7260.0, {}, id="registry-route"),
+        pytest.param("sys_os_shell", 504, 300.0, 300.0, {}, id="call-budget-spent"),
+        pytest.param("sys_advise_models", 504, 300.0, 7260.0, None, id="server-side-tool"),
         pytest.param(
             "mcp__omnigent__sys_advise_models",
             504,
             300.0,
             7260.0,
-            False,
+            None,
             id="namespaced-server-side-tool",
+        ),
+        pytest.param(
+            "deployment__deploy",
+            504,
+            300.0,
+            7260.0,
+            _INPUT_REQUESTED,
+            id="mcp-input-request",
         ),
     ],
 )
@@ -683,7 +697,7 @@ async def test_call_tool_does_not_repost_unattachable_http_failures(
     status: int,
     held_s: float,
     call_budget_s: float,
-    runner_executes: bool,
+    runner_content: dict[str, Any] | None,
 ) -> None:
     """Only a held gateway sever on a runner-held execution is re-POSTed."""
     from omnigent.runner import proxy_mcp_manager
@@ -691,7 +705,8 @@ async def test_call_tool_does_not_repost_unattachable_http_failures(
     registry = McpExecutionRegistry()
     transport = _HeldResponseTransport(
         [(held_s, httpx.Response(status))],
-        runner_registry=registry if runner_executes else None,
+        runner_registry=registry if runner_content is not None else None,
+        runner_content=runner_content,
     )
     monkeypatch.setattr(proxy_mcp_manager, "monotonic", lambda: transport.now)
     monkeypatch.setattr(proxy_mcp_manager, "MCP_PROXY_CALL_TIMEOUT_S", call_budget_s)
@@ -811,17 +826,19 @@ async def test_call_tool_does_not_resend_approved_reply_after_gateway_sever(
     from omnigent.runner import proxy_mcp_manager
 
     elicitation_id = "elicit_shell"
+    registry = McpExecutionRegistry()
     transport = _HeldResponseTransport(
         [
             (0.0, _input_required(elicitation_id, "approval-state", 1)),
             (300.0, httpx.Response(504)),
-        ]
+        ],
+        runner_registry=registry,
     )
     monkeypatch.setattr(proxy_mcp_manager, "monotonic", lambda: transport.now)
     pending_approvals.reset_for_tests()
     async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
         manager = ProxyMcpManager(
-            session_id="conv_test", ap_client=client, execution_registry=McpExecutionRegistry()
+            session_id="conv_test", ap_client=client, execution_registry=registry
         )
         task = asyncio.create_task(manager.call_tool(None, "sys_os_shell", {}))
         try:
@@ -836,6 +853,8 @@ async def test_call_tool_does_not_resend_approved_reply_after_gateway_sever(
 
     assert [call.body["id"] for call in transport.calls] == [1, 2]
     assert transport.calls[1].body["params"]["requestState"] == "approval-state"
+    operation_id = transport.calls[0].body["params"][MCP_OPERATION_ID_PARAM]
+    assert registry.can_attach("conv_test", operation_id, "initial")
 
 
 @pytest.mark.asyncio
@@ -887,6 +906,11 @@ async def test_call_tool_excludes_approval_wait_from_reattach_budget(
             pending_approvals.reset_for_tests()
 
     assert transport.read_timeouts == [300.0, 100.0, 100.0]
+    assert [MCP_ATTACH_ONLY_PARAM in call.body["params"] for call in transport.calls] == [
+        False,
+        True,
+        True,
+    ]
     assert ("requestState" in transport.calls[2].body["params"]) == (
         next_request == "approval-reply"
     )

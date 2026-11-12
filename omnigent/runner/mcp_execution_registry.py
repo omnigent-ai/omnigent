@@ -26,8 +26,12 @@ _MAX_COMPLETED = 1024
 # when the caller can prove it still owns the matching operation locally.
 MCP_OPERATION_ID_PARAM = "_omnigent_operation_id"
 MCP_INITIAL_STEP = "initial"
+MCP_ATTACH_ONLY_PARAM = "_omnigent_operation_attach"
 RUNNER_MCP_EXECUTION_DETACHED_CODE = -32098
 RUNNER_MCP_EXECUTION_DETACHED_MESSAGE = "Runner MCP execution detached."
+MCP_ATTACH_UNAVAILABLE_MESSAGE = (
+    "Runner cannot reattach to this MCP operation; completion is unknown"
+)
 
 
 class McpExecutionConflict(RuntimeError):
@@ -49,6 +53,12 @@ class _Execution:
     fingerprint: str
     task: asyncio.Task[McpExecutionResult]
     completed_at: float | None = None
+
+
+def requests_input(result: McpExecutionResult) -> bool:
+    """Return whether a step ended by asking the server for user input."""
+    rpc_result = result.content.get("result")
+    return isinstance(rpc_result, dict) and rpc_result.get("input_required") is not None
 
 
 def _fingerprint(params: JsonObject) -> str:
@@ -96,10 +106,18 @@ class McpExecutionRegistry:
             for stored_session, stored_operation, _step in self._entries
         )
 
-    def has_step(self, session_id: str, operation_id: str, step: str) -> bool:
-        """Return whether one operation step is running or retained."""
+    def can_attach(self, session_id: str, operation_id: str, step: str) -> bool:
+        """Return whether a retry can attach to this step without running it."""
         self._prune()
-        return (session_id, operation_id, step) in self._entries
+        entry = self._entries.get((session_id, operation_id, step))
+        if entry is None:
+            return False
+        task = entry.task
+        if not task.done() or task.cancelled() or task.exception() is not None:
+            return True
+        # The server consumed an input request before the sever; replaying it
+        # cannot resume the follow-up step that the server never received.
+        return not requests_input(task.result())
 
     async def execute(
         self,

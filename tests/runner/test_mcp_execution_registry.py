@@ -83,7 +83,7 @@ async def test_live_operation_lease_survives_result_eviction(
 
     registry.retain_operation("conv_restart", "mcpop_restart")
     assert registry.has_operation("conv_restart", "mcpop_restart")
-    assert not registry.has_step("conv_restart", "mcpop_restart", "initial")
+    assert not registry.can_attach("conv_restart", "mcpop_restart", "initial")
 
     request = {"name": "deploy", "arguments": {}}
     first = await registry.execute(
@@ -93,7 +93,7 @@ async def test_live_operation_lease_survives_result_eviction(
         params=request,
         run=_external_work,
     )
-    assert registry.has_step("conv_restart", "mcpop_restart", "initial")
+    assert registry.can_attach("conv_restart", "mcpop_restart", "initial")
     second = await registry.execute(
         session_id="conv_restart",
         operation_id="mcpop_restart",
@@ -107,6 +107,29 @@ async def test_live_operation_lease_survives_result_eviction(
 
     registry.release_operation("conv_restart", "mcpop_restart")
     assert not registry.has_operation("conv_restart", "mcpop_restart")
+
+
+@pytest.mark.asyncio
+async def test_step_that_requested_input_is_not_attachable() -> None:
+    """A retry cannot resume an input request the server already consumed."""
+    registry = McpExecutionRegistry()
+
+    async def _request_input() -> McpExecutionResult:
+        return McpExecutionResult(
+            status_code=200,
+            content={"result": {"input_required": {"inputRequests": {}, "requestState": "s"}}},
+        )
+
+    await registry.execute(
+        session_id="conv_restart",
+        operation_id="mcpop_input",
+        step="initial",
+        params={},
+        run=_request_input,
+    )
+
+    assert registry.has_operation("conv_restart", "mcpop_input")
+    assert not registry.can_attach("conv_restart", "mcpop_input", "initial")
 
 
 @pytest.mark.asyncio

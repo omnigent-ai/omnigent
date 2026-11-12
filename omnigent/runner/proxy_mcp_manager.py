@@ -36,6 +36,7 @@ import httpx
 from omnigent.debug_logging import debug_event
 from omnigent.runner import pending_approvals
 from omnigent.runner.mcp_execution_registry import (
+    MCP_ATTACH_ONLY_PARAM,
     MCP_INITIAL_STEP,
     MCP_OPERATION_ID_PARAM,
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
@@ -410,16 +411,25 @@ class ProxyMcpManager:
                     ),
                 )
 
+        # Requests that reattach after a gateway sever share the severed request's budget.
+        reattach_deadline: float | None = None
+
+        def _operation_params() -> _JsonObject:
+            params: _JsonObject = {
+                "name": wire_name,
+                "arguments": arguments,
+                MCP_OPERATION_ID_PARAM: operation_id,
+            }
+            if reattach_deadline is not None:
+                params[MCP_ATTACH_ONLY_PARAM] = True
+            return params
+
         def _initial_payload() -> _JsonObject:
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "method": "tools/call",
-                "params": {
-                    "name": wire_name,
-                    "arguments": arguments,
-                    MCP_OPERATION_ID_PARAM: operation_id,
-                },
+                "params": _operation_params(),
             }
 
         async def _wait_to_reattach(
@@ -486,8 +496,6 @@ class ProxyMcpManager:
 
         payload = _initial_payload()
         approval_retries = 0
-        # Requests that reattach after a gateway sever share the severed request's budget.
-        reattach_deadline: float | None = None
 
         while True:
             request_generation = pending_approvals.current_server_generation()
@@ -557,9 +565,9 @@ class ProxyMcpManager:
                     ) from exc
                 held_s = monotonic() - started
                 registry = self._execution_registry
-                # Only a step the runner registry already holds can be reattached;
-                # server-side tools never reach it. The server consumes an approval
-                # on first use, so an approved reply is never re-sent.
+                # Only a step this runner holds can be reattached, and the retry is
+                # attach-only so no runner starts it again. The server consumes an
+                # approval on first use, so an approved reply is never re-sent.
                 if (
                     isinstance(exc, httpx.HTTPStatusError)
                     and exc.response.status_code in _GATEWAY_SEVER_STATUSES
@@ -568,7 +576,7 @@ class ProxyMcpManager:
                     and approval_retries == 0
                     and monotonic() < request_deadline
                     and registry is not None
-                    and registry.has_step(self._session_id, operation_id, MCP_INITIAL_STEP)
+                    and registry.can_attach(self._session_id, operation_id, MCP_INITIAL_STEP)
                 ):
                     with suppress(Exception):
                         _logger.warning(
@@ -580,7 +588,7 @@ class ProxyMcpManager:
                         )
                     reattach_deadline = request_deadline
                     request_id += 1
-                    payload = cast("_JsonObject", {**payload, "id": request_id})
+                    payload = _initial_payload()
                     continue
                 _record_failure(
                     exc,
@@ -667,7 +675,7 @@ class ProxyMcpManager:
                     payload = _initial_payload()
                     continue
                 finally:
-                    # Approval waits do not spend a reattached execution's budget.
+                    # Policy approval waits do not spend a reattached execution's budget.
                     if reattach_deadline is not None:
                         reattach_deadline += monotonic() - approval_started
 
@@ -677,9 +685,7 @@ class ProxyMcpManager:
                     "id": request_id,  # MRTR retry MUST use a different id
                     "method": "tools/call",
                     "params": {
-                        "name": wire_name,
-                        "arguments": arguments,
-                        MCP_OPERATION_ID_PARAM: operation_id,
+                        **_operation_params(),
                         "requestState": request_state,
                         "inputResponses": {
                             elicitation_id: _input_response(
