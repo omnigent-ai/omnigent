@@ -7,6 +7,8 @@ import {
   setIOSDocumentScrollEnabled,
 } from "@/lib/nativeBridge";
 
+const SHELL_TOP_VAR = "--omnigent-shell-top";
+
 /** Keep content above the docked keyboard without shrinking for floating iPad controls. */
 export function useIOSViewportLock(): void {
   useEffect(() => {
@@ -34,6 +36,11 @@ export function useIOSViewportLock(): void {
         `${Math.round(getIOSKeyboardViewportHeight() ?? viewport.height)}px`,
       );
       resetPan();
+      // A host page can place the shell below its own header; the shell then
+      // fits the visible height minus that document offset.
+      const shell = document.querySelector<HTMLElement>(".app-shell[data-ios-native]");
+      const shellTop = shell ? shell.getBoundingClientRect().top + window.scrollY : 0;
+      root.style.setProperty(SHELL_TOP_VAR, `${Math.max(0, Math.round(shellTop))}px`);
     };
 
     // Coalesce the burst of resize/scroll events the keyboard animation fires.
@@ -60,6 +67,7 @@ export function useIOSViewportLock(): void {
       window.removeEventListener("orientationchange", schedule);
       window.removeEventListener("resize", schedule);
       root.style.removeProperty("--omnigent-viewport-height");
+      root.style.removeProperty(SHELL_TOP_VAR);
     };
   }, []);
 }
