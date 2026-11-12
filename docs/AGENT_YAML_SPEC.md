@@ -733,7 +733,7 @@ not pass secrets through the environment unless the tool genuinely needs them.
 
 You usually don't need to choose a `sandbox.type` — omit it and Omnigent picks
 the platform default (`linux_bwrap` on Linux, `darwin_seatbelt` on macOS, or
-`windows_jobobject` on Windows), so the same YAML works across platforms. Use
+`windows_jobobject` on Windows). Use
 `type: auto` to explicitly request the platform-default sandbox backend:
 
 ```yaml
@@ -763,6 +763,12 @@ success: shell descendants may outlive the command. The next tool call starts a
 fresh helper. Shell calls therefore still incur helper startup cost; warm shell
 reuse needs a complete per-request process lifetime boundary. This tool lease
 policy does not change shared copy-on-write environments or forked environments.
+
+Inner harness adapters reject `windows_jobobject`, including the Windows
+default, because it cannot enforce the requested filesystem and network
+boundaries. Confined harness processes require a supported Linux or macOS
+backend. Claude SDK containment also requires a system-installed or SDK-bundled Claude CLI;
+`OMNIGENT_CLAUDE_SDK_NO_SANDBOX` cannot bypass a requested sandbox.
 
 ### Secretless credential proxy
 
