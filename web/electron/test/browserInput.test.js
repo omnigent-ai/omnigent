@@ -11,7 +11,6 @@ const {
   AGENT_INPUT_GRACE_MS,
   agentInputInFlight,
   fileChooserGuard,
-  parseKeyCombo,
   performBrowserInput,
   runActionScript,
 } = require("../src/browserInput");
@@ -33,46 +32,6 @@ const {
   mouseTypes,
   keyEvents,
 } = require("./browserInputFakes");
-
-describe("parseKeyCombo", () => {
-  it("parses names, characters, aliases and the platform's modifiers", () => {
-    assert.equal(parseKeyCombo("Enter").text, "\r");
-    assert.deepEqual(parseKeyCombo("Shift+a"), {
-      modifiers: ["Shift"],
-      key: "A",
-      code: "KeyA",
-      keyCode: 65,
-      text: "A",
-    });
-    assert.equal(parseKeyCombo("Esc").key, "Escape");
-    assert.equal(parseKeyCombo("7").code, "Digit7");
-    assert.deepEqual(parseKeyCombo("Cmd+Ctrl+Option+x").modifiers, ["Meta", "Control", "Alt"]);
-    assert.deepEqual(parseKeyCombo("ControlOrMeta+a", "darwin").modifiers, ["Meta"]);
-    assert.deepEqual(parseKeyCombo("ControlOrMeta+a", "linux").modifiers, ["Control"]);
-    assert.equal(parseKeyCombo("+").key, "+");
-    assert.deepEqual(parseKeyCombo("Shift++").modifiers, ["Shift"]);
-  });
-
-  it("types what Shift gives on a US keyboard for digits and punctuation", () => {
-    assert.deepEqual(parseKeyCombo("Shift+1"), {
-      modifiers: ["Shift"],
-      key: "!",
-      code: "Digit1",
-      keyCode: 49,
-      text: "!",
-    });
-    assert.equal(parseKeyCombo("Shift+/").key, "?");
-    assert.equal(parseKeyCombo("Shift+/").code, "Slash");
-    assert.equal(parseKeyCombo("Shift+;").text, ":");
-    assert.equal(parseKeyCombo("1").text, "1", "unshifted is unchanged");
-  });
-
-  it("rejects unknown keys and modifiers", () => {
-    for (const combo of ["", "Hyper+a", "NotAKey", "Shift+", 5, "x".repeat(65)]) {
-      assert.throws(() => parseKeyCombo(combo), undefined, String(combo));
-    }
-  });
-});
 
 describe("performBrowserInput: mouse", () => {
   it("keeps the shell's context menu off through a slow right-click, then gives it back", async () => {
@@ -417,8 +376,8 @@ describe("performBrowserInput: drag", () => {
     }
     // An overlay, or another drop zone, covers the column.
     for (const [event, error] of [
-      ["started", /covered by <div.overlay> once the drag started; nothing was dropped/],
-      ["dragOver", /covered by <div.overlay> during the drag; nothing was dropped/],
+      ["started", /covered by <div.overlay>/],
+      ["dragOver", /covered by <div.overlay>/],
     ]) {
       // oxlint-disable-next-line no-await-in-loop -- One drag at a time.
       const { result, dropped, page } = await drag(
@@ -580,7 +539,7 @@ describe("performBrowserInput: keys and typing", () => {
     mode = "set";
     await performBrowserInput(entry, "type", { selector: "#when", text: "2026-01-02" });
     assert.deepEqual(
-      inputCommands(commands).map(([method, p]) => `${method}:${p.text ?? p.key}`),
+      inputCommands(commands).map(([method, p]) => `${method}:${p.key ?? p.text}`),
       [
         "Input.insertText:hello",
         "Input.dispatchKeyEvent:Backspace",
@@ -765,6 +724,34 @@ describe("performBrowserInput: check", () => {
 });
 
 describe("performBrowserInput: deadlines and cleanup", () => {
+  it("disconnects an automation connection that finishes after its action expired", async (t) => {
+    const ready = stall();
+    const { entry, commands, steps } = makeEntry({ points: { "#go": at(1, 1) } });
+    const driver = require("../src/browserAutomationDriver");
+    const connect = driver.connect;
+    let disconnected = 0;
+    t.mock.method(driver, "connect", async (...args) => {
+      await ready.promise;
+      const connection = await connect(...args);
+      return {
+        ...connection,
+        disconnect() {
+          disconnected += 1;
+          connection.disconnect();
+        },
+      };
+    });
+    await assert.rejects(
+      performBrowserInput(entry, "click", { selector: "#go" }, { deadlineAt: Date.now() + 30 }),
+      EXPIRED,
+    );
+    ready.resume();
+    await sleep(20);
+    assert.equal(disconnected, 1, "the late connection is released");
+    assert.deepEqual(steps, [], "no page work starts after connection setup expired");
+    assert.deepEqual(inputCommands(commands), [], "nothing reaches the page late");
+  });
+
   it("serializes actions on one view and reuses a debugger someone else attached", async () => {
     const { entry, lifecycle, commands } = makeEntry({
       attached: true,

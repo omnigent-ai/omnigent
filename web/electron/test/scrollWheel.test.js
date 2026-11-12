@@ -46,6 +46,11 @@ describe("performBrowserInput: scroll", () => {
     });
     const wheel = commands.find(([, p]) => p?.type === "mouseWheel")[1];
     assert.deepEqual([wheel.x, wheel.y, wheel.deltaX, wheel.deltaY], [50, 60, 0, 540]);
+    assert.equal(
+      commands.some(([, params]) => params?.type === "mouseMoved"),
+      false,
+      "scrolling does not trigger a hover that could change the measured container",
+    );
   });
 
   it("scrolls the container directly when no visible spot reaches it", async () => {

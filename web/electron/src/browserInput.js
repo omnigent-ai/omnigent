@@ -1,62 +1,16 @@
 "use strict";
 
 /**
- * Trusted mouse and keyboard input for agent browser actions. Page scripts can
- * only synthesize untrusted events, which hover menus, context menus,
- * drag-and-drop, real key presses and rich-text editors ignore. The Chrome
- * DevTools Protocol's `Input` domain dispatches events the page sees as user
- * input, including on detached (background-session) views. It works with the
- * user's own DevTools open on the page: Chromium allows both clients.
- *
- * Page scripts here only find elements and read state; the input itself goes
- * through the protocol. `select_option` stays a page script (browserIpc.js):
- * the native dropdown is an OS menu that protocol input can't drive.
+ * Puppeteer supplies trusted keyboard/mouse input to the authorized Electron
+ * view. Omnigent retains target, document, popup and deadline guards because
+ * those protect the app's shared browser rather than implement input mechanics.
  */
 
+const automationDriver = require("./browserAutomationDriver");
+const { keyboardKey, parseKeyCombo } = require("./browserKeys");
 const { buildAgentActionScript } = require("./agentActionScripts.mjs");
 const { beforeAgentDeadline, DEFAULT_ACTION_MS, PAGE_TIMEOUT_ERROR } = require("./agentDeadline");
 
-const BUTTON_BITS = { left: 1, right: 2, middle: 4 };
-const MODIFIER_BITS = { Alt: 1, Control: 2, Meta: 4, Shift: 8 };
-const MODIFIER_KEYS = {
-  Alt: { code: "AltLeft", keyCode: 18 },
-  Control: { code: "ControlLeft", keyCode: 17 },
-  Meta: { code: "MetaLeft", keyCode: 91 },
-  Shift: { code: "ShiftLeft", keyCode: 16 },
-};
-const MODIFIER_ALIASES = {
-  alt: "Alt",
-  option: "Alt",
-  control: "Control",
-  ctrl: "Control",
-  meta: "Meta",
-  cmd: "Meta",
-  command: "Meta",
-  shift: "Shift",
-};
-const NAMED_KEYS = {
-  Enter: { code: "Enter", keyCode: 13, text: "\r" },
-  Tab: { code: "Tab", keyCode: 9 },
-  Escape: { code: "Escape", keyCode: 27 },
-  Backspace: { code: "Backspace", keyCode: 8 },
-  Delete: { code: "Delete", keyCode: 46 },
-  Insert: { code: "Insert", keyCode: 45 },
-  ArrowUp: { code: "ArrowUp", keyCode: 38 },
-  ArrowDown: { code: "ArrowDown", keyCode: 40 },
-  ArrowLeft: { code: "ArrowLeft", keyCode: 37 },
-  ArrowRight: { code: "ArrowRight", keyCode: 39 },
-  Home: { code: "Home", keyCode: 36 },
-  End: { code: "End", keyCode: 35 },
-  PageUp: { code: "PageUp", keyCode: 33 },
-  PageDown: { code: "PageDown", keyCode: 34 },
-  " ": { code: "Space", keyCode: 32, text: " " },
-};
-for (let n = 1; n <= 12; n += 1) NAMED_KEYS[`F${n}`] = { code: `F${n}`, keyCode: 111 + n };
-const KEY_ALIASES = { esc: "Escape", return: "Enter", space: " ", del: "Delete" };
-const NAMED_KEY_BY_LOWER = Object.fromEntries(
-  Object.keys(NAMED_KEYS).map((name) => [name.toLowerCase(), name]),
-);
-const DRAG_STEPS = 5;
 const CONTEXT_MENU_SUPPRESS_MS = 1000;
 // A click handler can open a file picker a moment after the click.
 const FILE_CHOOSER_SETTLE_MS = 150;
@@ -111,7 +65,7 @@ const FILE_CHOOSER_ERROR =
 // Inputs whose click opens a native picker over the user's screen.
 const PICKER_INPUT_TYPES = new Set(["date", "datetime-local", "month", "time", "week", "color"]);
 // Keys that open a focused <select>'s or picker's popup (arrows do on macOS).
-const POPUP_KEY_CODES = new Set(["Space", "Enter", "NumpadEnter", "ArrowUp", "ArrowDown", "F4"]);
+const POPUP_KEYS = new Set([" ", "Enter", "ArrowUp", "ArrowDown", "F4"]);
 
 const sleep = (ms) =>
   new Promise((resolve) => {
@@ -236,121 +190,6 @@ async function runPinnedScript(dbg, webContents, node, js, { deadlineAt, goneErr
       },
     );
   return beforeAgentDeadline(call, deadlineAt);
-}
-
-// What Shift types on a US keyboard for digits and punctuation, with the
-// physical key's code and virtual key code.
-const US_SHIFTED = {
-  1: "!",
-  2: "@",
-  3: "#",
-  4: "$",
-  5: "%",
-  6: "^",
-  7: "&",
-  8: "*",
-  9: "(",
-  0: ")",
-  "`": "~",
-  "-": "_",
-  "=": "+",
-  "[": "{",
-  "]": "}",
-  "\\": "|",
-  ";": ":",
-  "'": '"',
-  ",": "<",
-  ".": ">",
-  "/": "?",
-};
-const US_SHIFTED_CODE = {
-  ...Object.fromEntries("1234567890".split("").map((d) => [d, `Digit${d}`])),
-  "`": "Backquote",
-  "-": "Minus",
-  "=": "Equal",
-  "[": "BracketLeft",
-  "]": "BracketRight",
-  "\\": "Backslash",
-  ";": "Semicolon",
-  "'": "Quote",
-  ",": "Comma",
-  ".": "Period",
-  "/": "Slash",
-};
-const US_SHIFTED_KEYCODE = {
-  ...Object.fromEntries("1234567890".split("").map((d) => [d, d.charCodeAt(0)])),
-  "`": 192,
-  "-": 189,
-  "=": 187,
-  "[": 219,
-  "]": 221,
-  "\\": 220,
-  ";": 186,
-  "'": 222,
-  ",": 188,
-  ".": 190,
-  "/": 191,
-};
-
-/**
- * Parse `"Shift+Tab"` / `"Control+a"` / `"Enter"` into modifiers and a key
- * definition for `Input.dispatchKeyEvent`.
- *
- * @param {unknown} combo
- * @param {string} [platform] `process.platform`, for `ControlOrMeta`.
- * @returns {{ modifiers: string[], key: string, code: string, keyCode: number, text?: string }}
- */
-function parseKeyCombo(combo, platform = process.platform) {
-  if (typeof combo !== "string" || !combo || combo.length > 64) {
-    throw new Error("key must be a non-empty string of at most 64 characters");
-  }
-  // The last `+`-separated part is the key; `+` itself is spelled `+` or `Shift++`.
-  const plusKey = combo === "+" || combo.endsWith("++");
-  const split = plusKey ? combo.length - 2 : combo.lastIndexOf("+");
-  const keyName = plusKey ? "+" : combo.slice(split + 1);
-  const modifierText = split < 0 ? "" : combo.slice(0, split);
-  if (!keyName) throw new Error(`key "${combo}" is missing the key after its modifiers`);
-  const modifiers = [];
-  for (const part of modifierText ? modifierText.split("+") : []) {
-    const lower = part.trim().toLowerCase();
-    const modifier =
-      lower === "controlormeta"
-        ? platform === "darwin"
-          ? "Meta"
-          : "Control"
-        : MODIFIER_ALIASES[lower];
-    if (!modifier) throw new Error(`unknown modifier "${part}" in key "${combo}"`);
-    if (!modifiers.includes(modifier)) modifiers.push(modifier);
-  }
-  const shift = modifiers.includes("Shift");
-  const named = NAMED_KEYS[keyName] ? keyName : NAMED_KEY_BY_LOWER[keyName.toLowerCase()];
-  const alias = KEY_ALIASES[keyName.toLowerCase()];
-  if (named || alias) {
-    const name = named ?? alias;
-    return { modifiers, key: name, ...NAMED_KEYS[name] };
-  }
-  if ([...keyName].length !== 1) {
-    throw new Error(`unknown key "${keyName}"; use a key name like Enter or a single character`);
-  }
-  const shiftedKey = shift ? US_SHIFTED[keyName] : undefined;
-  if (shiftedKey) {
-    return {
-      modifiers,
-      key: shiftedKey,
-      code: US_SHIFTED_CODE[keyName] ?? "",
-      keyCode: US_SHIFTED_KEYCODE[keyName] ?? 0,
-      text: shiftedKey,
-    };
-  }
-  const char = shift && /^[a-z]$/.test(keyName) ? keyName.toUpperCase() : keyName;
-  const upper = char.toUpperCase();
-  if (/^[A-Z]$/.test(upper)) {
-    return { modifiers, key: char, code: `Key${upper}`, keyCode: upper.charCodeAt(0), text: char };
-  }
-  if (/^[0-9]$/.test(char)) {
-    return { modifiers, key: char, code: `Digit${char}`, keyCode: char.charCodeAt(0), text: char };
-  }
-  return { modifiers, key: char, code: "", keyCode: 0, text: char };
 }
 
 /**
@@ -546,6 +385,8 @@ function withDebugger(webContents, fn, { deadlineAt = Date.now() + DEFAULT_ACTIO
       let relinquished = false;
       // Whether `pin` resolved a target, whose handles the cleanup releases.
       let pinned = false;
+      let automation;
+      let verifiedInput = false;
       const track = (method, params) => {
         const type = params?.type;
         if (method === "Input.dispatchKeyEvent") {
@@ -620,18 +461,23 @@ function withDebugger(webContents, fn, { deadlineAt = Date.now() + DEFAULT_ACTIO
             // A caller that has just done this itself (verifyDocument) skips
             // the round trip, so nothing can change between its last check
             // and the input.
-            if (!options?.documentVerified) {
+            if (!options?.documentVerified && !verifiedInput) {
               const loaderId = startLoaderId === undefined ? undefined : await mainLoaderId();
               if (loaderId !== startLoaderId) throw new Error(changedError());
             }
             live();
+            verifiedInput = false;
             inputSent = true;
           } else if (expired) {
             throw new Error(EXPIRED_ERROR);
           }
           // Recorded before sending: a press whose command stalls may still land.
           track(method, params);
-          const answer = await real.sendCommand(method, params);
+          const answer = await real.sendCommand(
+            method,
+            params,
+            typeof options === "string" ? options : undefined,
+          );
           untrack(method, params);
           return answer;
         },
@@ -642,6 +488,17 @@ function withDebugger(webContents, fn, { deadlineAt = Date.now() + DEFAULT_ACTIO
           const loaderId = startLoaderId === undefined ? undefined : await mainLoaderId();
           if (loaderId !== startLoaderId) throw new Error(changedError());
           live();
+        },
+        isAttached: () => real.isAttached(),
+        // Used after the final focus check: no protocol read may move focus
+        // between that check and the first trusted typing command.
+        withVerifiedInput: async (sendInput) => {
+          verifiedInput = true;
+          try {
+            return await sendInput();
+          } finally {
+            verifiedInput = false;
+          }
         },
         on: (name, listener) => real.on(name, listener),
         removeListener: (name, listener) => real.removeListener(name, listener),
@@ -690,6 +547,13 @@ function withDebugger(webContents, fn, { deadlineAt = Date.now() + DEFAULT_ACTIO
         await dbg.sendCommand("Page.enable");
         startLoaderId = await mainLoaderId();
         await dbg.sendCommand("Page.setInterceptFileChooserDialog", { enabled: true });
+        const connection = await automationDriver.connect(webContents, dbg, { deadlineAt });
+        if (relinquished) {
+          connection.disconnect();
+          throw new Error(EXPIRED_ERROR);
+        }
+        automation = connection;
+        dbg.automation = connection.page;
         const result = await fn(dbg);
         await sleep(FILE_CHOOSER_SETTLE_MS);
         if (fileChooser) throw new Error(FILE_CHOOSER_ERROR);
@@ -734,6 +598,7 @@ function withDebugger(webContents, fn, { deadlineAt = Date.now() + DEFAULT_ACTIO
         if (releases.length > 0) {
           await Promise.race([Promise.all(releases), sleep(CLEANUP_WAIT_MS)]);
         }
+        automation?.disconnect();
         // Input the page took as the user's may open a picker later on, as
         // may an earlier action's (a hover after a click sends none).
         const guardUntil = Math.max(
@@ -808,21 +673,36 @@ function rejectUnknownArgs(args, allowed) {
 }
 
 function mouse(dbg, type, point, extra = {}) {
-  return dbg.sendCommand("Input.dispatchMouseEvent", {
-    type,
-    x: point.x,
-    y: point.y,
-    button: "none",
-    buttons: 0,
-    modifiers: 0,
-    ...extra,
-  });
+  const pointer = dbg.automation.mouse;
+  if (type === "mouseMoved") return pointer.move(point.x, point.y, { steps: extra.steps ?? 1 });
+  if (type === "mousePressed") {
+    return pointer.down({ button: extra.button, clickCount: extra.clickCount });
+  }
+  if (type === "mouseReleased") {
+    return pointer.up({ button: extra.button, clickCount: extra.clickCount });
+  }
+  if (type === "mouseWheel") {
+    // Puppeteer's wheel uses its last pointer position. Moving there first
+    // would run hover handlers after our scroll-container measurement.
+    return dbg.sendCommand("Input.dispatchMouseEvent", {
+      type,
+      x: point.x,
+      y: point.y,
+      button: "none",
+      buttons: 0,
+      modifiers: 0,
+      deltaX: extra.deltaX,
+      deltaY: extra.deltaY,
+    });
+  }
+  throw new Error("Unsupported pointer input");
 }
 
 async function click(entry, dbg, args) {
   rejectUnknownArgs(args, ["ref", "snapshot_id", "selector", "button", "double_click"]);
   const button = args.button ?? "left";
-  if (!Object.hasOwn(BUTTON_BITS, button)) throw new Error("button must be left, right or middle");
+  if (!["left", "right", "middle"].includes(button))
+    throw new Error("button must be left, right or middle");
   if (args.double_click !== undefined && typeof args.double_click !== "boolean") {
     throw new Error("double_click must be a boolean");
   }
@@ -844,7 +724,7 @@ async function click(entry, dbg, args) {
       // oxlint-disable-next-line no-await-in-loop -- Mouse events must arrive in order.
       if (clickCount === 2) await secondClickPoint(dbg, target, at, button);
       // oxlint-disable-next-line no-await-in-loop -- Mouse events must arrive in order.
-      await mouse(dbg, "mousePressed", at, { button, buttons: BUTTON_BITS[button], clickCount });
+      await mouse(dbg, "mousePressed", at, { button, clickCount });
       // oxlint-disable-next-line no-await-in-loop -- Mouse events must arrive in order.
       await mouse(dbg, "mouseReleased", at, { button, clickCount });
     }
@@ -991,7 +871,7 @@ async function drag(entry, dbg, args) {
   };
   dbg.on("message", onMessage);
   try {
-    await dbg.sendCommand("Input.setInterceptDrags", { enabled: true });
+    await dbg.automation.setDragInterception(true);
     // A hover effect can move or cover the source once the pointer is on it.
     const from = await pointAtRest(dbg, start, () => locate(dbg, source, { scroll: "none" }));
     await mouse(dbg, "mousePressed", from, { button: "left", buttons: 1, clickCount: 1 });
@@ -999,31 +879,18 @@ async function drag(entry, dbg, args) {
     // insert placeholders or show overlays, which can move or cover the drop
     // target. Measure it again in that layout, and drop where it is now; a
     // refusal leaves the held button to withDebugger's cleanup.
-    let to = end;
-    for (let step = 1; step <= DRAG_STEPS; step += 1) {
-      const point = {
-        x: from.x + ((to.x - from.x) * step) / DRAG_STEPS,
-        y: from.y + ((to.y - from.y) * step) / DRAG_STEPS,
-      };
-      // oxlint-disable-next-line no-await-in-loop -- Mouse events must arrive in order.
-      await mouse(dbg, "mouseMoved", point, { button: "left", buttons: 1 });
-      if (step === 1) {
-        // oxlint-disable-next-line no-await-in-loop -- The rest of the path depends on it.
-        to = await dbg.page("locate", { ...dropTarget, scroll: "none" });
-        if (!to.inView) {
-          throw new Error(
-            "the drop target moved off screen once the drag started; nothing was dropped",
-          );
-        }
-        if (to.covered) {
-          throw new Error(
-            `the drop target is covered by ${to.covered} once the drag started; nothing was dropped`,
-          );
-        }
-      }
-    }
-    const dragEvent = (type) =>
-      dbg.sendCommand("Input.dispatchDragEvent", { type, x: to.x, y: to.y, data: dragData });
+    await mouse(dbg, "mouseMoved", {
+      x: from.x + (end.x - from.x) / 5,
+      y: from.y + (end.y - from.y) / 5,
+    });
+    let to = await locate(dbg, dropTarget, { scroll: "none" });
+    await mouse(dbg, "mouseMoved", to, { steps: 4 });
+    const dragEvent = (type) => {
+      const pointer = dbg.automation.mouse;
+      if (type === "dragEnter") return pointer.dragEnter(to, dragData);
+      if (type === "dragOver") return pointer.dragOver(to, dragData);
+      return pointer.drop(to, dragData);
+    };
     if (dragData) {
       await dragEvent("dragEnter");
       await dragEvent("dragOver");
@@ -1041,7 +908,7 @@ async function drag(entry, dbg, args) {
   } finally {
     dbg.removeListener("message", onMessage);
     try {
-      await dbg.sendCommand("Input.setInterceptDrags", { enabled: false });
+      await dbg.automation.setDragInterception(false);
     } catch {
       /* view destroyed mid-drag */
     }
@@ -1052,6 +919,7 @@ async function drag(entry, dbg, args) {
 async function pressKey(entry, dbg, args, platform) {
   rejectUnknownArgs(args, ["key", "ref", "snapshot_id", "selector"]);
   const combo = parseKeyCombo(args.key, platform);
+  const unicode = [...combo.key].length === 1 && !/^[\x20-\x7e]$/.test(combo.key);
   const target = await pinTarget(dbg, args);
   const targeted = target.node !== undefined;
   // Where the key would go: still the target (focus handlers run after the
@@ -1060,7 +928,7 @@ async function pressKey(entry, dbg, args, platform) {
   // `keep` leaves the target for checking again.
   const checkKeyTarget = async ({ keep = false } = {}) => {
     if (targeted) await dbg.page("focus_confirm", keep ? { keep: true } : {});
-    if (!POPUP_KEY_CODES.has(combo.code)) return;
+    if (!POPUP_KEYS.has(combo.key)) return;
     const { tag, input_type: inputType } = await dbg.page("key_target", {});
     if (tag === "select" || PICKER_INPUT_TYPES.has(inputType)) {
       const what = tag === "select" ? "a native <select>" : `an <input type=${inputType}> picker`;
@@ -1071,52 +939,24 @@ async function pressKey(entry, dbg, args, platform) {
   };
   if (targeted) await dbg.page("focus", target);
   await checkKeyTarget({ keep: combo.modifiers.length > 0 });
-  let modifiers = 0;
+  const keyboard = dbg.automation.keyboard;
   const held = [];
   try {
     for (const name of combo.modifiers) {
-      modifiers |= MODIFIER_BITS[name];
-      // oxlint-disable-next-line no-await-in-loop -- Key events must arrive in order.
-      await dbg.sendCommand("Input.dispatchKeyEvent", {
-        type: "rawKeyDown",
-        key: name,
-        code: MODIFIER_KEYS[name].code,
-        windowsVirtualKeyCode: MODIFIER_KEYS[name].keyCode,
-        modifiers,
-      });
+      // oxlint-disable-next-line no-await-in-loop -- Shortcut modifiers must precede the key.
+      await keyboard.down(name);
       held.push(name);
     }
-    // The modifiers' keydowns ran page handlers too, which may have moved
-    // focus or focused a picker: check again right before the key.
     if (held.length > 0) await checkKeyTarget();
-    // A held Control/Alt/Meta makes the press a shortcut, not text entry.
-    const text = modifiers & ~MODIFIER_BITS.Shift ? undefined : combo.text;
-    const key = {
-      key: combo.key,
-      code: combo.code,
-      windowsVirtualKeyCode: combo.keyCode,
-      modifiers,
-    };
-    await dbg.sendCommand("Input.dispatchKeyEvent", {
-      type: text ? "keyDown" : "rawKeyDown",
-      ...key,
-      ...(text ? { text, unmodifiedText: text } : {}),
-    });
-    await dbg.sendCommand("Input.dispatchKeyEvent", { type: "keyUp", ...key });
+    if (unicode) {
+      await keyboard.sendCharacter(combo.key);
+    } else {
+      await keyboard.press(keyboardKey(combo));
+    }
   } finally {
-    // Release what's held, even when the key itself was refused.
     for (const name of held.reverse()) {
-      modifiers &= ~MODIFIER_BITS[name];
-      // oxlint-disable-next-line no-await-in-loop -- Key events must arrive in order.
-      await dbg
-        .sendCommand("Input.dispatchKeyEvent", {
-          type: "keyUp",
-          key: name,
-          code: MODIFIER_KEYS[name].code,
-          windowsVirtualKeyCode: MODIFIER_KEYS[name].keyCode,
-          modifiers,
-        })
-        .catch(() => {});
+      // oxlint-disable-next-line no-await-in-loop -- Release shortcuts in reverse order.
+      await keyboard.up(name).catch(() => {});
     }
   }
   return { ok: true };
@@ -1134,15 +974,12 @@ async function typeText(_entry, dbg, args) {
   // confirmation from the input.
   await dbg.verifyDocument();
   await dbg.page("type_confirm", {});
-  const verified = { documentVerified: true };
-  if (args.text) {
-    // Commits the text like an IME: trusted beforeinput / input, no key events.
-    await dbg.sendCommand("Input.insertText", { text: args.text }, verified);
-  } else {
-    const backspace = { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 };
-    await dbg.sendCommand("Input.dispatchKeyEvent", { type: "rawKeyDown", ...backspace }, verified);
-    await dbg.sendCommand("Input.dispatchKeyEvent", { type: "keyUp", ...backspace });
-  }
+  // Commit once, like an IME, rather than synthesize long-text DOM events.
+  await dbg.withVerifiedInput(() =>
+    args.text
+      ? dbg.automation.keyboard.sendCharacter(args.text)
+      : dbg.automation.keyboard.press("Backspace"),
+  );
   return { ok: true };
 }
 

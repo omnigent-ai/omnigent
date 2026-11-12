@@ -14,6 +14,9 @@ const {
   fileChooserGuard,
   performBrowserInput,
 } = require("../src/browserInput");
+const { installAutomationDriver } = require("./browserInputFakes");
+
+installAutomationDriver();
 
 // Its own test covers the file-chooser guard's listeners.
 fileChooserGuard.ms = 0;

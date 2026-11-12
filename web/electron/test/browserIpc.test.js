@@ -24,7 +24,7 @@ const {
   buildDesignModeScript,
   DESIGN_MODE_GESTURE_WINDOW_MS,
 } = require("../src/browserIpc");
-const { fakeRuntime } = require("./browserInputFakes");
+const { fakeRuntime, installAutomationDriver } = require("./browserInputFakes");
 
 /** A fake ipcMain that records `handle(channel, fn)` registrations and lets a
  *  test invoke a channel with a synthetic event + args. */
@@ -493,6 +493,7 @@ function makeWebContents({
  * trusted-input scripts (locate, type_prepare). Returns the command log.
  */
 function withFakeDebugger(wc) {
+  installAutomationDriver();
   const commands = [];
   let attached = false;
   wc.debugger = {

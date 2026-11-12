@@ -3,7 +3,35 @@
 // A scripted page and debugger for browserInput's tests.
 
 const { EventEmitter } = require("node:events");
+const { mock } = require("node:test");
 const vm = require("node:vm");
+
+let automationInstalled = false;
+
+/** Keep real Puppeteer input serialization, replacing only its page connection. */
+function installAutomationDriver() {
+  if (automationInstalled) return;
+  const driver = require("../src/browserAutomationDriver");
+  mock.method(driver, "connect", async (_webContents, debuggerClient) => {
+    const { CdpKeyboard, CdpMouse } = await import("puppeteer-core/internal/cdp/Input.js");
+    const client = Object.assign(new EventEmitter(), {
+      send: (method, params) => debuggerClient.sendCommand(method, params),
+    });
+    const onMessage = (_event, method, params) => client.emit(method, params);
+    debuggerClient.on("message", onMessage);
+    const keyboard = new CdpKeyboard(client);
+    const page = Object.assign(new EventEmitter(), {
+      keyboard,
+      mouse: new CdpMouse(client, keyboard),
+      setDragInterception: (enabled) => client.send("Input.setInterceptDrags", { enabled }),
+    });
+    return {
+      page,
+      disconnect: () => debuggerClient.removeListener("message", onMessage),
+    };
+  });
+  automationInstalled = true;
+}
 
 // Run a page script in a JSDOM window (created with runScripts) and return its value.
 const runInPage = (window, js) => vm.runInContext(js, window);
@@ -42,6 +70,7 @@ function makeEntry({
   reply = () => undefined,
   pinFails = () => null,
 } = {}) {
+  installAutomationDriver();
   const commands = [];
   const steps = [];
   const lifecycle = [];
@@ -164,6 +193,7 @@ const keyEvents = (commands) =>
     );
 
 module.exports = {
+  installAutomationDriver,
   fakeRuntime,
   runInPage,
   STEP_MARKERS,
