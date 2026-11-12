@@ -1331,6 +1331,15 @@ def _user_message(text: str, response_id: str = "codex_turn_1") -> dict[str, Any
     }
 
 
+def _assistant_message(text: str, response_id: str = "codex_turn_1") -> dict[str, Any]:
+    return {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text}],
+        "response_id": response_id,
+    }
+
+
 @pytest.mark.parametrize(
     "history",
     [
@@ -1405,3 +1414,99 @@ def test_rollout_records_never_replay_tool_output_without_preceding_call(
     )
 
     _assert_tool_outputs_follow_their_calls(records)
+
+
+@pytest.mark.parametrize(
+    ("history", "expected"),
+    [
+        pytest.param(
+            [
+                _tool_call("call_long"),
+                _assistant_message("still running"),
+                _tool_call("call_poll"),
+                _tool_output("call_poll"),
+                _tool_output("call_long"),
+                _assistant_message("finished"),
+            ],
+            [
+                ("function_call", "call_long"),
+                ("function_call_output", "call_long"),
+                ("message", None),
+                ("function_call", "call_poll"),
+                ("function_call_output", "call_poll"),
+                ("message", None),
+            ],
+            id="output-stored-after-later-tool-exchange",
+        ),
+        pytest.param(
+            [
+                _tool_call("call_long"),
+                _tool_call("call_poll"),
+                _tool_output("call_poll"),
+                _tool_call("call_check"),
+                _tool_output("call_long"),
+                _tool_output("call_check"),
+            ],
+            [
+                ("function_call", "call_long"),
+                ("function_call", "call_poll"),
+                ("function_call_output", "call_long"),
+                ("function_call_output", "call_poll"),
+                ("function_call", "call_check"),
+                ("function_call_output", "call_check"),
+            ],
+            id="output-stored-after-next-tool-call",
+        ),
+        pytest.param(
+            [
+                _tool_call("call_a"),
+                _tool_call("call_b"),
+                _tool_output("call_b"),
+                {"type": "resource_event"},
+                _assistant_message("b finished"),
+                _tool_output("call_a"),
+            ],
+            [
+                ("function_call", "call_a"),
+                ("function_call", "call_b"),
+                ("function_call_output", "call_a"),
+                ("function_call_output", "call_b"),
+                ("message", None),
+            ],
+            id="parallel-output-stored-after-message",
+        ),
+        pytest.param(
+            [
+                _tool_call("call_long"),
+                _user_message("next", "codex_turn_2"),
+                _tool_output("call_long", "codex_turn_2"),
+            ],
+            [
+                ("function_call", "call_long"),
+                ("function_call_output", "call_long"),
+                ("message", None),
+            ],
+            id="output-stored-in-later-turn",
+        ),
+    ],
+)
+def test_rollout_records_replay_displaced_tool_output_next_to_its_call(
+    history: list[dict[str, Any]],
+    expected: list[tuple[str, str | None]],
+) -> None:
+    """A tool output stored after later content replays right after its call."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        history,
+        session_id="conv_codex",
+        external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+        cwd=Path("/workspace"),
+        model_provider="omnigent_databricks",
+        cli_version="0.154.0",
+    )
+
+    replayed = [
+        (record["payload"]["type"], record["payload"].get("call_id"))
+        for record in records
+        if record["type"] == "response_item"
+    ]
+    assert replayed == expected
