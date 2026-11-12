@@ -200,11 +200,11 @@ let _modalHostResolved = false;
  * first-seen insertion order (Map iteration order), which is stable enough for
  * a best-effort cache-affinity hint.
  */
-function pickModalHost(hosts: Map<string, string>): string | null {
+function pickModalHost(hostIds: Iterable<string>): string | null {
   const counts = new Map<string, number>();
   let best: string | null = null;
   let bestCount = 0;
-  for (const host of hosts.values()) {
+  for (const host of hostIds) {
     const next = (counts.get(host) ?? 0) + 1;
     counts.set(host, next);
     if (next > bestCount) {
@@ -227,9 +227,9 @@ function pickModalHost(hosts: Map<string, string>): string | null {
  * persisted-preference backstop, so a stale/sandbox-sentinel choice can never
  * become the slice key.
  */
-export function resolveModalHost(): void {
+export function resolveModalHost(ownListHostIds: Iterable<string>): void {
   if (_modalHostResolved) return;
-  _modalHostId = pickModalHost(_sessionHosts);
+  _modalHostId = pickModalHost(ownListHostIds);
   _modalHostResolved = true;
 }
 

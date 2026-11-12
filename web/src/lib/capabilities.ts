@@ -612,7 +612,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
       // Route through the host transport (`hostFetch`) so the embed hits the
       // proxied omnigent API; standalone `hostFetch` falls back to plain
       // `fetch("/v1/info")`, preserving the original behavior.
-      const res = await hostFetch("/v1/info");
+      const res = await hostFetch("/v1/info", undefined, { hostless: true });
       if (res.ok) {
         const data = (await res.json()) as Partial<ServerInfo>;
         const smartRoutingEnabled = data.smart_routing_enabled === true;
