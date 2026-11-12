@@ -253,7 +253,7 @@ class RunnerRouter:
     def client_for_session_control(
         self, conversation_id: str, *, conversation: Conversation | None = None
     ) -> RoutedRunner:
-        """Route teardown to the bound runner even when execution cannot be admitted."""
+        """Route control and observation without admitting execution."""
         return self._client_for_session(
             conversation_id, conversation=conversation, check_runtime=False
         )

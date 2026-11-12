@@ -1134,6 +1134,7 @@ class TerminalInstance:
     _git_ssh_tmpdir: Path | None = field(default=None, repr=False)
     _tcp_egress_broker: TcpEgressBroker | None = field(default=None, repr=False)
     _tcp_egress_tmpdir: Path | None = field(default=None, repr=False)
+    _resource_cleanup_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
     _clipboard_bridge: TerminalClipboardBridge | None = field(default=None, init=False, repr=False)
     _idle_task: asyncio.Task[None] | None = field(default=None, repr=False)
     # Threaded idle-watcher state. Mirrors :attr:`_idle_task` but for
@@ -1636,7 +1637,7 @@ class TerminalInstance:
         try:
             await self._launch_impl(cwd=cwd)
         except BaseException:
-            self._stop_network_brokers()
+            await asyncio.to_thread(self._stop_network_brokers)
             raise
 
     async def _launch_impl(self, *, cwd: Path | None = None) -> None:
@@ -1690,18 +1691,13 @@ class TerminalInstance:
             if sandbox_for_launcher.tcp_egress:
                 sandbox_for_launcher = self._bootstrap_tcp_egress(sandbox_for_launcher, env)
             cli_path = shutil.which(self.command) or self.command
-            try:
-                if sandbox_for_launcher.copy_on_write_namespace:
-                    host_cwd = "/"
-                    launcher_path = create_exec_launcher(
-                        cli_path, sandbox_for_launcher, cwd=effective_cwd
-                    )
-                else:
-                    launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
-            except Exception:
-                self._stop_git_ssh()
-                self._stop_tcp_egress()
-                raise
+            if sandbox_for_launcher.copy_on_write_namespace:
+                host_cwd = "/"
+                launcher_path = create_exec_launcher(
+                    cli_path, sandbox_for_launcher, cwd=effective_cwd
+                )
+            else:
+                launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
             inner_cmd = [launcher_path, *self.args]
         else:
             inner_cmd = [self.command, *self.args]
@@ -1798,8 +1794,6 @@ class TerminalInstance:
         except BaseException:
             if self._clipboard_bridge is not None:
                 await asyncio.to_thread(self._clipboard_bridge.close)
-            self._stop_git_ssh()
-            self._stop_tcp_egress()
             raise
 
         self.running = True
@@ -1992,13 +1986,9 @@ class TerminalInstance:
         routes = sandbox.tcp_egress
         assert routes is not None
         self._tcp_egress_tmpdir = create_private_tmpdir()
-        try:
-            sandbox = with_additional_write_roots(sandbox, [self._tcp_egress_tmpdir])
-            self._tcp_egress_broker = start_tcp_egress_broker(routes, self._tcp_egress_tmpdir)
-            apply_tcp_egress_env(env, self._tcp_egress_broker)
-        except Exception:
-            self._stop_tcp_egress()
-            raise
+        sandbox = with_additional_write_roots(sandbox, [self._tcp_egress_tmpdir])
+        self._tcp_egress_broker = start_tcp_egress_broker(routes, self._tcp_egress_tmpdir)
+        apply_tcp_egress_env(env, self._tcp_egress_broker)
         return replace(sandbox, tcp_egress_socket_path=str(self._tcp_egress_broker.socket_path))
 
     def _stop_tcp_egress(self) -> None:
@@ -2046,36 +2036,43 @@ class TerminalInstance:
                 )
         except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent cleanup.
             logger.debug("Terminal cleanup telemetry failed (%s)", type(exc).__name__)
-        # Cancel both idle-watcher variants first so they don't race
-        # the socket teardown. Order doesn't matter — they're
-        # independent.
-        await self._stop_idle_watcher()
-        self._stop_idle_watcher_thread()
+        try:
+            # Cancel both idle-watcher variants first so they don't race
+            # the socket teardown. Order doesn't matter — they're
+            # independent.
+            await self._stop_idle_watcher()
+            self._stop_idle_watcher_thread()
 
-        # The watcher and is_alive() both set ``running=False`` when they
-        # observe a failure. A private socket can still belong to a live tmux
-        # server (or a remain-on-exit pane), so cleanup must not trust that
-        # advisory flag before issuing kill-server.
-        if self.running or self.socket_path.exists():
-            with contextlib.suppress(RuntimeError):
-                await self._tmux("kill-server")
-        self.running = False
+            # The watcher and is_alive() both set ``running=False`` when they
+            # observe a failure. A private socket can still belong to a live tmux
+            # server (or a remain-on-exit pane), so cleanup must not trust that
+            # advisory flag before issuing kill-server.
+            if self.running or self.socket_path.exists():
+                with contextlib.suppress(RuntimeError):
+                    await self._tmux("kill-server")
+            self.running = False
 
-        if self._clipboard_bridge is not None:
-            await asyncio.to_thread(self._clipboard_bridge.close)
+            if self._clipboard_bridge is not None:
+                await asyncio.to_thread(self._clipboard_bridge.close)
 
-        if self.os_env is not None:
-            self.os_env.close()
+        finally:
+            if self._resource_cleanup_task is None or self._resource_cleanup_task.done():
+                self._resource_cleanup_task = asyncio.create_task(
+                    asyncio.to_thread(self._close_resources)
+                )
+            await asyncio.shield(self._resource_cleanup_task)
 
-        # Stop the egress proxy + clean up its scratch tmpdir.
-        # Order: stop first so the proxy isn't listening on a
-        # socket inside a soon-to-be-deleted dir, then remove the
-        # tmpdir.
-        self._stop_network_brokers()
-
-        # Clean up the private dir (contains socket + fork).
-        if self.private_dir.exists():
-            shutil.rmtree(self.private_dir, ignore_errors=True)
+    def _close_resources(self) -> None:
+        """Finish revocation and file cleanup even if the async owner times out."""
+        try:
+            self._stop_network_brokers()
+        finally:
+            try:
+                if self.os_env is not None:
+                    self.os_env.close()
+            finally:
+                if self.private_dir.exists():
+                    shutil.rmtree(self.private_dir, ignore_errors=True)
 
     def start_idle_watcher(
         self,

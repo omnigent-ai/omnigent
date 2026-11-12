@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import ipaddress
 import json
@@ -53,6 +54,7 @@ from omnigent.inner.tcp_egress import (
 from omnigent.inner.tcp_egress_policy import parse_tcp_egress
 from omnigent.inner.tcp_egress_wire import read_frame as _read_frame
 from omnigent.inner.terminal import (
+    TerminalInstance,
     build_terminal_os_env_spec,
     create_terminal_instance,
 )
@@ -92,6 +94,11 @@ def echo_server() -> Iterator[tuple[str, int]]:
 def tcp_route(echo_server: tuple[str, int]) -> TcpEgressRoute:
     host, port = echo_server
     return TcpEgressRoute(name="echo", host=host, port=port, allowed_cidrs=(f"{host}/32",))
+
+
+@pytest.fixture
+def static_tcp_route() -> TcpEgressRoute:
+    return TcpEgressRoute("echo", "db.example.test", 5432)
 
 
 @pytest.fixture
@@ -300,14 +307,14 @@ def test_tcp_connector_reports_missing_configuration(
 
 
 def test_tcp_global_resolver_limit_fails_closed(
-    tcp_route: TcpEgressRoute, monkeypatch: pytest.MonkeyPatch
+    static_tcp_route: TcpEgressRoute, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     resolver_slot = threading.BoundedSemaphore(1)
     assert resolver_slot.acquire(blocking=False)
     monkeypatch.setattr("omnigent.inner.tcp_egress._DNS_SLOTS", resolver_slot)
     try:
         with pytest.raises(TcpEgressDenied, match="resolver is busy"):
-            resolve_pinned_address(tcp_route)
+            resolve_pinned_address(static_tcp_route)
     finally:
         resolver_slot.release()
 
@@ -389,7 +396,7 @@ def test_tcp_dial_with_high_descriptor(
 
 @pytest.mark.parametrize("selector_failure", [False, True])
 def test_tcp_relay_with_high_descriptor(
-    tcp_route: TcpEgressRoute,
+    static_tcp_route: TcpEgressRoute,
     broker_dir: Path,
     high_descriptor_socket: Callable[[socket.socket], socket.socket],
     monkeypatch: pytest.MonkeyPatch,
@@ -403,7 +410,7 @@ def test_tcp_relay_with_high_descriptor(
             raise ValueError("selector registration failed")
 
         monkeypatch.setattr(tcp_module.selectors, "DefaultSelector", fail_selector)
-    broker = start_tcp_egress_broker([tcp_route], broker_dir)
+    broker = start_tcp_egress_broker([static_tcp_route], broker_dir)
     errors: list[Exception] = []
     transferred = [0]
     completed = threading.Event()
@@ -483,10 +490,13 @@ def test_tcp_connector_round_trip_and_revocation(
             broker.stop()
             client.settimeout(2)
             outcome = client.recv(1)
+            if outcome == b"Z":
+                assert tcp_egress_wire.read_exact(client, 4) == b"\x00" * 4
+                outcome = client.recv(1)
             assert outcome in (b"", b"D")
             if outcome:
-                length = struct.unpack("!I", client.recv(4))[0]
-                assert b"closed" in client.recv(length)
+                length = struct.unpack("!I", tcp_egress_wire.read_exact(client, 4))[0]
+                assert b"closed" in tcp_egress_wire.read_exact(client, length)
     finally:
         broker.stop()
 
@@ -600,6 +610,99 @@ def test_tcp_connector_timeouts_release_stream(
             broker.stop()
             server.shutdown()
             thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("direction", ["input", "output"])
+@pytest.mark.parametrize("revoke", [False, True])
+def test_tcp_backpressure_releases_stream(
+    static_tcp_route: TcpEgressRoute,
+    broker_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    direction: str,
+    revoke: bool,
+) -> None:
+    import omnigent.inner.tcp_egress as tcp_module
+
+    monkeypatch.setattr(tcp_module, "_MAX_CONNECTIONS", 1)
+    monkeypatch.setattr(tcp_module, "resolve_pinned_address", lambda _: "1.1.1.1")
+    caplog.set_level(logging.INFO, logger=tcp_module.__name__)
+    broker = start_tcp_egress_broker([static_tcp_route], broker_dir)
+    upstream, remote = socket.socketpair()
+    observed: list[list[int]] = []
+    blocked_peers: list[socket.socket] = []
+    payload = b"x" * 65536
+    remote.settimeout(1)
+
+    def send_output() -> None:
+        with contextlib.suppress(OSError):
+            remote.sendall(payload)
+
+    writer = threading.Thread(target=send_output, daemon=True)
+
+    def dial(_address: str, _port: int) -> socket.socket:
+        with broker._condition:
+            broker._connections.add(upstream)
+        return upstream
+
+    original_relay = broker._relay
+
+    def relay(client: socket.socket, upstream: socket.socket, counts: list[int]) -> None:
+        for connection in (client, upstream):
+            connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            connection.settimeout(5 if revoke else 0.5)
+        observed.append(counts)
+        blocked_peers.append(upstream if direction == "input" else client)
+        original_relay(client, upstream, counts)
+
+    monkeypatch.setattr(broker, "_dial_pinned", dial)
+    monkeypatch.setattr(broker, "_relay", relay)
+    stop_finished = threading.Event()
+
+    def stop() -> None:
+        try:
+            broker.stop()
+        finally:
+            stop_finished.set()
+
+    stopper = threading.Thread(target=stop, daemon=True)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(3)
+            client.connect(str(broker.socket_path))
+            request = json.dumps({"token": broker.token, "route": static_tcp_route.name}).encode()
+            client.sendall(struct.pack("!I", len(request)) + request)
+            assert client.recv(1) == b"\x00"
+            if direction == "input":
+                tcp_egress_wire.write_frame(client, b"I", payload)
+            else:
+                writer.start()
+            poll_until(lambda: observed and observed[0][0] > 0, timeout_s=3, interval_s=0.01)
+            if revoke:
+                poll_until(
+                    lambda: not select.select([], blocked_peers, [], 0)[1],
+                    timeout_s=0.4,
+                    interval_s=0.01,
+                )
+                stopper.start()
+                assert stop_finished.wait(timeout=2), (
+                    "revocation did not interrupt a blocked write"
+                )
+                assert not broker.socket_path.exists()
+            with broker._condition:
+                assert broker._condition.wait_for(lambda: not broker._connections, timeout=3)
+            assert broker._slots.acquire(blocking=False)
+            broker._slots.release()
+            if not revoke:
+                assert "timed out" in caplog.text
+    finally:
+        broker.stop()
+        upstream.close()
+        remote.close()
+        if writer.ident is not None:
+            writer.join(timeout=2)
+        if stopper.ident is not None:
+            stopper.join(timeout=2)
 
 
 def test_tcp_broker_pins_dns_answer_before_dialing(
@@ -855,14 +958,16 @@ def test_tcp_route_cannot_use_other_brokers_token(
 
 
 def test_tcp_broker_rejects_non_ascii_capability(
-    tcp_route: TcpEgressRoute, broker_dir: Path
+    static_tcp_route: TcpEgressRoute, broker_dir: Path
 ) -> None:
-    broker = start_tcp_egress_broker([tcp_route], broker_dir)
+    broker = start_tcp_egress_broker([static_tcp_route], broker_dir)
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(3)
             client.connect(str(broker.socket_path))
-            request = json.dumps({"token": "not-\u00e9-valid", "route": tcp_route.name}).encode()
+            request = json.dumps(
+                {"token": "not-\u00e9-valid", "route": static_tcp_route.name}
+            ).encode()
             client.sendall(struct.pack("!I", len(request)) + request)
             assert client.recv(1) == b"\x01"
             assert b"capability is invalid" in client.recv(1024)
@@ -871,14 +976,14 @@ def test_tcp_broker_rejects_non_ascii_capability(
 
 
 def test_tcp_broker_does_not_accept_client_selected_port(
-    tcp_route: TcpEgressRoute, broker_dir: Path
+    static_tcp_route: TcpEgressRoute, broker_dir: Path
 ) -> None:
-    broker = start_tcp_egress_broker([tcp_route], broker_dir)
+    broker = start_tcp_egress_broker([static_tcp_route], broker_dir)
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.connect(str(broker.socket_path))
             request = json.dumps(
-                {"token": broker.token, "route": "echo", "port": tcp_route.port + 1}
+                {"token": broker.token, "route": "echo", "port": static_tcp_route.port + 1}
             ).encode()
             client.sendall(struct.pack("!I", len(request)) + request)
             assert client.recv(1) == b"\x01"
@@ -1041,7 +1146,7 @@ def test_tcp_revocation_during_slow_quota_denial(
 
 @pytest.mark.parametrize("failure", ["chmod", "thread"])
 def test_tcp_broker_initialization_failure_removes_socket(
-    tcp_route: TcpEgressRoute,
+    static_tcp_route: TcpEgressRoute,
     broker_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
@@ -1054,7 +1159,7 @@ def test_tcp_broker_initialization_failure_removes_socket(
     else:
         monkeypatch.setattr(threading.Thread, "start", fail)
     with pytest.raises(OSError, match="injected initialization failure"):
-        start_tcp_egress_broker([tcp_route], broker_dir)
+        start_tcp_egress_broker([static_tcp_route], broker_dir)
     assert not (broker_dir / ".tcp-egress.sock").exists()
 
 
@@ -1266,10 +1371,12 @@ def test_tcp_helper_start_failure_closes_broker(
         environment.close()
 
 
-def test_tcp_terminal_start_failure_closes_broker(
+@pytest.mark.parametrize("stage", ["bootstrap", "launcher", "tmux", "close", "os_env_close"])
+def test_tcp_terminal_cleanup_does_not_block_event_loop(
     tmp_path: Path,
     active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
     monkeypatch: pytest.MonkeyPatch,
+    stage: str,
 ) -> None:
     route = TcpEgressRoute("database", "db.example.test", 5432)
     workspace = tmp_path / "workspace"
@@ -1284,26 +1391,131 @@ def test_tcp_terminal_start_failure_closes_broker(
     )
     instance = create_terminal_instance(name="tcp", session_key="test", spec=spec).instance
     brokers = []
+    stop_entered = threading.Event()
+    release_stop = threading.Event()
+    cleanup_timed_out = threading.Event()
     original_start = terminal_module.start_tcp_egress_broker
 
     def capture_start(routes: list[TcpEgressRoute], folder: Path):
         broker = original_start(routes, folder)
         brokers.append(broker)
+        original_stop = broker.stop
+
+        def blocked_stop() -> None:
+            stop_entered.set()
+            if not release_stop.wait(timeout=2):
+                cleanup_timed_out.set()
+            original_stop()
+
+        monkeypatch.setattr(broker, "stop", blocked_stop)
         return broker
 
     monkeypatch.setattr(terminal_module, "start_tcp_egress_broker", capture_start)
-    monkeypatch.setattr(
-        terminal_module,
-        "create_exec_launcher",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("launcher failed")),
-    )
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("injected launch failure")
+
+    if stage == "bootstrap":
+        monkeypatch.setattr(terminal_module, "apply_tcp_egress_env", fail)
+    elif stage == "launcher":
+        monkeypatch.setattr(terminal_module, "create_exec_launcher", fail)
+    elif stage == "tmux":
+        monkeypatch.setattr(terminal_module, "create_exec_launcher", lambda *_args: "/bin/true")
+
+        async def fail_spawn(*_args: object, **_kwargs: object) -> None:
+            fail()
+
+        monkeypatch.setattr(
+            terminal_module,
+            "asyncio",
+            SimpleNamespace(**{**vars(asyncio), "create_subprocess_exec": fail_spawn}),
+        )
+
+    async def exercise() -> None:
+        if stage in ("close", "os_env_close"):
+            assert instance.sandbox_policy is not None
+            instance._bootstrap_tcp_egress(instance.sandbox_policy, {})
+            if stage == "os_env_close":
+                broker = instance._tcp_egress_broker
+                assert broker is not None
+                instance._tcp_egress_broker = None
+                monkeypatch.setattr(instance, "os_env", SimpleNamespace(close=broker.stop))
+            task = asyncio.create_task(instance.close())
+        else:
+            task = asyncio.create_task(instance.launch(cwd=workspace))
+        try:
+            assert await asyncio.wait_for(asyncio.to_thread(stop_entered.wait, 3), timeout=4)
+            assert not cleanup_timed_out.is_set(), "cleanup stalled the event loop"
+        finally:
+            release_stop.set()
+            if stage in ("close", "os_env_close"):
+                await task
+            else:
+                with pytest.raises(RuntimeError, match="injected launch failure"):
+                    await task
+
     try:
-        with pytest.raises(RuntimeError, match="launcher failed"):
-            run_async(instance.launch(cwd=workspace))
+        run_async(exercise())
         assert brokers and brokers[0]._closed
         assert not brokers[0].socket_path.exists()
     finally:
+        release_stop.set()
         run_async(instance.close())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_owner", ["broker", "environment", "tmux"])
+async def test_tcp_terminal_cancelled_cleanup_still_revokes_broker(
+    static_tcp_route: TcpEgressRoute,
+    broker_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_owner: str,
+) -> None:
+    instance = TerminalInstance(
+        name="tcp", session_key="test", private_dir=broker_dir, socket_path=broker_dir / "tmux"
+    )
+    broker = start_tcp_egress_broker([static_tcp_route], broker_dir)
+    instance._tcp_egress_broker = broker
+    entered = threading.Event()
+    release = threading.Event()
+    expired = threading.Event()
+    original_stop = broker.stop
+
+    def block() -> None:
+        entered.set()
+        if not release.wait(timeout=2):
+            expired.set()
+        if blocked_owner == "broker":
+            original_stop()
+
+    if blocked_owner == "broker":
+        monkeypatch.setattr(broker, "stop", block)
+    elif blocked_owner == "environment":
+        monkeypatch.setattr(instance, "os_env", SimpleNamespace(close=block))
+    else:
+        instance.running = True
+
+        async def parked_tmux(*_args: object) -> None:
+            entered.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(instance, "_tmux", parked_tmux)
+    close = asyncio.create_task(instance.close())
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 3), timeout=4)
+        assert not expired.is_set()
+        if blocked_owner == "environment":
+            assert broker._closed
+        close.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close
+    finally:
+        release.set()
+        await asyncio.gather(close, return_exceptions=True)
+        assert instance._resource_cleanup_task is not None
+        await asyncio.wait_for(instance._resource_cleanup_task, timeout=3)
+    assert broker._closed and not broker.socket_path.exists()
+    assert not broker_dir.exists()
 
 
 @pytest.mark.parametrize("inherited", [False, True])

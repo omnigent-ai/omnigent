@@ -3969,6 +3969,8 @@ def register_events_routes(
         runner_client = await _get_runner_client(
             session_id,
             runner_router,
+            conversation=conv,
+            for_control=True,
         )
         # Hostless children stream on their ancestor's replica too. Reject a
         # routing miss before accepting a stream that would only send heartbeats.

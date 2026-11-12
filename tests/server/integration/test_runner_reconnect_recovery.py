@@ -32,6 +32,7 @@ from tests.server.integration.test_runner_tunnel_route import (
     _connect_route,
     _send_hello,
 )
+from tests.server.integration.test_sessions_permissions import _end_stream_via_close
 
 pytestmark = pytest.mark.asyncio
 
@@ -492,6 +493,8 @@ async def test_unreadable_bundle_does_not_block_other_sessions_on_old_runner(
     deletions: list[str] = []
 
     async def respond(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": []})
         if request.method == "DELETE":
             deletions.append(request.url.path)
             return httpx.Response(200, json={"deleted": True})
@@ -556,6 +559,23 @@ async def test_unreadable_bundle_does_not_block_other_sessions_on_old_runner(
             await _forward_session_change_to_runner_impl(
                 failed.id, router, {"type": "effort_change", "effort": "high"}
             )
+
+        async def relay_ready(_session_id, _runner_id, runner_client, *_args, **_kwargs):
+            assert runner_client is not None
+
+        monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", relay_ready)
+        stream_task = asyncio.create_task(client.get(f"/v1/sessions/{failed.id}/stream"))
+        try:
+            response = await _end_stream_via_close(failed.id, stream_task)
+            assert response.status_code == 200, response.text
+            assert response.headers["content-type"].startswith("text/event-stream")
+            first_data = next(
+                line[6:] for line in response.text.splitlines() if line.startswith("data: ")
+            )
+            assert json.loads(first_data)["type"] == "session.heartbeat"
+        finally:
+            stream_task.cancel()
+            await asyncio.gather(stream_task, return_exceptions=True)
         terminal_path = f"/v1/sessions/{failed.id}/resources/terminals/shell"
         response = await client.delete(terminal_path)
         assert response.status_code == 200, response.text

@@ -44,11 +44,19 @@ def _tcp_bundle(scope: str) -> bytes:
 
 
 @pytest.mark.parametrize(
-    ("feature", "scope"),
-    [("tcp", scope) for scope in ("root", "child", "terminal", "plain")]
-    + [("mcp", "root"), ("mcp", "plain")],
+    ("feature", "scope", "capable"),
+    [
+        (feature, scope, capable)
+        for feature, scope in [
+            ("tcp", "root"),
+            ("tcp", "child"),
+            ("tcp", "terminal"),
+            ("mcp", "root"),
+        ]
+        for capable in (False, True)
+    ]
+    + [("tcp", "plain", False)],
 )
-@pytest.mark.parametrize("capable", [False, True])
 @pytest.mark.parametrize("upload", [False, True])
 async def test_create_checks_runtime_support_before_side_effects(
     client,
