@@ -339,7 +339,8 @@ def test_reused_automation_settings(
         note = page.get_by_test_id("task-session-settings-note")
         note.scroll_into_view_if_needed()
         expect(note).to_contain_text("This automation continues in an existing session")
-        expect(page.get_by_test_id("task-model-trigger")).to_be_disabled()
+        expect(page.get_by_test_id("new-chat-landing-agent-select")).to_be_visible()
+        expect(page.get_by_test_id("task-permission-trigger")).to_be_disabled()
         if trigger:
             expect(note).to_contain_text("each match starts a new worker")
             page.get_by_role("button", name="Edit worker instructions", exact=True).click()
