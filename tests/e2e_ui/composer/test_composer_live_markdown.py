@@ -718,7 +718,8 @@ def test_edited_markdown_repaints_cleanly_and_restores_with_the_draft(
 
     page.reload()
     expect(composer).to_have_value(draft, timeout=30_000)
-    # Restored unfocused, it shows compact; editing it again, exactly as before.
+    # Restored and clicked away from, it shows compact; editing it again, exactly as before.
+    _blur_restored_composer(page, composer)
     expect(_compact_view(composer)).to_have_text("Keep _this and that in `code")
     composer.focus()
     composer.evaluate("t => t.setSelectionRange(11, 11)")
@@ -743,6 +744,7 @@ def test_restored_crlf_draft_stays_aligned(
     composer = page.get_by_role("textbox", name="Message the agent", exact=True)
     # textarea.value normalizes every line break to LF.
     expect(composer).to_have_value(draft.replace("\r\n", "\n"), timeout=30_000)
+    _blur_restored_composer(page, composer)
     expect(_compact_view(composer)).to_have_text(
         "Restored draft\ncode **not bold**\nafter the fence\nend", use_inner_text=True
     )
@@ -1832,6 +1834,12 @@ def _blur_composer(page: Page) -> None:
     page.mouse.click(box["x"] + 8, box["y"] + box["height"] / 2)
     _next_frame(page)
     _next_frame(page)
+
+
+def _blur_restored_composer(page: Page, composer: Locator) -> None:
+    """The page focuses the composer once it enables; click away so it shows compact."""
+    expect(composer).to_be_focused()
+    _blur_composer(page)
 
 
 _COMPACT_DRAFT = "Make **bold** and `code` then _it_ now.\n```\nx = 1\n```\n> quoted line\nend"
