@@ -37,7 +37,7 @@ def _deployment(fake: FakeSandboxLauncher, *, stop_on_archive: bool = True):
 
 
 async def _archived_session_on_a_sandbox(
-    db_uri: str, *, can_resume: bool = True, labels=None, git_branch=None
+    db_uri: str, *, can_resume: bool = True, labels=None, git_branch=None, runner_id=None
 ):
     host_store = HostStore(db_uri)
     conversations = SqlAlchemyConversationStore(db_uri)
@@ -52,7 +52,11 @@ async def _archived_session_on_a_sandbox(
         config=_deployment(fake), owner=_OWNER, host_store=host_store
     )
     conv = conversations.create_conversation(
-        host_id=launched.host_id, workspace="/workspace", labels=labels, git_branch=git_branch
+        host_id=launched.host_id,
+        workspace="/workspace",
+        labels=labels,
+        git_branch=git_branch,
+        runner_id=runner_id,
     )
     conversations.update_conversation(conv.id, archived=True)
     return fake, host_store, conversations, conversations.get_conversation(conv.id)
@@ -153,6 +157,43 @@ async def test_keeps_a_sandbox_another_unarchived_session_uses(db_uri, other_arc
     assert len(fake.stopped) == (1 if other_archived else 0)
 
 
+@pytest.mark.parametrize("side_chat_archived", [False, True], ids=["in-use", "also-archived"])
+@pytest.mark.parametrize("via_sub_agent", [False, True], ids=["of-source", "of-sub-agent"])
+async def test_keeps_a_sandbox_an_unarchived_side_chat_uses(
+    db_uri, side_chat_archived, via_sub_agent
+):
+    # Side chats and sub-agents have no host binding: they run on their source's
+    # or parent's runner, so only a walk from the host's sessions finds them.
+    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
+    parent_id = conv.id
+    if via_sub_agent:
+        parent_id = conversations.create_conversation(
+            kind="sub_agent", title="helper", parent_conversation_id=conv.id
+        ).id
+    side_chat = conversations.create_conversation(side_chat_parent_id=parent_id)
+    assert side_chat.host_id is None
+    if side_chat_archived:
+        conversations.update_conversation(side_chat.id, archived=True)
+
+    stopped = await _stop(fake, host_store, conversations, conv)
+    assert stopped is side_chat_archived
+    assert len(fake.stopped) == (1 if side_chat_archived else 0)
+
+
+async def test_keeps_the_sandbox_when_the_walk_passes_the_session_cap(db_uri, monkeypatch):
+    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
+    for title in ("one", "two"):
+        conversations.create_conversation(
+            kind="sub_agent", title=title, parent_conversation_id=conv.id
+        )
+    monkeypatch.setattr(managed_hosts, "_ARCHIVE_STOP_MAX_SESSIONS", 3)
+    assert await _stop(fake, host_store, conversations, conv) is True
+    monkeypatch.setattr(managed_hosts, "_ARCHIVE_STOP_MAX_SESSIONS", 2)
+    fake.stopped.clear()
+    assert await _stop(fake, host_store, conversations, conv) is False
+    assert fake.stopped == []
+
+
 async def test_keeps_a_sandbox_its_provider_cannot_resume(db_uri):
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(
         db_uri, can_resume=False
@@ -188,10 +229,9 @@ async def test_keeps_the_sandbox_when_the_hosts_sessions_exceed_the_page_cap(
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
     other = conversations.create_conversation(host_id=conv.host_id, workspace="/workspace")
     conversations.update_conversation(other.id, archived=True)
-    # Two archived sessions at one per page: the listing only ends on a third,
-    # short page. A cap that cuts it off first counts the host as in use.
-    monkeypatch.setattr(managed_hosts, "_ARCHIVE_STOP_HOST_SESSION_PAGE_SIZE", 1)
-    monkeypatch.setattr(managed_hosts, "_ARCHIVE_STOP_HOST_SESSION_PAGES", pages)
+    # Two archived sessions: a cap that a full listing reaches counts the host
+    # as in use, since sessions past it are unknown.
+    monkeypatch.setattr(managed_hosts, "_ARCHIVE_STOP_MAX_SESSIONS", pages)
     assert await _stop(fake, host_store, conversations, conv) is stops
     assert len(fake.stopped) == (1 if stops else 0)
 
@@ -210,9 +250,12 @@ async def test_the_archive_teardown_stops_the_sandbox_last(db_uri, monkeypatch):
     from omnigent.server.routes import sessions as sessions_facade
 
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(
-        db_uri, git_branch="topic"
+        db_uri, git_branch="topic", runner_id="runner_" + "a" * 32
     )
     calls: list[str] = []
+
+    async def stop_host_runner(*_args: object, **_kwargs: object) -> None:
+        calls.append("host-runner")
 
     async def stop_runner(*_args: object, **_kwargs: object) -> None:
         calls.append("runner")
@@ -221,6 +264,7 @@ async def test_the_archive_teardown_stops_the_sandbox_last(db_uri, monkeypatch):
         calls.append("worktree")
 
     monkeypatch.setattr(sessions_facade, "_best_effort_stop", stop_runner)
+    monkeypatch.setattr(orchestration, "_stop_host_runner_intentionally", stop_host_runner)
     monkeypatch.setattr(sessions_facade, "_remove_session_worktree_best_effort", remove_worktree)
     monkeypatch.setattr(fake, "stop", lambda sandbox_id: calls.append("sandbox"))
     await orchestration._archive_stop(
@@ -232,7 +276,7 @@ async def test_the_archive_teardown_stops_the_sandbox_last(db_uri, monkeypatch):
         host_store=host_store,
         sandbox_config=_deployment(fake),
     )
-    assert calls == ["runner", "worktree", "sandbox"]
+    assert calls == ["runner", "host-runner", "worktree", "sandbox"]
 
 
 class _SecondProviderLauncher(FakeSandboxLauncher):

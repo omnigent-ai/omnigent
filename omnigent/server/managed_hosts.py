@@ -5097,11 +5097,11 @@ async def release_session_managed_host(
     )
 
 
-# Pages of a host's sessions checked before stopping its sandbox on archive. A
-# host with more sessions than this is left running: stopping is a cost saving,
-# and the check must not grow with a host's history.
-_ARCHIVE_STOP_HOST_SESSION_PAGES = 5
-_ARCHIVE_STOP_HOST_SESSION_PAGE_SIZE = 100
+# Most sessions examined before stopping a sandbox on archive: the host's own
+# sessions plus the side chats and sub-agents that use it through them. Past
+# this the sandbox is left running: stopping is a cost saving, and the check
+# must not grow with a host's history. Also the size of each page read.
+_ARCHIVE_STOP_MAX_SESSIONS = 100
 
 
 async def _host_may_be_in_use(
@@ -5110,29 +5110,54 @@ async def _host_may_be_in_use(
     """
     Whether any session on *host_id*, *session_id* included, may still use it.
 
-    True when a session on the host is unarchived, which also covers
-    *session_id* having been unarchived since its teardown began. Fails closed:
-    a session whose archived state can't be read, a listing that omits
-    *session_id* (a store that can't list a host's sessions), or a listing
-    longer than the page cap counts as in use.
+    The host's own sessions are those bound to it. Side chats and sub-agents
+    have no host binding and run on their source's or parent's runner, so they
+    are found by walking out from those sessions. An unarchived host session or
+    side chat counts as in use, which also covers *session_id* having been
+    unarchived since its teardown began. Sub-agents are not archived with their
+    parent, so they are only walked for their own side chats.
+
+    Fails closed: a session whose archived state can't be read, a host listing
+    that omits *session_id* (a store that can't list a host's sessions), a full
+    page, or more than :data:`_ARCHIVE_STOP_MAX_SESSIONS` sessions counts as in
+    use.
     """
-    seen_self = False
-    after: str | None = None
-    for _ in range(_ARCHIVE_STOP_HOST_SESSION_PAGES):
-        ids = await asyncio.to_thread(
-            conversation_store.list_host_conversation_ids,
-            host_id,
-            after=after,
-            limit=_ARCHIVE_STOP_HOST_SESSION_PAGE_SIZE,
-        )
+    limit = _ARCHIVE_STOP_MAX_SESSIONS
+
+    async def all_archived(ids: list[str]) -> bool:
         archived = await asyncio.to_thread(conversation_store.get_archived_states, ids)
-        if any(archived.get(conversation_id) is not True for conversation_id in ids):
-            return True
-        seen_self = seen_self or session_id in ids
-        if len(ids) < _ARCHIVE_STOP_HOST_SESSION_PAGE_SIZE:
-            return not seen_self
-        after = ids[-1]
-    return True
+        return all(archived.get(conversation_id) is True for conversation_id in ids)
+
+    host_sessions = await asyncio.to_thread(
+        conversation_store.list_host_conversation_ids, host_id, limit=limit
+    )
+    if len(host_sessions) >= limit or session_id not in host_sessions:
+        return True
+    if not await all_archived(host_sessions):
+        return True
+    seen = set(host_sessions)
+    frontier = list(host_sessions)
+    while frontier:
+        next_frontier: list[str] = []
+        for parent_id in frontier:
+            side_chats = await asyncio.to_thread(
+                conversation_store.list_side_chat_ids, parent_id, limit=limit
+            )
+            children = await asyncio.to_thread(
+                conversation_store.list_child_conversation_ids_page, parent_id, limit=limit
+            )
+            if len(side_chats) >= limit or len(children) >= limit:
+                return True
+            if not await all_archived([i for i in side_chats if i not in seen]):
+                return True
+            for conversation_id in (*side_chats, *(child_id for child_id, _ in children)):
+                if conversation_id not in seen:
+                    seen.add(conversation_id)
+                    next_frontier.append(conversation_id)
+            if len(seen) > limit:
+                return True
+        frontier = next_frontier
+    return False
 
 
 async def stop_archived_session_sandbox(
