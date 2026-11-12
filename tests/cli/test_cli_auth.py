@@ -307,14 +307,17 @@ def test_databricks_request_headers_org_only(token_dir) -> None:
         org_id="2850744067564480",
     )
     assert databricks_request_headers("https://acme.databricks.com/api/2.0/omnigent") == {
-        "X-Databricks-Org-Id": "2850744067564480"
+        "X-Databricks-Org-Id": "2850744067564480",
+        "X-Databricks-Omnigent-Slice-Key": "client_key",
     }
 
     store_databricks_auth(
-        server_url="https://single.databricks.com/api/2.0/omnigent",
-        workspace_host="https://single.databricks.com",
+        server_url="https://single.example.com/api/2.0/omnigent",
+        workspace_host="https://single.example.com",
     )
-    assert databricks_request_headers("https://single.databricks.com/api/2.0/omnigent") == {}
+    assert databricks_request_headers("https://single.example.com/api/2.0/omnigent") == {
+        "X-Databricks-Omnigent-Slice-Key": "client_key",
+    }
 
 
 def test_databricks_request_headers_explicit_org_wins(token_dir) -> None:
@@ -465,9 +468,13 @@ def test_databricks_request_headers_pairs_bearer_and_org(token_dir) -> None:
     assert databricks_request_headers(recorded, bearer_token="tok") == {
         "Authorization": "Bearer tok",
         "X-Databricks-Org-Id": "2850744067564480",
+        "X-Databricks-Omnigent-Slice-Key": "client_key",
     }
     # Recorded selector but no token (local/unauth): org still rides, no bearer.
-    assert databricks_request_headers(recorded) == {"X-Databricks-Org-Id": "2850744067564480"}
+    assert databricks_request_headers(recorded) == {
+        "X-Databricks-Org-Id": "2850744067564480",
+        "X-Databricks-Omnigent-Slice-Key": "client_key",
+    }
     # No record (unknown server): bearer only, no routing header.
     assert databricks_request_headers("https://other.example.com", bearer_token="tok") == {
         "Authorization": "Bearer tok"
@@ -501,8 +508,10 @@ def test_databricks_request_headers_slice_key(token_dir) -> None:
         "X-Databricks-Omnigent-Slice-Key": "host_abc123",
     }
 
-    # Omitted (default) → no slice-key header even on the workspace mount.
-    assert "X-Databricks-Omnigent-Slice-Key" not in databricks_request_headers(recorded)
+    # Omitted (default) → the machine's own key; "" opts out for a keyless host.
+    assert databricks_request_headers(recorded)["X-Databricks-Omnigent-Slice-Key"] == "client_key"
+    unkeyed = databricks_request_headers(recorded, host_id="")
+    assert "X-Databricks-Omnigent-Slice-Key" not in unkeyed
 
 
 def test_oss_host_routing_opt_in(token_dir, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -543,7 +552,7 @@ def test_databricks_request_headers_runner_env_default(
     traffic (transcript posts, uploads, policy checks) keys by host_id and
     spreads across replicas instead of piling onto the single workspace-key pod.
     An explicit host_id still wins, the env is honoured only on the workspace
-    mount, and CLI / daemon callers (no such env) are unaffected.
+    mount, and CLI / daemon callers (no such env) fall back to the machine's key.
     """
     from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
     from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
@@ -554,9 +563,9 @@ def test_databricks_request_headers_runner_env_default(
     )
     mount = "https://acme.databricks.com/api/2.0/omnigent"
 
-    # No env, no explicit host_id → no key (CLI / daemon unaffected).
+    # No env, no explicit host_id → the machine's own key.
     monkeypatch.delenv(RUNNER_SLICE_KEY_ENV_VAR, raising=False)
-    assert "X-Databricks-Omnigent-Slice-Key" not in databricks_request_headers(mount)
+    assert databricks_request_headers(mount)["X-Databricks-Omnigent-Slice-Key"] == "client_key"
 
     # Runner env set → the key defaults to it.
     monkeypatch.setenv(RUNNER_SLICE_KEY_ENV_VAR, "host_runner")
@@ -638,6 +647,7 @@ def test_databricks_request_headers_folds_extra_headers(token_dir, monkeypatch) 
     assert databricks_request_headers(recorded, bearer_token="tok") == {
         "Authorization": "Bearer tok",
         "X-Databricks-Org-Id": "2850744067564480",
+        "X-Databricks-Omnigent-Slice-Key": "client_key",
         "x-databricks-route-hint": "instance-abc",
     }
     # It rides even for an unknown server with no token (routing-only request).

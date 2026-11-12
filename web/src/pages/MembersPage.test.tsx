@@ -7,28 +7,33 @@
 // table + actions), and useServerInfo (accounts_enabled toggles the
 // manage-vs-read-only surface — the latter is the OIDC case).
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MembersPage } from "./MembersPage";
 import type { AccountListEntry } from "@/lib/accountsApi";
 import * as accountsApi from "@/lib/accountsApi";
 import * as identity from "@/lib/identity";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 
 const mocks = vi.hoisted(() => ({
   accountsEnabled: true,
   loginUrl: null as string | null,
   serverVersion: "0.3.0.dev0" as string | null,
   singleUser: false,
+  bootFallback: false,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({
-    accounts_enabled: mocks.accountsEnabled,
-    login_url: mocks.loginUrl,
-    server_version: mocks.serverVersion,
-    single_user: mocks.singleUser,
-  }),
+  useServerInfo: () =>
+    mocks.bootFallback
+      ? SERVER_INFO_OFFLINE_FALLBACK
+      : {
+          accounts_enabled: mocks.accountsEnabled,
+          login_url: mocks.loginUrl,
+          server_version: mocks.serverVersion,
+          single_user: mocks.singleUser,
+        },
 }));
 vi.mock("@/lib/identity", () => ({
   resolveIdentity: vi.fn(),
@@ -65,6 +70,7 @@ beforeEach(() => {
   mocks.loginUrl = null;
   mocks.serverVersion = "0.3.0.dev0";
   mocks.singleUser = false;
+  mocks.bootFallback = false;
   vi.mocked(identity.resolveIdentity).mockResolvedValue("admin");
   vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
   vi.mocked(accountsApi.listUsers).mockResolvedValue([]);
@@ -89,6 +95,24 @@ afterEach(() => {
 });
 
 describe("MembersPage gating", () => {
+  it("waits through the boot fallback before reading admin access", async () => {
+    mocks.bootFallback = true;
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
+    const page = renderPage();
+    await act(async () => {});
+    expect(identity.getCurrentIsAdmin).not.toHaveBeenCalled();
+    expect(accountsApi.listUsers).not.toHaveBeenCalled();
+
+    mocks.bootFallback = false;
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
+    page.rerender(
+      <MemoryRouter>
+        <MembersPage />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(accountsApi.listUsers).toHaveBeenCalledOnce());
+  });
+
   it("shows a loading state until the identity probe resolves", () => {
     vi.mocked(identity.resolveIdentity).mockReturnValue(new Promise(() => {})); // never resolves
     renderPage();
