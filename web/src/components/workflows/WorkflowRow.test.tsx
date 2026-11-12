@@ -17,7 +17,12 @@ const WORKFLOW: WorkflowSummary = {
 };
 
 function renderRow(workflow: WorkflowSummary = WORKFLOW) {
-  const handlers = { onRun: vi.fn(), onEdit: vi.fn(), onCreateAutomation: vi.fn() };
+  const handlers = {
+    onRun: vi.fn(),
+    onEdit: vi.fn(),
+    onCreateAutomation: vi.fn(),
+    onDelete: vi.fn(),
+  };
   render(<WorkflowRow workflow={workflow} {...handlers} />);
   return handlers;
 }
@@ -39,12 +44,12 @@ describe("WorkflowRow", () => {
     expect(screen.queryByText(/Updated/)).toBeNull();
   });
 
-  it("offers Run, Edit and Create automation in the ⋯ menu", () => {
-    const { onRun, onEdit, onCreateAutomation } = renderRow();
+  it("offers Run, Edit, Create automation and Delete in the ⋯ menu", () => {
+    const { onRun, onEdit, onCreateAutomation, onDelete } = renderRow();
 
     expect(screen.getByRole("button", { name: "Actions for Fix flaky tests" })).toBeInTheDocument();
     openMenu();
-    expect(itemNames()).toEqual(["Run", "Edit", "Create automation"]);
+    expect(itemNames()).toEqual(["Run", "Edit", "Create automation", "Delete"]);
     fireEvent.click(screen.getByTestId("workflow-run"));
     expect(onRun).toHaveBeenCalledWith(WORKFLOW);
 
@@ -55,13 +60,17 @@ describe("WorkflowRow", () => {
     openMenu();
     fireEvent.click(screen.getByTestId("workflow-create-automation"));
     expect(onCreateAutomation).toHaveBeenCalledWith(WORKFLOW);
+
+    openMenu();
+    fireEvent.click(screen.getByTestId("workflow-delete"));
+    expect(onDelete).toHaveBeenCalledWith(WORKFLOW);
   });
 
   it("offers the same actions on right-click", () => {
     const { onRun } = renderRow();
 
     fireEvent.contextMenu(screen.getByTestId("workflow-row"));
-    expect(itemNames()).toEqual(["Run", "Edit", "Create automation"]);
+    expect(itemNames()).toEqual(["Run", "Edit", "Create automation", "Delete"]);
     fireEvent.click(screen.getByTestId("workflow-run"));
     expect(onRun).toHaveBeenCalledWith(WORKFLOW);
   });

@@ -98,6 +98,7 @@ export function WorkflowsPage() {
               onCreateAutomation={() =>
                 showToast("Creating automations from workflows isn’t connected yet.")
               }
+              onDelete={() => showToast("Deleting workflows isn’t connected yet.")}
             />
           ))}
         </div>

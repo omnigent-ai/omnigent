@@ -81,6 +81,10 @@ describe("WorkflowsPage", () => {
     expect(showToast).toHaveBeenLastCalledWith(
       "Creating automations from workflows isn’t connected yet.",
     );
+
+    openFirstMenu();
+    fireEvent.click(screen.getByTestId("workflow-delete"));
+    expect(showToast).toHaveBeenLastCalledWith("Deleting workflows isn’t connected yet.");
   });
 
   it("searches names and descriptions", () => {

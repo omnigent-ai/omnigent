@@ -1,5 +1,5 @@
 import type { ComponentType, ReactNode } from "react";
-import { ClockIcon, MoreHorizontalIcon, PencilIcon, PlayIcon } from "lucide-react";
+import { ClockIcon, MoreHorizontalIcon, PencilIcon, PlayIcon, Trash2Icon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -23,14 +23,21 @@ export interface WorkflowRowProps {
   onRun: (workflow: WorkflowSummary) => void;
   onEdit: (workflow: WorkflowSummary) => void;
   onCreateAutomation: (workflow: WorkflowSummary) => void;
+  onDelete: (workflow: WorkflowSummary) => void;
 }
 
 /**
- * One saved workflow: its name and description, with Run, Edit and Create
- * automation in a ⋯ menu and on right-click, like an automation's row.
+ * One saved workflow: its name and description, with Run, Edit, Create
+ * automation and Delete in a ⋯ menu and on right-click, like an automation's row.
  */
-export function WorkflowRow({ workflow, onRun, onEdit, onCreateAutomation }: WorkflowRowProps) {
-  const actions = { workflow, onRun, onEdit, onCreateAutomation };
+export function WorkflowRow({
+  workflow,
+  onRun,
+  onEdit,
+  onCreateAutomation,
+  onDelete,
+}: WorkflowRowProps) {
+  const actions = { workflow, onRun, onEdit, onCreateAutomation, onDelete };
 
   return (
     <ContextMenu>
@@ -79,6 +86,7 @@ export function WorkflowRow({ workflow, onRun, onEdit, onCreateAutomation }: Wor
 // Item props shared by the dropdown and context-menu item primitives.
 interface MenuItemProps {
   children?: ReactNode;
+  variant?: "default" | "destructive";
   onSelect?: (event: Event) => void;
   "data-testid"?: string;
 }
@@ -90,12 +98,14 @@ function WorkflowMenuItems({
   onRun,
   onEdit,
   onCreateAutomation,
+  onDelete,
 }: {
   Item: ComponentType<MenuItemProps>;
   workflow: WorkflowSummary;
   onRun: (workflow: WorkflowSummary) => void;
   onEdit: (workflow: WorkflowSummary) => void;
   onCreateAutomation: (workflow: WorkflowSummary) => void;
+  onDelete: (workflow: WorkflowSummary) => void;
 }) {
   const { trackClick } = useOmnigentAnalytics();
   return (
@@ -129,6 +139,17 @@ function WorkflowMenuItems({
       >
         <ClockIcon className="size-4" />
         Create automation
+      </Item>
+      <Item
+        variant="destructive"
+        onSelect={() => {
+          trackClick("workflows.row.delete", "button");
+          onDelete(workflow);
+        }}
+        data-testid="workflow-delete"
+      >
+        <Trash2Icon className="size-4" />
+        Delete
       </Item>
     </>
   );
