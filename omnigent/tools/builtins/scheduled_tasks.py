@@ -103,13 +103,17 @@ class SysScheduledTaskCreateTool(Tool):
                                 "Optional permission mode for native coding agents that "
                                 "support one. Use the selected harness's vocabulary: "
                                 "Claude Code (e.g. 'acceptEdits'), Codex ('default', "
-                                "'read-only', 'full-access', 'bypass'), "
+                                "'ask-for-approval', 'approve-for-me', 'read-only'), "
                                 "Cursor (e.g. 'auto-review'), "
                                 "Antigravity ('default', 'skip'), or Devin (e.g. 'smart'). "
+                                "Other harnesses, such as claude-sdk, have no automation "
+                                "permission modes. "
                                 "Runs are unattended, so a prompting mode ('default'/'plan') "
                                 "stalls waiting for approval — prefer an auto-running mode. "
-                                "Set null for the agent default. This field is required so "
-                                "the user can review the effective task setting."
+                                "Send JSON null (not the string 'null') for the agent "
+                                "default, and always for a harness without modes. This "
+                                "field is required so the user can review the effective "
+                                "task setting."
                             ),
                         },
                         "max_cost_usd": {
@@ -288,10 +292,11 @@ class SysScheduledTaskUpdateTool(Tool):
                                 "New permission mode using the selected harness's vocabulary: "
                                 "Claude Code (e.g. 'acceptEdits'), Codex (e.g. 'read-only'), "
                                 "Cursor (e.g. 'auto-review'), Antigravity ('default', 'skip'), "
-                                "or Devin (e.g. 'smart'). Set null for the agent default. "
-                                "Required for approval review; resend the current value "
-                                "when it is unchanged. When switching to a harness "
-                                "without permission-mode support, send null."
+                                "or Devin (e.g. 'smart'). Other harnesses, such as "
+                                "claude-sdk, have no automation permission modes. Send JSON "
+                                "null (not the string 'null') for the agent default, and "
+                                "always for a harness without modes. Required for approval "
+                                "review; resend the current value when it is unchanged."
                             ),
                         },
                         "max_cost_usd": {

@@ -4861,6 +4861,7 @@ def _fake_sessions_chat_cls(
     query_impl: Callable[[str], object],
     *,
     extra_turns: list[str] | None = None,
+    pending_status: str = "running",
 ) -> type:
     """
     Build a ``SessionsChat`` replacement whose ``query`` is ``query_impl``.
@@ -4877,6 +4878,8 @@ def _fake_sessions_chat_cls(
         successive ``await_turn()`` calls, simulating async orchestrator
         auto-wakes. When exhausted ``await_turn`` returns empty text and
         ``last_turn_saw_waiting`` returns ``False``.
+    :param pending_status: Snapshot status while extra turns remain, e.g.
+        ``"waiting"`` for a claude-native turn whose background agent runs.
     :returns: A class usable as a drop-in for ``SessionsChat``.
     """
     _extra = list(extra_turns or [])
@@ -4890,7 +4893,7 @@ def _fake_sessions_chat_cls(
             # Mirrors the real snapshot: "running" while sub-agents are pending
             # (the runner emits "waiting" → relay collapses to "running"),
             # "idle" when done.
-            return "running" if self._pending else "idle"
+            return pending_status if self._pending else "idle"
 
         async def refresh(self) -> None:
             pass  # status is derived from _pending; no fetch needed.
@@ -5078,6 +5081,36 @@ async def test_query_sessions_once_multi_turn_async_orchestrator(
     assert "direct answer" in result
     assert "<!-- POLLY_REVIEW_START -->" in result
     assert "Looks good." in result
+
+
+async def test_query_sessions_once_keeps_waiting_on_a_background_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A snapshot that reads ``waiting`` keeps headless ``-p`` going.
+
+    A claude-native turn that ends with a background agent running reads
+    ``waiting`` until the agent finishes and Claude reports on it. If this
+    fails, ``-p`` prints only the turn that launched the agent.
+    """
+    monkeypatch.setattr(
+        "omnigent_client.SessionsChat",
+        _fake_sessions_chat_cls(
+            _return_text,
+            extra_turns=["", "The audit found nothing."],
+            pending_status="waiting",
+        ),
+    )
+    client = _FakeAPClient([], list_items_must_not_be_called=True)
+    result = await _query_sessions_once(
+        client=client,
+        agent_name="claude-native-ui",
+        tool_handler=None,
+        prompt="audit this in the background",
+        session_bundle=b"bundle-bytes",
+        session_bundle_filename="agent.tar.gz",
+        runner_id="runner_test",
+    )
+    assert result == "direct answer\n\nThe audit found nothing."
 
 
 async def _never_return(_prompt: str) -> QueryResult:
