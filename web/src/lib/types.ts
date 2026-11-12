@@ -283,6 +283,7 @@ export interface BackgroundTaskInfo {
 export interface SessionFamily {
   id: string;
   representative_id: string | null;
+  representative_title?: string | null;
   pinned: boolean;
   pinned_at?: string | null;
 }

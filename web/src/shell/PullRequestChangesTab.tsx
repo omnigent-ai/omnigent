@@ -23,6 +23,8 @@ import { Button } from "@/components/ui/button";
 import { TabsContent } from "@/components/ui/tabs";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useComments } from "@/hooks/useComments";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import type { usePullRequestReviewThreads } from "@/hooks/usePullRequestReviewThreads";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
@@ -41,6 +43,7 @@ import {
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { gitProviderCopy } from "@/lib/gitProviders";
 import { hasCommandModifier } from "@/lib/hotkeys";
+import { consumeLocalReviewNavigation, useLocalReviewNavigation } from "@/lib/localReviewContext";
 import { PULL_REQUEST_DIFF_THEME, type ReviewThread } from "@/lib/pullRequestReviewThreads";
 import { patchFileHashes, useViewedFiles, type PullRequestIdentity } from "@/lib/pullRequestViewed";
 import { cn } from "@/lib/utils";
@@ -55,11 +58,13 @@ import {
 import { PullRequestCommitBar } from "./PullRequestCommitBar";
 import { PullRequestCommitsList } from "./PullRequestCommitsList";
 import { PullRequestChangesModeSwitch } from "./PullRequestChangesModeSwitch";
+import { PullRequestChangesSince } from "./PullRequestChangesSince";
 import { PullRequestFileActions } from "./PullRequestFileActions";
 import { PullRequestFindBar } from "./PullRequestFindBar";
 import { PullRequestPathFilter } from "./PullRequestPathFilter";
 import { PullRequestReviewThread, type ReviewThreadContext } from "./PullRequestReviewThread";
 import { PullRequestViewedProgress, PullRequestViewedToggle } from "./PullRequestViewedControls";
+import { LocalReviewComment } from "./LocalReviewComment";
 import {
   buildSearchCorpus,
   changedFilesFromPatch,
@@ -432,8 +437,13 @@ function readErrorText(error: Error): string {
 }
 
 /** What an empty file list says: an unreadable commit, a commit without changes, or a PR without any. */
-function emptyChangesText(commitView: boolean, commitUnavailable: boolean): string {
+function emptyChangesText(
+  commitView: boolean,
+  sinceView: boolean,
+  commitUnavailable: boolean,
+): string {
   if (commitUnavailable) return "This commit's diff can't be read here.";
+  if (sinceView) return "No changes since that commit.";
   if (commitView) return "This commit has no file changes.";
   return "No changes vs base.";
 }
@@ -492,8 +502,132 @@ export function PullRequestChangesTab({
   const headSha = pr.head_sha;
   const baseSha = pr.base_sha;
   const mobile = useIsMobileViewport();
+  const serverInfo = useServerInfo();
+  const sessionComments = useComments(selected ? conversationId : undefined);
+  const selectedPrUrl = data.selected_pr_url ?? pr.url;
+  const localComments = useMemo(
+    () =>
+      (sessionComments.data ?? []).filter(
+        (comment) => comment.anchor_metadata?.pr_url === selectedPrUrl,
+      ),
+    [sessionComments.data, selectedPrUrl],
+  );
+  const earlierLocalCommentIds = useMemo(
+    () =>
+      new Set(
+        localComments
+          .filter(
+            (comment) =>
+              comment.anchor_metadata?.head_sha !== prDiff.data?.head_sha ||
+              comment.anchor_metadata?.base_sha !== prDiff.data?.base_sha,
+          )
+          .map((comment) => comment.id),
+      ),
+    [localComments, prDiff.data?.head_sha, prDiff.data?.base_sha],
+  );
   const view = useChangesViewState(conversationId, data.selected_pr_url ?? pr.url);
-  const { revealedPaths, reveal, clearReveal, find } = view;
+  const {
+    revealedPaths,
+    reveal,
+    clearReveal,
+    find,
+    setPathFilter,
+    setHideViewed,
+    setMode,
+    setSinceSha,
+    shownEarlierCommentPaths,
+    setEarlierCommentsShown,
+  } = view;
+  const shownLocalComments = localComments.filter(
+    (comment) =>
+      !earlierLocalCommentIds.has(comment.id) || shownEarlierCommentPaths.has(comment.path),
+  );
+  const navigationTarget = useLocalReviewNavigation(conversationId);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const commentHighlight = useRef<Animation | null>(null);
+  useEffect(
+    () => () => commentHighlight.current?.cancel(),
+    [conversationId, selectedPrUrl, selected],
+  );
+  useEffect(() => {
+    if (
+      !selected ||
+      !navigationTarget ||
+      changes.isLoading ||
+      changes.isFetching ||
+      prDiff.isLoading ||
+      prDiff.isFetching ||
+      sessionComments.isFetching ||
+      !sessionComments.isSuccess ||
+      navigationTarget.anchor_metadata?.pr_url !== selectedPrUrl
+    )
+      return;
+    if (view.mode !== "changes" || view.sinceSha) {
+      setMode("changes");
+      setSinceSha(null);
+      return;
+    }
+    if (!localComments.some((comment) => comment.id === navigationTarget.id)) {
+      toast.error("This review comment is no longer available.");
+      consumeLocalReviewNavigation(conversationId);
+      return;
+    }
+    setPathFilter("");
+    setHideViewed(false);
+    if (earlierLocalCommentIds.has(navigationTarget.id)) {
+      setEarlierCommentsShown(navigationTarget.path, true);
+    }
+    reveal(navigationTarget.path);
+    // Tabs can mount their content after this effect; diff slots also settle asynchronously.
+    let frame = 0;
+    const focusComment = () => {
+      const element = scrollRef.current?.querySelector<HTMLElement>(
+        `[data-local-review-comment="${CSS.escape(navigationTarget.id)}"]`,
+      );
+      if (element?.getClientRects().length) {
+        element.focus({ preventScroll: true });
+        if ((element.getRootNode() as Document | ShadowRoot).activeElement === element) {
+          element.scrollIntoView({ block: "center" });
+          commentHighlight.current?.cancel();
+          const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+          commentHighlight.current =
+            element.animate?.(
+              [
+                { borderColor: "var(--ring)", offset: 0 },
+                { borderColor: "var(--ring)", offset: reducedMotion ? 1 : 0.8 },
+              ],
+              { duration: 3000, easing: "ease-out" },
+            ) ?? null;
+          consumeLocalReviewNavigation(conversationId);
+          return;
+        }
+      }
+      frame = requestAnimationFrame(focusComment);
+    };
+    frame = requestAnimationFrame(focusComment);
+    return () => cancelAnimationFrame(frame);
+  }, [
+    changes.isLoading,
+    changes.isFetching,
+    prDiff.isLoading,
+    prDiff.isFetching,
+    conversationId,
+    navigationTarget,
+    reveal,
+    selected,
+    selectedPrUrl,
+    setHideViewed,
+    setPathFilter,
+    setMode,
+    setSinceSha,
+    view.mode,
+    view.sinceSha,
+    localComments,
+    sessionComments.isSuccess,
+    sessionComments.isFetching,
+    earlierLocalCommentIds,
+    setEarlierCommentsShown,
+  ]);
   // The filter input shows in the sidebar; while the sidebar is collapsed it opens inline.
   const [filterOpen, setFilterOpen] = useState(false);
   // The revision the displayed list reports. Open uses only this pinned revision, so a newer
@@ -507,31 +641,43 @@ export function PullRequestChangesTab({
   const mode = commitsSupported ? view.mode : "changes";
   const commitsView = mode === "commits";
   const commitView = mode === "commit";
+  // In Changes, a picked PR commit narrows the view to the changes after it, up to the head.
+  const sinceSha = mode === "changes" && commitsSupported ? view.sinceSha : null;
+  const sinceView = !!sinceSha;
+  // An open commit's patch, or the changes since a commit, stand in for the PR patch.
+  const patchView = commitView || sinceView;
+  // The Changes since picker loads the commit list once it is first opened.
+  const [commitsWanted, setCommitsWanted] = useState(false);
   const commits = usePullRequestCommits(
     conversationId,
     prUrl,
     renderedHeadSha,
-    commitsSupported && mode !== "changes",
+    commitsSupported && (mode !== "changes" || commitsWanted || sinceView),
   );
-  // An open commit's patch replaces the PR patch everywhere the diff is read.
   const commitDiff = usePullRequestCommitDiff(
     conversationId,
     prUrl,
-    commitView ? view.commitSha : null,
+    commitView ? view.commitSha : sinceSha,
+    sinceView ? renderedHeadSha : null,
   );
-  const shownDiff = commitView ? commitDiff : prDiff;
+  const shownDiff = patchView ? commitDiff : prDiff;
   // The list is oldest first, so the previous commit is the older one and the next is newer.
-  const commitList = commits.data?.data ?? [];
+  const commitList = useMemo(() => commits.data?.data ?? [], [commits.data]);
   const commitIndex = commitList.findIndex((commit) => commit.sha === view.commitSha);
   const selectedCommit = commitIndex >= 0 ? commitList[commitIndex] : undefined;
   const previousCommit = commitIndex > 0 ? commitList[commitIndex - 1] : null;
   const nextCommit =
     commitIndex >= 0 && commitIndex < commitList.length - 1 ? commitList[commitIndex + 1] : null;
   // The open commit left the loaded list (the head moved), so there is nothing to step from.
-  const { setMode } = view;
   useEffect(() => {
     if (commitView && commits.data && commitIndex < 0) setMode("commits");
   }, [commitView, commits.data, commitIndex, setMode]);
+  // A picked start that left the loaded list (the head moved) falls back to the PR base.
+  useEffect(() => {
+    if (sinceSha && commits.data && !commitList.some((commit) => commit.sha === sinceSha)) {
+      setSinceSha(null);
+    }
+  }, [sinceSha, commits.data, commitList, setSinceSha]);
   // A server without the commit routes leaves Changes as the only view, so a saved commit view ends.
   useEffect(() => {
     if (!commitsUnsupported || view.mode === "changes") return;
@@ -549,7 +695,7 @@ export function PullRequestChangesTab({
   useEffect(() => {
     setFindTarget(null);
     setPendingReveal(null);
-  }, [mode, view.commitSha]);
+  }, [mode, view.commitSha, sinceSha]);
   // The head the shown patch was fetched for. Viewed state needs both the list and the diff
   // pinned to the same head; unpinned providers (GitLab, Azure) can't prove it, so marks are withheld.
   const pinnedHead = changes.data?.head_sha ?? null;
@@ -579,13 +725,13 @@ export function PullRequestChangesTab({
 
   // The shown patch: the whole PR's parse in Changes, or one commit's.
   const { filesByPath, parseError } = useMemo(
-    () => (commitView ? parsePatchByPath(shownDiff.data?.patch, COMMIT_PARSE_ERROR) : prParse),
-    [commitView, shownDiff.data, prParse],
+    () => (patchView ? parsePatchByPath(shownDiff.data?.patch, COMMIT_PARSE_ERROR) : prParse),
+    [patchView, shownDiff.data, prParse],
   );
   // A commit's list is the files its patch changes; the PR's list is the provider's.
   const commitFiles = useMemo(
-    () => (commitView ? changedFilesFromPatch(filesByPath) : []),
-    [commitView, filesByPath],
+    () => (patchView ? changedFilesFromPatch(filesByPath) : []),
+    [patchView, filesByPath],
   );
   const listing = useMemo<{
     data?: PullRequestChangedFilesResult;
@@ -593,18 +739,19 @@ export function PullRequestChangesTab({
     error: Error | null;
   }>(
     () =>
-      commitView
+      patchView
         ? {
             data: { available: true, data: commitFiles, has_more: false },
             isLoading: commitDiff.isLoading,
             error: commitDiff.error,
           }
         : changes,
-    [commitView, commitFiles, commitDiff.isLoading, commitDiff.error, changes],
+    [patchView, commitFiles, commitDiff.isLoading, commitDiff.error, changes],
   );
   const files = useMemo<PullRequestChangedFile[]>(() => listing.data?.data ?? [], [listing.data]);
-  // Review features (threads, drafts, viewed controls, marks and progress) apply only in Changes.
-  const reviewing = mode === "changes";
+  // Review features (threads, drafts, viewed controls, marks and progress) belong to the whole
+  // PR diff, so they apply only in Changes from the PR base.
+  const reviewing = mode === "changes" && !sinceView;
   // One filtered list drives the tree, sections, threads and collapse all so they never disagree.
   const hiddenPaths = view.hideViewed && reviewing ? viewedFiles.viewed : NO_HIDDEN_PATHS;
   const visibleFiles = useMemo(
@@ -633,7 +780,9 @@ export function PullRequestChangesTab({
   const [collapsedPaths, setCollapsedPaths] = useState<ReadonlySet<string>>(() => new Set());
   // Each view reads and writes only its own collapse and reveal state. A commit's is created
   // fresh for that commit, so nothing a commit does reaches the PR's Changes view.
-  const commitState = useCommitViewState(view.commitSha);
+  const commitState = useCommitViewState(
+    commitView ? view.commitSha : sinceSha ? `since:${sinceSha}` : null,
+  );
   const changesState = useMemo(
     () => ({
       collapsedPaths,
@@ -644,7 +793,7 @@ export function PullRequestChangesTab({
     }),
     [collapsedPaths, revealedPaths, reveal, clearReveal],
   );
-  const pane = commitView ? commitState : changesState;
+  const pane = patchView ? commitState : changesState;
   const {
     setCollapsedPaths: setPaneCollapsed,
     clearReveal: clearPaneReveal,
@@ -852,14 +1001,13 @@ export function PullRequestChangesTab({
       // trailing-region count) is served by loadDiffFiles on demand.
       expansionLineCount: 10,
       // A commit's unchanged lines need its parent revision, so its context can't expand.
-      loadDiffFiles: commitView ? undefined : loadDiffFiles,
+      loadDiffFiles: patchView ? undefined : loadDiffFiles,
     }),
-    [themeType, diffStyle, loadDiffFiles, commitView],
+    [themeType, diffStyle, loadDiffFiles, patchView],
   );
 
   // The stacked diff scrolls as one; the sidebar highlights the file at the top
   // of the viewport and jumps to a file on click.
-  const scrollRef = useRef<HTMLDivElement>(null);
   const sectionEls = useRef<Map<string, HTMLElement>>(new Map());
   const [activePath, setActivePath] = useState<string | null>(null);
 
@@ -1052,12 +1200,17 @@ export function PullRequestChangesTab({
   const patchReady = !!shownDiff.data?.patch && !parseError && !shownDiff.isLoading;
   // A disabled commit query has no data, which is not a commit without changes.
   const commitUnavailable =
-    commitView && !commitDiff.data && !commitDiff.isLoading && !commitDiff.error;
-  const emptyChangesMessage = emptyChangesText(commitView, commitUnavailable);
+    patchView && !commitDiff.data && !commitDiff.isLoading && !commitDiff.error;
+  const emptyChangesMessage = emptyChangesText(commitView, sinceView, commitUnavailable);
   const coverageNote =
     findOpen && patchReady && (listing.data?.has_more || withoutText > 0)
       ? `Search covers the fetched patch: ${patchFileCount} of ${listing.data?.total_count ?? files.length} files${withoutText > 0 ? `, ${withoutText} without text` : ""}`
       : null;
+
+  const earlierCommentsControl = (path: string) => ({
+    shown: shownEarlierCommentPaths.has(path),
+    onToggle: () => setEarlierCommentsShown(path, !shownEarlierCommentPaths.has(path)),
+  });
 
   // Header actions for one file. Deleted files open at the base revision; others
   // at the rendered head, so a newer polled head never changes the link. A commit's
@@ -1071,7 +1224,7 @@ export function PullRequestChangesTab({
       headRepoUrl: pr.head_repository_url,
       baseRepoUrl,
       headSha: commitView ? view.commitSha : renderedHeadSha,
-      baseSha: commitView ? null : renderedBaseSha,
+      baseSha: patchView ? null : renderedBaseSha,
       path: file.path,
       previousPath: renamedFrom,
       status: file.status,
@@ -1082,9 +1235,20 @@ export function PullRequestChangesTab({
         previousPath={renamedFrom}
         openLabel={`Open in ${providerLabel}`}
         openUrl={openUrl}
+        earlierComments={
+          reviewing &&
+          (threadsByFile.get(file.path)?.some((thread) => thread.outdated) ||
+            localComments.some(
+              (comment) => comment.path === file.path && earlierLocalCommentIds.has(comment.id),
+            ))
+            ? earlierCommentsControl(file.path)
+            : undefined
+        }
         openUnavailableReason={
-          commitView && file.status === "deleted"
-            ? "Deleted in this commit"
+          patchView && file.status === "deleted"
+            ? commitView
+              ? "Deleted in this commit"
+              : "Deleted since that commit"
             : openUnavailableReason(providerLabel, !!baseRepoUrl, sourceRepoUrl)
         }
       />
@@ -1125,8 +1289,8 @@ export function PullRequestChangesTab({
       pr.base_sha === prDiff.data?.base_sha &&
       reviews.page
     ),
-    headSha: pr.head_sha,
-    baseSha: pr.base_sha,
+    headSha: prDiff.data?.head_sha,
+    baseSha: prDiff.data?.base_sha,
     loadComments: reviews.loadComments,
     loadingComments: reviews.loadingComments,
   };
@@ -1157,6 +1321,22 @@ export function PullRequestChangesTab({
     else if (visibleFiles.includes(file))
       threadsByFile.set(file.path, [...(threadsByFile.get(file.path) ?? []), thread]);
   }
+  const localReviewReady =
+    reviewing &&
+    !listing.isLoading &&
+    !shownDiff.isLoading &&
+    !listing.error &&
+    !shownDiff.error &&
+    !parseError;
+  const unavailableLocalComments = localReviewReady
+    ? localComments.filter(
+        (comment) => !canShowFiles || !files.some((file) => file.path === comment.path),
+      )
+    : [];
+  const unavailableCommentPaths = new Set([
+    ...earlierThreads.map((thread) => thread.path),
+    ...unavailableLocalComments.map((comment) => comment.path),
+  ]);
   const unresolved = threads.filter((thread) => !thread.resolved);
   const navigateThread = (direction: number) => {
     const index = unresolved.findIndex((thread) => thread.id === focusedThread?.id);
@@ -1166,6 +1346,7 @@ export function PullRequestChangesTab({
     const file = files.find(
       (entry) => entry.path === next.path || filesByPath.get(entry.path)?.prevName === next.path,
     );
+    if (next.outdated) setEarlierCommentsShown(file?.path ?? next.path, true);
     if (file) {
       // A thread on a file a filter hides has no mounted section, so clear that filter first.
       // The path filter goes only when it hides the file; hide-viewed goes only for a viewed one.
@@ -1262,10 +1443,27 @@ export function PullRequestChangesTab({
           onToggleAll={toggleAll}
           modeSwitch={
             commitsSupported ? (
-              <PullRequestChangesModeSwitch
-                value={commitsView || commitView ? "commits" : "changes"}
-                onChange={view.setMode}
-              />
+              <>
+                <PullRequestChangesModeSwitch
+                  value={commitsView || commitView ? "commits" : "changes"}
+                  onChange={view.setMode}
+                />
+                {mode === "changes" && (
+                  <PullRequestChangesSince
+                    commits={commitList}
+                    headSha={renderedHeadSha}
+                    hasMore={!!commits.data?.has_more}
+                    loading={commits.isLoading}
+                    errorMessage={commits.error ? readErrorText(commits.error) : null}
+                    sinceSha={sinceSha}
+                    onChange={setSinceSha}
+                    onOpen={() => {
+                      setCommitsWanted(true);
+                      if (commits.error) void commits.refetch();
+                    }}
+                  />
+                )}
+              </>
             ) : undefined
           }
           navigation={
@@ -1435,7 +1633,11 @@ export function PullRequestChangesTab({
                 registerRef={registerRef}
                 collapsed={pane.collapsedPaths.has(file.path)}
                 forceExpanded={pane.revealedPaths.has(file.path)}
-                forceMount={pendingReveal?.path === file.path || activeFilePath === file.path}
+                forceMount={
+                  pendingReveal?.path === file.path ||
+                  activeFilePath === file.path ||
+                  navigationTarget?.path === file.path
+                }
                 bypassLargeDiffGate={!!highlight && activeFilePath === file.path}
                 highlight={activeFilePath === file.path ? highlight : null}
                 onToggleCollapsed={() => toggleOne(file.path)}
@@ -1451,25 +1653,95 @@ export function PullRequestChangesTab({
                     />
                   ) : undefined
                 }
-                threads={threadsByFile.get(file.path) ?? []}
+                threads={(threadsByFile.get(file.path) ?? []).filter(
+                  (thread) => !thread.outdated || shownEarlierCommentPaths.has(file.path),
+                )}
                 threadContext={threadContext}
                 matchingRevision={matchingRevision}
+                localComments={
+                  localReviewReady
+                    ? shownLocalComments.filter((comment) => comment.path === file.path)
+                    : []
+                }
+                canCommentLocally={
+                  serverInfo !== "loading" &&
+                  serverInfo.comment_anchor_metadata === true &&
+                  !!(canEdit && prDiff.data?.head_sha && prDiff.data?.base_sha)
+                }
               />
             ))
           )}
-          {earlierThreads.length > 0 && (
+          {unavailableCommentPaths.size > 0 && (
             <div className="p-3">
               <p className="text-ui font-medium">Earlier conversations and unavailable diffs</p>
-              {earlierThreads.map((thread) => (
-                <div key={thread.id}>
-                  <p className="mt-3 break-all text-xs text-muted-foreground">{thread.path}</p>
-                  <PullRequestReviewThread thread={thread} context={threadContext} showContext />
+              {[...unavailableCommentPaths].map((path) => (
+                <div key={path}>
+                  <div className="mt-3 flex items-center justify-between gap-2">
+                    <p className="break-all text-xs text-muted-foreground">{path}</p>
+                    <PullRequestFileActions
+                      path={path}
+                      previousPath={null}
+                      openLabel={`Open in ${providerLabel}`}
+                      openUrl={null}
+                      openUnavailableReason="Diff unavailable"
+                      earlierComments={
+                        earlierThreads.some((thread) => thread.path === path && thread.outdated) ||
+                        unavailableLocalComments.some(
+                          (comment) =>
+                            comment.path === path && earlierLocalCommentIds.has(comment.id),
+                        )
+                          ? earlierCommentsControl(path)
+                          : undefined
+                      }
+                    />
+                  </div>
+                  {earlierThreads
+                    .filter(
+                      (thread) =>
+                        thread.path === path &&
+                        (!thread.outdated || shownEarlierCommentPaths.has(path)),
+                    )
+                    .map((thread) => (
+                      <PullRequestReviewThread
+                        key={thread.id}
+                        thread={thread}
+                        context={threadContext}
+                        showContext
+                      />
+                    ))}
+                  {unavailableLocalComments
+                    .filter(
+                      (comment) =>
+                        comment.path === path &&
+                        (!earlierLocalCommentIds.has(comment.id) ||
+                          shownEarlierCommentPaths.has(path)),
+                    )
+                    .map((comment) => (
+                      <LocalReviewComment
+                        key={comment.id}
+                        comment={comment}
+                        canEdit={canEdit}
+                        outdated={earlierLocalCommentIds.has(comment.id)}
+                      />
+                    ))}
                 </div>
               ))}
             </div>
           )}
         </div>
       </div>
+      {sessionComments.isError && (
+        <p role="alert" className="p-3 text-ui">
+          Local comments could not be loaded.{" "}
+          <button
+            type="button"
+            className="underline"
+            onClick={() => void sessionComments.refetch()}
+          >
+            Retry
+          </button>
+        </p>
+      )}
     </TabsContent>
   );
 }

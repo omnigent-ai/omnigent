@@ -471,7 +471,8 @@ def _parse_git_porcelain_line(line: str) -> tuple[str, str] | None:
 
     Status mapping:
 
-    - ``??`` (untracked) and ``A`` (staged new file) → ``"created"``
+    - ``??`` (untracked), ``A`` (staged new file) and `` A`` (``git add -N``,
+      no HEAD version) → ``"created"``
     - ``D`` in either column → ``"deleted"``
     - Everything else (``M``, ``R``, ``C``, ``U``, …) → ``"modified"``
 
@@ -497,7 +498,7 @@ def _parse_git_porcelain_line(line: str) -> tuple[str, str] | None:
         path_part = _strip_git_quotes(path_part)
 
     x, y = xy[0], xy[1]
-    if (x == "?" and y == "?") or x == "A":
+    if xy in ("??", " A") or x == "A":
         operation = "created"
     elif x == "D" or y == "D":
         operation = "deleted"
