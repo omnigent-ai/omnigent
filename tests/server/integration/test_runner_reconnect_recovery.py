@@ -19,7 +19,7 @@ from fastapi import FastAPI
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Agent, Conversation
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.host.frames import CAP_TCP_EGRESS
+from omnigent.host.frames import CAP_MCP_REGISTRY, CAP_TCP_EGRESS
 from omnigent.runtime import get_artifact_store
 from omnigent.server.bundles import bundle_location
 from omnigent.server.child_session_recovery import RECOVERY_STORE_CONCURRENCY
@@ -82,6 +82,8 @@ async def _recover(
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
     respond: Callable[[httpx.Request], Awaitable[httpx.Response]],
+    *,
+    capabilities: list[str] | None = None,
 ) -> AsyncIterator[tuple[list[str], asyncio.Event]]:
     relays: list[str] = []
     finished = asyncio.Event()
@@ -103,6 +105,10 @@ async def _recover(
         communicator = await _connect_route(app, _TUNNEL_PATH)
         try:
             await _send_hello(communicator, app.state.tunnel_registry)
+            if capabilities is not None:
+                connection = app.state.tunnel_registry.get(_RUNNER_ID)
+                assert connection is not None
+                connection.hello.capabilities[:] = capabilities
             asyncio.get_running_loop().call_soon(start.set)
             yield relays, finished
         finally:
@@ -327,6 +333,20 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
         store.set_labels(child.id, {"omnigent.wrapper": "claude-code-native-ui-subagent"})
         mirrors.append(child.id)
     loop_thread = threading.get_ident()
+    requirement_reads: list[int] = []
+
+    def track_requirements(call: Any) -> Any:
+        def tracked(*args: Any, **kwargs: Any) -> Any:
+            requirement_reads.append(threading.get_ident())
+            return call(*args, **kwargs)
+
+        return tracked
+
+    for owner, method in (
+        (app.state.agent_store, "get"),
+        (app.state.runner_router._agent_cache, "load"),
+    ):
+        monkeypatch.setattr(owner, method, track_requirements(getattr(owner, method)))
     real_get = store.get_conversation
     real_get_many = store.get_conversations
     reads: list[tuple[str, int]] = []
@@ -372,7 +392,10 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
         requests.append(json.loads(request.content)["session_id"])
         return httpx.Response(201, json={})
 
-    async with _recover(app, monkeypatch, respond) as (relays, finished):
+    async with _recover(app, monkeypatch, respond, capabilities=[CAP_MCP_REGISTRY]) as (
+        relays,
+        finished,
+    ):
         ticker = asyncio.create_task(heartbeat())
         try:
             await asyncio.wait_for(finished.wait(), budget(5))
@@ -383,6 +406,7 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
         assert relays[0] == parent.id
         assert not set(mirrors).intersection(sid for sid, _ in reads)
         assert all(thread != loop_thread for _, thread in reads)
+        assert requirement_reads and all(thread != loop_thread for thread in requirement_reads)
         assert all(0 < len(ids) <= batch_size for ids in attachment_batches)
         assert any(1 < count <= batch_size + 1 for count in heartbeats)
         if superseded:
@@ -422,22 +446,40 @@ async def test_failed_root_init_keeps_failure_but_does_not_block_other_tree(
         assert set(requested) == {failed.id, healthy.id}
 
 
-@pytest.mark.parametrize("bundle_state", ["missing", "invalid"])
+@pytest.mark.parametrize("bundle_state", ["missing", "invalid", "downgraded"])
 async def test_unreadable_bundle_does_not_block_other_sessions_on_old_runner(
     app: FastAPI,
+    client: httpx.AsyncClient,
     agent: Agent,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     bundle_state: str,
 ) -> None:
     broken_id = generate_agent_id()
-    location = bundle_location(broken_id, b"invalid bundle")
-    if bundle_state == "invalid":
-        get_artifact_store().put(location, b"invalid bundle")
+    bundle = (
+        build_agent_bundle(
+            "restricted",
+            os_env={
+                "type": "caller_process",
+                "sandbox": {
+                    "type": "linux_bwrap",
+                    "tcp_egress": [{"name": "db", "host": "db.example.test", "port": 5432}],
+                },
+            },
+        )
+        if bundle_state == "downgraded"
+        else b"invalid bundle"
+    )
+    location = bundle_location(broken_id, bundle)
+    if bundle_state != "missing":
+        get_artifact_store().put(location, bundle)
     app.state.agent_store.create(broken_id, "broken", location)
     failed = _create_session(app, broken_id)
     healthy = _create_session(app, agent.id)
     router = app.state.runner_router
+    from omnigent.runtime import _globals
+
+    monkeypatch.setattr(_globals, "_runner_router", router)
     store = router._conversation_store
     list_bound = store.list_conversations_by_runner_id
     monkeypatch.setattr(
@@ -446,12 +488,23 @@ async def test_unreadable_bundle_does_not_block_other_sessions_on_old_runner(
         lambda rid: sorted(list_bound(rid), key=lambda row: row.id != failed.id),
     )
     requested: list[str] = []
+    controls: list[str] = []
+    deletions: list[str] = []
 
     async def respond(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            deletions.append(request.url.path)
+            return httpx.Response(200, json={"deleted": True})
+        if request.url.path.endswith("/events"):
+            controls.append(json.loads(request.content)["type"])
+            return httpx.Response(200, json={"queued": True})
         requested.append(json.loads(request.content)["session_id"])
         return httpx.Response(201)
 
-    async with _recover(app, monkeypatch, respond) as (relays, finished):
+    async with _recover(app, monkeypatch, respond, capabilities=[CAP_MCP_REGISTRY]) as (
+        relays,
+        finished,
+    ):
         connection = app.state.tunnel_registry.get(_RUNNER_ID)
         assert connection is not None and CAP_TCP_EGRESS not in connection.hello.capabilities
         for lookup in (
@@ -461,10 +514,13 @@ async def test_unreadable_bundle_does_not_block_other_sessions_on_old_runner(
             lambda: router.client_for_session_resources(failed.id),
             lambda: router.client_for_existing_conversation(failed.id),
         ):
-            with pytest.raises(OmnigentError, match="bundle could not be loaded") as error:
-                lookup()
-            assert error.value.code == ErrorCode.CONFLICT
-            assert error.value.__cause__ is not None
+            with pytest.raises(OmnigentError) as error:
+                await asyncio.to_thread(lookup)
+            assert error.value.code == (
+                ErrorCode.RUNNER_CAPABILITY_MISMATCH
+                if bundle_state == "downgraded"
+                else ErrorCode.CONFLICT
+            )
         await asyncio.wait_for(finished.wait(), budget(5))
         assert relays == requested == [healthy.id]
         assert sessions._session_status_cache[healthy.id] == "idle"
@@ -475,6 +531,39 @@ async def test_unreadable_bundle_does_not_block_other_sessions_on_old_runner(
             and isinstance(record.exc_info[1], OmnigentError)
             for record in caplog.records
         )
+        for event_type in ("interrupt", "stop_session"):
+            response = await client.post(
+                f"/v1/sessions/{failed.id}/events", json={"type": event_type}
+            )
+            assert response.status_code == 202, response.text
+        assert controls == ["interrupt", "stop_session"]
+        assert requested == [healthy.id]
+        assert store.get_conversation(failed.id).host_id is None
+        from omnigent.server.routes._sessions.helpers import (
+            _forward_approval_to_runner,
+            _forward_session_change_to_runner_impl,
+        )
+
+        await _forward_session_change_to_runner_impl(failed.id, router, {"type": "interrupt"})
+        assert controls == ["interrupt", "stop_session", "interrupt"]
+        for action in ("decline", "cancel"):
+            await _forward_approval_to_runner(failed.id, {"action": action}, router)
+        assert controls[-2:] == ["approval", "approval"]
+        for action in ("accept", [], {}):
+            with pytest.raises(OmnigentError):
+                await _forward_approval_to_runner(failed.id, {"action": action}, router)
+        with pytest.raises(OmnigentError):
+            await _forward_session_change_to_runner_impl(
+                failed.id, router, {"type": "effort_change", "effort": "high"}
+            )
+        terminal_path = f"/v1/sessions/{failed.id}/resources/terminals/shell"
+        response = await client.delete(terminal_path)
+        assert response.status_code == 200, response.text
+        response = await client.delete(f"/v1/sessions/{failed.id}")
+        assert response.status_code == 200, response.text
+        assert terminal_path in deletions and f"/v1/sessions/{failed.id}" in deletions
+        assert store.get_conversation(failed.id) is None
+        assert requested == [healthy.id]
 
 
 async def test_failed_binding_batch_does_not_strand_later_roots(

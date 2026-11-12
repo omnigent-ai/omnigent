@@ -6,6 +6,7 @@ All durably checkpointed for crash recovery.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -3213,7 +3214,7 @@ async def compact_conversation_now(
         task_id=task_id,
         llm_client=_get_llm_client(),
         connection=compaction_state.connection,
-        runner_client=_get_runner_client_for_compaction(conversation_id),
+        runner_client=await asyncio.to_thread(_get_runner_client_for_compaction, conversation_id),
         force=True,
         fail_on_summary_error=True,
         conversation_id=conversation_id,

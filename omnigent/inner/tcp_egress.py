@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 _SOCKET_NAME = ".tcp-egress.sock"
 _MAX_REQUEST = 2048
+_HANDSHAKE_SECONDS = 10
 _MAX_CONNECTIONS = 8
 _MAX_BYTES = 2 * 1024 * 1024 * 1024
 _SESSION_SECONDS = 1800
@@ -130,11 +131,11 @@ class _TcpHandler(socketserver.BaseRequestHandler):
         transferred = [0]
         accepted = False
         try:
-            client.settimeout(10)
-            length = struct.unpack("!I", _read_exact(client, 4))[0]
+            deadline = time.monotonic() + _HANDSHAKE_SECONDS
+            length = struct.unpack("!I", _read_exact(client, 4, deadline=deadline))[0]
             if not 1 <= length <= _MAX_REQUEST:
                 raise TcpEgressDenied("TCP egress request size is invalid")
-            request = json.loads(_read_exact(client, length))
+            request = json.loads(_read_exact(client, length, deadline=deadline))
             if not isinstance(request, dict) or set(request) != {"token", "route"}:
                 raise TcpEgressDenied("TCP egress request must name only one route")
             token = request.get("token")

@@ -141,7 +141,9 @@ def test_tcp_route_rejects_duplicate_names() -> None:
         parse_tcp_egress([entry, entry])
 
 
-def test_tcp_route_parsers_and_runtime_reject_weak_backend(tmp_path: Path) -> None:
+def test_tcp_route_parsers_and_runtime_reject_weak_backend(
+    tmp_path: Path, broker_dir: Path
+) -> None:
     raw = {
         "type": "linux_bwrap",
         "tcp_egress": [{"name": "db", "host": "db.example.test", "port": 5432}],
@@ -151,16 +153,19 @@ def test_tcp_route_parsers_and_runtime_reject_weak_backend(tmp_path: Path) -> No
     for parser in (_parse_os_env_sandbox, _parse_os_env_sandbox_spec):
         sandbox = parser(raw)
         assert sandbox.tcp_egress == [TcpEgressRoute("db", "db.example.test", 5432)]
-        with pytest.raises(ValueError, match="tcp_egress"):
-            resolve_sandbox(
-                OSEnvSpec(
-                    cwd=str(tmp_path),
-                    sandbox=OSEnvSandboxSpec(type="none", tcp_egress=sandbox.tcp_egress),
-                ),
-                tmp_path,
-            )
         with pytest.raises((OmnigentError, ValueError), match="tcp_egress"):
             parser({**raw, "type": "none"})
+    with pytest.raises(ValueError, match="tcp_egress"):
+        resolve_sandbox(
+            OSEnvSpec(
+                sandbox=OSEnvSandboxSpec(
+                    type="none", tcp_egress=[TcpEgressRoute("db", "db.example.test", 5432)]
+                )
+            ),
+            tmp_path,
+        )
+    with pytest.raises(ValueError, match="at least one route"):
+        start_tcp_egress_broker([], broker_dir)
     with pytest.raises(ValueError, match="at least one route"):
         resolve_sandbox(
             OSEnvSpec(
@@ -171,89 +176,56 @@ def test_tcp_route_parsers_and_runtime_reject_weak_backend(tmp_path: Path) -> No
         )
 
 
-def test_tcp_route_rejects_mixed_dns_and_blocked_addresses(
+@pytest.mark.parametrize(
+    ("addresses", "cidrs", "denial", "grant_private"),
+    [
+        (["8.8.8.8", "127.0.0.1"], (), "blocked", False),
+        (["10.1.0.2"], ("10.0.0.0/16",), "outside", False),
+        (["100.100.100.200"], ("100.100.100.200/32",), "blocked", False),
+        (["fd00:ec2::254"], ("fd00::/8",), "blocked", False),
+        (["10.42.7.9"], (), "outside", True),
+        (["fd42::9"], (), "outside", True),
+        (["fec0::9"], (), "outside", True),
+    ],
+)
+def test_tcp_dns_authorizes_every_answer(
+    addresses: list[str],
+    cidrs: tuple[str, ...],
+    denial: str,
+    grant_private: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    route = TcpEgressRoute("db", "db.example.test", 5432)
-    monkeypatch.setattr(
-        socket,
-        "getaddrinfo",
-        lambda *_args, **_kwargs: [
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 5432)),
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 5432)),
-        ],
-    )
-    with pytest.raises(TcpEgressDenied, match="blocked"):
-        resolve_pinned_address(route)
-    private = TcpEgressRoute("db", "db.example.test", 5432, ("10.0.0.0/16",))
-    monkeypatch.setattr(
-        socket,
-        "getaddrinfo",
-        lambda *_args, **_kwargs: [
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.1.0.2", 5432)),
-        ],
-    )
-    with pytest.raises(TcpEgressDenied, match="outside"):
-        resolve_pinned_address(private)
-    assert ipaddress.ip_address("100.100.100.200").is_global is False
-    cloud_control = TcpEgressRoute("db", "db.example.test", 5432, ("100.100.100.200/32",))
-    monkeypatch.setattr(
-        socket,
-        "getaddrinfo",
-        lambda *_args, **_kwargs: [
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("100.100.100.200", 5432))
-        ],
-    )
-    with pytest.raises(TcpEgressDenied, match="blocked"):
-        resolve_pinned_address(cloud_control)
-    ipv6_metadata = TcpEgressRoute("db", "db.example.test", 5432, ("fd00::/8",))
-    monkeypatch.setattr(
-        socket,
-        "getaddrinfo",
-        lambda *_args, **_kwargs: [
-            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("fd00:ec2::254", 5432, 0, 0))
-        ],
-    )
-    with pytest.raises(TcpEgressDenied, match="blocked"):
-        resolve_pinned_address(ipv6_metadata)
-
-
-@pytest.mark.parametrize("private_address", ["10.42.7.9", "fd42::9", "fec0::9"])
-def test_tcp_dns_private_answer_requires_explicit_cidr(
-    private_address: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    address = ipaddress.ip_address(private_address)
-    family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
-    if family == socket.AF_INET6:
-        sockaddr = (private_address, 5432, 0, 0)
-    else:
-        sockaddr = (private_address, 5432)
     queries: list[tuple[str, int]] = []
 
     def resolve(host: str, port: int, **_kwargs: object) -> list[tuple[object, ...]]:
         queries.append((host, port))
-        return [(family, socket.SOCK_STREAM, 6, "", sockaddr)]
+        return [
+            (
+                socket.AF_INET6 if ":" in address else socket.AF_INET,
+                socket.SOCK_STREAM,
+                6,
+                "",
+                (address, port, 0, 0) if ":" in address else (address, port),
+            )
+            for address in addresses
+        ]
 
     monkeypatch.setattr(socket, "getaddrinfo", resolve)
-    route = TcpEgressRoute("db", "db.example.test", 5432)
-    with pytest.raises(TcpEgressDenied, match="outside allowed addresses"):
+    route = TcpEgressRoute("db", "db.example.test", 5432, cidrs)
+    with pytest.raises(TcpEgressDenied, match=denial):
         resolve_pinned_address(route)
-
-    permitted = TcpEgressRoute(
-        "db", route.host, route.port, (f"{address}/{address.max_prefixlen}",)
-    )
-    assert parse_tcp_egress(
-        [
-            {
-                "name": "db",
-                "host": private_address,
-                "port": 5432,
-                "allowed_cidrs": list(permitted.allowed_cidrs),
-            }
+    if grant_private:
+        address = ipaddress.ip_address(addresses[0])
+        entry = {"name": "db", "host": str(address), "port": 5432}
+        with pytest.raises(OmnigentError, match="outside"):
+            parse_tcp_egress([entry])
+        networks = (f"{address}/{address.max_prefixlen}",)
+        assert parse_tcp_egress([{**entry, "allowed_cidrs": list(networks)}]) == [
+            TcpEgressRoute("db", str(address), 5432, networks)
         ]
-    ) == [TcpEgressRoute("db", private_address, 5432, permitted.allowed_cidrs)]
-    assert resolve_pinned_address(permitted) == private_address
-    assert queries == [(route.host, route.port)] * 2
+        permitted = TcpEgressRoute("db", route.host, route.port, networks)
+        assert resolve_pinned_address(permitted) == str(address)
+    assert queries == [(route.host, route.port)] * (2 if grant_private else 1)
 
 
 def test_tcp_broker_rejects_mixed_public_and_private_dns_without_dial(
@@ -316,12 +288,9 @@ def test_tcp_connector_wire_rejects_oversized_and_truncated_frames() -> None:
 
 
 def test_tcp_connector_reports_missing_configuration(
-    broker_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    with pytest.raises(ValueError, match="at least one route"):
-        start_tcp_egress_broker([], broker_dir)
     assert tcp_egress_wire.main([]) == 2
     assert "Usage:" in capsys.readouterr().err
     monkeypatch.delenv(tcp_egress_wire.SOCKET_ENV, raising=False)
@@ -690,6 +659,8 @@ def test_tcp_broker_pins_dns_answer_before_dialing(
 def test_tcp_connector_supports_real_ssh_proxy_command(
     ssh_git_server: tuple[GitSshBinding, str, Path],
     broker_dir: Path,
+    tmp_path: Path,
+    active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
 ) -> None:
     binding, url, _ = ssh_git_server
     host = _nonloopback_ip()
@@ -733,6 +704,40 @@ def test_tcp_connector_supports_real_ssh_proxy_command(
             timeout=25,
         )
         assert result.returncode == 0 and "refs/heads/main" in result.stdout, result.stderr
+        workspace = tmp_path / "ssh-terminal"
+        workspace.mkdir()
+        environment = OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=active_sandbox_spec_factory(
+                write_paths=["."],
+                tcp_egress=[route],
+                extra_read_paths=[str(Path(binding.identity_file).parent)],
+            ),
+        )
+        command = (
+            f"git ls-remote {shlex.quote(url)} > result 2> error; "
+            "printf '%s' $? > status; exec sleep 30"
+        )
+        terminal = create_terminal_instance(
+            name="tcp-ssh",
+            session_key="test",
+            spec=TerminalEnvSpec(
+                command="/bin/bash",
+                args=["-lc", command],
+                os_env="inherit",
+                env={key: value for key, value in env.items() if key.startswith("GIT_")},
+            ),
+            parent_os_env_spec=environment,
+        ).instance
+        try:
+            run_async(terminal.launch(cwd=workspace))
+            status = workspace / "status"
+            poll_until(lambda: status.exists() and bool(status.read_text()), timeout_s=20)
+            assert status.read_text() == "0", (workspace / "error").read_text()
+            assert "refs/heads/main" in (workspace / "result").read_text()
+        finally:
+            run_async(terminal.close())
     finally:
         broker.stop()
 
@@ -806,21 +811,46 @@ def test_tcp_broker_rejects_empty_input_frames(
 
 
 def test_tcp_route_cannot_use_other_brokers_token(
-    tcp_route: TcpEgressRoute, broker_dir: Path
+    tcp_route: TcpEgressRoute,
+    broker_dir: Path,
+    tmp_path: Path,
+    active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
 ) -> None:
-    first_dir, second_dir = broker_dir / "first", broker_dir / "second"
-    first_dir.mkdir()
+    second_dir = broker_dir / "second"
     second_dir.mkdir()
-    first = start_tcp_egress_broker([tcp_route], first_dir)
+    workspace = tmp_path / "isolated"
+    workspace.mkdir()
+    environment = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=active_sandbox_spec_factory(write_paths=["."], tcp_egress=[tcp_route]),
+        )
+    )
+    assert isinstance(environment, os_env_module.CallerProcessOSEnvironment)
     second = start_tcp_egress_broker([tcp_route], second_dir)
     try:
+        own = run_async(environment.shell("printf own | omnigent-egress-connect echo"))
+        assert own.get("exit_code") == 0 and own.get("stdout") == "own", own
+        first = environment._helper._tcp_egress_broker
+        assert first is not None
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.connect(str(second.socket_path))
             request = json.dumps({"token": first.token, "route": "echo"}).encode()
             client.sendall(struct.pack("!I", len(request)) + request)
             assert client.recv(1) == b"\x01"
+        borrowed = run_async(
+            environment.shell(
+                f"printf borrowed | {tcp_egress_wire.SOCKET_ENV}="
+                f"{shlex.quote(str(second.socket_path))} "
+                f"{tcp_egress_wire.TOKEN_ENV}={shlex.quote(second.token)} "
+                "omnigent-egress-connect echo"
+            )
+        )
+        assert borrowed.get("exit_code") != 0, borrowed
+        assert borrowed.get("stdout") == "", borrowed
     finally:
-        first.stop()
+        environment.close()
         second.stop()
 
 
@@ -897,6 +927,68 @@ def test_tcp_broker_busy_has_a_useful_error(
             assert len(handlers_started) == 1
     finally:
         broker.stop()
+
+
+@pytest.mark.parametrize(
+    "request_bytes",
+    [
+        struct.pack("!I", 0),
+        struct.pack("!I", 2049),
+        struct.pack("!I", 1) + b"{",
+        struct.pack("!I", 1) + b"\xff",
+    ],
+)
+def test_tcp_broker_rejects_malformed_initial_requests(
+    request_bytes: bytes, broker_dir: Path
+) -> None:
+    broker = start_tcp_egress_broker(
+        [TcpEgressRoute("echo", "echo.example.test", 5432)], broker_dir
+    )
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(2)
+            client.connect(str(broker.socket_path))
+            client.sendall(request_bytes)
+            assert client.recv(1) == b"\x01"
+    finally:
+        broker.stop()
+
+
+@pytest.mark.parametrize("partial_header", [False, True])
+def test_tcp_handshake_trickle_has_an_absolute_deadline(
+    partial_header: bool,
+    broker_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("omnigent.inner.tcp_egress._HANDSHAKE_SECONDS", 0.15)
+    broker = start_tcp_egress_broker(
+        [TcpEgressRoute("echo", "echo.example.test", 5432)], broker_dir
+    )
+    finished = threading.Event()
+    header = struct.pack("!I", 2048)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(2)
+        client.connect(str(broker.socket_path))
+        client.sendall(header[:1] if partial_header else header)
+
+        def trickle() -> None:
+            try:
+                for value in (header[1:] if partial_header else b"") + b" " * 2048:
+                    if finished.wait(0.04):
+                        return
+                    client.sendall(bytes([value]))
+            except OSError:
+                pass
+
+        writer = threading.Thread(target=trickle, daemon=True)
+        writer.start()
+        try:
+            assert client.recv(1) == b"\x01"
+            assert b"connection failed" in client.recv(1024)
+        finally:
+            finished.set()
+            writer.join(timeout=2)
+            broker.stop()
 
 
 def test_tcp_revocation_during_slow_quota_denial(

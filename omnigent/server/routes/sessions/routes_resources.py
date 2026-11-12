@@ -1215,6 +1215,8 @@ def register_resources_routes(
         session_id: str,
         path: str,
         conversation: Conversation,
+        *,
+        for_control: bool = False,
     ) -> tuple[int, dict[str, Any]]:
         """Proxy a DELETE request to the runner and return status + JSON.
 
@@ -1224,10 +1226,14 @@ def register_resources_routes(
         :returns: Tuple of (status_code, parsed_json_body).
         :raises HTTPException: On transport failure or an unreadable runner reply.
         """
-        runner_client = await _get_runner_client_for_resource_access(
-            session_id,
-            conversation=conversation,
-        )
+        if for_control:
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id, conversation=conversation, for_control=True
+            )
+        else:
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id, conversation=conversation
+            )
         if runner_client is None:
             raise HTTPException(
                 status_code=502,
@@ -1518,7 +1524,7 @@ def register_resources_routes(
         resolver = get_runner_direct_attach_resolver()
         if resolver is None:
             return
-        endpoint = resolver(session_id)
+        endpoint = await asyncio.to_thread(resolver, session_id)
         if endpoint is None:
             return
         if not await _caller_owns_session(session_id, request):
@@ -1852,6 +1858,7 @@ def register_resources_routes(
             session_id,
             path,
             conv,
+            for_control=True,
         )
         if status == 404:
             error = payload.get("error", {})

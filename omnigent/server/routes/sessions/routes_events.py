@@ -2050,6 +2050,7 @@ def register_events_routes(
             runner_client = await _get_runner_client(
                 target_session_id,
                 runner_router,
+                for_control=True,
             )
             interrupt_delivered = False
             if runner_client is not None:
@@ -2113,7 +2114,9 @@ def register_events_routes(
                 # A shared-runner chat owns its harness resources, while the
                 # parent owns the runner. Keep the persisted transcript.
                 try:
-                    cleanup_client = await _get_runner_client(session_id, runner_router)
+                    cleanup_client = await _get_runner_client(
+                        session_id, runner_router, for_control=True
+                    )
                     if cleanup_client is None:
                         raise ConnectionError("Side-chat runner is unavailable")
                     cleanup_resp = await cleanup_client.delete(
@@ -4165,7 +4168,9 @@ def register_events_routes(
         # resources are gone with the runner anyway.
         runner_client: httpx.AsyncClient | None = None
         try:
-            runner_client = await _get_runner_client_for_resource_access(session_id)
+            runner_client = await _get_runner_client(
+                session_id, runner_router, conversation=conv, for_control=True
+            )
         except OmnigentError as exc:
             _logger.info(
                 "Skipping runner-side cleanup for %s; proceeding with server-side delete: %s",

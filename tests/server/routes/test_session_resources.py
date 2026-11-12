@@ -474,6 +474,11 @@ class _FakeRunnerRouter:
         self.resource_calls: list[str] = []
         self.resource_conversations: list[Conversation | None] = []
 
+    def client_for_session_control(
+        self, conversation_id: str, *, conversation: Conversation | None = None
+    ) -> _RoutedRunner:
+        return self.client_for_session_resources(conversation_id, conversation=conversation)
+
     def client_for_session_resources(
         self,
         session_id: str,

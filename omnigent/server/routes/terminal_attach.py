@@ -202,7 +202,7 @@ def create_terminal_attach_router(
                 runner_cm = (
                     await _wait_for_runner_ws(ws_factory, runner_path)
                     if await_launch
-                    else ws_factory(runner_path)
+                    else await asyncio.to_thread(ws_factory, runner_path)
                 )
             except WrongReplicaWSError:
                 # Wrong-replica routing miss: the runner tunnel is bound but not
@@ -425,7 +425,7 @@ async def _wait_for_runner_ws(ws_factory: Callable[[str], Any], runner_path: str
     deadline = loop.time() + session_resources.TERMINAL_LAUNCH_ATTACH_WAIT_S
     while True:
         try:
-            return ws_factory(runner_path)
+            return await asyncio.to_thread(ws_factory, runner_path)
         except RunnerUnavailableWSError:
             if loop.time() >= deadline:
                 raise

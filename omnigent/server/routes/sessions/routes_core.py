@@ -656,7 +656,7 @@ def register_core_routes(
         """
         try:
             runner_client = await _get_runner_client(
-                session_id, runner_router, conversation=routing
+                session_id, runner_router, conversation=routing, for_control=True
             )
             if runner_client is not None:
                 await runner_client.delete(f"/v1/sessions/{session_id}", timeout=30.0)

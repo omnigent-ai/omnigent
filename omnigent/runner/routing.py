@@ -246,6 +246,25 @@ class RunnerRouter:
         :raises OmnigentError: If the conversation is missing, the
             pinned runner is offline, or no online runner is available.
         """
+        return self._client_for_session(
+            conversation_id, conversation=conversation, check_runtime=True
+        )
+
+    def client_for_session_control(
+        self, conversation_id: str, *, conversation: Conversation | None = None
+    ) -> RoutedRunner:
+        """Route teardown to the bound runner even when execution cannot be admitted."""
+        return self._client_for_session(
+            conversation_id, conversation=conversation, check_runtime=False
+        )
+
+    def _client_for_session(
+        self,
+        conversation_id: str,
+        *,
+        conversation: Conversation | None,
+        check_runtime: bool,
+    ) -> RoutedRunner:
         conv = conversation
         if conv is not None and conv.id != conversation_id:
             raise ValueError(
@@ -263,7 +282,8 @@ class RunnerRouter:
                     conv.runner_id,
                     f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
                 )
-            self.require_runtime_support(conv)
+            if check_runtime:
+                self.require_runtime_support(conv)
             return RoutedRunner(
                 runner_id=conv.runner_id,
                 client=self._client_for_runner(conv.runner_id),
@@ -279,8 +299,8 @@ class RunnerRouter:
         """
         Return the pinned runner client for an already-started conversation.
 
-        Used by server surfaces like terminal listing and interrupt
-        forwarding that know the conversation but do not know the
+        Used by terminal attachment and background requests that
+        know the conversation but do not know the
         harness kind. Unpinned or missing conversations return
         ``None`` so callers can fall back to local test/in-process
         behavior.

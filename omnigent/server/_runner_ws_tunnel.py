@@ -123,6 +123,8 @@ def make_direct_attach_resolver(
     :func:`omnigent.runtime.set_runner_direct_attach_resolver` so the
     terminals API can hand same-machine browsers a relay-free attach URL.
 
+    Async callers must offload this resolver: admission may load the agent bundle.
+
     :param router: Routes conversation ids to pinned runner ids.
     :param registry: Tunnel registry that owns the live runner sessions.
     :returns: Callable returning the advert, or ``None`` when the
@@ -159,6 +161,8 @@ def make_tunnel_ws_factory(
     factory shape (callable ``(runner_path) -> async-context``) is
     what :mod:`omnigent.server.routes.terminal_attach` already
     expects.
+
+    Async callers must offload this factory: admission may load the agent bundle.
 
     :param router: Routes conversation ids to pinned runner ids.
     :param registry: Tunnel registry that owns the live runner WS

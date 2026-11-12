@@ -4876,8 +4876,10 @@ def create_app(
                             "_on_runner_connect: matched %s (agent=%s)", conv.id, conv.agent_id
                         )
                         try:
-                            routed = runner_router.client_for_session_resources(
-                                conv.id, conversation=conv
+                            routed = await asyncio.to_thread(
+                                runner_router.client_for_session_resources,
+                                conv.id,
+                                conversation=conv,
                             )
                         except OmnigentError as exc:
                             if exc.code in (ErrorCode.RUNNER_UNAVAILABLE, ErrorCode.WRONG_REPLICA):

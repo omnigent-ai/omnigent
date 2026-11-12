@@ -1,7 +1,9 @@
 """Reject named TCP policies before an older runtime can ignore them."""
 
+import asyncio
 import dataclasses
 import json
+import threading
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -13,6 +15,7 @@ from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime import get_agent_store, get_conversation_store
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from tests.server.helpers import build_agent_bundle, create_test_session
+from tests.server.integration.test_mcp_registry import launch_registry as launch_registry
 from tests.server.integration.test_session_host_launch import app as app
 from tests.server.integration.test_session_worktree_create import _HOST_ID, _SOURCE_REPO
 from tests.server.integration.test_session_worktree_create import (
@@ -40,19 +43,39 @@ def _tcp_bundle(scope: str) -> bytes:
     )
 
 
-@pytest.mark.parametrize("scope", ["root", "child", "terminal", "plain"])
+@pytest.mark.parametrize(
+    ("feature", "scope"),
+    [("tcp", scope) for scope in ("root", "child", "terminal", "plain")]
+    + [("mcp", "root"), ("mcp", "plain")],
+)
 @pytest.mark.parametrize("capable", [False, True])
 @pytest.mark.parametrize("upload", [False, True])
-async def test_create_checks_tcp_support_before_side_effects(
-    client, app, register_worktree_host, monkeypatch, scope, capable, upload
+async def test_create_checks_runtime_support_before_side_effects(
+    client,
+    app,
+    launch_registry,
+    register_worktree_host,
+    monkeypatch,
+    feature,
+    scope,
+    capable,
+    upload,
 ):
-    capture = register_worktree_host(capabilities=[CAP_TCP_EGRESS] if capable else [])
-    bundle = _tcp_bundle(scope)
+    capability = CAP_TCP_EGRESS if feature == "tcp" else CAP_MCP_REGISTRY
+    capture = register_worktree_host(capabilities=[capability] if capable else [])
+    bundle = _tcp_bundle(scope if feature == "tcp" else "plain")
     source = await create_test_session(client, bundle=bundle)
     store = get_conversation_store()
-    create = Mock(wraps=store.create_session_with_agent)
-    monkeypatch.setattr(store, "create_session_with_agent", create)
+    creates = []
+    for method in ("create_session_with_agent", "create_conversation"):
+        create = Mock(wraps=getattr(store, method))
+        monkeypatch.setattr(store, method, create)
+        creates.append(create)
     metadata = {"host_id": _HOST_ID, "workspace": _SOURCE_REPO}
+    if feature == "mcp":
+        metadata["mcp_registry_services"] = ["tracker"] if scope != "plain" else []
+    if not upload:
+        metadata["git"] = {"branch_name": "runtime-check"}
     if upload:
         response = await client.post(
             "/v1/sessions",
@@ -62,22 +85,43 @@ async def test_create_checks_tcp_support_before_side_effects(
     else:
         response = await client.post(
             "/v1/sessions",
-            json={"agent_id": source["agent_id"], "sub_agent_name": "child", **metadata},
+            json={
+                "agent_id": source["agent_id"],
+                **({"sub_agent_name": "child"} if feature == "tcp" else {}),
+                **metadata,
+            },
         )
     if scope != "plain" and not capable:
         assert response.status_code == 503, response.text
         assert response.json()["error"]["code"] == ErrorCode.RUNNER_CAPABILITY_MISMATCH
-        assert "TCP egress support" in response.text
-        create.assert_not_called()
+        assert (
+            "TCP egress support" if feature == "tcp" else "MCP registry support"
+        ) in response.text
+        for create in creates:
+            create.assert_not_called()
         assert not capture.create and not capture.launches
     else:
         assert response.status_code == 201, response.text
         assert len(capture.launches) == 1
 
 
-@pytest.mark.parametrize("scope", ["root", "child", "terminal"])
-async def test_old_runner_cannot_bind_initialize_or_dispatch_then_recovers(client, app, scope):
-    session = await create_test_session(client, bundle=_tcp_bundle(scope))
+@pytest.mark.parametrize(
+    ("feature", "scope"), [("tcp", "root"), ("tcp", "child"), ("tcp", "terminal"), ("mcp", "root")]
+)
+async def test_old_runner_cannot_bind_initialize_or_dispatch_then_recovers(
+    client, app, launch_registry, feature, scope
+):
+    capability = CAP_TCP_EGRESS if feature == "tcp" else CAP_MCP_REGISTRY
+    message = "TCP egress support" if feature == "tcp" else "MCP registry support"
+    session = await create_test_session(
+        client, bundle=_tcp_bundle(scope if feature == "tcp" else "plain")
+    )
+    if feature == "mcp":
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/agent/mcp-servers",
+            json={"name": "tracker", "transport": "registry"},
+        )
+        assert response.status_code == 200, response.text
     sid = session["id"]
     connection = app.state.tunnel_registry.register(
         "old-runner",
@@ -85,7 +129,7 @@ async def test_old_runner_cannot_bind_initialize_or_dispatch_then_recovers(clien
         HelloFrame(
             runner_version="same-version",
             frame_protocol_version=1,
-            capabilities=[CAP_MCP_REGISTRY],
+            capabilities=[CAP_MCP_REGISTRY] if feature == "tcp" else [],
         ),
         owner=RESERVED_USER_LOCAL,
     )
@@ -101,7 +145,7 @@ async def test_old_runner_cannot_bind_initialize_or_dispatch_then_recovers(clien
             get_conversation_store().get_conversation(sid), runner_id="old-runner"
         )
         initializer = app.state.runner_session_initializer
-        with pytest.raises(OmnigentError, match="TCP egress support"):
+        with pytest.raises(OmnigentError, match=message):
             await initializer.initialize(conv, runner, timeout=1)
         runner.post.assert_not_awaited()
         from omnigent.server.routes._sessions.orchestration import (
@@ -109,7 +153,7 @@ async def test_old_runner_cannot_bind_initialize_or_dispatch_then_recovers(clien
         )
         from omnigent.server.schemas import SessionEventInput
 
-        with pytest.raises(OmnigentError, match="TCP egress support"):
+        with pytest.raises(OmnigentError, match=message):
             await _dispatch_session_event_to_runner_impl(
                 sid,
                 conv,
@@ -122,11 +166,11 @@ async def test_old_runner_cannot_bind_initialize_or_dispatch_then_recovers(clien
                 runner_router=app.state.runner_router,
             )
         runner.post.assert_not_awaited()
-        connection.hello.capabilities.append(CAP_TCP_EGRESS)
+        connection.hello.capabilities.append(capability)
         assert (await initializer.initialize(conv, runner, timeout=1)).status_code == 200
         runner.post.assert_awaited_once()
-        connection.hello.capabilities.remove(CAP_TCP_EGRESS)
-        with pytest.raises(OmnigentError, match="TCP egress support"):
+        connection.hello.capabilities.remove(capability)
+        with pytest.raises(OmnigentError, match=message):
             await initializer.initialize(conv, runner, timeout=1)
         runner.post.assert_awaited_once()
     finally:
@@ -211,7 +255,66 @@ async def test_bound_old_runner_cannot_serve_shell_or_terminal_attach(client, ap
 
         with pytest.raises(OmnigentError, match="TCP egress support"):
             await _get_runner_client_impl(sid, router)
+        from omnigent.server._runner_ws_tunnel import (
+            make_direct_attach_resolver,
+            make_tunnel_ws_factory,
+        )
+
+        direct = make_direct_attach_resolver(router, app.state.tunnel_registry)
+        assert await asyncio.to_thread(direct, sid) is None
+        tunnel = make_tunnel_ws_factory(router, app.state.tunnel_registry)
+        with pytest.raises(RuntimeError, match="TCP egress support"):
+            await asyncio.to_thread(tunnel, f"/v1/sessions/{sid}/resources/terminals/shell/attach")
         client_factory.assert_not_called()
         runner.post.assert_not_awaited()
     finally:
         app.state.tunnel_registry.deregister("old-runner", session=connection)
+
+
+async def test_plain_agent_requirement_reads_in_resource_helpers_run_off_loop(
+    client, app, monkeypatch
+):
+    from omnigent.runtime import _globals
+    from omnigent.server.routes._sessions.helpers import (
+        _get_runner_client_for_resource_access_impl,
+        _get_runner_client_impl,
+    )
+
+    session = await create_test_session(client, bundle=_tcp_bundle("plain"))
+    sid = session["id"]
+    get_conversation_store().replace_runner_id(sid, "pre-tcp")
+    connection = app.state.tunnel_registry.register(
+        "pre-tcp",
+        Mock(),
+        HelloFrame(
+            runner_version="old", frame_protocol_version=1, capabilities=[CAP_MCP_REGISTRY]
+        ),
+    )
+    router = app.state.runner_router
+    monkeypatch.setattr(_globals, "_runner_router", router)
+    loop_thread = threading.get_ident()
+    reads = {"get": [], "load": []}
+
+    def track(call, name):
+        def tracked(*args, **kwargs):
+            reads[name].append(threading.get_ident())
+            return call(*args, **kwargs)
+
+        return tracked
+
+    for owner, name in ((app.state.agent_store, "get"), (router._agent_cache, "load")):
+        monkeypatch.setattr(owner, name, track(getattr(owner, name), name))
+    try:
+        assert await _get_runner_client_impl(sid, router) is not None
+        assert await _get_runner_client_for_resource_access_impl(sid) is not None
+        assert all(
+            threads and all(t != loop_thread for t in threads) for threads in reads.values()
+        )
+        failure = OmnigentError("invalid saved spec", code=ErrorCode.INVALID_INPUT)
+        monkeypatch.setattr(router._agent_cache, "load", Mock(side_effect=failure))
+        with pytest.raises(OmnigentError) as error:
+            await _get_runner_client_impl(sid, router)
+        assert error.value.code == failure.code and error.value.__cause__ is failure
+        assert await _get_runner_client_impl(sid, router, for_control=True) is not None
+    finally:
+        app.state.tunnel_registry.deregister("pre-tcp", session=connection)

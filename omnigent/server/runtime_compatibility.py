@@ -19,6 +19,10 @@ if TYPE_CHECKING:
     from omnigent.stores import AgentStore
 
 
+class RuntimeSupportError(OmnigentError):
+    """Runtime requirements could not be verified for a saved session."""
+
+
 def registry_services(spec: AgentSpec | None) -> set[str]:
     """Include nested agents: runners parse the whole bundle before selecting one."""
     if spec is None:
@@ -90,13 +94,11 @@ def require_session_runtime_support(
         spec = agent_cache.load(
             agent.id, agent.bundle_location, expand_env=agent.operator_authored
         ).spec
-    except OmnigentError:
-        raise
     except Exception as exc:
-        raise OmnigentError(
+        raise RuntimeSupportError(
             "Cannot verify runtime support because this session's agent bundle could not "
             "be loaded. Restore or replace the bundle and retry.",
-            code=ErrorCode.CONFLICT,
+            code=exc.code if isinstance(exc, OmnigentError) else ErrorCode.CONFLICT,
         ) from exc
     from omnigent.mcp_selection import selected_mcp_spec
 
