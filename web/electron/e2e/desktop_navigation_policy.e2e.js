@@ -51,20 +51,21 @@ function writeResponseObserver(scratch) {
   fs.writeFileSync(
     observer,
     `
-    const mod = require(${JSON.stringify(path.resolve(__dirname, "../src/browserViewRegistry.js"))});
-    const create = mod.createBrowserViewRegistry;
+    const { registerTestOverride } = require(${JSON.stringify(path.resolve(__dirname, "../src/testOverrides.js"))});
     global.allowedNetworkResponses = [];
-    mod.createBrowserViewRegistry = (opts) => {
-      const registry = create(opts);
-      const response = registry.shouldCancelAgentResponse.bind(registry);
-      registry.shouldCancelAgentResponse = async (details, partition) => {
-        const cancel = await response(details, partition);
-        global.allowedNetworkResponses.push({ url: details.url, ip: details.ip,
-          resourceType: details.resourceType, statusCode: details.statusCode, cancel });
-        return cancel;
-      };
-      return registry;
-    };
+    registerTestOverride("browserViewRegistry", ({ createBrowserViewRegistry: create }) => ({
+      createBrowserViewRegistry: (opts) => {
+        const registry = create(opts);
+        const response = registry.shouldCancelAgentResponse.bind(registry);
+        registry.shouldCancelAgentResponse = async (details, partition) => {
+          const cancel = await response(details, partition);
+          global.allowedNetworkResponses.push({ url: details.url, ip: details.ip,
+            resourceType: details.resourceType, statusCode: details.statusCode, cancel });
+          return cancel;
+        };
+        return registry;
+      },
+    }));
   `,
   );
   return observer;
@@ -191,38 +192,39 @@ it(
     });
     const localUrl = `http://localhost:${fixture.address().port}/`;
     const preload = path.join(scratch, "observe-network.cjs");
-    const modulePath = path.resolve(__dirname, "../src/browserViewRegistry.js");
+    const modulePath = path.resolve(__dirname, "../src/testOverrides.js");
     // Main-only fault injection isolates the response guard from preflight.
     // No renderer gains an exception or a way to manufacture an Arca identity.
     fs.writeFileSync(
       preload,
       `
-    const mod = require(${JSON.stringify(modulePath)});
-    const create = mod.createBrowserViewRegistry;
+    const { registerTestOverride } = require(${JSON.stringify(modulePath)});
     global.navigationRequests = [];
     global.navigationResponses = [];
     global.navigationRedirects = [];
-    mod.createBrowserViewRegistry = (opts) => {
-      const registry = create({ ...opts,
-        allowsLocalhost: (context) => context?.trustedPreviewFixture === true,
-      });
-      const response = registry.shouldCancelAgentResponse.bind(registry);
-      registry.shouldCancelAgentResponse = async (details, partition) => {
-        const cancel = await response(details, partition);
-        global.navigationResponses.push({ url: details.url, ip: details.ip,
-          webContentsId: details.webContentsId, statusCode: details.statusCode, cancel });
-        return cancel;
-      };
-      const request = registry.shouldCancelAgentRequest.bind(registry);
-      registry.shouldCancelAgentRequest = async (details, partition) => {
-        const cancel = registry.get("response-fixture")?.view.webContents.id === details.webContentsId
-          && details.url === ${JSON.stringify(localUrl)} ? false : await request(details, partition);
-        global.navigationRequests.push({ url: details.url, resourceType: details.resourceType,
-          webContentsId: details.webContentsId, cancel });
-        return cancel;
-      };
-      return registry;
-    };
+    registerTestOverride("browserViewRegistry", ({ createBrowserViewRegistry: create }) => ({
+      createBrowserViewRegistry: (opts) => {
+        const registry = create({ ...opts,
+          allowsLocalhost: (context) => context?.trustedPreviewFixture === true,
+        });
+        const response = registry.shouldCancelAgentResponse.bind(registry);
+        registry.shouldCancelAgentResponse = async (details, partition) => {
+          const cancel = await response(details, partition);
+          global.navigationResponses.push({ url: details.url, ip: details.ip,
+            webContentsId: details.webContentsId, statusCode: details.statusCode, cancel });
+          return cancel;
+        };
+        const request = registry.shouldCancelAgentRequest.bind(registry);
+        registry.shouldCancelAgentRequest = async (details, partition) => {
+          const cancel = registry.get("response-fixture")?.view.webContents.id === details.webContentsId
+            && details.url === ${JSON.stringify(localUrl)} ? false : await request(details, partition);
+          global.navigationRequests.push({ url: details.url, resourceType: details.resourceType,
+            webContentsId: details.webContentsId, cancel });
+          return cancel;
+        };
+        return registry;
+      },
+    }));
   `,
     );
     let server;

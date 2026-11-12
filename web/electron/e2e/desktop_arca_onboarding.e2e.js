@@ -119,13 +119,18 @@ async function fixtureArca({ stateDir, serverUrl, hostId, secret }) {
 function fixturePolicy({ appRoot, arcaPath, serverUrl }) {
   const path = require("node:path");
   const src = path.join(appRoot, "src");
-  const managed = require(path.join(src, "managed_preferences"));
+  const { registerTestOverride } = require(path.join(src, "testOverrides.js"));
+  const managed = {};
+  registerTestOverride("managed_preferences", () => managed);
   managed.getDatabricksInternalFeaturesEnabled = () => true;
   managed.getManagedServerUrls = () => [serverUrl];
   managed.getManagedServerNames = () => ({ [serverUrl]: "Fixture team" });
-  require(path.join(src, "url")).isDatabricksManagedServerUrl = (url) =>
+  const urls = {};
+  registerTestOverride("url", () => urls);
+  urls.isDatabricksManagedServerUrl = (url) =>
     typeof url === "string" && new URL(url).origin === new URL(serverUrl).origin;
-  const cli = require(path.join(src, "omnigent_cli"));
+  const cli = {};
+  registerTestOverride("omnigent_cli", () => cli);
   cli.getCliStatus = async () => ({
     installed: true,
     path: null,

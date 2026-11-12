@@ -1,6 +1,6 @@
 "use strict";
 
-const path = require("node:path");
+const { pagePath, preloadPath } = require("./paths");
 
 // Loads that finish sooner never show the indicator, so fast connects don't flash it.
 const SHOW_DELAY_MS = 300;
@@ -29,7 +29,7 @@ function createConnectionLoading({ BrowserWindow, platform = process.platform })
         width: 340,
         height: 64,
         webPreferences: {
-          preload: path.join(__dirname, "connection_loading_preload.js"),
+          preload: preloadPath("connection_loading_preload"),
           contextIsolation: true,
           nodeIntegration: false,
           sandbox: true,
@@ -85,9 +85,7 @@ function createConnectionLoading({ BrowserWindow, platform = process.platform })
         reveal();
       });
       position();
-      void window
-        .loadFile(path.join(__dirname, "..", "connection-loading", "index.html"))
-        .catch(close);
+      void window.loadFile(pagePath("connection-loading")).catch(close);
     }
     entry.attempt = attempt;
     entry.label = label;
