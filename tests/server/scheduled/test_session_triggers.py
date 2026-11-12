@@ -306,34 +306,51 @@ def test_status_edges_report_turn_ends_with_their_response(
     session = "c0ffee00c0ffee00c0ffee00c0ffee01"
     monkeypatch.delitem(helpers._session_status_cache, session, raising=False)
 
+    # An idle observation mid-turn (a transcript lull, PTY quiet) is no turn end; the
+    # confirmed completion that follows is reported once.
+    helpers._publish_status(session, "running", response_id="resp_0")
+    helpers._publish_status(session, "idle")
+    helpers._publish_status(session, "running", response_id="resp_0")
+    helpers._publish_status(session, "idle", response_id="resp_obs")
+    helpers._publish_status(session, "running", response_id="resp_0")
+    helpers._publish_status(
+        session, "idle", response_id="resp_0", turn_completed=True, reports_turn_end=True
+    )
     # A native turn names its response on the running edge and settles with a bare idle.
     helpers._publish_status(session, "running", response_id="resp_1")
-    helpers._publish_status(session, "idle")
-    helpers._publish_status(session, "idle")
+    helpers._publish_status(session, "idle", reports_turn_end=True)
+    helpers._publish_status(session, "idle", reports_turn_end=True)
     helpers._publish_status(session, "running", response_id="resp_2")
     helpers._publish_status(session, "failed", error=ErrorDetail(code="runner_error", message="x"))
     helpers._publish_status(session, "failed")
     # A stop publishes idle without persisting it, which is no turn end.
     helpers._publish_status(session, "running", response_id="resp_3")
-    helpers._publish_status(session, "idle", persist_live_status=False)
+    helpers._publish_status(session, "idle", persist_live_status=False, reports_turn_end=True)
     # An anonymous late failure, then the next turn's own failure: two occurrences.
     helpers._publish_status(session, "running", response_id="resp_6")
     helpers._publish_status(session, "failed")
     helpers._publish_status(session, "running", response_id="resp_6")
     helpers._publish_status(session, "failed", response_id="resp_6")
-    helpers._publish_status(session, "idle", persist_live_status=False)
+    helpers._publish_status(session, "idle", persist_live_status=False, reports_turn_end=True)
     # A short turn can start and end between status polls: its confirmed completion
     # still counts, and a replay of it repeats the same key, which records nothing.
-    helpers._publish_status(session, "idle", response_id="resp_5", turn_completed=True)
-    helpers._publish_status(session, "idle", response_id="resp_5", turn_completed=True)
+    helpers._publish_status(
+        session, "idle", response_id="resp_5", turn_completed=True, reports_turn_end=True
+    )
+    helpers._publish_status(
+        session, "idle", response_id="resp_5", turn_completed=True, reports_turn_end=True
+    )
     # Without a response there is nothing to deduplicate by, so it is not reported.
-    helpers._publish_status(session, "idle", turn_completed=True)
+    helpers._publish_status(session, "idle", turn_completed=True, reports_turn_end=True)
     # A previous turn's late failure lands after the next turn started; that turn's
     # confirmed completion still counts.
     helpers._publish_status(session, "running", response_id="resp_4")
     helpers._publish_status(session, "failed")
-    helpers._publish_status(session, "idle", response_id="resp_4", turn_completed=True)
+    helpers._publish_status(
+        session, "idle", response_id="resp_4", turn_completed=True, reports_turn_end=True
+    )
     assert seen == [
+        ("turn.completed", session, {"occurrence": "resp_0", "response_id": "resp_0"}),
         ("turn.completed", session, {"occurrence": "resp_1", "response_id": "resp_1"}),
         (
             "turn.failed",

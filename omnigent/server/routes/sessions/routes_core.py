@@ -5032,6 +5032,8 @@ def register_core_routes(
             # A continuation is announced once placed, with the source's sharing.
             if not body.side_chat and not continue_source:
                 _announce_session_added(user_id, new_conv.id)
+            # A side chat is still a session its owner's automations hear of.
+            if not continue_source:
                 session_triggers.notify("session.created", new_conv.id, occurrence="created")
         # Default-public grant only after the managed launch was accepted (see
         # the create paths). A side chat is a private scratch fork of the
