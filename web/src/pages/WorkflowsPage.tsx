@@ -3,8 +3,9 @@
  * "New workflow" button. Laid out like the Automations page.
  *
  * New workflow starts a session, from the new-session page's defaults, that asks
- * the agent to draft and save the workflow. Delete removes one; Run, Edit and
- * Create automation aren't connected yet.
+ * the agent to draft and save the workflow. Run opens the new-session page with
+ * the run's request, so the user picks where and how it runs. Delete removes one;
+ * Edit and Create automation aren't connected yet.
  */
 
 import { useMemo, useState } from "react";
@@ -19,7 +20,7 @@ import { WorkflowRow } from "@/components/workflows/WorkflowRow";
 import { useDeleteWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import { newSessionLocation } from "@/lib/newSessionHandoff";
 import { useNavigate } from "@/lib/routing";
-import { createWorkflowPrompt } from "@/lib/workflow";
+import { createWorkflowPrompt, runSavedWorkflowPrompt } from "@/lib/workflow";
 
 export function WorkflowsPage() {
   const { workflows, isLoading, isError, refresh } = useSavedWorkflows();
@@ -98,7 +99,7 @@ export function WorkflowsPage() {
             <WorkflowRow
               key={workflow.id}
               workflow={workflow}
-              onRun={() => showToast("Running workflows isn’t connected yet.")}
+              onRun={() => navigate(newSessionLocation(runSavedWorkflowPrompt(workflow), []))}
               onEdit={() => showToast("Editing workflows isn’t connected yet.")}
               onCreateAutomation={() =>
                 showToast("Creating automations from workflows isn’t connected yet.")

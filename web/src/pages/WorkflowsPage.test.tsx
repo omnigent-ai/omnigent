@@ -9,7 +9,7 @@ import {
 } from "@/hooks/useSavedWorkflows";
 import { NEW_SESSION_HANDOFF_PARAM, peekNewSessionHandoff } from "@/lib/newSessionHandoff";
 import type * as RoutingModule from "@/lib/routing";
-import { createWorkflowPrompt } from "@/lib/workflow";
+import { createWorkflowPrompt, runSavedWorkflowPrompt } from "@/lib/workflow";
 
 import { WorkflowsPage } from "./WorkflowsPage";
 
@@ -87,13 +87,24 @@ describe("WorkflowsPage", () => {
     expect(showToast).toHaveBeenCalledWith("Couldn’t delete “Fix flaky tests”.");
   });
 
-  it("says Run, Edit and Create automation aren't connected yet", () => {
+  it("runs a workflow from the new-session page, where the user picks where it runs", () => {
     mockWorkflows({ workflows: WORKFLOWS });
     render(<WorkflowsPage />);
 
     openMenu(rows()[0]!);
     fireEvent.click(screen.getByTestId("workflow-run"));
-    expect(showToast).toHaveBeenLastCalledWith("Running workflows isn’t connected yet.");
+
+    const location = navigate.mock.calls[0]![0] as string;
+    const token = new URLSearchParams(location.split("?")[1]).get(NEW_SESSION_HANDOFF_PARAM);
+    expect(peekNewSessionHandoff(token)).toEqual({
+      text: runSavedWorkflowPrompt(WORKFLOWS[0]!),
+      files: [],
+    });
+  });
+
+  it("says Edit and Create automation aren't connected yet", () => {
+    mockWorkflows({ workflows: WORKFLOWS });
+    render(<WorkflowsPage />);
 
     openMenu(rows()[0]!);
     fireEvent.click(screen.getByTestId("workflow-edit"));

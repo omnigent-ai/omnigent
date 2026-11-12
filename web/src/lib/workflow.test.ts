@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   REVIEW_PLAN_FIRST,
   createWorkflowPrompt,
+  runSavedWorkflowPrompt,
   offersSaveWorkflow,
   offersWorkflow,
   parseSavedWorkflowMessage,
@@ -81,5 +82,18 @@ describe("parseSavedWorkflowMessage", () => {
   it("ignores other prompts", () => {
     expect(parseSavedWorkflowMessage("Summarize overnight activity")).toBeNull();
     expect(parseSavedWorkflowMessage("/workflow Add retries")).toBeNull();
+  });
+});
+
+describe("runSavedWorkflowPrompt", () => {
+  it("asks the workflow skill to run the saved workflow by ID, with the plan review", () => {
+    expect(
+      runSavedWorkflowPrompt({
+        id: "0123456789abcdef0123456789abcdef",
+        name: "Triage flaky tests",
+      }),
+    ).toBe(
+      `Use the workflow skill to run the saved workflow "Triage flaky tests" (ID 0123456789abcdef0123456789abcdef).\n\n${REVIEW_PLAN_FIRST}`,
+    );
   });
 });
