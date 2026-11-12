@@ -63,6 +63,15 @@ export function savedWorkflowMessage(
 }
 
 /**
+ * The message that asks the agent to pick a stopped task back up.
+ *
+ * @param taskName The task's name, e.g. `"Review #6109"`.
+ */
+export function continueTaskMessage(taskName: string): string {
+  return `Continue the task "${taskName}".`;
+}
+
+/**
  * The message that saves the session's plan as a workflow named *name*.
  *
  * @param skillPrefix The harness's skill prefix, `"/"` or `"$"` for Codex's own CLI.

@@ -9,6 +9,7 @@ import {
   ListChecksIcon,
   Loader2Icon,
   MessageCircleQuestionMarkIcon,
+  PlayIcon,
   WorkflowIcon,
   XIcon,
 } from "lucide-react";
@@ -70,7 +71,7 @@ export const STATE_LABELS: Record<StepState, string> = {
 export const SEGMENT_COLORS: Record<StepState, string> = {
   waiting: "bg-foreground/10",
   ready: "bg-session-active/25",
-  running: "bg-session-active",
+  running: "bg-session-active animate-pulse motion-reduce:animate-none",
   stopped: "bg-status-gray",
   needs_input: "bg-brand-accent",
   done: "bg-success",
@@ -333,6 +334,10 @@ function StepHistory({
   );
 }
 
+// A task row's small icon buttons: its ⋯ menu and the chevron that opens its history.
+const ROW_ICON_BUTTON =
+  "mt-1.5 shrink-0 cursor-pointer rounded-md p-1 text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50";
+
 function StepRow({
   item,
   number,
@@ -341,6 +346,7 @@ function StepRow({
   names,
   flash,
   onShowInChat,
+  onContinue,
 }: {
   item: StepProgress;
   number: number;
@@ -351,6 +357,8 @@ function StepRow({
   flash: boolean;
   /** Scroll the chat to a marker, e.g. ``journal-<entry id>``. */
   onShowInChat: (markerId: string) => void;
+  /** Asks the agent to pick the task back up; offered while it's stopped. */
+  onContinue?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const detail = stepDetail(item);
@@ -427,13 +435,33 @@ function StepRow({
         ) : (
           <div className={rowClassName}>{content}</div>
         )}
+        {onContinue && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                aria-label={`Actions for ${item.step.name}`}
+                className={cn(ROW_ICON_BUTTON, !hasHistory && "mr-1")}
+                data-testid="tasks-row-menu"
+              >
+                <EllipsisIcon aria-hidden className="size-4" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem data-testid="tasks-row-continue" onSelect={onContinue}>
+                <PlayIcon className="size-4" />
+                Continue
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
         {hasHistory && (
           <button
             type="button"
             aria-expanded={open}
             aria-label={`${open ? "Hide" : "Show"} ${item.step.name} history`}
             onClick={() => setOpen((value) => !value)}
-            className="mt-1.5 mr-1 shrink-0 cursor-pointer rounded-md p-1 text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            className={cn(ROW_ICON_BUTTON, "mr-1")}
             data-testid="tasks-row-history"
           >
             <ChevronRightIcon
@@ -621,7 +649,7 @@ export function ProgressStrip({
                     className={cn(
                       "h-1.5 w-full rounded-full transition-[height,opacity] duration-150 group-hover:h-2 group-focus-visible:h-2 group-focus-visible:ring-2 group-focus-visible:ring-ring/50",
                       SEGMENT_COLORS[item.state],
-                      !lit(index) && "opacity-30",
+                      !lit(index) && "animate-none opacity-30",
                     )}
                   />
                 </button>
@@ -837,12 +865,15 @@ function TaskList({
   names,
   flashStep,
   onShowInChat,
+  onContinueTask,
 }: {
   progress: readonly StepProgress[];
   entries: readonly JournalEntry[];
   names: ReadonlyMap<string, string>;
   flashStep: string | null;
   onShowInChat: (markerId: string) => void;
+  /** The composer's Continue, given a task's name; absent when this viewer can't send. */
+  onContinueTask?: (taskName: string) => void;
 }) {
   return (
     <section aria-label="Tasks">
@@ -857,6 +888,11 @@ function TaskList({
             names={names}
             flash={flashStep === item.step.id}
             onShowInChat={onShowInChat}
+            onContinue={
+              onContinueTask && item.state === "stopped"
+                ? () => onContinueTask(item.step.name)
+                : undefined
+            }
           />
         ))}
       </ol>
@@ -887,6 +923,7 @@ export function TasksPanel({
   const { journal, plan, progress } = tasks;
   const startWorkflow = useSessionTasksActions((state) => state.startWorkflow[conversationId]);
   const saveWorkflow = useSessionTasksActions((state) => state.saveWorkflow[conversationId]);
+  const continueTask = useSessionTasksActions((state) => state.continueTask[conversationId]);
   const entries = tasks.journalSupported ? journal.entries : NO_ENTRIES;
   const names = new Map(progress.map((item) => [item.step.id, item.step.name]));
   const empty = progress.length === 0;
@@ -996,6 +1033,7 @@ export function TasksPanel({
               names={names}
               flashStep={flashStep}
               onShowInChat={showInChat}
+              onContinueTask={continueTask}
             />
           </>
         )}

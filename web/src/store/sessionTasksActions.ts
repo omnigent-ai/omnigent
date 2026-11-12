@@ -5,6 +5,8 @@ interface SessionTasksActionsState {
   startWorkflow: Readonly<Record<string, () => void>>;
   /** Per session: how its composer saves the plan as a workflow, given the plan's name. */
   saveWorkflow: Readonly<Partial<Record<string, (planName: string) => void>>>;
+  /** Per session: how its composer asks the agent to continue a stopped task, given its name. */
+  continueTask: Readonly<Partial<Record<string, (taskName: string) => void>>>;
   /** A session whose Tasks tab should open; the shell clears it once open. */
   tasksTabToOpen: string | null;
   /** The task the Tasks tab should scroll to and highlight; the tab clears it once shown. */
@@ -15,12 +17,14 @@ interface SessionTasksActionsState {
 
 /**
  * Actions that cross surfaces for a session's tasks: the composer registers
- * how to start a workflow and how to save one, so the Tasks tab can offer both,
- * and the chat's task preview asks the shell to open the Tasks tab.
+ * how to start a workflow, save one and continue a stopped task, so the Tasks
+ * tab can offer them, and the chat's task preview asks the shell to open the
+ * Tasks tab.
  */
 export const useSessionTasksActions = create<SessionTasksActionsState>(() => ({
   startWorkflow: {},
   saveWorkflow: {},
+  continueTask: {},
   tasksTabToOpen: null,
   taskToShow: null,
   tasksTabAutoOpen: false,
@@ -47,7 +51,19 @@ export function registerSaveWorkflow(
   return registerSessionAction("saveWorkflow", conversationId, save);
 }
 
-type SessionActionKey = "startWorkflow" | "saveWorkflow";
+/**
+ * Offer a session's "continue a stopped task" action to its Tasks tab.
+ *
+ * @returns A function that withdraws the action, unless another took its place.
+ */
+export function registerContinueTask(
+  conversationId: string,
+  continueTask: (taskName: string) => void,
+): () => void {
+  return registerSessionAction("continueTask", conversationId, continueTask);
+}
+
+type SessionActionKey = "startWorkflow" | "saveWorkflow" | "continueTask";
 
 function registerSessionAction<Key extends SessionActionKey>(
   key: Key,

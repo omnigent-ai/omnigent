@@ -119,7 +119,11 @@ import {
   type PendingUserMessage,
   useChatStore,
 } from "@/store/chatStore";
-import { registerSaveWorkflow, registerStartWorkflow } from "@/store/sessionTasksActions";
+import {
+  registerContinueTask,
+  registerSaveWorkflow,
+  registerStartWorkflow,
+} from "@/store/sessionTasksActions";
 import { isRetryableRequestError } from "@/lib/queryRetry";
 import { useTrueForAtMost } from "@/hooks/useTrueForAtMost";
 import {
@@ -354,6 +358,7 @@ import { SaveWorkflowDialog } from "@/components/composer/SaveWorkflowDialog";
 import { WorkflowDialog, type WorkflowRequest } from "@/components/composer/WorkflowDialog";
 import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import {
+  continueTaskMessage,
   offersSaveWorkflow,
   offersWorkflow,
   savedWorkflowMessage,
@@ -3165,6 +3170,12 @@ function ComposerImpl(
     if (!canSaveWorkflow || composerSessionId === null) return;
     return registerSaveWorkflow(composerSessionId, setSaveWorkflowName);
   }, [canSaveWorkflow, composerSessionId]);
+  // The Tasks tab's Continue asks the agent to pick a stopped task back up.
+  const continueTaskRef = useRef<(taskName: string) => void>(() => undefined);
+  useEffect(() => {
+    if (isReadOnly || composerSessionId === null) return;
+    return registerContinueTask(composerSessionId, (taskName) => continueTaskRef.current(taskName));
+  }, [isReadOnly, composerSessionId]);
   const slashCommands = useMemo(
     () =>
       buildSlashCommandMap(
@@ -4236,13 +4247,22 @@ function ComposerImpl(
     );
   const saveWorkflow = (name: string) =>
     sendWorkflowMessage(saveWorkflowMessage(skillPrefix, name));
-  const workflowBlockedReason = composerLockedByBtw
-    ? "Close the side question first."
-    : hasPendingElicitation
-      ? "Answer the agent's question first."
-      : unreachable
-        ? "The session is offline. Reconnect it to run a workflow."
-        : (sendDisabledReason ?? (disabled ? "This session can't take messages right now." : null));
+  // Why a message from a dialog or the Tasks tab can't go out now, if it can't.
+  const blockedReasonFor = (action: string) =>
+    composerLockedByBtw
+      ? "Close the side question first."
+      : hasPendingElicitation
+        ? "Answer the agent's question first."
+        : unreachable
+          ? `The session is offline. Reconnect it to ${action}.`
+          : (sendDisabledReason ??
+            (disabled ? "This session can't take messages right now." : null));
+  const workflowBlockedReason = blockedReasonFor("run a workflow");
+  continueTaskRef.current = (taskName) => {
+    const reason = blockedReasonFor("continue");
+    if (reason) toast.error(reason);
+    else sendWorkflowMessage(continueTaskMessage(taskName));
+  };
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
