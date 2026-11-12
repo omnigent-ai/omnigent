@@ -43,6 +43,8 @@ function readRatio(): number {
 interface CanvasControls {
   compact: boolean;
   focused: boolean;
+  /** False while a focused or compact conversation hides the still-mounted board. */
+  canvasVisible: boolean;
   closeConversation: () => void;
   toggleFocus: () => void;
 }
@@ -119,10 +121,11 @@ export function CanvasWorkspace({
     () => ({
       compact,
       focused,
+      canvasVisible,
       closeConversation,
       toggleFocus: () => (focused ? showCanvas() : setFocused(true)),
     }),
-    [compact, focused, closeConversation, showCanvas],
+    [compact, focused, canvasVisible, closeConversation, showCanvas],
   );
 
   const resize = (next: number) => {

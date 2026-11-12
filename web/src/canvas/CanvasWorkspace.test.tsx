@@ -5,9 +5,12 @@ import { MemoryRouter, useLocation, useMatch, useNavigate } from "react-router-d
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { ReactFlowProvider } from "@xyflow/react";
+import { CanvasWhiteboard } from "./CanvasWhiteboard";
 import { CanvasWorkspace, useCanvasWorkspace } from "./CanvasWorkspace";
 
 let boardReady: Promise<void> | null = null;
+let withWhiteboard = false;
 
 vi.mock("@/pages/CanvasPage", () => ({
   CanvasPage: ({ selectedSessionId }: { selectedSessionId: string | null }) => {
@@ -19,6 +22,11 @@ vi.mock("@/pages/CanvasPage", () => ({
       <div>
         <input aria-label="Board state" defaultValue="Unchanged board" />
         <span data-testid="selected-session">{selectedSessionId}</span>
+        {withWhiteboard && (
+          <ReactFlowProvider>
+            <CanvasWhiteboard canvasId="project" viewerId="u" />
+          </ReactFlowProvider>
+        )}
       </div>
     );
   },
@@ -81,6 +89,7 @@ async function renderWorkspace(entry = "/canvas?canvas=project") {
 beforeEach(() => {
   localStorage.clear();
   boardReady = null;
+  withWhiteboard = false;
   containerWidth = 1200;
   vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(() => ({
     width: containerWidth,
@@ -155,6 +164,21 @@ describe("CanvasWorkspace", () => {
     expect(screen.queryByRole("separator")).toBeNull();
     expect(screen.getByLabelText("Board state")).toBe(board);
     expect(board).toHaveValue("Preserved viewport and cards");
+  });
+
+  it("restores the board on Escape while a whiteboard tool is still active", async () => {
+    withWhiteboard = true;
+    await renderWorkspace("/canvas/c/first?canvas=project");
+    fireEvent.click(screen.getByRole("button", { name: "Draw" }));
+    fireEvent.click(screen.getByText("Focus session"));
+    expect(screen.getByLabelText("Canvas pane")).toHaveClass("hidden");
+
+    fireEvent.keyDown(screen.getByText("Restore canvas"), { key: "Escape" });
+    expect(screen.getByLabelText("Canvas pane")).not.toHaveClass("hidden");
+    // The hidden board left the key alone; once shown, Escape leaves the pen.
+    expect(screen.getByRole("button", { name: "Draw" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByRole("button", { name: "Select" })).toHaveAttribute("aria-pressed", "true");
   });
 
   it("restores the board on Escape without declining a question in the conversation", async () => {

@@ -13,6 +13,8 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation, ProjectSummary } from "@/hooks/useConversations";
 import * as conversationsHook from "@/hooks/useConversations";
 import * as canvasSessions from "@/canvas/canvasSessions";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import {
   activeCanvasStorageKey,
@@ -84,6 +86,11 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
   useProjects: vi.fn(),
 }));
 vi.mock("@/canvas/canvasSessions", () => ({ useCanvasSessions: vi.fn() }));
+vi.mock("@/canvas/CanvasWhiteboard", () => ({
+  CanvasWhiteboard: ({ canvasId }: { canvasId: string }) => (
+    <div data-testid="canvas-whiteboard" data-canvas={canvasId} />
+  ),
+}));
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => viewerIdRef.current }));
 vi.mock("@/shell/NewProjectButton", () => ({
   NewProjectButton: ({ onCreated }: { onCreated: (name: string) => void }) => (
@@ -813,5 +820,27 @@ describe("CanvasPage", () => {
     renderPage();
     expect(screen.getByTestId("flow-node-conv_1")).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("Refresh failed: offline");
+  });
+
+  it("adds the whiteboard for the selected canvas only behind canvas_whiteboard", () => {
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
+    const { unmount } = render(
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, features: { canvas: true } }}>
+        {pageTree()}
+      </CapabilitiesProvider>,
+    );
+    expect(screen.queryByTestId("canvas-whiteboard")).toBeNull();
+    unmount();
+
+    render(
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { canvas: true, canvas_whiteboard: true } }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>,
+    );
+    expect(screen.getByTestId("canvas-whiteboard")).toHaveAttribute("data-canvas", "main");
+    fireEvent.click(screen.getByRole("tab", { name: /Alpha/ }));
+    expect(screen.getByTestId("canvas-whiteboard")).toHaveAttribute("data-canvas", "proj_a");
   });
 });

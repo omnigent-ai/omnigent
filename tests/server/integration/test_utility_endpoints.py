@@ -92,6 +92,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
+        "canvas_whiteboard": False,
         "arca_shutdown_warnings": False,
         "import_review": False,
         "custom_agents_settings_ui": True,
