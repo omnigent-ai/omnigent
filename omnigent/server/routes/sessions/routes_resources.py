@@ -3004,7 +3004,7 @@ def register_resources_routes(
 
     @file_read_router.get(
         "/sessions/{session_id}/resources/github/compare-diff",
-        # Internal (UI "Through head" commit view) — hidden from the public API reference.
+        # Internal (UI "Changes since" view) — hidden from the public API reference.
         include_in_schema=False,
         response_model=None,
     )
@@ -3016,7 +3016,7 @@ def register_resources_routes(
         from_sha: str | None = None,
     ) -> Any:
         """
-        Return the selected PR's patch from one of its commits through its head.
+        Return the selected PR's changes after one of its commits, up to its head.
 
         Falls back to the host tunnel when the runner is offline.
 

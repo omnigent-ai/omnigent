@@ -1564,9 +1564,9 @@ def test_changes_commits_view_lists_and_opens_a_commit(
     """Switch the Changes tab to Commits, open one commit, and step between commits.
 
     Only the commit's own files are listed, the viewed controls are absent there, and
-    Back returns to the commit list. Through head widens the open commit to every change
-    from it to the head, and turning it off narrows it again. The commit list and patches
-    are stubbed routes.
+    Back returns to the commit list. Back in Changes, **Changes since** narrows the tab to
+    the changes after a picked commit and the PR base restores them all. The commit list
+    and patches are stubbed routes.
     """
     base_url, session_id = seeded_session
     pr_url = _INFO["pr"]["url"]
@@ -1620,19 +1620,14 @@ def test_changes_commits_view_lists_and_opens_a_commit(
     page.route(re.compile(r"/resources/github/commit-diff\?"), commit_patch)
     compare_urls: list[str] = []
 
-    def through_head_patch(route: Route) -> None:
+    def changes_since_patch(route: Route) -> None:
         compare_urls.append(route.request.url)
-        start = re.search(r"from_sha=([0-9a-f]+)", route.request.url)
-        assert start is not None, route.request.url
-        # From the first commit the head holds both commits' changes; from the last, its own.
-        patch = (
-            _COMMIT_PATCHES[_COMMIT_ONE] + _COMMIT_PATCHES[_COMMIT_TWO]
-            if start.group(1) == _COMMIT_ONE
-            else _COMMIT_PATCHES[_COMMIT_TWO]
+        # After the first commit, only the second commit's changes reach the head.
+        route.fulfill(
+            json={"object": "session.github.pr_diff", "patch": _COMMIT_PATCHES[_COMMIT_TWO]}
         )
-        route.fulfill(json={"object": "session.github.pr_diff", "patch": patch})
 
-    page.route(re.compile(r"/resources/github/compare-diff\?"), through_head_patch)
+    page.route(re.compile(r"/resources/github/compare-diff\?"), changes_since_patch)
     page.goto(f"{base_url}/c/{session_id}")
     open_right_rail(page)
     panel = page.get_by_role("complementary", name="Workspace")
@@ -1665,27 +1660,25 @@ def test_changes_commits_view_lists_and_opens_a_commit(
     assert f"commit_sha={_COMMIT_ONE}" in patch_urls[-1], patch_urls
     page.screenshot(path=str(tmp_path / f"commits-{entry}-diff.png"), animations="disabled")
 
-    through_head = panel.get_by_role("button", name="Through head")
-    expect(through_head).to_have_attribute("aria-pressed", "false")
-    through_head.click()
-    expect(through_head).to_have_attribute("aria-pressed", "true")
+    panel.get_by_role("button", name="Next commit").click()
+    expect(files).to_have_attribute("data-github-file", "README.md")
+    panel.get_by_role("button", name="Back to commits").click()
+    expect(panel.get_by_text("2 commits", exact=True)).to_be_visible()
+
+    panel.get_by_role("group", name="Show changes or commits").get_by_role(
+        "button", name="Changes", exact=True
+    ).click()
     expect(files).to_have_count(2)
-    # The widened patch is pinned to the head the Changes list shows, from the open commit.
+    panel.get_by_role("combobox", name="Changes since").click()
+    page.get_by_role("option", name=re.compile("Add the parser")).click()
+    expect(files).to_have_count(1)
+    expect(files).to_have_attribute("data-github-file", "README.md")
+    # The narrowed patch is pinned to the head the Changes list shows, after the picked commit.
     assert "head_sha=head" in compare_urls[-1], compare_urls
     assert f"from_sha={_COMMIT_ONE}" in compare_urls[-1], compare_urls
     expect(panel.get_by_role("checkbox", name="Hide viewed")).to_have_count(0)
-    page.screenshot(
-        path=str(tmp_path / f"commits-{entry}-through-head.png"), animations="disabled"
-    )
-
-    # Stepping keeps Through head on; turning it off narrows to the commit's own files.
-    panel.get_by_role("button", name="Next commit").click()
-    expect(through_head).to_have_attribute("aria-pressed", "true")
-    expect(files).to_have_attribute("data-github-file", "README.md")
-    assert f"from_sha={_COMMIT_TWO}" in compare_urls[-1], compare_urls
-    through_head.click()
-    expect(through_head).to_have_attribute("aria-pressed", "false")
-    expect(files).to_have_attribute("data-github-file", "README.md")
-
-    panel.get_by_role("button", name="Back to commits").click()
-    expect(panel.get_by_text("2 commits", exact=True)).to_be_visible()
+    page.screenshot(path=str(tmp_path / f"commits-{entry}-since.png"), animations="disabled")
+    panel.get_by_role("combobox", name="Changes since").click()
+    page.get_by_role("option", name="PR base (all changes)").click()
+    expect(files).to_have_count(2)
+    expect(panel.get_by_role("checkbox", name="Hide viewed")).to_be_visible()

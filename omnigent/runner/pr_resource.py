@@ -1288,14 +1288,14 @@ def pr_compare_diff(
     head_sha: object = None,
     from_sha: object = None,
 ) -> dict[str, Any]:
-    """Return the selected PR's patch from one of its commits through its head.
+    """Return the selected PR's changes after one of its commits, up to its head.
 
     :raises ValueError: Without a selected tracked PR, when its provider cannot list
         commits, or when either commit is not a full commit id.
     """
     facet, reference = _commits_target(session_id, pr_url)
     if not isinstance(facet, CommitCompareFacet):
-        raise ValueError("This provider does not show changes through the head")
+        raise ValueError("This provider does not show changes since a commit")
     return facet.compare_diff(
         root,
         reference,

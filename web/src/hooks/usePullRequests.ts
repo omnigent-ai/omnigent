@@ -798,6 +798,8 @@ export interface PullRequestCommit {
   author: string | null;
   /** The git author date, ISO 8601. */
   date: string | null;
+  /** Other pull requests whose head is this commit, such as a stacked PR's parent. */
+  head_of?: { number: number; url: string | null; state: string | null }[];
 }
 
 /** The most commits the server lists for one pull request (GitHub's own limit). */
@@ -906,7 +908,7 @@ async function fetchPullRequestCommitDiff(
   );
 }
 
-async function fetchPullRequestThroughHead(
+async function fetchPullRequestChangesSince(
   conversationId: string,
   prUrl: string,
   commitSha: string,
@@ -918,7 +920,7 @@ async function fetchPullRequestThroughHead(
       // A peer without the route still serves single commits, so only this view is unavailable.
       if (error instanceof PullRequestApiError && error.status === 404) {
         throw new Error(
-          "Showing changes through the head needs an updated Omnigent server and host.",
+          "Showing changes since a commit needs an updated Omnigent server and host.",
         );
       }
       throw error;
@@ -927,23 +929,23 @@ async function fetchPullRequestThroughHead(
 }
 
 /**
- * One commit's patch, read by its full id, or with `throughHeadSha` the patch from that
- * commit through the PR's head. Enabled only while a commit is open. Both ends are fixed
+ * One commit's patch, read by its full id, or with `untilHeadSha` the PR's changes after
+ * that commit up to that head. Enabled only while a commit is picked. Both ends are fixed
  * commits, so the patch never changes and stays fresh for the whole cache lifetime.
  */
 export function usePullRequestCommitDiff(
   conversationId: string | undefined,
   prUrl: string | undefined,
   commitSha: string | null,
-  throughHeadSha: string | null = null,
+  untilHeadSha: string | null = null,
 ) {
   const serveable = useWorkspaceServeable(conversationId);
   const retry = useRunnerOfflineRetry(serveable !== false);
   return useQuery({
-    queryKey: ["github-pr-commit-diff", conversationId, prUrl, commitSha, throughHeadSha],
+    queryKey: ["github-pr-commit-diff", conversationId, prUrl, commitSha, untilHeadSha],
     queryFn: () =>
-      throughHeadSha
-        ? fetchPullRequestThroughHead(conversationId!, prUrl!, commitSha!, throughHeadSha)
+      untilHeadSha
+        ? fetchPullRequestChangesSince(conversationId!, prUrl!, commitSha!, untilHeadSha)
         : fetchPullRequestCommitDiff(conversationId!, prUrl!, commitSha!),
     enabled: !!conversationId && !!prUrl && !!commitSha && serveable !== false,
     retry,

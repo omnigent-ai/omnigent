@@ -11435,8 +11435,8 @@ def test_github_commit_ops_are_served_on_host(
             return 0, json.dumps([entries]), ""
         if "/compare/" in argv[-1]:
             return 0, "compare-patch", ""
-        if "Accept: application/vnd.github.diff" not in argv:
-            return 0, json.dumps({"sha": commit, "parents": [{"sha": "9" * 40}]}), ""
+        if "graphql" in argv:
+            return 1, "", "no associated PRs here"
         return 0, "commit-patch", ""
 
     monkeypatch.setattr(github_resource, "_gh", gh)

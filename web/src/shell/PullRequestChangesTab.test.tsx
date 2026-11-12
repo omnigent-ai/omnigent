@@ -34,9 +34,9 @@ const mocks = vi.hoisted(() => ({
   commitList: { object: "list", has_more: false, data: [] as unknown[] },
   /** Each commit's patch by sha, as the commit-diff query returns it. */
   commitPatches: new Map<string, string>(),
-  /** The patch from each commit through the head, by sha. */
-  throughHeadPatches: new Map<string, string>(),
-  /** Each commit-diff read's commit and through-head sha, in order. */
+  /** The PR's changes after each commit, up to the head, by sha. */
+  sincePatches: new Map<string, string>(),
+  /** Each commit-diff read's commit and until-head sha, in order. */
   commitDiffReads: [] as [string | null, string | null][],
   /** The commit-diff query's error, when a test wants a failed read. */
   commitDiffError: null as Error | null,
@@ -91,10 +91,10 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
     _conversationId: string,
     _prUrl: string,
     sha: string | null,
-    throughHeadSha: string | null = null,
+    untilHeadSha: string | null = null,
   ) => {
-    mocks.commitDiffReads.push([sha, throughHeadSha]);
-    const patches = throughHeadSha ? mocks.throughHeadPatches : mocks.commitPatches;
+    mocks.commitDiffReads.push([sha, untilHeadSha]);
+    const patches = untilHeadSha ? mocks.sincePatches : mocks.commitPatches;
     return {
       data: sha ? { object: "session.github.pr_diff", patch: patches.get(sha) } : undefined,
       isLoading: false,
@@ -1574,7 +1574,7 @@ describe("PullRequestChangesTab commits", () => {
     mocks.commitPatches.clear();
     mocks.commitPatches.set(SHA_A, A);
     mocks.commitPatches.set(SHA_B, B);
-    mocks.throughHeadPatches.clear();
+    mocks.sincePatches.clear();
     mocks.commitDiffReads = [];
     mocks.commitDiffError = null;
     mocks.draftAnchor = null;
@@ -1603,44 +1603,46 @@ describe("PullRequestChangesTab commits", () => {
     expect(screen.getByRole("button", { name: /Add a\.ts/ })).toBeInTheDocument();
   });
 
-  it("widens an open commit through the head, keeps it while stepping, and narrows it again", () => {
-    mocks.throughHeadPatches.set(SHA_A, A + B);
-    mocks.throughHeadPatches.set(SHA_B, B);
+  it("shows only the changes since a picked commit, without review controls, then all again", () => {
+    mocks.commitList = {
+      object: "list",
+      has_more: false,
+      data: [
+        { ...commit(SHA_A, "Parent work"), head_of: [{ number: 41, url: null, state: "OPEN" }] },
+        commit(SHA_B, "Own work"),
+      ],
+    };
+    mocks.sincePatches.set(SHA_A, B);
     renderTab({
-      conversationId: "commits-through-head",
+      conversationId: "changes-since",
       commitHistory: true,
       listing: { head_sha: "head" },
       headRepositoryUrl: "https://github.com/fork/app",
     });
-    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
-    fireEvent.click(screen.getByRole("button", { name: /Add a\.ts/ }));
-    const toggle = () => screen.getByRole("button", { name: "Through head" });
-    expect(toggle()).toHaveAttribute("aria-pressed", "false");
-    expect(isListed("b.ts")).toBe(false);
-
-    fireEvent.click(toggle());
-    expect(toggle()).toHaveAttribute("aria-pressed", "true");
     expect(isListed("a.ts")).toBe(true);
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Changes since" }));
+    // The newest commit is the head, so nothing comes after it and it isn't offered.
+    expect(screen.queryByRole("option", { name: /Own work/ })).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: /Parent work.*head of #41/ }));
+
+    expect(mocks.commitDiffReads.at(-1)).toEqual([SHA_A, "head"]);
     expect(isListed("b.ts")).toBe(true);
-    expect(mocks.commitDiffReads).toContainEqual([SHA_A, "head"]);
-    // The widened patch is the head's, so its files open at the head rather than the commit.
-    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for a.ts" }), {
+    expect(isListed("a.ts")).toBe(false);
+    expect(screen.queryByRole("checkbox", { name: "Hide viewed" })).toBeNull();
+    // The narrowed patch ends at the head, so its files open there.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for b.ts" }), {
       button: 0,
     });
     expect(screen.getByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute(
       "href",
-      "https://github.com/fork/app/blob/head/a.ts",
+      "https://github.com/fork/app/blob/head/b.ts",
     );
     fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
 
-    fireEvent.click(screen.getByRole("button", { name: "Next commit" }));
-    expect(toggle()).toHaveAttribute("aria-pressed", "true");
-    expect(mocks.commitDiffReads.at(-1)).toEqual([SHA_B, "head"]);
-
-    fireEvent.click(toggle());
-    expect(mocks.commitDiffReads.at(-1)).toEqual([SHA_B, null]);
-    expect(isListed("b.ts")).toBe(true);
-    expect(isListed("a.ts")).toBe(false);
+    fireEvent.click(screen.getByRole("combobox", { name: "Changes since" }));
+    fireEvent.click(screen.getByRole("option", { name: "PR base (all changes)" }));
+    expect(isListed("a.ts")).toBe(true);
   });
 
   it("hides the viewed controls and marks in a commit view, and keeps the marks for Changes", () => {

@@ -1062,6 +1062,70 @@ def test_github_pr_commits_listing_failures_are_not_empty_successes(
         github_resource._pr_commits("/root", _PR, head_sha=_HEAD)
 
 
+def _stub_commits_with_heads(
+    monkeypatch: pytest.MonkeyPatch, graphql: tuple[int, str, str]
+) -> list[list[str]]:
+    """Answer a fork PR, two commits, and the associated-PR query with ``graphql``."""
+    calls: list[list[str]] = []
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        calls.append(list(argv))
+        if argv[-1] == "repos/example/two/pulls/42":
+            head = {"sha": _HEAD, "repo": {"full_name": "fork/two"}}
+            return 0, json.dumps({"head": head, "base": {"sha": _BASE}, "commits": 2}), ""
+        if "graphql" in argv:
+            return graphql
+        entries = [_commit_entry(_COMMIT_ONE, "Parent work"), _commit_entry(_HEAD, "Own work")]
+        return 0, json.dumps([entries]), ""
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_args: None)
+    return calls
+
+
+def test_github_pr_commits_mark_commits_that_head_another_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = {"baseRepository": {"nameWithOwner": "example/two"}, "state": "OPEN"}
+    data = {
+        "c0": {
+            "associatedPullRequests": {
+                "nodes": [
+                    {**pr, "number": 41, "url": "u41", "headRefOid": _COMMIT_ONE},
+                    # A PR this commit is merely part of, and this PR itself, are not marks.
+                    {**pr, "number": 43, "url": "u43", "headRefOid": "f" * 40},
+                    {**pr, "number": 42, "url": "u42", "headRefOid": _HEAD},
+                ]
+            }
+        },
+        "c1": {"associatedPullRequests": {"nodes": [{**pr, "number": 42, "headRefOid": _HEAD}]}},
+    }
+    calls = _stub_commits_with_heads(
+        monkeypatch, (0, json.dumps({"data": {"repository": data}}), "")
+    )
+
+    result = github_resource._pr_commits("/root", _PR, head_sha=_HEAD)
+
+    assert result["data"][0]["head_of"] == [{"number": 41, "url": "u41", "state": "OPEN"}]
+    assert "head_of" not in result["data"][1]
+    # GitHub associates a fork PR's commits with the head repository.
+    query = next(call for call in calls if "graphql" in call)[-1]
+    assert 'repository(owner: "fork", name: "two")' in query
+
+
+def test_github_pr_commits_list_without_marks_when_the_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_commits_with_heads(monkeypatch, (1, "", "rate limited"))
+
+    result = github_resource._pr_commits("/root", _PR, head_sha=_HEAD)
+
+    assert [commit["sha"] for commit in result["data"]] == [_COMMIT_ONE, _HEAD]
+    assert all("head_of" not in commit for commit in result["data"])
+
+
 def _stub_commit_patch(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -1123,9 +1187,6 @@ def test_github_commit_patch_failure_is_not_an_empty_success(
         github_resource._pr_commit_patch("/root", _PR, commit_sha=_COMMIT_ONE)
 
 
-_PARENT = "9" * 40
-
-
 def _stub_compare(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -1149,8 +1210,6 @@ def _stub_compare(
             return 0, json.dumps({"head": {"sha": last_head}, "base": {"sha": _BASE}}), ""
         if endpoint.endswith("/commits?per_page=100"):
             return 0, json.dumps([[_commit_entry(sha, "Commit") for sha in listed]]), ""
-        if endpoint == f"repos/example/two/commits/{_COMMIT_ONE}":
-            return 0, json.dumps({"sha": _COMMIT_ONE, "parents": [{"sha": _PARENT}]}), ""
         if "/compare/" in endpoint:
             return compare_rc, "" if compare_rc else "diff --git a/x b/x\n", ""
         raise AssertionError(f"unexpected gh call: {argv}")
@@ -1160,7 +1219,7 @@ def _stub_compare(
     return calls
 
 
-def test_github_compare_reads_from_a_commit_through_the_head(
+def test_github_compare_reads_the_changes_after_a_pr_commit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = _stub_compare(monkeypatch)
@@ -1168,7 +1227,6 @@ def test_github_compare_reads_from_a_commit_through_the_head(
     result = github_resource._pr_compare("/root", _PR, head_sha=_HEAD, from_sha=_COMMIT_ONE)
 
     assert result == {"object": "session.github.pr_diff", "patch": "diff --git a/x b/x\n"}
-    # The comparison starts at the picked commit's parent, so the commit itself is included.
     assert [call for call in calls if "/compare/" in call[-1]] == [
         [
             "api",
@@ -1176,7 +1234,7 @@ def test_github_compare_reads_from_a_commit_through_the_head(
             "github.com",
             "-H",
             "Accept: application/vnd.github.diff",
-            f"repos/example/two/compare/{_PARENT}...{_HEAD}",
+            f"repos/example/two/compare/{_COMMIT_ONE}...{_HEAD}",
         ]
     ]
 
@@ -1204,7 +1262,7 @@ def test_github_compare_refuses_a_moved_head(
 def test_github_compare_failure_is_not_an_empty_success(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_compare(monkeypatch, compare_rc=1)
 
-    with pytest.raises(ValueError, match="could not load the changes from that commit"):
+    with pytest.raises(ValueError, match="could not load the changes since that commit"):
         github_resource._pr_compare("/root", _PR, head_sha=_HEAD, from_sha=_COMMIT_ONE)
 
 

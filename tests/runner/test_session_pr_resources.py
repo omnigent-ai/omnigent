@@ -587,11 +587,11 @@ async def test_commits_route_pins_head_and_diff_route_reads_one_commit(
             return 0, json.dumps(pr), ""
         if args[-1] == "repos/example/two/pulls/42/commits?per_page=100":
             return 0, json.dumps(listing), ""
-        if args[-1] == f"repos/example/two/compare/{'9' * 40}...{head}":
+        if args[-1] == f"repos/example/two/compare/{commit}...{head}":
             return 0, "compare-patch", ""
+        if "graphql" in args:
+            return 1, "", "no associated PRs here"
         assert args[-1] == f"repos/example/two/commits/{commit}"
-        if "Accept: application/vnd.github.diff" not in args:
-            return 0, json.dumps({"sha": commit, "parents": [{"sha": "9" * 40}]}), ""
         return 0, "commit-patch", ""
 
     monkeypatch.setattr(github, "_gh", gh)

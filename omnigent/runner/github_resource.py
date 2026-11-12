@@ -1629,12 +1629,74 @@ def _pr_commits(root: str, reference: PullRequestRef, *, head_sha: str) -> dict[
         commits = _pr_commit_entries(root, reference)
         _check_pr_revision(root, reference, head_sha=head_sha)
     shown = commits[:_MAX_PR_COMMITS]
+    heads = _other_pr_heads(root, reference, pr, [commit["sha"] for commit in shown])
+    for commit in shown:
+        if commit["sha"] in heads:
+            commit["head_of"] = heads[commit["sha"]]
     total = pr.get("commits")
     return {
         "object": "list",
         "data": shown,
         "has_more": isinstance(total, int) and total > len(shown),
     }
+
+
+# Commits looked up in one associated-PR query, newest first; older ones go unmarked.
+_MAX_HEAD_LOOKUPS = 100
+
+
+def _other_pr_heads(
+    root: str, reference: PullRequestRef, pr: dict[str, Any], shas: list[str]
+) -> dict[str, list[dict[str, Any]]]:
+    """Map each commit that is another PR's head to that PR, best effort.
+
+    Marks a stacked PR's parents in its commit list. GitHub associates a fork PR's
+    commits with the head repository, so the lookup goes there. Any failure leaves
+    the commits unmarked.
+    """
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    head_repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}
+    repository = head_repo.get("full_name") or reference.repository
+    owner, _, name = str(repository).partition("/")
+    wanted = shas[-_MAX_HEAD_LOOKUPS:]
+    if not owner or not name or not wanted:
+        return {}
+    fields = " ".join(
+        f'c{index}: object(oid: "{sha}") {{ ... on Commit {{ associatedPullRequests(first: 10) '
+        "{ nodes { number url state headRefOid baseRepository { nameWithOwner } } } } }"
+        for index, sha in enumerate(wanted)
+    )
+    query = f'query {{ repository(owner: "{owner}", name: "{name}") {{ {fields} }} }}'
+    try:
+        rc, out, _ = _gh(
+            ["api", *_host_args(root, reference), "graphql", "-f", f"query={query}"],
+            cwd=root,
+            token=_pr_token(root, reference),
+        )
+    except ValueError:
+        return {}
+    if rc != 0:
+        return {}
+    try:
+        found = (json.loads(out).get("data") or {}).get("repository") or {}
+    except (ValueError, AttributeError):
+        return {}
+    heads: dict[str, list[dict[str, Any]]] = {}
+    for index, sha in enumerate(wanted):
+        commit = found.get(f"c{index}") or {}
+        nodes = (commit.get("associatedPullRequests") or {}).get("nodes") or []
+        marks = [
+            {"number": node["number"], "url": node.get("url"), "state": node.get("state")}
+            for node in nodes
+            if isinstance(node, dict)
+            and node.get("headRefOid") == sha
+            and node.get("number") != reference.number
+            and str((node.get("baseRepository") or {}).get("nameWithOwner", "")).lower()
+            == reference.repository.lower()
+        ]
+        if marks:
+            heads[sha] = marks
+    return heads
 
 
 def _pr_commit_patch(root: str, reference: PullRequestRef, *, commit_sha: str) -> dict[str, Any]:
@@ -1663,17 +1725,17 @@ def _pr_commit_patch(root: str, reference: PullRequestRef, *, commit_sha: str) -
     return {"object": PR_DIFF_OBJECT, "patch": out}
 
 
-_COMPARE_FAILED = "GitHub could not load the changes from that commit. Refresh to retry."
+_COMPARE_FAILED = "GitHub could not load the changes since that commit. Refresh to retry."
 
 
 def _pr_compare(
     root: str, reference: PullRequestRef, *, head_sha: str, from_sha: str
 ) -> dict[str, Any]:
-    """Return the patch from ``from_sha`` through the PR's head, including ``from_sha``.
+    """Return the PR's changes after ``from_sha``, up to its head.
 
     ``from_sha`` must be one of the PR's own commits, so only the PR's history is
-    served. The comparison starts at its first parent, and the head is checked before
-    and after the reads so the patch describes the revision the panel shows.
+    served, and the head is checked before and after the reads so the patch describes
+    the revision the panel shows.
     """
     with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
         host = _host_args(root, reference)
@@ -1681,18 +1743,13 @@ def _pr_compare(
         _check_pr_revision(root, reference, head_sha=head_sha)
         if from_sha not in {entry["sha"] for entry in _pr_commit_entries(root, reference)}:
             raise ValueError("That commit is not part of the selected pull request.")
-        commit = _pr_api(root, reference, f"repos/{reference.repository}/commits/{from_sha}")
-        parents = commit.get("parents")
-        parent = parents[0].get("sha") if isinstance(parents, list) and parents else None
-        if not isinstance(parent, str) or not parent:
-            raise ValueError(_COMPARE_FAILED)
         rc, out, _ = _gh(
             [
                 "api",
                 *host,
                 "-H",
                 "Accept: application/vnd.github.diff",
-                f"repos/{reference.repository}/compare/{parent}...{head_sha}",
+                f"repos/{reference.repository}/compare/{from_sha}...{head_sha}",
             ],
             cwd=root,
             token=token,
