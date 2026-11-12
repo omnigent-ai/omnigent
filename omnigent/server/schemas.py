@@ -2186,7 +2186,7 @@ class SandboxStatus(BaseModel):
         has none) → ``starting`` (starting the in-sandbox host) →
         ``connecting`` (launching the agent runner) → ``ready`` /
         ``failed``.
-    :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
+    :param provider: Sandbox provider being launched, e.g. ``"kubernetes"``,
         or ``None`` when unknown.
     :param details: What the user needs to do when
         ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
@@ -4256,7 +4256,7 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     :param stage: The launch stage just entered, e.g.
         ``"provisioning"`` — see :class:`SandboxStatus` for the full
         pipeline order.
-    :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
+    :param provider: Sandbox provider being launched, e.g. ``"kubernetes"``,
         or ``None`` when unknown.
     :param details: What the user needs to do when
         ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.

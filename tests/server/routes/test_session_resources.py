@@ -1972,7 +1972,7 @@ async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
     conversation_store: _ConversationStore = app.state.test_conversation_store
     source = conversation_store.get_conversation("79b22ebd2309e48fdeb450c65611d51b")
     assert source is not None
-    source.host_id = "host_arca"
+    source.host_id = "host_remote"
     source.workspace = "/home/alice/workspace"
     source.git_branch = "feature/clear"
     terminal_resource = {
@@ -2014,7 +2014,7 @@ async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
     assert router.resource_calls == ["79b22ebd2309e48fdeb450c65611d51b"]
     target = conversation_store.get_conversation("5d29bee4350489d66feafecfebd94a97")
     assert target is not None
-    assert target.host_id == "host_arca"
+    assert target.host_id == "host_remote"
     assert target.workspace == "/home/alice/workspace"
     assert target.git_branch == "feature/clear"
 

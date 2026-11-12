@@ -5890,7 +5890,7 @@ def _kick_managed_wake_impl(
     :param conversation_store: Store holding the session row.
     :param host_store: Persistent host registrations.
     :param app_state: ``request.app.state`` — supplies the registries.
-    :param provider: The dormant host's sandbox provider, e.g. ``"arclet"``,
+    :param provider: The dormant host's sandbox provider, e.g. ``"kubernetes"``,
         which the seeded launch status names.
     """
     _logger.info(

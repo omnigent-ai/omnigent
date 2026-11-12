@@ -1936,7 +1936,7 @@ def test_host_status_selects_daemon_on_another_url_for_the_workspace(
     """
     ``host status --server`` reports the workspace's daemon and names the request.
 
-    The desktop app's Arca connect reads this JSON and needs to know the
+    The desktop app's SSH connection reads this JSON and needs to know the
     daemon serves the URL it asked for.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))

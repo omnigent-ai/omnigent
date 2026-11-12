@@ -6361,7 +6361,7 @@
                 "type": "null"
               }
             ],
-            "description": "Sandbox provider being launched, e.g. `\"arclet\"`, or `None` when unknown.",
+            "description": "Sandbox provider being launched, e.g. `\"kubernetes\"`, or `None` when unknown.",
             "title": "Provider"
           },
           "stage": {
@@ -10981,7 +10981,7 @@
               }
             ],
             "default": null,
-            "description": "Sandbox provider being launched, e.g. `\"arclet\"`, or `None` when unknown.",
+            "description": "Sandbox provider being launched, e.g. `\"kubernetes\"`, or `None` when unknown.",
             "title": "Provider"
           },
           "sequence_number": {

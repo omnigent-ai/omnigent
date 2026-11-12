@@ -5612,7 +5612,7 @@ def _publish_sandbox_status_impl(
     :param error: Failure detail when *stage* is ``"failed"``, e.g.
         ``"managed sandbox launch failed: spend limit reached"``.
         ``None`` for non-terminal stages.
-    :param provider: Sandbox provider being launched, e.g. ``"arclet"``.
+    :param provider: Sandbox provider being launched, e.g. ``"kubernetes"``.
         Later stages keep the cached launch's provider when omitted.
     :param details: What the user needs to do when *stage* is
         ``"action_required"``, e.g. ``"Sign in on your laptop."``. ``None`` for

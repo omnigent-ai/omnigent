@@ -6186,7 +6186,7 @@ async def test_relaunch_and_wake_seed_the_launch_status_with_the_host_provider(
     orchestration._kick_managed_relaunch(
         session_id="conv_relaunch",
         conv=SimpleNamespace(labels={}, host_id="host_1", agent_id=None),
-        host=SimpleNamespace(user_id=_OWNER, sandbox_provider="arclet"),
+        host=SimpleNamespace(user_id=_OWNER, sandbox_provider="test-sandbox"),
         tracker=ManagedLaunchTracker(),
         **shared,
     )
@@ -6194,13 +6194,13 @@ async def test_relaunch_and_wake_seed_the_launch_status_with_the_host_provider(
         session_id="conv_wake",
         conv=SimpleNamespace(labels={}, host_id="host_2", agent_id=None),
         tracker=ManagedLaunchTracker(),
-        provider="arclet",
+        provider="test-sandbox",
         **shared,
     )
     await asyncio.gather(*(set(orchestration._managed_launch_tasks) - before))
     assert published == [
-        ("conv_relaunch", "provisioning", "arclet"),
-        ("conv_wake", "provisioning", "arclet"),
+        ("conv_relaunch", "provisioning", "test-sandbox"),
+        ("conv_wake", "provisioning", "test-sandbox"),
     ]
 
 
@@ -6215,7 +6215,9 @@ def test_launch_stage_rows_name_the_provider(caplog: pytest.LogCaptureFixture) -
     session_id = "conv_provider_rows"
     try:
         with caplog.at_level(logging.INFO):
-            helpers._publish_sandbox_status_impl(session_id, "provisioning", provider="arclet")
+            helpers._publish_sandbox_status_impl(
+                session_id, "provisioning", provider="test-sandbox"
+            )
             helpers._publish_sandbox_status_impl(session_id, "starting")
             helpers._publish_sandbox_status_impl(session_id, "failed", "host never connected")
     finally:
@@ -6226,9 +6228,9 @@ def test_launch_stage_rows_name_the_provider(caplog: pytest.LogCaptureFixture) -
         if getattr(record, "event_name", None) in {"sandbox_launch_stage", "sandbox_launch_failed"}
     ]
     assert rows == [
-        ("sandbox_launch_stage", {"stage": "provisioning", "provider": "arclet"}),
-        ("sandbox_launch_stage", {"stage": "starting", "provider": "arclet"}),
-        ("sandbox_launch_failed", {"stage": "starting", "provider": "arclet"}),
+        ("sandbox_launch_stage", {"stage": "provisioning", "provider": "test-sandbox"}),
+        ("sandbox_launch_stage", {"stage": "starting", "provider": "test-sandbox"}),
+        ("sandbox_launch_failed", {"stage": "starting", "provider": "test-sandbox"}),
     ]
 
 
