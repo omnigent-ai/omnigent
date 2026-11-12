@@ -6524,7 +6524,9 @@ def test_certificate_failure_on_stderr_fails_fast_on_connection_retry():
             assert "wedged LLM" not in error.message
             assert error.code == "model_endpoint_certificate_rejected"
             assert error.title == "Codex can't reach its model endpoint"
-            assert error.remediation is not None and "run dbcert" in error.remediation
+            assert (
+                error.remediation is not None and "Renew the TLS certificate" in error.remediation
+            )
             session._request.assert_any_await(
                 "turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}
             )

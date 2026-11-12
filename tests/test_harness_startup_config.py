@@ -320,21 +320,21 @@ def test_args_no_config_layer() -> None:
     assert resolve_harness_args("codex", ("--verbose",), cfg=None) == ["--verbose"]
 
 
-# ── isaac wrapper shape (the runner auto-create's contract) ──────────
+# ── Configured wrapper shape (the runner auto-create's contract) ──────────
 # The runner's native terminal auto-create resolves command+args through the
-# resolvers above; these pin the exact `isaac -- <args>` / `isaac codex --
+# resolvers above; these pin the exact `example-wrapper -- <args>` / `example-wrapper codex --
 # <args>` shape a downstream integration configures. The config `args` base
 # prepends before Omnigent's already-augmented args, so the `--` stays first.
-def test_isaac_wrap_shape_claude_native() -> None:
-    cfg = {"harness": {"claude-native": {"command": "isaac", "args": ["--"]}}}
-    assert resolve_harness_command("claude-native", default="claude", cfg=cfg) == "isaac"
+def test_wrapper_shape_claude_native() -> None:
+    cfg = {"harness": {"claude-native": {"command": "example-wrapper", "args": ["--"]}}}
+    assert resolve_harness_command("claude-native", default="claude", cfg=cfg) == "example-wrapper"
     built = ("--model", "x", "--mcp-config", "{}")
     assert resolve_harness_args("claude-native", built, cfg=cfg) == ["--", *built]
 
 
-def test_isaac_wrap_shape_codex_native() -> None:
-    cfg = {"harness": {"codex-native": {"command": "isaac", "args": ["codex", "--"]}}}
-    assert resolve_harness_command("codex-native", default="codex", cfg=cfg) == "isaac"
+def test_wrapper_shape_codex_native() -> None:
+    cfg = {"harness": {"codex-native": {"command": "example-wrapper", "args": ["codex", "--"]}}}
+    assert resolve_harness_command("codex-native", default="codex", cfg=cfg) == "example-wrapper"
     built = ("--remote", "ws://127.0.0.1:9876")
     assert resolve_harness_args("codex-native", built, cfg=cfg) == ["codex", "--", *built]
 
@@ -354,13 +354,22 @@ def test_codex_app_server_command_is_separate_from_the_terminal_command(
     cfg = {
         "harness": {
             "codex-native": {
-                "command": "isaac",
+                "command": "example-wrapper",
                 "args": ["codex", "--"],
-                "app_server": {"command": "env", "args": ["MODE=omni", "isaac", "codex", "--"]},
+                "app_server": {
+                    "command": "env",
+                    "args": ["MODE=omni", "example-wrapper", "codex", "--"],
+                },
             }
         }
     }
-    assert resolve_codex_app_server_command(cfg) == ("env", "MODE=omni", "isaac", "codex", "--")
+    assert resolve_codex_app_server_command(cfg) == (
+        "env",
+        "MODE=omni",
+        "example-wrapper",
+        "codex",
+        "--",
+    )
     assert resolve_harness_command("codex-native", default="codex", cfg=cfg) == "/opt/codex"
     assert resolve_harness_args("codex-native", ("--remote", "ws://x"), cfg=cfg) == [
         "codex",
@@ -372,7 +381,7 @@ def test_codex_app_server_command_is_separate_from_the_terminal_command(
 
 def test_codex_app_server_command_unset_runs_codex_directly() -> None:
     assert resolve_codex_app_server_command({}) == ()
-    cfg = {"harness": {"codex-native": {"command": "isaac"}}}
+    cfg = {"harness": {"codex-native": {"command": "example-wrapper"}}}
     assert resolve_codex_app_server_command(cfg) == ()
 
 
@@ -409,7 +418,7 @@ def test_native_cli_persists_raw_args_not_config_merged(
     """The native ``codex``/``claude`` CLI must hand *raw* pass-through args to
     ``run_*_native``. The daemon runner is the single ``harness.<id>.args`` merge
     point (``_auto_create_*_terminal``), and every CLI launch reaches it; if the
-    CLI also pre-merged, a managed session wrapped twice (``isaac codex -- codex
+    CLI also pre-merged, a managed session wrapped twice (``example-wrapper codex -- codex
     -- …``), which broke the launch. Regression for that double-apply.
     """
     import click
@@ -422,8 +431,8 @@ def test_native_cli_persists_raw_args_not_config_merged(
 
     cfg = {
         "harness": {
-            "claude-native": {"command": "isaac", "args": ["--"]},
-            "codex-native": {"command": "isaac", "args": ["codex", "--"]},
+            "claude-native": {"command": "example-wrapper", "args": ["--"]},
+            "codex-native": {"command": "example-wrapper", "args": ["codex", "--"]},
         }
     }
     # Both are late-bound in cli_native to the omnigent.cli module (see _late_bound).

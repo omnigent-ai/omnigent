@@ -4464,7 +4464,7 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
     ("screen", "expected_code", "expected_title"),
     [
         (
-            "dbexec: launcher 1.2.3\nSign in to continue:\n"
+            "synthetic-launcher: launcher 1.2.3\nSign in to continue:\n"
             "  https://signin.example.com/device\n  code: HQ7M-2KPD\nwaiting for sign-in...\n",
             "databricks_sign_in_pending",
             "Codex can't start until you sign in to Databricks",
@@ -4598,9 +4598,10 @@ async def test_codex_discover_thread_and_forward_waits_while_terminal_alive(
     ("screen", "expect_early"),
     [
         (
-            "dbcert: Logging in via SSO...\n"
-            "dbcert: If the browser does not open automatically, please open the following URL:\n"
-            "https://databricks.okta.com/oauth2/v1/authorize?client_id=abc&state=xyz\n",
+            "credential-helper: Logging in via SSO...\n"
+            "credential-helper: If the browser does not open automatically, "
+            "please open the following URL:\n"
+            "https://login.example.test/oauth2/v1/authorize?client_id=abc&state=xyz\n",
             True,
         ),
         ("Codex requirements updated at /etc/codex/requirements.toml\n", False),

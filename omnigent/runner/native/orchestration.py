@@ -9914,8 +9914,8 @@ async def _auto_create_claude_terminal(
     # Apply the per-harness startup command/args override from config
     # (``harness.claude-native.{command,args}`` in ~/.omnigent/config.yaml) so a
     # downstream integration can wrap this managed-host launch — e.g. a wrapper
-    # such as ``isaac`` sets ``command: isaac`` + ``args: ["--"]`` to run
-    # ``isaac -- <augmented args>`` (the config args prepend, and augmentation
+    # such as ``example-wrapper`` sets ``command: example-wrapper`` + ``args: ["--"]`` to run
+    # ``example-wrapper -- <augmented args>`` (the config args prepend, and augmentation
     # appended above, so the ``--`` stays first). Identity by default. This is
     # the same resolver the local-CLI native launch uses (see cli_native.py), so
     # both terminal-creation paths honour one config surface.

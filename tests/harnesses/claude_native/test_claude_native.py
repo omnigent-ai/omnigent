@@ -12791,7 +12791,7 @@ async def test_claude_model_catalog_filters_canonical_ids_for_ambient_gateway(
 ) -> None:
     """When claude_config is None but ANTHROPIC_BASE_URL is a gateway, filter canonical IDs.
 
-    Managed settings (e.g. Isaac) may set ANTHROPIC_BASE_URL to a Databricks
+    Managed settings (e.g. a launcher wrapper) may set ANTHROPIC_BASE_URL to a Databricks
     gateway. The catalog must filter canonical claude-* IDs even when
     claude_config is None.
     """

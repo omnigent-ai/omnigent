@@ -166,7 +166,7 @@ def test_cookie_redaction_precedes_diagnostic_tail_clipping() -> None:
     ("screen", "expected_url", "expected_code"),
     [
         (
-            "dbexec: launcher 1.2.3\nSign in to continue:\n"
+            "synthetic-launcher: launcher 1.2.3\nSign in to continue:\n"
             "  https://signin.example.com/device\n  code: HQ7M-2KPD\nwaiting for sign-in...",
             "https://signin.example.com/device",
             "HQ7M-2KPD",
@@ -181,19 +181,21 @@ def test_cookie_redaction_precedes_diagnostic_tail_clipping() -> None:
         ("Enter code 123456 at https://x.example/verify.", "https://x.example/verify", None),
         # Keys echoed into the pane while the launcher waits are not its output.
         (
-            "dbcert: If the browser does not open automatically, please open the following URL:\n"
-            "\n\thttps://databricks.okta.com/oauth2/v1/authorize?client_id=0oa1&state=T4IU\n\n"
+            "credential-helper: If the browser does not open automatically, "
+            "please open the following URL:\n"
+            "\n\thttps://login.example.test/oauth2/v1/authorize?client_id=0oa1&state=T4IU\n\n"
             "^[^[^[^[\n^[[A\n",
-            "https://databricks.okta.com/oauth2/v1/authorize?client_id=0oa1&state=T4IU",
+            "https://login.example.test/oauth2/v1/authorize?client_id=0oa1&state=T4IU",
             None,
         ),
         # The launcher's prompt: the address is the last thing printed while it waits.
         (
-            "dbcert: Certificate requested by: omnigent\n"
-            "dbcert: Logging in via SSO...\n"
-            "dbcert: If the browser does not open automatically, please open the following URL:\n"
-            "\n\thttps://databricks.okta.com/oauth2/v1/authorize?client_id=0oa1&state=T4IU\n\n",
-            "https://databricks.okta.com/oauth2/v1/authorize?client_id=0oa1&state=T4IU",
+            "credential-helper: Certificate requested by: omnigent\n"
+            "credential-helper: Logging in via SSO...\n"
+            "credential-helper: If the browser does not open automatically, "
+            "please open the following URL:\n"
+            "\n\thttps://login.example.test/oauth2/v1/authorize?client_id=0oa1&state=T4IU\n\n",
+            "https://login.example.test/oauth2/v1/authorize?client_id=0oa1&state=T4IU",
             None,
         ),
     ],
@@ -239,10 +241,11 @@ def test_detect_sign_in_prompt_ignores_an_address_the_launcher_moved_past() -> N
     the spent address again.
     """
     screen = (
-        "dbcert: If the browser does not open automatically, please open the following URL:\n"
-        "\n\thttps://databricks.okta.com/oauth2/v1/authorize?client_id=0oa1&state=T4IU\n\n"
-        "dbcert: All credentials successfully written\n"
-        "dbcert: Successfully copied certificates for bazel cache\n"
+        "credential-helper: If the browser does not open automatically, "
+        "please open the following URL:\n"
+        "\n\thttps://login.example.test/oauth2/v1/authorize?client_id=0oa1&state=T4IU\n\n"
+        "credential-helper: All credentials successfully written\n"
+        "credential-helper: Successfully copied certificates for bazel cache\n"
         "Cloning hosted gateway models from gpt-5.5 because gpt-5.2 is not bundled\n"
         "\u256d\u2500\u2500 OpenAI Codex (v0.156.1) \u2500\u2500\u256e\n"
         "\u203a Ask Codex to do anything\n"
@@ -320,7 +323,7 @@ def test_detect_sign_in_prompt_ignores_a_later_endpoint_after_the_prompt_complet
     """An auth-shaped docs link below a finished prompt must not revive it."""
     screen = (
         "Open the following URL to sign in:\n"
-        "https://dbcert.example.com/x\n"
+        "https://auth.example.test/x\n"
         "Signed in as someone@example.com.\n"
         "Agent ready. Help: https://example.com/login\n"
     )

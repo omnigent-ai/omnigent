@@ -82,7 +82,7 @@ os_env:
 
 terminals:
   worker:
-    command: isaac
+    command: example-wrapper
     os_env:
       type: caller_process
       # Explicit ``sandbox: type: none`` so the example runs on

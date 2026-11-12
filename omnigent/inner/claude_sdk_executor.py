@@ -2447,7 +2447,7 @@ class ClaudeSDKExecutor(Executor):
                 # gateway we negotiate betas rather than disabling them, but
                 # *omitting* CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS from
                 # ``options.env`` does not beat an INHERITED one — a parent launcher
-                # may export it (the arca/isaac runners do), and the merge puts os.environ
+                # may export it (managed runners can), and the merge puts os.environ
                 # under options.env. Without this the child still strips
                 # interleaved-thinking and the gateway still answers 400. Scoped
                 # to launches that negotiate (CLAUDE_CODE_USE_GATEWAY): the

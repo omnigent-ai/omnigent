@@ -1,6 +1,6 @@
 """A message sent while Claude's launcher waits for a Databricks sign-in is sent after it.
 
-A launcher wrapper in front of ``claude`` (Isaac's launcher, for example) can stop
+A launcher wrapper in front of ``claude`` (a managed launcher, for example) can stop
 on a device-code sign-in before Claude Code starts. This drives a real server,
 runner and tmux pane with such a launcher: the message must wait for the sign-in,
 then reach Claude's composer once, in order with a message queued behind it,
@@ -53,7 +53,7 @@ def _launcher_script(tui: Path, signed_in: Path) -> str:
         "#!/bin/sh\n"
         'if [ "$1" = "--version" ]; then echo "2.1.296 (Claude Code)"; exit 0; fi\n'
         # The runner's ``-p`` probes and subcommands return at once; only the
-        # interactive launch meets the sign-in, as behind Isaac's launcher.
+        # interactive launch meets the sign-in, as behind a managed launcher.
         'case "$1" in -p|--print) exit 0 ;; -*) ;; ?*) exit 0 ;; esac\n'
         "echo 'Signing in to Databricks before starting Claude Code.'\n"
         f"echo 'Open this URL to sign in: {_SIGN_IN_URL}'\n"

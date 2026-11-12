@@ -492,7 +492,7 @@ def _ambient_env_is_non_anthropic_gateway(configured_base_url: str | None = None
     """Whether managed settings or the process env route through a gateway.
 
     Used as the ``claude_config is None`` counterpart to
-    :func:`_serves_canonical_anthropic_ids`: when managed settings (e.g. Isaac)
+    :func:`_serves_canonical_anthropic_ids`: when managed settings (e.g. a launcher wrapper)
     set ``ANTHROPIC_BASE_URL`` to a Databricks gateway, the catalog and its
     fingerprint must treat the env as a non-canonical endpoint.
 
@@ -7018,9 +7018,8 @@ def _claude_terminal_request(
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
     )
-    # Let a registered launcher plugin (e.g. a wrapper such as isaac) rewrite the
-    # command/args to wrap the same fully-augmented Claude launch. Identity by
-    # default. See omnigent.claude_launcher.
+    # Let a registered launcher plugin wrap the fully augmented Claude launch.
+    # The default leaves command/args unchanged. See omnigent.claude_launcher.
     command, args = resolve_claude_launch(command, args)
     spec: _JsonObject = {
         "command": command,
