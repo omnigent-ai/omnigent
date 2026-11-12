@@ -294,9 +294,10 @@ def _claude_allowlisted_servers(
         projects = user.get("projects")
         tables.append(servers_in(user))
         for directory in _claude_project_directories(cwd):
-            tables.append(
-                servers_in(projects.get(str(directory)) if isinstance(projects, dict) else None)
-            )
+            # Claude keys projects by its physical working directory.
+            for key in dict.fromkeys((str(directory), os.path.realpath(directory))):
+                project = projects.get(key) if isinstance(projects, dict) else None
+                tables.append(servers_in(project))
             tables.append(servers_in(read(directory / ".mcp.json")))
     return [
         (name, config)

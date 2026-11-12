@@ -350,7 +350,10 @@ def test_claude_strict_reads_linked_worktree_and_main_checkout_settings(
     ]
 
 
-def test_claude_strict_keeps_exact_transport_entries_of_allowlisted_servers(claude_project):
+@pytest.mark.parametrize("via_symlink", [False, True])
+def test_claude_strict_keeps_exact_transport_entries_of_allowlisted_servers(
+    claude_project, via_symlink
+):
     """A deny matching an allowlisted server's transport would block that server too."""
     write_mcp_inheritance({"inherit": False, "allow": ["kept", "kept_project", "kept_http"]})
     _write_json(
@@ -361,7 +364,7 @@ def test_claude_strict_keeps_exact_transport_entries_of_allowlisted_servers(clau
                 "other": {"command": "npx", "args": ["other-server"]},
             },
             "projects": {
-                str(claude_project): {"mcpServers": {"kept_project": {"command": "uvx"}}}
+                str(claude_project.resolve()): {"mcpServers": {"kept_project": {"command": "uvx"}}}
             },
         },
     )
@@ -381,7 +384,11 @@ def test_claude_strict_keeps_exact_transport_entries_of_allowlisted_servers(clau
             ]
         },
     )
-    result = apply_claude_settings({}, executor="claude-native", active_harnesses=None)
+    launch = claude_project
+    if via_symlink:
+        launch = claude_project.parent / "linked-project"
+        launch.symlink_to(claude_project, target_is_directory=True)
+    result = apply_claude_settings({}, executor="claude-native", active_harnesses=None, cwd=launch)
     assert result["deniedMcpServers"] == [other]
 
 
