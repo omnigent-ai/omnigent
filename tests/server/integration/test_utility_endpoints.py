@@ -95,14 +95,17 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "arca_shutdown_warnings": False,
         "import_review": False,
         "custom_agents_settings_ui": True,
-        "sidebar_grouping_ui": False,
+        "sidebar_grouping_ui": True,
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
         "automations_v2": False,
         "splittable_terminal_view_ui": False,
+        "sidebar_windowed_rows": False,
         "session_orchestration": True,
+        "sibling_sessions": True,
         "codex_plan_at_launch": True,
     }
+    assert data["sibling_sessions"] is True
     # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False
     # installable_harnesses is the allowlist the SPA offers setup for; blank
@@ -114,11 +117,15 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["scheduled_task_worktrees"] is True
     # Gates the palette's grouped session search; older servers omit it.
     assert data["session_search_scope"] is True
+    # Lets sys_session_list scope archive-inclusive listings server-side.
+    assert data["session_list_scoped_archives"] is True
     # Gates the automation dialog's Session control; older servers reject the fields.
     assert data["scheduled_task_session_modes"] is True
     assert data["scheduled_task_subhour"] is True
     assert data["automation_trigger_poll_minutes"] == 10
     assert data["scheduled_task_harness_settings"] is True
+    # Gates the automation picker's approval-skipping modes; older servers reject them.
+    assert data["scheduled_task_approval_skipping_modes"] is True
     assert data["agent_detail"] is True
     assert data["agent_config_edit"] is True
     # Gates the web's /clear for native sessions; older servers reject it.
@@ -127,6 +134,10 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # Browser-posted despite its prefix; runner-only events stay unadvertised.
     assert "external_btw_dismiss" in data["session_event_types"]
     assert "external_output_text_delta" not in data["session_event_types"]
+    # Gates the web's claude-sdk /clear, which older servers list "clear" without.
+    assert data["session_claude_sdk_clear"] is True
+    # Gates the Codex forwarder's non-blocking async question cards.
+    assert data["codex_nonblocking_decline"] is True
     # This app wires no project store, so automations cannot take a project.
     assert data["scheduled_task_projects"] is False
     # This app wires no scheduled-task store, so it has no automations to offer.
@@ -145,6 +156,10 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert ServerInfoResponse.model_validate(data).agent_config_edit is False
     del data["session_event_types"]
     assert ServerInfoResponse.model_validate(data).session_event_types == []
+    del data["session_claude_sdk_clear"]
+    assert ServerInfoResponse.model_validate(data).session_claude_sdk_clear is False
+    del data["codex_nonblocking_decline"]
+    assert ServerInfoResponse.model_validate(data).codex_nonblocking_decline is False
     del data["automations_enabled"]
     assert ServerInfoResponse.model_validate(data).automations_enabled is False
 

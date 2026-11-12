@@ -42,6 +42,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
+import { useSyncExternalStore } from "react";
 import {
   appendReviewReply,
   type ReviewComment,
@@ -229,6 +230,8 @@ export interface PullRequestCapabilities {
   details_editing?: boolean;
   /** Images and videos can be uploaded into the description; absent from older hosts. */
   attachment_uploads?: boolean;
+  /** The PR's commits can be listed and read one at a time; absent from older hosts. */
+  commit_history?: boolean;
 }
 
 /** Why the panel can't show pull request content.
@@ -737,19 +740,28 @@ export interface PullRequestDiffResponse {
   message?: string;
 }
 
-async function fetchPullRequestDiff(
+/** GET one patch resource of the session's GitHub panel: the whole PR, or one commit. */
+async function fetchPullRequestPatch(
   conversationId: string,
-  prUrl?: string,
-  revision?: string,
+  resource: "diff" | "commit-diff" | "compare-diff",
+  query: string,
 ): Promise<PullRequestDiffResponse> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff${pinnedPrQuery(prUrl, revision)}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/${resource}${query}`,
   );
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
   }
   if (!res.ok) throw await errorFromResponse(res);
   return (await res.json()) as PullRequestDiffResponse;
+}
+
+async function fetchPullRequestDiff(
+  conversationId: string,
+  prUrl?: string,
+  revision?: string,
+): Promise<PullRequestDiffResponse> {
+  return fetchPullRequestPatch(conversationId, "diff", pinnedPrQuery(prUrl, revision));
 }
 
 /**
@@ -773,6 +785,174 @@ export function usePullRequestDiff(
     retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
+    gcTime: 30 * 60_000,
+  });
+}
+
+/** One commit of the pull request, as the Commits view lists it. */
+export interface PullRequestCommit {
+  object: "session.github.commit";
+  sha: string;
+  /** The first line of the commit message. */
+  title: string;
+  author: string | null;
+  /** The git author date, ISO 8601. */
+  date: string | null;
+  /** Other pull requests whose head is this commit, such as a stacked PR's parent. */
+  head_of?: { number: number; url: string | null; state: string | null }[];
+}
+
+/** The most commits the server lists for one pull request (GitHub's own limit). */
+export const PULL_REQUEST_COMMITS_LIMIT = 250;
+
+/**
+ * The server or runner predates the commit routes. A 404 is the only answer they give to a commit
+ * read; every other failure is a 400, 502 or 503 and keeps its own error.
+ */
+export class PullRequestCommitsUnsupportedError extends Error {
+  constructor() {
+    super(
+      "This Omnigent server doesn't support pull request commits. Update it to browse commits.",
+    );
+  }
+}
+
+// PRs whose server lacks the commit routes, kept for the page's life so the switch stays hidden.
+const commitsUnsupportedPrs = new Set<string>();
+const commitsUnsupportedListeners = new Set<() => void>();
+
+function commitsKey(conversationId: string, prUrl: string | undefined): string {
+  return JSON.stringify([conversationId, prUrl ?? ""]);
+}
+
+/** Classifies a failed commit read: a 404 marks the PR unsupported, and any other error passes through. */
+function commitReadError(error: unknown, conversationId: string, prUrl: string): unknown {
+  if (!(error instanceof PullRequestApiError) || error.status !== 404) return error;
+  commitsUnsupportedPrs.add(commitsKey(conversationId, prUrl));
+  for (const listener of commitsUnsupportedListeners) listener();
+  return new PullRequestCommitsUnsupportedError();
+}
+
+/** Whether this PR's server lacks the commit routes, so its Commits view is unavailable. */
+export function usePullRequestCommitsUnsupported(
+  conversationId: string | undefined,
+  prUrl: string | undefined,
+): boolean {
+  return useSyncExternalStore(
+    (listener) => {
+      commitsUnsupportedListeners.add(listener);
+      return () => {
+        commitsUnsupportedListeners.delete(listener);
+      };
+    },
+    () => commitsUnsupportedPrs.has(commitsKey(conversationId ?? "", prUrl)),
+  );
+}
+
+export interface PullRequestCommitsResult {
+  object: "list";
+  /** Oldest first; at most {@link PULL_REQUEST_COMMITS_LIMIT}, with `has_more` when the PR has more. */
+  data: PullRequestCommit[];
+  has_more: boolean;
+}
+
+async function fetchPullRequestCommits(
+  conversationId: string,
+  prUrl: string,
+  headSha: string,
+): Promise<PullRequestCommitsResult> {
+  const query = new URLSearchParams({ pr_url: prUrl, head_sha: headSha });
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/commits?${query}`,
+  );
+  if (res.status === 503 && (await isRunnerUnavailable503(res))) {
+    throw new RunnerOfflineError();
+  }
+  if (!res.ok) throw commitReadError(await errorFromResponse(res), conversationId, prUrl);
+  return (await res.json()) as PullRequestCommitsResult;
+}
+
+/**
+ * The PR's commit list, pinned to the head the Changes list shows. Enabled only
+ * once that head is known, so the list and the file list describe one revision.
+ */
+export function usePullRequestCommits(
+  conversationId: string | undefined,
+  prUrl: string | undefined,
+  headSha: string | null,
+  enabled: boolean,
+) {
+  const serveable = useWorkspaceServeable(conversationId);
+  const retry = useRunnerOfflineRetry(serveable !== false);
+  return useQuery({
+    queryKey: ["github-pr-commits", conversationId, prUrl, headSha],
+    queryFn: () => fetchPullRequestCommits(conversationId!, prUrl!, headSha!),
+    enabled: enabled && !!conversationId && !!prUrl && !!headSha && serveable !== false,
+    retry,
+    retryDelay: runnerOfflineRetryDelay,
+    staleTime: 30_000,
+    gcTime: 30 * 60_000,
+  });
+}
+
+async function fetchPullRequestCommitDiff(
+  conversationId: string,
+  prUrl: string,
+  commitSha: string,
+): Promise<PullRequestDiffResponse> {
+  const query = new URLSearchParams({ pr_url: prUrl, commit_sha: commitSha });
+  return fetchPullRequestPatch(conversationId, "commit-diff", `?${query}`).catch(
+    (error: unknown) => {
+      throw commitReadError(error, conversationId, prUrl);
+    },
+  );
+}
+
+async function fetchPullRequestChangesSince(
+  conversationId: string,
+  prUrl: string,
+  commitSha: string,
+  headSha: string,
+): Promise<PullRequestDiffResponse> {
+  const query = new URLSearchParams({ pr_url: prUrl, head_sha: headSha, from_sha: commitSha });
+  return fetchPullRequestPatch(conversationId, "compare-diff", `?${query}`).catch(
+    (error: unknown) => {
+      // A peer without the route still serves single commits, so only this view is unavailable.
+      if (error instanceof PullRequestApiError && error.status === 404) {
+        throw new Error(
+          "Showing changes since a commit needs an updated Omnigent server and host.",
+        );
+      }
+      throw error;
+    },
+  );
+}
+
+/**
+ * One commit's patch, read by its full id, or with `untilHeadSha` the PR's changes after
+ * that commit up to that head. Enabled only while a commit is picked. Both ends are fixed
+ * commits, so the patch never changes and stays fresh for the whole cache lifetime.
+ */
+export function usePullRequestCommitDiff(
+  conversationId: string | undefined,
+  prUrl: string | undefined,
+  commitSha: string | null,
+  untilHeadSha: string | null = null,
+) {
+  const serveable = useWorkspaceServeable(conversationId);
+  const retry = useRunnerOfflineRetry(serveable !== false);
+  return useQuery({
+    queryKey: ["github-pr-commit-diff", conversationId, prUrl, commitSha, untilHeadSha],
+    queryFn: () =>
+      untilHeadSha
+        ? fetchPullRequestChangesSince(conversationId!, prUrl!, commitSha!, untilHeadSha)
+        : fetchPullRequestCommitDiff(conversationId!, prUrl!, commitSha!),
+    enabled: !!conversationId && !!prUrl && !!commitSha && serveable !== false,
+    retry,
+    retryDelay: runnerOfflineRetryDelay,
+    // Only a response that carries the patch is final; an unavailable one is retried like any other.
+    staleTime: (query) =>
+      query.state.data && !query.state.data.unavailable_reason ? Infinity : 30_000,
     gcTime: 30 * 60_000,
   });
 }

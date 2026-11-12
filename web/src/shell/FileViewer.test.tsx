@@ -205,10 +205,11 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { prepareDiffEditor } from "./MonacoDiffViewer";
-import { MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
+import { MAX_PREVIEW_MARKDOWN_BYTES, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
 import { useFileContent } from "@/hooks/useFileContent";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
+import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
 import { FileViewerContext, type FileNavigationGuard } from "./FileViewerContext";
 import { encodePdfAnchor } from "./pdfCommentHelpers";
@@ -268,11 +269,12 @@ interface RenderProps {
   /** Spy for the close affordance; defaults to a throwaway mock. */
   onClose?: () => void;
   onCloseTab?: () => void;
-  closeTabRef?: { current: (() => void) | null };
   /** Sort order for the prev/next navigation; defaults to the component default. */
   sort?: ChangedSort;
   /** Enables the prev/next nav header when provided. */
   onNavigateTo?: (path: string) => void;
+  /** Esc closes through `onClose` too, as a workspace file tab or the narrow-screen overlay does. */
+  escapeCloses?: boolean;
 }
 
 /**
@@ -295,9 +297,9 @@ function viewerTree({
   initialSearch = "",
   onClose = vi.fn(),
   onCloseTab,
-  closeTabRef,
   sort,
   onNavigateTo,
+  escapeCloses = false,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -316,8 +318,7 @@ function viewerTree({
           conversationId="conv_1"
           path={path}
           onClose={onClose}
-          onCloseTab={onCloseTab}
-          closeTabRef={closeTabRef}
+          onCloseTab={onCloseTab ?? (escapeCloses ? onClose : undefined)}
           sort={sort}
           onNavigateTo={onNavigateTo}
         />
@@ -1538,7 +1539,120 @@ describe("classifyAndRemapComments", () => {
 // the tabbed Files rail (frameless), where tabs own open/close, so the back
 // button is hidden there.
 
+describe("FileViewer Escape ownership", () => {
+  it("marks itself as owning Escape while Escape would close its tab", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    render(
+      <>
+        {viewerTree({ open: true, escapeCloses: true, syncUrl: false })}
+        <button type="button">Chat</button>
+      </>,
+    );
+    const viewer = screen.getByTestId("file-viewer");
+    expect(viewer).toHaveAttribute("data-escape-owner");
+
+    // Working in the chat leaves Escape to the chat.
+    fireEvent.mouseDown(screen.getByRole("button", { name: "Chat" }));
+    expect(viewer).not.toHaveAttribute("data-escape-owner");
+    fireEvent.mouseDown(viewer);
+    expect(viewer).toHaveAttribute("data-escape-owner");
+
+    // With Find open, Escape closes Find first, so the viewer still owns it.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Find in file" }));
+    // The menu took focus; the app's Find bar takes it back into the viewer.
+    fireEvent.mouseDown(viewer);
+    expect(viewer).toHaveAttribute("data-escape-owner");
+  });
+
+  it("leaves Escape to an open Find bar over a pending question", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onClose = vi.fn();
+    const onReject = vi.fn();
+    render(
+      <>
+        {viewerTree({ open: true, escapeCloses: true, syncUrl: false, onClose })}
+        <AskUserQuestionForm
+          elicitationId="elic_find"
+          questions={[
+            { id: "pick", question: "Pick one", multiSelect: false, options: [{ label: "A" }] },
+          ]}
+          onSubmit={vi.fn()}
+          onReject={onReject}
+          keyboardActive
+        />
+      </>,
+    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Find in file" }));
+    // Focus leaves the search box for the file's text, still inside the viewer.
+    const viewer = screen.getByTestId("file-viewer");
+    fireEvent.mouseDown(screen.getByTestId("code-viewer"));
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(viewer).toHaveAttribute("data-escape-owner");
+    expect(onReject).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    "leaves Escape to a question typed into after the viewer (syncUrl=%s)",
+    (syncUrl) => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      const onClose = vi.fn();
+      const onReject = vi.fn();
+      render(
+        <>
+          {viewerTree({ open: true, escapeCloses: true, syncUrl, onClose })}
+          <AskUserQuestionForm
+            elicitationId="elic_viewer"
+            questions={[
+              { id: "pick", question: "Pick one", multiSelect: false, options: [{ label: "A" }] },
+            ]}
+            onSubmit={vi.fn()}
+            onReject={onReject}
+            keyboardActive
+          />
+        </>,
+      );
+      const custom = screen.getByTestId("ask-user-question-custom-input");
+      fireEvent.focusIn(custom);
+      custom.focus();
+      fireEvent.keyDown(custom, { key: "Escape" });
+      expect(onReject).toHaveBeenCalledOnce();
+      expect(onClose).not.toHaveBeenCalled();
+    },
+  );
+
+  it("doesn't own Escape when Escape doesn't close it", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    render(viewerTree({ open: true }));
+    expect(screen.getByTestId("file-viewer")).not.toHaveAttribute("data-escape-owner");
+  });
+});
+
 describe("FileViewer header close affordance", () => {
+  it("lists Esc on Close only while Esc would close the viewer", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    render(viewerTree({ open: true, mobileOverlay: true, escapeCloses: true }));
+    const closeKeys = async () => {
+      fireEvent.pointerMove(screen.getByRole("button", { name: "Close file viewer" }), {
+        pointerType: "mouse",
+      });
+      const tooltip = await screen.findByRole("tooltip");
+      const keys = Array.from(tooltip.querySelectorAll("kbd"), (key) => key.textContent);
+      fireEvent.pointerLeave(screen.getByRole("button", { name: "Close file viewer" }));
+      return keys;
+    };
+    expect(await closeKeys()).toEqual(["Esc"]);
+
+    // Find keeps Esc for closing itself.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Find in file" }));
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-search-open", "true");
+    await waitFor(() => expect(screen.queryByRole("tooltip")).toBeNull());
+    expect(await closeKeys()).toEqual([]);
+  });
+
   it.each([false, true])("invokes onClose for a mobile overlay (frameless=%s)", (frameless) => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     const onClose = vi.fn();
@@ -2668,6 +2782,50 @@ describe("file position navigation", () => {
     expect(unregister).toHaveBeenCalled();
   });
 
+  it("asks before a closing tab or a session exit drops unsaved edits", () => {
+    let guard: FileNavigationGuard | undefined;
+    const registerNavigationGuard = vi.fn((next: FileNavigationGuard) => {
+      guard = next;
+      return () => {};
+    });
+    function GuardedViewer() {
+      const contextValue = useMemo(
+        () => ({
+          openFile: vi.fn(),
+          registerNavigationGuard,
+          openGithubTab: vi.fn(),
+          isChangedPath: () => false,
+          conversationId: "conv_1",
+          workspaceRoot: null,
+          workspaceHome: null,
+        }),
+        [],
+      );
+      return (
+        <FileViewerContext.Provider value={contextValue}>
+          {viewerTree({ open: true, path: "file1.md" })}
+        </FileViewerContext.Provider>
+      );
+    }
+    render(<GuardedViewer />);
+    const close = vi.fn();
+    // A clean editor lets the tab close straight away.
+    act(() => guard!(null, undefined, close));
+    expect(close).toHaveBeenCalledTimes(1);
+
+    const draft = screen.getByRole("textbox", { name: "Draft text" });
+    fireEvent.change(draft, { target: { value: "Unsaved draft" } });
+    act(() => guard!(null, undefined, close));
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(draft).toHaveValue("Unsaved draft");
+
+    act(() => guard!(null, undefined, close));
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(close).toHaveBeenCalledTimes(2);
+  });
+
   it.each([false, true])(
     "keeps unsaved Markdown edits when a line navigation is cancelled (diff preference=%s)",
     (diffActive) => {
@@ -2707,30 +2865,116 @@ describe("large Markdown file routing", () => {
   });
   afterEach(() => setContent(""));
 
-  it.each(["editor", "preview", "source"] as const)(
-    "overrides %s without changing the preference",
-    (mode) => {
-      writeFileViewPreferences({
-        diffActive: false,
-        diffLayout: "unified",
-        previewableViewMode: mode,
-        hideWhitespace: false,
-        wrapLines: false,
-      });
+  const viewModeOf = () => screen.getByTestId("code-viewer").getAttribute("data-view-mode");
+  const seedPreference = (mode: "editor" | "preview" | "source") =>
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: mode,
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+  const selectMode = (mode: "Preview" | "Edit") => {
+    fireEvent.pointerDown(screen.getByRole("button", { name: /^View mode/ }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: mode }));
+  };
+
+  it.each([
+    { preference: "editor", opensIn: "preview" },
+    { preference: "preview", opensIn: "preview" },
+    { preference: "source", opensIn: "source" },
+  ] as const)(
+    "opens in $opensIn for a $preference preference without changing it",
+    ({ preference, opensIn }) => {
+      seedPreference(preference);
       setContent(large);
       const view = render(viewerTree({ open: true, path: "large.md" }));
-      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "source");
+      expect(viewModeOf()).toBe(opensIn);
       expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-markdown-source", "true");
-      expect(screen.queryByRole("button", { name: /^View mode/ })).not.toBeInTheDocument();
-      vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux");
-      fireEvent.keyDown(window, { key: "f", ctrlKey: true });
-      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-search-open", "true");
       setContent("# Small");
       view.rerender(viewerTree({ open: true, path: "small.md" }));
-      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", mode);
+      expect(viewModeOf()).toBe(preference);
       expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-markdown-source", "false");
     },
   );
+
+  it("offers only Preview and an Edit that opens source", () => {
+    setContent(large);
+    render(viewerTree({ open: true, path: "large.md" }));
+    fireEvent.pointerDown(screen.getByRole("button", { name: /^View mode/ }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Preview" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Edit" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Source" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Edit" }));
+    expect(viewModeOf()).toBe("source");
+    fireEvent.mouseDown(screen.getByTestId("code-viewer"));
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux");
+    fireEvent.keyDown(window, { key: "f", ctrlKey: true });
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-search-open", "true");
+  });
+
+  it("keeps Edit for this visit only, then reopens in Preview", () => {
+    seedPreference("editor");
+    setContent(large);
+    const view = render(viewerTree({ open: true, path: "large.md" }));
+    selectMode("Edit");
+    expect(viewModeOf()).toBe("source");
+    setContent("# Small");
+    view.rerender(viewerTree({ open: true, path: "small.md" }));
+    expect(viewModeOf()).toBe("editor");
+    setContent(large);
+    view.rerender(viewerTree({ open: true, path: "large.md" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("guards unsaved source edits when returning to Preview", () => {
+    setContent(large);
+    render(viewerTree({ open: true, path: "large.md" }));
+    selectMode("Edit");
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+    selectMode("Preview");
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    expect(viewModeOf()).toBe("source");
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it.each([
+    { name: "beyond the preview limit", content: "a".repeat(MAX_PREVIEW_MARKDOWN_BYTES + 1) },
+    { name: "truncated", content: large, truncated: true },
+  ])("opens $name Markdown straight in source with no mode picker", (c) => {
+    seedPreference("preview");
+    vi.mocked(useFileContent).mockReturnValue({
+      data: { content: c.content, encoding: "utf-8", truncated: c.truncated },
+    } as ReturnType<typeof useFileContent>);
+    render(viewerTree({ open: true, path: "huge.md" }));
+    expect(viewModeOf()).toBe("source");
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-markdown-source", "true");
+    expect(screen.queryByRole("button", { name: /^View mode/ })).not.toBeInTheDocument();
+  });
+
+  it("keeps a citation's source editor when the citation clears, guarding unsaved edits", () => {
+    seedPreference("editor");
+    setContent(large);
+    const view = render(viewerTree({ open: true, path: "large.md", position: { line: 1 } }));
+    expect(viewModeOf()).toBe("source");
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+    view.rerender(viewerTree({ open: true, path: "large.md" }));
+    expect(viewModeOf()).toBe("source");
+    selectMode("Preview");
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(viewModeOf()).toBe("source");
+    selectMode("Preview");
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("opens a comment deep link in source, where its anchor is shown", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    setContent(large);
+    render(viewerTree({ open: true, path: "large.md", initialSearch: "comment=c1" }));
+    expect(viewModeOf()).toBe("source");
+  });
 
   it.each([
     { size: "large", content: large, monaco: true },
@@ -2781,39 +3025,4 @@ it("keeps grid file viewers independent of shared URL parameters and copies a se
   expect(copied.pathname).toBe("/c/conv_1");
   expect(copied.searchParams.get("file")).toBe("file1.py");
   expect(copied.searchParams.has("comment")).toBe(false);
-});
-
-describe("FileViewer Close Tab", () => {
-  beforeEach(() => {
-    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
-  });
-
-  it("retains an unsaved buffer when closing is cancelled, and closes only after confirmation", () => {
-    const closeTabRef: { current: (() => void) | null } = { current: null };
-    const onCloseTab = vi.fn();
-    const { unmount } = renderViewer({ open: true, path: "file1.md", closeTabRef, onCloseTab });
-    const draft = screen.getByRole("textbox", { name: "Draft text" });
-    fireEvent.change(draft, { target: { value: "Unsaved draft" } });
-    act(() => closeTabRef.current?.());
-    expect(screen.getByRole("dialog", { name: "Unsaved changes" })).toBeInTheDocument();
-    expect(onCloseTab).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
-    expect(onCloseTab).not.toHaveBeenCalled();
-    expect(draft).toHaveValue("Unsaved draft");
-
-    act(() => closeTabRef.current?.());
-    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
-    expect(onCloseTab).toHaveBeenCalledOnce();
-    unmount();
-    expect(closeTabRef.current).toBeNull();
-  });
-
-  it("closes a clean file without confirmation", () => {
-    const closeTabRef: { current: (() => void) | null } = { current: null };
-    const onCloseTab = vi.fn();
-    renderViewer({ open: true, closeTabRef, onCloseTab });
-    act(() => closeTabRef.current?.());
-    expect(onCloseTab).toHaveBeenCalledOnce();
-    expect(screen.queryByRole("dialog")).toBeNull();
-  });
 });

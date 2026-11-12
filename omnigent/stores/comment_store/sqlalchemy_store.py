@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 
 from sqlalchemy import delete, func, select
@@ -16,6 +17,7 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import Comment, CommentsFingerprint
+from omnigent.entities.comment import PullRequestCommentAnchor
 from omnigent.stores.comment_store import CommentStore
 
 
@@ -37,6 +39,9 @@ def _to_entity(row: SqlComment) -> Comment:
         updated_at=row.updated_at,
         anchor_content=row.anchor_content,
         created_by=row.created_by,
+        anchor_metadata=PullRequestCommentAnchor(**json.loads(row.anchor_metadata))
+        if row.anchor_metadata
+        else None,
     )
 
 

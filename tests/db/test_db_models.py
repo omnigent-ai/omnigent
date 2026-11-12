@@ -13,6 +13,7 @@ import string
 import time
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy import make_url
 from sqlalchemy.dialects import mysql, sqlite
 from sqlalchemy.exc import IntegrityError, OperationalError, StatementError
@@ -741,6 +742,40 @@ class TestSqlSessionPermission:
 
 
 class TestSqlComment:
+    def test_anchor_writes_enforce_stored_byte_limit(self) -> None:
+        assert "anchor_metadata" in sa.inspect(SqlComment).columns
+        table = SqlComment.__table__
+        assert table.c.anchor_metadata.type.max_stored_bytes == 1_024
+        anchor = '{"pr_url":"https://example.com/repo/pull/1","side":"LEFT","line":9}'
+        engine = sa.create_engine("sqlite://")
+        try:
+            table.create(engine)
+            with engine.begin() as connection:
+                connection.execute(
+                    table.insert().values(
+                        id="cccccccccccccccccccccccccccccc01",
+                        conversation_id="a9930027fd3e2e979e65844f7af7bf88",
+                        path="main.py",
+                        start_index=0,
+                        end_index=0,
+                        body="Review",
+                        status=encode_comment_status("draft"),
+                        created_at=0,
+                        updated_at=0,
+                        anchor_metadata=anchor,
+                    )
+                )
+                assert (
+                    connection.execute(sa.select(table.c.anchor_metadata)).scalar_one() == anchor
+                )
+            oversized_anchor = "".join(random.Random(0).choices(string.ascii_letters, k=2_048))
+            with pytest.raises(StatementError, match="size limit"), engine.begin() as connection:
+                connection.execute(
+                    table.update().values(anchor_metadata=oversized_anchor),
+                )
+        finally:
+            engine.dispose()
+
     def test_persist_and_read(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
