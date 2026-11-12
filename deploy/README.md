@@ -607,6 +607,7 @@ browser out, or wait to roll back until the max lifetime has passed since the
 last sign-out that must keep holding. Rotating the secret also invalidates CLI
 and host tokens and refresh grants signed with it, so those need
 `omnigent login` again.
+
 ### Ending accounts sessions
 
 An `accounts` browser session uses `OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS`
