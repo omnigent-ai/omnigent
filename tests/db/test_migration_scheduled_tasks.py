@@ -253,7 +253,7 @@ def test_scheduled_task_shares_rejects_non_integer_codes(db_engine: Engine, colu
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_expected_indexes(db_engine: Engine) -> None:
-    """Both tables expose the indexes that back the read paths."""
+    """The scheduled-task tables expose the indexes that back the read paths."""
     insp = sa.inspect(db_engine)
     scheduled_tasks_idx = {i["name"] for i in insp.get_indexes("scheduled_tasks")}
     assert "ix_scheduled_tasks_user_scope" in scheduled_tasks_idx
@@ -298,6 +298,14 @@ def test_expected_indexes(db_engine: Engine) -> None:
         "workspace_id",
         "id",
     ]
+    # Backs the per-user "shared with me" lookup; non-unique, so it keeps the PK's columns.
+    shares_idx = {i["name"]: i for i in insp.get_indexes("scheduled_task_shares")}
+    assert shares_idx["ix_scheduled_task_shares_user_id"]["column_names"] == [
+        "workspace_id",
+        "user_id",
+        "scheduled_task_id",
+    ]
+    assert not shares_idx["ix_scheduled_task_shares_user_id"]["unique"]
     assert runs_idx_cols["ix_scheduled_task_runs_conversation_id"] == [
         "workspace_id",
         "conversation_id",

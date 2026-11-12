@@ -63,8 +63,16 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("workspace_id", "scheduled_task_id", "user_id"),
         *constraints,
     )
+    # Looks up the automations shared with one user, for a later "shared with me" list.
+    op.create_index(
+        "ix_scheduled_task_shares_user_id",
+        "scheduled_task_shares",
+        ["workspace_id", "user_id", "scheduled_task_id"],
+        unique=False,
+    )
 
 
 def downgrade() -> None:
-    """Drop the ``scheduled_task_shares`` table."""
+    """Drop the ``scheduled_task_shares`` index and table."""
+    op.drop_index("ix_scheduled_task_shares_user_id", table_name="scheduled_task_shares")
     op.drop_table("scheduled_task_shares")

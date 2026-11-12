@@ -1830,4 +1830,12 @@ class SqlScheduledTaskShare(OmnigentBase):
             "typeof(level) = 'integer'",
             name="ck_scheduled_task_shares_level_integer",
         ).ddl_if(callable_=_on_sqlite_family),
+        # Looks up the automations shared with one user; the primary key already
+        # covers the remaining columns.
+        Index(
+            "ix_scheduled_task_shares_user_id",
+            "workspace_id",
+            "user_id",
+            "scheduled_task_id",
+        ),
     )
