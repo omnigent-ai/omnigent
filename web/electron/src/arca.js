@@ -22,7 +22,6 @@ const { execFile, execFileSync, spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { StringDecoder } = require("node:string_decoder");
 const { readArcaIdentity, IDENTITY_START, IDENTITY_END } = require("./arcaIdentity");
 
 /**
@@ -30,12 +29,7 @@ const { readArcaIdentity, IDENTITY_START, IDENTITY_END } = require("./arcaIdenti
  * whole ssh + remote daemon startup a generous ceiling.
  */
 const CONNECT_TIMEOUT_MS = 5 * 60 * 1000;
-/** A dbcert refresh waits for the user to finish its browser sign-in. */
-const DBCERT_REFRESH_TIMEOUT_MS = 5 * 60 * 1000;
-const DBCERT_STATUS_TIMEOUT_MS = 10_000;
-const DBCERT_ARCA_SYNC_TIMEOUT_MS = 60_000;
 const ARCA_AUTH_RE = /arca (auth )?login|certificate.*expired|permission denied \(publickey/i;
-const MAX_CLI_OUTPUT_BYTES = 256 * 1024;
 
 /**
  * The only characters allowed in the server URL that rides inside the ssh
@@ -311,112 +305,6 @@ function lastLine(text) {
 }
 
 /**
- * Run a headless Arca command and capture both output streams.
- * @param {string} arcaPath
- * @param {string[]} args
- * @param {{ spawn?: typeof spawn, timeoutMs: number, killGraceMs?: number, maxOutputBytes?: number, env?: NodeJS.ProcessEnv }} options
- * @returns {Promise<{ code: number | null, stdout: string, stderr: string, timedOut?: boolean, spawnError?: Error }>}
- */
-function runArca(arcaPath, args, options) {
-  return new Promise((resolve) => {
-    let child;
-    try {
-      child = (options.spawn || spawn)(arcaPath, args, {
-        stdio: ["ignore", "pipe", "pipe"],
-        detached: true,
-        ...(options.env ? { env: options.env } : {}),
-      });
-    } catch (error) {
-      resolve({ code: null, stdout: "", stderr: "", spawnError: error });
-      return;
-    }
-    let stdout = "";
-    let stdoutBytes = 0;
-    let stderr = "";
-    let stderrBytes = 0;
-    const stdoutDecoder = new StringDecoder("utf8");
-    const stderrDecoder = new StringDecoder("utf8");
-    let settled = false;
-    let exited = false;
-    let exitCode = null;
-    let exitGraceTimer;
-    let killTimer;
-    let timedOut = false;
-    const killTree = (signal) => {
-      try {
-        if (typeof child.pid === "number") process.kill(-child.pid, signal);
-        else child.kill(signal);
-      } catch {
-        try {
-          child.kill(signal);
-        } catch {
-          // Already gone.
-        }
-      }
-    };
-    const onStdout = (chunk) => {
-      if (stdoutBytes >= (options.maxOutputBytes ?? Infinity)) return;
-      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-      const retained = bytes.subarray(0, (options.maxOutputBytes ?? Infinity) - stdoutBytes);
-      stdout += stdoutDecoder.write(retained);
-      stdoutBytes += retained.length;
-    };
-    const onStderr = (chunk) => {
-      if (stderrBytes >= (options.maxOutputBytes ?? Infinity)) return;
-      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-      const retained = bytes.subarray(0, (options.maxOutputBytes ?? Infinity) - stderrBytes);
-      stderr += stderrDecoder.write(retained);
-      stderrBytes += retained.length;
-    };
-    const settle = (result, fromClose = false) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      clearTimeout(exitGraceTimer);
-      clearTimeout(killTimer);
-      stdout += stdoutDecoder.end();
-      stderr += stderrDecoder.end();
-      if (!fromClose) {
-        for (const [stream, listener] of [
-          [child.stdout, onStdout],
-          [child.stderr, onStderr],
-        ]) {
-          try {
-            stream?.off("data", listener);
-            stream?.destroy?.();
-          } catch {
-            // A child may already have closed the pipe.
-          }
-        }
-      }
-      resolve({ code: result.code, stdout, stderr, timedOut, ...result });
-    };
-    const timer = setTimeout(() => {
-      if (exited) {
-        settle({ code: exitCode });
-        return;
-      }
-      timedOut = true;
-      killTree("SIGTERM");
-      killTimer = setTimeout(() => {
-        killTree("SIGKILL");
-        settle({ code: null, timedOut: true });
-      }, options.killGraceMs ?? 5000);
-    }, options.timeoutMs);
-    child.stdout?.on("data", onStdout);
-    child.stderr?.on("data", onStderr);
-    child.on("error", (error) => settle({ code: null, spawnError: error }));
-    child.on("exit", (code) => {
-      if (settled) return;
-      exited = true;
-      exitCode = code;
-      exitGraceTimer = setTimeout(() => settle({ code }), 500);
-    });
-    child.on("close", (code) => settle({ code: exited ? exitCode : code }, true));
-  });
-}
-
-/**
  * Start connecting the user's Arca instance to `serverUrl` as an Omnigent
  * host, streaming the command's live output. Built for the connect console:
  * the caller shows `command` to the user, pipes `onOutput` chunks into a
@@ -604,131 +492,7 @@ function connectArcaHost(serverUrl, deps = {}) {
   return startArcaConnect(serverUrl, deps).promise;
 }
 
-/**
- * Well-known install locations for dbcert.
- *
- * @returns {string[]}
- */
-function dbcertCandidatePaths() {
-  return [
-    "/usr/local/bin/dbcert",
-    "/opt/homebrew/bin/dbcert",
-    path.join(os.homedir(), ".local", "bin", "dbcert"),
-  ];
-}
-
-/**
- * Locate dbcert the way {@link resolveArcaPathAsync} locates arca.
- *
- * @param {{ isExecutableFile?: (p: string) => boolean }} [deps]
- * @returns {Promise<string | null>}
- */
-function resolveDbcertPathAsync(deps = {}) {
-  return new Promise((resolve) => {
-    execFile("/bin/sh", ["-c", "command -v dbcert"], { encoding: "utf8" }, (error, stdout) => {
-      const onPath = error ? null : String(stdout).trim() || null;
-      resolve(
-        resolveArcaPath({ ...deps, whichArca: () => onPath, candidatePaths: dbcertCandidatePaths }),
-      );
-    });
-  });
-}
-
-/**
- * Renew this machine's dbcert with `dbcert --force`, which signs in through
- * the browser. Unless skipped, dbcert also syncs the primary Arca instance.
- * `--force` mints a new certificate even while the current one is valid.
- *
- * @param {{ resolveDbcertPath?: () => string | null | Promise<string | null>, spawn?: typeof spawn, timeoutMs?: number, killGraceMs?: number, skipArcaSync?: boolean }} [deps]
- * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
- */
-async function runDbcertRefresh(deps = {}) {
-  return runDbcertCommand(
-    ["--force", "--caller-name", "omnigent", "--update-kubeconfig=false"],
-    "sign-in",
-    deps,
-  );
-}
-
-async function runDbcertArcaSync(deps = {}) {
-  return runDbcertCommand(["sync-arca"], "Arca sync", {
-    ...deps,
-    timeoutMs: deps.timeoutMs ?? DBCERT_ARCA_SYNC_TIMEOUT_MS,
-  });
-}
-
-async function runDbcertCommand(args, action, deps) {
-  try {
-    const dbcertPath = await (deps.resolveDbcertPath || resolveDbcertPathAsync)();
-    if (!dbcertPath) return { ok: false, error: "dbcert was not found on this machine." };
-    const run = await runArca(dbcertPath, args, {
-      spawn: deps.spawn,
-      timeoutMs: deps.timeoutMs ?? DBCERT_REFRESH_TIMEOUT_MS,
-      killGraceMs: deps.killGraceMs,
-      maxOutputBytes: MAX_CLI_OUTPUT_BYTES,
-      ...(deps.skipArcaSync ? { env: { ...process.env, DBCERT_SKIP_ARCA_SYNC: "1" } } : {}),
-    });
-    if (run.spawnError)
-      return { ok: false, error: `Couldn't run dbcert: ${run.spawnError.message}` };
-    if (run.timedOut) return { ok: false, error: `The dbcert ${action} timed out.` };
-    if (run.code !== 0) {
-      const output = run.stderr.trim() || run.stdout.trim();
-      return {
-        ok: false,
-        error: output ? lastLine(output) : `dbcert exited with code ${run.code}.`,
-      };
-    }
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, error: `Couldn't run dbcert: ${error.message}` };
-  }
-}
-
-/** Check both SSH and X.509 credentials without starting an interactive login. */
-async function readDbcertStatus(dbcertPath, deps) {
-  const run = await runArca(dbcertPath, ["status"], {
-    spawn: deps.spawn,
-    timeoutMs: deps.timeoutMs ?? DBCERT_STATUS_TIMEOUT_MS,
-    killGraceMs: deps.killGraceMs,
-    maxOutputBytes: 0,
-  });
-  if (run.spawnError || run.code === null || run.timedOut) {
-    return {
-      ok: false,
-      error: "Couldn't check your laptop's dbcert. Try again, or check dbcert in Arca Companion.",
-    };
-  }
-  if (run.code !== 0 && run.code !== 1) {
-    return { ok: false, error: `Couldn't check your laptop's dbcert (exit ${run.code}).` };
-  }
-  return { ok: true, valid: run.code === 0 };
-}
-
-/**
- * Check local credentials before provisioning an Arclet without starting sign-in.
- * @param {Parameters<typeof runDbcertRefresh>[0]} [deps]
- * @returns {Promise<{ ok: true, valid: boolean } | { ok: false, error: string }>}
- */
-async function checkDbcert(deps = {}) {
-  try {
-    const dbcertPath = await (deps.resolveDbcertPath || resolveDbcertPathAsync)();
-    if (!dbcertPath) {
-      return {
-        ok: false,
-        error: "dbcert is not installed on this laptop. Install dbcert, then try again.",
-      };
-    }
-    return await readDbcertStatus(dbcertPath, deps);
-  } catch {
-    return { ok: false, error: "Couldn't check your laptop's dbcert. Try again." };
-  }
-}
-
 module.exports = {
-  DBCERT_REFRESH_TIMEOUT_MS,
-  runDbcertRefresh,
-  runDbcertArcaSync,
-  checkDbcert,
   CONNECT_TIMEOUT_MS,
   buildConnectArgs,
   buildLoginArgs,

@@ -223,15 +223,11 @@ interface ElectronDesktopApi extends NativeShellApi {
   connectArcaHost?: () => Promise<ArcaConnectResult>;
   /** Connect a machine the user reaches over SSH; absent on Windows and older shells. */
   connectSshHost?: (destination: string) => Promise<ArcaConnectResult>;
-  /** Renew this machine's dbcert. */
-  refreshDbcert?: (options?: DbcertRefreshOptions) => Promise<DbcertRefreshResult>;
-  /** Check local credentials before an Arclet launch without starting sign-in. */
-  checkDbcert?: () => Promise<DbcertStatusResult>;
-
   /** The local `omni` CLI status (installed, resolved path, version, source). */
   getCliStatus?: () => Promise<CliStatus | null>;
   /** Clear the CLI-path override (revert to auto-detection); resolves status. */
   resetCliPath?: () => Promise<CliStatus | null>;
+
   /**
    * Open/navigate a conversation's embedded browser view. Present only on
    * desktop shells new enough to ship the embedded browser feature — its
@@ -418,12 +414,6 @@ export interface ChromeCookieImportResult {
 /** A lifecycle action for the host daemon. */
 export type HostControlAction = "start" | "stop" | "restart";
 
-export type DbcertRefreshResult = { ok: true } | { ok: false; error: string };
-export interface DbcertRefreshOptions {
-  skipArcaSync?: boolean;
-}
-export type DbcertStatusResult = { ok: true; valid: boolean } | { ok: false; error: string };
-
 /** Result of connecting the Arca instance as a host, from the desktop shell. */
 export interface ArcaConnectResult extends HostActionResult {
   /** Actual daemon identity captured on Arca for this selected server target. */
@@ -456,8 +446,6 @@ export interface DesktopFeatures {
    * window's server is a managed server.
    */
   databricksInternalFeatures?: boolean;
-  /** This window may renew the laptop's dbcert. */
-  canRefreshDbcert?: boolean;
   /** Shell can restore Arca preview identity after a desktop restart. */
   arcaPreviewRecovery?: boolean;
   /** This shell can import the current site's cookies from local Google Chrome. */
@@ -1447,39 +1435,6 @@ export async function connectSshHost(destination: string): Promise<ArcaConnectRe
   } catch (err) {
     console.warn("[nativeBridge] electron connectSshHost failed:", err);
     return { ok: false, error: String(err) };
-  }
-}
-
-/** Present only in desktop shells that can renew this machine's dbcert. */
-export function hasDbcertRefreshBridge(): boolean {
-  return typeof electronApi()?.refreshDbcert === "function";
-}
-
-export function hasDbcertPreflightBridge(): boolean {
-  return typeof electronApi()?.checkDbcert === "function" && hasDbcertRefreshBridge();
-}
-
-/** Check the laptop's credentials without opening a browser or renewing them. */
-export async function checkDbcert(): Promise<DbcertStatusResult> {
-  const bridge = electronApi()?.checkDbcert;
-  if (!bridge) return { ok: false, error: "Laptop credential checks are unavailable in this app." };
-  try {
-    return await bridge();
-  } catch (error) {
-    console.warn("[nativeBridge] electron checkDbcert failed:", error);
-    return { ok: false, error: "Couldn't check your laptop's dbcert. Try again." };
-  }
-}
-
-/** Renew the laptop's dbcert through the desktop shell. */
-export async function refreshDbcert(options?: DbcertRefreshOptions): Promise<DbcertRefreshResult> {
-  const bridge = electronApi()?.refreshDbcert;
-  if (!bridge) return { ok: false, error: "dbcert refresh is unavailable in this app." };
-  try {
-    return await (options ? bridge(options) : bridge());
-  } catch (error) {
-    console.warn("[nativeBridge] electron refreshDbcert failed:", error);
-    return { ok: false, error: "Could not run dbcert from this app." };
   }
 }
 

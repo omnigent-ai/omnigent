@@ -5350,7 +5350,6 @@ function registerIpc() {
     const enabled = canExtendArca(event);
     return {
       databricksInternalFeatures: enabled,
-      canRefreshDbcert: enabled,
       arcaPreviewRecovery: true,
       // Importing local Chrome cookies is wired for macOS only (Keychain-decrypted
       // v10 values); the SPA hides the toolbar button everywhere else.
@@ -5441,67 +5440,6 @@ function registerIpc() {
           };
     }
     return arcaConnectFlow.run(win, arcaServerUrl);
-  });
-
-  // SPA → renew this machine's dbcert from the expired-dbcert banner. Same
-  // trusted-server gates. Clicks from several windows share one sign-in.
-  let dbcertPreflight = null;
-  let dbcertGeneration = 0;
-  let dbcertRefresh = null;
-  ipcMain.handle("omnigent:dbcert-refresh", async (event, options) => {
-    if (!isPinnedOriginSender(event)) {
-      throw new Error("dbcert-refresh is only available to a connected server page");
-    }
-    if (!canExtendArca(event)) {
-      return { ok: false, error: "dbcert refresh is not enabled for this server." };
-    }
-    if (!dbcertRefresh) {
-      const refresh = {
-        renewal: arca.runDbcertRefresh({ skipArcaSync: true }).then((result) => {
-          if (result.ok) {
-            dbcertGeneration += 1;
-            dbcertPreflight = null;
-          }
-          return result;
-        }),
-        sync: null,
-      };
-      refresh.renewal = refresh.renewal.finally(() => {
-        if (!refresh.sync && dbcertRefresh === refresh) dbcertRefresh = null;
-      });
-      dbcertRefresh = refresh;
-    }
-    const refresh = dbcertRefresh;
-    if (options?.skipArcaSync === true) return refresh.renewal;
-    refresh.sync ??= refresh.renewal
-      .then((result) => (result.ok ? arca.runDbcertArcaSync() : result))
-      .finally(() => {
-        if (dbcertRefresh === refresh) dbcertRefresh = null;
-      });
-    return refresh.sync;
-  });
-
-  const checkCurrentDbcert = () => {
-    if (!dbcertPreflight) {
-      const generation = dbcertGeneration;
-      const pending = arca
-        .checkDbcert()
-        .then((result) => (generation === dbcertGeneration ? result : checkCurrentDbcert()))
-        .finally(() => {
-          if (dbcertPreflight === pending) dbcertPreflight = null;
-        });
-      dbcertPreflight = pending;
-    }
-    return dbcertPreflight;
-  };
-  ipcMain.handle("omnigent:dbcert-check", async (event) => {
-    if (!isPinnedOriginSender(event)) {
-      throw new Error("dbcert-check is only available to a connected server page");
-    }
-    if (!canExtendArca(event)) {
-      return { ok: false, error: "dbcert checks are not enabled for this server." };
-    }
-    return checkCurrentDbcert();
   });
 
   // Push a status ping when a host child connects or exits on its own (no
