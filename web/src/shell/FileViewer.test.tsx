@@ -1285,11 +1285,16 @@ describe("FileViewer file sharing", () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
   });
 
-  it("opens file sharing from the toolbar while preserving copy link", () => {
+  it("opens file sharing from the toolbar while preserving copy link", async () => {
     const onShare = vi.fn();
     renderViewer({ open: true, onShare });
 
-    fireEvent.click(screen.getByRole("button", { name: "Share file" }));
+    const button = screen.getByRole("button", { name: "Share file" });
+    act(() => button.focus());
+    const tooltip = await screen.findByRole("tooltip");
+    expect(button).toHaveAttribute("aria-describedby", tooltip.id);
+    expect(tooltip).toHaveTextContent("Share file");
+    fireEvent.click(button);
 
     expect(onShare).toHaveBeenCalledOnce();
     expect(screen.getByRole("button", { name: "Copy link to file" })).toBeInTheDocument();

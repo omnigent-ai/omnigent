@@ -85,10 +85,11 @@ function sessionWith(overrides: Partial<Session>): Session {
 const userSearchMock = vi.mocked(host.getOmnigentUserSearch);
 const transformLinkMock = vi.mocked(host.getOmnigentTransformShareLink);
 
-function createWrapper() {
-  const qc = new QueryClient({
+function createWrapper(
+  qc = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  });
+  }),
+) {
   return function Wrapper({ children }: { children: React.ReactNode }) {
     return (
       <QueryClientProvider client={qc}>
@@ -1237,6 +1238,13 @@ describe("PermissionsModal", () => {
       "copies immediately and confirms after sharing workspace files (snapshot workspace: %s)",
       async (workspace) => {
         listMock.mockResolvedValue([]);
+        const queryClient = new QueryClient();
+        const cached = sessionWith({
+          workspace,
+          title: "Cached title",
+          shareWorkspaceFiles: false,
+        });
+        if (workspace) queryClient.setQueryData(["session", "conv_abc"], cached);
         useSessionMock.mockReturnValue({
           session: sessionWith({ workspace, shareWorkspaceFiles: false }),
           isLoading: false,
@@ -1258,7 +1266,7 @@ describe("PermissionsModal", () => {
             onOpenChange={() => {}}
           />,
           {
-            wrapper: createWrapper(),
+            wrapper: createWrapper(queryClient),
           },
         );
         fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
@@ -1268,8 +1276,18 @@ describe("PermissionsModal", () => {
           expect(updateSessionMock).toHaveBeenCalledWith("conv_abc", { shareWorkspaceFiles: true }),
         );
         expect(screen.queryByRole("button", { name: "Copied!" })).toBeNull();
-        enableFiles(sessionWith({ workspace, shareWorkspaceFiles: true }));
+        enableFiles(
+          sessionWith({ workspace, title: "Stale response title", shareWorkspaceFiles: true }),
+        );
         expect(await screen.findByRole("button", { name: "Copied!" })).toBeInTheDocument();
+        if (workspace) {
+          expect(queryClient.getQueryData(["session", "conv_abc"])).toEqual({
+            ...cached,
+            shareWorkspaceFiles: true,
+          });
+        } else {
+          expect(queryClient.getQueryData(["session", "conv_abc"])).toBeUndefined();
+        }
       },
     );
 

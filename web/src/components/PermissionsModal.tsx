@@ -52,6 +52,7 @@ import { getOmnigentUserSearch } from "@/lib/host";
 import { getSessionSharePath, getShareableSessionLink } from "@/lib/shareLink";
 import { workspaceSharingBlocked } from "@/lib/permissionsApi";
 import { useRebasePath } from "@/lib/routing";
+import type { Session } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const PUBLIC_USER = "__public__";
@@ -117,7 +118,9 @@ export function PermissionsModal({
   const shareWorkspace = useMutation({
     mutationFn: (next: boolean) => updateSession(sessionId, { shareWorkspaceFiles: next }),
     onSuccess: (updated) => {
-      queryClient.setQueryData(["session", sessionId], updated);
+      queryClient.setQueryData<Session>(["session", sessionId], (previous) =>
+        previous ? { ...previous, shareWorkspaceFiles: updated.shareWorkspaceFiles } : previous,
+      );
       void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
     },
     onError: (err: Error) => setError(err.message),

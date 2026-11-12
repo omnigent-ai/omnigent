@@ -1515,6 +1515,23 @@ function FileViewerBody({
     ].join("|"),
   );
 
+  const renderActionButton = (action: ToolbarAction, interactive: boolean) => {
+    const button = (
+      <Button
+        type="button"
+        variant={action.active ? "default" : "ghost"}
+        size="icon-sm"
+        aria-label={action.disabledLabel ?? action.label}
+        disabled={action.disabled}
+        tabIndex={interactive ? undefined : -1}
+        onClick={interactive ? action.onSelect : undefined}
+      >
+        {action.icon}
+      </Button>
+    );
+    return action.disabled ? <span className="inline-flex">{button}</span> : button;
+  };
+
   // The expanded inline row — rendered both offscreen (for measurement) and,
   // when it fits, as the visible toolbar. `interactive` is false for the
   // measurement clone so it stays out of the tab order / a11y tree.
@@ -1610,21 +1627,7 @@ function FileViewerBody({
       ) : (
         <TooltipProvider key={action.key}>
           <Tooltip>
-            <TooltipTrigger asChild>
-              <span className="inline-flex">
-                <Button
-                  type="button"
-                  variant={action.active ? "default" : "ghost"}
-                  size="icon-sm"
-                  aria-label={action.disabledLabel ?? action.label}
-                  disabled={action.disabled}
-                  tabIndex={interactive ? undefined : -1}
-                  onClick={interactive ? action.onSelect : undefined}
-                >
-                  {action.icon}
-                </Button>
-              </span>
-            </TooltipTrigger>
+            <TooltipTrigger asChild>{renderActionButton(action, interactive)}</TooltipTrigger>
             <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
           </Tooltip>
         </TooltipProvider>
