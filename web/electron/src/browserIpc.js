@@ -13,7 +13,7 @@ const chromeCookieStoreModule = require("./chromeCookieStore.ts");
 const { decodeLegacyBrowserAction } = require("./browserLegacyAction.ts");
 const { buildDesignModeScript } = require("./designModeScript.ts");
 
-const { SESSION_HOST_PROTOCOL } = require("./hostIdentity");
+const { SESSION_HOST_PROTOCOL } = require("./hostIdentity.ts");
 
 // Max age of a real native input event for a design-mode submit marker to be
 // honored (see the gesture gate below). Covers click/Enter → console.log.

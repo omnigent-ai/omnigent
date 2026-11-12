@@ -283,7 +283,7 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   desktop app per `web/electron/README.md` ("OIDC sign-in through the system
   browser", Manual verification) against an OIDC server. The verification
   instance is header mode, so it can't show this. Component tests:
-  `web/electron/test/oidc-auth.test.js`, `oidc-credentials.test.js`, and the
+  `web/electron/test/oidc-auth.test.ts`, `oidc-credentials.test.ts`, and the
   "OIDC system-browser sign-in wiring" suite in `main.test.js`; server flow:
   `tests/server/integration/test_oidc_native_login.py`.
 - **`ios-oidc-browser-sign-in` (iOS app, own environment):** drive the iOS app

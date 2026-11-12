@@ -2,28 +2,168 @@
 // cookie, and turn the SPA's /auth/login and /auth/logout into a silent renewal
 // or a sign-out so the identity provider never loads inside the app.
 
-"use strict";
-
-const { diagnostics } = require("./diagnostics.ts");
-
-const { serverEndpoint } = require("./oidc-credentials");
+import { diagnostics } from "./diagnostics.ts";
+import { serverEndpoint, type MintedSession, type OidcCredentials } from "./oidc-credentials.ts";
 
 // The SPA asking to sign in again this soon after a renewal means the server
 // rejected the renewed session: stop instead of renewing in a loop.
-const REJECTED_RENEWAL_WINDOW_MS = 15_000;
+export const REJECTED_RENEWAL_WINDOW_MS = 15_000;
 const VERIFY_TIMEOUT_MS = 10_000;
 // A background renewal that couldn't reach the server tries again after this.
 const RETRY_DELAY_MS = 30_000;
 
+/** A cookie as the session's cookie jar reports it. */
+export interface SessionCookie {
+  name: string;
+  value: string;
+  domain?: string | undefined;
+  expirationDate?: number | undefined;
+}
+
+/** A `session.cookies.set` payload for the session cookie. */
+export interface SessionCookieDetails {
+  url: string;
+  name: string;
+  value: string;
+  httpOnly: boolean;
+  secure: boolean;
+  sameSite: "lax";
+  path: string;
+  expirationDate?: number;
+}
+
+type CookieChangedListener = (
+  event: unknown,
+  cookie: SessionCookie,
+  cause: string,
+  removed: boolean,
+) => void;
+
+/** The part of Electron's `session.cookies` this module drives. */
+export interface OidcCookieJar {
+  get: (filter: { url: string; name: string }) => Promise<SessionCookie[]>;
+  set: (details: SessionCookieDetails) => Promise<void>;
+  remove: (url: string, name: string) => Promise<void>;
+  on: (event: "changed", listener: CookieChangedListener) => unknown;
+  removeListener: (event: "changed", listener: CookieChangedListener) => unknown;
+}
+
+export interface OidcSession {
+  cookies: OidcCookieJar;
+}
+
+/** A navigation event; only `preventDefault` is used. */
+export interface NavigationEvent {
+  preventDefault: () => void;
+}
+
+type NavigateListener = (event: unknown, url: string) => void;
+type NavigateInPageListener = (event: unknown, url: string, isMainFrame: boolean) => void;
+type WillNavigateListener = (event: NavigationEvent, url: string) => void;
+type WillRedirectListener = (
+  event: NavigationEvent,
+  url: string,
+  isInPlace: boolean,
+  isMainFrame: boolean,
+) => void;
+
+/** The navigation events of a window's webContents this module observes. */
+export interface OidcWebContents {
+  on: ((event: "did-navigate", listener: NavigateListener) => unknown) &
+    ((event: "did-navigate-in-page", listener: NavigateInPageListener) => unknown) &
+    ((event: "will-navigate", listener: WillNavigateListener) => unknown) &
+    ((event: "will-redirect", listener: WillRedirectListener) => unknown);
+  removeListener: ((event: "did-navigate", listener: NavigateListener) => unknown) &
+    ((event: "did-navigate-in-page", listener: NavigateInPageListener) => unknown) &
+    ((event: "will-navigate", listener: WillNavigateListener) => unknown) &
+    ((event: "will-redirect", listener: WillRedirectListener) => unknown);
+}
+
+export interface OidcWindow {
+  webContents: OidcWebContents;
+  isDestroyed: () => boolean;
+  loadURL: (url: string) => Promise<unknown>;
+}
+
+/** A timer handle from the real or an injected `setTimeout`. */
+export type RenewalTimer = ReturnType<typeof setTimeout> | number;
+
+/** The answer to the `/v1/me` session check; only the status is read. */
+export interface SessionCheckResponse {
+  status: number;
+}
+
+export interface OidcAuthOptions<W extends OidcWindow> {
+  session: OidcSession;
+  credentials: Pick<OidcCredentials, "signInWithBrowser" | "refreshSession" | "signOut">;
+  getOrigin: (win: W) => string | null;
+  onAuthRequired: (win: W, serverUrl: string, error: unknown) => void;
+  onSignedOut: (win: W, serverUrl: string, details: { complete: boolean }) => void;
+  fetchFn?: (url: string, init: RequestInit) => Promise<SessionCheckResponse>;
+  now?: () => number;
+  setTimeoutFn?: (callback: () => void, delay: number) => RenewalTimer;
+  clearTimeoutFn?: (timer: RenewalTimer | undefined) => void;
+}
+
+export interface EnsureSessionOptions {
+  interactive?: boolean;
+  signal?: AbortSignal | undefined;
+  onBrowserSignIn?: () => void;
+}
+
+export interface OidcConnection {
+  serverUrl: string;
+  cookieName: string;
+  loadUrl?: string;
+}
+
+export interface OidcAuth<W extends OidcWindow> {
+  ensureSession: (
+    serverUrl: string,
+    cookieName: string,
+    options?: EnsureSessionOptions,
+  ) => Promise<"existing" | "renewed" | "signed-in">;
+  attach: (win: W, connection: OidcConnection) => void;
+  detach: (win: W) => void;
+  signOutWindow: (win: W) => Promise<boolean>;
+  isAttached: (win: W) => boolean;
+  dispose: () => void;
+}
+
+/** One attached window's session state. */
+interface Connection<W extends OidcWindow> {
+  win: W;
+  webContents: OidcWebContents;
+  serverUrl: string;
+  origin: string;
+  cookieName: string;
+  returnUrl: string;
+  timer: RenewalTimer | undefined;
+  pending: Promise<void> | null;
+  scheduleGeneration: number;
+  lastRecoveredAt: number;
+  reloadRequested: boolean;
+  onNavigate: NavigateListener;
+  onNavigateInPage: NavigateInPageListener;
+  onWillNavigate: WillNavigateListener;
+  onWillRedirect: WillRedirectListener;
+}
+
+/** The fields of a rejection this module reads; rejections are untrusted. */
+interface FailureFields {
+  name?: unknown;
+  code?: unknown;
+}
+
+function unrefTimer(timer: RenewalTimer | undefined) {
+  if (typeof timer === "object") timer.unref();
+}
+
 /**
  * Which shell-handled auth route a main-frame URL is, if any: the server's
  * `/auth/login` or `/auth/logout` under its mount.
- *
- * @param {string} rawUrl
- * @param {string} serverUrl
- * @returns {"login" | "logout" | null}
  */
-function oidcAuthRoute(rawUrl, serverUrl) {
+export function oidcAuthRoute(rawUrl: string, serverUrl: string): "login" | "logout" | null {
   let url;
   let base;
   try {
@@ -39,50 +179,35 @@ function oidcAuthRoute(rawUrl, serverUrl) {
   return null;
 }
 
-function cookieMatches(cookie, origin, name) {
+function cookieMatches(cookie: SessionCookie, origin: string, name: string): boolean {
   const host = new URL(origin).hostname;
   return cookie.name === name && (cookie.domain ?? "").replace(/^\./, "") === host;
 }
 
-/**
- * @param {{
- *   session: Electron.Session,
- *   credentials: {
- *     signInWithBrowser: (serverUrl: string, options: { signal?: AbortSignal }) =>
- *       Promise<{ token: string, expiresIn: number | null }>,
- *     refreshSession: (serverUrl: string) =>
- *       Promise<{ token: string, expiresIn: number | null }>,
- *     signOut: (serverUrl: string) => Promise<void>,
- *   },
- *   getOrigin: (win: Electron.BrowserWindow) => string | null,
- *   onAuthRequired: (win: Electron.BrowserWindow, serverUrl: string, error: Error) => void,
- *   onSignedOut: (win: Electron.BrowserWindow, serverUrl: string) => void,
- *   fetchFn?: typeof fetch,
- *   now?: () => number,
- *   setTimeoutFn?: typeof setTimeout,
- *   clearTimeoutFn?: typeof clearTimeout,
- * }} options
- */
-function createOidcAuth({
+export function createOidcAuth<W extends OidcWindow>({
   session,
   credentials,
   getOrigin,
   onAuthRequired,
   onSignedOut,
-  fetchFn = (...args) => fetch(...args),
+  fetchFn = (url, init) => fetch(url, init),
   now = Date.now,
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
-}) {
-  const connections = new Map();
-  const renewals = new Map();
+}: OidcAuthOptions<W>): OidcAuth<W> {
+  const connections = new Map<W, Connection<W>>();
+  const renewals = new Map<string, Promise<void>>();
   // Bumped per origin on sign-out, so a renewal already in flight can't
   // reinstall a session the user just signed out of.
-  const signOutGenerations = new Map();
+  const signOutGenerations = new Map<string, number>();
 
-  async function installSession(serverUrl, cookieName, { token, expiresIn }) {
+  async function installSession(
+    serverUrl: string,
+    cookieName: string,
+    { token, expiresIn }: MintedSession,
+  ): Promise<void> {
     const origin = new URL(serverUrl).origin;
-    const details = {
+    const details: SessionCookieDetails = {
       url: origin,
       name: cookieName,
       value: token,
@@ -104,7 +229,12 @@ function createOidcAuth({
   }
 
   /** Whether the server accepts `token` as its session cookie (GET /v1/me → 200). */
-  async function tokenAccepted(serverUrl, cookieName, token, signal) {
+  async function tokenAccepted(
+    serverUrl: string,
+    cookieName: string,
+    token: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     const timeout = AbortSignal.timeout(VERIFY_TIMEOUT_MS);
     let response;
     try {
@@ -129,14 +259,14 @@ function createOidcAuth({
     });
   }
 
-  async function storedToken(serverUrl, cookieName) {
+  async function storedToken(serverUrl: string, cookieName: string): Promise<string | null> {
     const origin = new URL(serverUrl).origin;
     const cookies = await session.cookies.get({ url: origin, name: cookieName });
     return cookies.find((cookie) => cookieMatches(cookie, origin, cookieName))?.value ?? null;
   }
 
   /** Mint from the refresh grant (one request per origin) and install it. */
-  function renewSession(serverUrl, cookieName) {
+  function renewSession(serverUrl: string, cookieName: string): Promise<void> {
     const origin = new URL(serverUrl).origin;
     const existing = renewals.get(origin);
     if (existing) return existing;
@@ -167,13 +297,18 @@ function createOidcAuth({
    * accepts the renewed cookie, else the error explaining why not. Cancellation
    * and an unreachable server are thrown: neither is a reason to sign in again.
    */
-  async function renewForConnect(serverUrl, cookieName, signal) {
+  async function renewForConnect(
+    serverUrl: string,
+    cookieName: string,
+    signal: AbortSignal | undefined,
+  ): Promise<Error | null> {
     try {
       await renewSession(serverUrl, cookieName);
       signal?.throwIfAborted();
       return null;
     } catch (error) {
-      if (error?.name === "AbortError" || signal?.aborted || error?.code === "network") {
+      const failure = error as FailureFields | null | undefined;
+      if (failure?.name === "AbortError" || signal?.aborted || failure?.code === "network") {
         throw error;
       }
       return error instanceof Error ? error : new Error(String(error));
@@ -186,17 +321,12 @@ function createOidcAuth({
    * A valid cookie is kept; otherwise the stored refresh grant renews it. Only
    * an `interactive` call (the user chose Connect) goes on to sign in through
    * the system browser; restores and renewals throw instead.
-   *
-   * @param {string} serverUrl
-   * @param {string} cookieName
-   * @param {{ interactive?: boolean, signal?: AbortSignal, onBrowserSignIn?: () => void }} [options]
-   * @returns {Promise<"existing" | "renewed" | "signed-in">}
    */
   async function ensureSession(
-    serverUrl,
-    cookieName,
-    { interactive = false, signal, onBrowserSignIn } = {},
-  ) {
+    serverUrl: string,
+    cookieName: string,
+    { interactive = false, signal, onBrowserSignIn }: EnsureSessionOptions = {},
+  ): Promise<"existing" | "renewed" | "signed-in"> {
     const existing = await storedToken(serverUrl, cookieName);
     signal?.throwIfAborted();
     if (existing && (await tokenAccepted(serverUrl, cookieName, existing, signal))) {
@@ -226,7 +356,7 @@ function createOidcAuth({
     return "signed-in";
   }
 
-  function current(ctx) {
+  function current(ctx: Connection<W>): boolean {
     return (
       connections.get(ctx.win) === ctx &&
       !ctx.win.isDestroyed() &&
@@ -234,7 +364,7 @@ function createOidcAuth({
     );
   }
 
-  function detach(win) {
+  function detach(win: W) {
     const ctx = connections.get(win);
     if (!ctx) return;
     connections.delete(win);
@@ -245,20 +375,20 @@ function createOidcAuth({
     ctx.webContents.removeListener("will-redirect", ctx.onWillRedirect);
   }
 
-  function fail(ctx, error) {
+  function fail(ctx: Connection<W>, error: unknown) {
     if (!current(ctx)) return;
     detach(ctx.win);
     onAuthRequired(ctx.win, ctx.serverUrl, error);
   }
 
-  async function schedule(ctx) {
+  async function schedule(ctx: Connection<W>): Promise<void> {
     const generation = ++ctx.scheduleGeneration;
     clearTimeoutFn(ctx.timer);
     const cookies = await session.cookies.get({ url: ctx.origin, name: ctx.cookieName });
     if (!current(ctx) || generation !== ctx.scheduleGeneration) return;
     const expiries = cookies
       .filter((cookie) => cookieMatches(cookie, ctx.origin, ctx.cookieName))
-      .map((cookie) => cookie.expirationDate * 1000)
+      .map((cookie) => (cookie.expirationDate ?? Number.NaN) * 1000)
       .filter(Number.isFinite);
     // No local expiry (or no cookie yet): the SPA's own sign-in redirect recovers.
     if (!expiries.length) return;
@@ -268,7 +398,7 @@ function createOidcAuth({
       Math.min(2_147_483_647, remaining - Math.min(60_000, remaining / 5)),
     );
     ctx.timer = setTimeoutFn(() => void renew(ctx, { reason: "cookie expiry" }), delay);
-    ctx.timer?.unref?.();
+    unrefTimer(ctx.timer);
   }
 
   /**
@@ -278,7 +408,10 @@ function createOidcAuth({
    * screen. Background renewals (timer, cookie removal) never do either: the
    * current cookie may still be valid, and an unreachable server is retried.
    */
-  function renew(ctx, { reload = false, reason = "renewal" } = {}) {
+  function renew(
+    ctx: Connection<W>,
+    { reload = false, reason = "renewal" }: { reload?: boolean; reason?: string } = {},
+  ): Promise<void> {
     if (!current(ctx)) return Promise.resolve();
     if (reload) ctx.reloadRequested = true;
     if (ctx.pending) return ctx.pending;
@@ -302,15 +435,16 @@ function createOidcAuth({
           // did-fail-load path to report, not a sign-in problem.
           console.warn("[omnigent] oidc auth: recovery reload did not land", {
             origin: ctx.origin,
-            code: error.code,
+            code: (error as FailureFields).code,
           });
         }
       })
-      .catch((error) => {
+      .catch((error: unknown) => {
+        const failure = error as FailureFields | null | undefined;
         diagnostics.record("oidc_renewal", {
           origin: ctx.origin,
           outcome: "failed",
-          code: error?.code,
+          code: failure?.code,
         });
         if (ctx.reloadRequested) {
           fail(ctx, error);
@@ -318,11 +452,11 @@ function createOidcAuth({
         }
         console.warn("[omnigent] oidc auth: background renewal failed", {
           origin: ctx.origin,
-          code: error.code,
+          code: (failure as FailureFields).code,
         });
-        if (error.code === "network" && current(ctx)) {
+        if ((failure as FailureFields).code === "network" && current(ctx)) {
           ctx.timer = setTimeoutFn(() => void renew(ctx, { reason: "retry" }), RETRY_DELAY_MS);
-          ctx.timer?.unref?.();
+          unrefTimer(ctx.timer);
         }
       })
       .finally(() => {
@@ -337,7 +471,7 @@ function createOidcAuth({
     return ctx.pending;
   }
 
-  function recover(ctx) {
+  function recover(ctx: Connection<W>) {
     if (!current(ctx)) return;
     if (!ctx.pending && now() - ctx.lastRecoveredAt < REJECTED_RENEWAL_WINDOW_MS) {
       fail(
@@ -352,7 +486,7 @@ function createOidcAuth({
     void renew(ctx, { reload: true, reason: "sign-in requested" });
   }
 
-  async function signOut(ctx) {
+  async function signOut(ctx: Connection<W>): Promise<boolean> {
     const { serverUrl, origin, cookieName } = ctx;
     // Detach every window on this server first, so removing the shared cookie
     // reads as a sign-out rather than an expiry to renew.
@@ -372,7 +506,7 @@ function createOidcAuth({
       complete = false;
       console.warn("[omnigent] oidc auth: could not forget the grant", {
         origin,
-        code: error?.code,
+        code: (error as FailureFields | null | undefined)?.code,
       });
     }
     try {
@@ -381,7 +515,7 @@ function createOidcAuth({
       complete = false;
       console.warn("[omnigent] oidc auth: could not clear the session cookie", {
         origin,
-        code: error?.code,
+        code: (error as FailureFields | null | undefined)?.code,
       });
     }
     for (const c of signedOut)
@@ -392,27 +526,32 @@ function createOidcAuth({
 
   /**
    * Own the session lifecycle of a window that just loaded an OIDC server.
-   *
-   * @param {Electron.BrowserWindow} win
-   * @param {{ serverUrl: string, cookieName: string, loadUrl?: string }} connection
    */
-  function attach(win, { serverUrl, cookieName, loadUrl = serverUrl }) {
+  function attach(win: W, { serverUrl, cookieName, loadUrl = serverUrl }: OidcConnection) {
     detach(win);
     const origin = new URL(serverUrl).origin;
-    const ctx = {
+    const ctx: Connection<W> = {
       win,
       webContents: win.webContents,
       serverUrl,
       origin,
       cookieName,
       returnUrl: loadUrl,
-      timer: null,
+      timer: undefined,
       pending: null,
       scheduleGeneration: 0,
       lastRecoveredAt: -Infinity,
       reloadRequested: false,
+      onNavigate: (_event, url) => remember(url),
+      onNavigateInPage: (_event, url, isMainFrame) => {
+        if (isMainFrame) remember(url);
+      },
+      onWillNavigate: (event, url) => intercept(event, url),
+      onWillRedirect: (event, url, _isInPlace, isMainFrame) => {
+        if (isMainFrame !== false) intercept(event, url);
+      },
     };
-    const remember = (url) => {
+    const remember = (url: string) => {
       if (!current(ctx)) return;
       try {
         if (new URL(url).origin !== origin) return;
@@ -421,7 +560,7 @@ function createOidcAuth({
       }
       if (!oidcAuthRoute(url, serverUrl)) ctx.returnUrl = url;
     };
-    const intercept = (event, url) => {
+    const intercept = (event: NavigationEvent, url: string) => {
       if (!current(ctx)) return;
       const route = oidcAuthRoute(url, serverUrl);
       if (!route) return;
@@ -429,14 +568,6 @@ function createOidcAuth({
       event.preventDefault();
       if (route === "logout") void signOut(ctx);
       else recover(ctx);
-    };
-    ctx.onNavigate = (_event, url) => remember(url);
-    ctx.onNavigateInPage = (_event, url, isMainFrame) => {
-      if (isMainFrame) remember(url);
-    };
-    ctx.onWillNavigate = (event, url) => intercept(event, url);
-    ctx.onWillRedirect = (event, url, _isInPlace, isMainFrame) => {
-      if (isMainFrame !== false) intercept(event, url);
     };
     connections.set(win, ctx);
     win.webContents.on("did-navigate", ctx.onNavigate);
@@ -446,7 +577,7 @@ function createOidcAuth({
     void schedule(ctx);
   }
 
-  const onCookieChanged = (_event, cookie, cause, removed) => {
+  const onCookieChanged: CookieChangedListener = (_event, cookie, cause, removed) => {
     for (const ctx of connections.values()) {
       if (!current(ctx) || ctx.pending || !cookieMatches(cookie, ctx.origin, ctx.cookieName))
         continue;
@@ -462,10 +593,10 @@ function createOidcAuth({
    * Sign the window's server out, as the web app's own sign-out does: every
    * window on it returns to the connect screen.
    *
-   * @returns {Promise<boolean>} false when the window has no OIDC session
-   *   here, or the saved sign-in couldn't be fully cleared.
+   * Resolves false when the window has no OIDC session here, or the saved
+   * sign-in couldn't be fully cleared.
    */
-  async function signOutWindow(win) {
+  async function signOutWindow(win: W): Promise<boolean> {
     const ctx = connections.get(win);
     if (!ctx || !current(ctx)) return false;
     return signOut(ctx);
@@ -476,12 +607,10 @@ function createOidcAuth({
     attach,
     detach,
     signOutWindow,
-    isAttached: (win) => connections.has(win),
+    isAttached: (win: W) => connections.has(win),
     dispose() {
       for (const win of [...connections.keys()]) detach(win);
       session.cookies.removeListener("changed", onCookieChanged);
     },
   };
 }
-
-module.exports = { oidcAuthRoute, createOidcAuth, REJECTED_RENEWAL_WINDOW_MS };

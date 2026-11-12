@@ -27,7 +27,7 @@
  */
 export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 
-// Mirrors SESSION_HOST_PROTOCOL in electron/src/hostIdentity.js.
+// Mirrors SESSION_HOST_PROTOCOL in electron/src/hostIdentity.ts.
 export const SESSION_HOST_PROTOCOL = 1;
 
 export interface BrowserHostOptions {

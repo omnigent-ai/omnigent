@@ -388,9 +388,9 @@ electron/
   src/browserViewBounds.ts    # CSS-px → window-DIP bounds conversion (browser pane)
   src/browserIpc.js           # omnigent:browser-* IPC handlers (extracted from main.js)
   src/chromeCookieStore.ts    # per-site Chrome cookie import for the browser pane
-  src/loopback-oauth.js       # RFC 8252 loopback listener shared by browser sign-ins
-  src/oidc-credentials.js     # OIDC loopback sign-in, refresh, and revoke
-  src/oidc-auth.js            # OIDC window session lifecycle (cookie, renewal, sign-out)
+  src/loopback-oauth.ts       # RFC 8252 loopback listener shared by browser sign-ins
+  src/oidc-credentials.ts     # OIDC loopback sign-in, refresh, and revoke
+  src/oidc-auth.ts            # OIDC window session lifecycle (cookie, renewal, sign-out)
   src/url.ts               # URL rules shared by main, the setup page and the web selector
   src/setupPageUrl.ts      # setup page entry publishing window.omnigentUrl
   setup/index.html         # the bundled "connect to server" setup page

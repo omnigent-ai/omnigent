@@ -1,9 +1,7 @@
-"use strict";
-
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
-const {
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import {
   DATABRICKS_BROWSER_AUTH_KEY,
   readDatabricksAuthMode,
   usesDatabricksBrowserAuth,
@@ -12,7 +10,12 @@ const {
   IP_ACL_BLOCKED,
   SESSION_TRANSPORT,
   createDatabricksAuth,
-} = require("../src/databricks-auth");
+  type BeforeRequestListener,
+  type DatabricksAuthDeps,
+  type DatabricksAuthMode,
+  type RenewalTimer,
+  type WorkspaceCookie,
+} from "../src/databricks-auth.ts";
 
 const ORIGIN = "https://workspace.cloud.databricks.com";
 const TARGET = `${ORIGIN}/omnigent/c/chat`;
@@ -30,27 +33,51 @@ const drain = () =>
     setImmediate(resolve);
   });
 
-function harness({ mode = "browser", ensureSession, loadRejection } = {}) {
-  const timers = new Map();
-  const calls = { renew: [], load: [], errors: [] };
-  let jar = [cookie()];
-  let guard;
+interface FakeWindow {
+  webContents: EventEmitter & { id: number };
+  isDestroyed: () => boolean;
+  loadURL: (url: string) => Promise<void>;
+}
+
+type EnsureSessionArgs = Parameters<DatabricksAuthDeps<FakeWindow>["ensureSession"]>;
+
+interface HarnessOptions {
+  mode?: DatabricksAuthMode;
+  ensureSession?: (...args: EnsureSessionArgs) => Promise<unknown>;
+  loadRejection?: Error;
+}
+
+/** A rejection, with the fields the module and its callers attach. */
+interface AuthError extends Error {
+  errorCode?: string;
+}
+
+function harness({ mode = "browser", ensureSession, loadRejection }: HarnessOptions = {}) {
+  const timers = new Map<RenewalTimer | undefined, { fn: () => void; delay: number }>();
+  const calls = {
+    renew: [] as EnsureSessionArgs[],
+    load: [] as { win: FakeWindow; url: string }[],
+    errors: [] as { win: FakeWindow; url: string; error: unknown }[],
+  };
+  let jar: WorkspaceCookie[] = [cookie()];
+  let guard: BeforeRequestListener | null = null;
   const cookies = Object.assign(new EventEmitter(), { get: async () => jar });
   const session = {
     cookies,
     webRequest: {
-      onBeforeRequest: (fn) => {
+      onBeforeRequest: (fn: BeforeRequestListener | null) => {
         guard = fn;
       },
     },
   };
-  const windows = new Map();
-  const auth = createDatabricksAuth({
+  const windows = new Map<FakeWindow, string | null>();
+  let nextTimer = 0;
+  const auth = createDatabricksAuth<FakeWindow>({
     session,
     getWindow: (id) =>
       [...windows.keys()].find((win) => !win.isDestroyed() && win.webContents.id === id),
     getOrigin: (win) =>
-      usesDatabricksBrowserAuth(windows.get(win), mode) ? windows.get(win) : null,
+      usesDatabricksBrowserAuth(windows.get(win), mode) ? (windows.get(win) ?? null) : null,
     isSetupUrl: (url) => url === "file:///setup/index.html",
     onAuthRequired: (win, url, error) => calls.errors.push({ win, url, error }),
     ensureSession: async (...args) => {
@@ -61,7 +88,7 @@ function harness({ mode = "browser", ensureSession, loadRejection } = {}) {
     },
     now: () => NOW,
     setTimeoutFn: (fn, delay) => {
-      const id = {};
+      const id = ++nextTimer;
       timers.set(id, { fn, delay });
       return id;
     },
@@ -70,7 +97,7 @@ function harness({ mode = "browser", ensureSession, loadRejection } = {}) {
   let nextId = 0;
   function window() {
     const wc = Object.assign(new EventEmitter(), { id: ++nextId });
-    const win = {
+    const win: FakeWindow = {
       webContents: wc,
       isDestroyed: () => false,
       loadURL: async (url) => {
@@ -81,9 +108,9 @@ function harness({ mode = "browser", ensureSession, loadRejection } = {}) {
     windows.set(win, ORIGIN);
     return win;
   }
-  function request(win, url, resourceType = "mainFrame") {
-    let result;
-    guard({ webContentsId: win.webContents.id, url, resourceType }, (value) => {
+  function request(win: FakeWindow, url: string, resourceType = "mainFrame") {
+    let result: { cancel?: boolean } | undefined;
+    guard?.({ webContentsId: win.webContents.id, url, resourceType }, (value) => {
       result = value;
     });
     return result;
@@ -100,7 +127,7 @@ function harness({ mode = "browser", ensureSession, loadRejection } = {}) {
       jar = [];
       cookies.emit("changed", {}, cookie(), cause, true);
     },
-    setCookie(value) {
+    setCookie(value: WorkspaceCookie) {
       jar = [value];
       cookies.emit("changed", {}, value, "explicit", false);
     },
@@ -109,7 +136,7 @@ function harness({ mode = "browser", ensureSession, loadRejection } = {}) {
 
 describe("Databricks authentication mode", () => {
   it("registers a true default without overriding an explicit false preference", () => {
-    const calls = [];
+    const calls: unknown[] = [];
     assert.equal(
       readDatabricksAuthMode({
         platform: "darwin",
@@ -128,7 +155,7 @@ describe("Databricks authentication mode", () => {
   });
   it("defaults to browser mode when the preference is absent or true", () => {
     for (const value of [undefined, true]) {
-      let registered;
+      let registered: Record<string, boolean> = {};
       assert.equal(
         readDatabricksAuthMode({
           platform: "darwin",
@@ -202,11 +229,12 @@ describe("Databricks browser session lifecycle", () => {
     await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
     assert.equal(h.calls.renew.length, 0);
     const scheduled = [...h.timers.values()][0];
+    assert.ok(scheduled);
     assert.equal(scheduled.delay, 3_540_000);
     scheduled.fn();
     await drain();
     assert.equal(h.calls.renew.length, 1);
-    assert.equal(h.calls.renew[0][2].interactive, false);
+    assert.equal(h.calls.renew[0]?.[2].interactive, false);
     assert.deepEqual(h.calls.load, []);
   });
   it("renews a removed cookie once for concurrent windows, without reloading them", async (t) => {
@@ -251,8 +279,9 @@ describe("Databricks browser session lifecycle", () => {
     await h.auth.attach(win, `${ORIGIN}/omnigent`);
     h.removeCookie();
     await drain();
+    const [failure] = h.calls.errors;
     assert.equal(h.calls.errors.length, 1);
-    assert.match(h.calls.errors[0].error.message, /no stored token/);
+    assert.match(String((failure?.error as Error | undefined)?.message), /no stored token/);
     assert.deepEqual(h.calls.load, []);
     assert.equal(h.timers.size, 0);
   });
@@ -307,7 +336,7 @@ describe("Databricks browser session lifecycle", () => {
         code: "ERR_CONNECTION_REFUSED",
       }),
     ],
-  ]) {
+  ] as const) {
     it(`keeps the renewed connection when the recovery reload is ${label}`, async (t) => {
       const h = harness({ loadRejection });
       t.after(() => h.auth.dispose());
@@ -338,7 +367,10 @@ describe("Databricks browser session lifecycle", () => {
     await drain();
     assert.equal(h.calls.renew.length, 1);
     assert.equal(h.calls.errors.length, 1);
-    assert.equal(h.calls.errors[0].error.errorCode, "SESSION_REJECTED");
+    assert.equal(
+      (h.calls.errors[0]?.error as AuthError | undefined)?.errorCode,
+      "SESSION_REJECTED",
+    );
   });
   it("does not use an arbitrary foreign navigation as an expiry signal", async (t) => {
     const h = harness();
@@ -364,7 +396,7 @@ describe("Databricks browser session lifecycle", () => {
     assert.equal(legacy.calls.renew.length, 0);
   });
   it("does not overwrite navigation completed while renewal was in flight", async (t) => {
-    let resolve;
+    let resolve: (value: unknown) => void = () => {};
     const h = harness({
       ensureSession: () =>
         new Promise((r) => {
@@ -388,14 +420,14 @@ describe("Databricks browser session lifecycle", () => {
     await h.auth.attach(win, `${ORIGIN}/omnigent`);
     const wc = win.webContents;
     win.isDestroyed = () => true;
-    win.webContents = null;
+    Object.assign(win, { webContents: null });
     h.auth.detach(win);
     assert.equal(h.timers.size, 0);
     assert.equal(wc.listenerCount("did-navigate"), 0);
   });
 
   it("disposes pending recovery on server switch without navigating the new server", async (t) => {
-    let resolve;
+    let resolve: (value: unknown) => void = () => {};
     const h = harness({
       ensureSession: () =>
         new Promise((r) => {
@@ -424,7 +456,7 @@ describe("transient renewal error classification", () => {
       cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:1"), { code: "ECONNREFUSED" }),
     });
     const timedOut = new DOMException("The operation was aborted due to timeout", "TimeoutError");
-    const failure = (message, props) => Object.assign(new Error(message), props);
+    const failure = (message: string, props: object) => Object.assign(new Error(message), props);
     for (const [error, transient] of [
       [refused, true],
       [timedOut, true],
@@ -446,8 +478,12 @@ describe("transient renewal error classification", () => {
       [new TypeError("Invalid URL"), false],
       ["net::ERR_FAILED", false],
       [null, false],
-    ]) {
-      assert.equal(isTransientRenewalError(error), transient, String(error?.message ?? error));
+    ] as [unknown, boolean][]) {
+      assert.equal(
+        isTransientRenewalError(error),
+        transient,
+        String((error as Error | null)?.message ?? error),
+      );
     }
   });
 });

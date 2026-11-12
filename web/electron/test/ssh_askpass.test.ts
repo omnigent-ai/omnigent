@@ -1,18 +1,21 @@
-"use strict";
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { execFile } = require("node:child_process");
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
-const { createAskpass } = require("../src/ssh_askpass");
+import { createAskpass, type AskpassRequest } from "../src/ssh_askpass.ts";
 
 /** Run the helper the way ssh does: SSH_ASKPASS with the prompt as its argument. */
-function askLikeSsh(env, prompt, extraEnv = {}) {
+function askLikeSsh(
+  env: Record<string, string>,
+  prompt: string,
+  extraEnv: Record<string, string> = {},
+): Promise<{ code: unknown; stdout: string }> {
   return new Promise((resolve) => {
     execFile(
-      env.SSH_ASKPASS,
+      String(env.SSH_ASKPASS),
       [prompt],
       { env: { ...process.env, ...env, ...extraEnv } },
       (error, stdout) => {
@@ -26,7 +29,7 @@ describe("createAskpass", () => {
   it("answers ssh's prompt from the app, and exits 1 when the user cancels", async (t) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "askpass-test-"));
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-    const seen = [];
+    const seen: AskpassRequest[] = [];
     // In tests the app binary is plain node, which ignores ELECTRON_RUN_AS_NODE.
     const askpass = await createAskpass({
       dir,
@@ -54,7 +57,7 @@ describe("createAskpass", () => {
       ],
     );
     assert.equal(askpass.env.SSH_ASKPASS_REQUIRE, "force");
-    assert.equal(fs.statSync(askpass.env.OMNIGENT_SSH_ASKPASS_SOCKET).mode & 0o077, 0);
+    assert.equal(fs.statSync(String(askpass.env.OMNIGENT_SSH_ASKPASS_SOCKET)).mode & 0o077, 0);
   });
 
   // Without the withdrawal the wait never ends, so the timeout makes it a failure.
@@ -64,8 +67,8 @@ describe("createAskpass", () => {
     async (t) => {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), "askpass-test-"));
       t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-      let prompted;
-      const asked = new Promise((resolve) => {
+      let prompted: (request: AskpassRequest) => void = () => {};
+      const asked = new Promise<AskpassRequest>((resolve) => {
         prompted = resolve;
       });
       const askpass = await createAskpass({
@@ -78,7 +81,7 @@ describe("createAskpass", () => {
         },
       });
       t.after(() => askpass.close());
-      const helper = execFile(askpass.env.SSH_ASKPASS, ["password: "], {
+      const helper = execFile(String(askpass.env.SSH_ASKPASS), ["password: "], {
         env: { ...process.env, ...askpass.env },
       });
 

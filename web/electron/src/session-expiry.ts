@@ -6,7 +6,7 @@
 // redirect and reloads the window so the gate can re-challenge.
 //
 // Databricks browser-auth connections are excluded by the caller. Their cookie
-// lifecycle and request guard live in databricks-auth.js, never embedded SSO.
+// lifecycle and request guard live in databricks-auth.ts, never embedded SSO.
 //
 // Kept Electron-free at its core (isLoginRedirect) so the matching logic is
 // unit-testable (test/session-expiry.test.ts) without booting the app.

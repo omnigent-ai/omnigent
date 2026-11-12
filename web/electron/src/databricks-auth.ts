@@ -1,15 +1,24 @@
 // Databricks browser-auth lifecycle. Embedded SSO never participates in this mode.
-"use strict";
 
-const { isDatabricksOAuthServerUrl } = require("./url.ts");
+import { isDatabricksOAuthServerUrl } from "./url.ts";
 
-const DATABRICKS_BROWSER_AUTH_KEY = "DatabricksBrowserAuthEnabled";
+export const DATABRICKS_BROWSER_AUTH_KEY = "DatabricksBrowserAuthEnabled";
 
-function readDatabricksAuthMode({
+/** `browser` signs in to workspaces in the system browser; `embedded` keeps in-app SSO. */
+export type DatabricksAuthMode = "browser" | "embedded";
+
+/** The macOS user-defaults reads behind the auth mode (Electron's `systemPreferences`). */
+export interface DatabricksAuthModeSource {
+  platform?: NodeJS.Platform;
+  registerDefaults?: ((defaults: Record<string, boolean>) => void) | undefined;
+  getUserDefault?: ((key: string, type: "boolean") => unknown) | undefined;
+}
+
+export function readDatabricksAuthMode({
   platform = process.platform,
   registerDefaults,
   getUserDefault,
-} = {}) {
+}: DatabricksAuthModeSource = {}): DatabricksAuthMode {
   if (platform !== "darwin" || !registerDefaults || !getUserDefault) return "browser";
   try {
     // NSUserDefaults otherwise returns false for both missing and explicitly false keys.
@@ -22,11 +31,11 @@ function readDatabricksAuthMode({
   }
 }
 
-function usesDatabricksBrowserAuth(url, mode) {
+export function usesDatabricksBrowserAuth(url: unknown, mode: DatabricksAuthMode): boolean {
   return mode === "browser" && isDatabricksOAuthServerUrl(url);
 }
 
-function isDatabricksLoginUrl(rawUrl, origin) {
+export function isDatabricksLoginUrl(rawUrl: string, origin: string): boolean {
   try {
     const url = new URL(rawUrl);
     const p = url.pathname.toLowerCase();
@@ -43,7 +52,15 @@ function isDatabricksLoginUrl(rawUrl, origin) {
   }
 }
 
-function cookieMatchesOrigin(cookie, origin) {
+/** A cookie as the session's cookie jar reports it. */
+export interface WorkspaceCookie {
+  name: string;
+  domain?: string | undefined;
+  hostOnly?: boolean | undefined;
+  expirationDate?: number | undefined;
+}
+
+export function cookieMatchesOrigin(cookie: WorkspaceCookie, origin: string): boolean {
   const host = new URL(origin).hostname;
   const domain = (cookie.domain ?? "").replace(/^\./, "");
   return (
@@ -53,30 +70,142 @@ function cookieMatchesOrigin(cookie, origin) {
 }
 
 // The workspace rejected a freshly minted session: the stored credentials need a browser sign-in.
-const SESSION_REJECTED = "SESSION_REJECTED";
+export const SESSION_REJECTED = "SESSION_REJECTED";
 // The workspace IP access list refused session-create (e.g. off the VPN): retried.
-const IP_ACL_BLOCKED = "IP_ACL_BLOCKED";
-const sessionRejected = (message) =>
+export const IP_ACL_BLOCKED = "IP_ACL_BLOCKED";
+const sessionRejected = (message: string) =>
   Object.assign(new Error(message), { errorCode: SESSION_REJECTED });
 // Session-create timed out or its response was cut off (databricks-session.js).
-const SESSION_TRANSPORT = "SESSION_TRANSPORT";
+export const SESSION_TRANSPORT = "SESSION_TRANSPORT";
 
 /** Whether a renewal failure is worth retrying: no response, HTTP 5xx/429, or an IP ACL block. */
-function isTransientRenewalError(error) {
+export function isTransientRenewalError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
-  if (error.errorCode === IP_ACL_BLOCKED || error.errorCode === SESSION_TRANSPORT) return true;
-  const { status } = error;
-  if (status != null) return status === 429 || (status >= 500 && status <= 599);
-  const message = typeof error.message === "string" ? error.message : "";
+  const fields = error as Record<string, unknown>;
+  if (fields.errorCode === IP_ACL_BLOCKED || fields.errorCode === SESSION_TRANSPORT) return true;
+  const { status } = fields;
+  if (status != null) {
+    // Relational comparison converts `status` to a number the same way.
+    const numeric = Number(status);
+    return status === 429 || (numeric >= 500 && numeric <= 599);
+  }
+  const message = typeof fields.message === "string" ? fields.message : "";
   return (
-    error.name === "TimeoutError" ||
-    (error.name === "TypeError" && (message === "fetch failed" || message === "terminated")) ||
+    fields.name === "TimeoutError" ||
+    (fields.name === "TypeError" && (message === "fetch failed" || message === "terminated")) ||
     message.startsWith("net::ERR_")
   );
 }
 
+type CookieChangedListener = (
+  event: unknown,
+  cookie: WorkspaceCookie,
+  cause: string,
+  removed: boolean,
+) => void;
+
+/** The parts of a request's details the guard reads. */
+export interface GuardedRequest {
+  webContentsId?: number | undefined;
+  url: string;
+  resourceType: string;
+}
+
+export type BeforeRequestListener = (
+  details: GuardedRequest,
+  callback: (response: { cancel?: boolean }) => void,
+) => void;
+
+/** The part of Electron's `Session` the request guard and renewal use. */
+export interface DatabricksAuthSession {
+  cookies: {
+    get: (filter: { url: string; name: string }) => Promise<WorkspaceCookie[]>;
+    on: (event: "changed", listener: CookieChangedListener) => unknown;
+    removeListener: (event: "changed", listener: CookieChangedListener) => unknown;
+  };
+  webRequest: {
+    onBeforeRequest: (listener: BeforeRequestListener | null) => void;
+  };
+}
+
+/** A navigation event; only `preventDefault` is used. */
+export interface NavigationEvent {
+  preventDefault: () => void;
+}
+
+type NavigateListener = (event: unknown, url: string) => void;
+type NavigateInPageListener = (event: unknown, url: string, isMainFrame: boolean) => void;
+type GuardListener = (event: NavigationEvent, url: string) => void;
+
+/** The navigation events of a window's webContents this module observes. */
+export interface DatabricksAuthWebContents {
+  on: ((event: "did-navigate", listener: NavigateListener) => unknown) &
+    ((event: "did-navigate-in-page", listener: NavigateInPageListener) => unknown) &
+    ((event: "will-navigate" | "will-redirect", listener: GuardListener) => unknown);
+  removeListener: ((event: "did-navigate", listener: NavigateListener) => unknown) &
+    ((event: "did-navigate-in-page", listener: NavigateInPageListener) => unknown) &
+    ((event: "will-navigate" | "will-redirect", listener: GuardListener) => unknown);
+}
+
+export interface DatabricksAuthWindow {
+  webContents: DatabricksAuthWebContents;
+  isDestroyed: () => boolean;
+  loadURL: (url: string) => Promise<unknown>;
+}
+
+/** A timer handle from the real or an injected `setTimeout`. */
+export type RenewalTimer = ReturnType<typeof setTimeout> | number;
+
+export interface DatabricksAuthDeps<W extends DatabricksAuthWindow> {
+  session: DatabricksAuthSession;
+  ensureSession: (
+    session: DatabricksAuthSession,
+    origin: string,
+    options: { interactive: false },
+  ) => Promise<unknown>;
+  getWindow: (webContentsId: number | undefined) => W | null | undefined;
+  getOrigin: (win: W) => string | null;
+  onAuthRequired: (
+    win: W,
+    serverUrl: string,
+    error: unknown,
+    details: { returnUrl: string },
+  ) => void;
+  isSetupUrl?: (url: string) => boolean;
+  now?: () => number;
+  setTimeoutFn?: (callback: () => void, delay: number) => RenewalTimer;
+  clearTimeoutFn?: (timer: RenewalTimer | undefined) => void;
+}
+
+export interface DatabricksAuth<W extends DatabricksAuthWindow> {
+  attach: (win: W, serverUrl: string, loadUrl?: string) => Promise<void>;
+  detach: (win: W) => void;
+  rejectConnection: (win: W) => void;
+  reset: (win: W) => void;
+  recover: (win: W) => void;
+  whenSettled: (origin: string) => Promise<void>;
+  dispose: () => void;
+}
+
+/** One attached window's renewal state. */
+interface Connection<W extends DatabricksAuthWindow> {
+  win: W;
+  webContents: DatabricksAuthWebContents;
+  origin: string;
+  serverUrl: string;
+  returnUrl: string;
+  timer: RenewalTimer | undefined;
+  pending: Promise<void> | null;
+  scheduleGeneration: number;
+  navigationVersion: number;
+  reloadVersion: number | null;
+  lastRejectedAt: number;
+  onNavigate: NavigateListener;
+  onNavigateInPage: NavigateInPageListener;
+}
+
 /** One session owns the request guard; each window owns its renewal lifecycle. */
-function createDatabricksAuth({
+export function createDatabricksAuth<W extends DatabricksAuthWindow>({
   session,
   ensureSession,
   getWindow,
@@ -86,12 +215,15 @@ function createDatabricksAuth({
   now = Date.now,
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
-}) {
-  const connections = new Map();
-  const renewals = new Map();
-  const rejectedWindows = new Map();
+}: DatabricksAuthDeps<W>): DatabricksAuth<W> {
+  const connections = new Map<W, Connection<W>>();
+  const renewals = new Map<string, Promise<unknown>>();
+  const rejectedWindows = new Map<
+    W,
+    { webContents: DatabricksAuthWebContents; guard: GuardListener }
+  >();
 
-  function current(ctx) {
+  function current(ctx: Connection<W>): boolean {
     return (
       connections.get(ctx.win) === ctx &&
       !ctx.win.isDestroyed() &&
@@ -99,7 +231,7 @@ function createDatabricksAuth({
     );
   }
 
-  function detach(win) {
+  function detach(win: W) {
     const ctx = connections.get(win);
     if (!ctx) return;
     connections.delete(win);
@@ -108,11 +240,11 @@ function createDatabricksAuth({
     ctx.webContents.removeListener("did-navigate-in-page", ctx.onNavigateInPage);
   }
 
-  function rejectConnection(win) {
+  function rejectConnection(win: W) {
     detach(win);
     if (win.isDestroyed() || rejectedWindows.has(win)) return;
     const webContents = win.webContents;
-    const guard = (event, url) => {
+    const guard: GuardListener = (event, url) => {
       if (!isSetupUrl(url)) event.preventDefault();
     };
     rejectedWindows.set(win, { webContents, guard });
@@ -121,7 +253,7 @@ function createDatabricksAuth({
     webContents.on("will-redirect", guard);
   }
 
-  function reset(win) {
+  function reset(win: W) {
     detach(win);
     const rejected = rejectedWindows.get(win);
     if (rejected) {
@@ -131,19 +263,21 @@ function createDatabricksAuth({
     }
   }
 
-  function fail(ctx, error) {
+  function fail(ctx: Connection<W>, error: unknown) {
     if (!current(ctx)) return;
     rejectConnection(ctx.win);
     onAuthRequired(ctx.win, ctx.serverUrl, error, { returnUrl: ctx.returnUrl });
   }
 
-  async function schedule(ctx) {
+  async function schedule(ctx: Connection<W>): Promise<void> {
     const generation = ++ctx.scheduleGeneration;
     clearTimeoutFn(ctx.timer);
     const cookies = await session.cookies.get({ url: ctx.serverUrl, name: "DBAUTH" });
     if (!current(ctx) || generation !== ctx.scheduleGeneration) return;
     if (!cookies.length) throw new Error("Databricks session cookie is missing");
-    const expiries = cookies.map((c) => c.expirationDate * 1000).filter(Number.isFinite);
+    const expiries = cookies
+      .map((c) => (c.expirationDate ?? Number.NaN) * 1000)
+      .filter(Number.isFinite);
     // Session cookies have no local expiry timestamp; removal and auth rejection still recover.
     if (!expiries.length) return;
     const remaining = Math.min(...expiries) - now();
@@ -155,10 +289,13 @@ function createDatabricksAuth({
     ctx.timer = setTimeoutFn(() => {
       void renew(ctx, { reason: "cookie expiry" });
     }, delay);
-    ctx.timer?.unref?.();
+    if (typeof ctx.timer === "object") ctx.timer.unref();
   }
 
-  function renew(ctx, { reload = false, reason = "cookie renewal" } = {}) {
+  function renew(
+    ctx: Connection<W>,
+    { reload = false, reason = "cookie renewal" }: { reload?: boolean; reason?: string } = {},
+  ): Promise<void> {
     if (!current(ctx)) return Promise.resolve();
     if (reload) ctx.reloadVersion = ctx.navigationVersion;
     if (ctx.pending) return ctx.pending;
@@ -188,7 +325,7 @@ function createDatabricksAuth({
         } catch (error) {
           console.warn("[omnigent] databricks auth: recovery reload did not land", {
             origin: ctx.origin,
-            code: error.code,
+            code: (error as { code?: unknown }).code,
           });
         }
       })
@@ -201,7 +338,7 @@ function createDatabricksAuth({
     return ctx.pending;
   }
 
-  function recover(win) {
+  function recover(win: W) {
     const ctx = connections.get(win);
     if (!ctx || !current(ctx)) return;
     if (!ctx.pending && now() - ctx.lastRejectedAt < 15_000) {
@@ -215,26 +352,30 @@ function createDatabricksAuth({
     void renew(ctx, { reload: true, reason: "blocked workspace login" });
   }
 
-  async function attach(win, serverUrl, loadUrl = serverUrl) {
+  async function attach(win: W, serverUrl: string, loadUrl = serverUrl): Promise<void> {
     const origin = new URL(serverUrl).origin;
     if (!isDatabricksOAuthServerUrl(origin) || getOrigin(win) !== origin) {
       throw new Error("Browser session renewal requires a pinned Databricks workspace");
     }
     reset(win);
-    const ctx = {
+    const ctx: Connection<W> = {
       win,
       webContents: win.webContents,
       origin,
       serverUrl,
       returnUrl: loadUrl,
-      timer: null,
+      timer: undefined,
       pending: null,
       scheduleGeneration: 0,
       navigationVersion: 0,
       reloadVersion: null,
       lastRejectedAt: -Infinity,
+      onNavigate: (_event, url) => remember(url),
+      onNavigateInPage: (_event, url, isMainFrame) => {
+        if (isMainFrame) remember(url);
+      },
     };
-    const remember = (url) => {
+    const remember = (url: string) => {
       if (!current(ctx)) return;
       try {
         if (new URL(url).origin !== origin) return;
@@ -251,10 +392,6 @@ function createDatabricksAuth({
       ctx.returnUrl = url;
       ctx.navigationVersion++;
     };
-    ctx.onNavigate = (_event, url) => remember(url);
-    ctx.onNavigateInPage = (_event, url, isMainFrame) => {
-      if (isMainFrame) remember(url);
-    };
     connections.set(win, ctx);
     win.webContents.on("did-navigate", ctx.onNavigate);
     win.webContents.on("did-navigate-in-page", ctx.onNavigateInPage);
@@ -266,7 +403,7 @@ function createDatabricksAuth({
     }
   }
 
-  const onCookieChanged = (_event, cookie, cause, removed) => {
+  const onCookieChanged: CookieChangedListener = (_event, cookie, cause, removed) => {
     for (const ctx of connections.values()) {
       if (!current(ctx) || ctx.pending || !cookieMatchesOrigin(cookie, ctx.origin)) continue;
       // Chromium removes the old cookie before inserting its replacement.
@@ -286,7 +423,7 @@ function createDatabricksAuth({
       return;
     }
     const origin = win && getOrigin(win);
-    if (!origin) {
+    if (!win || !origin) {
       callback({});
       return;
     }
@@ -334,16 +471,3 @@ function createDatabricksAuth({
     },
   };
 }
-
-module.exports = {
-  DATABRICKS_BROWSER_AUTH_KEY,
-  readDatabricksAuthMode,
-  usesDatabricksBrowserAuth,
-  isDatabricksLoginUrl,
-  cookieMatchesOrigin,
-  isTransientRenewalError,
-  SESSION_REJECTED,
-  IP_ACL_BLOCKED,
-  SESSION_TRANSPORT,
-  createDatabricksAuth,
-};

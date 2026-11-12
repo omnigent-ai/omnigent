@@ -1530,7 +1530,7 @@ describe("browser IPC sessions on this machine", () => {
   function localNavigation({ hostId = "local", live = true, protocol = 1 } = {}) {
     const { createBrowserViewRegistry } = require("../src/browserViewRegistry.ts");
     const { createBrowserViewBoundsController } = require("../src/browserViewBounds.ts");
-    const { isHostThisMachine } = require("../src/hostIdentity");
+    const { isHostThisMachine } = require("../src/hostIdentity.ts");
     let liveEnrollment = live;
     const webContents = makeWebContents();
     webContents.loadURL = () => {};

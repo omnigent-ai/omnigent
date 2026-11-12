@@ -26,7 +26,7 @@ const {
   isTransientRenewalError,
   IP_ACL_BLOCKED,
   SESSION_TRANSPORT,
-} = require("./databricks-auth");
+} = require("./databricks-auth.ts");
 
 const SESSION_CREATE_PATH = "/auth/session/create";
 // Bound on the session-create request so a stalled socket can't hang connect.

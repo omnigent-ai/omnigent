@@ -1,38 +1,31 @@
-// Unit tests for the encrypted per-origin credential store (src/token_store.js),
+// Unit tests for the encrypted per-origin credential store (src/token_store.ts),
 // run with `node --test`. safeStorage is a reversible stub; HOME is a temp dir.
 
-"use strict";
+import { describe, it, beforeEach, afterEach, mock } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
-const { describe, it, beforeEach, afterEach, mock } = require("node:test");
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
-const Module = require("node:module");
+import { createTokenStore } from "../src/token_store.ts";
 
 const safeStorage = {
   available: true,
   isEncryptionAvailable: () => safeStorage.available,
-  encryptString: (text) => Buffer.from(`enc:${text}`),
-  decryptString: (buffer) => {
+  encryptString: (text: string) => Buffer.from(`enc:${text}`),
+  decryptString: (buffer: Buffer) => {
     const text = buffer.toString();
     if (!text.startsWith("enc:")) throw new Error("bad ciphertext");
     return text.slice(4);
   },
 };
-const origLoad = Module["_load"];
-Module["_load"] = function (request, ...rest) {
-  if (request === "electron") return { safeStorage };
-  return origLoad.call(this, request, ...rest);
-};
 
-const { createTokenStore } = require("../src/token_store");
-
-let home;
+let home: string;
+let warn: ReturnType<typeof mock.method>;
 beforeEach(() => {
   home = fs.mkdtempSync(path.join(os.tmpdir(), "omni-token-store-"));
   mock.method(os, "homedir", () => home);
-  mock.method(console, "warn", () => {});
+  warn = mock.method(console, "warn", () => {});
   safeStorage.available = true;
 });
 afterEach(() => {
@@ -41,14 +34,15 @@ afterEach(() => {
 });
 
 const file = () => path.join(home, ".omnigent", "test_tokens.json");
-const store = () => createTokenStore({ fileName: "test_tokens.json", label: "test tokens" });
+const store = () =>
+  createTokenStore({ fileName: "test_tokens.json", label: "test tokens", safeStorage });
 
 describe("createTokenStore", () => {
   it("encrypts at rest, keyed by the slash-stripped origin", () => {
     store().save("https://a.test/", { refresh_token: "r" });
-    const raw = JSON.parse(fs.readFileSync(file(), "utf8"));
+    const raw = JSON.parse(fs.readFileSync(file(), "utf8")) as Record<string, { enc: unknown }>;
     assert.deepEqual(Object.keys(raw), ["https://a.test"]);
-    assert.equal(typeof raw["https://a.test"].enc, "string");
+    assert.equal(typeof raw["https://a.test"]?.enc, "string");
     assert.doesNotMatch(fs.readFileSync(file(), "utf8"), /"r"/);
     assert.deepEqual(store().load("https://a.test"), { refresh_token: "r" });
     assert.equal(fs.statSync(file()).mode & 0o777, 0o600);
@@ -73,7 +67,7 @@ describe("createTokenStore", () => {
     assert.deepEqual(JSON.parse(fs.readFileSync(file(), "utf8"))["https://a.test"], {
       plain: { r: 1 },
     });
-    assert.match(console.warn.mock.calls[0].arguments[0], /storing test tokens unencrypted/);
+    assert.match(String(warn.mock.calls[0]?.arguments[0]), /storing test tokens unencrypted/);
   });
 
   it("returns null for undecryptable, corrupt, or missing entries", () => {
