@@ -1,5 +1,5 @@
 import { renderSidebar } from "@/test/sidebarTestHelpers";
-import { conversationPage } from "@/test/sidebarMockHelpers";
+import { conversationPage, setConversationMutedMock } from "@/test/sidebarMockHelpers";
 // Tests for the read-state actions in the sidebar's session menus:
 //   1. A row's kebab always offers exactly one read-state action — "Mark as
 //      unread" on a read row, "Mark as read" on a row already showing the
@@ -23,6 +23,7 @@ vi.mock("@/hooks/useConversations", async () => {
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
+import { MUTED_LABEL_KEY } from "@/lib/sessionListCache";
 import {
   isConversationUnseen,
   markConversationUnread,
@@ -109,6 +110,33 @@ describe("row kebab read-state action", () => {
     openKebab(row);
     expect(screen.getByTestId("mark-unread-conversation")).toBeInTheDocument();
     expect(screen.queryByTestId("mark-read-conversation")).toBeNull();
+  });
+});
+
+describe("row mute action", () => {
+  it("hides a muted row's unread dot, marks it muted, and offers Unmute", () => {
+    const muted = { ...CONV_A, labels: { [MUTED_LABEL_KEY]: "1" } };
+    mockConversations([muted, CONV_B]);
+    markConversationUnread(CONV_A.id, CONV_A.updated_at);
+    renderSidebar();
+
+    const row = rowFor("Session Alpha");
+    expect(unreadDot(row)).toBeNull();
+    expect(within(row).getByTestId("conversation-muted-icon")).toBeInTheDocument();
+
+    openKebab(row);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Unmute" }));
+    expect(setConversationMutedMock).toHaveBeenLastCalledWith({ id: CONV_A.id, muted: false });
+  });
+
+  it("offers Mute on an unmuted row", () => {
+    renderSidebar();
+    const row = rowFor("Session Beta");
+    expect(within(row).queryByTestId("conversation-muted-icon")).toBeNull();
+
+    openKebab(row);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Mute" }));
+    expect(setConversationMutedMock).toHaveBeenLastCalledWith({ id: CONV_B.id, muted: true });
   });
 });
 

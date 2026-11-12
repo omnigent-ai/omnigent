@@ -61,6 +61,7 @@ import {
 } from "@/lib/idleTransitions";
 import { isConversationUnseen, useUnseenTick } from "@/hooks/useUnseenConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
+import { isConversationMuted } from "@/lib/sessionListCache";
 
 const IDLE_BODY = "Agent finished and is ready for your input.";
 const ELICITATION_BODY = "Agent is asking for your input.";
@@ -352,8 +353,10 @@ export function useIdleNotifications(activeConversationId?: string): void {
           setTimeout(() => {
             timers.delete(id);
             // Re-check suppression at fire time — the user may have opened the
-            // session (or refocused the window) during the settle window.
+            // session (or refocused the window), or muted it, during the settle window.
             if (windowFocusedRef.current && id === activeIdRef.current) return;
+            const latest = latestConversations.current?.find((c) => c.id === id);
+            if (latest && isConversationMuted(latest)) return;
             // Mark it beeped so a later finish stays silent until the user has
             // viewed this session.
             notifiedSessions.current.add(id);

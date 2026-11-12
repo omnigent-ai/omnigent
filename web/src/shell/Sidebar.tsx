@@ -45,6 +45,8 @@ import {
 import { createPortal } from "react-dom";
 import {
   ArchiveIcon,
+  BellIcon,
+  BellOffIcon,
   ArrowUpDownIcon,
   ArchiveRestoreIcon,
   CheckIcon as CheckMarkIcon,
@@ -117,7 +119,11 @@ import {
 } from "@dnd-kit/sortable";
 import { useProjectOrder, useSaveProjectOrder } from "@/hooks/useProjectOrder";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
-import { PINNED_LABEL_KEY, PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import {
+  isConversationMuted,
+  PINNED_LABEL_KEY,
+  PIN_WRITE_MUTATION_KEY,
+} from "@/lib/sessionListCache";
 import {
   Link,
   useLocation,
@@ -183,6 +189,7 @@ import {
   PINNED_CONVERSATIONS_KEY,
   useTogglePinnedConversation,
   useReorderPinnedConversations,
+  useSetConversationMuted,
   setConversationPinned,
   useRenameConversation,
   useStopAndDeleteConversation,
@@ -4600,6 +4607,8 @@ function ConversationMenuItems({
   canMarkUnread,
   currentProject,
   onTogglePinned,
+  isMuted,
+  onToggleMuted,
   onMarkUnread,
   onMarkRead,
   onProjectAssigned,
@@ -4636,6 +4645,9 @@ function ConversationMenuItems({
   canMarkUnread: boolean;
   currentProject: string | null;
   onTogglePinned: (conversationId: string) => void;
+  /** Whether the viewer muted this session (no notifications, dimmed row). */
+  isMuted: boolean;
+  onToggleMuted: () => void;
   onMarkUnread: () => void;
   onMarkRead: () => void;
   onProjectAssigned?: (projectName: string) => void;
@@ -4846,6 +4858,14 @@ function ConversationMenuItems({
           </TooltipContent>
         </Tooltip>
       )}
+      <C.Item
+        className="mobile-touch-target"
+        data-testid="mute-conversation"
+        onSelect={onToggleMuted}
+      >
+        {isMuted ? <BellIcon className="size-3.5" /> : <BellOffIcon className="size-3.5" />}
+        {isMuted ? "Unmute" : "Mute"}
+      </C.Item>
       {/* Every row offers one read-state action: "Mark as unread" re-lights
           the pink dot so a session can be flagged to revisit (including the
           one you're currently viewing); a row already showing the dot offers
@@ -5621,7 +5641,11 @@ function ConversationRowImpl({
   // invisible until the turn finishes (then the dot lights like any unseen
   // row). The explicit override only lifts the active-row suppression, so
   // flagging the thread you're currently viewing surfaces the dot at once.
-  const hasUnseenMessages = readState.unseen && (!isActive || readState.explicitlyUnread);
+  // A muted session never shows the unread dot.
+  const isMuted = isConversationMuted(conversation);
+  const setMuted = useSetConversationMuted();
+  const hasUnseenMessages =
+    !isMuted && readState.unseen && (!isActive || readState.explicitlyUnread);
   // "Mark as unread" is offered on any row not already showing the dot.
   const canMarkUnread = !hasUnseenMessages;
   // Approvals and failures outrank the unread dot without clearing read state.
@@ -5905,6 +5929,8 @@ function ConversationRowImpl({
     canMarkUnread,
     currentProject,
     onTogglePinned,
+    isMuted,
+    onToggleMuted: () => setMuted.mutate({ id: conversation.id, muted: !isMuted }),
     onMarkUnread: () => markConversationUnread(conversation.id, conversation.updated_at),
     onMarkRead: () => markConversationRead(conversation.id, conversation.updated_at),
     onProjectAssigned,
@@ -5932,11 +5958,20 @@ function ConversationRowImpl({
             // The optimistic first-prompt label is a placeholder until the
             // server's title lands — dim it so it doesn't read as final.
             isProvisionalLabel && "italic text-muted-foreground",
+            isMuted && "text-muted-foreground",
           )}
         >
           {label}
           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
         </span>
+        {isMuted && (
+          <BellOffIcon
+            role="img"
+            aria-label="Muted"
+            data-testid="conversation-muted-icon"
+            className="ml-1.5 size-3 shrink-0 text-muted-foreground"
+          />
+        )}
       </div>
       {/* Row 2: the "Show" metadata, each part omitted when it has no value. */}
       <SessionMetaLine environment={metaEnvironment} repo={metaRepo} branch={metaBranch} />

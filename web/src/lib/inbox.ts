@@ -7,6 +7,7 @@ import type { Comment } from "@/hooks/useComments";
 import type { Conversation } from "@/hooks/useConversations";
 import type { ElicitationRequest } from "./events";
 import { parseEvent } from "./sse";
+import { isConversationMuted } from "./sessionListCache";
 
 /** One pending approval prompt, paired with the session that owns it. */
 export interface InboxItem {
@@ -76,7 +77,8 @@ export interface UnreadInboxItem {
  * `isUnseen` is the sidebar dot's predicate (injected to keep this module
  * free of the read-state store), so both surfaces agree on what's unread.
  * Rows with pending approvals are skipped — they're already listed as
- * approval items, and one session shouldn't appear twice.
+ * approval items, and one session shouldn't appear twice. Muted sessions are
+ * skipped too, matching their hidden sidebar dot; their approvals still list.
  */
 export function collectUnreadInboxItems(
   rows: Conversation[],
@@ -86,6 +88,7 @@ export function collectUnreadInboxItems(
     .filter(
       (row) =>
         !row.archived &&
+        !isConversationMuted(row) &&
         (row.pending_elicitations_count ?? 0) === 0 &&
         isUnseen(row.id, row.updated_at, row.status),
     )

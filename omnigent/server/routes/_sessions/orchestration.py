@@ -420,12 +420,14 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
+    MUTED_LABEL_KEY,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
+    muted_label_key,
     pinned_label_key,
     runner_seen_is_fresh,
 )
@@ -1232,6 +1234,8 @@ def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str,
       THIS viewer pinned the session, and drop every ``omnigent.pinned.*`` key.
       That keeps the per-user dimension server-side and stops other users' pins
       from bloating the payload.
+    - Mutes are per-user like pins: ``omnigent.muted`` is set iff THIS viewer
+      muted the session.
     - Sandbox repos are stored one per repo as ``omnigent.sandbox.repo.<index>``
       (avoiding the 256-char label-value cap); we present the canonical
       ``omnigent.sandbox.repo`` as the space-joined list so clients that read
@@ -1246,6 +1250,7 @@ def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str,
 
     my_key = pinned_label_key(user_id)
     my_pin = labels.get(my_key)
+    my_mute = labels.get(muted_label_key(user_id))
     repos = read_managed_repo_workspaces(labels)
     cleaned = {
         k: v
@@ -1254,11 +1259,15 @@ def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str,
         and not k.startswith(PROFILE_LABEL_PREFIX)
         and k != PINNED_LABEL_KEY
         and not k.startswith(f"{PINNED_LABEL_KEY}.")
+        and k != MUTED_LABEL_KEY
+        and not k.startswith(f"{MUTED_LABEL_KEY}.")
         and k != MANAGED_REPO_LABEL_KEY
         and not k.startswith(f"{MANAGED_REPO_LABEL_KEY}.")
     }
     if my_pin is not None:
         cleaned[PINNED_LABEL_KEY] = my_pin
+    if my_mute is not None:
+        cleaned[MUTED_LABEL_KEY] = my_mute
     if repos:
         cleaned[MANAGED_REPO_LABEL_KEY] = " ".join(repos)
     return cleaned

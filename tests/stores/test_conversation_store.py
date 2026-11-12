@@ -197,13 +197,13 @@ def test_fork_drops_per_repo_sandbox_labels(
     assert not any(k.startswith(f"{MANAGED_REPO_LABEL_KEY}.") for k in fork.labels)
 
 
-def test_fork_drops_per_user_pin_labels(
+def test_fork_drops_per_user_pin_and_mute_labels(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """A fork is a NEW conversation, so it must not inherit the source's pins:
-    neither the forker's nor any other user's per-user pin key rides along
-    (those keys have a dynamic suffix, so a prefix drop is required)."""
-    from omnigent.stores.conversation_store import pinned_label_key
+    """A fork is a NEW conversation, so it must not inherit the source's pins or
+    mutes: no user's per-user key rides along (those keys have a dynamic
+    suffix, so a prefix drop is required)."""
+    from omnigent.stores.conversation_store import muted_label_key, pinned_label_key
 
     source = conversation_store.create_conversation()
     conversation_store.set_labels(
@@ -211,6 +211,7 @@ def test_fork_drops_per_user_pin_labels(
         {
             pinned_label_key("alice"): "1721760000000",
             pinned_label_key("bob"): "1700000000000",
+            muted_label_key("alice"): "1",
             "kept": "yes",
         },
     )
@@ -220,6 +221,7 @@ def test_fork_drops_per_user_pin_labels(
     assert fork.labels["kept"] == "yes"
     assert pinned_label_key("alice") not in fork.labels
     assert pinned_label_key("bob") not in fork.labels
+    assert muted_label_key("alice") not in fork.labels
 
 
 def test_side_chats_page_by_parent_in_id_order(tmp_path: Path) -> None:

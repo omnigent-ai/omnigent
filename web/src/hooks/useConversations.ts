@@ -39,6 +39,7 @@ import {
   insertNewRowsIntoPages,
   markRecentlyCreated,
   mergeItemsIntoPages,
+  MUTED_LABEL_KEY,
   overlayArchivedIntoCaches,
   overlayTitleIntoCaches,
   PIN_WRITE_MUTATION_KEY,
@@ -2283,6 +2284,88 @@ export function useReorderPinnedConversations() {
       if (writes.some(({ id }) => findCachedConversationRow(queryClient, id)?.family)) {
         invalidateFamilyLists(queryClient);
       }
+    },
+  });
+}
+
+// ── Mute hooks ────────────────────────────────────────────────────────────────
+
+export { MUTED_LABEL_KEY };
+
+/**
+ * Set or clear one label on every cached copy of a session row, leaving its
+ * other labels as each cache has them.
+ */
+function overlayLabelIntoCaches(
+  queryClient: QueryClient,
+  id: string,
+  key: string,
+  value: string | undefined,
+) {
+  const withLabel = (labels: Record<string, string> | undefined) => {
+    const rest = Object.fromEntries(Object.entries(labels ?? {}).filter(([k]) => k !== key));
+    return value === undefined ? rest : { ...rest, [key]: value };
+  };
+  for (const [listKey, filtersOf] of [
+    [["conversations"], filtersFromConversationQueryKey],
+    [["project-sessions"], filtersFromProjectQueryKey],
+  ] as const) {
+    for (const [cacheKey, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: listKey,
+    })) {
+      const row = data?.pages.flatMap((page) => page.data).find((c) => c.id === id);
+      if (!row) continue;
+      const { data: next } = mergeItemsIntoPages(
+        data,
+        new Map([[id, { id, labels: withLabel(row.labels) } satisfies SessionListWireItem]]),
+        filtersOf(cacheKey),
+      );
+      if (next !== data) queryClient.setQueryData(cacheKey, next);
+    }
+  }
+  queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+    old
+      ? {
+          ...old,
+          conversations: old.conversations.map((c) =>
+            c.id === id ? { ...c, labels: withLabel(c.labels) } : c,
+          ),
+        }
+      : old,
+  );
+  queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
+    old ? { ...old, labels: withLabel(old.labels) } : old,
+  );
+  queryClient.setQueryData<Session>(["session", id], (old) =>
+    old ? { ...old, labels: withLabel(old.labels) } : old,
+  );
+}
+
+/**
+ * Mute / unmute a session for the viewer via `PATCH /v1/sessions/{id}` (the
+ * `omnigent.muted` label; an empty value deletes it). Painted optimistically
+ * and rolled back on failure. Like a pin, the write leaves `updated_at` alone,
+ * so it never changes the row's read state.
+ */
+export function useSetConversationMuted() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, muted }: { id: string; muted: boolean }) => {
+      const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ labels: { [MUTED_LABEL_KEY]: muted ? "1" : "" } }),
+      });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    },
+    onMutate: ({ id, muted }) => {
+      const previous = findCachedConversationRow(queryClient, id)?.labels?.[MUTED_LABEL_KEY];
+      overlayLabelIntoCaches(queryClient, id, MUTED_LABEL_KEY, muted ? "1" : undefined);
+      return { previous };
+    },
+    onError: (_err, { id, muted }, ctx) => {
+      overlayLabelIntoCaches(queryClient, id, MUTED_LABEL_KEY, ctx?.previous);
+      showToast(muted ? "Couldn't mute the session." : "Couldn't unmute the session.");
     },
   });
 }

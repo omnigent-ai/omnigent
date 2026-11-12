@@ -11,6 +11,7 @@
 // unarchiving diffs against real prior state, not a phantom transition.
 
 import type { Conversation } from "@/hooks/useConversations";
+import { isConversationMuted } from "@/lib/sessionListCache";
 
 // Statuses that mean "the agent stopped working and is waiting on the
 // user" — the moment worth surfacing. "running" is excluded (still
@@ -41,7 +42,7 @@ export function detectIdleTransitions(
   conversations: Conversation[],
 ): Conversation[] {
   return conversations.filter((conversation) => {
-    if (conversation.archived) return false;
+    if (conversation.archived || isConversationMuted(conversation)) return false;
     const status = conversation.status;
     if (status === undefined || !TERMINAL_STATUSES.has(status)) return false;
     return previous.get(conversation.id) === "running";
@@ -72,7 +73,7 @@ export function detectNewElicitations(
   conversations: Conversation[],
 ): Conversation[] {
   return conversations.filter((conversation) => {
-    if (conversation.archived) return false;
+    if (conversation.archived || isConversationMuted(conversation)) return false;
     const current = conversation.pending_elicitations_count ?? 0;
     const prior = previous.get(conversation.id);
     return prior !== undefined && current > prior;
@@ -86,7 +87,8 @@ export function detectNewElicitations(
  * flags as needing attention, including sessions that finished while this
  * window wasn't open.
  *
- * A session counts as unread when it is NOT actively viewed (the window is
+ * Muted sessions never count. Otherwise a session counts as unread when it is
+ * NOT actively viewed (the window is
  * focused AND it's the open conversation — the one suppression rule; a
  * blurred window means even the open conversation counts) AND either:
  *
@@ -114,7 +116,7 @@ export function computeUnreadBadgeIds(
 ): Set<string> {
   const unread = new Set<string>();
   for (const conversation of conversations) {
-    if (conversation.archived) continue;
+    if (conversation.archived || isConversationMuted(conversation)) continue;
     if (windowFocused && conversation.id === activeId) continue;
     const awaiting = (conversation.pending_elicitations_count ?? 0) > 0;
     if (awaiting || isUnseen(conversation.id, conversation.updated_at, conversation.status)) {

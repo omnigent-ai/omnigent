@@ -39,6 +39,19 @@ export const PROJECT_LABEL_KEY = "omni_project";
  */
 export const PINNED_LABEL_KEY = "omnigent.pinned";
 
+/**
+ * The reserved `conversation_labels` key recording that the viewer muted a
+ * session: its row is dimmed and it raises no notifications or unread dot.
+ * Per-viewer on the server like the pin; absent when unmuted. Mirrors the
+ * server's `MUTED_LABEL_KEY`.
+ */
+export const MUTED_LABEL_KEY = "omnigent.muted";
+
+/** Whether the viewer muted this session. */
+export function isConversationMuted(conversation: { labels?: Record<string, string> }): boolean {
+  return !!conversation.labels?.[MUTED_LABEL_KEY];
+}
+
 /** Mutation key shared by every pin, unpin, and pinned-reorder write. */
 export const PIN_WRITE_MUTATION_KEY = ["pin-write"] as const;
 

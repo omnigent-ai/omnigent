@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { MUTED_LABEL_KEY } from "./sessionListCache";
 import type { Comment } from "@/hooks/useComments";
 import type { Conversation } from "@/hooks/useConversations";
 import {
@@ -300,6 +301,21 @@ describe("collectUnreadInboxItems", () => {
     ];
     const items = collectUnreadInboxItems(rows, unseenAfter(1_000));
     expect(items.map((i) => i.row.id)).toEqual(["unread"]);
+  });
+
+  it("skips muted sessions", () => {
+    const rows = [
+      makeRow({
+        id: "muted",
+        status: "idle",
+        updated_at: 2_000,
+        labels: { [MUTED_LABEL_KEY]: "1" },
+      }),
+      makeRow({ id: "unread", status: "idle", updated_at: 2_000 }),
+    ];
+    expect(collectUnreadInboxItems(rows, unseenAfter(1_000)).map((i) => i.row.id)).toEqual([
+      "unread",
+    ]);
   });
 
   it("defers to the predicate, so running sessions stay out", () => {

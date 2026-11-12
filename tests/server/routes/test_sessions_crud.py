@@ -736,27 +736,30 @@ async def test_archiving_wins_over_a_same_request_pin(
     assert user_key not in conv.labels
 
 
+@pytest.mark.parametrize("prefix", ["omnigent.pinned", "omnigent.muted"])
 async def test_patch_rejects_client_supplied_per_user_pin_key(
     client: httpx.AsyncClient,
     session_id: str,
     db_uri: str,
+    prefix: str,
 ) -> None:
-    """A client may only write the bare canonical ``omnigent.pinned`` key. A
-    suffixed ``omnigent.pinned.<user>`` is server-derived — accepting one would
-    let a caller pin/unpin a shared session for another user. It must be
-    rejected, and nothing persisted."""
+    """A client may only write the bare canonical pin or mute key. A suffixed
+    ``<key>.<user>`` is server-derived — accepting one would let a caller
+    pin or mute a shared session for another user. It must be rejected, and
+    nothing persisted."""
     conv_store = SqlAlchemyConversationStore(db_uri)
+    suffixed = f"{prefix}.bob@example.com"
 
     for value in ("1721760000000", ""):
         resp = await client.patch(
             f"/v1/sessions/{session_id}",
-            json={"labels": {"omnigent.pinned.bob@example.com": value}},
+            json={"labels": {suffixed: value}},
             headers={"Content-Type": "application/json"},
         )
         assert resp.status_code == 400
     conv = conv_store.get_conversation(session_id)
     assert conv is not None
-    assert "omnigent.pinned.bob@example.com" not in conv.labels
+    assert suffixed not in conv.labels
 
 
 async def test_patch_rejects_client_supplied_sandbox_labels(
