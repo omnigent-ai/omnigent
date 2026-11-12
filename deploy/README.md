@@ -308,6 +308,10 @@ For an IdP that cannot supply a fresh `auth_time` (for example, Cloudflare
 Access), set `OMNIGENT_OIDC_REQUIRE_REAUTH=0`. The server still sends
 `prompt=login` and requires PKCE, ticket-specific sign-in, and approval, but it
 no longer verifies that the IdP asked for credentials again.
+If the IdP fails the sign-in when asked to re-authenticate (for example,
+self-managed GitLab), also set `OMNIGENT_OIDC_REAUTH_PROMPT=0` to stop sending
+`prompt=login` and `max_age`. The IdP then reuses its session, so only the
+ticket-specific approval screen confirms the request.
 Polling responses forbid caching, including successful credential responses.
 CLI and Slack display a comparison code; native mobile apps currently rely
 on explicit browser approval without displaying that code in the app. Include

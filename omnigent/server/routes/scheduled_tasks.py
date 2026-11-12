@@ -262,6 +262,11 @@ def _to_response(
     }
 
 
+# Bounds each run's free-text failure detail in run lists; the session transcript
+# keeps the same cap for a launch failure's reason.
+_RUN_ERROR_DETAIL_MAX_CHARS = 1000
+
+
 def _run_to_response(
     run: ScheduledTaskRun,
     *,
@@ -274,8 +279,10 @@ def _run_to_response(
 ) -> dict[str, Any]:
     """Serialize a :class:`ScheduledTaskRun` to a JSON-safe dict.
 
-    Excludes the free-text ``error`` blob (never SQL-queried, potentially
-    large); ``error_code`` carries the queryable failure classification.
+    ``error_code`` carries the queryable failure classification. The free-text
+    ``error`` is sent as ``error_detail``, capped at
+    :data:`_RUN_ERROR_DETAIL_MAX_CHARS`, so the run list can say why a run failed,
+    e.g. the sandbox provider's recovery steps for a sandbox that never connected.
 
     :param conversation_updated_at: The conversation's ``updated_at`` epoch
         seconds, or ``None`` for runs without a conversation. Embedded so the
@@ -304,6 +311,7 @@ def _run_to_response(
         "fired_at": run.fired_at,
         "finished_at": run.finished_at,
         "error_code": run.error_code,
+        "error_detail": run.error[:_RUN_ERROR_DETAIL_MAX_CHARS] if run.error else None,
         "conversation_updated_at": conversation_updated_at,
         "conversation_status": conversation_status,
         "viewer_last_seen": viewer_last_seen,
