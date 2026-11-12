@@ -71,3 +71,20 @@ export function savedWorkflowMessage(
 export function saveWorkflowMessage(skillPrefix: string, name: string): string {
   return `${skillPrefix}${SAVE_WORKFLOW_SKILL} Save this session's plan as a workflow named "${name.trim()}".`;
 }
+
+// A savedWorkflowMessage without the plan review, as New automation stores it.
+const SAVED_WORKFLOW_RUN =
+  /^[/$]workflow Run the saved workflow "(.+)" \(ID ([0-9a-f]{32})\)\.(?:\n\n([\s\S]*))?$/;
+
+/**
+ * Read back a {@link savedWorkflowMessage}, e.g. an automation's prompt.
+ *
+ * @returns The workflow's ID and name and the run's details, or `null` for any other text.
+ */
+export function parseSavedWorkflowMessage(
+  text: string,
+): { id: string; name: string; details: string } | null {
+  const match = SAVED_WORKFLOW_RUN.exec(text.trim());
+  if (!match) return null;
+  return { id: match[2], name: match[1], details: (match[3] ?? "").trim() };
+}

@@ -4,6 +4,7 @@ import {
   REVIEW_PLAN_FIRST,
   offersSaveWorkflow,
   offersWorkflow,
+  parseSavedWorkflowMessage,
   savedWorkflowMessage,
   saveWorkflowMessage,
   workflowMessage,
@@ -52,5 +53,24 @@ describe("saveWorkflowMessage", () => {
     );
     expect(offersSaveWorkflow([{ name: "save-workflow" }])).toBe(true);
     expect(offersSaveWorkflow([{ name: "workflow" }])).toBe(false);
+  });
+});
+
+describe("parseSavedWorkflowMessage", () => {
+  const workflow = { id: "0123456789abcdef0123456789abcdef", name: 'Triage "flaky" tests' };
+
+  it("reads back a saved workflow's message, with or without details", () => {
+    expect(
+      parseSavedWorkflowMessage(savedWorkflowMessage("$", workflow, " The upload tests ", false)),
+    ).toEqual({ ...workflow, details: "The upload tests" });
+    expect(parseSavedWorkflowMessage(savedWorkflowMessage("/", workflow, "", false))).toEqual({
+      ...workflow,
+      details: "",
+    });
+  });
+
+  it("ignores other prompts", () => {
+    expect(parseSavedWorkflowMessage("Summarize overnight activity")).toBeNull();
+    expect(parseSavedWorkflowMessage("/workflow Add retries")).toBeNull();
   });
 });
