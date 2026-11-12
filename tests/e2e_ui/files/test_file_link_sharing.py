@@ -182,7 +182,7 @@ def test_share_file_grants_read_access_and_opens_fullscreen(
         grants.raise_for_status()
         assert {p["user_id"]: p["level"] for p in grants.json()["permissions"]}[grantee] == 1
 
-        dialog.get_by_role("button", name="Copy link", exact=True).click()
+        dialog.get_by_role("button", name="Copy file link", exact=True).click()
         expect(dialog.get_by_role("button", name="Copied!", exact=True)).to_be_visible()
         # Read the real clipboard from a secure loopback origin; the public
         # HTTP alias uses the app's selected-textarea copy fallback.

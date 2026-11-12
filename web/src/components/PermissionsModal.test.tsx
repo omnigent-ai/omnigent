@@ -553,7 +553,9 @@ describe("PermissionsModal", () => {
           />,
           { wrapper: createWrapper() },
         );
-        fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+        fireEvent.click(
+          screen.getByRole("button", { name: filePath ? "Copy file link" : "Copy link" }),
+        );
 
         expect(await screen.findByText(/Could not copy the link/)).toBeInTheDocument();
         expect(screen.queryByRole("button", { name: "Copied!" })).toBeNull();
@@ -917,7 +919,7 @@ describe("PermissionsModal", () => {
         await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
         expect(grantMock).not.toHaveBeenCalled();
         if (filePath) {
-          expect(screen.getByRole("button", { name: "Copy link" })).toBeDisabled();
+          expect(screen.getByRole("button", { name: "Copy file link" })).toBeDisabled();
           expect(screen.getByRole("button", { name: "Open in mobile app" })).toBeDisabled();
           expect(updateSessionMock).not.toHaveBeenCalled();
         }
@@ -1107,7 +1109,7 @@ describe("PermissionsModal", () => {
       );
 
       expect(
-        screen.getByText(/enables Workspace files for everyone with Read access/),
+        screen.getByText(/workspace files available to everyone with Read access/),
       ).toBeInTheDocument();
       await screen.findByText("No grants yet.");
       expect(updateSessionMock).not.toHaveBeenCalled();
@@ -1153,7 +1155,7 @@ describe("PermissionsModal", () => {
 
         await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", "carol", 1));
         expect(updateSessionMock).not.toHaveBeenCalled();
-        expect(screen.getByRole("button", { name: "Copy link" })).toBeDisabled();
+        expect(screen.getByRole("button", { name: "Copy file link" })).toBeDisabled();
         expect(screen.getByRole("button", { name: "Open in mobile app" })).toBeDisabled();
         const workspaceToggle = within(screen.getByTestId("share-workspace-files")).getByRole(
           "switch",
@@ -1285,7 +1287,7 @@ describe("PermissionsModal", () => {
             wrapper: createWrapper(queryClient),
           },
         );
-        fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+        fireEvent.click(screen.getByRole("button", { name: "Copy file link" }));
 
         expect(writeText).toHaveBeenCalled();
         await waitFor(() =>
@@ -1349,7 +1351,7 @@ describe("PermissionsModal", () => {
             />,
             { wrapper: createWrapper() },
           );
-          fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+          fireEvent.click(screen.getByRole("button", { name: "Copy file link" }));
 
           expect(writeText).toHaveBeenCalled();
           await waitFor(() => expect(updateSessionMock).toHaveBeenCalled());
@@ -1504,7 +1506,7 @@ describe("PermissionsModal", () => {
         });
 
         expect(screen.getByRole("button", { name: "Grant" })).toBeDisabled();
-        expect(screen.getByRole("button", { name: "Copy link" })).toBeDisabled();
+        expect(screen.getByRole("button", { name: "Copy file link" })).toBeDisabled();
         expect(screen.getByRole("button", { name: "Open in mobile app" })).toBeDisabled();
         expect(screen.getByRole("combobox", { name: "Permission level for bob" })).toBeDisabled();
         if (sessionError) expect(screen.getByText(sessionError.message)).toBeInTheDocument();
@@ -1533,8 +1535,14 @@ describe("PermissionsModal", () => {
 
       expect(screen.getByRole("heading", { name: "Share this file" })).toBeInTheDocument();
       expect(
-        screen.getByText(/access to the entire session, including its messages and other files/),
+        within(screen.getByRole("note")).getByText(
+          "Shares the entire session and all workspace files",
+        ),
       ).toBeInTheDocument();
+      expect(screen.getByRole("note")).toHaveTextContent(
+        "New recipients get read-only access to all session messages by default. Existing permissions are preserved.",
+      );
+      expect(screen.getByRole("button", { name: "Copy file link" })).toBeEnabled();
       expect(screen.getByText("artifacts/report.html")).toBeInTheDocument();
       await waitFor(() => expect(screen.getByText("No grants yet.")).toBeInTheDocument());
       fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
@@ -1617,7 +1625,7 @@ describe("PermissionsModal", () => {
           />,
           { wrapper: createWrapper() },
         );
-        fireEvent.click(screen.getByRole("button", { name: /copy link/i }));
+        fireEvent.click(screen.getByRole("button", { name: /copy file link/i }));
         await waitFor(() => expect(writeText).toHaveBeenCalled());
         const link = new URL(writeText.mock.calls[0][0]);
         expect(link.origin).toBe("https://app.example.com");
@@ -1653,7 +1661,7 @@ describe("PermissionsModal", () => {
         { wrapper: createWrapper() },
       );
 
-      fireEvent.click(screen.getByRole("button", { name: /copy link/i }));
+      fireEvent.click(screen.getByRole("button", { name: /copy file link/i }));
       await waitFor(() => {
         expect(writeText).toHaveBeenCalledWith(
           `https://host.example.com:8443/embed#/workspace/omni/c/conv_abc?${query}`,

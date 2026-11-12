@@ -16,8 +16,9 @@ import {
   useState,
 } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { CheckIcon, LinkIcon, QrCodeIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
+import { CheckIcon, InfoIcon, LinkIcon, QrCodeIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -223,8 +224,7 @@ export function PermissionsModal({
 
   let description = "Invite others to view or collaborate on this session.";
   if (filePath) {
-    description =
-      "This link opens the file in full screen. Sharing grants access to the entire session, including its messages and other files.";
+    description = "This link opens the selected file in full screen.";
   } else if (sharingReadOnly) {
     description = "This server allows read-only sharing — invite others to view this session.";
   }
@@ -261,13 +261,7 @@ export function PermissionsModal({
           <DialogDescription asChild>
             <div className="space-y-3">
               <p>{description}</p>
-              {filePath && (
-                <p>
-                  Granting access, copying the link, or opening the mobile link enables Workspace
-                  files for everyone with Read access to this session.
-                </p>
-              )}
-              {sharingReadOnly && (
+              {sharingReadOnly && !filePath && (
                 <p>
                   Please be careful when sharing. Read access will allow for reading of all session
                   outputs.
@@ -276,7 +270,25 @@ export function PermissionsModal({
             </div>
           </DialogDescription>
         </DialogHeader>
-        {filePath && <p className="break-all font-mono text-sm">{filePath}</p>}
+        {filePath && (
+          <>
+            <p className="break-all font-mono text-sm">{filePath}</p>
+            <Alert role="note" className="bg-muted/50">
+              <InfoIcon />
+              <AlertTitle>Shares the entire session and all workspace files</AlertTitle>
+              <AlertDescription>
+                <p>
+                  New recipients get read-only access to all session messages by default. Existing
+                  permissions are preserved.
+                </p>
+                <p>
+                  Granting access, copying a file link, or opening the mobile link makes all
+                  workspace files available to everyone with Read access to this session.
+                </p>
+              </AlertDescription>
+            </Alert>
+          </>
+        )}
 
         {(publicSharingEnabled || publicGrant) && (
           <div className="flex min-w-0 items-center justify-between gap-3 rounded-lg border px-3 py-2">
@@ -336,9 +348,13 @@ export function PermissionsModal({
             data-testid="share-workspace-files"
           >
             <div>
-              <p className="text-ui font-medium">Workspace files</p>
+              <p className="text-ui font-medium">
+                {filePath ? "All workspace files" : "Workspace files"}
+              </p>
               <p className="text-sm text-muted-foreground">
-                Let people with view access browse this session's files
+                {filePath
+                  ? "Let everyone with Read access browse all workspace files"
+                  : "Let people with view access browse this session's files"}
               </p>
             </div>
             <Switch
@@ -704,6 +720,7 @@ function CopyLinkButton({
 }) {
   const [copied, setCopied] = useState(false);
   const rebasePath = useRebasePath();
+  const label = filePath ? "Copy file link" : "Copy link";
 
   useEffect(() => {
     if (!copied) return;
@@ -753,7 +770,7 @@ function CopyLinkButton({
       componentId="diagnostics.permissions.copy_link"
     >
       {copied ? <CheckIcon className="size-3.5" /> : <LinkIcon className="size-3.5" />}
-      {copied ? "Copied!" : "Copy link"}
+      {copied ? "Copied!" : label}
     </Button>
   );
 }
