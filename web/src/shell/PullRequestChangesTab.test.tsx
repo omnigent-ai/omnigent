@@ -287,6 +287,8 @@ describe("PullRequestChangesTab", () => {
     Element.prototype.animate = originalAnimate;
     comments.data = [];
     comments.isSuccess = true;
+    mocks.commitList.data = [];
+    mocks.sincePatches.clear();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
@@ -295,6 +297,7 @@ describe("PullRequestChangesTab", () => {
     { selected: true, mode: "changes", reducedMotion: false, earlier: false },
     { selected: false, mode: "changes", reducedMotion: false, earlier: false },
     { selected: true, mode: "commits", reducedMotion: true, earlier: false },
+    { selected: true, mode: "since", reducedMotion: false, earlier: false },
     { selected: true, mode: "changes", reducedMotion: false, earlier: true },
   ] as const)(
     "reveals review context from $mode after loading and mounting (selected: $selected, earlier: $earlier)",
@@ -307,7 +310,13 @@ describe("PullRequestChangesTab", () => {
       vi.spyOn(window, "matchMedia").mockReturnValue({ ...media, matches: reducedMotion });
       const conversationId = `local-comment-loading-${mode}-${selected}-${earlier}`;
       const view = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
-      act(() => view.result.current.setMode(mode));
+      if (mode === "since") {
+        mocks.commitList.data = [{ sha: "earlier-commit" }];
+        mocks.sincePatches.set("earlier-commit", B);
+        act(() => view.result.current.setSinceSha("earlier-commit"));
+      } else {
+        act(() => view.result.current.setMode(mode));
+      }
       const comment = {
         id: "local-comment",
         conversation_id: conversationId,
@@ -369,6 +378,7 @@ describe("PullRequestChangesTab", () => {
       await waitFor(() => expect(navigation.result.current).toBeUndefined());
       expect(getSeenCommentIds().has(comment.id)).toBe(true);
       expect(view.result.current.mode).toBe("changes");
+      expect(view.result.current.sinceSha).toBeNull();
       expect(view.result.current.shownEarlierCommentPaths.has("b.ts")).toBe(earlier);
       expect(focus.mock.calls.length).toBeGreaterThan(1);
       expect(mocks.animateComment).toHaveBeenCalledWith(

@@ -534,6 +534,7 @@ export function PullRequestChangesTab({
     setPathFilter,
     setHideViewed,
     setMode,
+    setSinceSha,
     shownEarlierCommentPaths,
     setEarlierCommentsShown,
   } = view;
@@ -561,8 +562,9 @@ export function PullRequestChangesTab({
       navigationTarget.anchor_metadata?.pr_url !== selectedPrUrl
     )
       return;
-    if (view.mode !== "changes") {
+    if (view.mode !== "changes" || view.sinceSha) {
       setMode("changes");
+      setSinceSha(null);
       return;
     }
     if (!localComments.some((comment) => comment.id === navigationTarget.id)) {
@@ -617,7 +619,9 @@ export function PullRequestChangesTab({
     setHideViewed,
     setPathFilter,
     setMode,
+    setSinceSha,
     view.mode,
+    view.sinceSha,
     localComments,
     sessionComments.isSuccess,
     sessionComments.isFetching,
@@ -669,7 +673,6 @@ export function PullRequestChangesTab({
     if (commitView && commits.data && commitIndex < 0) setMode("commits");
   }, [commitView, commits.data, commitIndex, setMode]);
   // A picked start that left the loaded list (the head moved) falls back to the PR base.
-  const { setSinceSha } = view;
   useEffect(() => {
     if (sinceSha && commits.data && !commitList.some((commit) => commit.sha === sinceSha)) {
       setSinceSha(null);
