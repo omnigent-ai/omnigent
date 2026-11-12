@@ -197,7 +197,7 @@ function MergeAccountPicker({
           disabled={disabled || setPref.isPending}
         >
           <SelectTrigger aria-label="Merge as" className="h-8 min-w-0 flex-1 text-ui">
-            <SelectValue placeholder="Account" />
+            <SelectValue placeholder="Choose an account" />
           </SelectTrigger>
           <SelectContent>
             {options.map((account) => (
@@ -263,8 +263,12 @@ function PullRequestMergeDialog({
 
   // `isPending` updates after a render, so a fast second click needs this guard.
   const submitting = useRef(false);
+  // After a failed switch the account is unknown until the info refetch says.
+  const accountUnknown = choosesAccount && !mergeAccount;
   const confirm = () => {
-    if (!method || unavailable || setPref.isPending || submitting.current) return;
+    if (!method || unavailable || setPref.isPending || accountUnknown || submitting.current) {
+      return;
+    }
     submitting.current = true;
     merge.mutate(
       { prUrl, mergeMethod: method, expectedHead: headSha, account: mergeAccount },
@@ -333,7 +337,9 @@ function PullRequestMergeDialog({
           </Button>
           <Button
             className={MERGE_BUTTON_CLASS}
-            disabled={!method || unavailable || merge.isPending || setPref.isPending}
+            disabled={
+              !method || unavailable || merge.isPending || setPref.isPending || accountUnknown
+            }
             onClick={confirm}
           >
             {merge.isPending && <Spinner aria-hidden />}

@@ -1144,10 +1144,16 @@ describe("PullRequestPanel", () => {
       expect(screen.getByText("Merge pull request #6000?")).toBeInTheDocument();
     });
 
-    it.each([true, false])(
-      "offers the PR's accounts to merge as when it can switch them (%s)",
-      (switching) => {
+    it.each([
+      [true, true, true],
+      [false, true, false],
+      // An older host would merge as its saved account, whatever the dialog sent.
+      [true, undefined, false],
+    ])(
+      "offers the PR's accounts to merge as (switching: %s, merge as account: %s)",
+      (switching, mergeAsAccount, offered) => {
         state.info!.data!.capabilities!.account_switching = switching;
+        state.info!.data!.capabilities!.merge_as_account = mergeAsAccount;
         state.info!.data!.accounts = ["work", "personal"].map((login) => ({
           login,
           active: login === "work",
@@ -1164,7 +1170,7 @@ describe("PullRequestPanel", () => {
         const picker = within(screen.getByRole("dialog")).queryByRole("combobox", {
           name: "Merge as",
         });
-        if (switching) {
+        if (offered) {
           expect(picker).toHaveTextContent("work (active)");
         } else {
           expect(picker).toBeNull();

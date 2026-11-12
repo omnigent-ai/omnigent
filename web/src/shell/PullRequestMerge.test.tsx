@@ -3,9 +3,9 @@
 // and a merge posts once, pinned to the head the dialog opened on.
 
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { PullRequest, PullRequestMergeMethod } from "@/hooks/usePullRequests";
+import type { PullRequest, PullRequestInfo, PullRequestMergeMethod } from "@/hooks/usePullRequests";
 import { mergeButtonState, PullRequestMerge, type MergeAccounts } from "./PullRequestMerge";
 
 const PR_URL = "https://github.com/acme/app/pull/7";
@@ -13,6 +13,7 @@ const MERGE_PATH = "/v1/sessions/conv_1/resources/github/merge";
 const DISABLE_PATH = "/v1/sessions/conv_1/resources/github/disable-auto-merge";
 const OPTIONS_PATH = "/v1/sessions/conv_1/resources/github/merge-options";
 const PREFERENCES_PATH = "/v1/sessions/conv_1/resources/github/preferences";
+const INFO_PATH = "/v1/sessions/conv_1/resources/github";
 const HEAD = "a".repeat(40);
 const AUTO_MERGE = { merge_method: "MERGE", enabled_by: "dev", enabled_at: "2026-10-21T06:02:55Z" };
 
@@ -53,11 +54,12 @@ interface Post {
 }
 
 /** Stub fetch: posts wait for the test to answer; merge options answer `options`. */
-function stubFetch(options: () => Response) {
+function stubFetch(options: () => Response, info?: () => Promise<Response>) {
   const posts: Post[] = [];
   const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), "http://localhost");
     if (url.pathname === OPTIONS_PATH) return Promise.resolve(options());
+    if (url.pathname === INFO_PATH && info) return info();
     if (init?.method === "POST") {
       return new Promise<Response>((respond) => {
         posts.push({ path: url.pathname, body: JSON.parse(String(init.body)), respond });
@@ -384,33 +386,98 @@ describe("merging as another account", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   });
 
-  it("merges as the account it shows after a switch fails", async () => {
-    const { posts } = stubFetch(allMethods);
-    renderMerge(pullRequest(), false, twoAccounts);
-
-    await openDialog();
-    const dialog = screen.getByRole("dialog");
-    const picker = within(dialog).getByRole("combobox", { name: "Merge as" });
-    fireEvent.click(picker);
-    fireEvent.click(screen.getByRole("option", { name: "personal" }));
-    await waitFor(() => expect(posts).toHaveLength(1));
-    // The host may have saved the new account before the reply failed.
-    await act(async () => {
-      posts[0].respond(json({ detail: "Host offline" }, 400));
+  /** The dialog fed from the PR's info query, as the panel feeds it. */
+  function MergeFromInfo() {
+    const { data } = useQuery({
+      queryKey: ["github-info", "conv_1", PR_URL],
+      queryFn: async () => {
+        const response = await fetch(INFO_PATH);
+        if (!response.ok) throw new Error("info failed");
+        return (await response.json()) as PullRequestInfo;
+      },
+      retry: false,
     });
-
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Couldn’t switch accounts: Host offline",
+    return (
+      <PullRequestMerge
+        conversationId="conv_1"
+        prUrl={PR_URL}
+        pr={pullRequest()}
+        accounts={data?.auth ?? undefined}
+      />
     );
-    expect(picker).toHaveTextContent("work");
-    fireEvent.click(within(dialog).getByRole("button", { name: "Squash and merge" }));
-    await waitFor(() => expect(posts).toHaveLength(2));
-    // The merge carries the shown account, so the host runs it as that one.
-    expect(posts[1]).toMatchObject({
-      path: MERGE_PATH,
-      body: { pr_url: PR_URL, merge_method: "squash", expected_head: HEAD, account: "work" },
-    });
-  });
+  }
+
+  it.each(["names the account", "fails too"])(
+    "fails closed after a failed switch until the refetch %s",
+    async (refetch) => {
+      const infoRequests: ((response: Response) => void)[] = [];
+      const { fetch, posts } = stubFetch(
+        allMethods,
+        () =>
+          new Promise((respond) => {
+            infoRequests.push(respond);
+          }),
+      );
+      const info = (selected: string) =>
+        json({
+          object: "session.github.info",
+          selected_pr_url: PR_URL,
+          auth: { ...twoAccounts, selected_account: selected },
+        });
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={client}>
+          <MergeFromInfo />
+        </QueryClientProvider>,
+      );
+      await waitFor(() => expect(infoRequests).toHaveLength(1));
+      await act(async () => infoRequests[0](info("work")));
+      const optionLoads = () =>
+        fetch.mock.calls.filter(([input]) => String(input).startsWith(OPTIONS_PATH)).length;
+
+      await openDialog();
+      const dialog = screen.getByRole("dialog");
+      const picker = within(dialog).getByRole("combobox", { name: "Merge as" });
+      await waitFor(() => expect(picker).toHaveTextContent("work"));
+      const loadsBefore = optionLoads();
+      fireEvent.click(picker);
+      fireEvent.click(screen.getByRole("option", { name: "personal" }));
+      await waitFor(() => expect(posts).toHaveLength(1));
+      // The host saved `personal`, then the reply failed.
+      await act(async () => {
+        posts[0].respond(json({ detail: "Host offline" }, 400));
+      });
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "Couldn’t switch accounts: Host offline",
+      );
+      // Neither account is known to be the saved one, so nothing can merge.
+      expect(picker).toHaveTextContent("Choose an account");
+      const confirm = within(dialog).getByRole("button", { name: "Squash and merge" });
+      expect(confirm).toBeDisabled();
+      // The failure still refetches the PR's info and the account's merge options.
+      await waitFor(() => expect(infoRequests).toHaveLength(2));
+      await waitFor(() => expect(optionLoads()).toBeGreaterThan(loadsBefore));
+
+      if (refetch === "names the account") {
+        await act(async () => infoRequests[1](info("personal")));
+        await waitFor(() => expect(picker).toHaveTextContent("personal"));
+      } else {
+        await act(async () => infoRequests[1](json({ detail: "Host offline" }, 503)));
+        expect(confirm).toBeDisabled();
+        // An explicit choice settles it.
+        fireEvent.click(picker);
+        fireEvent.click(screen.getByRole("option", { name: "personal" }));
+        await waitFor(() => expect(posts).toHaveLength(2));
+        await act(async () => posts[1].respond(info("personal")));
+        expect(picker).toHaveTextContent("personal");
+      }
+      await waitFor(() => expect(confirm).toBeEnabled());
+      fireEvent.click(confirm);
+      await waitFor(() => expect(posts.at(-1)?.path).toBe(MERGE_PATH));
+      expect(posts.at(-1)?.body).toMatchObject({ account: "personal" });
+    },
+  );
 
   it("offers no account choice with one signed-in account", async () => {
     const { posts } = stubFetch(allMethods);

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -376,50 +377,156 @@ def test_invalid_merges_never_reach_github(
         pr_resource.merge_pr(tracked, session_id="session", **request)  # type: ignore[arg-type]
 
 
-def test_a_merge_as_the_confirmed_account_saves_it_then_runs_as_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The panel may still show an account the host has since replaced.
+def _account_gh(calls: list[GhCall]) -> Callable[..., tuple[int, str, str]]:
+    """A ``_gh`` that hands each login a distinct token and records every call."""
+
+    def gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int, str, str]:
+        del cwd
+        calls.append((argv, token))
+        if argv[:2] == ["auth", "token"]:
+            return 0, f"token-{argv[3]}\n", ""
+        return 0, "", ""
+
+    return gh
+
+
+@pytest.fixture
+def account_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    """A tracked PR with isolated config, outside a sandbox."""
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.delenv("IS_SANDBOX", raising=False)
     SessionPrRegistry("session").record(
         [PullRequestRef.from_url(PR_URL)], relationship="created", source="test"
     )
-    github._config.set_github_account_preference("github.com/acme/widgets", "personal")
-    calls: list[GhCall] = []
+    return str(tmp_path)
 
-    def gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int, str, str]:
-        calls.append((argv, token))
-        if argv[:2] == ["auth", "token"]:
-            return 0, f"token-{argv[3]}\n", ""
-        return 0, "", ""
 
-    monkeypatch.setattr(github, "_gh", gh)
-
+def _merge_as(root: str, account: str) -> None:
     pr_resource.merge_pr(
-        str(tmp_path),
+        root,
         session_id="session",
         pr_url=PR_URL,
         merge_method="squash",
         expected_head=HEAD_SHA,
-        account="work",
+        account=account,
     )
 
+
+def test_a_merge_as_the_confirmed_account_saves_it_then_runs_as_it(
+    account_workspace: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The panel may still show an account the host has since replaced.
+    github._config.set_github_account_preference("github.com/acme/widgets", "personal")
+    calls: list[GhCall] = []
+    monkeypatch.setattr(github, "_gh", _account_gh(calls))
+
+    _merge_as(account_workspace, "work")
+
     assert github._config.github_account_preference("github.com/acme/widgets") == "work"
-    assert calls[-1] == (
-        [
-            "pr",
-            "merge",
-            "17",
-            "-R",
-            "github.com/acme/widgets",
-            "--squash",
-            "--match-head-commit",
-            HEAD_SHA,
-        ],
-        "token-work",
+    assert calls == [
+        (["auth", "token", "--user", "work", "-h", "github.com"], None),
+        (
+            [
+                "pr",
+                "merge",
+                "17",
+                "-R",
+                "github.com/acme/widgets",
+                "--squash",
+                "--match-head-commit",
+                HEAD_SHA,
+            ],
+            "token-work",
+        ),
+    ]
+
+
+def test_concurrent_merges_each_run_as_their_confirmed_account(
+    account_workspace: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[GhCall] = []
+    monkeypatch.setattr(github, "_gh", _account_gh(calls))
+    save = github._set_preference
+
+    def save_then_interleave(
+        root: str, reference: PullRequestRef | None, *, account: str | None, remote: str | None
+    ) -> None:
+        save(root, reference, account=account, remote=remote)
+        # A second dialog's merge saves its account before this one's runs.
+        if account == "work":
+            _merge_as(root, "personal")
+
+    monkeypatch.setattr(github, "_set_preference", save_then_interleave)
+
+    _merge_as(account_workspace, "work")
+
+    merges = [token for argv, token in calls if argv[:2] == ["pr", "merge"]]
+    assert merges == ["token-personal", "token-work"]
+
+
+@pytest.mark.parametrize(
+    ("active", "account", "error"),
+    [
+        ("work", "work", None),
+        ("work", "personal", "only use its own GitHub account, work"),
+        (None, "work", "only use its own GitHub account."),
+    ],
+)
+def test_a_sandbox_merges_only_as_its_own_account(
+    account_workspace: str,
+    monkeypatch: pytest.MonkeyPatch,
+    active: str | None,
+    account: str,
+    error: str | None,
+) -> None:
+    monkeypatch.setenv("IS_SANDBOX", "1")
+    calls: list[GhCall] = []
+    monkeypatch.setattr(github, "_gh", _account_gh(calls))
+    signed_in = [{"login": "work", "active": True, "host": "github.com"}] if active else []
+    monkeypatch.setattr(github, "_list_accounts", lambda _root: (bool(active), signed_in))
+
+    if error:
+        with pytest.raises(ValueError, match=error):
+            _merge_as(account_workspace, account)
+        assert not any(argv[:2] == ["pr", "merge"] for argv, _ in calls)
+    else:
+        _merge_as(account_workspace, account)
+        # gh's own (broker) identity runs it; no other account's token is read.
+        assert calls == [
+            (
+                [
+                    "pr",
+                    "merge",
+                    "17",
+                    "-R",
+                    "github.com/acme/widgets",
+                    "--squash",
+                    "--match-head-commit",
+                    HEAD_SHA,
+                ],
+                None,
+            )
+        ]
+
+
+def test_a_merge_as_an_account_needs_a_provider_that_binds_it(
+    account_workspace: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.runner.git_providers import github as github_provider
+
+    monkeypatch.setattr(
+        github_provider.GitHubPullRequests,
+        "capabilities",
+        dataclasses.replace(github_provider._CAPABILITIES, merge_as_account=False),
     )
+    calls: list[GhCall] = []
+    monkeypatch.setattr(github, "_gh", _account_gh(calls))
+
+    with pytest.raises(ValueError, match="can't merge as a chosen account"):
+        _merge_as(account_workspace, "work")
+    assert calls == []
+    assert github._config.github_account_preference("github.com/acme/widgets") is None
 
 
 @pytest.mark.parametrize("operation", ["pr_merge_options", "disable_pr_auto_merge"])

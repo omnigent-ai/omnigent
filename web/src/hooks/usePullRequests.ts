@@ -228,6 +228,8 @@ export interface PullRequestCapabilities {
   reviewer_editing?: boolean;
   /** The PR's title and description can be edited; absent from older hosts. */
   details_editing?: boolean;
+  /** A merge runs as the account the dialog sends; absent from older hosts. */
+  merge_as_account?: boolean;
   /** Images and videos can be uploaded into the description; absent from older hosts. */
   attachment_uploads?: boolean;
   /** The PR's commits can be listed and read one at a time; absent from older hosts. */
@@ -643,6 +645,18 @@ export function useSetPullRequestPreference(conversationId: string | undefined) 
         info,
       );
     },
+    // The host may have saved the account before the reply failed, so the cached
+    // one is no longer known to be right; nothing shows it until the refetch does.
+    onError: (_error, body) => {
+      if (body.account === undefined) return;
+      queryClient.setQueriesData<PullRequestInfo>(
+        { queryKey: ["github-info", conversationId] },
+        (info) =>
+          info && (!body.pr_url || info.selected_pr_url === body.pr_url)
+            ? withoutSelectedAccount(info)
+            : info,
+      );
+    },
     // The host may save the choice and still fail the reply, so refetch either way.
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] });
@@ -651,6 +665,14 @@ export function useSetPullRequestPreference(conversationId: string | undefined) 
       queryClient.invalidateQueries({ queryKey: ["github-merge-options", conversationId] });
     },
   });
+}
+
+function withoutSelectedAccount(info: PullRequestInfo): PullRequestInfo {
+  return {
+    ...info,
+    ...(info.selected_account !== undefined ? { selected_account: null } : {}),
+    ...(info.auth ? { auth: { ...info.auth, selected_account: null } } : {}),
+  };
 }
 
 /** `pr_url` plus the `base:head` revision the diff and file list are pinned to. */

@@ -39,6 +39,7 @@ from omnigent.git_providers import (
 from omnigent.runner import pr_reports
 from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
+    AccountMergeFacet,
     CommitCompareFacet,
     CommitsFacet,
     PinnedRevisionFacet,
@@ -814,9 +815,10 @@ def merge_pr(
 
     :param merge_method: ``merge``, ``squash``, or ``rebase``.
     :param expected_head: The full head commit SHA the user reviewed.
-    :param account: The account the user confirmed the merge as. It becomes the
-        PR's account first, so the merge runs as it even when the panel's view of
-        the saved account is stale. ``None`` merges as the saved account.
+    :param account: The account the user confirmed the merge as. The merge runs
+        as it even when the panel's view of the saved account is stale, and it
+        becomes the PR's account for later requests. ``None`` merges as the saved
+        account.
     :returns: A ``session.github.pr_merge``.
     :raises ValueError: On an unknown method, malformed SHA or account, without a
         selected tracked PR, or when the provider refuses the merge.
@@ -828,9 +830,20 @@ def merge_pr(
     if account is not None and (not isinstance(account, str) or not account.strip()):
         raise ValueError("Expected account to be an account login")
     facet, reference = _merge_target(session_id, pr_url)
-    if isinstance(account, str) and facet.capabilities.account_switching:
-        facet.set_preference(root, reference, account=account, remote=None)
-    return facet.merge(root, reference, merge_method=merge_method, expected_head=expected_head)
+    if not isinstance(account, str):
+        return facet.merge(root, reference, merge_method=merge_method, expected_head=expected_head)
+    capabilities = facet.capabilities
+    if not (
+        capabilities.account_switching
+        and capabilities.merge_as_account
+        and isinstance(facet, AccountMergeFacet)
+    ):
+        # Merging as the saved account instead could act as one the user didn't confirm.
+        raise ValueError("This provider can't merge as a chosen account.")
+    facet.set_preference(root, reference, account=account, remote=None)
+    return facet.merge_as(
+        root, reference, merge_method=merge_method, expected_head=expected_head, account=account
+    )
 
 
 def disable_pr_auto_merge(

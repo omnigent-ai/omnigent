@@ -233,6 +233,13 @@ function GithubAccountSelector({
   );
 }
 
+/** The accounts the merge dialog offers, when the host merges as the one it sends. */
+function mergeAccounts(info: NormalizedPullRequestInfo | undefined) {
+  return info?.capabilities.account_switching && info.capabilities.merge_as_account
+    ? info.auth
+    : undefined;
+}
+
 /** The one thing the panel should show, derived from the info query. Every
  *  non-`ready` kind is a whole-panel state; `ready` renders the PR + diff. */
 export type PullRequestPanelState =
@@ -936,7 +943,7 @@ function PullRequestListRow({
             conversationId={conversationId}
             prUrl={association.url}
             pr={cachedPr}
-            accounts={data?.capabilities.account_switching ? data.auth : undefined}
+            accounts={mergeAccounts(data)}
           />
         )}
       </div>
@@ -1851,7 +1858,7 @@ function PullRequestPanelDetails({
                   conversationId={conversationId}
                   prUrl={data.selected_pr_url}
                   pr={pr}
-                  accounts={data.capabilities.account_switching ? data.auth : undefined}
+                  accounts={mergeAccounts(data)}
                 />
               )
             }

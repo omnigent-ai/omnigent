@@ -2040,27 +2040,59 @@ def _merge_error(stderr: str, *, action: str) -> str:
     return f"GitHub could not {action}: {detail}"
 
 
-def _run_pr_merge(
-    root: str, reference: PullRequestRef, flags: list[str], *, action: str, timed_out: str
-) -> None:
-    """Run ``gh pr merge <flags>`` on the PR as its selected account.
+def _active_login(root: str, host: str) -> str | None:
+    """``gh``'s active account on ``host``, or ``None`` when there is none."""
+    _, accounts = _list_accounts(root)
+    return next(
+        (a.get("login") for a in accounts if a.get("host") == host and a.get("active")), None
+    )
 
-    Every ``gh`` call shares :data:`_PR_EDIT_REQUEST_SECONDS`. Without a saved
-    account, ``gh``'s active account runs it; a saved one without a token refuses.
+
+def _run_pr_merge(
+    root: str,
+    reference: PullRequestRef,
+    flags: list[str],
+    *,
+    action: str,
+    timed_out: str,
+    account: str | None = None,
+) -> None:
+    """Run ``gh pr merge <flags>`` on the PR as ``account`` or its selected account.
+
+    Every ``gh`` call shares :data:`_PR_EDIT_REQUEST_SECONDS`. ``account`` binds
+    this call alone; it is never read back from the saved preference, which a
+    concurrent request can change. Without either, ``gh``'s active account runs
+    it; a named account without a token refuses. A sandbox keeps its single
+    broker identity, so it refuses any other ``account``.
 
     :param action: What the command does, for error messages.
     :param timed_out: Message when the deadline leaves the outcome unknown.
+    :param account: The account the user confirmed for this command.
     :raises ValueError: With a user-facing message when GitHub refuses.
     """
     with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
         _host_args(root, reference)
-        token = _pr_token(root, reference)
+        sandbox_login: str | None = None
+        if account is None:
+            token = _pr_token(root, reference)
+            login = (
+                None
+                if _in_sandbox()
+                else _config.github_account_preference(_repo_argument(reference))
+            )
+        elif _in_sandbox():
+            token, login = None, None
+            sandbox_login = _active_login(root, reference.host)
+        else:
+            token, login = _gh_auth_token(root, account, reference.host), account
         # Without the selected account's token gh would run as another account.
         if _gh_timed_out.get():
             raise ValueError(timed_out)
-        login = (
-            None if _in_sandbox() else _config.github_account_preference(_repo_argument(reference))
-        )
+        if account is not None and _in_sandbox() and sandbox_login != account:
+            raise ValueError(
+                "This sandbox can only use its own GitHub account"
+                + (f", {sandbox_login}." if sandbox_login else ".")
+            )
         if login and token is None:
             raise ValueError(
                 f"The selected GitHub account {login} isn't signed in on the host. "
@@ -2078,13 +2110,19 @@ def _run_pr_merge(
 
 
 def _merge_pr(
-    root: str, reference: PullRequestRef, *, merge_method: str, expected_head: str
+    root: str,
+    reference: PullRequestRef,
+    *,
+    merge_method: str,
+    expected_head: str,
+    account: str | None = None,
 ) -> dict[str, Any]:
     """Merge the PR with ``gh pr merge``, only while its head is ``expected_head``.
 
     ``--match-head-commit`` makes GitHub refuse the merge when the branch moved
     since the panel showed it.
 
+    :param account: Run as this account instead of the PR's saved one.
     :raises ValueError: With a user-facing message when GitHub refuses the merge.
     """
     _run_pr_merge(
@@ -2093,6 +2131,7 @@ def _merge_pr(
         [f"--{merge_method}", "--match-head-commit", expected_head],
         action="merge this pull request",
         timed_out=_MERGE_TIMED_OUT,
+        account=account,
     )
     return {"object": PR_MERGE_OBJECT, "pr_url": reference.url}
 
