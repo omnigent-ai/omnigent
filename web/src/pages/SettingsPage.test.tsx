@@ -30,6 +30,7 @@ import {
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import * as host from "@/lib/host";
 import * as adminView from "@/lib/adminView";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
 import {
   readTerminalClipboardPreference,
@@ -55,6 +56,7 @@ const mocks = vi.hoisted(() => ({
   // multi-user-header. Gates the settings-route single-user redirect.
   singleUser: false,
   adminViewSupported: true as boolean | undefined,
+  bootFallback: false,
   sessionTitleInstructions: false,
   nestedAgents: false,
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
@@ -82,15 +84,18 @@ vi.mock("next-themes", () => ({
   }),
 }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({
-    accounts_enabled: mocks.accountsEnabled,
-    login_url: mocks.loginUrl,
-    single_user: mocks.singleUser,
-    admin_view: mocks.adminViewSupported,
-    sibling_sessions: mocks.nestedAgents,
-    enabled_connections: mocks.enabledConnections,
-    session_title_instructions: mocks.sessionTitleInstructions,
-  }),
+  useServerInfo: () =>
+    mocks.bootFallback
+      ? SERVER_INFO_OFFLINE_FALLBACK
+      : {
+          accounts_enabled: mocks.accountsEnabled,
+          login_url: mocks.loginUrl,
+          single_user: mocks.singleUser,
+          admin_view: mocks.adminViewSupported,
+          sibling_sessions: mocks.nestedAgents,
+          enabled_connections: mocks.enabledConnections,
+          session_title_instructions: mocks.sessionTitleInstructions,
+        },
 }));
 vi.mock("@/components/SessionTitleInstructionsControl", () => ({
   SessionTitleInstructionsControl: () => <div data-testid="mock-session-title-instructions" />,
@@ -286,6 +291,7 @@ beforeEach(() => {
   mocks.isEmbedded = false;
   mocks.accountsEnabled = true;
   mocks.adminViewSupported = true;
+  mocks.bootFallback = false;
   mocks.sessionTitleInstructions = false;
   mocks.nestedAgents = false;
   mocks.importSessionsPanel.mockClear();
@@ -382,14 +388,16 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 
 describe("SettingsPage", () => {
   it.each([
-    { supported: false, enabled: true },
-    { supported: false, enabled: false },
-    { supported: undefined, enabled: true },
+    { supported: false, enabled: true, bootFallback: false },
+    { supported: false, enabled: false, bootFallback: false },
+    { supported: undefined, enabled: true, bootFallback: false },
+    { supported: undefined, enabled: false, bootFallback: true },
   ])(
-    "hides admin view with support=$supported and preference=$enabled",
-    ({ supported, enabled }) => {
+    "hides admin view with support=$supported, preference=$enabled, boot=$bootFallback",
+    ({ supported, enabled, bootFallback }) => {
       mocks.me = { id: "admin", is_admin: true };
       mocks.adminViewSupported = supported;
+      mocks.bootFallback = bootFallback;
       if (!enabled) document.cookie = "omnigent_admin_view=off; Path=/";
       try {
         renderPage("/settings/general");

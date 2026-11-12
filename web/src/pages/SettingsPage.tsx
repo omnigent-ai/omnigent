@@ -1981,6 +1981,7 @@ function AdminViewControl() {
   if (
     !eligible ||
     info === "loading" ||
+    isBootFallbackInfo(info) ||
     info.admin_view === false ||
     (isAdminViewEnabled() && (!info.admin_view || info.single_user || isDatabricksWorkspace()))
   )
