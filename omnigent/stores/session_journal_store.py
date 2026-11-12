@@ -572,6 +572,37 @@ class SessionJournalStore:
             plans=plans, next_cursor=_run_cursor(plans[-1]) if len(rows) > limit else None
         )
 
+    def run_start_plans(self, runs: Sequence[tuple[str, str]]) -> list[JournalEntry | None]:
+        """Each automation run's first plan: the one it started with.
+
+        One run-index lookup per run, e.g. for a page of an automation's runs.
+
+        :param runs: ``(scheduled_task_run_id, conversation_id)`` pairs; each
+            run serves one session.
+        :returns: Each run's first plan entry in order, or ``None`` for a run
+            that wrote no plan.
+        """
+        entries = SqlSessionJournalEntry
+        plans: list[JournalEntry | None] = []
+        with self._session("read_run_start_plans") as session:
+            for run_id, conversation_id in runs:
+                row = session.execute(
+                    _using(
+                        select(entries)
+                        .where(
+                            entries.workspace_id == current_workspace_id(),
+                            entries.scheduled_task_run_id == run_id,
+                            entries.conversation_id == conversation_id,
+                            entries.kind == _PLAN_KIND,
+                        )
+                        .order_by(entries.position)
+                        .limit(1),
+                        "ix_session_journal_entries_scheduled_task_run_id",
+                    )
+                ).scalar_one_or_none()
+                plans.append(None if row is None else self._entries([row])[0])
+        return plans
+
     def plan_step_statuses(self, plans: Sequence[JournalEntry]) -> list[dict[str, JournalEntry]]:
         """For each plan, its steps' newest status entries in its session.
 

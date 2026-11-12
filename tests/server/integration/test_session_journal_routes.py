@@ -732,3 +732,57 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
     assert (await client.get(url, headers=_headers(BOB))).status_code == 404
     bad = await client.get(f"{url}?before=nope", headers=_headers(ALICE))
     assert bad.status_code == 400
+
+
+async def test_an_automations_runs_list_the_steps_of_their_first_plans(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    task = tasks.create(
+        uuid.uuid4().hex,
+        "triage",
+        '/workflow Run the saved workflow "Triage" (ID ' + "9" * 32 + ").",
+        "FREQ=DAILY;BYHOUR=7;BYMINUTE=0",
+        ALICE,
+        uuid.uuid4().hex,
+        "UTC",
+    )
+    steps = [
+        {"id": "explore", "name": "Explore", "depends_on": []},
+        {"id": "fix", "name": "Fix", "depends_on": ["explore"]},
+    ]
+    planned, idle = _session(db_uri), _session(db_uri)
+    run_ids = []
+    for index, session_id in enumerate((planned, idle)):
+        run = tasks.create_run(
+            uuid.uuid4().hex,
+            task.id,
+            "running",
+            1_762_498_800 + index,
+            conversation_id=session_id,
+            fired_at=1_762_498_801 + index,
+        )
+        SqlAlchemyConversationStore(db_uri).set_labels(
+            session_id, {SCHEDULED_TASK_RUN_LABEL_KEY: run.id}
+        )
+        run_ids.append(run.id)
+    url = f"/v1/sessions/{planned}/journal"
+    for body in (
+        _write("plan", {"name": "Triage", "steps": steps}, "tool:1"),
+        _write("status", {"status": "done", "text": "Found it"}, "tool:2", step="explore"),
+    ):
+        assert (await client.post(url, json=body, headers=_runner(planned))).status_code == 200
+
+    page = (
+        await client.get(f"/v1/scheduled-tasks/{task.id}/run-steps", headers=_headers(ALICE))
+    ).json()
+    # The run whose session wrote no plan has no steps to show.
+    assert [run["run_id"] for run in page["runs"]] == [run_ids[0]]
+    (shown,) = page["runs"]
+    assert [step["id"] for step in shown["steps"]] == ["explore", "fix"]
+    assert [(s["step"], s["payload"]["status"]) for s in shown["statuses"]] == [
+        ("explore", "done")
+    ]
+    assert page["next_cursor"] is None
+    other = await client.get(f"/v1/scheduled-tasks/{task.id}/run-steps", headers=_headers(BOB))
+    assert other.status_code == 404
