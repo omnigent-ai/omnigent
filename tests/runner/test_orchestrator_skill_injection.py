@@ -62,8 +62,8 @@ def test_codex_resolves_the_injected_skill(tmp_path: Path) -> None:
     assert SKILL_NAME in select_codex_skill_dirs("all", sources)
 
 
-def test_agents_with_the_journal_tools_also_get_the_workflow_skill(tmp_path: Path) -> None:
-    """Native harnesses run ``/workflow`` themselves, so the skill lands in the bundle."""
+def test_agents_with_the_journal_tools_also_get_the_workflow_skills(tmp_path: Path) -> None:
+    """Native harnesses run ``/workflow`` and ``/save-workflow`` themselves; both are bundled."""
     from omnigent.spec.types import AgentSpec, ToolGroupsConfig
 
     with_journal, without = tmp_path / "with", tmp_path / "without"
@@ -73,5 +73,8 @@ def test_agents_with_the_journal_tools_also_get_the_workflow_skill(tmp_path: Pat
     )
 
     assert (with_journal / "skills" / "workflow" / "SKILL.md").is_file()
-    assert sorted(p.name for p in (with_journal / "skills").iterdir()) == [SKILL_NAME, "workflow"]
+    assert (with_journal / "skills" / "save-workflow" / "SKILL.md").is_file()
+    assert sorted(p.name for p in (with_journal / "skills").iterdir()) == sorted(
+        [SKILL_NAME, "save-workflow", "workflow"]
+    )
     assert [p.name for p in (without / "skills").iterdir()] == [SKILL_NAME]

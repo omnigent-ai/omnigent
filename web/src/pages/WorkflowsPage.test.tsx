@@ -2,13 +2,15 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { showToast } from "@/components/ui/toast";
+import type { WorkflowSessionRequest } from "@/components/workflows/WorkflowSessionDialog";
 import {
   type SavedWorkflow,
   useDeleteWorkflow,
   useSavedWorkflows,
 } from "@/hooks/useSavedWorkflows";
-
-import type { WorkflowSessionRequest } from "@/components/workflows/WorkflowSessionDialog";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import type * as RoutingModule from "@/lib/routing";
 
 import { WorkflowsPage } from "./WorkflowsPage";
 
@@ -23,7 +25,29 @@ vi.mock("@/components/workflows/WorkflowSessionDialog", () => ({
       <div data-testid="workflow-session-dialog">{JSON.stringify(props.request)}</div>
     ) : null,
 }));
+// Likewise New automation: it shows the workflow it locks, and Create reports a new automation.
+vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
+  CreateScheduledTaskDialog: (props: {
+    open: boolean;
+    initialName?: string;
+    lockedWorkflow?: SavedWorkflow | null;
+    onCreated?: (task: { id: string }) => void;
+  }) =>
+    props.open ? (
+      <div data-testid="new-automation-dialog" data-name={props.initialName}>
+        {props.lockedWorkflow?.name}
+        <button type="button" onClick={() => props.onCreated?.({ id: "task-1" })}>
+          Create
+        </button>
+      </div>
+    ) : null,
+}));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
+const navigate = vi.fn();
+vi.mock("@/lib/routing", async (importOriginal) => {
+  const actual = await importOriginal<typeof RoutingModule>();
+  return { ...actual, useNavigate: () => navigate };
+});
 
 function workflow(name: string, description: string): SavedWorkflow {
   return { id: name.toLowerCase().replaceAll(" ", "-"), name, description };
@@ -54,6 +78,7 @@ const openMenu = (row: HTMLElement) =>
 describe("WorkflowsPage", () => {
   beforeEach(() => {
     vi.mocked(showToast).mockClear();
+    navigate.mockClear();
     deleteWorkflow.mockClear();
     vi.mocked(useDeleteWorkflow).mockReturnValue({
       mutate: deleteWorkflow,
@@ -101,15 +126,26 @@ describe("WorkflowsPage", () => {
     });
   });
 
-  it("says Create automation isn't connected yet", () => {
+  it("opens New automation locked to the workflow, then the automation it creates", () => {
     mockWorkflows({ workflows: WORKFLOWS });
-    render(<WorkflowsPage />);
-
-    openMenu(rows()[0]!);
-    fireEvent.click(screen.getByTestId("workflow-create-automation"));
-    expect(showToast).toHaveBeenLastCalledWith(
-      "Creating automations from workflows isn’t connected yet.",
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { automations_v2: true } }}
+      >
+        <WorkflowsPage />
+      </CapabilitiesProvider>,
     );
+    expect(screen.queryByTestId("new-automation-dialog")).toBeNull();
+
+    openMenu(rows()[1]!);
+    fireEvent.click(screen.getByTestId("workflow-create-automation"));
+    const dialog = screen.getByTestId("new-automation-dialog");
+    expect(dialog).toHaveTextContent("Release a new version");
+    expect(dialog).toHaveAttribute("data-name", "Release a new version");
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+    expect(showToast).toHaveBeenCalledWith("Automation created");
+    expect(navigate).toHaveBeenCalledWith("/tasks/task-1");
   });
 
   it("searches names and descriptions", () => {

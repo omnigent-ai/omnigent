@@ -3,14 +3,16 @@
  * "New workflow" button. Laid out like the Automations page.
  *
  * New workflow asks for a name and what it should do, then where the session
- * that drafts it runs; Run asks where a saved one's session runs. Delete
- * removes one; Create automation isn't connected yet.
+ * that drafts it runs; Run asks where a saved one's session runs. Create
+ * automation opens New automation with the workflow chosen and locked. Delete
+ * removes one.
  */
 
 import { useMemo, useState } from "react";
 import { Loader2Icon, SearchIcon, TriangleAlertIcon, WorkflowIcon } from "lucide-react";
 
 import { PageScroll } from "@/components/PageScroll";
+import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { showToast } from "@/components/ui/toast";
@@ -20,11 +22,20 @@ import {
   type WorkflowSessionRequest,
   WorkflowSessionDialog,
 } from "@/components/workflows/WorkflowSessionDialog";
-import { useDeleteWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import {
+  type SavedWorkflow,
+  useDeleteWorkflow,
+  useSavedWorkflows,
+} from "@/hooks/useSavedWorkflows";
+import { automationPagePath } from "@/lib/automationFromSession";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { useNavigate } from "@/lib/routing";
 
 export function WorkflowsPage() {
   const { workflows, isLoading, isError, refresh } = useSavedWorkflows();
   const deleteWorkflow = useDeleteWorkflow();
+  const navigate = useNavigate();
+  const info = useServerInfo();
   const [search, setSearch] = useState("");
   const [creating, setCreating] = useState(false);
   // The request stays set while its session dialog closes.
@@ -34,6 +45,9 @@ export function WorkflowsPage() {
     setSessionRequest(request);
     setSessionOpen(true);
   };
+  // Likewise for its New automation dialog.
+  const [automationTarget, setAutomationTarget] = useState<SavedWorkflow | null>(null);
+  const [automationOpen, setAutomationOpen] = useState(false);
 
   const hasAnyWorkflows = workflows.length > 0;
   const filtered = useMemo(() => {
@@ -106,9 +120,10 @@ export function WorkflowsPage() {
               key={workflow.id}
               workflow={workflow}
               onRun={() => startSession({ kind: "run", workflow })}
-              onCreateAutomation={() =>
-                showToast("Creating automations from workflows isn’t connected yet.")
-              }
+              onCreateAutomation={() => {
+                setAutomationTarget(workflow);
+                setAutomationOpen(true);
+              }}
               onDelete={() =>
                 deleteWorkflow.mutate(workflow.id, {
                   onError: () => showToast(`Couldn’t delete “${workflow.name}”.`),
@@ -130,6 +145,18 @@ export function WorkflowsPage() {
         open={sessionOpen}
         onOpenChange={setSessionOpen}
       />
+      {automationTarget && (
+        <CreateScheduledTaskDialog
+          open={automationOpen}
+          onOpenChange={setAutomationOpen}
+          initialName={automationTarget.name}
+          lockedWorkflow={automationTarget}
+          onCreated={(task) => {
+            showToast("Automation created");
+            navigate(automationPagePath(info, task));
+          }}
+        />
+      )}
     </PageScroll>
   );
 }

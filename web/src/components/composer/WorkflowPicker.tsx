@@ -65,9 +65,10 @@ export function WorkflowPicker({
             <span className="flex size-4 shrink-0 items-center justify-center">
               <WorkflowIcon className="size-3.5" />
             </span>
-            <span className="flex h-lh min-w-0 flex-wrap items-center gap-x-2 overflow-hidden">
-              <span className="min-w-0 truncate">{workflow.name}</span>
-              <span className="text-xs leading-4 text-muted-foreground">
+            {/* One line: the description is cut off to fit, so the row never widens. */}
+            <span className="flex min-w-0 flex-1 items-center gap-2">
+              <span className="max-w-[70%] shrink-0 truncate">{workflow.name}</span>
+              <span className="min-w-0 flex-1 truncate text-xs leading-4 text-muted-foreground">
                 {workflow.description.split("\n")[0]}
               </span>
             </span>

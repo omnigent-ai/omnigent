@@ -238,6 +238,7 @@ export function CreateScheduledTaskDialog({
   sessionLink = "",
   editingTask = null,
   sourceSession = null,
+  lockedWorkflow = null,
   onCreated,
 }: {
   open: boolean;
@@ -253,6 +254,8 @@ export function CreateScheduledTaskDialog({
   editingTask?: ScheduledTask | null;
   /** Create the automation from this session: every run starts from a copy of it. */
   sourceSession?: AutomationSourceSession | null;
+  /** Create the automation from this saved workflow: runs follow it, and it can't be changed. */
+  lockedWorkflow?: SavedWorkflow | null;
   /** Called once with the new automation after it is created (not after an edit). */
   onCreated?: (task: ScheduledTask) => void;
 }) {
@@ -563,7 +566,9 @@ export function CreateScheduledTaskDialog({
       setEditingSystemPrompt(false);
       const parts = splitTriggerPrompt(editingTask?.prompt ?? initialPrompt ?? "");
       const savedRun = parseSavedWorkflowMessage(parts.userPrompt);
-      setWorkflowChoice(savedRun && { id: savedRun.id, name: savedRun.name, description: "" });
+      setWorkflowChoice(
+        lockedWorkflow ?? (savedRun && { id: savedRun.id, name: savedRun.name, description: "" }),
+      );
       setPrompt(savedRun ? savedRun.details : parts.userPrompt);
       setSystemPrompt(parts.systemPrompt);
       setTimezone(editingTask?.timezone ?? localTimezone());
@@ -626,6 +631,7 @@ export function CreateScheduledTaskDialog({
     savedSchedule,
     savedWorkspace,
     sourceSession,
+    lockedWorkflow,
   ]);
 
   // A new task starts on a server sandbox when one is offered, so it doesn't
@@ -933,6 +939,7 @@ export function CreateScheduledTaskDialog({
         value={workflowShown}
         onChange={setWorkflowChoice}
         onOpenChange={handleSelectOpenChange}
+        locked={lockedWorkflow !== null}
       />
     ) : null;
   const promptTriggerFields = {
