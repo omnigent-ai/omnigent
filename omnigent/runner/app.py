@@ -5659,6 +5659,15 @@ def create_runner_app(
         _own_task = asyncio.current_task()
         _turn_message_bodies[conv] = msg_body
         _own_epoch = _turn_bind_epoch.get(conv)
+
+        def owns_turn() -> bool:
+            """Whether this task still owns the session's turn generation."""
+            return (
+                _own_task is not None
+                and _active_turns.get(conv) is _own_task
+                and _turn_bind_epoch.get(conv) == _own_epoch
+            )
+
         # A fresh turn is binding: whatever desync the previous turn ended on is
         # resolved now. Also clear a stale publish-once token (e.g. left set by a
         # wedged stream that never reached its own _on_proxy_stream_end) so it
@@ -5679,6 +5688,7 @@ def create_runner_app(
                 # error event) is never shadowed by the generic except below.
                 raise
             except asyncio.CancelledError as exc:
+                owns_active_turn = owns_turn()
                 _logger.error(
                     "turn cancelled for %s: %s",
                     conv,
@@ -5694,20 +5704,25 @@ def create_runner_app(
                         interrupt_marked=conv in _interrupted_sessions,
                         desync_marked=conv in _desynced_sessions,
                         handed_to_harness=handed_off[0],
-                        owns_active_turn=_active_turns.get(conv) is _own_task,
+                        owns_active_turn=owns_active_turn,
                         task_cancel_count=_own_task.cancelling() if _own_task else None,
                     ),
                 )
-                _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+                if owns_active_turn:
+                    _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
                 raise
             except Exception as exc:
-                _logger.error(
+                owns_active_turn = owns_turn()
+                _logger.log(
+                    logging.ERROR if owns_active_turn else logging.WARNING,
                     "turn setup failed for %s: %s",
                     conv,
                     exc,
                     exc_info=True,
                     extra={"session_id": conv},
                 )
+                if not owns_active_turn:
+                    return
                 error: dict[str, object] = {"message": f"turn setup failed: {exc}"}
                 if not handed_off[0]:
                     identity = _input_identity(msg_body)
@@ -5734,7 +5749,7 @@ def create_runner_app(
                 # clobber the newer turn (the same class of bug the ExecutorAdapter
                 # identity CAS fixes). When the slot is a None sentinel or a
                 # different task, this turn is already accounted for — skip.
-                if _active_turns.get(conv) is _own_task and _own_task is not None:
+                if owns_turn():
                     _on_proxy_stream_end(conv)
                 if _turn_message_bodies.get(conv) is msg_body:
                     _turn_message_bodies.pop(conv, None)

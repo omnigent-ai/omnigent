@@ -726,12 +726,14 @@ describe("authenticatedFetch", () => {
     );
 
     it.each([
-      [{ host_type: "managed", host_id: "host_fork" }, "host_fork"],
-      [{ host_type: "managed" }, CLIENT_KEY],
-      [{}, "host_source"],
-    ])("keys a managed fork only by the host it names (%j)", async (body, key) => {
-      // A managed fork's launch runs on the replica it lands on, so it must
-      // land where its own new host will connect (the client key without an
+      ["fork", { host_type: "managed", host_id: "host_fork" }, "host_fork"],
+      ["fork", { host_type: "managed" }, CLIENT_KEY],
+      ["fork", {}, "host_source"],
+      ["managed-host", { host_id: "host_sandbox" }, "host_sandbox"],
+      ["managed-host", {}, CLIENT_KEY],
+    ])("keys a managed %s only by the new host it names (%j)", async (route, body, key) => {
+      // A managed fork's or move's launch runs on the replica it lands on, so
+      // it must land where its own new host will connect (the client key without an
       // id), never on the source's; any other fork keeps the source's key.
       vi.doMock("./sessionHost", () => ({
         getSessionHost: vi.fn(() => "host_source"),
@@ -753,7 +755,7 @@ describe("authenticatedFetch", () => {
       fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
       const { authenticatedFetch } = await import("./identity");
 
-      await authenticatedFetch("/v1/sessions/conv_src/fork", {
+      await authenticatedFetch(`/v1/sessions/conv_src/${route}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
