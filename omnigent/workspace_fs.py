@@ -774,6 +774,26 @@ class WorkspaceReader:
             ),
         )
 
+    def github_compare_diff(
+        self,
+        session_id: str | None = None,
+        pr_url: str | None = None,
+        *,
+        head_sha: str | None = None,
+        from_sha: str | None = None,
+    ) -> _WorkspacePayload:
+        """The selected PR's changes after one of its commits."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_compare_diff(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+                head_sha=head_sha,
+                from_sha=from_sha,
+            ),
+        )
+
     def github_labels(
         self, session_id: str | None = None, pr_url: str | None = None
     ) -> _WorkspacePayload:

@@ -3819,11 +3819,16 @@ def test_pr_attachments_fit_one_tunnel_frame() -> None:
 
 
 @pytest.mark.asyncio
-async def test_github_merge_relays_the_runner_refusal(client: httpx.AsyncClient) -> None:
+@pytest.mark.parametrize(
+    ("route", "extra"), [("merge", {}), ("merge-as", {"account": "personal"})]
+)
+async def test_github_merge_relays_the_runner_refusal(
+    client: httpx.AsyncClient, route: str, extra: dict[str, str]
+) -> None:
     """A refused merge keeps the runner's status and message, with the PR edit wait."""
     from omnigent.server.routes.sessions import routes_resources
 
-    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/merge"
+    path = f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/{route}"
     detail = "The pull request's branch changed since the panel loaded."
     fake_runner = _FakeRunnerClient(responses={path: (400, {"detail": detail})})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
@@ -3839,6 +3844,7 @@ async def test_github_merge_relays_the_runner_refusal(client: httpx.AsyncClient)
         "pr_url": "https://github.com/acme/widgets/pull/17",
         "merge_method": "merge",
         "expected_head": "a" * 40,
+        **extra,
     }
 
     resp = await client.post(path, json={**body, "admin": True})
@@ -3848,6 +3854,29 @@ async def test_github_merge_relays_the_runner_refusal(client: httpx.AsyncClient)
     assert timeouts == [routes_resources._PR_EDIT_PROXY_TIMEOUT_S]
     # Only the known fields are forwarded.
     assert fake_runner.post_json_calls == [(path, body)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("account", [None, "", " ", 7])
+async def test_github_merge_as_requires_an_account(
+    client: httpx.AsyncClient, account: object
+) -> None:
+    """Without an account to bind, merge-as is refused, never sent as a plain merge."""
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/merge-as"
+    fake_runner = _FakeRunnerClient(payload={"object": "session.github.pr_merge"})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    body = {
+        "pr_url": "https://github.com/acme/widgets/pull/17",
+        "merge_method": "merge",
+        "expected_head": "a" * 40,
+        "account": account,
+    }
+
+    resp = await client.post(path, json=body)
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "Expected an account to merge as"
+    assert fake_runner.post_json_calls == []
 
 
 @pytest.mark.asyncio
@@ -3908,6 +3937,25 @@ async def test_github_commit_diff_forwards_the_commit_to_the_runner(
         "GET",
         "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/commit-diff",
     ) in fake_runner.calls
+
+
+@pytest.mark.asyncio
+async def test_github_compare_diff_forwards_both_commits_to_the_runner(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /resources/github/compare-diff proxies the head and the picked commit."""
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/compare-diff"
+    payload = {"object": "session.github.pr_diff", "patch": "through head\n"}
+    fake_runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    head, start = "a" * 40, "c" * 40
+
+    resp = await client.get(path, params={"head_sha": head, "from_sha": start})
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert {"head_sha": head, "from_sha": start} in fake_runner.get_params
+    assert ("GET", path) in fake_runner.calls
 
 
 @pytest.mark.asyncio
@@ -10845,6 +10893,13 @@ async def test_selected_pr_reaches_offline_host(
             404,
         ),
         (
+            "/compare-diff",
+            {"head_sha": "a" * 40, "from_sha": "c" * 40},
+            "github_compare_diff",
+            "unknown fs op: 'github_compare_diff'",
+            404,
+        ),
+        (
             "/commits",
             {"head_sha": "a" * 40},
             "github_commits",
@@ -10934,6 +10989,12 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
             {"merge_method": "squash", "expected_head": "a" * 40},
             "github_merge",
             {"merge_method": "squash", "expected_head": "a" * 40},
+        ),
+        (
+            "/merge-as",
+            {"merge_method": "squash", "expected_head": "a" * 40, "account": "personal"},
+            "github_merge_as",
+            {"merge_method": "squash", "expected_head": "a" * 40, "account": "personal"},
         ),
         ("/disable-auto-merge", {"extra": True}, "github_disable_auto_merge", {}),
     ],

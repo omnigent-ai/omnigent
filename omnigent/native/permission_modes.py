@@ -66,3 +66,31 @@ APPROVAL_SKIPPING_PERMISSION_MODES: frozenset[str] = frozenset(
         "dangerous",  # devin-native
     }
 )
+
+
+def created_session_launch_args(harness: str | None, mode: str) -> list[str] | None:
+    """
+    Launch args for a session created with ``permission_mode``, e.g. by ``sys_session_create``.
+
+    The creating agent chooses the mode, and what it reads (a ticket, a message)
+    can try to steer that choice, so a mode that skips approval is refused: the
+    new session keeps an approval prompt or the harness's own reviewer.
+
+    :param harness: The new session's canonical harness, e.g. ``"codex-native"``.
+    :param mode: A mode in that harness's vocabulary, e.g. ``"approve-for-me"``.
+    :returns: The CLI args, or ``None`` when the mode is the harness's own default.
+    :raises ValueError: The mode skips approval, or the harness doesn't offer it.
+    """
+    if mode in APPROVAL_SKIPPING_PERMISSION_MODES:
+        raise ValueError(
+            f"permission_mode {mode!r} skips approval, which a created session can't use; "
+            "choose a mode that asks for approval or uses the harness's reviewer"
+        )
+    modes = PERMISSION_LAUNCH_ARGS.get(harness or "", {})
+    if mode not in modes:
+        choices = [name for name in modes if name not in APPROVAL_SKIPPING_PERMISSION_MODES]
+        supported = f"use one of {', '.join(map(repr, choices))}" if choices else "omit it"
+        raise ValueError(
+            f"permission_mode {mode!r} is not a mode of {harness or 'this agent'!r}; {supported}"
+        )
+    return list(modes[mode]) or None

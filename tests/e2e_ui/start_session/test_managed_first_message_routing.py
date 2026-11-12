@@ -461,6 +461,7 @@ async def _drive_sharded(rig: ManagedReplicas, model_url: str, *, keyed: bool) -
             session_prefix = f"/v1/sessions/{json.loads(create['body'])['id']}"
             replica, replica_url = ("b", rig.b) if keyed else ("a", rig.a)
             host_id = json.loads(create["request"]).get("host_id")
+            # The stripped legacy create reaches the ingress with neither id nor key.
             assert create["replica"] == replica and create["key"] == host_id
             assert create["status"] == 201
             labels = json.loads(create["body"])["labels"]
