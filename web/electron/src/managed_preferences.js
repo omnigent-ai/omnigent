@@ -7,8 +7,8 @@ const SERVER_URLS_KEY = "serverUrls";
 const SERVER_NAME_PARAM = "omnigentServerName";
 
 /**
- * Managed Preferences key gating managed features (e.g. the Arca
- * host option). Boolean; anything but an explicit true reads as disabled.
+ * Managed preference controlling onboarding defaults and network guidance.
+ * Boolean; anything but an explicit true reads as disabled.
  */
 const DATABRICKS_INTERNAL_FEATURES_KEY = "databricksInternalFeaturesEnabled";
 

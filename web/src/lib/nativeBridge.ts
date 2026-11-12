@@ -436,12 +436,6 @@ export interface HostConnectResult extends HostActionResult {
  * optional: an older shell reports fewer.
  */
 export interface DesktopFeatures {
-  /**
-   * Managed features (e.g. the Arca host option) are enabled.
-   * Already scoped by the shell: true only when the flag is set AND the
-   * window's server is a managed server.
-   */
-  databricksInternalFeatures?: boolean;
   /** This shell can import the current site's cookies from local Google Chrome. */
   chromeCookieImport?: boolean;
 }

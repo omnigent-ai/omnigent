@@ -6,8 +6,7 @@
  * Runs the repo's bundled `install_oss.sh --non-interactive`, which resolves to
  * `uv tool install --force --python 3.12 omnigent` and drops the `omnigent` /
  * `omni` binaries in ~/.local/bin. Streams the installer's live output so the
- * setup page can show it in a terminal pane, mirroring the local-server and
- * Arca-connect flows.
+ * setup page can show it in a terminal pane, like the local-server and SSH flows.
  *
  * `install_oss.sh --non-interactive` *declines* its own uv-bootstrap prompt and
  * fails if uv is missing, so we ensure uv first (the same one-liner the script
