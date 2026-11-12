@@ -4929,20 +4929,13 @@ function registerIpc() {
     return result;
   });
 
-  // SPA → desktop feature gates. The managed features flag reads true only when
-  // the window's own server is managed, never on arbitrary self-hosted servers.
-  // Read fresh per call so profile changes apply without a restart.
-  const canExtendArca = (event) =>
-    databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(senderServerUrl(event));
-
+  // SPA → capabilities supported by this installed desktop shell.
   ipcMain.handle("omnigent:get-desktop-features", (event) => {
     if (!isPinnedOriginSender(event)) {
       console.warn("[omnigent] get-desktop-features from untrusted sender dropped");
       return null;
     }
-    const enabled = canExtendArca(event);
     return {
-      databricksInternalFeatures: enabled,
       // Importing local Chrome cookies is wired for macOS only (Keychain-decrypted
       // v10 values); the SPA hides the toolbar button everywhere else.
       chromeCookieImport: process.platform === "darwin",

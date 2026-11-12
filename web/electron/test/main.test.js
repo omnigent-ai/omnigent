@@ -4519,6 +4519,23 @@ describe("server names from the manifest", () => {
   });
 });
 
+describe("desktop feature capabilities", () => {
+  for (const platform of ["darwin", "linux", "win32"]) {
+    it(`reports supported capabilities only to the pinned page on ${platform}`, (t) => {
+      const server = "https://host.example/omnigent";
+      const h = loadNavigationHarness({ serverUrl: server, platform, internalFeatures: true });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      const features = h.ipc.get("omnigent:get-desktop-features");
+      const event = (url) => ({ sender: h.webContents, senderFrame: { url } });
+      assert.equal(features(event("https://elsewhere.example/")), null);
+      assert.deepEqual(JSON.parse(JSON.stringify(features(event(server)))), {
+        chromeCookieImport: platform === "darwin",
+      });
+    });
+  }
+});
+
 describe("SSH connect IPC", () => {
   const server = "https://host.example/ml/omnigents";
   const fromServer = (h) => ({ sender: h.webContents, senderFrame: { url: server } });
