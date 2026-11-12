@@ -646,6 +646,7 @@ async def test_clear_hook_consumes_hook_rotated_session_without_duplicate_fork(
 
 @pytest.mark.asyncio
 async def test_fork_hook_creates_omnigent_fork_and_consumes_hook(
+    claude_transcript_dir: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -664,7 +665,7 @@ async def test_fork_hook_creates_omnigent_fork_and_consumes_hook(
         workspace=tmp_path,
     )
     (bridge_dir / "transcript_forwarder.json").write_text("{}", encoding="utf-8")
-    transcript_path = tmp_path / "fork.jsonl"
+    transcript_path = claude_transcript_dir / "fork.jsonl"
     transcript_path.write_text(
         json.dumps(
             {
@@ -782,6 +783,7 @@ async def test_fork_hook_creates_omnigent_fork_and_consumes_hook(
 
 @pytest.mark.asyncio
 async def test_fork_hook_consumes_hook_rotated_session_without_duplicate_fork(
+    claude_transcript_dir: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -800,7 +802,7 @@ async def test_fork_hook_consumes_hook_rotated_session_without_duplicate_fork(
         workspace=tmp_path,
     )
     write_active_session_id(bridge_dir, "conv_fork")
-    transcript_path = tmp_path / "fork.jsonl"
+    transcript_path = claude_transcript_dir / "fork.jsonl"
     transcript_path.write_text(
         json.dumps(
             {
@@ -871,6 +873,7 @@ async def test_fork_hook_consumes_hook_rotated_session_without_duplicate_fork(
 
 @pytest.mark.asyncio
 async def test_resume_seen_claude_fork_does_not_create_second_omnigent_fork(
+    claude_transcript_dir: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -888,7 +891,7 @@ async def test_resume_seen_claude_fork_does_not_create_second_omnigent_fork(
         bridge_id="bridge_shared",
         workspace=tmp_path,
     )
-    transcript_path = tmp_path / "fork.jsonl"
+    transcript_path = claude_transcript_dir / "fork.jsonl"
     transcript_path.write_text(
         json.dumps(
             {

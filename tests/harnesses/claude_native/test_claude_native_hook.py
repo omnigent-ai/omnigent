@@ -505,6 +505,7 @@ def test_clear_session_start_hook_stops_when_the_unfiled_retry_fails(
 
 
 def test_fork_session_start_hook_forks_before_printing_conversation_url(
+    claude_transcript_dir: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -640,7 +641,7 @@ def test_fork_session_start_hook_forks_before_printing_conversation_url(
             "session_id": "claude_old",
         },
     )
-    transcript_path = tmp_path / "fork.jsonl"
+    transcript_path = claude_transcript_dir / "fork.jsonl"
     transcript_path.write_text(
         json.dumps(
             {
@@ -765,6 +766,7 @@ def test_session_rotation_honours_ambient_proxy_for_a_remote_server(
 
 
 def test_resume_session_start_without_branch_marker_does_not_fork(
+    claude_transcript_dir: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

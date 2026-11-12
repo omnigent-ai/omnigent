@@ -3711,14 +3711,23 @@ def transcript_has_forked_from_marker(
 def _read_transcript_edge_lines(
     transcript_path: Path, *, head_limit: int, tail_limit: int
 ) -> list[str]:
-    """Sample a finite JSONL snapshot without retaining its middle records.
+    """Sample a finite snapshot within Claude's configured project directory.
 
     Memory scales with the selected edge records and largest individual line.
     Unicode line separators inside JSON strings remain part of their record.
     """
+    from omnigent.harnesses.claude_native.status_file import sessions_dir
+
+    try:
+        projects_root = (sessions_dir().parent / "projects").resolve()
+        resolved_path = transcript_path.resolve()
+        if not resolved_path.is_relative_to(projects_root) or not resolved_path.is_file():
+            return []
+    except (OSError, RuntimeError, ValueError):
+        return []
     head: list[str] = []
     tail: deque[str] = deque(maxlen=tail_limit)
-    with transcript_path.open("rb") as handle:
+    with resolved_path.open("rb") as handle:
         remaining = os.fstat(handle.fileno()).st_size
         while remaining > 0:
             raw_line = handle.readline(remaining)

@@ -110,8 +110,8 @@ _CLEAR_ONE_ROW_COMPOSER = "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2
 
 
 @pytest.mark.parametrize("reader", ["recent_command", "fork_marker"])
-def test_transcript_metadata_scan_bounds_memory(tmp_path: Path, reader: str) -> None:
-    transcript = tmp_path / "session.jsonl"
+def test_transcript_metadata_scan_bounds_memory(claude_transcript_dir: Path, reader: str) -> None:
+    transcript = claude_transcript_dir / "session.jsonl"
     marker = {
         "sessionId": "current",
         "subtype": "local_command",
@@ -154,9 +154,9 @@ def test_transcript_metadata_scan_bounds_memory(tmp_path: Path, reader: str) -> 
 @pytest.mark.parametrize("reader", ["recent_command", "fork_marker"])
 @pytest.mark.parametrize("position", [0, 199, 200, 399, 400, 599])
 def test_transcript_metadata_scan_preserves_record_windows(
-    tmp_path: Path, reader: str, position: int
+    claude_transcript_dir: Path, reader: str, position: int
 ) -> None:
-    transcript = tmp_path / "session.jsonl"
+    transcript = claude_transcript_dir / "session.jsonl"
     marker = {
         "sessionId": "current",
         "subtype": "local_command",
@@ -185,9 +185,9 @@ def test_transcript_metadata_scan_preserves_record_windows(
 
 @pytest.mark.parametrize("reader", ["recent_command", "fork_marker"])
 def test_transcript_metadata_scan_keeps_unicode_line_separators(
-    tmp_path: Path, reader: str
+    claude_transcript_dir: Path, reader: str
 ) -> None:
-    transcript = tmp_path / "session.jsonl"
+    transcript = claude_transcript_dir / "session.jsonl"
     transcript.write_text(
         json.dumps(
             {
@@ -216,9 +216,9 @@ def test_transcript_metadata_scan_keeps_unicode_line_separators(
 
 @pytest.mark.parametrize("reader", ["recent_command", "fork_marker"])
 def test_transcript_metadata_scan_stops_at_its_snapshot(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str
+    claude_transcript_dir: Path, monkeypatch: pytest.MonkeyPatch, reader: str
 ) -> None:
-    transcript = tmp_path / "session.jsonl"
+    transcript = claude_transcript_dir / "session.jsonl"
     transcript.write_text("{}\n", encoding="utf-8")
     original_fstat = os.fstat
 
@@ -278,9 +278,9 @@ def test_transcript_metadata_scan_stops_at_its_snapshot(
     ],
 )
 def test_transcript_metadata_scan_preserves_identity_and_command_filters(
-    tmp_path: Path, record: dict[str, Any], recent_command: bool, fork_marker: bool
+    claude_transcript_dir: Path, record: dict[str, Any], recent_command: bool, fork_marker: bool
 ) -> None:
-    transcript = tmp_path / "session.jsonl"
+    transcript = claude_transcript_dir / "session.jsonl"
     marker = {
         "sessionId": "current",
         "subtype": "local_command",
@@ -306,6 +306,110 @@ def test_transcript_metadata_scan_preserves_identity_and_command_filters(
         )
         is fork_marker
     )
+
+
+@pytest.mark.parametrize("reader", ["recent_command", "fork_marker"])
+@pytest.mark.parametrize("path_kind", ["absolute", "parent", "sibling", "file_link", "dir_link"])
+def test_transcript_metadata_scan_rejects_paths_outside_claude_projects(
+    claude_transcript_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: str,
+    path_kind: str,
+) -> None:
+    outside = claude_transcript_dir.parent / "projects-other" / "session.jsonl"
+    outside.parent.mkdir()
+    outside.write_text(
+        json.dumps(
+            {
+                "sessionId": "current",
+                "subtype": "local_command",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "content": "<command-name>/fork</command-name>",
+                "forkedFrom": {"sessionId": "parent"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    if path_kind == "parent":
+        transcript = claude_transcript_dir / ".." / "projects-other" / outside.name
+    elif path_kind == "sibling":
+        transcript = outside
+    elif path_kind == "file_link":
+        transcript = claude_transcript_dir / "session.jsonl"
+        transcript.symlink_to(outside)
+    elif path_kind == "dir_link":
+        link = claude_transcript_dir / "linked-project"
+        link.symlink_to(outside.parent, target_is_directory=True)
+        transcript = link / outside.name
+    else:
+        transcript = tmp_path / "outside.jsonl"
+        outside.rename(transcript)
+        outside = transcript
+
+    original_open = Path.open
+
+    def refuse_outside_read(path: Path, *args: Any, **kwargs: Any) -> Any:
+        assert path.resolve() != outside.resolve(), "an untrusted transcript was opened"
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", refuse_outside_read)
+    if reader == "recent_command":
+        assert not claude_native_bridge.transcript_has_recent_local_command(
+            transcript,
+            claude_session_id="current",
+            recorded_at=1767225600.0,
+            command_names=frozenset({"/fork"}),
+        )
+    else:
+        assert not claude_native_bridge.transcript_has_forked_from_marker(
+            transcript, claude_session_id="current", source_claude_session_id="parent"
+        )
+
+
+@pytest.mark.parametrize("reader", ["recent_command", "fork_marker"])
+@pytest.mark.parametrize("config_kind", ["default", "relative", "symlink"])
+def test_transcript_metadata_scan_uses_claude_config_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str, config_kind: str
+) -> None:
+    if config_kind == "default":
+        monkeypatch.setenv("HOME", str(tmp_path))
+        config_dir = tmp_path / ".claude"
+    elif config_kind == "relative":
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "custom-config")
+        config_dir = tmp_path / "custom-config"
+    else:
+        config_dir = tmp_path / "actual-config"
+        config_dir.mkdir()
+        alias = tmp_path / "config-alias"
+        alias.symlink_to(config_dir, target_is_directory=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(alias))
+    transcript = config_dir / "projects" / "project" / "session.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        json.dumps(
+            {
+                "sessionId": "current",
+                "subtype": "local_command",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "content": "<command-name>/fork</command-name>",
+                "forkedFrom": {"sessionId": "parent"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    if reader == "recent_command":
+        assert claude_native_bridge.transcript_has_recent_local_command(
+            transcript,
+            claude_session_id="current",
+            recorded_at=1767225600.0,
+            command_names=frozenset({"/fork"}),
+        )
+    else:
+        assert claude_native_bridge.transcript_has_forked_from_marker(
+            transcript, claude_session_id="current", source_claude_session_id="parent"
+        )
 
 
 def _composer_pane(draft: str = "") -> str:
