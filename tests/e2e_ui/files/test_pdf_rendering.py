@@ -9,7 +9,8 @@ The new toolbar behaviour is also asserted here (it is user-facing and specific
 to PDFs): the diff (Δ) button is hidden because a rendered PDF has no text
 surface to diff against. Comments are supported via the pdf.js text layer.
 percentage doubles as the reset control. A web link inside the PDF opens in a
-new page while the app stays on its session; the linked site is a routed stub.
+new page while the app stays on its session; where popups are withheld, the
+same click follows the link in place. The linked site is a routed stub.
 
 The fixture seeds a minimal but valid PDF. It is pure ASCII, so it round-trips
 through the filesystem PUT endpoint's text-only path (``str.encode(encoding)``)
@@ -160,3 +161,9 @@ def test_pdf_preview_toolbar_zoom_and_web_link(
 
     expect(page).to_have_url(re.compile(rf"/c/{session_id}"))
     expect(file_viewer.get_by_text("Hello PDF")).to_be_visible()
+
+    # An embedding host pane or a popup blocker withholds the new tab; the click
+    # must still follow the link instead of being silently swallowed.
+    page.evaluate("window.open = () => null")
+    pdf_link.click()
+    expect(page).to_have_url(_PDF_LINK_URL)
