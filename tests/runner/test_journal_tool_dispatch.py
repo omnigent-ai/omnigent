@@ -153,6 +153,10 @@ async def test_invalid_arguments_never_reach_the_server() -> None:
             "a plan needs a name"
             in (await _run(client, "sys_journal_write_plan", unnamed))["error"]
         )
+        stray = {**unnamed, "name": "Run", "workflow_id": "Triage"}
+        assert (await _run(client, "sys_journal_write_plan", stray))["error"] == (
+            "invalid_entry: workflow_id must be a saved workflow's ID"
+        )
         assert (await _run(client, "sys_journal_read", {"limit": 101}))["error"].startswith(
             "invalid_entry"
         )
@@ -295,26 +299,97 @@ _WORKFLOW = {
     "steps": _STEPS,
 }
 _SAVE_ARGS = {key: _WORKFLOW[key] for key in ("name", "description", "steps")}
+# The session's current plan, as GET …/journal returns it.
+_PLAN = {
+    **_ENTRY,
+    "id": "b" * 32,
+    "position": 3,
+    "kind": "plan",
+    "payload": {
+        "name": "Triage the upload tests",
+        "version": 2,
+        "source": "agent",
+        "steps": _STEPS,
+    },
+    "workflow_id": None,
+}
+
+
+def _save_handler(seen: list[httpx.Request], plans: list[dict[str, object]]):
+    """Answers the save, the read of the session's plan, and the plan written after it."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/v1/workflows":
+            return httpx.Response(200, json=_WORKFLOW)
+        if request.method == "GET":
+            return httpx.Response(200, json={"object": "list", "data": plans, "has_more": False})
+        body = json.loads(request.content)
+        return httpx.Response(
+            200, json={**_PLAN, "position": 4, "workflow_id": body["workflow_id"]}
+        )
+
+    return handler
 
 
 async def test_a_save_posts_the_workflow_as_the_session_and_returns_its_id() -> None:
     seen: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request)
-        return httpx.Response(200, json=_WORKFLOW)
-
     args = {**_SAVE_ARGS, "name": " Triage  flaky tests "}
-    async with _client(handler) as client:
+    async with _client(_save_handler(seen, [])) as client:
         result = await _run(client, "sys_workflow_save", args)
     assert result == {"id": _WORKFLOW_ID, "name": "Triage flaky tests"}
-    (request,) = seen
+    request = seen[0]
     assert (request.method, request.url.path) == ("POST", "/v1/workflows")
     # The server refuses a save from a session shared with edit access, so the call names it.
     assert request.headers[ORCHESTRATION_SOURCE_HEADER] == SESSION
     body = json.loads(request.content)
     assert body["name"] == "Triage flaky tests"
     assert [step["id"] for step in body["steps"]] == ["explore", "fix"]
+
+
+async def test_a_save_names_the_sessions_plan_after_the_new_workflow() -> None:
+    seen: list[httpx.Request] = []
+    published: list[dict[str, object]] = []
+    async with _client(_save_handler(seen, [_PLAN])) as client:
+        result = await _run(
+            client,
+            "sys_workflow_save",
+            _SAVE_ARGS,
+            call_id="call_1",
+            publish_event=lambda session, event: published.append(event),
+        )
+    assert result == {"id": _WORKFLOW_ID, "name": "Triage flaky tests"}
+    save, read, write = seen
+    assert save.url.path == "/v1/workflows"
+    assert (read.method, read.url.path) == ("GET", f"/v1/sessions/{SESSION}/journal")
+    assert dict(read.url.params) == {"order": "desc", "limit": "1", "kind": "plan"}
+    assert (write.method, write.url.path) == ("POST", f"/v1/sessions/{SESSION}/journal")
+    body = json.loads(write.content)
+    # The same plan, now naming the workflow, so the Tasks tab can show it.
+    assert body["kind"] == "plan"
+    assert body["workflow_id"] == _WORKFLOW_ID
+    assert body["payload"]["name"] == "Triage the upload tests"
+    assert [step["id"] for step in body["payload"]["steps"]] == ["explore", "fix"]
+    assert body["idempotency_key"] == "tool:call_1:plan"
+    assert [event["entry"]["workflow_id"] for event in published] == [_WORKFLOW_ID]
+
+
+@pytest.mark.parametrize(
+    "plans",
+    [[], [{**_PLAN, "workflow_id": _WORKFLOW_ID}]],
+    ids=["no-plan", "already-named"],
+)
+async def test_a_save_writes_no_plan_when_there_is_none_to_name(
+    plans: list[dict[str, object]],
+) -> None:
+    seen: list[httpx.Request] = []
+    async with _client(_save_handler(seen, plans)) as client:
+        result = await _run(client, "sys_workflow_save", _SAVE_ARGS)
+    assert result == {"id": _WORKFLOW_ID, "name": "Triage flaky tests"}
+    assert [(request.method, request.url.path) for request in seen] == [
+        ("POST", "/v1/workflows"),
+        ("GET", f"/v1/sessions/{SESSION}/journal"),
+    ]
 
 
 async def test_a_save_with_a_taken_name_or_bad_fields_says_so() -> None:

@@ -5865,6 +5865,34 @@ describe("CreateScheduledTaskDialog workflow", () => {
     expect(mutateAsync.mock.calls[0][0].prompt).toBe(run("The upload tests"));
   });
 
+  it("keeps the workflow it was opened from: the field has no menu, and runs follow it", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        initialName={WORKFLOW.name}
+        lockedWorkflow={WORKFLOW}
+      />,
+    );
+    const field = screen.getByTestId("task-workflow-trigger");
+    expect(field).toHaveTextContent("Triage flaky tests");
+    expect(field).toBeDisabled();
+    fireEvent.pointerDown(field, { button: 0 });
+    expect(screen.queryByTestId("composer-workflow-picker")).toBeNull();
+    expect(screen.getByLabelText("Additional instructions")).toBe(
+      screen.getByTestId("task-prompt-input"),
+    );
+
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({
+      name: "Triage flaky tests",
+      prompt: run(""),
+    });
+  });
+
   it("opens a workflow automation with its workflow chosen and its details", () => {
     render(
       <CreateScheduledTaskDialog

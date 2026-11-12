@@ -19,7 +19,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any, TypeVar
 
-from sqlalchemy import Select, delete, select, update
+from sqlalchemy import Select, and_, delete, or_, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -51,6 +51,7 @@ from omnigent.entities.session_journal import (
     JournalEntryTooLargeError,
     JournalPage,
     StepNotReadyError,
+    WorkflowRunPage,
     normalize_payload,
     normalize_step_id,
 )
@@ -114,6 +115,29 @@ def _entry_id(value: str, name: str) -> str:
         raise ValueError(f"{name} must be an entry ID") from exc
 
 
+def _workflow_id(value: str) -> str:
+    try:
+        return uuid_to_bytes(value).hex()
+    except InvalidUuidError as exc:
+        raise InvalidJournalEntryError("workflow_id must be a workflow ID") from exc
+
+
+def _run_cursor(plan: JournalEntry) -> str:
+    """Where the next page of a workflow's runs starts, e.g. ``"1762900000.0123…cdef.4"``."""
+    return f"{plan.created_at}.{plan.conversation_id}.{plan.position}"
+
+
+def _parse_run_cursor(cursor: str) -> tuple[int, str, int]:
+    """The ``(created_at, conversation_id, position)`` a runs cursor names."""
+    parts = cursor.split(".")
+    try:
+        if len(parts) != 3:
+            raise ValueError(cursor)
+        return int(parts[0]), uuid_to_bytes(parts[1]).hex(), int(parts[2])
+    except (ValueError, InvalidUuidError) as exc:
+        raise ValueError("before must be a cursor from a previous page") from exc
+
+
 class SessionJournalStore:
     """SQLAlchemy-backed store of each session's journal."""
 
@@ -145,6 +169,7 @@ class SessionJournalStore:
                 step=row.step,
                 scheduled_task_run_id=row.scheduled_task_run_id,
                 payload=json.loads(row.payload),
+                workflow_id=row.workflow_id,
             )
             for row in rows
         ]
@@ -242,23 +267,30 @@ class SessionJournalStore:
         current = next((item for item in steps or [] if item["id"] == step), None)
         waiting = []
         for dependency in current["depends_on"] if current else []:
-            newest = session.execute(
-                _using(
-                    select(SqlSessionJournalEntry)
-                    .where(
-                        SqlSessionJournalEntry.workspace_id == current_workspace_id(),
-                        SqlSessionJournalEntry.conversation_id == conversation_id,
-                        SqlSessionJournalEntry.kind == _STATUS_KIND,
-                        SqlSessionJournalEntry.step == dependency,
-                    )
-                    .order_by(SqlSessionJournalEntry.position.desc())
-                    .limit(1),
-                    "ix_session_journal_entries_kind_step",
-                )
-            ).scalar_one_or_none()
+            newest = self._newest_status_row(session, conversation_id, dependency)
             if newest is None or self._entries([newest])[0].payload.get("status") != "done":
                 waiting.append(dependency)
         return waiting
+
+    @staticmethod
+    def _newest_status_row(
+        session: Session, conversation_id: str, step: str
+    ) -> SqlSessionJournalEntry | None:
+        """The step's newest status entry in the session, or ``None``."""
+        return session.execute(
+            _using(
+                select(SqlSessionJournalEntry)
+                .where(
+                    SqlSessionJournalEntry.workspace_id == current_workspace_id(),
+                    SqlSessionJournalEntry.conversation_id == conversation_id,
+                    SqlSessionJournalEntry.kind == _STATUS_KIND,
+                    SqlSessionJournalEntry.step == step,
+                )
+                .order_by(SqlSessionJournalEntry.position.desc())
+                .limit(1),
+                "ix_session_journal_entries_kind_step",
+            )
+        ).scalar_one_or_none()
 
     def append(
         self,
@@ -269,6 +301,7 @@ class SessionJournalStore:
         idempotency_key: str,
         step: str | None = None,
         scheduled_task_run_id: str | None = None,
+        workflow_id: str | None = None,
     ) -> JournalAppend:
         """Append an entry to the session's journal.
 
@@ -282,6 +315,9 @@ class SessionJournalStore:
         :param step: The plan step the entry is about. A status without one
             names the only step of a one-step plan; a plan never has one.
         :param scheduled_task_run_id: The automation run the session is serving.
+        :param workflow_id: The saved workflow a plan starts a run of, e.g.
+            ``"0123…cdef"``. Only a plan names one; a status or note takes the
+            current plan's.
         :returns: The entry, and whether this call appended it.
         :raises InvalidJournalEntryError: If a field is invalid.
         :raises JournalEntryTooLargeError: If the stored payload is too large.
@@ -300,6 +336,10 @@ class SessionJournalStore:
             if kind == "plan":
                 raise InvalidJournalEntryError("a plan names no step; its steps are in the graph")
             step = normalize_step_id(step)
+        if workflow_id is not None:
+            if kind != "plan":
+                raise InvalidJournalEntryError("only a plan names a workflow")
+            workflow_id = _workflow_id(workflow_id)
         # A plan's version is known only under the lock, so its size is checked there.
         stored = None if kind == "plan" else _stored_payload(fields)
         code = encode_journal_entry_kind(kind)
@@ -336,8 +376,13 @@ class SessionJournalStore:
                 entry_payload = {"version": version, **fields}
                 entry_text = _stored_payload(entry_payload)
             entry_step = step
+            entry_workflow_id = workflow_id
+            if kind == "note":
+                plan = self._newest_plan_row(session, conversation_id)
+                entry_workflow_id = plan.workflow_id if plan is not None else None
             if kind == "status":
                 plan = self._newest_plan_row(session, conversation_id)
+                entry_workflow_id = plan.workflow_id if plan is not None else None
                 steps = self._entries([plan])[0].payload["steps"] if plan is not None else None
                 if entry_step is None:
                     entry_step = self._default_step(steps)
@@ -355,6 +400,7 @@ class SessionJournalStore:
                 id=uuid.uuid4().hex,
                 kind=code,
                 scheduled_task_run_id=scheduled_task_run_id,
+                workflow_id=entry_workflow_id,
                 step=entry_step,
                 idempotency_key=idempotency_key,
                 payload=entry_text,
@@ -384,6 +430,7 @@ class SessionJournalStore:
             step=row.step,
             scheduled_task_run_id=row.scheduled_task_run_id,
             payload=entry_payload,
+            workflow_id=row.workflow_id,
         )
         return JournalAppend(entry=entry, created=created)
 
@@ -469,6 +516,82 @@ class SessionJournalStore:
         with self._session("read_current_plan") as session:
             row = self._newest_plan_row(session, conversation_id)
         return None if row is None else self._entries([row])[0]
+
+    def list_workflow_runs(
+        self, workflow_id: str, *, limit: int = 20, before: str | None = None
+    ) -> WorkflowRunPage:
+        """A saved workflow's runs in every session, newest first.
+
+        A run is the plan entry that named the workflow. Replans name none, so a
+        session that ran the workflow twice has two runs, and a replan none.
+
+        :param workflow_id: The workflow, e.g. ``"0123…cdef"``.
+        :param limit: Page size, 1 to
+            :data:`~omnigent.entities.session_journal.JOURNAL_PAGE_MAX`.
+        :param before: The previous page's ``next_cursor``.
+        :raises ValueError: If an argument is invalid.
+        """
+        if not 1 <= limit <= JOURNAL_PAGE_MAX:
+            raise ValueError(f"limit must be between 1 and {JOURNAL_PAGE_MAX}")
+        try:
+            workflow = uuid_to_bytes(workflow_id).hex()
+        except InvalidUuidError as exc:
+            raise ValueError("workflow_id must be a workflow ID") from exc
+        entries = SqlSessionJournalEntry
+        stmt = select(entries).where(
+            entries.workspace_id == current_workspace_id(),
+            entries.workflow_id == workflow,
+            entries.kind == _PLAN_KIND,
+        )
+        if before is not None:
+            created_at, conversation_id, position = _parse_run_cursor(before)
+            # The bound starts every engine's scan at the cursor; the OR settles ties.
+            stmt = stmt.where(
+                entries.created_at <= created_at,
+                or_(
+                    entries.created_at < created_at,
+                    and_(
+                        entries.created_at == created_at, entries.conversation_id < conversation_id
+                    ),
+                    and_(
+                        entries.created_at == created_at,
+                        entries.conversation_id == conversation_id,
+                        entries.position < position,
+                    ),
+                )
+            )
+        stmt = stmt.order_by(
+            entries.created_at.desc(), entries.conversation_id.desc(), entries.position.desc()
+        ).limit(limit + 1)
+        with self._session("list_workflow_runs") as session:
+            rows = list(
+                session.execute(_using(stmt, "ix_session_journal_entries_workflow")).scalars()
+            )
+        plans = self._entries(rows[:limit])
+        return WorkflowRunPage(
+            plans=plans, next_cursor=_run_cursor(plans[-1]) if len(rows) > limit else None
+        )
+
+    def plan_step_statuses(self, plans: Sequence[JournalEntry]) -> list[dict[str, str]]:
+        """For each plan, its steps' current statuses in its session.
+
+        One kind-and-step lookup per step, the reads behind the Tasks tab's step
+        summary, for a page of plans at once.
+
+        :param plans: Plan entries, e.g. a page of a workflow's runs.
+        :returns: One ``{step: status}`` per plan, in order, e.g.
+            ``{"tests": "done"}``; a step with no status yet is left out.
+        """
+        statuses: list[dict[str, str]] = []
+        with self._session("read_plan_step_statuses") as session:
+            for plan in plans:
+                current: dict[str, str] = {}
+                for step in plan.payload.get("steps", []):
+                    row = self._newest_status_row(session, plan.conversation_id, step["id"])
+                    if row is not None:
+                        current[step["id"]] = self._entries([row])[0].payload["status"]
+                statuses.append(current)
+        return statuses
 
 
 # ── Deletion with the session ─────────────────────────

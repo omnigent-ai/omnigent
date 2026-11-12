@@ -87,6 +87,28 @@ export function saveWorkflowMessage(skillPrefix: string, name: string): string {
   return `${skillPrefix}${SAVE_WORKFLOW_SKILL} Save this session's plan as a workflow named "${name.trim()}".`;
 }
 
+/**
+ * The first message of a session that drafts a new workflow from a description.
+ * It names the save-workflow skill rather than invoking it: the agent, and with
+ * it the skill prefix, can be changed after this is written.
+ *
+ * @param name The name the user picked, e.g. `"Triage flaky tests"`.
+ * @param description What the workflow should do, e.g. `"Rerun the suite and file issues"`.
+ */
+export function createWorkflowPrompt(name: string, description: string): string {
+  return `Use the ${SAVE_WORKFLOW_SKILL} skill to create a workflow named "${name.trim()}" from this description, without doing the work:\n\n${description.trim()}`;
+}
+
+/**
+ * The first message of a session that runs one of the user's saved workflows.
+ * Like {@link createWorkflowPrompt}, it names the skill rather than invoking it.
+ *
+ * @param workflow The saved workflow, e.g. `{ id: "0123…", name: "Triage flaky tests" }`.
+ */
+export function runSavedWorkflowPrompt(workflow: { id: string; name: string }): string {
+  return `Use the ${WORKFLOW_SKILL} skill to run the saved workflow "${workflow.name}" (ID ${workflow.id}).`;
+}
+
 // A savedWorkflowMessage without the plan review, as New automation stores it.
 const SAVED_WORKFLOW_RUN =
   /^[/$]workflow Run the saved workflow "(.+)" \(ID ([0-9a-f]{32})\)\.(?:\n\n([\s\S]*))?$/;

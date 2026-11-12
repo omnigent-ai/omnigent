@@ -1262,6 +1262,25 @@ describe("Sidebar session list", () => {
     expect(usage).toHaveClass("bg-[var(--sidebar-active)]");
   });
 
+  it("hides Workflows navigation while the release feature is off", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    expect(screen.queryByTestId("workflows-nav")).toBeNull();
+  });
+
+  it("shows and highlights Workflows navigation when the release feature is on", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/workflows", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { workflows_page: true },
+    });
+
+    const workflows = screen.getByTestId("workflows-nav");
+    expect(workflows).toHaveAttribute("href", "/workflows");
+    expect(workflows).toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
   it("hides Canvas navigation while the release feature is off", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar(true, "/canvas");

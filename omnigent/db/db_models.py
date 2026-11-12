@@ -1807,9 +1807,10 @@ class SqlSessionJournalEntry(OmnigentBase):
     :param scheduled_task_run_id: The automation run the session was serving
         (relates to ``scheduled_task_runs.id``; no DB foreign key); ``None``
         outside automation runs.
-    :param workflow_id: The workflow the entry was written under, a UUID in the
-        session ID's format; ``None`` outside workflows. Nothing writes it yet:
-        it ships now so the phase that gives workflows IDs needs no migration.
+    :param workflow_id: The saved workflow the entry was written under, a UUID
+        in the session ID's format: set on the plan that starts a run of it, and
+        on the statuses and notes written while that plan is current. ``None``
+        outside saved workflows.
     :param step: The plan step the entry is about, e.g. ``"propose"``; ``None``
         for entries about no step, such as plans.
     :param idempotency_key: Names the write that appended the entry, e.g.
@@ -1833,7 +1834,6 @@ class SqlSessionJournalEntry(OmnigentBase):
     # No CHECK, so adding a kind needs no migration.
     kind: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     scheduled_task_run_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
-    # Unindexed until a query reads it.
     workflow_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     step: Mapped[str | None] = mapped_column(String(64), nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -1900,6 +1900,17 @@ class SqlSessionJournalEntry(OmnigentBase):
             "step",
             "position",
             "created_at",
+        ),
+        # Pages a saved workflow's runs in every session, newest first: each run
+        # is the plan entry that named the workflow.
+        Index(
+            "ix_session_journal_entries_workflow",
+            "workspace_id",
+            "workflow_id",
+            "kind",
+            "created_at",
+            "conversation_id",
+            "position",
         ),
     )
 

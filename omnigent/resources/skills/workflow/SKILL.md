@@ -86,13 +86,14 @@ tests" (ID …)", or "run my triage workflow" in chat):
   the one whose description fits. If more than one fits, or none does, ask
   the user which they meant, or whether to describe the work instead.
 - Its steps are your plan: write them with `sys_journal_write_plan`, named
-  after the workflow, keeping their IDs and dependencies. Rename an ID only if
-  this session's journal already used it. Fill the run's details into the step
-  names and goals.
+  after the workflow, keeping their IDs and dependencies, and with
+  `workflow_id` set to its ID, so the workflow's page lists this run. Rename an
+  ID only if this session's journal already used it. Fill the run's details
+  into the step names and goals.
 - Its description says what a run needs. If the details the user gave leave
   something out, ask with `sys_workflow_request_input` on the first step.
 - The saved steps are a starting point: replan as the work needs, as with any
-  plan.
+  plan. A replan leaves out `workflow_id`, since the run already started.
 
 ## Review the plan
 

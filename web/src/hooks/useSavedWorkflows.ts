@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { authenticatedFetch } from "@/lib/identity";
@@ -17,23 +17,27 @@ export interface SavedWorkflow {
 // The menu lists the user's workflows by name; more than this many need a search page.
 const SAVED_WORKFLOWS_PAGE = 200;
 const NO_WORKFLOWS: readonly SavedWorkflow[] = [];
+const SAVED_WORKFLOWS_KEY = ["saved-workflows"];
 
 /**
  * The user's saved workflows, by name, for Run a workflow. Empty on servers
  * without saved workflows.
  *
  * @param enabled - Whether to load them now, e.g. while the session offers workflows.
- * @returns The workflows, and `refresh`, which reloads them, e.g. as the "+" menu opens
- *   after the agent saved one.
+ * @returns The workflows; `isLoading` while the first load is in flight; `isError` when
+ *   it failed; and `refresh`, which reloads them, e.g. as the "+" menu opens after the
+ *   agent saved one.
  */
 export function useSavedWorkflows({ enabled = true }: { enabled?: boolean } = {}): {
   workflows: readonly SavedWorkflow[];
+  isLoading: boolean;
+  isError: boolean;
   refresh: () => void;
 } {
   const serverInfo = useServerInfo();
   const supported = serverInfo !== "loading" && serverInfo.workflows === true;
   const query = useQuery<SavedWorkflow[]>({
-    queryKey: ["saved-workflows"],
+    queryKey: SAVED_WORKFLOWS_KEY,
     queryFn: async ({ signal }) => {
       const res = await authenticatedFetch(`/v1/workflows?limit=${SAVED_WORKFLOWS_PAGE}`, {
         signal,
@@ -50,5 +54,24 @@ export function useSavedWorkflows({ enabled = true }: { enabled?: boolean } = {}
   const refresh = useCallback(() => {
     if (enabled && supported) void refetch();
   }, [enabled, supported, refetch]);
-  return { workflows: query.data ?? NO_WORKFLOWS, refresh };
+  return {
+    workflows: query.data ?? NO_WORKFLOWS,
+    isLoading: query.isLoading,
+    isError: query.isError,
+    refresh,
+  };
+}
+
+/** Deletes one of the user's saved workflows by ID, then reloads the list. */
+export function useDeleteWorkflow() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const res = await authenticatedFetch(`/v1/workflows/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: SAVED_WORKFLOWS_KEY }),
+  });
 }

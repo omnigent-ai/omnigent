@@ -58,11 +58,11 @@ spec can drop it with `tool_groups.journal: false` (see
 | Tool                                                               | Does                                                                                                                                                                                                                                                                            |
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `sys_journal_read(conversation_id?, kind?, step?, cursor?, limit?)` | Returns entries as compact lines, oldest first within the page, and `page.next_cursor` for older ones. With no arguments it reads the caller's newest entries. `kind: "plan"` returns plans with their full graphs. Another session's journal needs read access to that session. |
-| `sys_journal_write_plan(name, steps)`                               | Sets the session's plan: its name and the whole graph; returns `{id, position, version}`.                                                                                                                                                                                       |
+| `sys_journal_write_plan(name, steps, workflow_id?)`                | Sets the session's plan: its name and the whole graph; returns `{id, position, version}`. `workflow_id` names the saved workflow the plan starts a run of.                                                                                                                      |
 | `sys_journal_write_status(status, step?, text?)`                    | Records a step's status. `step` may be left out when the plan has one step. `started` and `done` need every step it depends on to be done first; otherwise the write fails with `step_not_ready`, naming them.                                                                  |
 | `sys_journal_write_note(body, step?)`                               | Adds a note.                                                                                                                                                                                                                                                                    |
 | `sys_workflow_request_input(step, questions)`                      | Asks the user about a task in the current plan and waits for the answer. It marks the task `needs_input` with the first question, raises the questions as an elicitation in the Inbox with the options as buttons, and returns `{answered, answers}`.                           |
-| `sys_workflow_save(name, description, steps)` | Saves a reusable workflow for the session's owner through `POST /v1/workflows`, and returns `{id, name}`, or `name_taken`. The `save-workflow` skill says how to make the steps generic. A save from a session shared with edit access is refused. |
+| `sys_workflow_save(name, description, steps)` | Saves a reusable workflow for the session's owner through `POST /v1/workflows`, and returns `{id, name}`, or `name_taken`. The session's current plan is then written again naming the workflow, with no new chat line. The `save-workflow` skill says how to make the steps generic. A save from a session shared with edit access is refused. |
 | `sys_workflow_load(workflow)` | Loads one of the owner's saved workflows by ID or name, with its steps. A name with no exact match returns `workflow_not_found` with the closest names. |
 | `sys_workflow_list(cursor?, limit?)` | Lists the owner's saved workflows by name, 20 at a time unless `limit` says otherwise (at most 50): each one's ID, name and the start of its description, without steps. `next_cursor` pages to the rest. |
 
@@ -138,6 +138,12 @@ without a plan review, and the automation's **Additional instructions**
 customize it. No one is watching the run, so the agent doesn't stop to ask:
 it takes the option it would recommend when that's easy to undo, or leaves
 the step **Waiting for you** and goes on with the rest.
+
+Click a workflow on the **Workflows** page to open it: its steps as a graph,
+and its runs, newest first. Each run links to its session and shows how many
+of its tasks are done, or that it's waiting for you. A run is listed once the
+agent writes the saved workflow's steps as its plan, so runs from before this
+release don't appear.
 
 ## Automations
 
@@ -248,8 +254,10 @@ servers that keep journals.
 A saved workflow is a named plan its owner can run, private to that owner, with
 steps in the plan's step format. Running one will copy its steps into the
 session's journal as the plan, and the entries written under it carry its ID in
-`workflow_id`. Workflows have no versions: an edit rewrites the workflow, and
-each run's journal keeps the plan it ran.
+`workflow_id`. Saving a session's plan as a workflow names it the same way, so
+the Tasks tab marks the plan with a Workflow chip either way. Workflows have no
+versions: an edit rewrites the workflow, and each run's journal keeps the plan
+it ran.
 
 - `GET /v1/workflows`: the caller's workflows by name, without their steps.
   `limit` (1–200, default 50), `after` (the previous page's `last_id`) and

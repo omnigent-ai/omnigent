@@ -58,4 +58,5 @@ and the agent running it asks for any that are missing.
 
 On `name_taken`, ask the user for another name. After saving, reply with what
 you saved, its name, description and steps, and say where to run it: Run a
-workflow in the + menu of a session's composer.
+workflow in the + menu of a session's composer, or Run in the workflow's ⋯
+menu on the Workflows page in the sidebar.

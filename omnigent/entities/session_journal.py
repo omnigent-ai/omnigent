@@ -110,6 +110,9 @@ class JournalEntry:
     :param scheduled_task_run_id: The automation run the session was serving
         when it was appended, or ``None``.
     :param payload: The kind's fields, e.g. ``{"status": "done", "text": "PR merged"}``.
+    :param workflow_id: The saved workflow the entry was written under: set on
+        the plan that starts a run of it, and on the statuses and notes written
+        while that plan is current. ``None`` outside saved workflows.
     """
 
     id: str
@@ -120,6 +123,7 @@ class JournalEntry:
     step: str | None
     scheduled_task_run_id: str | None
     payload: dict[str, Any]
+    workflow_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -145,6 +149,18 @@ class JournalPage:
 
     entries: list[JournalEntry]
     has_more: bool
+
+
+@dataclass(frozen=True)
+class WorkflowRunPage:
+    """One page of a saved workflow's runs, newest first.
+
+    :param plans: Each run's starting plan: the plan entry that named the workflow.
+    :param next_cursor: Pass it back for the next page; ``None`` on the last one.
+    """
+
+    plans: list[JournalEntry]
+    next_cursor: str | None
 
 
 def _text(name: str, value: object) -> str:

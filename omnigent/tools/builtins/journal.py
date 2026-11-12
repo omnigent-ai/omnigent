@@ -149,7 +149,9 @@ class SysJournalWritePlanTool(Tool):
             "its name. A single goal is a one-step plan. Replan when the goal grows or "
             "changes; keep the name while the goal is the same. A step that keeps its ID "
             "keeps its status, so finished work stays finished; give a step a new ID only "
-            "when its work changes. Returns the plan's version."
+            "when its work changes. When the plan starts a run of one of the user's saved "
+            "workflows, pass its ID as workflow_id, so the workflow's page lists the run; "
+            "leave it out when you replan. Returns the plan's version."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -169,6 +171,14 @@ class SysJournalWritePlanTool(Tool):
                 "steps": _steps_schema(
                     "Every step of the plan, with unique IDs and no dependency cycles."
                 ),
+                "workflow_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{32}$",
+                    "description": (
+                        "Only on the plan that starts a run of a saved workflow: its ID, "
+                        "from sys_workflow_load."
+                    ),
+                },
             },
             ["name", "steps"],
         )
@@ -444,7 +454,8 @@ class SysWorkflowLoadTool(Tool):
             "Load one of the user's saved workflows by ID or name: its name, its description "
             "(what a run needs), and its steps. To run it, follow the workflow skill: write "
             "its steps as your plan with sys_journal_write_plan, keeping their IDs and "
-            "dependencies, and fill the run's details into step names and goals. A name with "
+            "dependencies, with workflow_id set to its ID, and fill the run's details into "
+            "step names and goals. A name with "
             "no exact match returns workflow_not_found with the user's closest workflow names; "
             "to pick one by what it does instead, list them with sys_workflow_list."
         )

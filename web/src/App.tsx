@@ -66,6 +66,10 @@ const TaskDetailPage = withPageView(
   "tasks.detail",
   lazy(() => import("@/pages/TaskDetailPage").then((m) => ({ default: m.TaskDetailPage }))),
 );
+const WorkflowsPage = withPageView(
+  "workflows",
+  lazy(() => import("@/pages/WorkflowsPage").then((m) => ({ default: m.WorkflowsPage }))),
+);
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
@@ -216,6 +220,14 @@ function AppRoutes({ basename }: AppProps) {
             element={
               <FeatureGatedPage feature="automations_v2">
                 <TaskDetailPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/workflows`}
+            element={
+              <FeatureGatedPage feature="workflows_page">
+                <WorkflowsPage />
               </FeatureGatedPage>
             }
           />

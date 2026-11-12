@@ -1,4 +1,5 @@
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseSavedWorkflowsModule from "@/hooks/useSavedWorkflows";
 import type * as UseSessionJournalModule from "@/hooks/useSessionJournal";
 import type * as CapabilitiesModule from "@/lib/CapabilitiesContext";
 
@@ -6,6 +7,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
+import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import { type SessionJournalView, useSessionJournal } from "@/hooks/useSessionJournal";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { formatMessageTimestamp } from "@/lib/relativeTime";
@@ -26,6 +28,10 @@ import { TasksPanel } from "./TasksPanel";
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(),
+}));
+vi.mock("@/hooks/useSavedWorkflows", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseSavedWorkflowsModule>()),
+  useSavedWorkflows: vi.fn(),
 }));
 vi.mock("@/hooks/useSessionJournal", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionJournalModule>()),
@@ -88,6 +94,12 @@ function setSession(state: Partial<ConversationState>) {
 beforeEach(() => {
   vi.mocked(useChildSessions).mockReturnValue({ children: [] } as never);
   vi.mocked(useServerInfo).mockReturnValue({ session_journal: true } as never);
+  vi.mocked(useSavedWorkflows).mockReturnValue({
+    workflows: [],
+    isLoading: false,
+    isError: false,
+    refresh: vi.fn(),
+  });
   conversationRegistry
     .acquire("conv")
     .setState({ sessionStatus: "idle", todos: [], backgroundTaskCount: 0 });
@@ -244,6 +256,40 @@ describe("TasksPanel", () => {
     fireEvent.pointerLeave(screen.getByTestId("tasks-progress"));
     expect(screen.queryAllByTestId("tasks-progress-arc")).toHaveLength(0);
     expect(segments.some((segment) => segment.dataset.dimmed)).toBe(false);
+  });
+
+  it("marks a plan that runs or was saved as a workflow, naming it on hover", async () => {
+    const workflowId = "0123456789abcdef0123456789abcdef";
+    vi.mocked(useSavedWorkflows).mockReturnValue({
+      workflows: [{ id: workflowId, name: "Triage flaky tests", description: "Finds them." }],
+      isLoading: false,
+      isError: false,
+      refresh: vi.fn(),
+    });
+    showJournal([{ ...journalPlan(0, ["explore"]), workflow_id: workflowId }]);
+    renderPanel();
+    const chip = screen.getByTestId("tasks-plan-workflow");
+    expect(chip).toHaveTextContent("Workflow");
+    expect(chip.tagName).toBe("SPAN");
+    fireEvent.focus(chip);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "Saved workflow “Triage flaky tests”",
+    );
+    cleanup();
+
+    // With the Workflows page on, the chip opens it.
+    vi.mocked(useServerInfo).mockReturnValue({
+      session_journal: true,
+      features: { workflows_page: true },
+    } as never);
+    renderPanel();
+    expect(screen.getByTestId("tasks-plan-workflow")).toHaveAttribute("href", "/workflows");
+    cleanup();
+
+    showJournal([journalPlan(0, ["explore"])]);
+    renderPanel();
+    expect(screen.getByTestId("tasks-plan-name")).toHaveTextContent("The plan");
+    expect(screen.queryByTestId("tasks-plan-workflow")).toBeNull();
   });
 
   it("says on hover which task a progress segment is and where it stands", async () => {

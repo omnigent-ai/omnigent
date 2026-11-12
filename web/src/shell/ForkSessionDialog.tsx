@@ -53,7 +53,7 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { partitionAgentsByKind } from "@/lib/agentGrouping";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useSession } from "@/hooks/useSession";
-import type { Session } from "@/lib/types";
+import type { NativeModelOption, Session } from "@/lib/types";
 import { useHosts, useHostModelOptions, type Host } from "@/hooks/useHosts";
 import {
   nativeAgentHasCapability,
@@ -169,7 +169,7 @@ function sandboxRepositoryHint(count: number): string {
  * Compact host label for the Select item — mirrors NewChatDialog's
  * HostOption (which is private to that module).
  */
-function HostLabel({ host }: { host: Host }) {
+export function HostLabel({ host }: { host: Host }) {
   const isOnline = host.status === "online";
   return (
     <span className="flex items-center gap-2">
@@ -272,7 +272,8 @@ export interface ForkRunConfigValue {
  * permission/approval/mode pickers seed from the source only on a same-AGENT
  * fork (`sameAgentAsSource`); otherwise each seeds the target's default. See
  * the parent for how those two flags are derived from the backend's
- * `copy_model_settings` / `copy_terminal_launch_args` gates.
+ * `copy_model_settings` / `copy_terminal_launch_args` gates. The Run workflow
+ * dialog passes no source, so every picker starts on its default there.
  *
  * Emission is opt-in per control: a field is sent ONLY when the user actually
  * changed that control (see `touched`). An untouched control omits its field,
@@ -293,15 +294,22 @@ export interface ForkRunConfigValue {
  *   backend carries only on a same-agent fork.
  * @param selectedHostId - Host whose model catalog feeds the model picker; null
  *   leaves it on Default until a host is chosen.
+ * @param modelCatalog - Models to offer instead of the host's, e.g. a new
+ *   sandbox's; omitted to list the selected host's.
+ * @param remembered - Settings to start on in place of the source's, e.g. the
+ *   last ones used for a new session. With it, every shown control reports its
+ *   value, changed or not: a new session has no source to inherit from.
  * @param onChange - Reports the ready-to-send value on every change.
  */
-function ForkRunConfig({
+export function ForkRunConfig({
   targetHarness,
   targetAgent,
   sourceSession,
   sameFamilyAsSource,
   sameAgentAsSource,
   selectedHostId,
+  modelCatalog,
+  remembered,
   onChange,
 }: {
   targetHarness: string | null;
@@ -310,8 +318,11 @@ function ForkRunConfig({
   sameFamilyAsSource: boolean;
   sameAgentAsSource: boolean;
   selectedHostId: string | null;
+  modelCatalog?: { options: NativeModelOption[]; loading: boolean };
+  remembered?: ForkRunConfigValue;
   onChange: (value: ForkRunConfigValue) => void;
 }) {
+  const reportAll = remembered !== undefined;
   const hasPermission = nativeAgentHasCapability(targetAgent, "permissionMode");
   const hasApproval = nativeAgentHasCapability(targetAgent, "approvalMode");
   const hasCursor = nativeAgentHasCapability(targetAgent, "cursorMode");
@@ -326,19 +337,21 @@ function ForkRunConfig({
   // native harnesses that expose a picker resolve a catalog; others pass a
   // harmless unused harness key with the query disabled.
   const catalogHarness = showModel && targetHarness ? targetHarness : "claude-native";
-  const { data: hostModelOptions, isLoading: modelsLoading } = useHostModelOptions(
+  const hostCatalog = useHostModelOptions(
     selectedHostId,
     catalogHarness,
-    showModel && selectedHostId !== null,
+    showModel && selectedHostId !== null && modelCatalog === undefined,
   );
+  const catalogOptions = modelCatalog?.options ?? hostCatalog.data;
+  const modelsLoading = modelCatalog?.loading ?? hostCatalog.isLoading;
   const modelOptions = useMemo(
     () =>
-      (hostModelOptions ?? []).map((option) => ({
+      (catalogOptions ?? []).map((option) => ({
         id: option.id,
         displayName: option.displayName ?? option.id,
         isDefault: option.isDefault,
       })),
-    [hostModelOptions],
+    [catalogOptions],
   );
   const modelSelectOptions = useMemo(
     () => modelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
@@ -352,19 +365,34 @@ function ForkRunConfig({
     // Seed the source's model only once the catalog confirms it: a model id
     // absent from the loaded options has no Select item to land on and would
     // blank the trigger. Until the catalog resolves, Default holds.
-    const picked = sameFamilyAsSource ? sourceSession?.modelOverride : null;
+    const picked = remembered
+      ? remembered.modelOverride
+      : sameFamilyAsSource
+        ? sourceSession?.modelOverride
+        : null;
     return picked && modelOptions.some((m) => m.id === picked) ? picked : MODEL_SELECT_DEFAULT;
-  }, [sameFamilyAsSource, sourceSession, modelOptions]);
+  }, [remembered, sameFamilyAsSource, sourceSession, modelOptions]);
   const seededEffort = useMemo(() => {
     // Seed only an effort the picker can display; a source value outside the
     // offered vocabulary (e.g. "minimal") falls back to Default rather than
     // leaving the Select on an empty, unselectable value.
-    const effort = sameFamilyAsSource ? sourceSession?.reasoningEffort : null;
+    const effort = remembered
+      ? remembered.reasoningEffort
+      : sameFamilyAsSource
+        ? sourceSession?.reasoningEffort
+        : null;
     return effort && CLAUDE_NATIVE_EFFORTS.some((e) => e.value === effort)
       ? effort
       : EFFORT_SELECT_NONE;
-  }, [sameFamilyAsSource, sourceSession]);
+  }, [remembered, sameFamilyAsSource, sourceSession]);
   const seededPermission = useMemo(() => {
+    if (remembered) {
+      // Only a mode the picker still offers.
+      const mode = claudePermissionModeFromSession(remembered);
+      return mode && CLAUDE_NATIVE_PERMISSION_MODES.some((m) => m.value === mode)
+        ? mode
+        : CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE;
+    }
     // Permission mode rides terminal_launch_args, which the backend copies
     // ONLY on a same-AGENT fork (copy_terminal_launch_args = not switching).
     // Seed on the same rule (not harness equality) so the displayed mode can't
@@ -375,11 +403,15 @@ function ForkRunConfig({
       );
     }
     return CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE;
-  }, [sameAgentAsSource, sourceSession]);
+  }, [remembered, sameAgentAsSource, sourceSession]);
   const seededModeValue = useMemo(() => {
     // Same as permission: launch args carry over only on a same-agent fork, so
     // seed the mode from the source only then; otherwise the harness's default.
-    const source = sameAgentAsSource ? (sourceSession?.terminalLaunchArgs ?? []) : [];
+    const source = remembered
+      ? (remembered.terminalLaunchArgs ?? [])
+      : sameAgentAsSource
+        ? (sourceSession?.terminalLaunchArgs ?? [])
+        : [];
     const table: NativeHarnessMode[] = hasApproval
       ? CODEX_NATIVE_APPROVAL_MODES
       : hasCursor
@@ -396,11 +428,11 @@ function ForkRunConfig({
     // same-agent fork of a bypass-armed codex source seeds the bypass option.
     // (The source label is still dropped server-side; re-selecting here is the
     // explicit opt-in that re-arms it — never automatic.)
-    if (
-      isCodex &&
-      sameAgentAsSource &&
-      sourceSession?.labels?.["omnigent.codex_native.bypass_sandbox"] === "1"
-    ) {
+    const bypassed = remembered
+      ? remembered.codexBypassSandbox === true
+      : sameAgentAsSource &&
+        sourceSession?.labels?.["omnigent.codex_native.bypass_sandbox"] === "1";
+    if (isCodex && bypassed) {
       return CODEX_NATIVE_BYPASS_APPROVAL_VALUE;
     }
     // Match the source's launch args against the mode table (longest args first
@@ -409,7 +441,7 @@ function ForkRunConfig({
       .sort((a, b) => b.args.length - a.args.length)
       .find((m) => m.args.length > 0 && m.args.every((arg) => source.includes(arg)));
     return match?.value ?? dflt;
-  }, [isCodex, sameAgentAsSource, sourceSession, hasApproval, hasCursor, hasAgySkip]);
+  }, [remembered, isCodex, sameAgentAsSource, sourceSession, hasApproval, hasCursor, hasAgySkip]);
 
   const [model, setModel] = useState(seededModel);
   const [effort, setEffort] = useState(seededEffort);
@@ -472,20 +504,20 @@ function ForkRunConfig({
   // for a fork that sent no run-config at all.
   useEffect(() => {
     const value: ForkRunConfigValue = {};
-    if (showModel && touched.model) {
+    if (showModel && (touched.model || reportAll)) {
       value.modelOverride = model === MODEL_SELECT_DEFAULT ? "default" : model;
     }
     if (hasPermission) {
-      if (touched.effort) {
+      if (touched.effort || reportAll) {
         value.reasoningEffort = effort === EFFORT_SELECT_NONE ? "default" : effort;
       }
-      if (touched.permission) {
+      if (touched.permission || reportAll) {
         value.terminalLaunchArgs =
           permission === CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
             ? []
             : ["--permission-mode", permission];
       }
-    } else if (hasApproval && touched.mode) {
+    } else if (hasApproval && (touched.mode || reportAll)) {
       if (isCodex && mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE) {
         // Bypass is a LABEL, not launch args: clear any preset flags and set
         // the dedicated opt-in the server turns into the bypass label.
@@ -495,9 +527,9 @@ function ForkRunConfig({
         value.terminalLaunchArgs =
           CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === mode)?.args ?? [];
       }
-    } else if (hasCursor && touched.mode) {
+    } else if (hasCursor && (touched.mode || reportAll)) {
       value.terminalLaunchArgs = CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === mode)?.args ?? [];
-    } else if (hasAgySkip && touched.mode) {
+    } else if (hasAgySkip && (touched.mode || reportAll)) {
       value.terminalLaunchArgs = AGY_NATIVE_SKIP_MODES.find((m) => m.value === mode)?.args ?? [];
     }
     onChange(value);
@@ -513,6 +545,7 @@ function ForkRunConfig({
     permission,
     mode,
     touched,
+    reportAll,
     onChange,
   ]);
 
@@ -543,7 +576,9 @@ function ForkRunConfig({
             )}
             {!modelsLoading && modelOptions.length === 0 && (
               <div className="px-2.5 py-1 text-sm text-muted-foreground">
-                {selectedHostId === null ? "Select a host to list models" : "Models unavailable"}
+                {selectedHostId === null && modelCatalog === undefined
+                  ? "Select a host to list models"
+                  : "Models unavailable"}
               </div>
             )}
           </RoutingModelSelect>

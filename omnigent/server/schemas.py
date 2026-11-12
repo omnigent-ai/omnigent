@@ -3280,6 +3280,9 @@ class SessionJournalEntry(BaseModel):
     :param payload: e.g. ``{"status": "done", "text": "PR merged"}`` for a
         status, ``{"body": "…"}`` for a note, or ``{"version": 2, "source":
         "agent", "steps": [...]}`` for a plan.
+    :param workflow_id: The saved workflow the entry was written under, or
+        ``None``: set on the plan that starts a run of it, and on the statuses
+        and notes written while that plan is current.
     """
 
     id: str
@@ -3290,6 +3293,7 @@ class SessionJournalEntry(BaseModel):
     author: SessionJournalAuthor
     kind: JournalEntryKind
     payload: dict[str, Any]
+    workflow_id: str | None = None
 
 
 class SessionJournalPage(BaseModel):
@@ -3372,6 +3376,62 @@ class WorkflowList(BaseModel):
     has_more: bool = False
 
 
+class WorkflowRunProgress(BaseModel):
+    """
+    Where a run's steps stand: the steps of the plan that started it, counted
+    by their current status in the session.
+
+    :param total: Steps in that plan, e.g. ``5``.
+    :param started: Steps in progress.
+    :param done: Steps done.
+    :param needs_input: Steps waiting for the user.
+    :param failed: Steps that failed.
+    """
+
+    total: int
+    started: int = 0
+    done: int = 0
+    needs_input: int = 0
+    failed: int = 0
+
+
+class WorkflowRun(BaseModel):
+    """
+    One run of a saved workflow: a session that started it.
+
+    :param session_id: The session that ran it.
+    :param title: The session's title; empty when it has none yet.
+    :param started_at: Unix epoch seconds when the run's plan was written.
+    :param session_status: The session's status, ``"idle"``, ``"running"`` or
+        ``"failed"``.
+    :param archived: Whether the session is archived.
+    :param progress: Where the run's steps stand.
+    """
+
+    session_id: str
+    title: str
+    started_at: int
+    session_status: Literal["idle", "running", "failed"]
+    archived: bool = False
+    progress: WorkflowRunProgress
+
+
+class WorkflowRunList(BaseModel):
+    """
+    One page of a saved workflow's runs, newest first, for
+    ``GET /v1/workflows/{id}/runs``.
+
+    :param object: Discriminator; always ``"list"``.
+    :param data: The page's runs in sessions the caller can read.
+    :param next_cursor: Pass it as ``before`` for the next page; ``None`` on
+        the last page.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[WorkflowRun] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
 class CreateWorkflowRequest(BaseModel):
     """
     Request body for ``POST /v1/workflows``.
@@ -3429,6 +3489,8 @@ class SessionJournalAppendRequest(BaseModel):
     :param step: The plan step the entry is about.
     :param idempotency_key: Names the write, e.g. ``"tool:<tool call ID>"``; a
         retry with the same key returns the first attempt's entry.
+    :param workflow_id: For a plan that starts a run of one of the user's saved
+        workflows, that workflow's ID.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -3437,6 +3499,7 @@ class SessionJournalAppendRequest(BaseModel):
     payload: dict[str, Any]
     step: str | None = None
     idempotency_key: str = Field(min_length=1, max_length=128)
+    workflow_id: str | None = None
 
 
 class SessionJournalInputRequest(BaseModel):

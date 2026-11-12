@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   REVIEW_PLAN_FIRST,
+  createWorkflowPrompt,
+  runSavedWorkflowPrompt,
   offersSaveWorkflow,
   offersWorkflow,
   parseSavedWorkflowMessage,
@@ -68,6 +70,14 @@ describe("saveWorkflowMessage", () => {
   });
 });
 
+describe("createWorkflowPrompt", () => {
+  it("asks the save-workflow skill to draft the named workflow without doing the work", () => {
+    expect(createWorkflowPrompt("  Triage flaky tests ", " Rerun the suite ")).toBe(
+      'Use the save-workflow skill to create a workflow named "Triage flaky tests" from this description, without doing the work:\n\nRerun the suite',
+    );
+  });
+});
+
 describe("parseSavedWorkflowMessage", () => {
   const workflow = { id: "0123456789abcdef0123456789abcdef", name: 'Triage "flaky" tests' };
 
@@ -84,5 +94,18 @@ describe("parseSavedWorkflowMessage", () => {
   it("ignores other prompts", () => {
     expect(parseSavedWorkflowMessage("Summarize overnight activity")).toBeNull();
     expect(parseSavedWorkflowMessage("/workflow Add retries")).toBeNull();
+  });
+});
+
+describe("runSavedWorkflowPrompt", () => {
+  it("asks the workflow skill to run the saved workflow by ID", () => {
+    expect(
+      runSavedWorkflowPrompt({
+        id: "0123456789abcdef0123456789abcdef",
+        name: "Triage flaky tests",
+      }),
+    ).toBe(
+      'Use the workflow skill to run the saved workflow "Triage flaky tests" (ID 0123456789abcdef0123456789abcdef).',
+    );
   });
 });

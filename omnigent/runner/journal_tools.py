@@ -134,11 +134,17 @@ def _write_request(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
         payload = normalize_status(args.get("status"), text=args.get("text"))
         return {"kind": "status", "payload": payload, "step": step}
     plan = normalize_plan(args.get("steps"), name=args.get("name"))
-    return {
+    body: dict[str, Any] = {
         "kind": "plan",
         "payload": {"name": plan["name"], "steps": plan["steps"]},
         "step": None,
     }
+    workflow_id = args.get("workflow_id")
+    if workflow_id is not None:
+        if not (isinstance(workflow_id, str) and _WORKFLOW_ID.fullmatch(workflow_id)):
+            raise InvalidJournalEntryError("workflow_id must be a saved workflow's ID")
+        body["workflow_id"] = workflow_id
+    return body
 
 
 async def _post_with_retries(
@@ -493,9 +499,17 @@ _DESCRIPTION_PREVIEW_CHARS = 200
 
 
 async def _save_workflow(
-    args: dict[str, Any], *, server_client: httpx.AsyncClient, conversation_id: str
+    args: dict[str, Any],
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    call_id: str | None,
+    publish_event: _Publisher | None,
 ) -> str:
-    """Save a workflow for the session's owner with ``POST /v1/workflows``."""
+    """Save a workflow for the session's owner with ``POST /v1/workflows``.
+
+    The session's plan is then the workflow, so it's written again naming it.
+    """
     try:
         name, description, steps = normalize_workflow(
             name=args.get("name"), description=args.get("description"), steps=args.get("steps")
@@ -521,7 +535,50 @@ async def _save_workflow(
     if response.status_code >= 400:
         return _error(_server_message(response))
     workflow = response.json()
+    await _name_plan_workflow(
+        workflow["id"],
+        server_client=server_client,
+        conversation_id=conversation_id,
+        call_id=call_id,
+        publish_event=publish_event,
+    )
     return json.dumps({"id": workflow["id"], "name": workflow["name"]}, ensure_ascii=False)
+
+
+async def _name_plan_workflow(
+    workflow_id: str,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    call_id: str | None,
+    publish_event: _Publisher | None,
+) -> None:
+    """Write the session's current plan again, unchanged but for *workflow_id*.
+
+    The journal adds no chat line for a plan whose steps don't change, and the
+    Tasks tab keeps each step's progress. Skipped when the session has no plan;
+    a failure leaves the saved workflow as it is.
+    """
+    page = await _get(
+        server_client, conversation_id, {"order": "desc", "limit": 1, "kind": "plan"}
+    )
+    if isinstance(page, str) or not page.get("data"):
+        return
+    plan = page["data"][0]
+    if plan.get("workflow_id") == workflow_id:
+        return
+    await _write(
+        "sys_journal_write_plan",
+        {
+            "name": plan["payload"]["name"],
+            "steps": plan["payload"]["steps"],
+            "workflow_id": workflow_id,
+        },
+        server_client=server_client,
+        conversation_id=conversation_id,
+        call_id=f"{call_id}:plan" if call_id else None,
+        publish_event=publish_event,
+    )
 
 
 async def _get_workflows(
@@ -668,7 +725,11 @@ async def execute_journal_tool(
         return await _read(args, server_client=server_client, conversation_id=conversation_id)
     if tool_name == "sys_workflow_save":
         return await _save_workflow(
-            args, server_client=server_client, conversation_id=conversation_id
+            args,
+            server_client=server_client,
+            conversation_id=conversation_id,
+            call_id=call_id,
+            publish_event=publish_event,
         )
     if tool_name == "sys_workflow_load":
         return await _load_workflow(

@@ -48,11 +48,17 @@ async def client(
         yield client
 
 
-def _session(db_uri: str, *, labels: dict[str, str] | None = None) -> str:
-    """A session alice owns."""
+def _session(
+    db_uri: str,
+    *,
+    labels: dict[str, str] | None = None,
+    title: str | None = None,
+    owner: str = ALICE,
+) -> str:
+    """A session *owner* owns, alice by default."""
     conversations = SqlAlchemyConversationStore(db_uri)
-    session = conversations.create_conversation()
-    SqlAlchemyPermissionStore(db_uri).grant(ALICE, session.id, 4)
+    session = conversations.create_conversation(title=title)
+    SqlAlchemyPermissionStore(db_uri).grant(owner, session.id, 4)
     if labels:
         conversations.set_labels(session.id, labels)
     return session.id
@@ -583,3 +589,139 @@ async def test_the_workflow_tools_save_and_load_through_the_real_routes(
         ],
         "next_cursor": None,
     }
+
+    # Running it: the plan names the workflow, and the workflow's page lists the run.
+    plan = {"name": by_name["name"], "steps": by_name["steps"], "workflow_id": saved["id"]}
+    assert (await run("sys_journal_write_plan", plan))["version"] == 1
+    runs = (await client.get(f"/v1/workflows/{saved['id']}/runs")).json()
+    assert [run["session_id"] for run in runs["data"]] == [session_id]
+
+
+async def test_saving_a_workflow_names_the_sessions_plan_after_it(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """The plan a session saves is then the workflow: it names it, with no new chat line."""
+    import json
+
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.runner.journal_tools import execute_journal_tool
+
+    session_id = _session(db_uri)
+    token = "save-names-plan-runner"
+    conversations = SqlAlchemyConversationStore(db_uri)
+    assert conversations.set_runner_id(session_id, token_bound_runner_id(token)) is True
+    client.headers.update({**_headers(), RUNNER_TUNNEL_TOKEN_HEADER: token})
+
+    async def run(tool: str, args: dict[str, object]) -> dict:
+        output = await execute_journal_tool(
+            tool, json.dumps(args), server_client=client, conversation_id=session_id
+        )
+        return json.loads(output)
+
+    steps = [
+        {"id": "explore", "name": "Explore the failing tests", "depends_on": []},
+        {"id": "fix", "name": "Fix the failing tests", "depends_on": ["explore"]},
+    ]
+    plan = {"name": "Fix the upload flakes", "steps": steps}
+    assert (await run("sys_journal_write_plan", plan))["version"] == 1
+    workflow = {
+        "name": "Triage flaky tests",
+        "description": "Finds and fixes them.",
+        "steps": steps,
+    }
+    saved = await run("sys_workflow_save", workflow)
+
+    url = f"/v1/sessions/{session_id}/journal"
+    plans = (await client.get(url, params={"kind": "plan"})).json()["data"]
+    assert [(entry["payload"]["version"], entry["workflow_id"]) for entry in plans] == [
+        (1, None),
+        (2, saved["id"]),
+    ]
+    assert plans[1]["payload"]["name"] == "Fix the upload flakes"
+    assert [step["id"] for step in plans[1]["payload"]["steps"]] == ["explore", "fix"]
+    items = conversations.list_items(session_id, limit=50).data
+    markers = [item.data.resource for item in items if item.type == "resource_event"]
+    assert [marker.get("change") for marker in markers] == ["made"]
+
+
+async def test_a_workflows_runs_list_the_sessions_that_ran_it(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.stores.session_journal_store import SessionJournalStore
+
+    steps = [
+        {"id": "explore", "name": "Explore", "depends_on": []},
+        {"id": "fix", "name": "Fix", "depends_on": ["explore"]},
+    ]
+    saved = await client.post(
+        "/v1/workflows",
+        json={"name": "Triage", "description": "Triage a flaky test.", "steps": steps},
+        headers=_headers(ALICE),
+    )
+    workflow_id = saved.json()["id"]
+    plan = {"name": "Triage", "steps": steps}
+    first = _session(db_uri, title="Fix the upload test")
+    second = _session(db_uri, title="Fix the retry test")
+    for session_id, status in ((first, "done"), (second, "needs_input")):
+        url = f"/v1/sessions/{session_id}/journal"
+        started = await client.post(
+            url,
+            json=_write("plan", plan, "tool:plan", workflow_id=workflow_id),
+            headers=_runner(session_id),
+        )
+        assert started.status_code == 200, started.text
+        assert started.json()["workflow_id"] == workflow_id
+        explored = await client.post(
+            url,
+            json=_write("status", {"status": status, "text": "x"}, "tool:s", step="explore"),
+            headers=_runner(session_id),
+        )
+        assert explored.json()["workflow_id"] == workflow_id
+
+    # Only a plan names a workflow, and only one of the caller's own.
+    note = _write("note", {"body": "x"}, "tool:note", workflow_id=workflow_id)
+    refused = await client.post(f"/v1/sessions/{first}/journal", json=note, headers=_runner(first))
+    assert refused.status_code == 400 and "only a plan names a workflow" in refused.text
+    bobs = _session(db_uri, title="Bob's session", owner=BOB)
+    foreign = await client.post(
+        f"/v1/sessions/{bobs}/journal",
+        json=_write("plan", plan, "tool:plan", workflow_id=workflow_id),
+        headers=_runner(bobs, BOB),
+    )
+    assert foreign.status_code == 400 and "workflow_not_found" in foreign.text
+    # A run in a session alice can't read stays off her list.
+    SessionJournalStore(db_uri).append(
+        bobs, "plan", plan, idempotency_key="direct", workflow_id=workflow_id
+    )
+
+    url = f"/v1/workflows/{workflow_id}/runs"
+    runs = (await client.get(url, headers=_headers(ALICE))).json()
+    by_session = {run["session_id"]: run for run in runs["data"]}
+    assert set(by_session) == {first, second} and runs["next_cursor"] is None
+    assert by_session[first]["title"] == "Fix the upload test"
+    assert by_session[first]["session_status"] == "idle"
+    assert by_session[first]["progress"] == {
+        "total": 2,
+        "started": 0,
+        "done": 1,
+        "needs_input": 0,
+        "failed": 0,
+    }
+    assert by_session[second]["progress"]["needs_input"] == 1
+    # One run a page: three pages, one of them empty where bob's run was left out.
+    pages, cursor = [], ""
+    while cursor is not None:
+        page = (
+            await client.get(
+                f"{url}?limit=1&before={cursor}" if cursor else f"{url}?limit=1",
+                headers=_headers(ALICE),
+            )
+        ).json()
+        pages.append([run["session_id"] for run in page["data"]])
+        cursor = page["next_cursor"]
+    assert len(pages) == 3
+    assert sorted(run for page in pages for run in page) == sorted([first, second])
+
+    assert (await client.get(url, headers=_headers(BOB))).status_code == 404
+    bad = await client.get(f"{url}?before=nope", headers=_headers(ALICE))
+    assert bad.status_code == 400
