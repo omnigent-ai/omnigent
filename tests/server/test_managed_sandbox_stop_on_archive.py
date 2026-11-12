@@ -106,6 +106,21 @@ async def test_the_providers_launcher_makes_the_final_call(db_uri, monkeypatch, 
     assert len(fake.stopped) == (0 if configured else 1)
 
 
+@pytest.mark.parametrize("configured", [True, False], ids=["on", "off"])
+async def test_a_launcher_without_the_hook_follows_the_setting(db_uri, monkeypatch, configured):
+    # Embedding deployments may inject duck-typed launchers that predate the hook.
+    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
+    monkeypatch.setattr(type(fake), "stop_when_archived", property(_raise_attribute_error))
+    assert not hasattr(fake, "stop_when_archived")
+    stopped = await _stop(fake, host_store, conversations, conv, stop_on_archive=configured)
+    assert stopped is configured
+    assert len(fake.stopped) == (1 if configured else 0)
+
+
+def _raise_attribute_error(_self: object) -> None:
+    raise AttributeError("stop_when_archived")
+
+
 async def test_an_unarchive_while_the_launcher_decides_keeps_the_sandbox(db_uri, monkeypatch):
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
 

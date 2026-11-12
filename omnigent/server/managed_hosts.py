@@ -47,8 +47,8 @@ stores into ``create_app``):
          stop_on_archive: false   # optional; per provider (a top-level value
                                   # is every `providers:` entry's default).
                                   # Stop (not delete) a session's sandbox when
-                                  # the session is archived and no unarchived
-                                  # session still uses it; the next message
+                                  # the session is archived and no other
+                                  # session uses its host; the next message
                                   # resumes it. Only for providers that can
                                   # resume a stopped sandbox (default: false)
          reaper:                  # optional; deployment-wide, not per-provider
@@ -805,7 +805,7 @@ class ManagedSandboxConfig:
         names none, from ``sandbox.default_profile_id``. Authorized and saved like an
         explicit selection. ``None`` keeps a selection mandatory.
     :param stop_on_archive: Stop an archived session's sandbox, keeping it
-        resumable, once no unarchived session is bound to its host. The
+        resumable, when no other session uses its host. The
         provider's launcher makes the final call through
         :meth:`~omnigent.onboarding.sandboxes.base.SandboxLifecycle.stop_when_archived`
         (see :func:`stop_archived_session_sandbox`).
