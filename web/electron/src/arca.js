@@ -22,6 +22,7 @@ const { execFile, execFileSync, spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { lastLine, SAFE_URL_RE } = require("./remoteCommand");
 const { readArcaIdentity, IDENTITY_START, IDENTITY_END } = require("./arcaIdentity");
 
 /**
@@ -30,16 +31,6 @@ const { readArcaIdentity, IDENTITY_START, IDENTITY_END } = require("./arcaIdenti
  */
 const CONNECT_TIMEOUT_MS = 5 * 60 * 1000;
 const ARCA_AUTH_RE = /arca (auth )?login|certificate.*expired|permission denied \(publickey/i;
-
-/**
- * The only characters allowed in the server URL that rides inside the ssh
- * remote command. ssh joins argv with spaces and the REMOTE shell re-parses
- * the line, so the URL (the one non-literal argument) must not smuggle shell
- * metacharacters (`;`, `$`, backticks, quotes, spaces…) through its path or
- * query — URL-legal but shell-hostile. Allowlist, not escape: a URL outside
- * this set is refused outright.
- */
-const SAFE_URL_RE = /^[A-Za-z0-9\-._~:/?=&%]+$/;
 
 /**
  * @typedef {"timeout" | "omni-auth" | "arca-auth" | "missing-remote-cli" | "unreachable" | "not-installed" | "no-instance" | "runtime-limit" | "unknown"} ArcaErrorKind
@@ -287,21 +278,6 @@ function describeConnectFailure(run) {
       ? `Connecting to Arca failed: ${lastLine(detail)}`
       : `Connecting to Arca failed (exit code ${run.code ?? "unknown"}).`,
   };
-}
-
-/**
- * The last non-empty line of captured output — arca and ssh are chatty, and
- * the final line is where both put the actual error.
- *
- * @param {string} text
- * @returns {string}
- */
-function lastLine(text) {
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  return lines[lines.length - 1] ?? text;
 }
 
 /**

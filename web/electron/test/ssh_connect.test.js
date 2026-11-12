@@ -24,7 +24,7 @@ const {
   startSshConnect,
   validateDestination,
 } = require("../src/ssh_connect");
-const { IDENTITY_START, IDENTITY_END } = require("../src/arcaIdentity");
+const { IDENTITY_START, IDENTITY_END } = require("../src/hostIdentity");
 
 const SERVER = "https://example.cloud.databricks.com/omnigent";
 const sleep = (ms) =>

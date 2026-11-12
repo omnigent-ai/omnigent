@@ -219,10 +219,8 @@ interface ElectronDesktopApi extends NativeShellApi {
   onHostStatusChanged?: (callback: () => void) => () => void;
   /** Desktop feature gates; absent on older shells. */
   getDesktopFeatures?: () => Promise<DesktopFeatures | null>;
-  /** Connect the user's Arca instance to the window's server as a host. */
-  connectArcaHost?: () => Promise<ArcaConnectResult>;
   /** Connect a machine the user reaches over SSH; absent on Windows and older shells. */
-  connectSshHost?: (destination: string) => Promise<ArcaConnectResult>;
+  connectSshHost?: (destination: string) => Promise<HostConnectResult>;
   /** The local `omni` CLI status (installed, resolved path, version, source). */
   getCliStatus?: () => Promise<CliStatus | null>;
   /** Clear the CLI-path override (revert to auto-detection); resolves status. */
@@ -412,9 +410,9 @@ export interface ChromeCookieImportResult {
 /** A lifecycle action for the host daemon. */
 export type HostControlAction = "start" | "stop" | "restart";
 
-/** Result of connecting the Arca instance as a host, from the desktop shell. */
-export interface ArcaConnectResult extends HostActionResult {
-  /** Actual daemon identity captured on Arca for this selected server target. */
+/** Result of connecting a remote host through the desktop shell. */
+export interface HostConnectResult extends HostActionResult {
+  /** Daemon identity captured for the selected server target. */
   identity?: { serverUrl: string; hostId: string };
   /**
    * The box's host daemon was already connected to this server (the command
@@ -1388,24 +1386,6 @@ export async function getDesktopFeatures(): Promise<DesktopFeatures | null> {
   }
 }
 
-/**
- * Connect the user's Arca instance to the window's server as a host, via the
- * desktop shell. The shell asks for native consent first and resolves once the
- * remote host daemon starts or fails. A no-op `{ ok: false }` outside the shell.
- */
-export async function connectArcaHost(): Promise<ArcaConnectResult> {
-  const electron = electronApi();
-  if (!electron?.connectArcaHost) {
-    return { ok: false, error: "not running under the desktop shell" };
-  }
-  try {
-    return await electron.connectArcaHost();
-  } catch (err) {
-    console.warn("[nativeBridge] electron connectArcaHost failed:", err);
-    return { ok: false, error: String(err) };
-  }
-}
-
 /** Whether this desktop shell can connect a machine the user reaches over SSH. */
 export function supportsSshConnect(): boolean {
   return typeof electronApi()?.connectSshHost === "function";
@@ -1416,7 +1396,7 @@ export function supportsSshConnect(): boolean {
  * server as a host. The shell asks consent and handles ssh prompts and the
  * browser sign-in in its own window. A no-op `{ ok: false }` outside the shell.
  */
-export async function connectSshHost(destination: string): Promise<ArcaConnectResult> {
+export async function connectSshHost(destination: string): Promise<HostConnectResult> {
   const electron = electronApi();
   if (!electron?.connectSshHost) {
     return { ok: false, error: "not running under the desktop shell" };
