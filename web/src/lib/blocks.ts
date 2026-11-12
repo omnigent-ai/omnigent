@@ -1,3 +1,4 @@
+import type { AssistantMessagePhase } from "./conversationItems";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_blocks.py.
 //
@@ -13,7 +14,13 @@ import { capitalizeAgentName } from "./agentLabels";
 import { agentRootName } from "./forkHarness";
 import { nativeCodingAgentForAgentName } from "./nativeCodingAgents";
 import type { RoutingDecisionExtras } from "./routingDecision";
-import type { AgyPermission, CodexPersistMode, RememberScope, Response } from "./types";
+import type {
+  AgyPermission,
+  CodexPersistMode,
+  FileEditRequest,
+  RememberScope,
+  Response,
+} from "./types";
 
 /**
  * Metadata attached to every stream block.
@@ -303,6 +310,13 @@ export interface SlashCommandBlock {
   output: string | null;
 }
 
+/** Hide the internal native-wrapper namespace added to bundled skills. */
+export function slashCommandDisplayName(name: string): string {
+  const separator = name.indexOf(":");
+  if (separator < 0 || !nativeCodingAgentForAgentName(name.slice(0, separator))) return name;
+  return name.slice(separator + 1) || name;
+}
+
 /**
  * Reconstruct the literal composer text a skill invocation came from,
  * e.g. `/review-pr 123 focus on auth`. A skill's `slash_command`
@@ -312,7 +326,8 @@ export interface SlashCommandBlock {
  * Skill indicator.
  */
 export function slashCommandEchoText(name: string, args: string): string {
-  return args ? `/${name} ${args}` : `/${name}`;
+  const displayName = slashCommandDisplayName(name);
+  return args ? `/${displayName} ${args}` : `/${displayName}`;
 }
 
 /**
@@ -387,6 +402,8 @@ export interface TextDone {
   hasCodeBlocks: boolean;
   /** True when this persisted assistant text came from an interrupted turn. */
   interrupted?: boolean;
+  /** Harness label for the message, when the harness reports one (Codex). */
+  phase?: AssistantMessagePhase;
   /** UI-only marker for a provisional native preview with missing live output. */
   previewInterrupted?: boolean;
   /** Last native chunk index rendered in this provisional preview. */
@@ -467,6 +484,8 @@ export interface ErrorBlock {
    * native terminal, whose mirrored message carries no stable id.
    */
   unansweredSend?: { stableId: string; text?: string };
+  /** A client-only card for a failure carried only by a `failed` session status. */
+  fromSessionStatus?: true;
 }
 
 /**
@@ -616,6 +635,8 @@ export interface ElicitationBlock {
   type: "elicitation";
   ctx: BlockContext;
   elicitationId: string;
+  /** False when the agent keeps working while the card waits, e.g. a Codex async question. */
+  isBlocking?: false;
   /**
    * Session whose resolve endpoint should receive the verdict.
    * Present when a child/sub-agent prompt is mirrored into an
@@ -680,6 +701,8 @@ export interface ElicitationBlock {
    * Optional/null for every other elicitation.
    */
   exitPlanMode?: Record<string, unknown> | null;
+  /** Claude-native file-edit prompts only: the full tool call, so the card can show a diff. */
+  fileEdit?: FileEditRequest | null;
   /**
    * Structured Codex command-approval payload. Present for
    * codex-native command approvals so the card can show command,
@@ -751,7 +774,12 @@ export type AnyBlock =
   | PolicyDeniedBlock
   | ResponseEndBlock;
 
-/** Whether a pending card answers `sessionId`'s own prompt, not a mirrored sub-agent's. */
+/** Whether a block is a pending card that parks the agent's turn until it is answered. */
+export function isPendingBlockingElicitation(block: AnyBlock): boolean {
+  return block.type === "elicitation" && block.status === "pending" && block.isBlocking !== false;
+}
+
+/** Whether a pending blocking card answers `sessionId`'s own prompt, not a mirrored sub-agent's. */
 export function hasPendingOwnElicitation(
   blocks: readonly AnyBlock[],
   sessionId: string | null,
@@ -759,7 +787,7 @@ export function hasPendingOwnElicitation(
   return blocks.some(
     (b) =>
       b.type === "elicitation" &&
-      b.status === "pending" &&
+      isPendingBlockingElicitation(b) &&
       (b.targetSessionId == null || b.targetSessionId === sessionId),
   );
 }

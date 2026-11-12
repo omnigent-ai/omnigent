@@ -36,7 +36,8 @@ local; automatic client sync and shared/machine scope controls remain deferred.
 `harness=<harness>` saves a user default. Omit `--global` to save in the current
 project. Use `omnigent config list` to inspect the files and
 `omnigent config unset [--global] model` to remove a value. Startup commands
-and argument lists are configured in the user file's per-harness mappings;
+and argument lists are configured in the user file's per-harness mappings, as is
+`harness.codex-native.app_server`, a wrapper for Codex's session app-servers;
 `config list` names any project-file entries it ignores.
 
 **Launch:** run `omnigent run` with an agent/default agent and optional model
@@ -219,8 +220,8 @@ observed results, any mocked services, and remaining entry-point gaps.
 - Requests have bounded bodies and worker admission. Managed rollout and task
   ownership still require deployment wiring; the OSS process recipe does not
   validate managed authentication or MySQL concurrency.
-- Managed deployment, Universe wiring, Arclet startup, automatic outbox/reconnect,
-  and native plugin isolation remain unverified follow-ups.
+- Managed deployment wiring, Arclet startup, automatic outbox/reconnect, and
+  native plugin isolation remain unverified follow-ups.
 - `--global` means this machine's user YAML, not a shared workspace write.
   Reading or editing YAML does not opt into shared preferences.
 - `config list` displays user and project defaults under their file paths;

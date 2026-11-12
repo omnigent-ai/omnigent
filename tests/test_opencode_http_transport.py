@@ -18,36 +18,24 @@ from omnigent.harnesses.opencode_native.http_transport import (
 )
 from omnigent.native.native_server_transport import (
     NativeLaunchConfig,
-    NativePermissionDecision,
     NativePrompt,
 )
 
-# ── build_prompt_payload + part/model helpers ──────────────────────────────
+# ── build_prompt_payload ─────────────────────────────────────────────────────
 
 
 def test_build_prompt_payload_text_only() -> None:
-    assert build_prompt_payload(NativePrompt(text="hi")) == {
-        "parts": [{"type": "text", "text": "hi"}]
-    }
+    assert build_prompt_payload("hi", ()) == {"text": "hi", "files": [], "delivery": "steer"}
 
 
-def test_build_prompt_payload_system_and_model_split() -> None:
+def test_build_prompt_payload_queue_delivery() -> None:
+    assert build_prompt_payload("hi", (), delivery="queue")["delivery"] == "queue"
+
+
+def test_build_prompt_payload_data_uri_attachments_become_files() -> None:
     body = build_prompt_payload(
-        NativePrompt(text="hi", system_prompt="be brief", model="anthropic/claude-opus-4")
-    )
-    assert body["system"] == "be brief"
-    assert body["model"] == {"providerID": "anthropic", "modelID": "claude-opus-4"}
-
-
-def test_build_prompt_payload_bare_model_id_is_dropped() -> None:
-    # No ``provider/model`` slash → not a valid opencode model object → omitted.
-    assert "model" not in build_prompt_payload(NativePrompt(text="hi", model="just-a-name"))
-
-
-def test_build_prompt_payload_image_and_file_attachments() -> None:
-    prompt = NativePrompt(
-        text="look",
-        attachments=(
+        "look",
+        (
             {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
             {
                 "type": "input_file",
@@ -55,16 +43,16 @@ def test_build_prompt_payload_image_and_file_attachments() -> None:
                 "filename": "a.pdf",
             },
             {"type": "input_file", "url": "data:text/plain;base64,CCCC"},
-            {"type": "input_image"},  # no url → skipped
+            {"type": "input_image"},  # no uri → skipped
+            {"type": "input_image", "image_url": "https://example.com/cat.png"},  # not inline
         ),
     )
-    parts = build_prompt_payload(prompt)["parts"]
-    assert {"type": "file", "mime": "image/png", "url": "data:image/png;base64,AAAA"} in parts
-    pdf = next(p for p in parts if p.get("filename") == "a.pdf")
-    assert pdf["mime"] == "application/pdf"
-    # The url-only file part falls back to its data-URI mime; the empty image is dropped.
-    assert any(p.get("mime") == "text/plain" for p in parts)
-    assert sum(1 for p in parts if p["type"] == "file") == 3
+    assert body["files"] == [
+        {"uri": "data:image/png;base64,AAAA"},
+        {"uri": "data:application/pdf;base64,BBBB", "name": "a.pdf"},
+        {"uri": "data:text/plain;base64,CCCC"},
+    ]
+    assert set(body) == {"text", "files", "delivery"}
 
 
 # ── transport methods over a fake client ────────────────────────────────────
@@ -82,34 +70,43 @@ class _FakeClient:
         self.calls.append(("get_session", session_id))
         return self.existing
 
-    async def create_session(self, payload: Any = None) -> SimpleNamespace:
-        self.calls.append(("create_session", payload))
+    async def create_session(self, **kwargs: Any) -> SimpleNamespace:
+        self.calls.append(("create_session", kwargs))
         return SimpleNamespace(id="ses_new")
 
-    async def prompt_async(self, session_id: str, payload: Any) -> dict[str, Any]:
-        self.calls.append(("prompt_async", (session_id, payload)))
-        return {"ok": True}
+    async def prompt(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("prompt", (session_id, kwargs)))
+        return {"id": "msg_1"}
 
-    async def abort(self, session_id: str) -> bool:
-        self.calls.append(("abort", session_id))
+    async def interrupt(self, session_id: str) -> bool:
+        self.calls.append(("interrupt", session_id))
         return True
 
     async def list_messages(self, session_id: str) -> list[dict[str, Any]]:
         self.calls.append(("list_messages", session_id))
         return [{"info": {"id": "msg_1"}}]
 
-    async def fork(self, session_id: str, payload: Any = None) -> SimpleNamespace:
-        self.calls.append(("fork", (session_id, payload)))
+    async def fork(self, session_id: str, *, before: str | None = None) -> SimpleNamespace:
+        self.calls.append(("fork", (session_id, before)))
         return SimpleNamespace(id="ses_fork")
 
-    async def reply_permission(self, request_id: str, reply: Any) -> bool:
-        self.calls.append(("reply_permission", (request_id, reply)))
-        return True
+    async def set_model(
+        self,
+        session_id: str,
+        *,
+        provider_id: str,
+        model_id: str,
+        variant: str | None = None,
+    ) -> None:
+        self.calls.append(("set_model", (session_id, provider_id, model_id)))
 
-    async def events(self) -> Any:
-        self.calls.append(("events", None))
+    async def stream_events(self) -> Any:
+        self.calls.append(("stream_events", None))
         yield SimpleNamespace(
-            id="evt_1", type="message.updated", properties={"k": "v"}, raw={"r": 1}
+            id="evt_1",
+            type="session.status",
+            data={"sessionID": "ses_1", "type": "busy"},
+            location={"directory": "/w"},
         )
 
     async def aclose(self) -> None:
@@ -129,6 +126,7 @@ async def test_create_session_when_no_external_id() -> None:
     sid = await _transport(client).create_or_resume_session(_launch())
     assert sid == "ses_new"
     assert client.closed
+    assert ("create_session", {"title": "omnigent:conv_1", "directory": "/w"}) in client.calls
 
 
 async def test_resume_returns_existing_session() -> None:
@@ -147,14 +145,54 @@ async def test_resume_falls_back_to_create_when_session_gone() -> None:
 async def test_send_prompt_builds_payload_and_closes() -> None:
     client = _FakeClient()
     out = await _transport(client).send_prompt("ses_1", NativePrompt(text="hi"))
-    assert out == {"ok": True}
-    assert ("prompt_async", ("ses_1", {"parts": [{"type": "text", "text": "hi"}]})) in client.calls
+    assert out == {"id": "msg_1"}
+    assert (
+        "prompt",
+        ("ses_1", {"text": "hi", "files": [], "delivery": "steer"}),
+    ) in client.calls
     assert client.closed
 
 
-async def test_abort() -> None:
+async def test_send_prompt_honors_queue_delivery() -> None:
+    client = _FakeClient()
+    await _transport(client).send_prompt(
+        "ses_1", NativePrompt(text="later", metadata={"delivery": "queue"})
+    )
+    assert client.calls[-1] == (
+        "prompt",
+        ("ses_1", {"text": "later", "files": [], "delivery": "queue"}),
+    )
+
+
+async def test_send_prompt_drops_system_prompt() -> None:
+    client = _FakeClient()
+    await _transport(client).send_prompt(
+        "ses_1", NativePrompt(text="hi", system_prompt="be brief")
+    )
+    assert "system" not in client.calls[-1][1][1]
+
+
+async def test_send_prompt_switches_model_once_without_bridge_state() -> None:
+    client = _FakeClient()
+    transport = _transport(client)
+    await transport.send_prompt("ses_1", NativePrompt(text="a", model="acme/model-x"))
+    await transport.send_prompt("ses_1", NativePrompt(text="b", model="acme/model-x"))
+    assert [c for c in client.calls if c[0] == "set_model"] == [
+        ("set_model", ("ses_1", "acme", "model-x"))
+    ]
+    assert [c[0] for c in client.calls] == ["set_model", "prompt", "prompt"]
+
+
+async def test_send_prompt_ignores_unqualified_model() -> None:
+    client = _FakeClient()
+    await _transport(client).send_prompt("ses_1", NativePrompt(text="a", model="just-a-name"))
+    assert [c[0] for c in client.calls] == ["prompt"]
+
+
+async def test_abort_interrupts() -> None:
     client = _FakeClient()
     assert await _transport(client).abort("ses_1") is True
+    assert ("interrupt", "ses_1") in client.calls
 
 
 async def test_events_maps_to_native_event() -> None:
@@ -163,9 +201,10 @@ async def test_events_maps_to_native_event() -> None:
     assert len(events) == 1
     assert (events[0].id, events[0].type, events[0].payload) == (
         "evt_1",
-        "message.updated",
-        {"k": "v"},
+        "session.status",
+        {"sessionID": "ses_1", "type": "busy"},
     )
+    assert events[0].raw["location"] == {"directory": "/w"}
     assert client.closed
 
 
@@ -179,29 +218,8 @@ async def test_fork_with_and_without_message_id() -> None:
     transport = _transport(client)
     assert await transport.fork("ses_1") == "ses_fork"
     assert await transport.fork("ses_1", at_message_id="msg_9") == "ses_fork"
-    assert ("fork", ("ses_1", {"messageID": "msg_9"})) in client.calls
+    assert ("fork", ("ses_1", "msg_9")) in client.calls
     assert ("fork", ("ses_1", None)) in client.calls
-
-
-async def test_reply_permission_maps_decision() -> None:
-    client = _FakeClient()
-    await _transport(client).reply_permission(
-        NativePermissionDecision(request_id="per_1", decision="allow_always", message="ok")
-    )
-    assert ("reply_permission", ("per_1", {"reply": "always", "message": "ok"})) in client.calls
-
-
-def test_build_tui_attach_command_uses_launch_server_url() -> None:
-    transport = OpenCodeHttpTransport(client_factory=lambda: _FakeClient())
-    argv, env = transport.build_tui_attach_command(
-        _launch(server_url="http://127.0.0.1:1234", terminal_launch_args=("--foo",)),
-        "ses_1",
-    )
-    assert argv[0] == "attach"
-    assert "http://127.0.0.1:1234" in argv
-    assert "ses_1" in argv
-    assert "--foo" in argv
-    assert env == {}  # no server handle → empty terminal env
 
 
 async def test_no_connection_coordinates_raises() -> None:

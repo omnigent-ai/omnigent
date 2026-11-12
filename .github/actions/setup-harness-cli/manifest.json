@@ -2,7 +2,7 @@
   "claude": {
     "kind": "npm",
     "package": "@anthropic-ai/claude-code",
-    "version": "2.1.283",
+    "version": "2.1.295",
     "binary": "claude",
     "lockfile": "locks/claude/package-lock.json",
     "installScript": "node_modules/@anthropic-ai/claude-code/install.cjs"

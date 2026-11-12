@@ -15,9 +15,8 @@ import shutil
 import subprocess
 import sys
 import threading
-import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,13 +26,12 @@ import pytest
 
 from omnigent.harnesses.claude_native import bridge
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
-from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
 from omnigent.terminals import TerminalRegistry
-from tests._helpers.polling import poll_until_async
+from tests._helpers.polling import poll_until_async, wait_for_terminal_screen
 from tests.server.integration.mock_llm_server import (
     anthropic_sse_text_response,
     anthropic_sse_tool_call_response,
@@ -150,24 +148,6 @@ def _local_gateway(gateway: _Gateway) -> Iterator[str]:
         thread.join(timeout=5)
 
 
-async def _wait_for_pane(
-    terminal: TerminalInstance,
-    predicate: Callable[[str], bool],
-    *,
-    timeout: float = 30,
-    description: str,
-) -> str:
-    deadline = time.monotonic() + timeout
-    screen = ""
-    while time.monotonic() < deadline:
-        result = await terminal.read()
-        screen = str(result.get("screen", result))
-        if predicate(screen):
-            return screen
-        await asyncio.sleep(0.1)
-    raise AssertionError(f"Timed out waiting for {description}; actual Claude pane:\n{screen}")
-
-
 @pytest.mark.parametrize("recovery", ["runner_watcher", "permission_mode"])
 async def test_real_claude_billing_notice_unblocks_pending_tool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recovery: str
@@ -279,7 +259,7 @@ async def test_real_claude_billing_notice_unblocks_pending_tool(
             bridge.write_tmux_target(
                 bridge_dir, socket_path=terminal.socket_path, tmux_target=terminal.tmux_target
             )
-            await _wait_for_pane(
+            await wait_for_terminal_screen(
                 terminal,
                 lambda pane: "❯" in pane and "auto mode on" in pane,
                 description="the ready auto-mode composer",
@@ -288,9 +268,14 @@ async def test_real_claude_billing_notice_unblocks_pending_tool(
                 "Create billing-notice-sentinel.txt containing confirmed using Python in Bash.",
                 keys="",
             ) == {"status": "sent"}
-            await asyncio.sleep(0.3)
+            # An Enter that lands before Claude draws the typed draft is swallowed.
+            await wait_for_terminal_screen(
+                terminal,
+                lambda pane: "billing-notice-sentinel.txt" in pane,
+                description="the typed prompt in Claude's composer",
+            )
             assert await terminal.send(keys="Enter") == {"status": "sent"}
-            notice = await _wait_for_pane(
+            notice = await wait_for_terminal_screen(
                 terminal,
                 lambda pane: _NOTICE in pane and "Enter to continue · Esc to cancel" in pane,
                 description="Claude's actual classifier-billing dialog",
@@ -321,12 +306,12 @@ async def test_real_claude_billing_notice_unblocks_pending_tool(
                     == "auto"
                 )
 
-            await _wait_for_pane(
+            await wait_for_terminal_screen(
                 terminal,
                 lambda pane: (
                     marker.exists() and bool(gateway.tool_results) and _NOTICE not in pane
                 ),
-                timeout=20,
+                timeout_s=20,
                 description="automatic notice acknowledgement and completion of the pending Bash",
             )
             assert marker.read_text() == "confirmed"

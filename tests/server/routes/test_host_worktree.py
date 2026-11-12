@@ -16,16 +16,20 @@ from typing import Any
 import pytest
 
 from omnigent.host.frames import (
+    CAP_WORKTREE_CREATE_BUDGET,
     HostCreateWorktreeFrame,
     HostHelloFrame,
+    HostListWorktreesFrame,
     HostRemoveWorktreeFrame,
     decode_host_frame,
 )
+from omnigent.host.git_worktree import WORKTREE_CREATE_BUDGET_S
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._host_worktree import (
     WorktreeHostUnavailableError,
     WorktreeProxyError,
     create_worktree_on_host,
+    list_worktrees_on_host,
     remove_worktree_on_host,
 )
 
@@ -49,12 +53,19 @@ class _FakeWebSocket:
         self.sent.append(data)
 
 
-def _hello_frame() -> HostHelloFrame:
+def _hello_frame(capabilities: list[str] | None = None) -> HostHelloFrame:
     """Construct a hello frame for registry registration.
 
+    :param capabilities: Capability tokens the host advertises; ``None``
+        for an older host that advertises none.
     :returns: Hello frame with default version + empty runners.
     """
-    return HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="wt-host")
+    return HostHelloFrame(
+        version="0.1.0-test",
+        frame_protocol_version=1,
+        name="wt-host",
+        capabilities=capabilities or [],
+    )
 
 
 @pytest.fixture()
@@ -153,6 +164,7 @@ async def test_create_worktree_success_returns_path_and_branch(
     assert sent.repo_path == "/Users/alice/myrepo"
     assert sent.branch_name == "feature/login"
     assert sent.base_branch == "main"
+    assert sent.timeout_s == WORKTREE_CREATE_BUDGET_S
 
 
 async def test_create_worktree_failure_surfaced(host_setup: HostRegistry) -> None:
@@ -272,33 +284,159 @@ async def test_create_worktree_connection_lost_raises_unavailable(
     assert isinstance(exc.value, WorktreeProxyError)
 
 
+@pytest.mark.parametrize(
+    ("capabilities", "expects_older_host_hint"),
+    [(None, True), ([CAP_WORKTREE_CREATE_BUDGET], False)],
+    ids=["legacy-host", "budgeted-host"],
+)
 async def test_create_worktree_timeout_raises_unavailable(
     monkeypatch: pytest.MonkeyPatch,
+    capabilities: list[str] | None,
+    expects_older_host_hint: bool,
 ) -> None:
     """No host reply within the timeout raises WorktreeHostUnavailableError.
 
     Uses a host with no auto-replier so the pending future never
-    resolves; a tiny patched timeout keeps the test fast.
+    resolves. Only the wait that host should get is tiny; the other is
+    long enough that choosing it trips the outer guard. Only a host that
+    does not advertise the create budget is told it may be outdated.
     """
     import omnigent.server.routes._host_worktree as hw_mod
 
-    monkeypatch.setattr(hw_mod, "_WORKTREE_TIMEOUT_S", 0.05)
+    legacy = capabilities is None
+    monkeypatch.setattr(hw_mod, "_WORKTREE_TIMEOUT_S", 0.05 if legacy else 30.0)
+    monkeypatch.setattr(hw_mod, "_WORKTREE_CREATE_TIMEOUT_S", 30.0 if legacy else 0.05)
     registry = HostRegistry()
     registry.register(
         host_id="host_silent",
         ws=_FakeWebSocket(),  # type: ignore[arg-type] — duck-typed
-        hello=_hello_frame(),
+        hello=_hello_frame(capabilities),
         owner=None,
     )
     conn = registry.get("host_silent")
     assert conn is not None
 
     with pytest.raises(WorktreeHostUnavailableError) as exc:
-        await create_worktree_on_host(
+        await asyncio.wait_for(
+            create_worktree_on_host(
+                host_registry=registry,
+                host_conn=conn,
+                repo_path="/repo",
+                branch_name="x",
+                base_branch=None,
+            ),
+            timeout=5.0,
+        )
+    assert "did not respond" in exc.value.message
+    assert ("older version" in exc.value.message) is expects_older_host_hint
+
+
+async def test_create_worktree_outwaits_a_checkout_longer_than_the_short_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Creation outwaits the host's whole budget; listing keeps the short bound.
+
+    The fake host answers every frame only after the short bound has
+    elapsed: the create still succeeds while the list times out.
+    """
+    import omnigent.server.routes._host_worktree as hw_mod
+
+    # The server outwaits the host's whole budget by exactly its normal 150 s margin.
+    assert hw_mod._WORKTREE_TIMEOUT_S == 150.0
+    assert hw_mod._WORKTREE_CREATE_TIMEOUT_S == WORKTREE_CREATE_BUDGET_S + 150.0
+    monkeypatch.setattr(hw_mod, "_WORKTREE_TIMEOUT_S", 0.05)
+
+    registry = HostRegistry()
+    registry.register(
+        host_id="host_slow_checkout",
+        ws=_FakeWebSocket(),  # type: ignore[arg-type] — duck-typed
+        hello=_hello_frame([CAP_WORKTREE_CREATE_BUDGET]),
+        owner=None,
+    )
+    conn = registry.get("host_slow_checkout")
+    assert conn is not None
+
+    async def _reply_late() -> None:
+        """Answer each outbound frame only after the short bound elapses."""
+        while True:
+            frame_text = await conn.outbound_queue.get()
+            if frame_text is None:
+                return
+            frame = decode_host_frame(frame_text.data)
+            await asyncio.sleep(0.5)
+            if isinstance(frame, HostCreateWorktreeFrame):
+                fut = conn.pending_create_worktrees.pop(frame.request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(
+                        {
+                            "status": "ok",
+                            "worktree_path": "/repo-worktrees/slow",
+                            "branch": "slow",
+                            "error": None,
+                        }
+                    )
+            elif isinstance(frame, HostListWorktreesFrame):
+                fut = conn.pending_list_worktrees.pop(frame.request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result({"status": "ok", "worktrees": [], "error": None})
+
+    drain_task = asyncio.create_task(_reply_late())
+    try:
+        created = await asyncio.wait_for(
+            create_worktree_on_host(
+                host_registry=registry,
+                host_conn=conn,
+                repo_path="/repo",
+                branch_name="slow",
+                base_branch=None,
+            ),
+            timeout=10.0,
+        )
+        assert created.worktree_path == "/repo-worktrees/slow"
+
+        with pytest.raises(WorktreeHostUnavailableError) as exc:
+            await list_worktrees_on_host(
+                host_registry=registry,
+                host_conn=conn,
+                repo_path="/repo",
+            )
+        assert "did not respond" in exc.value.message
+    finally:
+        conn.outbound_queue.put_nowait(None)
+        try:
+            await asyncio.wait_for(drain_task, timeout=1.0)
+        except TimeoutError:
+            drain_task.cancel()
+
+
+async def test_create_worktree_fails_fast_when_host_disconnects_mid_request() -> None:
+    """A dropped host fails an in-flight creation at once, not after the full bound."""
+    registry = HostRegistry()
+    registry.register(
+        host_id="host_dropped",
+        ws=_FakeWebSocket(),  # type: ignore[arg-type] — duck-typed
+        hello=_hello_frame(),
+        owner=None,
+    )
+    conn = registry.get("host_dropped")
+    assert conn is not None
+
+    create = asyncio.create_task(
+        create_worktree_on_host(
             host_registry=registry,
             host_conn=conn,
             repo_path="/repo",
             branch_name="x",
             base_branch=None,
         )
-    assert "did not respond" in exc.value.message
+    )
+    # Wait until the proxy has registered its pending future, then drop
+    # the host as if the tunnel died mid-request. Bail out if the create
+    # task fails first so a setup error surfaces instead of hanging.
+    while not conn.pending_create_worktrees and not create.done():
+        await asyncio.sleep(0)
+    registry.deregister("host_dropped")
+
+    with pytest.raises(WorktreeHostUnavailableError) as exc:
+        await asyncio.wait_for(create, timeout=5.0)
+    assert "connection lost" in exc.value.message

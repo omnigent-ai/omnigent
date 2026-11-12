@@ -16,6 +16,7 @@ Codex exit-screen telemetry.
 | --- | --- | --- |
 | Codex native | App-server stderr pipe; bounded terminal output on startup exit | Stderr continuously throughout the app-server lifetime; terminal evidence before startup cleanup |
 | Claude native | An Omnigent-owned Claude `--debug-file` | Continuously while the transcript forwarder runs, plus a bounded final drain on shutdown or launch failure |
+| OpenCode native | `opencode serve` stderr, with `--print-logs` added | Continuously throughout the server lifetime; the last lines are quoted in startup errors |
 
 The flag is shared across harnesses and lifecycle phases. Codex captures the
 app-server's stderr, including startup and runtime diagnostics. A separate
@@ -487,6 +488,19 @@ quota. The next enabled launch in the same bridge directory removes the prior
 owned file and its rotated predecessor. Other user debug files are never read
 or deleted.
 
+## OpenCode continuous diagnostics
+
+`opencode serve` writes its logs to its own file,
+`<bridge_dir>/xdg-data/opencode/log/opencode.log`, and leaves stderr empty.
+Enabled capture adds `--print-logs` to the server's arguments so those log lines
+reach stderr; a user-supplied `--print-logs` is kept as is. Omnigent drains the
+pipe and exports the redacted lines through the same batched INFO path as Codex,
+as `harness_diagnostic_output` events with `harness=opencode-native` and
+`source_kind=opencode_serve_stderr`. If the server exits or never becomes ready,
+the startup error quotes a redacted excerpt of its last lines.
+
+When disabled, the server's stderr goes to `/dev/null` and Omnigent reads
+nothing. OpenCode's own log file is written either way; Omnigent never reads it.
 ## Codex bridge availability
 
 When an input cannot be delivered because bridge state is unavailable, the
@@ -507,6 +521,21 @@ input correlation IDs when available. It contains no file paths, state bytes,
 startup-error text, or user input. Error wording, wait budgets, and undelivered
 input handling are unchanged.
 
+## Harness IPC directory recovery
+
+The process manager recreates its private temporary root and per-instance
+directory before spawning a harness, including when replacing a live harness
+whose socket pathname disappeared. It restores the current process's
+namespace-qualified `AP_PID` owner claim so orphan cleanup recognizes the
+directory as live. Recreated directories use mode `0700`; bound sockets use
+`0600`. This recovery also runs with diagnostic capture disabled.
+
+A missing socket parent otherwise causes uvicorn's `create_unix_server` to
+raise `FileNotFoundError`, followed by an exited-during-spawn error in the
+runner. Continued deletion during startup, permission errors and filesystem
+failures can still prevent binding; retain the harness traceback to distinguish
+these cases.
+
 ## Verification
 
 ```sh
@@ -519,6 +548,7 @@ uv run --no-sync pytest -q tests/e2e/test_codex_continuous_diagnostics_e2e.py
 uv run --no-sync pytest -q tests/e2e/test_codex_native_runtime_diagnostics_e2e.py
 uv run --no-sync pytest -q tests/e2e_ui/chat/test_codex_early_tui_startup_error.py
 uv run --no-sync pytest -q tests/harnesses/claude_native/test_claude_native_diagnostics.py tests/harnesses/claude_native/test_claude_native_diagnostics_integration.py
+uv run --no-sync pytest -q tests/test_opencode_native_app_server.py -k stderr
 ```
 
 These tests inject a startup timeout and an ended event stream, inspect the
@@ -579,3 +609,18 @@ the process and reader states with its tail. With the flag unset or `0`, confirm
 `stderr_reader_state = 'failed'` and `stderr_reader_error_type = 'ValueError'`
 distinguishes a failed drain from a live reader with an otherwise stalled
 startup. Use the return code and adjacent lifecycle events to interpret it.
+
+
+For failed status events, `session_turn_failed` also records the incoming error,
+code, message, output, detail, context, and response-ID field availability under
+`failure_wire_*`. These observations precede server detail enrichment and contain
+no event text. Existing normalized native hook metadata remains on the same row.
+`active_response_id_at_failure` names the server's cached response when available;
+it is an observation, not proof that a bare status belongs to that response.
+
+`failure_connection_source=relay_stream` identifies the connection retained by
+the stream response, with its advertised version, connection ID, and generation.
+A replacement tunnel does not change that snapshot. For external status posts,
+`bound_runner_at_intake` describes the currently bound local runner and does not
+claim it sent the event. An absent local connection is explicitly unavailable;
+it may be owned by another server replica. No version is inferred from the server.

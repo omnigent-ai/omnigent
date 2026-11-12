@@ -10,16 +10,11 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
   useSessionHostOnline: vi.fn(),
 }));
-// The hook only reads conversationId/sessionStatus to gate the pre-write
-// conflict check, which these tests never reach.
-vi.mock("@/store/chatStore", () => ({
-  useChatStore: (selector: (s: unknown) => unknown) =>
-    selector({ conversationId: null, sessionStatus: "idle" }),
-}));
 
 import { useEditorAutoSave } from "./useEditorAutoSave";
 import * as writeHook from "@/hooks/useWriteFileContent";
 import * as runnerHook from "@/hooks/RunnerHealthProvider";
+import { fetchFileContent } from "@/hooks/useFileContent";
 
 const CONV = "conv_save_gate";
 const PATH = "notes.md";
@@ -38,7 +33,7 @@ function renderAutoSave() {
       setDirty: () => {},
       hasExternalUpdate: false,
       markSaved: () => {},
-      reconcileServerContent: () => false,
+      beginServerCheck: () => () => "write",
       dismissExternalUpdate: () => {},
       baselineRef,
       getContent: () => EDITED,
@@ -48,6 +43,15 @@ function renderAutoSave() {
 }
 
 beforeEach(() => {
+  // The pre-write conflict check finds the content the editor started from.
+  vi.mocked(fetchFileContent).mockResolvedValue({
+    object: "session.environment.filesystem.file_content",
+    path: PATH,
+    content_type: "text/markdown",
+    encoding: "utf-8",
+    content: "base",
+    bytes: 4,
+  });
   mutateAsync = vi.fn().mockResolvedValue(undefined);
   vi.mocked(writeHook.useWriteFileContent).mockReturnValue({
     isPending: false,

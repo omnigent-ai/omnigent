@@ -214,7 +214,7 @@ def split_command_segments(command: str) -> list[str]:
 
 
 _SEGMENT_OPERATOR_CHARS: frozenset[str] = frozenset(";|&\n()")
-_HEREDOC_DELIMITER = re.compile(
+HEREDOC_DELIMITER = re.compile(
     r"<<(?P<tabs>-?)[ \t]*(?P<delimiter>'[^'\n]*'|\"[^\"\n$`\\]*\"|[A-Za-z_][A-Za-z0-9_]*)"
     r"(?=$|[\s;|&()<>])"
 )
@@ -233,7 +233,7 @@ def _skip_escaped_delimiter(command: str, start: int, delimiter: str) -> int | N
     return None
 
 
-def _skip_command_substitution(command: str, start: int, depth: int = 0) -> int | None:
+def skip_command_substitution(command: str, start: int, depth: int = 0) -> int | None:
     """Bound a substitution; return None when its grammar is ambiguous."""
     if depth > MAX_SHELL_NESTING:
         return None
@@ -253,7 +253,7 @@ def _skip_command_substitution(command: str, start: int, depth: int = 0) -> int 
             i += 2
             continue
         elif ch == "`" or command[i : i + 2] == "$(":
-            end = _skip_command_substitution(command, i, depth + 1)
+            end = skip_command_substitution(command, i, depth + 1)
             if end is None:
                 return None
             i = end
@@ -335,7 +335,7 @@ def _split_unquoted_operators(command: str) -> list[str]:
             unsupported_reason = (
                 unsupported_reason or "Shell command substitutions require approval"
             )
-            end = _skip_command_substitution(command, i)
+            end = skip_command_substitution(command, i)
             if end is None:
                 raise UnsupportedShellSyntax(unsupported_reason, segments)
             unsupported_segment = True
@@ -378,7 +378,7 @@ def _split_unquoted_operators(command: str) -> list[str]:
             continue
         elif command[i : i + 2] == "<<":
             unsupported_reason = unsupported_reason or "Shell here-documents require approval"
-            match = _HEREDOC_DELIMITER.match(command, i)
+            match = HEREDOC_DELIMITER.match(command, i)
             if match is None:
                 raise UnsupportedShellSyntax(unsupported_reason, segments)
             delimiter = match.group("delimiter")

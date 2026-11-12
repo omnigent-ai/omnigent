@@ -28,7 +28,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, TypedDict
 
 from cachetools import TTLCache
 
@@ -40,6 +40,7 @@ from omnigent.db.account_authority import (
 )
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
 from omnigent.harness_accounts import HarnessAccounts
+from omnigent.harness_availability import HarnessAvailability
 from omnigent.host.frames import (
     CAP_CODEX_SIDE_CHAT,
     HostHelloFrame,
@@ -47,12 +48,14 @@ from omnigent.host.frames import (
     HostMcpToolsResultFrame,
     HostPluginsResultFrame,
     HostProbeAccountsFrame,
+    HostSetMcpServerEnabledResultFrame,
     HostSkillContentResultFrame,
     HostSkillsResultFrame,
     encode_host_frame,
 )
 from omnigent.host.harness_startup import HarnessStartup
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
+from omnigent.server.feature_flags import FeatureFlags, McpDisabledServersGate, active_harnesses
 
 _logger = logging.getLogger(__name__)
 
@@ -188,13 +191,27 @@ def _fail_pending_skills(conn: HostConnection) -> None:
 def _fail_pending_mcp_servers(conn: HostConnection) -> None:
     """Fail MCP inventory requests as soon as their host disappears."""
     _fail_pending_inventory(conn.pending_mcp_servers, conn.host_id)
+    _fail_pending_inventory(conn.pending_mcp_server_enabled, conn.host_id)
+
+
+def _fail_pending_worktrees(conn: HostConnection) -> None:
+    """Fail worktree requests as soon as their host disappears."""
+    for pending in (
+        conn.pending_create_worktrees,
+        conn.pending_remove_worktrees,
+        conn.pending_list_worktrees,
+    ):
+        _fail_pending_inventory(pending, conn.host_id)
 
 
 def _fail_pending_harness_rpcs(conn: HostConnection) -> None:
-    """Wake account/readiness route waiters when their tunnel disappears."""
+    """Wake account/login route waiters when their tunnel disappears."""
     for pending in (
         conn.pending_harness_account_probes,
         conn.pending_harness_refreshes,
+        conn.pending_harness_login_starts,
+        conn.pending_harness_login_cancels,
+        conn.pending_harness_logouts,
     ):
         _fail_pending_inventory(pending, conn.host_id)
 
@@ -232,6 +249,24 @@ class RunnerExitReport:
     error: str
     owner: str | None
     had_connected: bool | None = None
+
+
+HarnessLoginStatus = Literal["pending", "succeeded", "failed", "expired", "cancelled"]
+
+
+@dataclass
+class HarnessLoginState:
+    """Server-side state for one host-owned device login."""
+
+    harness: str
+    status: HarnessLoginStatus
+    expires_at: int
+    error: str | None = None
+    expired: bool = False
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
+    harness_accounts: HarnessAccounts | None = None
+    terminal_at: int | None = None
+    terminal_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
 
 class RunnerExitReports:
@@ -328,6 +363,22 @@ class WebSocketLike(Protocol):
     async def receive_text(self) -> str:
         """Receive a text frame."""
         ...
+
+
+class HostLaunchResult(TypedDict, total=False):
+    """
+    Resolved fields of a ``host.launch_runner_result`` awaited by launch callers.
+
+    Mirrors :class:`omnigent.host.frames.HostLaunchRunnerResultFrame`; a
+    caller-synthesized failure (lost connection, timeout) carries only
+    ``status`` and ``error``.
+    """
+
+    status: str
+    runner_id: str | None
+    error: str | None
+    error_code: str | None
+    workspace_recreated: bool
 
 
 @dataclass
@@ -455,7 +506,7 @@ class HostConnection:
     # user machine reusing a managed host's id under ordinary login. Read by the
     # default-public policy so only genuine sandboxes count as managed.
     registered_with_managed_token: bool = False
-    pending_launches: dict[str, asyncio.Future[dict[str, str | None]]] = field(
+    pending_launches: dict[str, asyncio.Future[HostLaunchResult]] = field(
         default_factory=dict,
     )
     pending_stops: dict[str, asyncio.Future[dict[str, str | None]]] = field(
@@ -493,6 +544,17 @@ class HostConnection:
     )
     harness_account_probe_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     harness_accounts_probed_at: float | None = None
+    pending_harness_login_starts: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_harness_login_cancels: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_harness_logouts: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    harness_logins: dict[str, HarnessLoginState] = field(default_factory=dict)
+    active_harness_logins: dict[str, str] = field(default_factory=dict)
     inflight_installs: dict[str, asyncio.Task[dict[str, Any]]] = field(
         default_factory=dict,
     )
@@ -520,6 +582,9 @@ class HostConnection:
     )
     pending_skill_content: dict[str, asyncio.Future[HostSkillContentResultFrame]] = field(
         default_factory=dict
+    )
+    pending_mcp_server_enabled: dict[str, asyncio.Future[HostSetMcpServerEnabledResultFrame]] = (
+        field(default_factory=dict)
     )
     pending_mcp_tools: dict[str, asyncio.Future[HostMcpToolsResultFrame]] = field(
         default_factory=dict
@@ -553,8 +618,15 @@ class HostRegistry:
     don't race.
     """
 
-    def __init__(self) -> None:
-        """Initialize an empty host registry."""
+    def __init__(
+        self,
+        *,
+        mcp_disabled_servers: McpDisabledServersGate = False,
+        feature_flags: FeatureFlags | None = None,
+    ) -> None:
+        """Initialize an empty host registry with fail-closed launch activation."""
+        self._mcp_disabled_servers = mcp_disabled_servers
+        self._feature_flags = feature_flags or FeatureFlags()
         self._lock = threading.RLock()
         # Keyed by (workspace_id, host_id) to mirror the hosts-table PK:
         # one stable host_id can be live in more than one workspace.
@@ -570,6 +642,10 @@ class HostRegistry:
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
+
+    def mcp_disabled_servers_active_harnesses(self) -> list[str] | None:
+        """Resolve launch activation; omit the wire field when no harness is active."""
+        return active_harnesses(self._mcp_disabled_servers, self._feature_flags) or None
 
     def register(
         self,
@@ -642,6 +718,7 @@ class HostRegistry:
                 _fail_pending_mcp_tools(old)
                 _fail_pending_skills(old)
                 _fail_pending_mcp_servers(old)
+                _fail_pending_worktrees(old)
                 _fail_pending_harness_rpcs(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
@@ -692,6 +769,7 @@ class HostRegistry:
         _fail_pending_mcp_tools(removed)
         _fail_pending_skills(removed)
         _fail_pending_mcp_servers(removed)
+        _fail_pending_worktrees(removed)
         _fail_pending_harness_rpcs(removed)
         return True
 
@@ -780,10 +858,27 @@ class HostRegistry:
         :returns: ``False`` only for a connected host that did not advertise the
             codex side-chat capability.
         """
+        return self.host_may_support(host_id, CAP_CODEX_SIDE_CHAT, workspace_id)
+
+    def host_may_support(
+        self, host_id: str, capability: str, workspace_id: int | None = None
+    ) -> bool:
+        """Whether a host is not known to lack a capability token.
+
+        Fails OPEN (``True``) when the host is offline/unknown: we then can't
+        prove it's too old, and the launch surfaces any real failure itself.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param capability: Capability token, e.g. ``"codex_plan_at_launch"``.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
+        :returns: ``False`` only for a connected host that did not advertise
+            ``capability``.
+        """
         conn = self.get(host_id, workspace_id)
         if conn is None:
             return True
-        return CAP_CODEX_SIDE_CHAT in conn.hello.capabilities
+        return capability in conn.hello.capabilities
 
     def record_gateway_inference(
         self,

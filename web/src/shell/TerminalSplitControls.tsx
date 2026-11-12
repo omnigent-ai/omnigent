@@ -2,6 +2,7 @@
 
 import { useState, type ReactNode } from "react";
 import { Columns2Icon, Rows2Icon, XIcon } from "lucide-react";
+import { SPLIT_TERMINAL_KEYS } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -14,6 +15,7 @@ import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useTerminalSplitHotkey } from "@/hooks/useTerminalSplitHotkey";
 import {
   findAgentTerminal,
   isAgentTerminalKey,
@@ -95,8 +97,8 @@ export function TerminalSplitControls({
 
   const splitWith = (shell: string, axis: TerminalSplitAxis) => {
     writePreferredShell(shell);
-    create.mutate(shell, {
-      onSuccess: (info) => {
+    create.launch(shell, {
+      onOpen: (info) => {
         const newKey = terminalTabKey(info);
         updateTerminalSplit(conversationId, (current) => {
           const layout = current?.layout ?? agentKey;
@@ -105,7 +107,19 @@ export function TerminalSplitControls({
           return { layout: splitTerminalLayout(layout, target, newKey, axis), focusedKey: newKey };
         });
       },
-      onError: (error) => showToast(`Couldn't open a shell: ${error.message}`),
+      onError: (error, opened) => {
+        if (opened) {
+          const openedKey = terminalTabKey(opened);
+          updateTerminalSplit(conversationId, (current) => {
+            const layout = current && removeTerminalLayoutKey(current.layout, openedKey);
+            if (!layout || typeof layout === "string") return undefined;
+            const keys = terminalLayoutKeys(layout);
+            const focusedKey = keys.includes(current.focusedKey) ? current.focusedKey : keys[0];
+            return { layout, focusedKey };
+          });
+        }
+        showToast(`Couldn't open a shell: ${error.message}`);
+      },
     });
   };
 
@@ -113,6 +127,7 @@ export function TerminalSplitControls({
     <div className="hidden items-center md:flex" data-testid="terminal-split-controls">
       <SplitMenu
         label="Split right"
+        axis="columns"
         icon={<Columns2Icon className="size-3.5" />}
         disabled={create.isPending}
         shells={shellOptions}
@@ -120,6 +135,7 @@ export function TerminalSplitControls({
       />
       <SplitMenu
         label="Split down"
+        axis="rows"
         icon={<Rows2Icon className="size-3.5" />}
         disabled={create.isPending}
         shells={shellOptions}
@@ -157,20 +173,27 @@ export function TerminalSplitControls({
 /** One split direction: a header icon opening the shell-type picker, default first. */
 function SplitMenu({
   label,
+  axis,
   icon,
   disabled,
   shells,
   onPick,
 }: {
   label: string;
+  axis: TerminalSplitAxis;
   icon: ReactNode;
   disabled: boolean;
   shells: string[];
   onPick: (shell: string) => void;
 }) {
+  // The chord skips the picker and opens the default shell. It stays bound while a
+  // create is pending so a second press is still claimed instead of reaching the PTY.
+  useTerminalSplitHotkey(axis, () => {
+    if (!disabled) onPick(shells[0]);
+  });
   return (
     <DropdownMenu>
-      <HeaderTooltip label={label}>
+      <HeaderTooltip label={label} shortcut={SPLIT_TERMINAL_KEYS[axis]}>
         <DropdownMenuTrigger asChild>
           <Button
             type="button"
@@ -198,12 +221,22 @@ function SplitMenu({
   );
 }
 
-function HeaderTooltip({ label, children }: { label: string; children: ReactNode }) {
+function HeaderTooltip({
+  label,
+  shortcut,
+  children,
+}: {
+  label: string;
+  shortcut?: string[];
+  children: ReactNode;
+}) {
   return (
     <Tooltip>
       <TooltipTrigger asChild>{children}</TooltipTrigger>
       {/* The header sits at top-0, so a top-side tooltip would be clipped. */}
-      <TooltipContent side="bottom">{label}</TooltipContent>
+      <TooltipContent side="bottom" shortcut={shortcut}>
+        {label}
+      </TooltipContent>
     </Tooltip>
   );
 }

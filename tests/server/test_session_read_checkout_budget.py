@@ -16,6 +16,7 @@ import pytest
 from sqlalchemy import Engine, event
 
 from omnigent.db.utils import get_or_create_engine
+from omnigent.server.session_pull_requests import PullRequestRefresher
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests._helpers.session import post_session_bundle
 from tests.server.helpers import build_agent_bundle
@@ -70,6 +71,16 @@ async def _create_session(client: httpx.AsyncClient, title: str | None = None) -
     return response.json()["session_id"]
 
 
+def _skip_background_pull_request_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the list's background PR refresh task out of the metered window.
+
+    Listing an unsynced session schedules a separate refresh task with its own
+    reads; it is not part of the request's read burst, but it can race into
+    the meter.
+    """
+    monkeypatch.setattr(PullRequestRefresher, "request", lambda _self, _session_id: None)
+
+
 def _assert_one_checkout(meter: CheckoutMeter, request: str) -> None:
     assert meter.checkouts >= 1, (
         f"{request}: meter saw no checkouts; attached to the wrong engine?"
@@ -118,6 +129,7 @@ async def test_session_sidebar_list_costs_one_checkout(
     auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_id = await _create_session(auth_client)
+    _skip_background_pull_request_refresh(monkeypatch)
     request = f"/v1/sessions?{SIDEBAR_QUERY}"
 
     with meter_engine(get_or_create_engine(db_uri), monkeypatch) as meter:
@@ -135,6 +147,7 @@ async def test_session_sidebar_search_costs_one_checkout(
     """A sidebar search shares the checkout too, including the Postgres statement timeout."""
     session_id = await _create_session(auth_client, title="budget search target")
     await _create_session(auth_client, title="unrelated")
+    _skip_background_pull_request_refresh(monkeypatch)
     request = f"/v1/sessions?{SIDEBAR_QUERY}&search_query=budget"
 
     with meter_engine(get_or_create_engine(db_uri), monkeypatch) as meter:

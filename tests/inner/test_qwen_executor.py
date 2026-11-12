@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
@@ -77,6 +78,77 @@ async def test_close_with_no_process_is_a_noop() -> None:
     """close() is safe to call when no subprocess was started."""
     executor = QwenExecutor()
     await executor.close()  # must not raise
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context", [None, "invalid", '{"pipeline":"repro-agent","run_id":"123"}'])
+async def test_ci_provider_settings_reach_qwen_spawn(
+    tmp_path, monkeypatch, caplog, context
+) -> None:
+    """The supported settings file carries headers through the actual ACP env boundary."""
+    from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
+    from omnigent.harnesses.qwen_native.credentials import with_qwen_ci_request_tags
+
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
+    if context is not None:
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", context)
+    if context in (None, "invalid"):
+        monkeypatch.setattr(
+            "omnigent.databricks_ai_gateway.urlparse",
+            lambda _: pytest.fail("Disabled telemetry must not parse URLs"),
+        )
+    gateway = "https://test.cloud.databricks.com/ai-gateway/mlflow/v1"
+    original = {
+        "theme": "Default",
+        "modelProviders": {
+            "openai": [
+                {
+                    "id": "test-model",
+                    "baseUrl": gateway,
+                    "envKey": "OPENAI_API_KEY",
+                    "generationConfig": {
+                        "temperature": 0.2,
+                        "customHeaders": {
+                            "X-Existing": "kept",
+                            REQUEST_TAGS_HEADER: '{"team":"ci"}',
+                        },
+                    },
+                },
+                {"id": "external", "baseUrl": "https://example.com/v1"},
+                {"id": "legacy", "baseUrl": "https://test.cloud.databricks.com/serving-endpoints"},
+                {"id": "unused", "baseUrl": "https://[invalid"},
+            ],
+        },
+    }
+    path = tmp_path / "ci-settings.json"
+    path.write_text(json.dumps(with_qwen_ci_request_tags(original)))
+    monkeypatch.setenv("QWEN_CODE_SYSTEM_SETTINGS_PATH", str(path))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", gateway)
+    executor = QwenExecutor(model="test-model")
+    env = await executor._build_spawn_env()
+    configured = json.loads(Path(env["QWEN_CODE_SYSTEM_SETTINGS_PATH"]).read_text())
+    assert env["OPENAI_API_KEY"] == "test-key"
+    assert env["OPENAI_BASE_URL"] == gateway
+    models = configured["modelProviders"]["openai"]
+    assert configured["theme"] == original["theme"]
+    assert models[1:] == original["modelProviders"]["openai"][1:]
+    assert models[0]["envKey"] == "OPENAI_API_KEY"
+    assert models[0]["generationConfig"]["temperature"] == 0.2
+    headers = models[0]["generationConfig"]["customHeaders"]
+    assert headers["X-Existing"] == "kept"
+    expected = {"team": "ci"}
+    if context and context != "invalid":
+        expected.update(json.loads(context))
+    assert json.loads(headers[REQUEST_TAGS_HEADER]) == expected
+    assert ("malformed provider URL" in caplog.text) == (context not in (None, "invalid"))
+    assert (
+        original["modelProviders"]["openai"][0]["generationConfig"]["customHeaders"][
+            REQUEST_TAGS_HEADER
+        ]
+        == '{"team":"ci"}'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2321,3 +2393,48 @@ async def test_ensure_initialized_image_capability_defaults_false() -> None:
     await executor._ensure_initialized()
     assert executor._initialized is True
     assert executor._image_supported is False
+
+
+@pytest.mark.parametrize("input_item_id", ["msg_current", None])
+@pytest.mark.parametrize("content", ["current", [], [{"type": "input_text", "text": ""}]])
+@pytest.mark.parametrize("fresh_session", [False, True], ids=["warm", "history-replay"])
+@pytest.mark.asyncio
+async def test_prompt_includes_input_item_metadata(input_item_id, content, fresh_session) -> None:
+    """Every ACP prompt names the initiating item or explicitly sends null."""
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "acp-session"
+    executor._proc = MagicMock(returncode=None)
+    executor._system_prompt_sent = not fresh_session
+    prompts = []
+
+    async def send(message):
+        prompts.append(message)
+        executor._pending[message["id"]].set_result({"result": {"stopReason": "end_turn"}})
+
+    executor._send = send
+    tail = {"type": "message", "role": "user", "content": content}
+    if input_item_id is not None:
+        tail["id"] = input_item_id
+    messages = _translate_input_to_messages(
+        [
+            {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+            {"type": "message", "role": "assistant", "content": "old reply"},
+            tail,
+        ],
+        preserve_empty_initiating_message=executor.preserves_empty_initiating_message(),
+    )
+    events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert len(prompts) == 1
+    assert prompts[0]["method"] == "session/prompt"
+    assert prompts[0]["params"]["_meta"] == {_META_INPUT_ITEM_ID: input_item_id}
+    if fresh_session:
+        assert "old reply" in prompts[0]["params"]["prompt"][0]["text"]
+    else:
+        assert prompts[0]["params"]["prompt"] == [
+            {"type": "text", "text": content if isinstance(content, str) else ""}
+        ]

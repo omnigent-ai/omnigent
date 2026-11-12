@@ -28,13 +28,16 @@ lifecycle metadata.
 
 | Key | Default | Owner | Review by | Purpose |
 | --- | --- | --- | --- | --- |
+| `codex_plan_at_launch` | On | Server | 0.22.0 | Allows the new-session composer to start Codex in Plan mode. Missing or disabled support disables this launch option; connected hosts must also advertise support. |
 | `session_orchestration` | On | Server | 0.22.0 | Private-owner peer messages and independent workers. Append `-session_orchestration` and restart every server replica to refuse new orchestration; already accepted work may finish. Existing reads and child operations remain available. Server-only; not exposed in `/v1/info`. |
-| `automations_v2` | Off | Server | 0.20.0 | Shared backend/UI rollout for automation improvements: scheduling, run management, execution targets and UI. Currently selects the DB scheduler instead of per-task timers and is exposed to the frontend. Requires claimed-run fire/recovery hooks and a transactional store; coordinated restart and startup draining are required when switching schedulers. See the [scheduler integration contract](../omnigent/server/scheduled/README.md). |
+| `sibling_sessions` | On | Server | 0.24.0 | Enables Add nested agent, same-sandbox fork selection, and new sibling creation through JSON, uploaded agents and MCP. Append `-sibling_sessions` to disable new nested creation. Existing sessions, family metadata and shared-sandbox cleanup protections remain available while off. |
+| `automations_v2` | Off | Server | 0.20.0 | Shared backend/UI rollout for automation improvements: scheduling, run management, execution targets and UI. Currently selects the DB scheduler instead of per-task timers and is exposed to the frontend. Requires a transactional store; a multi-replica deployment also supplies host ownership, and coordinated restart and startup draining are required when switching schedulers. See the [scheduler integration contract](../omnigent/server/scheduled/README.md). |
 | `usage_page` | Off | Web | 0.11.0 | Exposes the web Usage route, sidebar navigation, timeline, and cost breakdown details. The existing `GET /v1/usage` CLI API remains available while off. |
 | `harness_install` | Off | Onboarding | 0.11.0 | Allows the web UI to install or configure supported harnesses on a connected host. |
 | `canvas` | Off | Web | 0.15.0 | Exposes the web Canvas route (`/canvas`) and its sidebar navigation: top-level sessions as draggable cards, one canvas per project. |
-| `custom_agents_settings_ui` | Off | Web | 0.18.0 | Exposes Custom agents settings when the server also advertises `agent_install`. |
-| `sidebar_grouping_ui` | Off | Web | 0.19.0 | Adds Grouping, Ordering and Show options to the sidebar filter menu, moves that menu to the Projects header, splits Shared sessions into their own section, lets a Status or Updated grouping replace the Projects, Shared and Sessions sections, and expands the session tooltip with Repo, PR and Created by. |
+| `custom_agents_settings_ui` | On | Web | 0.24.0 | Exposes Custom agents settings when the server also advertises `agent_install`. Append `-custom_agents_settings_ui` to restore the previous Settings layout, with Harnesses under General. |
+| `sidebar_grouping_ui` | On | Web | 0.23.0 | Adds Grouping, Ordering and Show options to the sidebar filter menu, moves that menu to the Projects header, splits Shared sessions into their own section, lets a Status or Updated grouping replace the Projects, Shared and Sessions sections, and expands the session tooltip with Repo, PR and Created by. Append `-sidebar_grouping_ui` to restore the previous sidebar until the flag is removed in 0.23.0. |
+| `sidebar_windowed_rows` | Off | Web | 0.24.0 | Mounts only the sidebar session rows near the viewport, plus any row that is focused, has an open menu, or is being dragged, so long session lists stay responsive. Off keeps every loaded row mounted. |
 | `claude_osc_status` | On | Runner | 0.20.0 | Uses Claude OSC 7501 reports for working status, with legacy file/pane fallback. Set on the host/runner; applies to newly launched Claude-native terminals after restart. Not exposed in `/v1/info`. |
 
 At the review release, each flag must be removed by making the feature
@@ -51,6 +54,24 @@ for Claude working-status acceptance and kill-switch verification.
 
 ## Rollout and rollback
 
+Nested agents are enabled by default. Set `OMNIGENT_FEATURES=-sibling_sessions`
+to disable them. Both `features.sibling_sessions` and the `sibling_sessions`
+capability in `/v1/info` report the same value. Embedded deployments can pass a
+`FeatureFlags` subclass to `create_app(feature_flags=...)` and override
+`enabled(Feature.SIBLING_SESSIONS)` with a per-request rollout-service read.
+That reader must default to false when configuration or request context is
+unavailable. The capability and creation authorization both evaluate it per
+request, including worker-thread context propagation. UI capabilities refresh
+after a page reload; stale clients are still refused by the server.
+
+Disabling nested agents stops new sibling admission, without cancelling accepted
+work or removing existing families. Keep shared-sandbox retention enabled: those
+protections apply to any sessions sharing compute, regardless of the flag.
+MCP child creation and ordinary user-created roots remain available. MCP
+`same_host` and `managed` placements create private standalone sessions while
+the flag is off. Disable `session_orchestration` separately to stop independent
+MCP creation and peer messages.
+
 1. Deploy an immutable image with `-feature_name` in `OMNIGENT_FEATURES` to
    explicitly disable the feature, including one that defaults on.
 2. Remove that disable and add `feature_name` on one deployment, consistently
@@ -61,9 +82,9 @@ for Claude working-status acceptance and kill-switch verification.
    features, apply the override to the host/runner environment, restart those
    processes, and launch fresh terminals.
 
-The built-in server entrypoints do not yet supply the required execution/recovery
-hooks. Enabling `automations_v2` there fails startup, even if only UI changes are
-needed. A deployment wrapper must provide the hooks through `create_app()`.
+With `automations_v2`, the built-in server entrypoints run claimed runs with the
+built-in executor and own every host, which suits a single replica. A
+multi-replica deployment passes its own host ownership through `create_app()`.
 
 For `session_orchestration`, verify the server gate with an actual peer-message
 or independent-create request; `/v1/info` does not advertise this backend flag.

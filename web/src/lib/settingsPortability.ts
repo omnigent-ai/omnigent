@@ -8,7 +8,27 @@
 
 import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
-import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
+import {
+  FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  notifyFoldAssistantNarrationChanged,
+} from "./foldNarrationPreferences";
+import {
+  notifyPeerSessionMessageDisplayChanged,
+  PEER_SESSION_MESSAGES_STORAGE_KEY,
+} from "./peerSessionMessagePreferences";
+import {
+  notifyProjectFolderPaginationChanged,
+  PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
+  PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
+} from "./projectFolderPaginationPreferences";
+import {
+  notifySessionRowQuickActionsChanged,
+  SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
+} from "./sessionRowQuickActionsPreferences";
+import {
+  HIDDEN_PICKER_AGENTS_STORAGE_KEY,
+  notifyHiddenPickerAgentsChanged,
+} from "./pickerEntryVisibility";
 import {
   resetSessionWorkspaceTabSelections,
   unpinSessionWorkspaceTabs,
@@ -35,6 +55,11 @@ const EXPORTABLE_KEYS = [
   "omnigent:default-transcript-view",
   "omnigent:hide-unconfigured-harnesses",
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  PEER_SESSION_MESSAGES_STORAGE_KEY,
+  PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
+  PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
+  SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
+  HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
   DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY,
@@ -155,6 +180,13 @@ export function applyImportedSettings(imported: ExportedSettings): number {
       // Swallow individual write failures.
     }
   }
+  // Same-tab writes fire no storage event, so the subscribable preferences
+  // have to be told; otherwise an open picker keeps the pre-import set.
+  notifyHiddenPickerAgentsChanged();
+  notifyProjectFolderPaginationChanged();
+  notifyFoldAssistantNarrationChanged();
+  notifyPeerSessionMessageDisplayChanged();
+  notifySessionRowQuickActionsChanged();
   const nextPins = readPinnedWorkspaceTabs();
   const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));
   unpinSessionWorkspaceTabs(removedPins);
