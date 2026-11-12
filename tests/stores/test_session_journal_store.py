@@ -10,13 +10,13 @@ import threading
 import pytest
 import sqlalchemy as sa
 
+from omnigent.db.db_models import MAX_STORED_VALUE_BYTES
 from omnigent.db.utils import run_write_transaction
 from omnigent.entities.session_journal import InvalidJournalEntryError, StepNotReadyError
 from omnigent.errors import StaleCursorError
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.session_journal_store import (
     JOURNAL_DELETE_BATCH,
-    JOURNAL_PAYLOAD_MAX_STORED_BYTES,
     JournalEntryTooLargeError,
     JournalSessionNotFoundError,
     SessionJournalStore,
@@ -171,8 +171,8 @@ def test_the_stored_payload_limit_counts_compressed_bytes(
         journal.append(
             SESSION, "plan", {"name": "The plan", "steps": steps}, idempotency_key="tool:1"
         )
-    assert raised.value.limit == JOURNAL_PAYLOAD_MAX_STORED_BYTES
-    assert raised.value.size > JOURNAL_PAYLOAD_MAX_STORED_BYTES
+    assert raised.value.limit == MAX_STORED_VALUE_BYTES == 16 * 1024 - 1
+    assert raised.value.size > MAX_STORED_VALUE_BYTES
     assert journal.list_entries(SESSION).entries == []
 
 

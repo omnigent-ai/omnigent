@@ -21,11 +21,13 @@ agent can't run workflows and stop.
    the plan for its goal in a few words ("Cut GET /orders p95 by 20%"). Give
    each step a short, stable ID (`profile`, `opt-pool`), a name, and its
    dependencies.
-3. Make the first step exploring the work (`explore`), without changing
-   anything, deeply enough that the steps you add from it are reasonably
-   specific: each a concrete piece of work, such as one change or one PR,
-   rather than a broad phase like "implement the changes". A small, clear task
-   needs only a quick look.
+3. Make the first step exploring the work: ID `explore`, and a name that
+   starts with "Explore" ("Explore the open PRs and pick 3"), so the user can
+   tell it apart in the Tasks tab. Explore without changing anything, deeply
+   enough that the steps you add from it are reasonably specific: each a
+   concrete piece of work, such as one change or one PR, rather than a broad
+   phase like "implement the changes". A small, clear task needs only a quick
+   look.
 4. Once you've explored, replan: keep the exploration first and add the work
    after it, depending on it. A single goal is one step after the exploration.
 5. Ask first only if the description is ambiguous. Otherwise start.
