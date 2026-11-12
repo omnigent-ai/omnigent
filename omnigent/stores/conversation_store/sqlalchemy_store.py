@@ -3475,6 +3475,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        family_id: str | None = None,
+        project_id: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -3547,6 +3549,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             can access but does NOT own — i.e. sessions shared with them
             by another user. Requires ``accessible_by`` to be set.
             ``False`` (default) disables the filter.
+        :param family_id: Only sessions in this sidebar family.
+        :param project_id: Only first-class members of this project, any owner.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         :raises ValueError: If ``search_scope`` is not a known scope.
@@ -3865,6 +3869,30 @@ class SqlAlchemyConversationStore(ConversationStore):
                             ),
                         )
                     )
+            metadata_match: list[ColumnElement[bool]] = []
+            if family_id is not None:
+                metadata_match.append(SqlConversationMetadata.family_id == family_id)
+            if project_id is not None:
+                metadata_match.append(SqlConversationMetadata.project_id == project_id)
+            if metadata_match:
+                # family / project ids live on the Omnigent DB's metadata table
+                # (each indexed with workspace_id), so match them like the
+                # project-name membership above.
+                metadata_stmt = select(SqlConversationMetadata.id).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    *metadata_match,
+                )
+                metadata_ids: Any
+                if self._conv_engine is self._engine:
+                    metadata_ids = metadata_stmt
+                else:
+                    if qualifying_ids is not None:
+                        metadata_stmt = metadata_stmt.where(
+                            SqlConversationMetadata.id.in_(qualifying_ids)
+                        )
+                    with self._session("list_conversations") as meta_sess:
+                        metadata_ids = list(meta_sess.execute(metadata_stmt).scalars())
+                stmt = stmt.where(SqlConversation.id.in_(metadata_ids))
             if pinned:
                 # Restrict to sessions the caller has pinned. Pins are per-user,
                 # so match the caller's own key (``omnigent.pinned.<user>``), not

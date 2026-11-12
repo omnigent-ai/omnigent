@@ -446,7 +446,11 @@ async def test_sys_session_list_preserves_small_default_then_pages() -> None:
 
 @pytest.mark.asyncio
 async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
-    """The tool forwards the opaque continuation into the server's cursor API."""
+    """The tool forwards the opaque continuation into the server's cursor API.
+
+    The caller's own session is in the catalog but never listed, and pages
+    stay full around it.
+    """
     rows = [
         {
             "id": f"conv_{index:04d}",
@@ -459,6 +463,7 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
         }
         for index in range(1_001)
     ]
+    rows.insert(10, {**rows[0], "id": "conv_caller", "title": "Caller"})
     received_afters: list[str | None] = []
     received_visibilities: list[str | None] = []
     received_limits: list[str | None] = []
@@ -503,19 +508,81 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
             )
         )
 
-    # Without a limit, a large catalog returns the newest 50 and a cursor.
+    # Without a limit, a large catalog returns 50 and a cursor, never the caller.
     assert [row["session_id"] for row in default["sessions"]] == [
         f"conv_{index:04d}" for index in range(50)
     ]
     assert default["page"]["limit"] == 50
     assert default["page"]["has_more"] == {"sessions": True}
     assert "next_cursor" in default["page"]
-    assert first["sessions"][0]["session_id"] == "conv_0000"
-    assert second["sessions"][0]["session_id"] == "conv_0100"
+    assert default["scope"] == "any"
+    # Full pages that continue without a gap or a repeat.
+    assert [row["session_id"] for row in first["sessions"] + second["sessions"]] == [
+        f"conv_{index:04d}" for index in range(200)
+    ]
     assert received_afters == [None, None, "conv_0099"]
-    assert received_limits == ["50", "100", "100"]
+    # One extra row replaces the caller's.
+    assert received_limits == ["51", "101", "101"]
     # Own sessions only by default, like the UI sidebar.
     assert received_visibilities == ["mine", "mine", "mine"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_list_scope_is_anchored_on_the_caller() -> None:
+    """A scope reaches the server as a relation to the caller and binds the cursor."""
+    rows = _session_rows(large=False)
+    session_params: list[dict[str, str]] = []
+    state: dict[str, object] = {"related_scopes": True, "refusal": None}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_caller/child_sessions":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
+        if request.url.path == "/v1/info":
+            return httpx.Response(
+                200, json={"session_list_related_scopes": True} if state["related_scopes"] else {}
+            )
+        if request.url.path == "/v1/sessions":
+            session_params.append(dict(request.url.params))
+            if state["refusal"] is not None:
+                return httpx.Response(409, json={"error": {"message": state["refusal"]}})
+            return _server_page(request, rows)
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        family = await _call_session(client, {"scope": "family", "limit": 5})
+        other_scope = await _call_session(
+            client, {"scope": "project", "limit": 5, "cursor": family["page"]["next_cursor"]}
+        )
+        continued = await _call_session(
+            client, {"scope": "family", "limit": 5, "cursor": family["page"]["next_cursor"]}
+        )
+        invalid = await _call_session(client, {"scope": "repository"})
+        state["refusal"] = "This session is not in a project"
+        refused = await _call_session(client, {"scope": "project"})
+        state["related_scopes"] = False
+        requests_before_old_server = len(session_params)
+        old_server = await _call_session(client, {"scope": "project"})
+
+    assert family["scope"] == "family"
+    assert len(family["sessions"]) == 5
+    assert {key: session_params[0].get(key) for key in ("related_to", "relation")} == {
+        "related_to": "conv_caller",
+        "relation": "family",
+    }
+    # A cursor only continues the scope it was minted with.
+    assert other_scope == {"error": "sys_session_list: cursor uses different filter arguments"}
+    assert [row["session_id"] for row in family["sessions"] + continued["sessions"]] == [
+        f"conv_{index:02d}" for index in range(10)
+    ]
+    assert invalid["error"].startswith("sys_session_list: scope must be one of")
+    assert refused == {"error": "sys_session_list: This session is not in a project"}
+    # An older server would ignore the relation, so the tool refuses without listing.
+    assert old_server == {"error": "sys_session_list: scope needs a newer server"}
+    assert len(session_params) == requests_before_old_server
 
 
 _VIEWER = "alice@example.com"

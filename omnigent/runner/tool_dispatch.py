@@ -675,6 +675,10 @@ _RUNNER_STATUS_CONCURRENCY = 8
 _SESSION_LIST_DEFAULT_VISIBILITY = "mine"
 # Newest sessions ``sys_session_list`` returns when the agent passes no ``limit``.
 _SESSION_LIST_DEFAULT_LIMIT = 50
+# ``sys_session_list`` scopes: ``any`` adds no relation filter; the others are
+# forwarded as ``GET /v1/sessions``'s ``relation`` with the caller as anchor.
+_SESSION_LIST_DEFAULT_SCOPE = "any"
+_SESSION_LIST_SCOPES = ("any", "project", "family")
 _SESSION_LIST_VISIBILITIES = ("mine", "shared", "all")
 
 _DISCOVERY_LIST_MAX_LIMIT = 100
@@ -780,6 +784,8 @@ class _DiscoveryPage:
     has_more: bool
     next_after: str | None = None
     failed: bool = False
+    # A refusal the agent should see verbatim instead of a retryable gap.
+    error: str | None = None
 
 
 def _parse_discovery_page(body: object) -> _DiscoveryPage:
@@ -817,15 +823,18 @@ def _bounded_discovery_result(
     source_pages: dict[str, _DiscoveryPage],
     page_sections: tuple[str, ...] | None = None,
     default_limit: int | None = None,
+    fixed_fields: _JsonObject | None = None,
     tool_name: str,
     filters: _JsonObject,
 ) -> str:
     """Keep a small legacy result intact, otherwise return a fitting page.
 
-    ``default_limit`` caps paged rows when the caller passes no ``limit``.
+    ``default_limit`` caps paged rows when the caller passes no ``limit``;
+    ``fixed_fields`` are added to every result and count toward its budget.
     """
     paged = page_sections or tuple(sections)
-    complete = json.dumps(sections)
+    fixed = fixed_fields or {}
+    complete = json.dumps({**sections, **fixed})
     if (
         limit is None
         and not continued
@@ -874,7 +883,7 @@ def _bounded_discovery_result(
             if cursor is None:
                 return None
             metadata["next_cursor"] = cursor
-        return json.dumps({**page, "page": metadata})
+        return json.dumps({**page, **fixed, "page": metadata})
 
     # Cursor size depends on the last returned row, so serialized page size is
     # not monotonic in the row limit. Check the bounded public range directly.
@@ -5411,11 +5420,19 @@ async def _execute_session_query_tool(
                     )
                 }
             )
+        scope = args.get("scope", _SESSION_LIST_DEFAULT_SCOPE)
+        if scope not in _SESSION_LIST_SCOPES:
+            return json.dumps(
+                {
+                    "error": "sys_session_list: scope must be one of "
+                    + ", ".join(repr(value) for value in _SESSION_LIST_SCOPES)
+                }
+            )
         window = _discovery_list_window(
             args,
             tool_name,
             ("sessions",),
-            _session_list_filters(agent_name, include_archived, visibility),
+            _session_list_filters(agent_name, include_archived, visibility, scope),
         )
         if isinstance(window, str):
             return window
@@ -5426,6 +5443,7 @@ async def _execute_session_query_tool(
             agent_name,
             include_archived=include_archived,
             visibility=visibility,
+            scope=scope,
             limit=limit,
             cursor_state=cursor_state,
             continued=continued,
@@ -6379,6 +6397,7 @@ def _session_list_filters(
     agent_name: object,
     include_archived: bool,
     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
+    scope: str = _SESSION_LIST_DEFAULT_SCOPE,
 ) -> _JsonObject:
     """
     The ``sys_session_list`` filters a continuation cursor is bound to.
@@ -6390,6 +6409,7 @@ def _session_list_filters(
     :param agent_name: The caller's ``agent_name`` argument, e.g. ``"researcher"``.
     :param include_archived: Whether archived sessions are listed.
     :param visibility: Which sessions the global view covers, e.g. ``"mine"``.
+    :param scope: The relation filter, e.g. ``"project"``.
     :returns: The filter mapping, e.g. ``{"agent_name": None}``.
     """
     filters: _JsonObject = {
@@ -6399,6 +6419,8 @@ def _session_list_filters(
         filters["include_archived"] = True
     if visibility != _SESSION_LIST_DEFAULT_VISIBILITY:
         filters["visibility"] = visibility
+    if scope != _SESSION_LIST_DEFAULT_SCOPE:
+        filters["scope"] = scope
     return filters
 
 
@@ -6409,6 +6431,7 @@ async def _session_list_via_rest(
     *,
     include_archived: bool = False,
     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
+    scope: str = _SESSION_LIST_DEFAULT_SCOPE,
     limit: int | None,
     cursor_state: dict[str, _DiscoveryState],
     continued: bool,
@@ -6433,6 +6456,8 @@ async def _session_list_via_rest(
     :param include_archived: Also list archived sessions in the global view.
     :param visibility: ``"mine"``, ``"shared"`` or ``"all"`` — the server's
         ownership filter for the global view.
+    :param scope: ``"any"``, or a relation to the caller (``"project"`` or
+        ``"family"``) the server filters on.
     :param limit: Optional maximum rows returned from the global sessions view;
         :data:`_SESSION_LIST_DEFAULT_LIMIT` when omitted.
     :param cursor_state: Opaque continuation position for the global sessions view.
@@ -6440,7 +6465,12 @@ async def _session_list_via_rest(
         :data:`_SESSION_LIST_DEFAULT_LIMIT` sessions exist, otherwise a bounded
         page with continuation metadata.
     """
+    if scope != _SESSION_LIST_DEFAULT_SCOPE and not await _server_info_flag(
+        server_client, "session_list_related_scopes"
+    ):
+        return json.dumps({"error": "sys_session_list: scope needs a newer server"})
     sub_agents = await _collect_sub_agents(conversation_id, server_client)
+    page_limit = limit or _SESSION_LIST_DEFAULT_LIMIT
     sessions_page = (
         _DiscoveryPage([], False)
         if cursor_state["sessions"][0] == _DISCOVERY_END
@@ -6449,9 +6479,18 @@ async def _session_list_via_rest(
             agent_name,
             include_archived=include_archived,
             visibility=visibility,
+            relation=None if scope == _SESSION_LIST_DEFAULT_SCOPE else scope,
+            caller_id=conversation_id,
             after=cursor_state["sessions"][1],
-            limit=limit or _SESSION_LIST_DEFAULT_LIMIT,
+            # One extra row replaces the caller's own, which is never listed.
+            limit=page_limit + 1,
         )
+    )
+    if sessions_page.error is not None:
+        return json.dumps({"error": f"sys_session_list: {sessions_page.error}"})
+    sessions_page = dataclasses.replace(
+        sessions_page,
+        rows=[row for row in sessions_page.rows if row.get("session_id") != conversation_id],
     )
     result = _bounded_discovery_result(
         {"sub_agents": cast(list[_JsonObject], sub_agents), "sessions": sessions_page.rows},
@@ -6459,10 +6498,11 @@ async def _session_list_via_rest(
         cursor_state=cursor_state,
         continued=continued,
         tool_name="sys_session_list",
-        filters=_session_list_filters(agent_name, include_archived, visibility),
+        filters=_session_list_filters(agent_name, include_archived, visibility, scope),
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
         default_limit=_SESSION_LIST_DEFAULT_LIMIT,
+        fixed_fields={"scope": scope},
     )
     return await _fill_returned_runner_online(result, server_client)
 
@@ -6715,6 +6755,8 @@ async def _collect_global_sessions(
     *,
     include_archived: bool = False,
     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
+    relation: str | None = None,
+    caller_id: str | None = None,
     after: str | None,
     limit: int,
 ) -> _DiscoveryPage:
@@ -6743,9 +6785,13 @@ async def _collect_global_sessions(
     :param visibility: The server's ownership filter. ``"mine"`` (the
         sidebar's default) keeps other users' sessions out of an agent's
         view; ``"shared"`` / ``"all"`` rows also carry ``owner``.
+    :param relation: Server ``relation`` filter anchored on ``caller_id``,
+        e.g. ``"family"``; ``None`` lists without one.
+    :param caller_id: The calling session, the ``related_to`` anchor.
     :param after: Server cursor from the previous page, if any.
     :param limit: Maximum number of source rows to fetch.
-    :returns: Projected global session entries and continuation metadata.
+    :returns: Projected global session entries and continuation metadata; a
+        refused relation (400/409) carries the server's message in ``error``.
     """
     server_visibility = visibility
     scope_locally = False
@@ -6769,6 +6815,9 @@ async def _collect_global_sessions(
         "order": "desc",
         "visibility": server_visibility,
     }
+    if relation is not None and caller_id is not None:
+        params["related_to"] = caller_id
+        params["relation"] = relation
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     if include_archived:
@@ -6779,6 +6828,9 @@ async def _collect_global_sessions(
         resp = await server_client.get("/v1/sessions", params=params, timeout=30.0)
     except Exception:  # noqa: BLE001
         return _DiscoveryPage([], False, failed=True)
+    if relation is not None and resp.status_code in (400, 409):
+        message = _omnigent_error_message(resp) or "the server refused this scope"
+        return _DiscoveryPage([], False, failed=True, error=message)
     if resp.status_code != 200:
         return _DiscoveryPage([], False, failed=True)
     try:
@@ -6837,12 +6889,23 @@ async def _server_scopes_archives(server_client: httpx.AsyncClient) -> bool:
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: ``True`` when the server scopes archive-inclusive listings itself.
     """
+    return await _server_info_flag(server_client, "session_list_scoped_archives")
+
+
+async def _server_info_flag(server_client: httpx.AsyncClient, flag: str) -> bool:
+    """
+    Whether ``GET /v1/info`` advertises *flag* as ``true``.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param flag: Capability key, e.g. ``"session_list_related_scopes"``.
+    :returns: ``False`` when it is absent, not ``true``, or unreadable.
+    """
     try:
         info = await server_client.get("/v1/info", timeout=30.0)
         body = info.json() if info.status_code == 200 else None
     except (httpx.HTTPError, ValueError):
         return False
-    return isinstance(body, dict) and body.get("session_list_scoped_archives") is True
+    return isinstance(body, dict) and body.get(flag) is True
 
 
 async def _session_list_viewer(

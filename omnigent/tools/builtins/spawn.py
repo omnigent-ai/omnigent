@@ -540,7 +540,8 @@ class SysSessionListTool(Tool):
             "(agent, title) children under this conversation (and your "
             "parent/siblings) — use their conversation_id to read "
             "history, get info, or close. 'sessions': a global list of "
-            "the sessions you own (visibility 'mine', the default), each "
+            "the sessions you own (visibility 'mine', the default), excluding "
+            "this one, each "
             "with status, runner connectivity and "
             "created_by_session_id (creation origin for independent workers). "
             "Match that field to your session ID to find workers you created. "
@@ -551,9 +552,11 @@ class SysSessionListTool(Tool):
             "for children or sys_session_message for independent sessions. "
             "Pass agent_name to filter the global list to "
             "sessions running that agent, and include_archived to also list "
-            "archived sessions (marked archived). 'sessions' returns the newest 50 by "
-            "default; when more remain, pass page.next_cursor as cursor to continue. "
-            "sub_agents stays complete."
+            "archived sessions (marked archived). Pass scope to list only sessions "
+            "related to this one: in its project or its sidebar family (not "
+            "sub_agents). "
+            "'sessions' returns the newest 50 by default; when more remain, pass "
+            "page.next_cursor as cursor to continue. sub_agents stays complete."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -589,6 +592,17 @@ class SysSessionListTool(Tool):
                                 "view covers. 'mine' (default): sessions you own. "
                                 "'shared': sessions other users shared with you. "
                                 "'all': both. Does not affect 'sub_agents'."
+                            ),
+                        },
+                        "scope": {
+                            "type": "string",
+                            "enum": ["any", "project", "family"],
+                            "description": (
+                                "Optional: only sessions related to this one. "
+                                "'any' (default): no relation filter. 'project': "
+                                "in this session's project. 'family': in its "
+                                "sidebar family. Ownership is still set by "
+                                "visibility."
                             ),
                         },
                         "include_archived": {

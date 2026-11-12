@@ -31,8 +31,13 @@ MCP independent creation.
   caller's own sessions by default, like the sidebar's My view. Sessions other
   users shared with the caller appear only with `visibility: "shared"` (or
   `"all"` for both), and those rows carry `owner`. `include_archived` applies to
-  every scope. Runner coverage: `tests/runner/test_discovery_list_pagination.py`;
-  the route's scopes: `tests/server/routes/test_sessions_shared_projects.py`.
+  every scope. The caller itself is never listed. `scope: "project" | "family"`
+  (default `"any"`) narrows the list to sessions in the caller's project (by
+  project, so members filed by others count; a legacy label folder covers only
+  the caller's own sessions) or sidebar family; a caller without one gets an
+  error. Runner coverage: `tests/runner/test_discovery_list_pagination.py`;
+  the route's scopes: `tests/server/routes/test_sessions_shared_projects.py` and
+  `tests/server/routes/test_sessions_project_membership.py`.
 - `kill-switch`: an explicit disable refuses new peer sends and independent
   creates, even if an enable is also listed, and hides the Automations page's
   trigger templates (`/v1/info` reports `features.session_orchestration`). Restart every server replica to

@@ -7791,6 +7791,30 @@ def test_list_conversations_project_none_disables_filter(
     assert ids >= {filed.id, unfiled.id}
 
 
+def test_list_conversations_filters_by_family_and_project_id(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """``family_id`` and ``project_id`` match sessions related by metadata."""
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+    work = SqlAlchemyProjectStore(db_uri).create("a" * 32, "Work", None)
+    source = conversation_store.create_conversation()
+    sibling = conversation_store.create_conversation()
+    conversation_store.add_new_sibling(source.id, sibling.id, user_id=None)
+    member = conversation_store.create_conversation()
+    labelled = conversation_store.create_conversation()
+    conversation_store.set_conversation_project(member.id, work.id)
+    conversation_store.set_labels(labelled.id, {"omni_project": "Work"})
+
+    def listed(**filters: Any) -> set[str]:
+        return {c.id for c in conversation_store.list_conversations(**filters).data}
+
+    assert listed(family_id=source.id) == {source.id, sibling.id}
+    # By id: a legacy label of the same name is not a member.
+    assert listed(project_id=work.id) == {member.id}
+
+
 def test_set_conversation_project_files_and_unfiles(
     conversation_store: SqlAlchemyConversationStore,
     monkeypatch,

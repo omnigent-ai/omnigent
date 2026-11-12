@@ -264,6 +264,50 @@ def test_project_filter_dual_reads_label_and_entity(db_uri: str) -> None:
     assert {s["id"] for s in listed} == {entity_member.id, label_member.id}
 
 
+def test_related_to_lists_sessions_sharing_the_anchors_relation(db_uri: str) -> None:
+    """``related_to`` + ``relation`` filter on the anchor's project or family;
+    an anchor without that value is a 409."""
+    _ensure_agent(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+
+    def create(title: str) -> str:
+        return store.create_conversation(title=title, agent_id=AGENT_ID).id
+
+    anchor = create("anchor")
+    project_member = create("project member")
+    sibling = create("sibling")
+    store.add_new_sibling(anchor, sibling, user_id=None)
+    loose = create("loose")
+    child = store.create_conversation(
+        title="child", agent_id=AGENT_ID, parent_conversation_id=anchor
+    ).id
+    client = TestClient(_single_user_app(db_uri))
+    project = client.post("/v1/projects", json={"name": "Work"}).json()
+    for session_id in (anchor, project_member):
+        client.patch(f"/v1/sessions/{session_id}", json={"project_id": project["id"]})
+
+    def related(relation: str, session_id: str = anchor) -> object:
+        response = client.get(
+            "/v1/sessions", params={"related_to": session_id, "relation": relation}
+        )
+        if response.status_code != 200:
+            return response.status_code, response.json()["error"]["message"]
+        return {row["id"] for row in response.json()["data"]}
+
+    # A family shares its representative's project, so the sibling is filed too.
+    assert related("project") == {anchor, project_member, sibling}
+    # A sub-agent stores no project; it is in its top-level session's.
+    assert related("project", child) == {anchor, project_member, sibling}
+    assert related("family") == {anchor, sibling}
+    assert related("project", loose) == (409, "This session is not in a project")
+    assert related("family", loose) == (409, "This session is not in a family")
+    assert client.get("/v1/sessions", params={"related_to": anchor}).status_code == 400
+    both = client.get(
+        "/v1/sessions", params={"related_to": anchor, "relation": "project", "project": "Work"}
+    )
+    assert both.status_code == 400
+
+
 # ── Multi-user mode (header auth) — ownership boundary ───────────────────
 
 
@@ -435,3 +479,68 @@ def test_project_listing_is_owner_scoped(db_uri: str) -> None:
     # (Bob's) does not surface: the listing is owner-scoped.
     alice_list = client.get("/v1/sessions?project=Shared", headers=_hdr(ALICE))
     assert alice_list.json()["data"] == []
+
+
+def test_related_to_requires_read_access_to_the_anchor(db_uri: str) -> None:
+    """An anchor the caller cannot read is refused, so it reveals no relations."""
+    _ensure_agent(db_uri)
+    bobs_session = _seed_owned_session(db_uri, BOB)
+    SqlAlchemyPermissionStore(db_uri).ensure_user(ALICE)
+    client = TestClient(_multi_user_app(db_uri))
+
+    response = client.get(
+        "/v1/sessions",
+        params={"related_to": bobs_session, "relation": "family"},
+        headers=_hdr(ALICE),
+    )
+    assert response.status_code in (403, 404)
+
+
+def test_related_project_matches_the_anchors_project_under_each_visibility(
+    db_uri: str,
+) -> None:
+    """A first-class project matches by id, so a member another user filed is
+    listed under ``shared`` and ``all``; a like-named project of theirs is not.
+    A legacy label folder covers only the caller's own sessions."""
+    _ensure_agent(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    perms = SqlAlchemyPermissionStore(db_uri)
+    client = TestClient(_multi_user_app(db_uri))
+
+    def share_with_alice(session_id: str) -> str:
+        perms.ensure_user(ALICE)
+        perms.grant(ALICE, session_id, LEVEL_EDIT)
+        return session_id
+
+    alice_project = client.post("/v1/projects", json={"name": "Work"}, headers=_hdr(ALICE)).json()
+    bob_project = client.post("/v1/projects", json={"name": "Work"}, headers=_hdr(BOB)).json()
+    anchor = _seed_owned_session(db_uri, ALICE, "anchor")
+    alice_member = _seed_owned_session(db_uri, ALICE, "member")
+    bob_in_alice_project = share_with_alice(_seed_owned_session(db_uri, BOB, "shared member"))
+    bob_like_named = share_with_alice(_seed_owned_session(db_uri, BOB, "like-named"))
+    for session_id in (anchor, alice_member, bob_in_alice_project):
+        # Stands in for a future shared project; filing today is owner-only.
+        store.set_conversation_project(session_id, alice_project["id"])
+    store.set_conversation_project(bob_like_named, bob_project["id"])
+
+    legacy_anchor = _seed_owned_session(db_uri, ALICE, "legacy anchor")
+    legacy_member = _seed_owned_session(db_uri, ALICE, "legacy member")
+    bob_legacy = share_with_alice(_seed_owned_session(db_uri, BOB, "bob legacy"))
+    for session_id in (legacy_anchor, legacy_member, bob_legacy):
+        store.set_labels(session_id, {"omni_project": "Old"})
+
+    def related(session_id: str, visibility: str) -> set[str]:
+        response = client.get(
+            "/v1/sessions",
+            params={"related_to": session_id, "relation": "project", "visibility": visibility},
+            headers=_hdr(ALICE),
+        )
+        assert response.status_code == 200
+        return {row["id"] for row in response.json()["data"]}
+
+    assert related(anchor, "mine") == {anchor, alice_member}
+    assert related(anchor, "shared") == {bob_in_alice_project}
+    assert related(anchor, "all") == {anchor, alice_member, bob_in_alice_project}
+    assert related(legacy_anchor, "mine") == {legacy_anchor, legacy_member}
+    assert related(legacy_anchor, "all") == {legacy_anchor, legacy_member}
+    assert related(legacy_anchor, "shared") == set()
