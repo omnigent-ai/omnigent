@@ -1005,6 +1005,35 @@ async def test_a_transferred_pane_keeps_the_sign_in_state_it_started_with(
     assert [server["name"] for server in status.json()["servers"]] == ["linear"], status.text
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output_age_s", "restarted"),
+    [(10.0, False), (20.0, True)],
+    ids=["output-10s-ago", "output-20s-ago"],
+)
+async def test_mcp_reconnect_waits_15_seconds_after_terminal_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, output_age_s: float, restarted: bool
+) -> None:
+    """Reconnect holds off for recent output, but not for the idle reaper's longer window."""
+    conv_id = "c9b2c3d4e5f60718293a4b5c6d7e8f90"
+    app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
+        monkeypatch, tmp_path, conv_id
+    )
+    statuses["linear"] = "connected"
+    pane = app.state.session_resource_registry.terminal_registry.get(conv_id, "claude", "main")
+    pane.screen_changed_within = lambda window_s: window_s > output_age_s  # type: ignore[method-assign]
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/live-mcp-servers/reconnect", json={"name": "linear"}
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert (closes == [conv_id]) is restarted
+    assert ("reconnect_error" in resp.json()) is not restarted
+    assert relaunched == ([conv_id] if restarted else [])
+
+
 _REFUSALS = {
     "terminal_turn": "Claude Code is working",
     "background_shell": "Claude still has background work running",
@@ -1297,6 +1326,65 @@ async def test_a_message_whose_restart_outlives_its_session_starts_no_turn(
 
 
 @pytest.mark.asyncio
+async def test_a_queued_drain_behind_a_reconnect_starts_no_turn_once_the_session_is_deleted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The next queued message, waiting behind Reconnect, ends quietly when its session goes."""
+    conv_id = "abb2c3d4e5f60718293a4b5c6d7e8f90"
+    checking, release = threading.Event(), threading.Event()
+
+    def _held_attach_check(_socket: str, _target: str) -> float | None:
+        checking.set()
+        release.wait(5)
+        return None
+
+    # Bound when the runner app is built.
+    monkeypatch.setattr(
+        "omnigent.native.native_cost_popup._tmux_last_client_input_at", _held_attach_check
+    )
+    harness = _ScriptedHarnessClient([])
+    app, _closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
+        monkeypatch, tmp_path, conv_id, harness_client=harness
+    )
+    statuses["linear"] = "connected"
+
+    async with _runner_client(app) as client:
+        # A message buffered behind a running turn.
+        app.state.active_turns[conv_id] = None
+        queued = await client.post(f"/v1/sessions/{conv_id}/events", json=_MESSAGE)
+        assert queued.status_code < 300, queued.text
+        assert app.state.session_message_buffers[conv_id]
+        # The turn ends just as Reconnect takes the line; its drain then queues behind it.
+        app.state.active_turns.pop(conv_id)
+        reconnect = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{conv_id}/live-mcp-servers/reconnect", json={"name": "linear"}
+            )
+        )
+        await poll_until_async(checking.is_set, timeout_s=5)
+        # Note when the drain starts waiting for its turn behind Reconnect.
+        parked = asyncio.Event()
+        condition_wait = asyncio.Condition.wait
+
+        async def _noted_wait(self: asyncio.Condition) -> bool:
+            parked.set()
+            return await condition_wait(self)
+
+        monkeypatch.setattr(asyncio.Condition, "wait", _noted_wait)
+        drain = asyncio.create_task(app.state.check_and_start_next_turn(conv_id))
+        await asyncio.wait_for(parked.wait(), timeout=5)
+        deleted = await client.delete(f"/v1/sessions/{conv_id}")
+        assert deleted.status_code < 300, deleted.text
+        release.set()
+        await asyncio.wait_for(drain, timeout=5)
+        await asyncio.wait_for(reconnect, timeout=5)
+
+    assert harness.posted_bodies == []
+    assert conv_id not in app.state.active_turns
+    assert relaunched == []
+
+
+@pytest.mark.asyncio
 async def test_deleting_the_session_during_a_reconnect_relaunch_leaves_no_pane(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1330,6 +1418,7 @@ async def test_deleting_the_session_during_a_reconnect_relaunch_leaves_no_pane(
 async def test_a_cancelled_reconnect_does_not_hold_up_later_messages(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """A Reconnect cancelled while it waits in line gives up its place."""
     conv_id = "a4b2c3d4e5f60718293a4b5c6d7e8f90"
     gate = asyncio.Event()
     harness = _ScriptedHarnessClient([])
@@ -1342,10 +1431,20 @@ async def test_a_cancelled_reconnect_does_not_hold_up_later_messages(
     async with _runner_client(app) as client:
         first = asyncio.create_task(client.post(url, json={"name": "linear"}))
         await poll_until_async(lambda: relaunched == [conv_id], timeout_s=5)
+        # Note when the second starts waiting for its turn in the session's line.
+        waiting = asyncio.Event()
+        condition_wait = asyncio.Condition.wait
+
+        async def _noted_wait(self: asyncio.Condition) -> bool:
+            waiting.set()
+            return await condition_wait(self)
+
+        monkeypatch.setattr(asyncio.Condition, "wait", _noted_wait)
         second = asyncio.create_task(client.post(url, json={"name": "linear"}))
-        for _ in range(20):  # Let the second take its place in line, then drop it.
-            await asyncio.sleep(0)  # custom-lint: disable=sleep-then-assert -- let it queue
+        await asyncio.wait_for(waiting.wait(), timeout=5)
         second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
         gate.set()
         await first
         message = await asyncio.wait_for(

@@ -4844,6 +4844,71 @@ describe("Composer MCP status command", () => {
     expect(refetch).toHaveBeenCalledOnce();
   });
 
+  it("re-reads claude-native live state when the host's first inventory arrives", () => {
+    // The live answer came back before a sign-in finished; the inventory loads after it.
+    composerSessionSnapshot.hostId = "host_native";
+    setComposerState({ boundAgentId: "agent_native", sessionHarness: "claude-native" });
+    hostMcpQueryMock.mockReturnValue({ data: undefined, isLoading: true, isError: false });
+    const refetch = vi.fn();
+    liveMcpQueryMock.mockReturnValue({
+      data: { live: true, partial: true, servers: [] },
+      isError: false,
+      refetch,
+    });
+    liveMcpReconnectMock.mockReturnValue({
+      reconnect: vi.fn(),
+      reconnectingName: null,
+      error: null,
+      clearError: vi.fn(),
+    });
+    const { rerender } = render(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [] })} />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+    expect(refetch).not.toHaveBeenCalled();
+
+    hostMcpQueryMock.mockReturnValue({
+      data: [
+        {
+          name: "wiki",
+          harness: "claude",
+          transport: "http",
+          scope: "user",
+          auth_status: "connected",
+        },
+      ],
+      isLoading: false,
+      isError: false,
+    });
+    rerender(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [] })} />
+      </MemoryRouter>,
+    );
+    expect(refetch).toHaveBeenCalledOnce();
+
+    // The re-read finds the server Claude Code started without.
+    liveMcpQueryMock.mockReturnValue({
+      data: {
+        live: true,
+        partial: true,
+        servers: [
+          { name: "wiki", status: "failed", error: "Signed in after Claude Code started." },
+        ],
+      },
+      isError: false,
+      refetch,
+    });
+    rerender(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [] })} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("mcp-reconnect-wiki")).toBeInTheDocument();
+  });
+
   it("reads a claude-native live answer without the partial flag as partial", () => {
     // An older server forwards the runner's answer without `partial`.
     composerSessionSnapshot.hostId = "host_native";

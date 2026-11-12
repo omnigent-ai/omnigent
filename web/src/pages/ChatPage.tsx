@@ -2822,14 +2822,14 @@ function ComposerImpl(
         `${server.harness}:${server.plugin ?? ""}:${server.name}=${server.auth_status ?? ""}`,
     )
     .join("|");
-  // Compared from the first loaded read, so that read adds no refetch of its own.
+  // The first read counts as a change too: the live answer may predate a sign-in it reports.
   const previousHostMcpAccounts = useRef<string | undefined>(undefined);
   const { refetch: refetchLiveMcp } = liveMcpQuery;
   useEffect(() => {
     if (hostMcpAccounts === undefined) return;
     const previous = previousHostMcpAccounts.current;
     previousHostMcpAccounts.current = hostMcpAccounts;
-    if (previous === undefined || previous === hostMcpAccounts) return;
+    if (previous === hostMcpAccounts) return;
     if (mcpPanelRequested && sessionHarness === "claude-native") void refetchLiveMcp();
   }, [hostMcpAccounts, mcpPanelRequested, sessionHarness, refetchLiveMcp]);
   const liveMcpReconnect = useReconnectLiveMcpServer(composerSessionId);
