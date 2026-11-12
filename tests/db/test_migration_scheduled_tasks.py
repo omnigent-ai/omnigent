@@ -192,7 +192,8 @@ def test_scheduled_task_shares_columns(db_engine: Engine) -> None:
     assert all(column["nullable"] is False for column in columns.values())
     assert all(column["default"] is None for column in columns.values())
     assert columns["user_id"]["type"].length == 128
-    assert "INT" in str(columns["level"]["type"]).upper()
+    # SMALLINT on SQLite, MySQL, PostgreSQL; INT2 may be reported by CockroachDB.
+    assert str(columns["level"]["type"]).upper().startswith(("SMALLINT", "INT2"))
 
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
@@ -236,6 +237,9 @@ def test_scheduled_task_shares_bounds_grantee_bytes(db_engine: Engine) -> None:
 
     with pytest.raises(DBAPIError), db_engine.begin() as conn:
         conn.execute(share("a" * 513))
+    # 129 characters and 513 bytes: over the width everywhere, and over the byte cap on SQLite.
+    with pytest.raises(DBAPIError), db_engine.begin() as conn:
+        conn.execute(share("😀" * 128 + "a"))
     with db_engine.begin() as conn:
         conn.execute(share("😀" * 128))
 

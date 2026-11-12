@@ -4,10 +4,11 @@ Revision ID: a8be64286ffc
 Revises: a7d4c2e9f610
 Create Date: 2026-11-12 00:00:00.000000
 
-Adds ``scheduled_task_shares``, one row per user or group that an automation's
-runs are shared with. Rows are instructions for the sessions a run creates;
-nothing reads them for access checks. The application writes them with the
-owning ``scheduled_tasks`` row and deletes them with it.
+Adds ``scheduled_task_shares``, one row per user or group an automation is shared
+with. Each run grants its session to these recipients, and they may view the
+automation read-only. Session grants stay in ``session_permissions``. The
+application writes the rows with the owning ``scheduled_tasks`` row and deletes
+them with it.
 
 Additive and unused by earlier releases, so this schema can ship before the
 application code that writes it. Rollout and rollback order:

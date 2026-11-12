@@ -1787,9 +1787,11 @@ class SqlScheduledTaskShare(OmnigentBase):
     """
     SQLAlchemy model for the ``scheduled_task_shares`` table.
 
-    One row per user or group that an automation's runs are shared with. These
-    rows are the automation's instructions for the sessions it creates. They are
-    not an access-control list, and no access check reads them.
+    One row per user or group an automation is shared with. Each run grants its
+    session to these recipients, and they may also view the automation itself
+    (read-only). These rows are not session grants; those stay in
+    ``session_permissions``. Public shares (``__public__``) are never stored; the
+    application enforces that.
 
     :param scheduled_task_id: The automation this share belongs to (relates to
         ``scheduled_tasks.id``). Rows are deleted with their task by the
