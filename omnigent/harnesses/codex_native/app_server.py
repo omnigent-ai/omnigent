@@ -165,6 +165,10 @@ _STDERR_CHUNK_LIMIT = 65536
 _CODEX_STATE_DB_GLOB = "state_*.sqlite"
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
+# The app-server is always local, so a dead process already closes the socket.
+# Keepalive only adds a failure mode: a host stall longer than the pong timeout
+# drops the connection, and the forwarder tears the app-server down with it.
+_APP_SERVER_PING_INTERVAL_SECONDS: float | None = None
 # hooks.json filename written into the private CODEX_HOME registering the
 # Omnigent policy hook. Codex discovers it as a ``user``-layer hook
 # source on every config load (see codex hooks ``discover_handlers``).
@@ -1334,6 +1338,7 @@ class CodexAppServerClient:
                 self._ws_url,
                 max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
                 compression=None,
+                ping_interval=_APP_SERVER_PING_INTERVAL_SECONDS,
             )
         else:
             self._ws = await websockets.unix_connect(
@@ -1341,6 +1346,7 @@ class CodexAppServerClient:
                 uri=_UDS_WEBSOCKET_HANDSHAKE_URI,
                 max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
                 compression=None,
+                ping_interval=_APP_SERVER_PING_INTERVAL_SECONDS,
             )
         # Fresh queue per connection so a previous stream's end marker
         # cannot end this connection's consumers.
@@ -1538,9 +1544,11 @@ class CodexAppServerClient:
 
         :returns: None.
         """
-        assert self._ws is not None
+        ws = self._ws
+        assert ws is not None
+        cancelled = False
         try:
-            async for raw in self._ws:
+            async for raw in ws:
                 if not isinstance(raw, str):
                     continue
                 decoded: object = json.loads(raw)
@@ -1569,7 +1577,23 @@ class CodexAppServerClient:
                         future.set_result(message)
                     continue
                 await self._events.put(message)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
+            if not cancelled:
+                # Cancellation is our own close(); anything else ends the
+                # forwarder, so record why the socket went away.
+                _logger.warning(
+                    "Codex app-server connection closed: code=%s reason=%r",
+                    ws.close_code,
+                    ws.close_reason,
+                    extra=debug_event(
+                        "codex_app_server_connection_closed",
+                        close_code=ws.close_code,
+                        close_reason=ws.close_reason,
+                    ),
+                )
             # Wake iter_events() consumers: no further events can arrive.
             self._events.put_nowait(None)
 

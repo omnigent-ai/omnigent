@@ -1610,6 +1610,31 @@ def settle_pending_mcp_startup(bridge_dir: Path) -> tuple[dict[str, dict[str, st
     return servers, True
 
 
+def fail_pending_mcp_startup(
+    bridge_dir: Path, error: str
+) -> tuple[dict[str, dict[str, str | None]], bool]:
+    """
+    Mark every still-``starting`` MCP server as ``failed``.
+
+    For when the round can no longer finish (the app-server is going away), so
+    unlike :func:`settle_pending_mcp_startup` the outcome is known.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param error: Failure detail recorded on each pending server, e.g.
+        ``"Codex app-server stopped before MCP startup finished"``.
+    :returns: ``(map_after, changed)`` — the updated map and whether any
+        entry was marked failed.
+    """
+    servers = read_mcp_startup(bridge_dir)
+    pending = pending_mcp_servers(servers)
+    if not pending:
+        return servers, False
+    for name in pending:
+        servers[name] = {"status": MCP_STARTUP_FAILED, "error": error}
+    _write_mcp_startup(bridge_dir, servers)
+    return servers, True
+
+
 def mcp_startup_waiting_detail(servers: dict[str, dict[str, str | None]]) -> str | None:
     """
     Describe the MCP servers a startup wait is still blocked on.

@@ -49,6 +49,7 @@ from omnigent.harnesses.codex_native.bridge import (
     clear_certificate_failure,
     codex_config_revision,
     codex_home_for_bridge_dir,
+    fail_pending_mcp_startup,
     pending_mcp_servers,
     read_bridge_state,
     read_certificate_failure,
@@ -2964,6 +2965,17 @@ async def supervise_forwarder(
                 if isinstance(result, BaseException)
                 and not isinstance(result, asyncio.CancelledError)
             ]
+            # Skip on cancellation: the session is being torn down, not stranded.
+            if not isinstance(stream_error, asyncio.CancelledError):
+                try:
+                    await _fail_mcp_startup_on_forwarder_exit(
+                        ap_client, session_id=target.session_id, bridge_dir=bridge_dir
+                    )
+                except Exception:  # best effort; finish the remaining cleanup.
+                    _logger.warning(
+                        "Codex forwarder could not fail the pending MCP startup round",
+                        exc_info=True,
+                    )
             # Child lanes run first: their queued handlers use the shared tracker.
             for close in (
                 forwarder_state.close_child_streams,
@@ -5830,6 +5842,34 @@ async def _settle_mcp_startup(
     if not changed:
         return
     _logger.info("Codex MCP startup round settled (%s)", reason)
+    await _post_mcp_startup(client, session_id, servers)
+
+
+_MCP_STARTUP_FORWARDER_EXIT_ERROR = "Codex app-server stopped before MCP startup finished"
+
+
+async def _fail_mcp_startup_on_forwarder_exit(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+) -> None:
+    """
+    Fail the still-``starting`` MCP servers when the forwarder stops.
+
+    The settle timer and idle signal both live in this forwarder, and the
+    runner stops the app-server once it exits, so nothing else would ever
+    resolve the round and the web band would spin until a relaunch.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: None.
+    """
+    servers, changed = fail_pending_mcp_startup(bridge_dir, _MCP_STARTUP_FORWARDER_EXIT_ERROR)
+    if not changed:
+        return
+    _logger.warning("Codex MCP startup round failed: forwarder stopped mid-startup")
     await _post_mcp_startup(client, session_id, servers)
 
 

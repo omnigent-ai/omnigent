@@ -2285,6 +2285,7 @@ def test_codex_app_server_client_uses_codex_remote_handshake(
         "uri": "ws://localhost/rpc",
         "max_size": 128 << 20,
         "compression": None,
+        "ping_interval": None,
     }
     assert [json.loads(payload) for payload in fake_websocket.sent] == [
         {
@@ -2540,6 +2541,58 @@ def test_supervise_forwarder_resumes_when_it_opens_client(
         ("thread/backgroundTerminals/list", {"threadId": "thread_123"}),
     ]
     assert fake_client.closed
+
+
+def test_supervise_forwarder_fails_pending_mcp_startup_when_stream_ends(
+    tmp_path: Path,
+) -> None:
+    """
+    An app-server connection that ends mid-startup fails the pending servers.
+
+    The forwarder owns every signal that resolves the round, and the runner
+    stops the app-server after it returns, so without this the web band kept
+    reading "Starting MCP servers" until the user relaunched the session.
+    """
+    from omnigent.harnesses.codex_native.bridge import read_mcp_startup, update_mcp_server_startup
+
+    update_mcp_server_startup(tmp_path, "omnigent", "ready")
+    update_mcp_server_startup(tmp_path, "jira", "starting")
+    ap_events: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ap_events.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    async def run() -> None:
+        """
+        Run the forwarder against an event stream that ends immediately.
+
+        :returns: None.
+        """
+        await codex_native_forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:1",
+            headers={},
+            session_id="conv_123",
+            bridge_dir=tmp_path,
+            app_server_url=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            client=_FakeCodexAppServerClient(),  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(handler),
+        )
+
+    asyncio.run(run())
+
+    expected = {
+        "omnigent": {"status": "ready", "error": None},
+        "jira": {
+            "status": "failed",
+            "error": "Codex app-server stopped before MCP startup finished",
+        },
+    }
+    assert read_mcp_startup(tmp_path) == expected
+    assert [event["data"] for event in ap_events if event["type"] == "external_mcp_startup"] == [
+        {"servers": expected}
+    ]
 
 
 @pytest.mark.parametrize(

@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 
+import pytest
 from websockets.asyncio.server import ServerConnection, serve
 
 from omnigent.harnesses.codex_native.app_server import CodexAppServerClient
@@ -26,6 +28,9 @@ async def _serve_probe_scenario(websocket: ServerConnection) -> None:
             await websocket.send(json.dumps({"method": "thread/event", "params": {}}))
         elif method == "probe/disconnect":
             await websocket.close()
+            return
+        elif method == "probe/disconnect_with_reason":
+            await websocket.close(code=1011, reason="probe stalled")
             return
 
 
@@ -96,3 +101,51 @@ async def test_reconnected_client_streams_live_events() -> None:
             await second_stream.aclose()
             with contextlib.suppress(Exception):
                 await client.close()
+
+
+def _connection_closed_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Return the captured app-server connection-closed log records."""
+    return [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_app_server_connection_closed"
+    ]
+
+
+async def test_server_side_close_logs_code_and_reason(caplog: pytest.LogCaptureFixture) -> None:
+    """A socket the app-server closes is logged with why; our own close() is not."""
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.codex_native.app_server")
+    async with serve(_serve_probe_scenario, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        client = CodexAppServerClient(ws_url=f"ws://127.0.0.1:{port}")
+        await client.connect()
+        stream = client.iter_events()
+        try:
+            await client.notify("probe/disconnect_with_reason")
+            with contextlib.suppress(StopAsyncIteration):
+                await asyncio.wait_for(anext(stream), timeout=_SETTLE_DEADLINE)
+            closed = _connection_closed_records(caplog)
+            assert [
+                (r.attributes["close_code"], r.attributes["close_reason"]) for r in closed
+            ] == [(1011, "probe stalled")]
+        finally:
+            await stream.aclose()
+            await client.close()
+
+        caplog.clear()
+        await client.connect()
+        await client.close()
+        assert _connection_closed_records(caplog) == []
+
+
+async def test_app_server_connection_disables_keepalive() -> None:
+    """A host stall must not time out the local socket and tear down Codex."""
+    async with serve(_serve_probe_scenario, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        client = CodexAppServerClient(ws_url=f"ws://127.0.0.1:{port}")
+        await client.connect()
+        try:
+            assert client._ws is not None
+            assert client._ws.ping_interval is None
+        finally:
+            await client.close()
