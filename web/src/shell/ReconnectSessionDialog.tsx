@@ -25,9 +25,6 @@ const HOST_OWNER_DESCRIPTION =
 const HOST_OWNER_THIS_MACHINE_DESCRIPTION =
   "This session's host is this machine. Reconnect it below, or run the command from a terminal.";
 
-const HOST_OWNER_ARCA_DESCRIPTION =
-  "This session's Arca host is offline. Reconnect it below, or run the command from a terminal.";
-
 const HOST_VIEWER_DESCRIPTION =
   "This session's host machine is offline and only its owner can reconnect it.";
 
@@ -157,7 +154,6 @@ export function ReconnectSessionDialog({
   sourceHostId,
   sourceGitBranch,
   localReconnect,
-  arcaReconnect,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -172,11 +168,6 @@ export function ReconnectSessionDialog({
   sourceHostId?: string | null;
   sourceGitBranch?: string | null;
   localReconnect?: {
-    reconnecting: boolean;
-    error: string | null;
-    onReconnect: () => void;
-  };
-  arcaReconnect?: {
     reconnecting: boolean;
     error: string | null;
     onReconnect: () => void;
@@ -201,7 +192,6 @@ export function ReconnectSessionDialog({
     switchHostDisabledReason === SESSION_ACTIONS_LOADING ? undefined : switchHostDisabledReason;
   const isHostReconnect = state === "host_offline";
   const canReconnectThisMachine = isHostReconnect && isOwner && localReconnect != null;
-  const canReconnectArca = isHostReconnect && isOwner && arcaReconnect != null;
 
   // A non-owner can't reach the host machine to reconnect it, so the
   // CLI command is useless to them. Owners of both states, and anyone
@@ -215,11 +205,9 @@ export function ReconnectSessionDialog({
   const title = isHostReconnect ? "Host is offline" : "Agent disconnected";
   const description = isHostReconnect
     ? isOwner
-      ? canReconnectArca
-        ? HOST_OWNER_ARCA_DESCRIPTION
-        : canReconnectThisMachine
-          ? HOST_OWNER_THIS_MACHINE_DESCRIPTION
-          : HOST_OWNER_DESCRIPTION
+      ? canReconnectThisMachine
+        ? HOST_OWNER_THIS_MACHINE_DESCRIPTION
+        : HOST_OWNER_DESCRIPTION
       : `${HOST_VIEWER_DESCRIPTION} ${forkRestriction ?? "Clone the session to continue in a copy you own."}`
     : RUN_DESCRIPTION;
   return (
@@ -286,28 +274,6 @@ export function ReconnectSessionDialog({
                       data-testid="reconnect-session-reconnect-error"
                     >
                       {localReconnect.error}
-                    </p>
-                  )}
-                </div>
-              )}
-              {canReconnectArca && arcaReconnect && (
-                <div className="flex flex-col gap-2">
-                  <Button
-                    className="self-start"
-                    data-testid="reconnect-session-arca"
-                    disabled={arcaReconnect.reconnecting}
-                    aria-busy={arcaReconnect.reconnecting}
-                    onClick={arcaReconnect.onReconnect}
-                  >
-                    {arcaReconnect.reconnecting ? "Reconnecting Arca…" : "Reconnect Arca"}
-                  </Button>
-                  {arcaReconnect.error && (
-                    <p
-                      className="text-sm text-destructive select-text"
-                      role="alert"
-                      data-testid="reconnect-session-arca-error"
-                    >
-                      {arcaReconnect.error}
                     </p>
                   )}
                 </div>

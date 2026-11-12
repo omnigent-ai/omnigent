@@ -25,7 +25,6 @@ import {
   setNativeServerSwitcherHidden,
   setThemeSource,
   supportsNativeServerPicker,
-  supportsArcaConnect,
   supportsBrowser,
   switchServer,
   takeOnboardingRunner,
@@ -151,20 +150,6 @@ afterEach(() => {
   setElectron(false);
   setIOS(false);
   setAndroid(false);
-});
-
-describe("supportsArcaConnect", () => {
-  it("is true only when the desktop shell offers the Arca connect", () => {
-    setElectron(false);
-    expect(supportsArcaConnect()).toBe(false);
-    // An older desktop shell without the method.
-    setElectron(true);
-    expect(supportsArcaConnect()).toBe(false);
-    (
-      window as unknown as { omnigentDesktop: Record<string, unknown> }
-    ).omnigentDesktop.connectArcaHost = () => Promise.resolve({ ok: true });
-    expect(supportsArcaConnect()).toBe(true);
-  });
 });
 
 describe("takeOnboardingRunner", () => {
