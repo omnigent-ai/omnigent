@@ -404,7 +404,7 @@ heartbeat. Ordinary heartbeats keep their existing cost. Expiry is measured
 from the last renewal; disconnected hosts receive no renewals, and an expired
 token cannot open a new connection. Renewal also extends the validity of any
 leaked copy of that token. This setting does not change sandbox lifetime or
-Mac/Arca user-login credentials.
+user-login credentials on personal or remote hosts.
 
 The optional reaper runs once for the whole `sandbox:` deployment, including
 multi-provider configurations. It queries managed host rows directly and

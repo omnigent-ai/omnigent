@@ -441,8 +441,8 @@ After reconciliation, run `source:vendored_replay_test`, `source:contracts_test`
 and the managed composer tests, following the commands in that skill. Check a
 managed new-session launch: exactly one intended MCP picker, OAuth before
 selection, persisted selections (including none), and the existing sandbox
-labels. Verify Arclet receives no Lakebox MCP label. Check standalone UI with no
-`mcp` capability as well. Replay proves
+labels. Verify provider identity and MCP labels stay separate between sandbox
+providers. Check standalone UI with no `mcp` capability as well. Replay proves
 source fidelity; the managed browser journey is still needed to verify behavior.
 
 ### Bring your own gateway

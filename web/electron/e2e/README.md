@@ -164,7 +164,7 @@ A main-frame redirect and page-created `window.open` to that alias must also
 retain the owning view ID and be cancelled. A main-only
 fixture bypasses preflight for one local request to isolate response cancellation;
 its real network metadata must trigger the production response guard. Preview
-eligibility is supplied by the main-only fixture rather than live Arca enrollment.
+eligibility is supplied by the main-only fixture.
 The test requires outbound HTTPS access to `example.com` and `hsts.badssl.com`,
 and public DNS resolution of `lvh.me` to loopback. Repeated local-fixture loads must report HTTP 200 because
 the document guard skips cache reads.

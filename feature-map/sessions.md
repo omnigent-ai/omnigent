@@ -135,8 +135,8 @@ the header menu), and each place is a separate entry point.
   source workspaces retain their original selections.
 - `fork-access`: require read access to the source and, for a custom target,
   its owning session. The caller owns the fork; source grants are not copied.
-- `unsupported-sandbox-actions`: Databricks Sandbox and Arclet host-switch
-  controls stay visible but disabled, with hover and keyboard explanations.
+- `unsupported-sandbox-actions`: Host-switch controls for sandbox sessions
+  stay visible but disabled, with hover and keyboard explanations.
   Their forms cannot submit. Fork is not restricted for these sessions.
 - `switch-host-sandbox`: on a server that offers managed sandboxes, Switch host
   on a session running on a connected machine also lists a new sandbox per
@@ -547,7 +547,7 @@ left edge. Swipe left on the drawer or the dimmed chat strip beside it; past a
 third of the drawer's width or after a quick flick it closes on the current
 chat, otherwise it springs back. Settings and desktop widths don't use it.
 
-**Databricks Sandbox and Arclet sessions:** Fork is enabled in the header,
+**Sandbox sessions:** Fork is enabled in the header,
 sidebar menus, and message actions, and offers the same destinations as any
 other session: connected hosts and each offered sandbox provider. Sessions
 labelled `omnigent.host_type: managed` fork the same way. The source's own
@@ -910,9 +910,9 @@ plain `uv run pytest`, which starts a private server for the test.
   checks that the header, sidebar context menu, and message action offer Fork, and
   that the composer host menu's Switch host stays disabled, at desktop and phone
   widths. It checks hover, keyboard focus, and ignored activation for Switch host.
-  The Arclet session forks to connected hosts and a new Arclet:
+  The example sandbox session forks to connected hosts and a fresh sandbox:
   `tests/e2e_ui/fork_session/test_sandbox_disabled_controls.py::test_sandbox_session_forks_onto_connected_hosts_and_a_new_sandbox`.
-  The server and transcript are real; Databricks Sandbox and Arclet metadata is
+  The server and transcript are real; Example and Kubernetes sandbox metadata is
   patched at the browser boundary, and no live sandbox is provisioned. Direct form
   and reconnect guards have component coverage in `web/src/shell/ForkSessionDialog.test.tsx`,
   `web/src/shell/SwitchHostDialog.test.tsx`, and
@@ -1084,7 +1084,7 @@ plain `uv run pytest`, which starts a private server for the test.
   responses, covering local startup, failure and retry.
 - **`reconnect`, asleep sandbox:**
   `tests/e2e_ui/sessions/test_host_asleep_composer.py::test_opening_asleep_session_wakes_sandbox_in_status_dot`
-  drives the real SPA and server with the session patched to an asleep Arclet
+  drives the real SPA and server with the session patched to an asleep sandbox
   host. It checks that opening the session sends `retry_session` on its own,
   spins the chip and menu dots with no toast, and turns them green once
   `/health` reports the host online. Sibling tests cover a failed wake's error
@@ -1348,7 +1348,7 @@ its discoverability.
 - Forking copies files and images into the new session. After a fork, open the
   forked session and confirm the image still loads; the transcript text alone
   does not prove the file came along.
-- Databricks Sandbox, Arclet, and managed sources fork to connected hosts and
+- Sandbox and managed sources fork to connected hosts and
   every offered sandbox provider, including shared sessions. Workspace
   recovery offers connected hosts only. Verify a managed sandbox fork with
   `tests/e2e_ui/fork_session/test_fork_managed_sandbox.py::test_fork_onto_managed_sandbox_with_no_host_online`.
