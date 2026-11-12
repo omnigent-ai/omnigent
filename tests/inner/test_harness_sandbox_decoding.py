@@ -241,6 +241,8 @@ def test_harness_default_requires_absent_policy(
 ) -> None:
     harness = importlib.import_module(f"omnigent.inner.{harness_name}_harness")
     monkeypatch.delenv(harness._ENV_OS_ENV, raising=False)
-    assert harness._resolve_os_env().sandbox == OSEnvSandboxSpec(type="none")
+    resolved = harness._resolve_os_env()
+    assert resolved.type == "caller_process"
+    assert resolved.sandbox == OSEnvSandboxSpec(type="none")
     monkeypatch.setenv(harness._ENV_OS_ENV, json.dumps({"sandbox": {"type": "none"}}))
     assert harness._resolve_os_env().sandbox == OSEnvSandboxSpec(type="none")

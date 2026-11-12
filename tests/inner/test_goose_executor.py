@@ -1476,15 +1476,6 @@ async def test_respond_to_agent_request_exception_yields_error_reply() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_os_env_default(monkeypatch) -> None:
-    from omnigent.inner import goose_harness
-
-    monkeypatch.delenv("HARNESS_GOOSE_OS_ENV", raising=False)
-    spec = goose_harness._resolve_os_env()
-    assert spec.type == "caller_process"
-    assert spec.sandbox is not None and spec.sandbox.type == "none"
-
-
 def test_resolve_os_env_from_json(monkeypatch) -> None:
     from omnigent.inner import goose_harness
 
