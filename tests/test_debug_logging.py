@@ -242,6 +242,7 @@ def test_insert_auth_rejection_refreshes_credentials_and_retries_same_batch(
     sink._client = client  # type: ignore[assignment]
     sink._tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
     sink._delivered_any = False
+    sink._reset_held_rows()
     batch: list[dl.DebugLogRow] = [{"message": "same batch"}]
 
     sink._post(batch)
@@ -254,12 +255,16 @@ def _command_secret_sink(
     monkeypatch: pytest.MonkeyPatch,
     outcomes: list[int],
     token_bodies: list[object] | None = None,
+    insert_statuses: list[int] | None = None,
 ) -> tuple[dl.ZerobusLogHandler, list[str], list[int]]:
     """A worker-less sink whose secret command exits with *outcomes* in turn.
 
-    Token mints answer with *token_bodies* in turn, the last one repeating.
+    Token mints answer with *token_bodies* in turn, the last one repeating;
+    inserts answer with *insert_statuses* in turn, then 200. Only accepted
+    inserts are recorded.
     """
     bodies = token_bodies or [{"access_token": "token", "expires_in": 3600}]
+    statuses = iter(insert_statuses or [])
     mints: list[object] = []
     monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
     monkeypatch.setenv(dl.CLIENT_SECRET_COMMAND_ENV_VAR, "credential-helper")
@@ -281,8 +286,10 @@ def _command_secret_sink(
                 body = bodies[min(len(mints), len(bodies) - 1)]
                 mints.append(body)
                 return httpx.Response(200, json=body)
-            inserted.append(kwargs["content"])  # type: ignore[arg-type]
-            return httpx.Response(200)
+            status = next(statuses, 200)
+            if status == 200:
+                inserted.append(kwargs["content"])  # type: ignore[arg-type]
+            return httpx.Response(status)
 
     monkeypatch.setattr(dl.subprocess, "run", run)
     client = Client()
@@ -291,6 +298,7 @@ def _command_secret_sink(
     sink._client = client  # type: ignore[assignment]
     sink._tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
     sink._delivered_any = False
+    sink._reset_held_rows()
     return sink, inserted, command_calls
 
 
@@ -379,8 +387,10 @@ def test_held_rows_are_dropped_not_retried_during_shutdown_drain(
     sink._post([{"message": "startup"}])
     sink._drain_deadline = time.monotonic() + 5.0
 
-    sink._post([])
+    with pytest.raises(dl._ShutdownDeadline) as dropped:
+        sink._post([])
 
+    assert dropped.value.rows == 1
     # An unresolved secret command is never run under the shutdown deadline.
     assert command_calls == [1]
     assert inserted == []
@@ -389,6 +399,78 @@ def test_held_rows_are_dropped_not_retried_during_shutdown_drain(
     messages = [record.getMessage() for record in caplog.records]
     assert any("holding 1 row(s)" in message for message in messages)
     assert any("dropping 1 held row(s)" in message for message in messages)
+
+
+def test_mint_failure_mid_batch_holds_only_the_unsent_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dl, "_BATCH_MAX_RECORDS", 1)
+    # The first token is already stale, so the second chunk re-mints and fails.
+    sink, inserted, _ = _command_secret_sink(
+        monkeypatch, [0], token_bodies=[{"access_token": "token", "expires_in": 0}, {}]
+    )
+    rows: list[dl.DebugLogRow] = [{"message": "sent"}, {"message": "held"}]
+
+    sink._post(rows)
+
+    assert inserted == [json.dumps(rows[:1])]
+    assert list(sink._held_rows) == rows[1:]
+
+
+def test_insert_401_then_failed_remint_holds_the_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    sink, inserted, command_calls = _command_secret_sink(
+        monkeypatch, [0, 1, 0], insert_statuses=[401]
+    )
+    batch: list[dl.DebugLogRow] = [{"message": "rejected"}]
+
+    sink._post(batch)
+    assert command_calls == [0, 1]  # the 401 dropped the cached secret
+    assert inserted == []
+    assert list(sink._held_rows) == batch
+
+    sink._mint_retry_at = 0.0
+    sink._post([])
+    assert inserted == [json.dumps(batch)]
+    assert not sink._has_held_rows()
+
+
+def test_post_reraises_shutdown_deadline_with_the_unsent_row_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dl, "_BATCH_MAX_RECORDS", 1)
+    sink, _, _ = _command_secret_sink(monkeypatch, [0])
+    chunk_calls: list[int] = []
+
+    def post_chunk(chunk: list[dl.DebugLogRow]) -> bool:
+        chunk_calls.append(len(chunk))
+        if len(chunk_calls) == 2:
+            raise dl._ShutdownDeadline(len(chunk))
+        return True
+
+    monkeypatch.setattr(sink, "_post_chunk", post_chunk)
+
+    with pytest.raises(dl._ShutdownDeadline) as dropped:
+        sink._post([{"message": f"row-{index}"} for index in range(3)])
+
+    assert chunk_calls == [1, 1]
+    assert dropped.value.rows == 2
+
+
+def test_unexpected_chunk_error_drops_only_that_chunk(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(dl, "_diag_last", {})
+    monkeypatch.setattr(dl, "_BATCH_MAX_RECORDS", 1)
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    sink, inserted, _ = _command_secret_sink(monkeypatch, [0])
+    later: list[dl.DebugLogRow] = [{"message": "later"}]
+
+    sink._post([{"message": object()}, *later])  # the first row is not JSON-serializable
+
+    assert inserted == [json.dumps(later)]
+    assert not sink._has_held_rows()
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("dropped 1 row(s) after an unexpected upload error" in m for m in messages)
 
 
 def test_uploader_delivers_held_rows_on_idle_tick(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1749,6 +1831,7 @@ def _bare_zerobus_sink(client: _FakeZerobus) -> dl.ZerobusLogHandler:
     sink._client = client  # type: ignore[assignment]
     sink._tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
     sink._delivered_any = False
+    sink._reset_held_rows()
     return sink
 
 

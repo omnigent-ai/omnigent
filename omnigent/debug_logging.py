@@ -117,7 +117,8 @@ _SECRET_COMMAND_TIMEOUT_S = 30.0
 # Backoff between token mints after a failure; rows wait, bounded, meanwhile.
 _MINT_RETRY_INITIAL_S = 5.0
 _MINT_RETRY_MAX_S = 120.0
-_HELD_MAX_RECORDS = _QUEUE_MAX_RECORDS
+# Held rows stay in memory until a mint succeeds, so keep the cap small.
+_HELD_MAX_RECORDS = 1_000
 # At shutdown, don't start a request with less time than this left.
 _MIN_POST_BUDGET_S = 0.1
 # Transport errors raised before the request was fully sent, so a retry can't
@@ -1114,9 +1115,9 @@ class ZerobusLogHandler(DebugLogHandler):
     """Default batched debug-log handler that delivers through ZeroBus."""
 
     # Rows kept across a failed token mint, oldest first, and the mint backoff.
-    _held_rows: tuple[DebugLogRow, ...] = ()
-    _mint_retry_at = 0.0
-    _mint_backoff_s = 0.0
+    _held_rows: tuple[DebugLogRow, ...]
+    _mint_retry_at: float
+    _mint_backoff_s: float
 
     def __init__(self, config: DebugLogConfig, source: str) -> None:
         self._config = config
@@ -1129,10 +1130,13 @@ class ZerobusLogHandler(DebugLogHandler):
         self._client = httpx.Client(timeout=_HTTP_TIMEOUT_S)
         self._tokens = _TokenSource(self._config, self._client)
         # A forked child must not resend its parent's held rows.
+        self._reset_held_rows()
+        super()._start_worker()
+
+    def _reset_held_rows(self) -> None:
         self._held_rows = ()
         self._mint_retry_at = 0.0
         self._mint_backoff_s = 0.0
-        super()._start_worker()
 
     def _has_held_rows(self) -> bool:
         return bool(self._held_rows)
@@ -1166,10 +1170,19 @@ class ZerobusLogHandler(DebugLogHandler):
         rows = [*self._held_rows, *batch]
         self._held_rows = ()
         for start in range(0, len(rows), _BATCH_MAX_RECORDS):
+            chunk = rows[start : start + _BATCH_MAX_RECORDS]
             try:
-                sent = self._post_chunk(rows[start : start + _BATCH_MAX_RECORDS])
+                sent = self._post_chunk(chunk)
             except _ShutdownDeadline:
                 raise _ShutdownDeadline(len(rows) - start) from None
+            except Exception as exc:  # noqa: BLE001 — lose only the chunk that failed
+                _diag(
+                    "post_error",
+                    "dropped %d row(s) after an unexpected upload error: %s",
+                    len(chunk),
+                    type(exc).__name__,
+                )
+                continue
             if not sent:
                 self._hold_after_mint_failure(rows[start:])
                 return
@@ -1188,7 +1201,7 @@ class ZerobusLogHandler(DebugLogHandler):
             # Shutting down: there is no later attempt to wait for.
             # Own key, so a recent "holding" diag cannot throttle this one away.
             _diag("held_dropped", "no auth token at shutdown; dropping %d held row(s)", len(rows))
-            return
+            raise _ShutdownDeadline(len(rows))  # so the worker counts every lost row
         self._hold(rows)
         self._mint_backoff_s = min(
             max(self._mint_backoff_s * 2, _MINT_RETRY_INITIAL_S), _MINT_RETRY_MAX_S
