@@ -39,8 +39,12 @@ interface ScopeState {
   /** The latest update per item whose PATCH has not settled. */
   pending: Map<string, SuggestionUpdate>;
   inFlight: number;
-  /** Each item's PATCHes go out one at a time, in the order the viewer made them. */
-  chains: Map<string, Promise<unknown>>;
+  /**
+   * PATCHes go out one at a time, in the order the viewer made them. Each reply
+   * carries the viewer's whole unread total, so replies for different items
+   * must land in request order too, or an older total overwrites a newer one.
+   */
+  chain: Promise<unknown>;
   /** Items the viewer resolved here; a later read or unread mark must not reopen them. */
   resolved: Set<string>;
   /**
@@ -75,7 +79,7 @@ function scopeState(queryClient: QueryClient, scopeKeyText: string): ScopeState 
     state = {
       pending: new Map(),
       inFlight: 0,
-      chains: new Map(),
+      chain: Promise.resolve(),
       resolved: new Set(),
       confirmed: new Map(),
       started: new Map(),
@@ -182,8 +186,7 @@ export function useProactiveInbox(
       scope.inFlight += 1;
       notify();
       void queryClient.cancelQueries({ queryKey: key });
-      const previous = scope.chains.get(id) ?? Promise.resolve();
-      const request: Promise<boolean> = previous
+      const request: Promise<boolean> = scope.chain
         .then(async () => {
           let saved: SuggestionUpdateResult | null = null;
           try {
@@ -212,12 +215,11 @@ export function useProactiveInbox(
             scope.confirmed.delete(id);
             scope.started.delete(id);
           }
-          if (scope.chains.get(id) === request) scope.chains.delete(id);
           scope.inFlight -= 1;
           notify();
           if (scope.inFlight === 0) void queryClient.invalidateQueries({ queryKey: key });
         });
-      scope.chains.set(id, request);
+      scope.chain = request;
       return request;
     },
     [queryClient, scopeKeyText],

@@ -460,6 +460,44 @@ it("settles a list first loaded before the server committed the dismissal on the
   expect(result.current.unreadCount).toBe(2);
 });
 
+it("sends updates to different suggestions one at a time, so an older total cannot overwrite a newer one", async () => {
+  const a = { ...item, id: "a", createdAt: 3 };
+  const b = { ...item, id: "b", createdAt: 2 };
+  const c = { ...item, id: "c", createdAt: 1 };
+  vi.mocked(listSuggestions).mockResolvedValue(page([a, b, c], 3));
+  const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
+  await waitFor(() => expect(result.current.unreadCount).toBe(3));
+  const patchA = deferred<SuggestionUpdateResult>();
+  const patchB = deferred<SuggestionUpdateResult>();
+  vi.mocked(updateSuggestion)
+    .mockReturnValueOnce(patchA.promise)
+    .mockReturnValueOnce(patchB.promise);
+
+  act(() => void result.current.update("a", { resolution: "not_now" }));
+  act(() => void result.current.update("b", { resolution: "not_now" }));
+  expect(result.current.items).toEqual([c]);
+  expect(result.current.unreadCount).toBe(1);
+  // B's PATCH waits for A's reply, so the server's totals arrive in order.
+  await waitFor(() => expect(updateSuggestion).toHaveBeenCalledTimes(1));
+  await act(async () => {});
+  expect(updateSuggestion).toHaveBeenCalledTimes(1);
+
+  await act(async () =>
+    patchA.resolve(saved({ ...a, status: "dismissed", resolution: "not_now" }, 2)),
+  );
+  await waitFor(() => expect(updateSuggestion).toHaveBeenCalledTimes(2));
+  // A's reply says two unread; B's pending dismissal still shows one.
+  expect(result.current.unreadCount).toBe(1);
+
+  vi.mocked(listSuggestions).mockRejectedValue(new Error("offline"));
+  await act(async () =>
+    patchB.resolve(saved({ ...b, status: "dismissed", resolution: "not_now" }, 1)),
+  );
+  await waitFor(() => expect(listSuggestions).toHaveBeenCalledTimes(2));
+  expect(result.current.items).toEqual([c]);
+  expect(result.current.unreadCount).toBe(1);
+});
+
 it("trusts the total of a list first loaded while the dismissal is in flight", async () => {
   const others = [
     { ...item, id: "two", createdAt: 2 },
