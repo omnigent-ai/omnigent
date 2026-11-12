@@ -484,8 +484,6 @@ function loadNavigationHarness({
     "./arca": {
       ...require("../src/arca"),
       resolveArcaPath: () => arcaPath,
-      resolveArcaPathAsync: async () => arcaPath,
-      isExecutableFile: (p) => p === arcaPath,
       startArcaConnect: (url) => {
         calls.arcaConnects.push(url);
         const result = typeof arcaResult === "function" ? arcaResult(url) : arcaResult;
@@ -739,26 +737,13 @@ function loadNavigationHarness({
   };
 }
 
-describe("Arca auto-connect wiring", () => {
+describe("manual host connect wiring", () => {
   const workspace = "https://workspace.cloud.databricks.com/omnigent";
   const arcaPath = "/usr/local/bin/arca";
   const tick = () =>
     new Promise((resolve) => {
       setImmediate(resolve);
     });
-  const enableFeature = (h) =>
-    fs.writeFileSync(h.settingsPath, JSON.stringify({ arca_auto_connect: true }));
-
-  it("connects Arca once per launch after loading a managed server", async (t) => {
-    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
-    t.after(h.cleanup);
-    enableFeature(h);
-    await h.api.loadServerUrl(h.win, workspace);
-    await tick();
-    await h.api.loadServerUrl(h.win, workspace);
-    await tick();
-    assert.deepEqual(h.calls.arcaConnects, [workspace]);
-  });
 
   it("connects from an existing server without running onboarding setup", async (t) => {
     const h = loadNavigationHarness({
@@ -780,46 +765,6 @@ describe("Arca auto-connect wiring", () => {
     assert.deepEqual(h.calls.arcaConnects, [workspace]);
   });
 
-  for (const errorKind of ["omni-auth", "timeout"]) {
-    it(`preserves existing connect recovery for a passive ${errorKind} without onboarding setup`, async (t) => {
-      let finishPassive;
-      let attempts = 0;
-      const h = loadNavigationHarness({
-        serverUrl: workspace,
-        databricksMode: "browser",
-        internalFeatures: true,
-        arcaPath,
-        arcaConsentResult: { ok: true },
-        arcaResult: () =>
-          ++attempts === 1
-            ? new Promise((resolve) => {
-                finishPassive = resolve;
-              })
-            : { ok: true },
-      });
-      t.after(h.cleanup);
-      h.api.registerIpc();
-      enableFeature(h);
-      await h.api.loadServerUrl(h.win, workspace);
-      await until(() => h.calls.arcaConnects.length === 1, "passive Arca connection");
-
-      const requested = h.ipc.get("omnigent:arca-connect")({
-        sender: h.webContents,
-        senderFrame: { url: workspace },
-      });
-      assert.deepEqual(h.calls.arcaConsentRuns, []);
-      finishPassive({ ok: false, errorKind, error: "Browser sign-in did not complete." });
-
-      const recovered = errorKind === "omni-auth";
-      assert.equal((await requested).ok, recovered);
-      assert.deepEqual(
-        h.calls.arcaConsentRuns,
-        recovered ? [{ serverUrl: workspace, options: undefined }] : [],
-      );
-      assert.deepEqual(h.calls.arcaConnects, recovered ? [workspace, workspace] : [workspace]);
-    });
-  }
-
   describe("manual connect target validation", () => {
     function harness(t, options = {}) {
       const h = loadNavigationHarness({
@@ -837,7 +782,6 @@ describe("Arca auto-connect wiring", () => {
       fs.writeFileSync(
         h.settingsPath,
         JSON.stringify({
-          arca_auto_connect: true,
           server_labels: { [new URL(workspace).origin]: "https://evil.example/" },
         }),
       );
@@ -850,47 +794,6 @@ describe("Arca auto-connect wiring", () => {
       assert.match(result.error, /Databricks-managed servers/);
       assert.deepEqual(h.calls.arcaConnects, []);
     });
-  });
-
-  it("stays off without the feature flag, even with arca installed", async (t) => {
-    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
-    t.after(h.cleanup);
-    await h.api.loadServerUrl(h.win, workspace);
-    await tick();
-    assert.deepEqual(h.calls.arcaConnects, []);
-  });
-
-  it("turns on with OMNIGENT_ARCA_AUTO_CONNECT=1", async (t) => {
-    process.env.OMNIGENT_ARCA_AUTO_CONNECT = "1";
-    let h;
-    try {
-      h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
-    } finally {
-      delete process.env.OMNIGENT_ARCA_AUTO_CONNECT;
-    }
-    t.after(h.cleanup);
-    await h.api.loadServerUrl(h.win, workspace);
-    await tick();
-    assert.deepEqual(h.calls.arcaConnects, [workspace]);
-  });
-
-  it("doesn't try without an installed arca CLI", async (t) => {
-    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
-    t.after(h.cleanup);
-    enableFeature(h);
-    await h.api.loadServerUrl(h.win, workspace);
-    await tick();
-    assert.deepEqual(h.calls.arcaConnects, []);
-  });
-
-  it("skips servers that aren't managed", async (t) => {
-    const local = "http://localhost:6767";
-    const h = loadNavigationHarness({ serverUrl: local, arcaPath });
-    t.after(h.cleanup);
-    enableFeature(h);
-    await h.api.loadServerUrl(h.win, local);
-    await tick();
-    assert.deepEqual(h.calls.arcaConnects, []);
   });
 });
 

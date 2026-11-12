@@ -87,7 +87,7 @@ authentication-required result starts `isaac omni login <server-url>` on Arca
 and retries the noninteractive host command once after sign-in. The connect
 console does the same after the same consent click. Tokens and login output are
 not forwarded to the desktop renderer. Closing the sign-in console cancels the
-command. Passive auto-connect never starts login.
+command.
 
 A server URL can include `/omnigent?o=<workspace-id>` to select the workspace;
 the same full server URL is used for remote login and host startup.
