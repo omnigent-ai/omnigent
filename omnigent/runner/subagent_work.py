@@ -21,8 +21,10 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from fastapi.responses import JSONResponse
 
+from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
+from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
 from omnigent.runner.policy_proxy import _ASK_GATE_DELIVERY_TIMEOUT
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -131,7 +133,12 @@ class _SubagentWorkEntry:
     :param delivered: Whether the terminal payload has been pushed to
         the parent's inbox.
     :param cancellation_confirmed: Whether a native terminal edge confirmed
-        an abort, rather than an interrupt merely being requested.
+        an abort, rather than an interrupt merely being requested. An
+        unconfirmed (optimistic grace-timer) cancellation can be corrected
+        by a surviving child's later confirmed completion.
+    :param corrected_status: The provisional status this terminal report
+        overturned, e.g. ``"cancelled"`` when a confirmed completion
+        corrected an optimistic cancellation. ``None`` for a direct report.
     :param launch_timed_out: Whether the recorded ``failed`` came from the
         launch-liveness reaper rather than from the child itself. Such a
         failure is a guess ("no start acknowledgment"), so a genuine
@@ -151,6 +158,7 @@ class _SubagentWorkEntry:
     completed_at: float | None = None
     delivered: bool = False
     cancellation_confirmed: bool = False
+    corrected_status: str | None = None
     launch_timed_out: bool = False
 
 
@@ -179,6 +187,10 @@ class _SubagentDeliveryAck:
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
 _drained_delivered_subagent_children: set[str] = set()
+# Optimistic (grace-timer) cancellations, delivered then drained, kept so a
+# surviving child's confirmed completion can still correct the parent under the
+# same dispatch. Confirmed aborts are not kept; a new send or teardown clears it.
+_provisional_cancelled_subagent_work: dict[str, _SubagentWorkEntry] = {}
 # Parents whose restart-recovery scan completed in this process, plus a
 # per-parent lock so an init racing a sys_read_inbox drain cannot run two
 # scans that both pass the registry check and queue one result twice.
@@ -299,6 +311,7 @@ def register_subagent_work(
         created_by=created_by,
     )
     _drained_delivered_subagent_children.discard(child_session_id)
+    _provisional_cancelled_subagent_work.pop(child_session_id, None)
     _subagent_work_by_child[child_session_id] = entry
     _subagent_work_by_parent.setdefault(parent_session_id, set()).add(child_session_id)
     return entry
@@ -361,6 +374,12 @@ def unregister_subagent_work(
         return
     if remember_drained_delivery and entry.delivered:
         _drained_delivered_subagent_children.add(child_session_id)
+        if entry.status == "cancelled" and not entry.cancellation_confirmed:
+            # Keep an optimistic cancellation so a surviving child's confirmed
+            # completion can still correct this drained record.
+            _provisional_cancelled_subagent_work[child_session_id] = entry
+        else:
+            _provisional_cancelled_subagent_work.pop(child_session_id, None)
     _subagent_work_by_child.pop(child_session_id, None)
     _in_flight_send_locks.pop(child_session_id, None)
     children = _subagent_work_by_parent.get(entry.parent_session_id)
@@ -385,11 +404,19 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     """
     unregister_subagent_work(session_id)
     _drained_delivered_subagent_children.discard(session_id)
+    _provisional_cancelled_subagent_work.pop(session_id, None)
     _in_flight_send_locks.pop(session_id, None)
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
         _subagent_work_by_child.pop(child_id, None)
         _drained_delivered_subagent_children.discard(child_id)
+        _provisional_cancelled_subagent_work.pop(child_id, None)
         _in_flight_send_locks.pop(child_id, None)
+    # Drained optimistic cancellations are retained keyed by child id, outside the
+    # parent-child index, so clear this parent's retained records too: a late
+    # completion then acknowledges as delivered instead of re-registering work.
+    for child_id, provisional in list(_provisional_cancelled_subagent_work.items()):
+        if provisional.parent_session_id == session_id:
+            _provisional_cancelled_subagent_work.pop(child_id, None)
     _subagent_work_by_parent.pop(session_id, None)
 
 
@@ -429,6 +456,46 @@ def is_codex_native_subagent_wrapper(wrapper_label: str | None) -> bool:
         return False
     agent = native_coding_agent_for_harness(_CODEX_NATIVE_HARNESS)
     return agent is not None and wrapper_label == agent.subagent_wrapper_label
+
+
+def latest_wake_eligible_subagent_work(
+    entries: list[_SubagentWorkEntry],
+) -> _SubagentWorkEntry | None:
+    """
+    The most recently completed entry that still owes the parent an inbox wake.
+
+    Stranded-wake recovery nudges an idle parent to drain its inbox, so it must
+    skip codex-native sub-agents: a suppressed thread completing after an
+    independent child would otherwise shadow the child's stranded wake, which
+    the ownership guard then drops.
+
+    :param entries: Candidate work entries for one parent.
+    :returns: The latest wake-eligible entry, or ``None`` when every entry is a
+        codex-native sub-agent.
+    """
+    eligible = [
+        entry for entry in entries if not is_codex_native_subagent_wrapper(entry.wrapper_label)
+    ]
+    if not eligible:
+        return None
+    return max(
+        eligible,
+        key=lambda entry: entry.completed_at if entry.completed_at is not None else 0.0,
+    )
+
+
+def wrapper_label_from_labels(labels: object) -> str | None:
+    """
+    Return a child's ``omnigent.wrapper`` label from its session labels.
+
+    :param labels: Session labels as the server returns them, e.g.
+        ``{"omnigent.wrapper": "codex-native-ui"}``.
+    :returns: The wrapper label, or ``None`` when absent or not a string.
+    """
+    if not isinstance(labels, Mapping):
+        return None
+    wrapper = labels.get(WRAPPER_LABEL_KEY)
+    return wrapper if isinstance(wrapper, str) and wrapper else None
 
 
 def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None:
@@ -554,7 +621,8 @@ async def _recover_subagent_results_from_server(
         interrupted = status == "in_progress" or (
             status == "failed"
             and isinstance(error, dict)
-            and error.get("code") in {"runner_disconnected", "runner_failed_to_start"}
+            and error.get("code")
+            in {"runner_disconnected", "runner_failed_to_start", RUNNER_PROCESS_CRASH}
         )
         if status not in _SUBAGENT_TERMINAL_STATUSES and not interrupted:
             continue
@@ -563,8 +631,9 @@ async def _recover_subagent_results_from_server(
             child_id in _drained_delivered_subagent_children
         ):
             continue
-        labels = child.get("labels")
-        dispatch_id = undelivered_subagent_dispatch_id(labels if isinstance(labels, dict) else {})
+        raw_labels = child.get("labels")
+        labels = raw_labels if isinstance(raw_labels, dict) else {}
+        dispatch_id = undelivered_subagent_dispatch_id(labels)
         if dispatch_id is None or (existing is not None and existing.work_id != dispatch_id):
             continue
         output: str | None = None
@@ -586,6 +655,7 @@ async def _recover_subagent_results_from_server(
             child_session_id=child_id,
             agent=str(child.get("tool") or child.get("agent_name") or "sub-agent"),
             title=str(child.get("session_name") or ""),
+            wrapper_label=wrapper_label_from_labels(labels),
             work_id=dispatch_id,
         )
         if interrupted:
@@ -603,6 +673,8 @@ def mark_subagent_work_terminal(
     status: str,
     output: str | None,
     only_if_work_id: str | None = None,
+    confirmed_completion: bool = False,
+    confirmed_cancellation: bool = False,
 ) -> _SubagentDeliveryAck:
     """
     Mark a sub-agent dispatch terminal and notify the parent inbox.
@@ -625,9 +697,23 @@ def mark_subagent_work_terminal(
         entry is still that dispatch. A delayed op (an interrupt's grace-timer
         cancel) bound to the dispatch it was raised for is dropped when a newer
         send has replaced the entry, so an old timer never cancels new work.
+    :param confirmed_completion: Whether this ``completed`` report is a
+        confirmed turn-end (not a bare quiescence idle). A confirmed
+        completion corrects an optimistic cancellation that was already
+        delivered or drained for the same dispatch, so a child that survived
+        an interrupt still reaches the parent with its real result.
+    :param confirmed_cancellation: Whether this ``cancelled`` report is a
+        confirmed kill. It marks the dispatch's cancellation final (including
+        a delivered or drained provisional entry) so a late survivor
+        completion can no longer correct it.
     :returns: Delivery acknowledgement for this terminal report.
     :raises ValueError: If ``status`` is not terminal.
     """
+    # A confirmed completion is the only edge that corrects an optimistic
+    # cancellation: a surviving child that genuinely fails keeps the cancelled
+    # outcome, and a confirmed kill makes the abort final.
+    corrects_cancellation = confirmed_completion and status == "completed"
+    confirms_cancellation = confirmed_cancellation and status == "cancelled"
     if status not in _SUBAGENT_TERMINAL_STATUSES:
         raise ValueError(
             f"sub-agent terminal status must be one of "
@@ -635,6 +721,18 @@ def mark_subagent_work_terminal(
         )
     entry = _subagent_work_by_child.get(child_session_id)
     if entry is None:
+        provisional = _provisional_cancelled_subagent_work.get(child_session_id)
+        # Only act on a retained record that belongs to the reporting dispatch,
+        # matching the dispatch-binding guard on the live-entry path below.
+        if provisional is not None and (
+            only_if_work_id is None or provisional.work_id == only_if_work_id
+        ):
+            if confirms_cancellation:
+                # A confirmed kill finalizes the abort; the drained-delivery tombstone
+                # alone blocks a late survivor correction, so drop the retained entry.
+                _provisional_cancelled_subagent_work.pop(child_session_id, None)
+            elif corrects_cancellation:
+                return _deliver_corrected_completion(provisional, output)
         if child_session_id in _drained_delivered_subagent_children:
             return _SubagentDeliveryAck(
                 entry=None,
@@ -659,6 +757,19 @@ def mark_subagent_work_terminal(
             reason=_SUBAGENT_DELIVERY_SUPERSEDED_DISPATCH,
         )
     if entry.status in _SUBAGENT_TERMINAL_STATUSES:
+        if confirms_cancellation and entry.status == "cancelled":
+            # A confirmed kill makes the delivered optimistic cancellation
+            # final; a late survivor completion can no longer correct it.
+            entry.cancellation_confirmed = True
+        if (
+            corrects_cancellation
+            and entry.status == "cancelled"
+            and not entry.cancellation_confirmed
+            and entry.delivered
+        ):
+            # The child survived an optimistic cancellation and finished; its
+            # confirmed completion corrects the already-delivered record.
+            return _deliver_corrected_completion(entry, output)
         # ``failed`` outranks ``completed``: a quiescence-derived ``completed``
         # (the watcher's ``idle`` edge) can be recorded — and delivered — before
         # the turn's real ``failed`` edge lands. The failure must replace it and
@@ -687,11 +798,17 @@ def mark_subagent_work_terminal(
                 delivered_now=False,
                 reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
             )
-        # A late stop_session-driven "cancelled" must not downgrade an
-        # already-recorded "completed"/"failed" still awaiting delivery, and a
-        # trailing quiescence "completed" must not launder a recorded "failed".
-        keep_recorded = (status == "cancelled" and entry.status != "cancelled") or (
-            status == "completed" and entry.status == "failed"
+        # Only undelivered entries reach here. A late "cancelled" must not
+        # downgrade a recorded "completed"/"failed", a trailing "completed" must
+        # not launder a "failed", and only a confirmed kill outranks a completion.
+        keep_recorded = (
+            (status == "cancelled" and entry.status != "cancelled")
+            or (status == "completed" and entry.status == "failed")
+            or (
+                status == "completed"
+                and entry.status == "cancelled"
+                and entry.cancellation_confirmed
+            )
         )
         if not keep_recorded:
             entry.status = status
@@ -701,6 +818,39 @@ def mark_subagent_work_terminal(
     entry.status = status
     entry.output = output
     entry.completed_at = time.time()
+    if confirms_cancellation:
+        entry.cancellation_confirmed = True
+    return _deliver_subagent_completion(entry)
+
+
+def _deliver_corrected_completion(
+    cancelled_entry: _SubagentWorkEntry, output: str | None
+) -> _SubagentDeliveryAck:
+    """
+    Overturn an optimistic cancellation with the child's confirmed completion.
+
+    Re-registers the dispatch under its original ``work_id`` (clearing the
+    drained-delivery and provisional-cancel tombstones) and delivers the real
+    result, noting the cancellation it superseded so the parent-readable line
+    can explain the correction.
+
+    :param cancelled_entry: The provisional-cancelled entry being corrected.
+    :param output: The surviving child's confirmed completion output.
+    :returns: Delivery acknowledgement for the corrected completion.
+    """
+    entry = register_subagent_work(
+        parent_session_id=cancelled_entry.parent_session_id,
+        child_session_id=cancelled_entry.child_session_id,
+        agent=cancelled_entry.agent,
+        title=cancelled_entry.title,
+        wrapper_label=cancelled_entry.wrapper_label,
+        created_by=cancelled_entry.created_by,
+        work_id=cancelled_entry.work_id,
+    )
+    entry.status = "completed"
+    entry.output = output
+    entry.completed_at = time.time()
+    entry.corrected_status = cancelled_entry.status
     return _deliver_subagent_completion(entry)
 
 
@@ -739,20 +889,21 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
         output = (
             "[System: sub-agent completed with no output]" if entry.status == "completed" else ""
         )
-    inbox.put_nowait(
-        {
-            "type": "sub_agent",
-            "work_id": entry.work_id,
-            "task_id": entry.child_session_id,
-            "handle_id": entry.child_session_id,
-            "conversation_id": entry.child_session_id,
-            "tool_name": entry.agent,
-            "agent": entry.agent,
-            "title": entry.title,
-            "status": entry.status,
-            "output": output,
-        }
-    )
+    item: _JsonObject = {
+        "type": "sub_agent",
+        "work_id": entry.work_id,
+        "task_id": entry.child_session_id,
+        "handle_id": entry.child_session_id,
+        "conversation_id": entry.child_session_id,
+        "tool_name": entry.agent,
+        "agent": entry.agent,
+        "title": entry.title,
+        "status": entry.status,
+        "output": output,
+    }
+    if entry.corrected_status is not None:
+        item["corrected_status"] = entry.corrected_status
+    inbox.put_nowait(item)
     entry.delivered = True
     return _SubagentDeliveryAck(
         entry=entry,
@@ -843,7 +994,7 @@ async def run_subagent_launch_reaper(
             reap_stalled_subagent_launches(mark_terminal=mark_terminal)
             if reconcile_pending is not None:
                 await reconcile_pending()
-        except Exception:  # noqa: BLE001 — the sweep is a backstop; never die.
+        except Exception:  # the sweep is a backstop; never die.
             _logger.warning("sub-agent launch reaper sweep failed", exc_info=True)
 
 
@@ -944,7 +1095,7 @@ async def _deliver_subagent_wake_post(
             # failure — httpx does not raise on status by itself.
             resp.raise_for_status()
             return True
-        except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, httpx.HTTPError) as exc:
             if (
                 attribution_created_by is not None
                 and isinstance(exc, httpx.HTTPStatusError)
@@ -1049,6 +1200,27 @@ def _format_subagent_wake_notice(*, agent: str, title: str, status: str, pending
     noun = "result" if pending == 1 else "results"
     return (
         f"[System: sub-agent {agent}/{title} finished ({status}) — "
+        f"{pending} {noun} waiting in inbox. Call sys_read_inbox to collect.]"
+    )
+
+
+def _format_async_result_wake_notice(
+    *, handle_id: str, tool_name: str, status: str, pending: int
+) -> str:
+    """
+    Build the framework notice that wakes a session after a background task finishes.
+
+    :param handle_id: The ``sys_call_async`` handle, e.g. ``"handle_0123456789ab"``.
+    :param tool_name: The dispatched tool, e.g. ``"sys_os_shell"``.
+    :param status: Terminal task status, e.g. ``"completed"`` or ``"failed"``.
+    :param pending: Number of undrained items in the session inbox, e.g. ``1``.
+    :returns: A ``[System: ...]`` notice string, e.g. ``"[System: background task
+        handle_0123456789ab (sys_os_shell) finished (completed) — 1 result waiting
+        in inbox. Call sys_read_inbox to collect.]"``.
+    """
+    noun = "result" if pending == 1 else "results"
+    return (
+        f"[System: background task {handle_id} ({tool_name}) finished ({status}) — "
         f"{pending} {noun} waiting in inbox. Call sys_read_inbox to collect.]"
     )
 

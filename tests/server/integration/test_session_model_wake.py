@@ -94,6 +94,7 @@ async def test_model_switch_wakes_and_initializes_before_forwarding(
             "type": "model_change",
             "model": "gpt-5.6-sol",
             "rollback_on_refusal": True,
+            "cold_start_settings": True,
         }
         assert store.get_conversation(session_id).model_override == "gpt-5.6-sol"
         order.append("forward")

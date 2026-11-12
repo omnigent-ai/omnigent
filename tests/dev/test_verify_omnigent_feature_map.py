@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.harness_bench.probes import PROBES_BY_NAME
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _FEATURES = _REPO_ROOT / "feature-map"
 _SKILL = _FEATURES / "skills" / "verify-omnigent"
@@ -103,6 +105,26 @@ def test_native_harness_matrix_lists_every_harness() -> None:
     rows = set(re.findall(r"^\|\s*`([\w-]+)-native`\s*\|", matrix, re.M))
     missing = [name for name in harnesses if name not in rows]
     assert not missing, f"native-harnesses.md matrix has no row for: {missing}"
+
+
+def test_harness_acceptance_maps_checklist_and_registered_probes() -> None:
+    checklist = (_FEATURES / "harness-acceptance.md").read_text()
+    acceptance = checklist.split("\n## Sub-features\n", 1)[1].split("\n## ", 1)[0]
+    coverage = checklist.split("\n### Existing coverage and gaps\n", 1)[1].split("\n### ", 1)[0]
+    checklist_ids = re.findall(r"^\| `([\w-]+)` \|", acceptance, re.M)
+    rows = re.findall(r"^\| `([\w-]+)` \| ([^|]+) \|", coverage, re.M)
+    mapped_ids = [checklist_id for checklist_id, _ in rows]
+    assert checklist_ids and len(checklist_ids) == len(set(checklist_ids))
+    assert len(mapped_ids) == len(set(mapped_ids)), "duplicate checklist coverage row"
+    assert set(mapped_ids) == set(checklist_ids), "every acceptance row needs coverage or a gap"
+    mapped_probes = {
+        probe for _, dimensions in rows for probe in re.findall(r"`([\w_]+)`", dimensions)
+    }
+    assert mapped_probes == set(PROBES_BY_NAME), (
+        "harness-acceptance.md must map every registered probe; "
+        f"unmapped: {sorted(set(PROBES_BY_NAME) - mapped_probes)}, "
+        f"unknown: {sorted(mapped_probes - set(PROBES_BY_NAME))}"
+    )
 
 
 def test_verify_env_helper_is_executable() -> None:

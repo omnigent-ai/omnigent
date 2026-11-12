@@ -39,6 +39,7 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
+from tests._helpers.session import send_user_text
 from tests.e2e.helpers import POLL_INTERVAL_S
 
 # Marker file the cwd-resolution tests ask Codex to read back. It is placed
@@ -206,34 +207,6 @@ def _content_types(item: dict[str, object]) -> list[object]:
     if not isinstance(content, list):
         return []
     return [block.get("type") for block in content if isinstance(block, dict)]
-
-
-def _send_user_text(
-    client: httpx.Client,
-    *,
-    session_id: str,
-    text: str,
-) -> None:
-    """
-    Post a user text message to a session (the web "send" action).
-
-    :param client: HTTP client pointed at the test server.
-    :param session_id: Session/conversation id.
-    :param text: User message text to deliver to the agent.
-    :returns: None.
-    """
-    resp = client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "message",
-            "data": {
-                "role": "user",
-                "content": [{"type": "input_text", "text": text}],
-            },
-        },
-        timeout=30.0,
-    )
-    resp.raise_for_status()
 
 
 def _poll_for_assistant_marker(
@@ -854,7 +827,7 @@ def test_codex_native_spawn_creates_child_session(
             host_id=host_id,
             workspace=str(workspace),
         )
-        _send_user_text(
+        send_user_text(
             http_client,
             session_id=session_id,
             text=(
@@ -1540,7 +1513,7 @@ def test_codex_native_web_model_effort_override_survives_turn(
         # so the override below is a genuine mid-session change (the only
         # path that must ride thread/settings/update — a fresh thread could
         # otherwise be launch-pinned).
-        _send_user_text(
+        send_user_text(
             http_client,
             session_id=session_id,
             text=f"Reply with exactly one word: {boot_marker}",
@@ -1575,7 +1548,7 @@ def test_codex_native_web_model_effort_override_survives_turn(
         # {model, effort} before turn/start; if the app-server rejected those
         # fields (the pre-fix turn-path behavior), this turn would raise an
         # ExecutorError and the marker would never arrive.
-        _send_user_text(
+        send_user_text(
             http_client,
             session_id=session_id,
             text=f"Reply with exactly one word: {switched_marker}",
@@ -1639,7 +1612,7 @@ def test_codex_native_stale_completed_turn_recovers_with_new_turn(
 
         # Complete a real first Codex turn and retain its id. The forwarder
         # normally clears this id when it processes turn/completed.
-        _send_user_text(
+        send_user_text(
             http_client,
             session_id=session_id,
             text=f"Reply with exactly one word: {first_marker}",
@@ -1674,7 +1647,7 @@ def test_codex_native_stale_completed_turn_recovers_with_new_turn(
         assert stale_state is not None
         assert stale_state.active_turn_id == completed_turn_id
 
-        _send_user_text(
+        send_user_text(
             http_client,
             session_id=session_id,
             text=f"Reply with exactly one word: {second_marker}",

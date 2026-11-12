@@ -6,7 +6,13 @@ import { describe, expect, it } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
-import { initialPrefillState, projectPrefillStep } from "./projectPrefill";
+import type { ProjectLaunchDefaults } from "@/lib/projectLaunchPreferences";
+import {
+  initialPrefillState,
+  projectPrefillStep,
+  withProjectLaunchDefaults,
+  type ProjectPrefillConfig,
+} from "./projectPrefill";
 
 const hosts: Host[] = [
   { host_id: "host_1", name: "laptop", owner: "corey", status: "online" },
@@ -221,5 +227,89 @@ describe("projectPrefill agent seeding", () => {
     // Host track can still settle, but the agent track stays open.
     expect(step).not.toBeNull();
     expect(step!.state.agentSeeded).toBe(false);
+  });
+});
+
+describe("projectPrefill last start's agent", () => {
+  it("waits for the pickable list before seeding any agent", () => {
+    const step = projectPrefillStep(
+      initialPrefillState("Alpha"),
+      inputs({ agents: undefined, config: { agentId: "ag_cfg", launchAgentId: "ag_launch" } }),
+    );
+    expect(step!.state.agentSeeded).toBe(false);
+    expect(step!.writes.agentId).toBeUndefined();
+  });
+
+  it.each([
+    {
+      label: "the last start's agent while the list has it",
+      agents: ["ag_launch", "ag_cfg", "ag_hello"],
+      config: { agentId: "ag_cfg", launchAgentId: "ag_launch" },
+      seeded: "ag_launch",
+    },
+    {
+      label: "the configured agent once the last start's is gone",
+      agents: ["ag_cfg", "ag_hello"],
+      config: { agentId: "ag_cfg", launchAgentId: "ag_gone" },
+      seeded: "ag_cfg",
+    },
+    {
+      label: "the last-used agent without a configured one",
+      agents: ["ag_hello"],
+      config: { launchAgentId: "ag_gone" },
+      seeded: "ag_hello",
+    },
+  ])("seeds $label", ({ agents, config, seeded }) => {
+    const { writes } = runToDone(
+      inputs({ agents: agents.map((id) => ({ id })), lastAgentId: "ag_hello", config }),
+    );
+    expect(writes.agentId).toBe(seeded);
+  });
+});
+
+describe("withProjectLaunchDefaults", () => {
+  const stored = {
+    hostId: "host_1",
+    workspace: "/repos/alpha",
+    agentId: "ag_claude",
+    model: "opus",
+    effort: "low",
+    useWorktree: true,
+  };
+
+  it("keeps the stored defaults when the project has no last start", () => {
+    expect(withProjectLaunchDefaults(stored, null)).toEqual(stored);
+  });
+
+  it.each<{ label: string; launch: ProjectLaunchDefaults; expected: ProjectPrefillConfig }>([
+    {
+      label: "keeps the stored model and effort for another agent's start",
+      launch: { agentId: "ag_codex", harness: "codex-native", harnessOptions: { effort: "high" } },
+      expected: { ...stored, launchAgentId: "ag_codex" },
+    },
+    {
+      label: "drops them when the stored agent started with its own options",
+      launch: { agentId: "ag_claude", harness: "claude-native", harnessOptions: { model: "" } },
+      expected: { ...stored, launchAgentId: "ag_claude", model: undefined, effort: undefined },
+    },
+    {
+      // A Smart Routing start records no harness options.
+      label: "keeps them when the stored agent started without options",
+      launch: { agentId: "ag_claude", pickedHarness: "auto-native" },
+      expected: { ...stored, launchAgentId: "ag_claude" },
+    },
+  ])("$label", ({ launch, expected }) => {
+    expect(withProjectLaunchDefaults(stored, launch)).toEqual(expected);
+  });
+
+  it("replaces the stored host together with its working directory", () => {
+    expect(withProjectLaunchDefaults(stored, { hostId: SANDBOX_HOST_CHOICE })).toEqual({
+      ...stored,
+      hostId: SANDBOX_HOST_CHOICE,
+      workspace: undefined,
+    });
+    expect(
+      withProjectLaunchDefaults({}, { hostId: "host_2", workspace: "/repos/working-dir-b" }),
+    ).toEqual({ hostId: "host_2", workspace: "/repos/working-dir-b" });
   });
 });

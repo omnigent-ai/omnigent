@@ -6,8 +6,10 @@ import asyncio
 import json
 import os
 import subprocess
+import threading
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +41,8 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalListEntry, TerminalRegistry
+from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
@@ -151,9 +155,23 @@ class _CapturingResourceRegistry:
         """
         self._terminal_activity_publisher = publisher
 
+    def set_session_background_publisher(
+        self,
+        publisher: Callable[[str, bool], None],
+    ) -> None:
+        """
+        Accept the background-shell publisher installed by the runner app.
+
+        :param publisher: Callable ``(session_id, running) -> None``.
+        :returns: None.
+        """
+        self._session_background_publisher = publisher
+
     def set_session_status_publisher(
         self,
         publisher: Callable[[str, str], None],
+        *,
+        accepts_inferred_status: Callable[[], bool] | None = None,
     ) -> None:
         """
         Accept the session-status publisher installed by the runner app.
@@ -162,9 +180,14 @@ class _CapturingResourceRegistry:
         callback (unused) to satisfy ``create_runner_app``'s wiring.
 
         :param publisher: Callable ``(session_id, status) -> None``.
+        :param accepts_inferred_status: Unused server capability check.
         :returns: None.
         """
+        del accepts_inferred_status
         self._session_status_publisher = publisher
+
+    def set_session_failure_publisher(self, publisher: Callable[[str, str], None]) -> None:
+        self._session_failure_publisher = publisher
 
     def set_terminal_exit_publisher(
         self,
@@ -298,6 +321,39 @@ def test_terminal_activity_refreshes_harness_idle_lease(tmp_path: Path) -> None:
     assert process_manager.activity_noted == ["conv_native"]
 
 
+@pytest.mark.asyncio
+async def test_background_shell_reports_reach_the_server_as_session_events(
+    tmp_path: Path,
+) -> None:
+    """The runner posts the flag as a session event, never into its session stream."""
+    posts: list[tuple[str, Any]] = []
+
+    class _RecordingServerClient(NullServerClient):
+        async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+            posts.append((url, kwargs.get("json")))
+            return httpx.Response(202, json={"queued": False}, request=httpx.Request("POST", url))
+
+    resource_registry = _CapturingResourceRegistry(tmp_path)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        resource_registry=resource_registry,  # type: ignore[arg-type]
+        server_client=_RecordingServerClient(),  # type: ignore[arg-type]
+    )
+    session_id = "conv_background_report"
+
+    resource_registry._session_background_publisher(session_id, True)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert len(posts) == 1
+    url, body = posts[0]
+    assert url == f"/v1/sessions/{session_id}/events"
+    assert body["type"] == "external_background_work"
+    assert body["data"]["running"] is True
+    assert isinstance(body["data"]["reported_at"], int)
+    assert session_id not in app.state.session_event_queues
+
+
 @pytest.fixture
 def registry(tmp_path: Path) -> TerminalRegistry:
     terminal_registry = TerminalRegistry(
@@ -341,6 +397,40 @@ async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
         yield c
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "targets,status",
+    [
+        ([{"url": "https://github.com/org/repo", "path": ""}], 200),
+        ([{"url": "https://github.com/org/repo", "path": "../outside"}], 400),
+        ([{"url": "https://github.com/org/repo", "path": ""}] * 11, 400),
+        ([{"path": ""}], 400),
+    ],
+)
+async def test_repository_branches_runner_contract(
+    tmp_path: Path, targets: object, status: int
+) -> None:
+    app = create_runner_app(
+        runner_workspace=tmp_path,
+        per_session_workspace=False,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        response = await client.get(
+            "/v1/sessions/session/resources/repository-branches",
+            params={"repositories": json.dumps(targets)},
+        )
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.json() == {
+            "repositories": [
+                {"url": "https://github.com/org/repo", "branch": None, "pushed": None}
+            ]
+        }
 
 
 @pytest.mark.asyncio
@@ -1694,18 +1784,14 @@ def _make_capturing_instance(
     return instance
 
 
-class _LaunchReturningRegistry:
-    """Terminal-registry stub whose ``launch`` returns a fixed instance.
-
-    The real terminal launch helpers only call
-    ``launch`` on its terminal registry; returning a prepared instance
-    lets the test exercise the real ``_start_terminal_activity_watcher``
-    wiring without spawning a terminal.
+class _LaunchReturningRegistry(TerminalRegistry):
+    """Register a prepared instance using the real registry's ownership lookups.
 
     :param instance: The instance every ``launch`` returns.
     """
 
     def __init__(self, instance: TerminalInstance) -> None:
+        super().__init__()
         self._instance = instance
 
     async def launch(
@@ -1718,20 +1804,21 @@ class _LaunchReturningRegistry:
         parent_os_env: Any | None = None,
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
+        program_status_app: str | None = None,
     ) -> TerminalInstance:
         """Return the fixed instance, ignoring the launch spec.
 
-        :param conversation_id: Session/conversation id (unused).
+        :param conversation_id: Session/conversation id that owns the instance.
         :param terminal_name: Terminal name (unused).
         :param session_key: Per-launch key (unused).
         :param spec: Terminal env spec (unused).
         :param parent_os_env: Agent os_env (unused).
         :param cwd_override: cwd override (unused).
         :param sandbox_override: sandbox override (unused).
+        :param program_status_app: Runtime status application identity.
         :returns: The prepared terminal instance.
         """
         del (
-            conversation_id,
             terminal_name,
             session_key,
             spec,
@@ -1739,6 +1826,8 @@ class _LaunchReturningRegistry:
             cwd_override,
             sandbox_override,
         )
+        self._instance.program_status_app = program_status_app
+        _seed_registry(self, conversation_id, [self._instance])
         return self._instance
 
 
@@ -2691,6 +2780,78 @@ async def test_failed_snapshot_does_not_pin_workspace_cache_to_none(
         f"Only the startup entry means the failed first snapshot pinned this "
         f"session's workspace to None forever."
     )
+
+
+@pytest.mark.asyncio
+async def test_slow_changed_files_listing_leaves_the_default_executor_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``git status`` stuck in the changes listing holds no default-executor worker.
+
+    A listing the browser abandons keeps its git call running; on the default
+    executor, enough of them starve every other offload, message delivery included.
+    """
+    import omnigent.runtime.filesystem_registry as filesystem_registry_mod
+
+    conv = "conv_slow_changes"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    release_git = threading.Event()
+    listing_threads: list[str] = []
+
+    class _SlowGitRegistry:
+        """Stands in for a git status that takes minutes on a large tree."""
+
+        def __init__(self, watch_path: Path | None) -> None:
+            self.watch_path = watch_path
+
+        def start(self) -> None:
+            return None
+
+        def list_changed_files(self, session_id: str, *, limit: int = 10_000) -> list[Any]:
+            del session_id, limit
+            listing_threads.append(threading.current_thread().name)
+            release_git.wait(budget(10))
+            return []
+
+    monkeypatch.setattr(
+        filesystem_registry_mod,
+        "create_filesystem_registry",
+        lambda *, watch_path=None: _SlowGitRegistry(watch_path),
+    )
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            return httpx.Response(
+                200, json={"id": conv, "agent_id": None, "workspace": str(workspace)}
+            )
+        return httpx.Response(200, json={})
+
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2))
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    )
+    app = create_runner_app(runner_workspace=workspace, server_client=server_client)
+    path = f"/v1/sessions/{conv}/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            # As many stuck listings as the default executor has workers.
+            listings = [asyncio.create_task(client.get(path)) for _ in range(2)]
+            await poll_until_async(lambda: len(listing_threads) == 2, timeout_s=budget(5))
+
+            quick = asyncio.to_thread(lambda: "done")
+            assert await asyncio.wait_for(quick, timeout=budget(2)) == "done"
+            assert all(name.startswith("runner-slow-io_") for name in listing_threads)
+
+            release_git.set()
+            responses = await asyncio.gather(*listings)
+    finally:
+        release_git.set()
+        await server_client.aclose()
+
+    assert [response.status_code for response in responses] == [200, 200]
 
 
 @pytest.mark.asyncio

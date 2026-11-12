@@ -173,7 +173,7 @@ def _load_providers() -> tuple[GitProvider, ...]:
                 key=lambda entry: (entry.name, entry.value),
             )
         )
-    except Exception:  # noqa: BLE001 — installed metadata must not hide built-ins
+    except Exception:  # installed metadata must not hide built-ins
         _logger.warning("Failed to discover git provider plugins", exc_info=True)
     loaded: dict[str, GitProvider] = {}
     for entry in entries:
@@ -197,7 +197,7 @@ def _load_providers() -> tuple[GitProvider, ...]:
             if descriptor_id in loaded:
                 raise ValueError(f"Provider id {descriptor_id!r} is already defined")
             loaded[descriptor_id] = cast(GitProvider, descriptor)
-        except Exception:  # noqa: BLE001 — a broken plugin must not hide other providers
+        except Exception:  # a broken plugin must not hide other providers
             _logger.warning("Failed to load git provider %s; skipping", entry.name, exc_info=True)
     return tuple(loaded.values())
 

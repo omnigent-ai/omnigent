@@ -19,7 +19,6 @@ import os
 import secrets
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -30,6 +29,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.live_server import find_free_port
 from tests.e2e_ui.conftest import _create_native_codex_session
 from tests.e2e_ui.messages.test_message_render_parity import _ensure_chat_view, _send
 
@@ -61,12 +61,6 @@ _TURN_EXECUTOR_ERROR = "inner executor error"
 # Both claim nothing routes the codex harness, which the ambient config refutes.
 _NO_ROUTE_MARKER = "no Omnigent provider routes the codex harness"
 _NO_PROVIDER_SUMMARY_MARKER = "no provider configured for the codex harness"
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 # CI forces an egress proxy; loopback requests to the spawned server must bypass it.
@@ -170,7 +164,7 @@ def ambient_bedrock_codex_session(
     assert codex_path is not None
     codex_shim = _write_isolated_codex_shim(work, codex_path)
 
-    port = _free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     binding_token = secrets.token_urlsafe(32)
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  appendReplyDraft,
   readComposerDraft,
   removeReplyQuote,
   restoreReplyDraft,
@@ -128,5 +129,24 @@ describe("reply drafts", () => {
       text: "",
     };
     expect(removeReplyQuote(draft, "real")).toEqual({ quotes: [], text: "  \n" });
+  });
+
+  it("appends a draft as a new paragraph, keeping both drafts' cards and authored text", () => {
+    const first: ReplyDraft = {
+      quotes: [{ id: "a", before: "", text: "Earlier" }],
+      text: "check this ",
+    };
+    const second: ReplyDraft = {
+      quotes: [{ id: "b", before: "Also", text: "Later" }],
+      text: "and this",
+    };
+    const appended = appendReplyDraft(first, second);
+    expect(appended.quotes.map((quote) => quote.id)).toEqual(["a", "b"]);
+    expect(serializeReplyDraft(appended)).toBe(
+      "> Earlier\n\ncheck this \n\nAlso\n\n> Later\n\nand this",
+    );
+    expect(
+      appendReplyDraft({ quotes: [], text: "draft\n" }, { quotes: [], text: "queued" }),
+    ).toEqual({ quotes: [], text: "draft\n\nqueued" });
   });
 });

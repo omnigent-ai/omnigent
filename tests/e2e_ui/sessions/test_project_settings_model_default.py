@@ -24,16 +24,28 @@ The e2e_ui runner registers no host, so Codex (whose catalog is
 host-resolved) has no models to offer — its control is present but disabled.
 Claude Code carries a static version-agnostic alias catalog
 (``CLAUDE_NATIVE_MODELS``), so its control is populated and drives the
-round-trip: pick "Opus" → Save → the stored config carries ``model: "opus"``.
+round-trip: pick "Opus" and Effort "High" → Save → the stored config carries
+both. A separate journey starts a session from the project against a real
+host whose Claude Code CLI talks to the mock model, and checks the seeded
+``reasoning_effort``.
 """
 
 from __future__ import annotations
 
+import json
+import re
+import shutil
+import time
 import uuid
+from pathlib import Path
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests._helpers.host import isolated_host
+
+_CLAUDE_MOCK_MODEL = "claude-sonnet-4-20250514"
 
 
 def _create_project(base_url: str, name: str) -> str:
@@ -84,6 +96,14 @@ def _pick_default_agent(page: Page, agent_id: str) -> None:
     row.click()
 
 
+def _session_effort(base_url: str, session_id: str) -> str | None:
+    """Return the session's persisted ``reasoning_effort`` (``None`` = unset)."""
+    resp = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=15.0)
+    resp.raise_for_status()
+    effort = resp.json().get("reasoning_effort")
+    return effort if isinstance(effort, str) else None
+
+
 @pytest.mark.parametrize(
     ("builtin_name", "display_name"),
     [
@@ -131,11 +151,11 @@ def test_project_settings_offers_model_default_for_native_harness(
     expect(page.get_by_test_id("project-settings-model")).to_be_visible(timeout=5_000)
 
 
-def test_project_settings_model_default_round_trips(
+def test_project_settings_model_and_effort_defaults_round_trip(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A chosen model default persists into the project config and re-seeds.
+    """Chosen model and effort defaults persist into the project config and re-seed.
 
     Extends the visibility guard into the full user journey the feature
     needs: pick Claude Code as the default agent, choose "Opus" in the model
@@ -168,6 +188,12 @@ def test_project_settings_model_default_round_trips(
         option = page.get_by_role("menuitem", name="Opus", exact=True)
     expect(option.first).to_be_visible()
     option.first.click()
+
+    effort = page.get_by_test_id("project-settings-effort")
+    expect(effort).to_contain_text("No default")
+    effort.click()
+    page.get_by_role("option", name="High", exact=True).click()
+    expect(effort).to_contain_text("High")
     page.get_by_test_id("project-settings-save").click()
     expect(page.get_by_test_id("project-settings-save")).to_have_count(0)
 
@@ -178,7 +204,96 @@ def test_project_settings_model_default_round_trips(
     assert config.get("model") == "opus", (
         f"saved project config carries no model default: {config!r}"
     )
+    assert config.get("effort") == "high", f"saved config carries no effort: {config!r}"
 
     # Reopen — the stored default seeds the control back.
     _open_project_settings(page, project)
     expect(page.get_by_test_id("project-settings-model")).to_contain_text("Opus")
+    expect(page.get_by_test_id("project-settings-effort")).to_contain_text("High")
+
+
+@pytest.mark.timeout(600)
+def test_project_effort_default_seeds_new_session(
+    request: pytest.FixtureRequest,
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path: Path,
+) -> None:
+    """A new session started in the project comes up with the project's effort.
+
+    The project's default agent is Claude Code with effort "high"; "New session
+    in <project>" must show "High" in the composer, and the created session must
+    persist ``reasoning_effort == "high"``.
+    """
+    if shutil.which("claude") is None or shutil.which("tmux") is None:
+        pytest.skip("needs the claude CLI and tmux")
+    agent = _resolve_builtin_agent(live_server, "claude-native-ui")
+    project = f"Project {uuid.uuid4().hex[:6]}"
+    project_id = _create_project(live_server, project)
+    httpx.patch(
+        f"{live_server}/v1/projects/{project_id}",
+        json={"config": {"agent_id": agent["id"], "effort": "high"}},
+        timeout=10.0,
+    ).raise_for_status()
+    providers = {
+        "e2e-claude": {
+            "kind": "key",
+            "default": ["anthropic"],
+            "anthropic": {
+                "base_url": mock_llm_server_url,
+                "api_key": "mock-key",
+                "models": {"default": _CLAUDE_MOCK_MODEL},
+            },
+        }
+    }
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with (
+        httpx.Client(base_url=live_server, timeout=20) as client,
+        isolated_host(
+            tmp_path / "host",
+            live_server,
+            config={"providers": providers},
+            env={"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
+            cwd=workspace,
+        ) as host,
+    ):
+        host.wait_online(client, timeout=120, poll_interval=0.5)
+        created_id: str | None = None
+        page: Page = request.getfixturevalue("page")
+        reviewed_key = json.dumps(f"omnigent:imports-reviewed:{host.host_id}")
+        page.add_init_script(f"localStorage.setItem({reviewed_key}, 'true')")
+        try:
+            page.goto(f"{live_server}/")
+            new_in_project = page.get_by_role("link", name=f"New session in {project}", exact=True)
+            expect(new_in_project).to_be_visible(timeout=30_000)
+            new_in_project.hover()
+            new_in_project.click()
+
+            agent_picker = page.get_by_test_id("new-chat-landing-agent-select")
+            expect(agent_picker).to_be_enabled(timeout=60_000)
+            expect(agent_picker).to_have_attribute(
+                "aria-label", re.compile("Claude Code"), timeout=30_000
+            )
+            expect(page.get_by_test_id("new-chat-landing-agent-effort-value")).to_have_text(
+                "High", timeout=30_000
+            )
+
+            page.get_by_test_id("new-chat-landing-input").fill("Say hello.")
+            submit = page.get_by_test_id("new-chat-landing-submit")
+            expect(submit).to_be_enabled(timeout=30_000)
+            submit.click()
+            page.wait_for_url(lambda url: "/c/" in url and "temp:" not in url, timeout=90_000)
+            created_id = page.url.rstrip("/").split("/c/")[-1].split("?")[0]
+
+            deadline = time.time() + 30
+            while time.time() < deadline and _session_effort(live_server, created_id) is None:
+                time.sleep(0.5)
+            assert _session_effort(live_server, created_id) == "high"
+            expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text(
+                "High", timeout=60_000
+            )
+        finally:
+            page.context.close()
+            if created_id:
+                client.delete(f"/v1/sessions/{created_id}")
