@@ -97,7 +97,9 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
             "cline",
             "cline",
             login_args=("auth",),
-            auth_hint="run `cline auth` (Cline OAuth, ChatGPT subscription, or a provider API key)",
+            auth_hint=(
+                "run `cline auth` (Cline OAuth, ChatGPT subscription, or a provider API key)"
+            ),
         ),
         args=("--acp",),
     ),
