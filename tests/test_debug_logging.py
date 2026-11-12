@@ -263,7 +263,7 @@ def _command_secret_sink(
     mints: list[object] = []
     monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
     monkeypatch.setenv(dl.CLIENT_SECRET_COMMAND_ENV_VAR, "credential-helper")
-    monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://ws.cloud.databricks.com")
+    monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://workspace.example.com")
     monkeypatch.setenv(dl.ENDPOINT_ENV_VAR, _INSERT_URL)
     config = dl.config_from_env()
     assert config is not None
@@ -394,7 +394,7 @@ def test_held_rows_are_dropped_not_retried_during_shutdown_drain(
 def test_uploader_delivers_held_rows_on_idle_tick(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
     monkeypatch.setenv(dl.CLIENT_SECRET_COMMAND_ENV_VAR, "credential-helper")
-    monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://ws.cloud.databricks.com")
+    monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://workspace.example.com")
     monkeypatch.setenv(dl.ENDPOINT_ENV_VAR, _INSERT_URL)
     monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
     monkeypatch.setattr(dl, "_MINT_RETRY_INITIAL_S", 0.05)
