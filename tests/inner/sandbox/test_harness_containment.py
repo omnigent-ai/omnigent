@@ -149,8 +149,17 @@ def test_requested_sandbox_never_falls_back_to_bare_worker(
 
 
 # Goose/Qwen's executor scenarios already cover absent and explicit-none policies.
-@pytest.mark.parametrize("harness", [name for name in _HARNESSES if name not in ("goose", "qwen")])
-@pytest.mark.parametrize("declared", [False, True])
+# Codex's worker scenario covers explicit none and preserves the caller's executable.
+@pytest.mark.parametrize(
+    ("harness", "declared"),
+    [
+        (harness, declared)
+        for harness in _HARNESSES
+        if harness not in ("goose", "qwen")
+        for declared in (False, True)
+        if not (harness == "codex" and declared)
+    ],
+)
 def test_unsandboxed_worker_requires_no_policy_or_explicit_none(
     harness: str, declared: bool, tmp_path: Path
 ) -> None:

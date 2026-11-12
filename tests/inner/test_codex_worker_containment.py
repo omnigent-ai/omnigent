@@ -717,6 +717,7 @@ def test_launcher_scratch_clone_preserves_exact_relay(tmp_path: Path) -> None:
 
 def test_explicit_none_sandbox_keeps_direct_worker_path(tmp_path: Path) -> None:
     codex = tmp_path / "codex"
+    codex.touch()
 
     worker = prepare_codex_worker(
         codex_path=str(codex),
@@ -729,6 +730,7 @@ def test_explicit_none_sandbox_keeps_direct_worker_path(tmp_path: Path) -> None:
     assert worker.launch_path == str(codex)
     assert not worker.sandboxed
     worker.close()
+    assert codex.exists()
 
 
 async def test_session_containment_failure_prevents_worker_spawn(
