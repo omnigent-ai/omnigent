@@ -135,7 +135,9 @@ workflow").
 To run a saved workflow on a schedule or a trigger, pick it in New
 automation's **Workflow (optional)** field. Each run follows the workflow
 without a plan review, and the automation's **Additional instructions**
-customize it.
+customize it. No one is watching the run, so the agent doesn't stop to ask:
+it takes the option it would recommend when that's easy to undo, or leaves
+the step **Waiting for you** and goes on with the rest.
 
 ## Automations
 

@@ -24,6 +24,19 @@ how it went and what's left. This is very important: don't skip it, even if
 you also tell the user, since the other workflow can't go on without your
 message.
 
+## When an automation runs you
+
+Check this too. If your message says no one is watching this run, as an
+Omnigent automation's note does, no one can answer you or approve anything:
+
+- Skip the plan review, even if the message asks for one. Add no review step,
+  and wait for no approval.
+- Don't ask with `sys_workflow_request_input`, wherever this skill says to.
+  Take the option you'd recommend when it's easy to reverse, and say so in the
+  step's status. Otherwise write `needs_input` on the step with the options
+  and your recommendation, in a note if they need more room, and go on with
+  the steps that don't depend on it.
+
 ## Plan
 
 1. Read your journal first with `sys_journal_read`. If the session's plan has
@@ -129,9 +142,6 @@ When the user asks to review the plan before the work starts:
   `sys_workflow_request_input`, saying what's in the way and offering the ways
   forward you see (retry later, a workaround, or dropping the step), with your
   recommendation.
-- In a run no one is watching, such as an automation's, don't ask: write
-  `needs_input` with the options and your recommendation, in a note if they
-  need more room, and go on with the steps that don't depend on it.
 - Write `failed` when a step's own work failed. The text says why in a few
   words.
 - If the user stops you, leave the step you were on `started`; the Tasks tab
