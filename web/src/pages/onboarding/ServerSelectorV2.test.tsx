@@ -192,6 +192,7 @@ describe("ServerSelectorV2", () => {
 
   it("never installs the CLI from a picked local installation, even a stopped one", async () => {
     const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
+    const onConnect = vi.fn().mockResolvedValue({});
     const onStartLocal = vi
       .fn()
       .mockResolvedValue({ ok: false, error: "The omnigent CLI was not found." });
@@ -201,6 +202,7 @@ describe("ServerSelectorV2", () => {
           installed: false,
           recentServers: ["http://localhost:6767/"],
           onInstallCli,
+          onConnect,
           onStartLocal,
           onCheckServer: vi.fn().mockResolvedValue({ status: "unreachable" }),
         })}
@@ -213,6 +215,12 @@ describe("ServerSelectorV2", () => {
     for (const name of ["Retry", "Continue anyway", "Back"]) {
       expect(screen.getByRole("button", { name })).toBeInTheDocument();
     }
+    fireEvent.click(screen.getByRole("button", { name: "Continue anyway" }));
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("http://localhost:6767/", expect.any(Function)),
+    );
+    expect(onStartLocal).toHaveBeenCalledOnce();
+    expect(onInstallCli).not.toHaveBeenCalled();
   });
 
   it("re-checks on click: a local install that stopped since the list loaded is booted", async () => {
@@ -355,6 +363,41 @@ describe("ServerSelectorV2", () => {
     expect(onConnect).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
     await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
+    expect(onConnect).toHaveBeenCalledWith("https://typed.example.com/", expect.any(Function));
+  });
+
+  it("a slow runner lookup can't act after a newer pick opened directly", async () => {
+    let resolveFirst: (v: { remote: boolean; bundledCli: boolean }) => void = () => {};
+    const getRunnerOptions = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirst = resolve;
+          }),
+      )
+      .mockResolvedValue({ remote: false, bundledCli: false });
+    const onConnect = vi.fn().mockResolvedValue({});
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          managedServers: ["https://team.example.com/"],
+          getRunnerOptions,
+          onConnect,
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
+    openPresetDropdown();
+    fireEvent.change(screen.getByLabelText("Server URL"), {
+      target: { value: "https://typed.example.com" },
+    });
+    fireEvent.keyDown(screen.getByLabelText("Server URL"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: "Join your team (typed.example.com)" }));
+    await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
+    // Settling as "no runner" would open the stale pick too, without the guard.
+    await act(async () => resolveFirst({ remote: false, bundledCli: false }));
+    expect(onConnect).toHaveBeenCalledOnce();
     expect(onConnect).toHaveBeenCalledWith("https://typed.example.com/", expect.any(Function));
   });
 
