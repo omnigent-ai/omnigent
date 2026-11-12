@@ -70,6 +70,10 @@ const WorkflowsPage = withPageView(
   "workflows",
   lazy(() => import("@/pages/WorkflowsPage").then((m) => ({ default: m.WorkflowsPage }))),
 );
+const WorkflowDetailPage = withPageView(
+  "workflows.detail",
+  lazy(() => import("@/pages/WorkflowDetailPage").then((m) => ({ default: m.WorkflowDetailPage }))),
+);
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
@@ -228,6 +232,14 @@ function AppRoutes({ basename }: AppProps) {
             element={
               <FeatureGatedPage feature="workflows_page">
                 <WorkflowsPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/workflows/:workflowId`}
+            element={
+              <FeatureGatedPage feature="workflows_page">
+                <WorkflowDetailPage />
               </FeatureGatedPage>
             }
           />
