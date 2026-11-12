@@ -265,6 +265,7 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
@@ -1561,6 +1562,9 @@ def register_core_routes(
             project_store=project_store,
             created_by_session_id=source.id if source is not None else None,
             created_by_project_id=source.project_id if source is not None else None,
+            created_by_scheduled_task_id=(
+                source.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY) if source is not None else None
+            ),
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.

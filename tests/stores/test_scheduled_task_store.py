@@ -1295,6 +1295,38 @@ def test_list_latest_run_status_is_workspace_scoped(
         }
 
 
+# ── has_active_run (workers of a live automation run) ─────────────────────────
+
+
+@pytest.mark.parametrize("status", ["starting", "running"])
+def test_has_active_run_counts_starting_and_running(
+    store: SqlAlchemyScheduledTaskStore, status: str
+) -> None:
+    """A claimed run records its session while still starting, before the prompt is sent."""
+    _seed_running_run(store, "active_other")
+    store.create_run(
+        run_id=_uid(f"run_active_{status}"),
+        scheduled_task_id=_uid("task_active_other"),
+        status=status,
+        scheduled_at=200,
+        conversation_id=_uid(f"conv_active_{status}"),
+    )
+    assert store.has_active_run(_uid("task_active_other"), _uid(f"conv_active_{status}"))
+
+
+def test_has_active_run_false_once_finished_or_for_another_task(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Only this task's live run counts, not a finished one or another task's."""
+    run_id = _seed_running_run(store, "active_fin")
+    _seed_running_run(store, "active_peer")
+    assert store.has_active_run(_uid("task_active_fin"), _uid("conv_active_fin"))
+    assert not store.has_active_run(_uid("task_active_peer"), _uid("conv_active_fin"))
+    assert not store.has_active_run(_uid("task_active_fin"), _uid("conv_absent"))
+    store.update_run(run_id, status="succeeded", finished_at=202)
+    assert not store.has_active_run(_uid("task_active_fin"), _uid("conv_active_fin"))
+
+
 # ── get_running_run_by_conversation (event-hook reverse lookup) ───────────────
 
 

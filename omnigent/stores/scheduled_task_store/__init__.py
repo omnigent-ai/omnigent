@@ -399,6 +399,22 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
+    def has_active_run(self, scheduled_task_id: str, conversation_id: str) -> bool:
+        """
+        Whether the task has a ``starting`` or ``running`` run in a conversation.
+
+        A claimed run records its session while still ``starting``, before the
+        prompt is sent, so this also covers a run whose turn has just begun.
+        Workspace-scoped like :meth:`get_running_run_by_conversation`, and backed
+        by the same ``ix_scheduled_task_runs_conversation_status`` index.
+
+        :param scheduled_task_id: The task whose run to look for.
+        :param conversation_id: The conversation the run fired, e.g. ``"conv_1"``.
+        :returns: ``True`` if such a run exists.
+        """
+        ...
+
+    @abstractmethod
     def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
         """
         Return the ``running`` run for a conversation, or ``None``.

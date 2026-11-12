@@ -958,6 +958,23 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         return run_write_transaction(self._session_immediate, "update_task_run", write)
 
+    def has_active_run(self, scheduled_task_id: str, conversation_id: str) -> bool:
+        """Whether the task has a ``starting`` or ``running`` run in a conversation."""
+        active_codes = [
+            encode_scheduled_task_run_status("starting"),
+            encode_scheduled_task_run_status("running"),
+        ]
+        with self._session("select_active_run_by_conversation") as session:
+            stmt = (
+                select(SqlScheduledTaskRun.id)
+                .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
+                .where(SqlScheduledTaskRun.conversation_id == conversation_id)
+                .where(SqlScheduledTaskRun.status.in_(active_codes))
+                .where(SqlScheduledTaskRun.scheduled_task_id == scheduled_task_id)
+                .limit(1)
+            )
+            return session.execute(stmt).first() is not None
+
     def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
         """Return the ``running`` run for a conversation, or ``None``.
 

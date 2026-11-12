@@ -18,6 +18,7 @@ from omnigent.server.feature_flags import (
 )
 from omnigent.server.sharing_settings import write_peer_session_messaging_override
 from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
@@ -552,6 +553,275 @@ async def test_scheduled_origin_allows_new_controls_children_and_reads(
         conversations.get_conversation(scheduled_id).labels[SCHEDULED_TASK_ORIGIN_LABEL_KEY]
         == task.id
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "permission_mode",
+        "scheduled_origin",
+        "run_status",
+        "worker_config",
+        "launch_args",
+        "labels",
+    ),
+    [
+        pytest.param(
+            "approve-for-me",
+            True,
+            "running",
+            None,
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            {},
+            id="running-run",
+        ),
+        # A claimed run records its session while starting, before the prompt is sent.
+        pytest.param(
+            "approve-for-me",
+            True,
+            "starting",
+            None,
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            {},
+            id="starting-run",
+        ),
+        # A fork keeps the origin label but isn't the run.
+        pytest.param("approve-for-me", True, None, None, None, {}, id="fork"),
+        pytest.param("approve-for-me", True, "succeeded", None, None, {}, id="finished-run"),
+        pytest.param("approve-for-me", False, "running", None, None, {}, id="no-origin"),
+        pytest.param(None, True, "running", None, None, {}, id="no-mode"),
+        # The automation's own mode wins over a permissive worker spec...
+        pytest.param("default", True, "running", {"yolo": True}, None, {}, id="default-over-spec"),
+        # ...which still applies when the automation sets no mode.
+        pytest.param(
+            None,
+            True,
+            "running",
+            {"yolo": True},
+            ["--dangerously-bypass-approvals-and-sandbox"],
+            {},
+            id="spec-without-mode",
+        ),
+        pytest.param(
+            "bypass",
+            True,
+            "running",
+            None,
+            None,
+            {CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"},
+            id="bypass-label",
+        ),
+    ],
+)
+async def test_scheduled_origin_workers_use_the_automation_permission_mode(
+    auth_client,
+    auth_app,
+    peers,
+    db_uri,
+    monkeypatch,
+    permission_mode,
+    scheduled_origin,
+    run_status,
+    worker_config,
+    launch_args,
+    labels,
+):
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+
+    source, _target, _captured = peers
+    worker_agent_id = await _upload_codex_worker(auth_client, **(worker_config or {}))
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
+    task = schedules.create(
+        scheduled_task_id=uuid4().hex,
+        name="Trigger watcher",
+        prompt="Start a worker for each new item",
+        rrule="FREQ=HOURLY",
+        user_id="alice",
+        agent_id=worker_agent_id,
+        timezone="UTC",
+        execution_target="managed_sandbox",
+        permission_mode=permission_mode,
+    )
+    monkeypatch.setattr(auth_app.state, "scheduled_task_store", schedules)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    if scheduled_origin:
+        conversations.set_labels(source["id"], {SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id})
+    if run_status is not None:
+        schedules.create_run(
+            uuid4().hex,
+            task.id,
+            run_status,
+            scheduled_at=1,
+            conversation_id=source["id"],
+            fired_at=1,
+        )
+
+    async def launch(**kwargs):
+        pass
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": worker_agent_id, "placement": "managed"}),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    assert result.get("conversation_id"), result
+    worker = conversations.get_conversation(result["conversation_id"])
+    assert worker.terminal_launch_args == launch_args
+    for key, value in labels.items():
+        assert worker.labels.get(key) == value
+    assert worker.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == labels.get(
+        CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
+    )
+
+
+@pytest.mark.parametrize(
+    ("automation_mode", "requested_mode", "launch_args"),
+    [
+        # Even the harness default, when the call names it, wins over the automation's mode.
+        pytest.param("approve-for-me", "default", None, id="requested-default"),
+        # A call can't name a bypass, but its gated mode still replaces the automation's.
+        pytest.param(
+            "bypass",
+            "approve-for-me",
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="requested-over-bypass",
+        ),
+    ],
+)
+async def test_requested_permission_mode_wins_over_the_automation_mode(
+    auth_client,
+    auth_app,
+    peers,
+    db_uri,
+    monkeypatch,
+    automation_mode,
+    requested_mode,
+    launch_args,
+):
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+
+    source, _target, _captured = peers
+    worker_agent_id = await _upload_codex_worker(auth_client)
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
+    task = schedules.create(
+        scheduled_task_id=uuid4().hex,
+        name="Trigger watcher",
+        prompt="Start a worker for each new item",
+        rrule="FREQ=HOURLY",
+        user_id="alice",
+        agent_id=worker_agent_id,
+        timezone="UTC",
+        execution_target="managed_sandbox",
+        permission_mode=automation_mode,
+    )
+    monkeypatch.setattr(auth_app.state, "scheduled_task_store", schedules)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conversations.set_labels(source["id"], {SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id})
+    schedules.create_run(
+        uuid4().hex, task.id, "running", scheduled_at=1, conversation_id=source["id"], fired_at=1
+    )
+
+    async def launch(**kwargs):
+        pass
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": worker_agent_id,
+                    "placement": "managed",
+                    "permission_mode": requested_mode,
+                }
+            ),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    assert result.get("conversation_id"), result
+    worker = conversations.get_conversation(result["conversation_id"])
+    assert worker.terminal_launch_args == launch_args
+    assert CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY not in worker.labels
+
+
+async def test_worker_started_before_a_legacy_run_is_recorded_uses_the_automation_mode(
+    auth_client, auth_app, peers, db_uri, monkeypatch, tmp_path
+):
+    """A legacy fire sends the prompt before writing its run row; workers the turn
+    starts first still get the automation's mode."""
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.server.scheduled.fire import FireDeps, build_on_fire
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+    from tests._helpers.polling import poll_until_async
+
+    worker_agent_id = await _upload_codex_worker(auth_client)
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
+    task = schedules.create(
+        scheduled_task_id=uuid4().hex,
+        name="Trigger watcher",
+        prompt="Start a worker for each new item",
+        rrule="FREQ=HOURLY",
+        user_id="alice",
+        agent_id=worker_agent_id,
+        timezone="UTC",
+        execution_target="connected_host",
+        host_id=uuid4().hex,
+        workspace="/tmp",
+        permission_mode="approve-for-me",
+    )
+    monkeypatch.setattr(auth_app.state, "scheduled_task_store", schedules)
+    conversations = SqlAlchemyConversationStore(db_uri)
+
+    async def managed_launch(**kwargs):
+        pass
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", managed_launch)
+    workers = []
+
+    async def dispatch(session, task):
+        # The run's turn is already going, and no run row exists yet.
+        assert schedules.list_runs(task.id)[0] == []
+        auth_client.headers.update(_bind_runner(db_uri, session.id))
+        workers.append(
+            json.loads(
+                await execute_tool(
+                    tool_name="sys_session_create",
+                    arguments=json.dumps({"agent_id": worker_agent_id, "placement": "managed"}),
+                    server_client=auth_client,
+                    conversation_id=session.id,
+                )
+            )
+        )
+
+    on_fire = build_on_fire(
+        FireDeps(
+            scheduled_task_store=schedules,
+            agent_store=auth_app.state.agent_store,
+            conversation_store=conversations,
+            permission_store=SqlAlchemyPermissionStore(db_uri),
+            host_store=auth_app.state.host_store,
+            host_registry=auth_app.state.host_registry,
+            sandbox_config=auth_app.state.sandbox_config,
+            agent_cache=AgentCache(
+                artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+                cache_dir=tmp_path / "fire-cache",
+            ),
+        ),
+        launch_dispatch=dispatch,
+    )
+    assert await on_fire(0, task.id)
+    await poll_until_async(lambda: schedules.list_runs(task.id)[0], timeout_s=5)
+    assert len(workers) == 1 and workers[0].get("conversation_id"), workers
+    worker = conversations.get_conversation(workers[0]["conversation_id"])
+    assert worker.terminal_launch_args == PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]
 
 
 @pytest.mark.parametrize("placement", ["same_host", "managed"])

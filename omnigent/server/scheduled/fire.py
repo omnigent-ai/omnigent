@@ -109,7 +109,10 @@ from omnigent.server.scheduled.dispatch_scheduler import (
     StartupLease,
 )
 from omnigent.server.scheduled.harness_settings import (
+    forget_unrecorded_legacy_run_session,
     inherited_approval_skipping_problem,
+    note_unrecorded_legacy_run_session,
+    permission_mode_launch_options,
     scheduled_agent_harness,
     validate_scheduled_permission_mode,
 )
@@ -322,12 +325,16 @@ class _NewRunRecorder:
         self._deps = deps
         self._task = task
         self._scheduled_at = scheduled_at
+        self._session_id: str | None = None
 
     async def check(self) -> None:
         return None
 
-    async def session_created(self, conversation_id: str) -> None:  # noqa: ARG002
-        return None
+    async def session_created(self, conversation_id: str) -> None:
+        # The run row is written only after the prompt is sent, so workers the
+        # turn starts first still need to count as this run's.
+        self._session_id = conversation_id
+        note_unrecorded_legacy_run_session(conversation_id, self._task.id)
 
     async def finish(
         self,
@@ -337,15 +344,23 @@ class _NewRunRecorder:
         error: str | None = None,
         error_code: str | None = None,
     ) -> None:
-        await _record_run(
-            self._deps,
-            self._task,
-            conversation_id,
-            self._scheduled_at,
-            status=status,
-            error=error,
-            error_code=error_code,
-        )
+        try:
+            await _record_run(
+                self._deps,
+                self._task,
+                conversation_id,
+                self._scheduled_at,
+                status=status,
+                error=error,
+                error_code=error_code,
+            )
+        finally:
+            self.release()
+
+    def release(self) -> None:
+        """Stop counting the fired session as this run's before a run row exists."""
+        if self._session_id is not None:
+            forget_unrecorded_legacy_run_session(self._session_id)
 
     async def hand_off_managed(
         self, conv: Conversation, task: ScheduledTask, start: ManagedLaunchStart | None
@@ -659,6 +674,9 @@ async def _run_fire(
                 await _run_fire_for_task(deps, task, fire_dispatch, recorder)
         except Exception:
             _logger.exception("scheduled fire: task %s failed", task.id)
+        finally:
+            # A fire that fails before recording its run must not leave its session counted.
+            recorder.release()
 
 
 async def _run_fire_for_task(
@@ -1536,17 +1554,14 @@ async def _permission_mode_launch_options(
             "Restore access to the agent and retry.",
             error_code="permission_harness_unresolved",
         )
-    args = PERMISSION_LAUNCH_ARGS.get(harness, {}).get(task.permission_mode)
-    if args is None:
+    options = permission_mode_launch_options(harness, task.permission_mode)
+    if options is None:
         raise _CannotLaunchScheduledFire(
             f"Saved permission setting {task.permission_mode!r} is not supported by {harness!r}. "
             "Edit the automation to choose a supported permission or clear the override.",
             error_code="permission_mode_unsupported",
         )
-    labels = {}
-    if harness == "codex-native" and task.permission_mode == "bypass":
-        labels[CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
-    return list(args) or None, labels
+    return options
 
 
 async def _spec_reasoning_effort(deps: FireDeps, task: ScheduledTask) -> str | None:
