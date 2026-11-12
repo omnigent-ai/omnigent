@@ -42,6 +42,7 @@ import type {
   OnboardingRunner,
   ServerManifest,
   ServerPickerInfo,
+  SshConnectResult,
   ThemeSource,
   UpdateConfig,
   UpdateStatus,
@@ -74,6 +75,7 @@ export type {
   OnboardingRunner,
   ServerManifest,
   ServerPickerInfo,
+  SshConnectResult,
   ThemeSource,
   UpdateConfig,
   UpdateMode,
@@ -1111,7 +1113,7 @@ export function supportsSshConnect(): boolean {
  * server as a host. The shell asks consent and handles ssh prompts and the
  * browser sign-in in its own window. A no-op `{ ok: false }` outside the shell.
  */
-export async function connectSshHost(destination: string): Promise<ArcaConnectResult> {
+export async function connectSshHost(destination: string): Promise<SshConnectResult> {
   const electron = electronApi();
   if (!electron?.connectSshHost) {
     return { ok: false, error: "not running under the desktop shell" };

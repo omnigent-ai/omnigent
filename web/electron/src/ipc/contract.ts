@@ -54,6 +54,7 @@ import type {
   SshConnectAnswer,
   SshConnectInit,
   SshConnectPrompt,
+  SshConnectResult,
   SshConnectStatus,
   ThemeSource,
   UpdateConfig,
@@ -100,7 +101,7 @@ export interface InvokeChannels {
   "omnigent:host-control": { args: [action: HostControlAction]; result: HostActionResult };
   "omnigent:get-desktop-features": { args: []; result: DesktopFeatures | null };
   "omnigent:arca-connect": { args: []; result: ArcaConnectResult };
-  "omnigent:ssh-connect": { args: [destination: string]; result: ArcaConnectResult };
+  "omnigent:ssh-connect": { args: [destination: string]; result: SshConnectResult };
   "omnigent:arca-extend": { args: [mode: ArcaExtendMode]; result: ArcaExtendResult };
   "omnigent:dbcert-refresh": {
     args: [options: DbcertRefreshOptions | undefined];

@@ -42,9 +42,9 @@ const FORWARDERS = [
     callee: "send",
   },
   {
-    file: "ssh_connect_window.js",
-    site: "win.webContents.send(channel, payload)",
-    callerFile: "ssh_connect_window.js",
+    file: "ssh_connect_window.ts",
+    site: "push(win.webContents, channel, ...args)",
+    callerFile: "ssh_connect_window.ts",
     callee: "send",
   },
 ];
@@ -144,6 +144,15 @@ function helperImports(source: string, file: string): string[] {
   return names;
 }
 
+/** liveCode() output with string literal contents blanked too, so their words aren't calls. */
+function withoutStrings(code: string): string {
+  return code.replace(STRING_OR_COMMENT, (match, literal?: string) =>
+    literal === undefined
+      ? match
+      : literal.slice(0, 1) + blank(literal.slice(1, -1)) + literal.slice(-1),
+  );
+}
+
 /** Channel sites made through the src/ipc/main.ts helpers; the channel is the second argument. */
 function helperSites(
   source: string,
@@ -161,9 +170,11 @@ function helperSites(
     if (!inImport(reference.index))
       assert.fail(`${where}: load ipc/main.ts only by a named import`);
   }
+  const code = withoutStrings(source);
   for (const name of helperImports(source, file)) {
-    for (const match of source.matchAll(new RegExp(`(?<![.\\w$])${name}\\b`, "g"))) {
-      if (inImport(match.index)) continue;
+    for (const match of code.matchAll(new RegExp(`(?<![.\\w$])${name}\\b`, "g"))) {
+      // A property key or declaration (`on: ...`) of the same name isn't a use.
+      if (inImport(match.index) || /^\??:/.test(code.slice(match.index + name.length))) continue;
       const where = `${file}:${lineOf(source, match.index)}`;
       if (source[match.index + name.length] !== "(") {
         assert.fail(`${where}: uses \`${name}\` other than as a direct call`);

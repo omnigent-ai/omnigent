@@ -271,6 +271,14 @@ export interface ArcaConnectResult extends HostActionResult {
 }
 
 /**
+ * Result of connecting a machine over SSH, from the desktop shell. `identity` is
+ * null after a success whose host id wasn't confirmed.
+ */
+export interface SshConnectResult extends Omit<ArcaConnectResult, "identity"> {
+  identity?: { serverUrl: string; hostId: string } | null;
+}
+
+/**
  * Desktop-shell feature gates the server can't know about. All fields
  * optional: an older shell reports fewer.
  */
@@ -528,7 +536,7 @@ export interface ElectronDesktopBridge {
   /** Connect the user's Arca instance to the window's server as a host. */
   connectArcaHost: () => Promise<ArcaConnectResult>;
   /** Connect a machine the user reaches over SSH; absent on Windows and older shells. */
-  connectSshHost?: (destination: string) => Promise<ArcaConnectResult>;
+  connectSshHost?: (destination: string) => Promise<SshConnectResult>;
   /** Extend this machine's running Arca instance with an approved mode. */
   extendArca: (mode: ArcaExtendMode) => Promise<ArcaExtendResult>;
   /** Renew this machine's dbcert. */

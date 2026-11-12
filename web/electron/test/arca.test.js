@@ -17,7 +17,7 @@ const {
   startArcaConnect,
   startArcaLogin,
 } = require("../src/arca");
-const { IDENTITY_START, IDENTITY_END } = require("../src/arcaIdentity");
+const { IDENTITY_START, IDENTITY_END } = require("../src/arcaIdentity.ts");
 
 /** A fake connect child: an EventEmitter with stdout/stderr stream stubs. */
 function fakeConnectChild() {

@@ -437,7 +437,7 @@ function loadNavigationHarness({
 
   const localRequires = {
     "./desktop_updater.ts": { createDesktopUpdater },
-    "./ssh_connect_window": {
+    "./ssh_connect_window.ts": {
       createSshConnectFlow: () => ({
         run: async (_parentWin, sshServerUrl, destination) => {
           calls.sshConnects.push({ serverUrl: sshServerUrl, destination });
@@ -4615,7 +4615,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
   });
 
   it("uses captured Arca identity for the sender's workspace and revokes a changed context", async (t) => {
-    const { arcaTarget } = require("../src/arcaIdentity");
+    const { arcaTarget } = require("../src/arcaIdentity.ts");
     const serverUrl = "https://account.databricks.com/omnigent?o=123";
     const hostId = "a".repeat(32);
     const h = loadNavigationHarness({
@@ -4662,7 +4662,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
   });
 
   it("uses consent to recapture a source host that differs from the remembered host", async (t) => {
-    const { arcaTarget } = require("../src/arcaIdentity");
+    const { arcaTarget } = require("../src/arcaIdentity.ts");
     const serverUrl = "https://account.databricks.com/omnigent?o=123";
     const hostId = "a".repeat(32);
     const h = loadNavigationHarness({
@@ -4814,7 +4814,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
   });
 
   it("keeps opted-in preview recovery silent", async (t) => {
-    const { arcaTarget } = require("../src/arcaIdentity");
+    const { arcaTarget } = require("../src/arcaIdentity.ts");
     const serverUrl = "https://account.databricks.com/omnigent?o=123";
     const hostId = "a".repeat(32);
     const h = loadNavigationHarness({
@@ -4844,7 +4844,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
   });
 
   it("retries a failed launch-time connect during opted-in preview recovery", async (t) => {
-    const { arcaTarget } = require("../src/arcaIdentity");
+    const { arcaTarget } = require("../src/arcaIdentity.ts");
     const serverUrl = "https://account.databricks.com/omnigent?o=123";
     const hostId = "a".repeat(32);
     let attempts = 0;
@@ -4875,7 +4875,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
   });
 
   it("denies opted-in recovery when the captured identity is for another host", async (t) => {
-    const { arcaTarget } = require("../src/arcaIdentity");
+    const { arcaTarget } = require("../src/arcaIdentity.ts");
     const serverUrl = "https://account.databricks.com/omnigent?o=123";
     const hostId = "a".repeat(32);
     const h = loadNavigationHarness({
@@ -4903,7 +4903,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
   });
 
   it("captures consented recovery in the background for the agent's next retry", async (t) => {
-    const { arcaTarget } = require("../src/arcaIdentity");
+    const { arcaTarget } = require("../src/arcaIdentity.ts");
     const serverUrl = "https://account.databricks.com/omnigent?o=123";
     const hostId = "a".repeat(32);
     const h = loadNavigationHarness({
