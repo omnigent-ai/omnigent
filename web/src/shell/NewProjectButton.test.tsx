@@ -435,6 +435,22 @@ describe("NewProjectButton", () => {
       await waitFor(() => expect(mocks.cloneRepository).toHaveBeenCalledTimes(2));
     });
 
+    it("asks for a target before saving a repository with none selected", () => {
+      const view = render(projectButton(null));
+      fireEvent.click(screen.getByRole("button", { name: "New project" }));
+      fireEvent.change(screen.getByPlaceholderText("Project name…"), {
+        target: { value: "Sample" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
+      fireEvent.click(screen.getByRole("radio", { name: "Repository" }));
+      fireEvent.change(screen.getByLabelText("Repository URL"), { target: { value: url } });
+      fireEvent.click(screen.getByTestId("new-project-confirm"));
+      expect(screen.getByRole("alert")).toHaveTextContent("Choose where to run");
+      expect(mocks.cloneRepository).not.toHaveBeenCalled();
+      expect(mocks.createProject).not.toHaveBeenCalled();
+      view.unmount();
+    });
+
     it("refuses a known duplicate name before cloning", () => {
       mocks.projects = [{ name: "Sample" }];
       chooseRepository();

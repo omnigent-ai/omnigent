@@ -213,7 +213,12 @@ export function NewProjectButton({
       setSubmitError("A project with this name already exists. Use a different name.");
       return;
     }
-    const repositoryProblem = repositoryMode && repository ? repositoryError(repository) : null;
+    const repositoryProblem =
+      repositoryMode && repository
+        ? runOn === null
+          ? "Choose where to run this project."
+          : repositoryError(repository)
+        : null;
     if (repositoryProblem) {
       setSubmitError(repositoryProblem);
       return;

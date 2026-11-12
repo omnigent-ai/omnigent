@@ -430,6 +430,7 @@ async def test_clone_repository_uncertain_transport(mkdir_setup, monkeypatch, di
     "body",
     [
         {"url": "https://user:secret@git.example.com/team/sample.git", "path": "~/sample"},
+        {"url": "HTTPS://user:secret@git.example.com/team/sample.git", "path": "~/sample"},
         {"url": "https://git.example.com/team/sample.git", "path": "relative/sample"},
         {"url": "https://git.example.com/team/sample.git", "branch": "bad..ref", "path": "~/s"},
     ],

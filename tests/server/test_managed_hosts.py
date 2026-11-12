@@ -2281,6 +2281,8 @@ def test_parse_repo_workspace_rejects_malformed(workspace: str, expected_fragmen
         # (the credential check runs before any URL-echoing error).
         "https://user:s3cr3t@github.com",
         "git@x-access-token:s3cr3t@github.com:org/repo.git",
+        "HTTPS://user:s3cr3t@github.com/org/repo",
+        "ftp://user:s3cr3t@github.com/org/repo",
     ],
 )
 def test_credential_rejection_does_not_echo_the_token(workspace: str) -> None:

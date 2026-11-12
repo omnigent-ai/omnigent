@@ -1231,8 +1231,9 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
                 f"'{url}' is not a usable ssh repository URL — expected 'git@<host>:<org>/<repo>'"
             )
     else:
+        # Unsupported schemes skip the credential checks above, so never echo the URL.
         raise ValueError(
-            f"'{url}' is not a supported repository URL — use "
+            "this is not a supported repository URL — use "
             "'https://<host>/<org>/<repo>' or 'git@<host>:<org>/<repo>'"
         )
     branch = _validate_clone_branch(fragment) if sep else None
