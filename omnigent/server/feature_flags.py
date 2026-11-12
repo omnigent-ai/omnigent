@@ -212,7 +212,8 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Agent-posted Inbox suggestions and the proactive agent that writes them",
         owner="server",
         review_by_release="0.25.0",
-        # Clients read the per-request proactive_agent_enabled in GET /v1/info.
+        # Clients probe proactive_agent_available in GET /v1/info; the settings
+        # decide whether it is enabled.
         frontend_visible=False,
     ),
 )
