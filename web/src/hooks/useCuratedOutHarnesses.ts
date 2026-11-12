@@ -27,14 +27,23 @@ export function curatedOutHarnesses(
 /**
  * Native harness slugs Settings leaves out, per {@link curatedOutHarnesses}.
  * Empty unless every pickable agent is known: while either catalog request
- * loads or fails, and when the user's own agents run past the read cap.
+ * loads or fails, when the user's own agents run past the read cap, and until
+ * each agent only a recent session offers has its harness.
  *
  * @param enabled - Whether to fetch the agent catalog; defaults true.
  */
 export function useCuratedOutHarnesses(enabled = true): ReadonlySet<string> {
-  const { data: agents, suppressedNames, complete } = useAgentCatalog(enabled);
+  const {
+    data: agents,
+    sessionAgents,
+    suppressedNames,
+    complete,
+  } = useAgentCatalog(enabled, { sessionAgents: true });
   return useMemo(
-    () => (!complete || agents === undefined ? NONE : curatedOutHarnesses(suppressedNames, agents)),
-    [agents, suppressedNames, complete],
+    () =>
+      !complete || agents === undefined
+        ? NONE
+        : curatedOutHarnesses(suppressedNames, [...agents, ...sessionAgents]),
+    [agents, sessionAgents, suppressedNames, complete],
   );
 }

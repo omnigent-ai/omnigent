@@ -1,6 +1,6 @@
-import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { useQueries, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
-import { useSidebarData } from "./useSidebarData";
+import { useOptionalMineSessions, useSidebarData } from "./useSidebarData";
 import { authenticatedFetch } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { agentRootName } from "@/lib/forkHarness";
@@ -265,28 +265,42 @@ interface DiscoveredSessionAgent {
   agent: AvailableAgent;
 }
 
+type MineSessions = ReturnType<typeof useSidebarData>["mine"];
+
+/** The agents of the first 30 owned sessions the sidebar loaded, name-only. */
+function discoverSessionAgents(mineData: NonNullable<MineSessions["data"]>): AvailableAgent[] {
+  const agents = new Map<string, AvailableAgent>();
+  for (const row of mineData.pages.flatMap((page) => page.data).slice(0, 30)) {
+    if (!row.agent_id || !row.agent_name || agents.has(row.agent_id)) continue;
+    agents.set(row.agent_id, {
+      id: row.agent_id,
+      name: row.agent_name,
+      display_name: displayNameForAgent(row.agent_name),
+      description: null,
+      harness: null,
+      skills: [],
+      sessionId: row.id,
+      created_at: row.created_at,
+    });
+  }
+  return [...agents.values()];
+}
+
 /** Discover agents from the first 30 owned sessions already loaded by the sidebar. */
 export function useSessionAgents(enabled = true) {
   const { mine } = useSidebarData();
-  const data = useMemo(() => {
-    if (!enabled || !mine.data) return undefined;
-    const agents = new Map<string, AvailableAgent>();
-    for (const row of mine.data.pages.flatMap((page) => page.data).slice(0, 30)) {
-      if (!row.agent_id || !row.agent_name || agents.has(row.agent_id)) continue;
-      agents.set(row.agent_id, {
-        id: row.agent_id,
-        name: row.agent_name,
-        display_name: displayNameForAgent(row.agent_name),
-        description: null,
-        harness: null,
-        skills: [],
-        sessionId: row.id,
-        created_at: row.created_at,
-      });
-    }
-    return [...agents.values()];
-  }, [enabled, mine.data]);
+  const data = useMemo(
+    () => (enabled && mine.data ? discoverSessionAgents(mine.data) : undefined),
+    [enabled, mine.data],
+  );
   return { ...mine, data };
+}
+
+/** The harness of the agent a session runs, from `GET /v1/sessions/{id}/agent`. */
+async function fetchSessionAgentHarness(sessionId: string): Promise<string | null> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/agent`);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return ((await res.json()) as AgentObjectWire).harness ?? null;
 }
 
 /** Wire shape of `GET /v1/sessions/{id}/agent` (AgentObject). */
@@ -504,20 +518,28 @@ const AVAILABLE_AGENTS_STALE_MS = 30_000;
  * own agents, flagged and labelled the way the picker shows them.
  *
  * Shares the picker's query keys, and works outside a ``SidebarDataProvider``.
- * Agents known only from a session (a one-off upload) are therefore absent.
+ * Agents known only from a session (a one-off upload) are absent from *data*.
  *
  * @param enabled - Whether to fetch; defaults true.
+ * @param options.sessionAgents - Also resolve those session-only agents, with
+ *   their harness, from the sidebar's recent sessions, as New Chat offers them.
  * @returns The merged agents (``undefined`` until the catalog loads), whether
  *   the catalog is still loading or failed to load, and a retry.
  */
-export function useAgentCatalog(enabled = true): {
+export function useAgentCatalog(
+  enabled = true,
+  { sessionAgents: includeSessionAgents = false }: { sessionAgents?: boolean } = {},
+): {
   data: AvailableAgent[] | undefined;
+  /** With ``sessionAgents``: the agents only a recent session offers, harness resolved. */
+  sessionAgents: AvailableAgent[];
   /** Built-in names the deployment hides; empty until the catalog loads. */
   suppressedNames: ReadonlySet<string>;
   /**
    * Whether *data* holds every agent the user can pick: the built-in catalog
    * and, where the server has them, all of the user's own agents, neither
-   * failing its latest fetch.
+   * failing its latest fetch; with ``sessionAgents``, also every session-only
+   * agent's harness.
    */
   complete: boolean;
   isLoading: boolean;
@@ -554,6 +576,51 @@ export function useAgentCatalog(enabled = true): {
           ),
     [catalog, userAgents, acpHarnessIds, harnessLabels],
   );
+  const mine = useOptionalMineSessions();
+  const mineData = includeSessionAgents ? mine?.data : undefined;
+  // New Chat also offers these, found only in a recent session, without a harness.
+  // Only a deployment that hides a built-in needs them: nothing else is curated.
+  const hidesBuiltins = (catalog?.suppressedNames.size ?? 0) > 0;
+  const sessionOnly = useMemo(() => {
+    if (catalog === undefined || mineData === undefined || !hidesBuiltins) return [];
+    const discovered = discoverSessionAgents(mineData).map((agent) => ({
+      agentId: agent.id,
+      agentName: agent.name,
+      createdAt: agent.created_at ?? null,
+      agent,
+    }));
+    return mergeAvailableAgents(
+      catalog.agents,
+      discovered,
+      userAgents ?? [],
+      catalog.suppressedNames,
+    ).filter((agent) => agent.sessionId !== undefined);
+  }, [catalog, mineData, userAgents, hidesBuiltins]);
+  const sessionHarnesses = useQueries({
+    queries: sessionOnly.map((agent) => ({
+      // By agent, which keeps its harness whichever recent session represents it.
+      queryKey: ["session-agent-harness", agent.id],
+      queryFn: () => fetchSessionAgentHarness(agent.sessionId!),
+      enabled,
+      staleTime: Infinity,
+    })),
+    combine: (results) => ({
+      harnesses: results.map((result) => result.data ?? null),
+      resolved: results.every((result) => result.isSuccess),
+    }),
+  });
+  const sessionAgents = useMemo(
+    () =>
+      sessionOnly.map((agent, index) => ({
+        ...agent,
+        harness: sessionHarnesses.harnesses[index] ?? null,
+      })),
+    [sessionOnly, sessionHarnesses.harnesses],
+  );
+  const sessionAgentsComplete =
+    !includeSessionAgents ||
+    (catalog !== undefined && !hidesBuiltins) ||
+    (mineData !== undefined && mine?.isError !== true && sessionHarnesses.resolved);
   const { refetch } = catalogQuery;
   const retry = useCallback(() => void refetch(), [refetch]);
   // A failed refetch keeps the last data, so the error flags count too.
@@ -564,8 +631,10 @@ export function useAgentCatalog(enabled = true): {
       (userAgentList !== undefined && !userAgentsQuery.isError && !userAgentList.truncated));
   return {
     data,
+    sessionAgents,
     suppressedNames: catalog?.suppressedNames ?? NO_SUPPRESSED_NAMES,
-    complete: data !== undefined && !catalogQuery.isError && userAgentsComplete,
+    complete:
+      data !== undefined && !catalogQuery.isError && userAgentsComplete && sessionAgentsComplete,
     isLoading: catalogQuery.isLoading,
     isError: catalogQuery.isError,
     retry,

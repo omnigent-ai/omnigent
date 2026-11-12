@@ -1770,7 +1770,9 @@ describe("useCuratedOutHarnesses", () => {
       wrapper: ({ children }: { children: ReactNode }) => (
         <QueryClientProvider client={client}>
           <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, agent_install: agentInstall }}>
-            {children}
+            <SidebarDataProvider config={{ ...sidebarConfig, sharedAvailable: false }}>
+              {children}
+            </SidebarDataProvider>
           </CapabilitiesProvider>
         </QueryClientProvider>
       ),
@@ -1783,6 +1785,7 @@ describe("useCuratedOutHarnesses", () => {
     fetchMock.mockImplementation((url: string) => {
       if (url === BUILTINS_URL) return Promise.resolve(HIDES_CODEX);
       if (url === HARNESSES_URL) return Promise.resolve(mockResponse({ data: [] }));
+      if (url === MINE_URL || url.includes("pinned=true")) return Promise.resolve(EMPTY_MINE);
       if (url === USER_AGENTS_URL)
         return new Promise<Response>((resolve) => {
           answerUserAgents = resolve;
@@ -1803,6 +1806,7 @@ describe("useCuratedOutHarnesses", () => {
     ["49 names, then the end", [[49, false]], ["codex-native"]],
     ["stopped at the 50-name cap", [[50, true]], []],
     ["names skipped on the last page", [[51, false]], []],
+    ["exactly 50 names, then the end", [[50, false]], ["codex-native"]],
     [
       "5 pages the server trimmed to copies",
       [
@@ -1822,6 +1826,7 @@ describe("useCuratedOutHarnesses", () => {
       const routes: Record<string, Response> = {
         [BUILTINS_URL]: HIDES_CODEX,
         [HARNESSES_URL]: mockResponse({ data: [] }),
+        [MINE_URL]: EMPTY_MINE,
       };
       let url = USER_AGENTS_URL;
       pages.forEach(([count, hasMore]) => {
@@ -1840,10 +1845,105 @@ describe("useCuratedOutHarnesses", () => {
     },
   );
 
+  it.each([
+    ["is missing", [{ last_id: undefined }]],
+    ["repeats", [{ last_id: "ag_own_1" }, { last_id: "ag_own_1" }]],
+  ])("hides nothing when a continuation cursor %s", async (_, cursors) => {
+    // The read stops on a cursor it can't follow, before the list says it ended.
+    const routes: Record<string, Response> = {
+      [BUILTINS_URL]: HIDES_CODEX,
+      [HARNESSES_URL]: mockResponse({ data: [] }),
+      [MINE_URL]: EMPTY_MINE,
+    };
+    let url = USER_AGENTS_URL;
+    cursors.forEach(({ last_id }, index) => {
+      const row = {
+        id: `ag_own_${index + 1}`,
+        name: `own-agent-${index + 1}`,
+        harness: "claude-sdk",
+      };
+      routes[url] = mockResponse({ data: [row], has_more: true, last_id });
+      url = `${USER_AGENTS_URL}&after=${last_id}`;
+    });
+    routeFetch(routes);
+    const { client, result } = renderCuration(true);
+
+    await waitFor(() => expect(client.getQueryState(USER_AGENTS_KEY)?.status).toBe("success"));
+    expect([...result.current]).toEqual([]);
+  });
+
+  it.each([
+    ["on Codex", mockResponse({ id: "ag_one_off", name: "my-codex", harness: "codex-native" }), []],
+    [
+      "on Claude",
+      mockResponse({ id: "ag_one_off", name: "my-claude", harness: "claude-native" }),
+      ["codex-native"],
+    ],
+    [
+      "whose harness can't be read",
+      mockResponse({ detail: "down" }, { ok: false, status: 503 }),
+      [],
+    ],
+  ])(
+    "keeps a suppressed harness required by a selectable session-discovered custom agent %s",
+    async (_, sessionAgent, expected) => {
+      // A one-off upload: in a recent session only, neither built-in nor one of the user's own.
+      routeFetch({
+        [BUILTINS_URL]: HIDES_CODEX,
+        [HARNESSES_URL]: mockResponse({ data: [] }),
+        [USER_AGENTS_URL]: mockResponse({ data: [], has_more: false }),
+        [MINE_URL]: sessionResponse({ data: [{ id: "ag_one_off", name: "my-one-off" }] }),
+        "/v1/sessions/session_0/agent": sessionAgent,
+      });
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const { result } = renderHook(
+        () => ({ curated: useCuratedOutHarnesses(), picker: useAvailableAgents() }),
+        {
+          wrapper: ({ children }: { children: ReactNode }) => (
+            <QueryClientProvider client={client}>
+              <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, agent_install: true }}>
+                <SidebarDataProvider config={{ ...sidebarConfig, sharedAvailable: false }}>
+                  {children}
+                </SidebarDataProvider>
+              </CapabilitiesProvider>
+            </QueryClientProvider>
+          ),
+        },
+      );
+
+      // New Chat still offers the agent.
+      await waitFor(() =>
+        expect(result.current.picker.data?.some((agent) => agent.id === "ag_one_off")).toBe(true),
+      );
+      await waitFor(() =>
+        expect(["success", "error"]).toContain(
+          client.getQueryState(["session-agent-harness", "ag_one_off"])?.status,
+        ),
+      );
+      await waitFor(() => expect([...result.current.curated]).toEqual(expected));
+    },
+  );
+
+  it("looks up no session agent's harness when the deployment hides nothing", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({ data: [], has_more: false }),
+      [HARNESSES_URL]: mockResponse({ data: [] }),
+      [USER_AGENTS_URL]: mockResponse({ data: [], has_more: false }),
+      [MINE_URL]: sessionResponse({ data: [{ id: "ag_one_off", name: "my-one-off" }] }),
+    });
+    const { client, result } = renderCuration(true);
+
+    await waitFor(() => expect(client.getQueryState(USER_AGENTS_KEY)?.status).toBe("success"));
+    await waitFor(() => expect(client.getQueryState(CATALOG_KEY)?.status).toBe("success"));
+    expect([...result.current]).toEqual([]);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/agent"))).toBe(false);
+  });
+
   it("hides nothing while the user's own agents fail to load", async () => {
     routeFetch({
       [BUILTINS_URL]: HIDES_CODEX,
       [HARNESSES_URL]: mockResponse({ data: [] }),
+      [MINE_URL]: EMPTY_MINE,
       [USER_AGENTS_URL]: mockResponse({ detail: "down" }, { ok: false, status: 503 }),
     });
     const { client, result } = renderCuration(true);
@@ -1860,6 +1960,7 @@ describe("useCuratedOutHarnesses", () => {
       [BUILTINS_URL]: HIDES_CODEX,
       [USER_AGENTS_URL]: mockResponse({ data: [], has_more: false }),
       [HARNESSES_URL]: mockResponse({ data: [] }),
+      [MINE_URL]: EMPTY_MINE,
     };
     routeFetch(routes);
     const { client, result } = renderCuration(true);
