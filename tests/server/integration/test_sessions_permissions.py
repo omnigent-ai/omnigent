@@ -1228,6 +1228,7 @@ async def test_admin_user_bypasses_permission_checks(
     auth_client.cookies.set("omnigent_admin_view", "off")
     headers = {"X-Forwarded-Email": "admin-user"}
     session_url = f"/v1/sessions/{session_id}"
+    assert (await auth_client.get("/v1/sharing", headers=headers)).status_code == 403
     assert (await auth_client.get(session_url, headers=headers)).status_code in (403, 404)
     assert (
         await auth_client.patch(session_url, headers=headers, json={"title": "Denied"})
@@ -1251,6 +1252,7 @@ async def test_admin_user_bypasses_permission_checks(
     ).status_code == 403
 
     auth_client.cookies.set("omnigent_admin_view", "on")
+    assert (await auth_client.get("/v1/sharing", headers=headers)).status_code == 200
     assert (
         await auth_client.patch(session_url, headers=headers, json={"title": "Admin edit"})
     ).status_code == 200

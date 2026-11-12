@@ -105,7 +105,7 @@ vi.mock("@/lib/identity", () => ({
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () =>
     (mocks.me?.is_admin ?? false) &&
-    (mocks.adminViewSupported !== true || adminView.isAdminViewEnabled()),
+    (mocks.adminViewSupported === false || adminView.isAdminViewEnabled()),
   getCurrentAdminEligibility: () => mocks.me?.is_admin ?? false,
   getCurrentUserId: () => mocks.me?.id ?? null,
   subscribeIdentity: () => () => {},

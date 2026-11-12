@@ -152,6 +152,11 @@ it("keeps session catalogs apart from previews and other agents, for a week", ()
   const now = Date.now();
   const sessionKey = sandboxSessionCatalogKey("company", "codex-native", "ag_1");
   writeModelCatalogCache(sessionKey, models, false);
+  document.cookie = "omnigent_admin_view=off; Path=/";
+  expect(
+    readModelCatalogCache(sandboxSessionCatalogKey("company", "codex-native", "ag_1")),
+  ).toBeNull();
+  document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
   expect(readModelCatalogCache(key())).toBeNull();
   expect(
     readModelCatalogCache(sandboxSessionCatalogKey("company", "claude-native", "ag_1")),

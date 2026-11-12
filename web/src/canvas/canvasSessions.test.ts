@@ -439,7 +439,7 @@ describe("useCanvasSessions", () => {
     });
   });
 
-  it.each([true, false])("restores cached owned rows for admin view %s", async (enabled) => {
+  it.each([true, false])("restores owned rows only for matching view %s", async (enabled) => {
     if (!enabled) document.cookie = "omnigent_admin_view=off; Path=/";
     window.sessionStorage.setItem(
       "omnigent:canvas-sessions:server-a:me:true",
