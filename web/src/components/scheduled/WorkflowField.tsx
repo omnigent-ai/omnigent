@@ -45,7 +45,11 @@ export function WorkflowField({
           <Button
             type="button"
             variant="outline"
-            className={cn("w-full justify-start gap-2 text-muted-foreground", pickerTriggerClass)}
+            className={cn(
+              "w-full justify-start gap-2",
+              value ? "text-foreground" : "text-muted-foreground",
+              pickerTriggerClass,
+            )}
             data-testid="task-workflow-trigger"
           >
             {value && <WorkflowIcon className="size-3.5 shrink-0" />}
