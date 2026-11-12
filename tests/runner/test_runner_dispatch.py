@@ -1720,22 +1720,28 @@ async def test_runner_stream_emits_failed_when_tool_spec_resolver_fails() -> Non
         ),
     ]
 
-    async def _failing_spec_resolver(
-        agent_id: str, session_id: str | None = None
-    ) -> AgentSpec | None:
+    recording = _RecordingHarnessClient(chunks)
+
+    async def _failing_spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """
-        Raise during local tool dispatch spec resolution.
+        Resolve startup, then fail local tool dispatch resolution.
 
         :param agent_id: Agent id requested by the runner.
-        :returns: Never returns.
-        :raises RuntimeError: Always.
+        :returns: The startup spec before harness dispatch.
+        :raises RuntimeError: After the harness receives the turn.
         """
-        raise RuntimeError(f"stream spec resolver unavailable for {agent_id}")
+        if recording.posted_bodies:
+            raise RuntimeError(f"stream spec resolver unavailable for {agent_id}")
+        return AgentSpec(
+            spec_version=1,
+            name="tool-resolution-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": _TEST_HARNESS_NAME}),
+        )
 
     app = create_runner_app(
         process_manager=cast(
             HarnessProcessManager,
-            _FakeProcessManager(_FakeHarnessClient(chunks)),
+            _FakeProcessManager(recording),
         ),
         spec_resolver=_failing_spec_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -13161,7 +13167,7 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
             },
             id="child_missing-background-parent",
         ),
-        # ── Resolver raises: same three-way split, different trigger.
+        # Resolver failures reject both streaming paths before dispatch.
         pytest.param(
             "resolver_raises",
             "no_harness",
@@ -13171,8 +13177,8 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
         pytest.param(
             "resolver_raises",
             "known_harness",
-            {"status": 200, "instructions": _CONTRACT_CALLER_INSTRUCTIONS},
-            id="resolver_raises-known_harness-degrades",
+            {"status": 503, "error": "spec_resolver_failed", "instructions": None},
+            id="resolver_raises-known_harness-503",
         ),
         pytest.param(
             "resolver_raises",
@@ -13191,8 +13197,8 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
         pytest.param(
             "resolver_none",
             "known_harness",
-            {"status": 200, "instructions": _CONTRACT_CALLER_INSTRUCTIONS},
-            id="resolver_none-known_harness-continues-unknown-spec",
+            {"status": 410, "error": "session_agent_missing", "instructions": None},
+            id="resolver_none-known_harness-410-agent-missing",
         ),
         pytest.param(
             "resolver_none",
@@ -13228,16 +13234,15 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
             },
             id="cache_holds_child-known_harness-shortcut",
         ),
-        # no_harness path resolves a second time even with a cached child.
         pytest.param(
             "cache_holds_child",
             "no_harness",
             {
                 "status": 200,
                 "instructions": _contract_composed_instructions("Worker instructions."),
-                "resolver_calls": 2,
+                "resolver_calls": 1,
             },
-            id="cache_holds_child-no_harness-resolves-again",
+            id="cache_holds_child-no_harness-shortcut",
         ),
     ],
 )
@@ -13254,10 +13259,9 @@ async def test_cross_path_resolution_contract(
     agreement is load-bearing — an unresolvable ``sub_agent_name`` gets one
     answer (warn, then the parent's spec) no matter which transport asked.
     The remaining scenarios still record transport-driven differences that
-    are intended: a synchronous 503, graceful degradation preserving the
-    caller's own instructions, and an asynchronous terminal ``failed``
-    against a 202 that has already gone out. Those differences come from
-    what each transport can report, not from differing answers.
+    are intended: streaming requests reject failed or missing resolution
+    before dispatch, while background requests publish terminal ``failed``
+    after their 202 response. All paths reuse a valid cached child spec.
 
     If you change one path and a row here starts failing, that is the point:
     decide whether the contract moved, do not quietly re-align the table.
