@@ -12,11 +12,10 @@ export const REVIEW_PLAN_FIRST =
   "Make the plan's first step exploring the work, without changing anything, deeply enough " +
   "that the plan you write from it is reasonably specific: each step a concrete piece of " +
   "work, such as one change or one PR, rather than a broad phase like implementing " +
-  "everything. Make its second step my review of the plan, with every later step depending " +
-  "on the review. Once you've explored, update the plan with what you found: drop the " +
-  "exploration step, make my review the first step, and make every other step depend on it. " +
-  "Then ask me to approve the plan before you start anything else; if I ask for changes, " +
-  "replan and ask again.";
+  "everything. Make its second step my review of the plan, and make every later step depend " +
+  "on the review. Once you've explored, update the plan with what you found, keeping those " +
+  "two steps first. Then ask me to approve the plan before you start anything else; if I ask " +
+  "for changes, replan and ask again.";
 
 /** Whether a skill list offers the workflow skill, so the composer can offer "Run a workflow". */
 export function offersWorkflow(skills: readonly { name: string }[]): boolean {
