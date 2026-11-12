@@ -11,9 +11,12 @@ import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import CAP_MCP_REGISTRY, CAP_TCP_EGRESS
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TcpEgressRoute, TerminalEnvSpec
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime import get_agent_store, get_conversation_store
 from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.runtime_compatibility import uses_tcp_egress
+from omnigent.spec.types import AgentSpec
 from tests.server.helpers import build_agent_bundle, create_test_session, echo_runner_client
 from tests.server.integration.test_mcp_registry import launch_registry as launch_registry
 from tests.server.integration.test_session_host_launch import app as app
@@ -23,6 +26,25 @@ from tests.server.integration.test_session_worktree_create import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_tcp_requirement_detection_includes_explicit_terminals(nested, terminal):
+    target = AgentSpec(spec_version=1)
+    spec = AgentSpec(spec_version=1, sub_agents=[target]) if nested else target
+    assert not uses_tcp_egress(spec)
+    sandbox = OSEnvSandboxSpec(
+        type="linux_bwrap", tcp_egress=[TcpEgressRoute("db", "db.example.test", 5432)]
+    )
+    environment = OSEnvSpec(sandbox=sandbox)
+    if terminal:
+        target.terminals = {"shell": TerminalEnvSpec(command="bash", os_env=environment)}
+    else:
+        target.os_env = environment
+    assert uses_tcp_egress(spec)
+    sandbox.tcp_egress = None
+    assert not uses_tcp_egress(spec)
 
 
 def _tcp_bundle(scope: str) -> bytes:

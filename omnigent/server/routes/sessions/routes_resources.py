@@ -562,6 +562,8 @@ def register_resources_routes(
         params: dict[str, str] | None = None,
         timeout: float = 10.0,
         unsupported_endpoint_message: str | None = None,
+        *,
+        for_control: bool = False,
     ) -> dict[str, Any]:
         """Proxy a GET request to the runner and return parsed JSON.
 
@@ -572,6 +574,7 @@ def register_resources_routes(
             e.g. ``{"order": "asc"}``. ``None`` sends no query string.
         :param timeout: Seconds to wait for the runner response.
         :param unsupported_endpoint_message: Upgrade guidance for an unregistered runner route.
+        :param for_control: Read registry metadata without admitting execution.
         :returns: Parsed JSON response body.
         :raises OmnigentError: ``runner_unavailable`` (503) for an unsupported endpoint;
             typed ``not_found`` (404) or
@@ -579,10 +582,14 @@ def register_resources_routes(
         :raises HTTPException: The runner's 400 with its detail when it rejects the request;
             502 on any other runner failure.
         """
-        runner_client = await _get_runner_client_for_resource_access(
-            session_id,
-            conversation=conversation,
-        )
+        if for_control:
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id, conversation=conversation, for_control=True
+            )
+        else:
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id, conversation=conversation
+            )
         if runner_client is None:
             raise HTTPException(
                 status_code=502,
@@ -1464,6 +1471,7 @@ def register_resources_routes(
             path,
             conv,
             params=forwarded or None,
+            for_control=True,
         )
         await _annotate_direct_attach(page, session_id, request)
         return page
@@ -1697,7 +1705,7 @@ def register_resources_routes(
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}"
-        return await _proxy_get_to_runner(session_id, path, conv)
+        return await _proxy_get_to_runner(session_id, path, conv, for_control=True)
 
     @router.get("/sessions/{session_id}/sign-in-link", response_model=None)
     async def get_session_sign_in_link(request: Request, session_id: str) -> dict[str, Any]:

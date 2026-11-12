@@ -491,10 +491,16 @@ async def test_unreadable_bundle_does_not_block_other_sessions_on_old_runner(
     requested: list[str] = []
     controls: list[str] = []
     deletions: list[str] = []
+    reads: list[str] = []
 
     async def respond(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
-            return httpx.Response(200, json={"data": []})
+            reads.append(request.url.path)
+            terminal = {"id": "shell", "type": "terminal"}
+            return httpx.Response(
+                200,
+                json={"data": [terminal]} if request.url.path.endswith("/terminals") else terminal,
+            )
         if request.method == "DELETE":
             deletions.append(request.url.path)
             return httpx.Response(200, json={"deleted": True})
@@ -583,6 +589,14 @@ async def test_unreadable_bundle_does_not_block_other_sessions_on_old_runner(
             stream_task.cancel()
             await asyncio.gather(stream_task, return_exceptions=True)
         terminal_path = f"/v1/sessions/{failed.id}/resources/terminals/shell"
+        for path in (terminal_path.rsplit("/", 1)[0], terminal_path):
+            response = await client.get(path)
+            assert response.status_code == 200, response.text
+            assert path in reads
+            payload = response.json()
+            terminal = payload["data"][0] if "data" in payload else payload
+            assert terminal["id"] == "shell"
+            assert "direct_attach_url" not in terminal.get("metadata", {})
         response = await client.delete(terminal_path)
         assert response.status_code == 200, response.text
         response = await client.delete(f"/v1/sessions/{failed.id}")

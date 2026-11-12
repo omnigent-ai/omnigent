@@ -50,8 +50,8 @@ class TcpEgressDenied(ValueError):
     """The request exceeds this sandbox's TCP route grants."""
 
 
-def resolve_pinned_address(route: TcpEgressRoute) -> str:
-    """Validate every address returned for the exact host before selecting one."""
+def resolve_pinned_addresses(route: TcpEgressRoute) -> tuple[str, ...]:
+    """Validate every address returned for the exact host before dialing any."""
     if not _DNS_SLOTS.acquire(blocking=False):
         raise TcpEgressDenied("TCP egress DNS resolver is busy")
     try:
@@ -62,7 +62,7 @@ def resolve_pinned_address(route: TcpEgressRoute) -> str:
     finally:
         _DNS_SLOTS.release()
     networks = tuple(ipaddress.ip_network(value) for value in route.allowed_cidrs)
-    chosen: str | None = None
+    addresses: list[str] = []
     for family, _, _, _, sockaddr in answers:
         if family not in (socket.AF_INET, socket.AF_INET6):
             continue
@@ -75,11 +75,11 @@ def resolve_pinned_address(route: TcpEgressRoute) -> str:
             allowed = is_public_tcp_address(address)
         if not allowed:
             raise TcpEgressDenied("TCP egress destination resolved outside allowed addresses")
-        if chosen is None:
-            chosen = str(address)
-    if chosen is None:
+        if str(address) not in addresses:
+            addresses.append(str(address))
+    if not addresses:
         raise TcpEgressDenied("TCP egress destination has no usable address")
-    return chosen
+    return tuple(addresses)
 
 
 class _BoundedTcpServer(socketserver.ThreadingMixIn):
@@ -148,8 +148,7 @@ class _TcpHandler(socketserver.BaseRequestHandler):
                 raise TcpEgressDenied("TCP egress route is not allowed")
             route_name = requested_route
             route = broker.routes[route_name]
-            pinned_ip = resolve_pinned_address(route)
-            upstream = broker._dial_pinned(pinned_ip, route.port)
+            upstream = broker._connect_route(route)
             with upstream:
                 try:
                     client.sendall(b"\x00")
@@ -216,7 +215,24 @@ class TcpEgressBroker:
             socket_path.unlink(missing_ok=True)
             raise
 
-    def _dial_pinned(self, pinned_ip: str, port: int) -> socket.socket:
+    def _connect_route(self, route: TcpEgressRoute) -> socket.socket:
+        addresses = resolve_pinned_addresses(route)
+        deadline = time.monotonic() + 10
+        for index, address in enumerate(addresses):
+            try:
+                return self._dial_pinned(address, route.port, deadline=deadline)
+            except OSError:
+                if index == len(addresses) - 1:
+                    raise
+        raise TcpEgressDenied("TCP egress destination has no usable address")
+
+    def _dial_pinned(
+        self, pinned_ip: str, port: int, *, deadline: float | None = None
+    ) -> socket.socket:
+        if deadline is None:
+            deadline = time.monotonic() + 10
+        if time.monotonic() >= deadline:
+            raise TimeoutError("TCP egress dial timed out")
         family = (
             socket.AF_INET6 if ipaddress.ip_address(pinned_ip).version == 6 else socket.AF_INET
         )
@@ -231,7 +247,6 @@ class TcpEgressBroker:
             error = upstream.connect_ex((pinned_ip, port))
             if error not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
                 raise OSError(error, "TCP egress dial failed")
-            deadline = time.monotonic() + 10
             with selectors.DefaultSelector() as readiness:
                 readiness.register(upstream, selectors.EVENT_WRITE)
                 while error:

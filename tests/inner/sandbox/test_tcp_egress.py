@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import ipaddress
 import json
 import logging
@@ -48,7 +49,7 @@ from omnigent.inner.tcp_egress import (
     TcpEgressBroker,
     TcpEgressDenied,
     apply_tcp_egress_env,
-    resolve_pinned_address,
+    resolve_pinned_addresses,
     start_tcp_egress_broker,
 )
 from omnigent.inner.tcp_egress_policy import parse_tcp_egress
@@ -222,7 +223,7 @@ def test_tcp_dns_authorizes_every_answer(
     monkeypatch.setattr(socket, "getaddrinfo", resolve)
     route = TcpEgressRoute("db", "db.example.test", 5432, cidrs)
     with pytest.raises(TcpEgressDenied, match=denial):
-        resolve_pinned_address(route)
+        resolve_pinned_addresses(route)
     if grant_private:
         address = ipaddress.ip_address(addresses[0])
         entry = {"name": "db", "host": str(address), "port": 5432}
@@ -233,7 +234,7 @@ def test_tcp_dns_authorizes_every_answer(
             TcpEgressRoute("db", str(address), 5432, networks)
         ]
         permitted = TcpEgressRoute("db", route.host, route.port, networks)
-        assert resolve_pinned_address(permitted) == str(address)
+        assert resolve_pinned_addresses(permitted) == (str(address),)
     assert queries == [(route.host, route.port)] * (2 if grant_private else 1)
 
 
@@ -252,7 +253,7 @@ def test_tcp_broker_rejects_mixed_public_and_private_dns_without_dial(
     broker = start_tcp_egress_broker([route], broker_dir)
     dials: list[tuple[str, int]] = []
 
-    def dial(address: str, port: int) -> socket.socket:
+    def dial(address: str, port: int, **_kwargs: object) -> socket.socket:
         dials.append((address, port))
         raise AssertionError("a mixed DNS answer must not reach the upstream dial")
 
@@ -316,7 +317,7 @@ def test_tcp_global_resolver_limit_fails_closed(
     monkeypatch.setattr("omnigent.inner.tcp_egress._DNS_SLOTS", resolver_slot)
     try:
         with pytest.raises(TcpEgressDenied, match="resolver is busy"):
-            resolve_pinned_address(static_tcp_route)
+            resolve_pinned_addresses(static_tcp_route)
     finally:
         resolver_slot.release()
 
@@ -388,6 +389,8 @@ def test_tcp_dial_with_high_descriptor(
         assert upstream.fileno() >= 2048
         upstream.sendall(b"high fd")
         assert upstream.recv(7) == b"high fd"
+        with pytest.raises(TimeoutError, match="dial timed out"):
+            broker._dial_pinned(tcp_route.host, tcp_route.port, deadline=time.monotonic() - 1)
     finally:
         if upstream is not None:
             upstream.close()
@@ -627,7 +630,7 @@ def test_tcp_backpressure_releases_stream(
     import omnigent.inner.tcp_egress as tcp_module
 
     monkeypatch.setattr(tcp_module, "_MAX_CONNECTIONS", 1)
-    monkeypatch.setattr(tcp_module, "resolve_pinned_address", lambda _: "1.1.1.1")
+    monkeypatch.setattr(tcp_module, "resolve_pinned_addresses", lambda _: ("1.1.1.1",))
     caplog.set_level(logging.INFO, logger=tcp_module.__name__)
     broker = start_tcp_egress_broker([static_tcp_route], broker_dir)
     upstream, remote = socket.socketpair()
@@ -642,7 +645,7 @@ def test_tcp_backpressure_releases_stream(
 
     writer = threading.Thread(target=send_output, daemon=True)
 
-    def dial(_address: str, _port: int) -> socket.socket:
+    def dial(_address: str, _port: int, **_kwargs: object) -> socket.socket:
         with broker._condition:
             broker._connections.add(upstream)
         return upstream
@@ -707,25 +710,49 @@ def test_tcp_backpressure_releases_stream(
             stopper.join(timeout=2)
 
 
+@pytest.mark.parametrize("fallback", [False, True])
 def test_tcp_broker_pins_dns_answer_before_dialing(
     tcp_route: TcpEgressRoute,
     broker_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
+    fallback: bool,
 ) -> None:
-    route = TcpEgressRoute("echo", "db.example.test", tcp_route.port, tcp_route.allowed_cidrs)
+    unreachable = "192.0.2.1"
+    route = TcpEgressRoute(
+        "echo", "db.example.test", tcp_route.port, (*tcp_route.allowed_cidrs, f"{unreachable}/32")
+    )
     original_getaddrinfo = socket.getaddrinfo
+    original_connect = socket.socket.connect_ex
     looked_up: list[str] = []
+    dialed: list[str] = []
+    deadlines: list[float | None] = []
+
+    def connect(sock: socket.socket, address: tuple[str, int]) -> int:
+        dialed.append(address[0])
+        if address[0] == unreachable:
+            return errno.ENETUNREACH
+        return original_connect(sock, address)
 
     def resolve(host: str, port: int, *args: object, **kwargs: object) -> object:
         looked_up.append(host)
         if host == route.host:
+            addresses = [unreachable, tcp_route.host] if fallback else [tcp_route.host]
             return [
-                (socket.AF_INET, socket.SOCK_STREAM, 6, "", (tcp_route.host, port)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))
+                for address in addresses
             ]
         return original_getaddrinfo(host, port, *args, **kwargs)
 
     monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect)
     broker = start_tcp_egress_broker([route], broker_dir)
+    original_dial = broker._dial_pinned
+
+    def dial(address: str, port: int, *, deadline: float | None = None) -> socket.socket:
+        deadlines.append(deadline)
+        return original_dial(address, port, deadline=deadline)
+
+    monkeypatch.setattr(broker, "_dial_pinned", dial)
     env = os.environ.copy()
     apply_tcp_egress_env(env, broker)
     try:
@@ -738,6 +765,8 @@ def test_tcp_broker_pins_dns_answer_before_dialing(
         )
         assert result.returncode == 0 and result.stdout == b"pinned", result.stderr
         assert looked_up.count(route.host) == 1
+        assert dialed == ([unreachable, tcp_route.host] if fallback else [tcp_route.host])
+        assert deadlines[0] is not None and len(set(deadlines)) == 1
         monkeypatch.setattr(
             socket,
             "getaddrinfo",
@@ -746,7 +775,7 @@ def test_tcp_broker_pins_dns_answer_before_dialing(
             ],
         )
         dials: list[object] = []
-        monkeypatch.setattr(broker, "_dial_pinned", lambda *args: dials.append(args))
+        monkeypatch.setattr(broker, "_dial_pinned", lambda *args, **kwargs: dials.append(args))
         denied = subprocess.run(
             ["omnigent-egress-connect", "echo"],
             input=b"rebound",
@@ -977,22 +1006,6 @@ def test_tcp_broker_rejects_non_ascii_capability(
         broker.stop()
 
 
-def test_tcp_broker_does_not_accept_client_selected_port(
-    static_tcp_route: TcpEgressRoute, broker_dir: Path
-) -> None:
-    broker = start_tcp_egress_broker([static_tcp_route], broker_dir)
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.connect(str(broker.socket_path))
-            request = json.dumps(
-                {"token": broker.token, "route": "echo", "port": static_tcp_route.port + 1}
-            ).encode()
-            client.sendall(struct.pack("!I", len(request)) + request)
-            assert client.recv(1) == b"\x01"
-    finally:
-        broker.stop()
-
-
 def test_tcp_broker_busy_has_a_useful_error(
     tcp_route: TcpEgressRoute, broker_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1043,15 +1056,19 @@ def test_tcp_broker_busy_has_a_useful_error(
         struct.pack("!I", 2049),
         struct.pack("!I", 1) + b"{",
         struct.pack("!I", 1) + b"\xff",
+        pytest.param(None, id="client-selected-port"),
     ],
 )
 def test_tcp_broker_rejects_malformed_initial_requests(
-    request_bytes: bytes, broker_dir: Path
+    request_bytes: bytes | None, broker_dir: Path
 ) -> None:
     broker = start_tcp_egress_broker(
         [TcpEgressRoute("echo", "echo.example.test", 5432)], broker_dir
     )
     try:
+        if request_bytes is None:
+            request = json.dumps({"token": broker.token, "route": "echo", "port": 5433}).encode()
+            request_bytes = struct.pack("!I", len(request)) + request
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(2)
             client.connect(str(broker.socket_path))
@@ -1175,19 +1192,19 @@ def test_tcp_revocation_prevents_dial_after_stalled_dns(
     dials: list[object] = []
     import omnigent.inner.tcp_egress as tcp_module
 
-    def resolve(_route: TcpEgressRoute) -> str:
+    def resolve(_route: TcpEgressRoute) -> tuple[str, ...]:
         started.set()
         assert released.wait(timeout=10)
-        return tcp_route.host
+        return (tcp_route.host,)
 
-    monkeypatch.setattr(tcp_module, "resolve_pinned_address", resolve)
+    monkeypatch.setattr(tcp_module, "resolve_pinned_addresses", resolve)
     broker = start_tcp_egress_broker([tcp_route], broker_dir)
     original_dial = broker._dial_pinned
 
-    def dial(pinned_ip: str, port: int) -> socket.socket:
+    def dial(pinned_ip: str, port: int, *, deadline: float | None = None) -> socket.socket:
         if not broker._closed:
             dials.append((pinned_ip, port))
-        return original_dial(pinned_ip, port)
+        return original_dial(pinned_ip, port, deadline=deadline)
 
     monkeypatch.setattr(broker, "_dial_pinned", dial)
     try:
