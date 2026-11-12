@@ -1105,6 +1105,8 @@ def test_forwarder_closes_codex_async_questions_the_tui_queue_clears(
     hook_ids: list[str] = []
     cancelled_ids: list[str] = []
     cancelled_before_teardown: list[str] = []
+    # Resolutions and hook cancellations, in the order the server sees them.
+    server_log: list[str] = []
     posted_events: list[dict[str, Any]] = []
     both_hooks_started = asyncio.Event()
 
@@ -1124,7 +1126,14 @@ def test_forwarder_closes_codex_async_questions_the_tui_queue_clears(
                 await asyncio.Future()
             except asyncio.CancelledError:
                 cancelled_ids.append(body["id"])
+                server_log.append(f"cancelled {body['id']}")
                 raise
+        if body["type"] == "external_elicitation_resolved":
+            # Yield first, as a real server read would, so an already-requested
+            # hook cancellation lands before this resolution.
+            for _ in range(3):
+                await asyncio.sleep(0)
+            server_log.append(f"resolved {body['data']['elicitation_id']}")
         posted_events.append(body)
         return httpx.Response(202, json={"queued": False})
 
@@ -1170,5 +1179,11 @@ def test_forwarder_closes_codex_async_questions_the_tui_queue_clears(
     assert cancelled_before_teardown == [
         f"async_question:call-async-1:{index}" for index in closed_indexes
     ]
+    # A dropped hook wait alone keeps the card up for the server's re-park
+    # grace, so each card is resolved before its wait is dropped.
+    for index in closed_indexes:
+        assert server_log.index(
+            f"resolved {_async_question_elicitation_id(index)}"
+        ) < server_log.index(f"cancelled async_question:call-async-1:{index}")
     assert _user_messages(posted_events) == []
     assert fake_client.requests == []

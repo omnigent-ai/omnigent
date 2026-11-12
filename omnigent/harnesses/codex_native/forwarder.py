@@ -2468,8 +2468,10 @@ class _CodexElicitationTaskTracker:
         pending = self._pending.get(task) if task is not None else None
         if task is None or pending is None:
             return
-        task.cancel()
+        # Resolve before dropping the hook wait: a dropped wait alone keeps the
+        # card up for the server's re-park grace.
         await self._post_resolved_once(client, session_id, pending)
+        task.cancel()
 
     async def resolve_by_server_notification(
         self,
