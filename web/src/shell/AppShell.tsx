@@ -2017,19 +2017,26 @@ function AppShellImpl() {
   // open file to reveal the picked tab's scope list.
   const handleRightRailTabChange = useCallback(
     (next: RightRailTab | null) => {
-      selectRightRailTab(next);
-      if (selectedFilePath !== null) {
-        setSelectedFilePath(null);
-        setFileViewerCommentsOpen(false);
-        clearFileViewerUrl();
-      }
-      // Clicking a static nav tab deselects any active shell tab (it stays in
-      // the strip) so the picked tab's content shows in the single slot.
-      if (selectedTerminalKey !== null) {
-        setSelectedTerminalKey(null);
-      }
+      const commit = () => {
+        selectRightRailTab(next);
+        if (selectedFilePath !== null) {
+          setSelectedFilePath(null);
+          setFileViewerCommentsOpen(false);
+          clearFileViewerUrl();
+        }
+        // Static nav tabs deselect the shell without closing its tab.
+        if (selectedTerminalKey !== null) setSelectedTerminalKey(null);
+      };
+      if (selectedFilePath !== null) guardFileNavigation(null, undefined, commit);
+      else commit();
     },
-    [selectedFilePath, selectedTerminalKey, clearFileViewerUrl, selectRightRailTab],
+    [
+      selectedFilePath,
+      selectedTerminalKey,
+      clearFileViewerUrl,
+      selectRightRailTab,
+      guardFileNavigation,
+    ],
   );
   const closeWorkspacePanel = useCallback(
     (tab: DefaultWorkspaceTab) => {

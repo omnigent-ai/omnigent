@@ -804,6 +804,52 @@ afterEach(() => {
 });
 
 describe("AppShell session overview", () => {
+  it.each([
+    { action: "View all agents →", tab: "Agents", overview: true },
+    { action: "View changes →", tab: "Changes", overview: true },
+    { action: "Agents", tab: "Agents", overview: false },
+    { action: "Changes", tab: "Changes", overview: false },
+  ])(
+    "preserves unsaved edits before opening $action (overview=$overview)",
+    ({ action, tab, overview }) => {
+      const baseMatchMedia = window.matchMedia;
+      const media = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+        ...baseMatchMedia(query),
+        matches: query === "(min-width: 768px)",
+      }));
+      onTestFinished(() => media.mockRestore());
+      writeSessionWorkspaceState("conv_overview", {
+        open: true,
+        openFiles: ["draft.md"],
+        selectedFilePath: "draft.md",
+      });
+      mockConversations([{ id: "conv_overview", permission_level: null }]);
+      renderShell(
+        "/c/conv_overview?file=draft.md",
+        serverInfo({ features: { session_overview: true } }),
+        { dirtyFileViewer: true },
+      );
+      if (overview) {
+        fireEvent.click(screen.getByRole("button", { name: /Session overview, cost/ }));
+        fireEvent.click(screen.getByText(action));
+      } else {
+        fireEvent.mouseDown(screen.getByRole("tab", { name: new RegExp(tab) }));
+      }
+      expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "draft.md");
+      expect(screen.getByTestId("url-params").textContent).toContain("file=draft.md");
+      expect(screen.getByRole("tab", { name: new RegExp(tab) })).not.toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+      expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+      expect(screen.getByTestId("url-params").textContent).not.toContain("file=");
+      expect(screen.getByRole("tab", { name: new RegExp(tab) })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+    },
+  );
   it.each([false, true])(
     "gates the header and opens the existing Agents workspace (enabled=%s)",
     (enabled) => {
