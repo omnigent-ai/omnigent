@@ -586,6 +586,42 @@ def test_a_merge_as_an_account_needs_a_provider_that_binds_it(
     assert github._config.github_account_preference("github.com/acme/widgets") is None
 
 
+def test_a_merge_as_an_account_needs_the_facet_not_just_the_capability(
+    account_workspace: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.runner.git_providers import AccountMergeFacet
+    from omnigent.runner.git_providers import github as github_provider
+
+    class CapabilityOnly:
+        """A stale installed provider: it advertises merge_as_account but has no merge_as."""
+
+        capabilities = github_provider._CAPABILITIES
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def set_preference(self, *_args: object, **_kwargs: object) -> None:
+            self.calls.append("set_preference")
+
+        def merge(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+            self.calls.append("merge")
+            return {}
+
+    provider = CapabilityOnly()
+    assert provider.capabilities.merge_as_account
+    assert not isinstance(provider, AccountMergeFacet)
+    monkeypatch.setattr(
+        pr_resource,
+        "_merge_target",
+        lambda _session_id, _pr_url: (provider, PullRequestRef.from_url(PR_URL)),
+    )
+
+    with pytest.raises(ValueError, match="can't merge as a chosen account"):
+        _merge_as(account_workspace, "work")
+    # Neither saved nor merged as the saved account instead.
+    assert provider.calls == []
+
+
 @pytest.mark.parametrize("operation", ["pr_merge_options", "disable_pr_auto_merge"])
 def test_merge_operations_need_a_merging_provider(tracked: str, operation: str) -> None:
     function = getattr(pr_resource, operation)

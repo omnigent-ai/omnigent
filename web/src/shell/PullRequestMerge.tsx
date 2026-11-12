@@ -184,7 +184,9 @@ function MergeAccountPicker({
           Merge as
         </span>
         <Select
-          value={selected}
+          // Stays controlled while no account is known, so the placeholder comes back
+          // and choosing the same account again still saves it.
+          value={selected ?? ""}
           onValueChange={(login) => {
             onChange();
             setPref.mutate({ account: login, pr_url: prUrl });

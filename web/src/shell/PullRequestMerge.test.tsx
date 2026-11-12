@@ -490,11 +490,20 @@ describe("merging as another account", () => {
       } else {
         await act(async () => infoRequests[1](json({ detail: "Host offline" }, 503)));
         expect(confirm).toBeDisabled();
-        // An explicit choice settles it.
+        // Retrying the same account fails again: the picker goes back to no account.
         fireEvent.click(picker);
         fireEvent.click(screen.getByRole("option", { name: "personal" }));
         await waitFor(() => expect(posts).toHaveLength(2));
-        await act(async () => posts[1].respond(info("personal")));
+        expect(posts[1].path).toBe(PREFERENCES_PATH);
+        await act(async () => posts[1].respond(json({ detail: "Host offline" }, 400)));
+        await waitFor(() => expect(picker).toHaveTextContent("Choose an account"));
+        expect(confirm).toBeDisabled();
+        // Choosing it once more still sends a save, which settles it.
+        fireEvent.click(picker);
+        fireEvent.click(screen.getByRole("option", { name: "personal" }));
+        await waitFor(() => expect(posts).toHaveLength(3));
+        expect(posts[2].path).toBe(PREFERENCES_PATH);
+        await act(async () => posts[2].respond(info("personal")));
         expect(picker).toHaveTextContent("personal");
       }
       await waitFor(() => expect(confirm).toBeEnabled());

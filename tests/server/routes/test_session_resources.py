@@ -3819,11 +3819,16 @@ def test_pr_attachments_fit_one_tunnel_frame() -> None:
 
 
 @pytest.mark.asyncio
-async def test_github_merge_relays_the_runner_refusal(client: httpx.AsyncClient) -> None:
+@pytest.mark.parametrize(
+    ("route", "extra"), [("merge", {}), ("merge-as", {"account": "personal"})]
+)
+async def test_github_merge_relays_the_runner_refusal(
+    client: httpx.AsyncClient, route: str, extra: dict[str, str]
+) -> None:
     """A refused merge keeps the runner's status and message, with the PR edit wait."""
     from omnigent.server.routes.sessions import routes_resources
 
-    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/merge"
+    path = f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/{route}"
     detail = "The pull request's branch changed since the panel loaded."
     fake_runner = _FakeRunnerClient(responses={path: (400, {"detail": detail})})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
@@ -3839,6 +3844,7 @@ async def test_github_merge_relays_the_runner_refusal(client: httpx.AsyncClient)
         "pr_url": "https://github.com/acme/widgets/pull/17",
         "merge_method": "merge",
         "expected_head": "a" * 40,
+        **extra,
     }
 
     resp = await client.post(path, json={**body, "admin": True})
