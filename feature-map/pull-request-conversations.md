@@ -25,10 +25,13 @@ together in Comments.
   same-side range; independent conversations on lines with existing threads.
   Selection follows the drag, with the sidebar's theme tint and an accent gutter.
   The plus hides while the composer is open; its top-right X closes it.
+  Cmd+Enter (Ctrl+Enter on Windows/Linux) performs the same action as **Submit**.
 - `history`: On-demand pages, incomplete/error states, resolved collapse,
   unresolved navigation and original context for unplaceable conversations.
   Conversations on files hidden by the path filter are hidden with their file.
   Navigating to one clears the filter and shows **Filter cleared to show <file>**.
+  Earlier local comments and outdated GitHub threads are hidden by default. Each
+  file's overflow menu offers **Show earlier comments / Hide earlier comments**.
 - `local-review`: Save session-only comments on either diff side, with pencil and
   trash actions in the comment header. Submitting an **Agent** comment attaches a context chip
   to the session composer while preserving existing text and attachments. Hover
@@ -38,6 +41,8 @@ together in Comments.
   The full snapshots are sent only when the user submits their chat message.
   Sent comments show a file/line label and a Markdown preview in chat; IDs and
   revision coordinates are available under **Comment reference**.
+  Feedback remains unread in the Inbox until its comment card is displayed;
+  fetching it while loading or in a hidden file, revision or view does not mark it read.
 - `file-controls`: The sidebar **Filter changed files** input (on narrow screens a
   toolbar button opens it above the list; hiding it clears the filter). Escape
   clears it, and **Clear filter** restores the list. Each file header has a
@@ -95,7 +100,8 @@ old side, verifying coordinates, placement and deduplication after refresh.
 It checks focus-to-expand, Cancel and keyboard reopening, collapse after posting,
 and the gutter plus centered over the line-number/code divider in both layouts.
 Suggestion assertions verify the before/after lines and numbers, highlighting, mobile sizing,
-and original-context labeling on outdated threads. Component tests cover empty
+and original-context labeling on outdated threads after **Show earlier comments**
+is selected in the file's overflow menu. Component tests cover empty
 replacements, ordinary Markdown/code and unavailable context; mapping tests
 cover side/range selection, partial patches and historical coordinates.
 

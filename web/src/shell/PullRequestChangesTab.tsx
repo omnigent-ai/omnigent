@@ -25,7 +25,6 @@ import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useComments } from "@/hooks/useComments";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { markCommentsSeen } from "@/hooks/useSeenComments";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import type { usePullRequestReviewThreads } from "@/hooks/usePullRequestReviewThreads";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
@@ -526,9 +525,6 @@ export function PullRequestChangesTab({
       ),
     [localComments, prDiff.data?.head_sha, prDiff.data?.base_sha],
   );
-  useEffect(() => {
-    if (selected) markCommentsSeen(localComments.map((comment) => comment.id));
-  }, [selected, localComments]);
   const view = useChangesViewState(conversationId, data.selected_pr_url ?? pr.url);
   const {
     revealedPaths,
@@ -1322,7 +1318,14 @@ export function PullRequestChangesTab({
     else if (visibleFiles.includes(file))
       threadsByFile.set(file.path, [...(threadsByFile.get(file.path) ?? []), thread]);
   }
-  const unavailableLocalComments = reviewing
+  const localReviewReady =
+    reviewing &&
+    !listing.isLoading &&
+    !shownDiff.isLoading &&
+    !listing.error &&
+    !shownDiff.error &&
+    !parseError;
+  const unavailableLocalComments = localReviewReady
     ? localComments.filter(
         (comment) => !canShowFiles || !files.some((file) => file.path === comment.path),
       )
@@ -1652,7 +1655,11 @@ export function PullRequestChangesTab({
                 )}
                 threadContext={threadContext}
                 matchingRevision={matchingRevision}
-                localComments={shownLocalComments.filter((comment) => comment.path === file.path)}
+                localComments={
+                  localReviewReady
+                    ? shownLocalComments.filter((comment) => comment.path === file.path)
+                    : []
+                }
                 canCommentLocally={
                   serverInfo !== "loading" &&
                   serverInfo.comment_anchor_metadata === true &&
@@ -1699,8 +1706,13 @@ export function PullRequestChangesTab({
                         showContext
                       />
                     ))}
-                  {shownLocalComments
-                    .filter((comment) => comment.path === path)
+                  {unavailableLocalComments
+                    .filter(
+                      (comment) =>
+                        comment.path === path &&
+                        (!earlierLocalCommentIds.has(comment.id) ||
+                          shownEarlierCommentPaths.has(path)),
+                    )
                     .map((comment) => (
                       <LocalReviewComment
                         key={comment.id}

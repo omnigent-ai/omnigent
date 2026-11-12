@@ -21,6 +21,7 @@ import {
   type PullRequestIdentity,
 } from "@/lib/pullRequestViewed";
 import type { Comment } from "@/hooks/useComments";
+import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { requestLocalReviewNavigation, useLocalReviewNavigation } from "@/lib/localReviewContext";
 import type * as SonnerModule from "sonner";
 import { PullRequestChangesTab } from "./PullRequestChangesTab";
@@ -64,19 +65,8 @@ const mocks = vi.hoisted(() => ({
 const comments = vi.hoisted(() => ({ data: [] as Comment[], isSuccess: true }));
 vi.mock("@/hooks/useComments", () => ({
   useComments: () => ({ ...comments, isFetching: false }),
-}));
-vi.mock("./LocalReviewComment", () => ({
-  LocalReviewComment: ({ comment }: { comment: Comment }) => (
-    <section
-      data-local-review-comment={comment.id}
-      tabIndex={-1}
-      ref={(element) => {
-        if (element) element.animate = mocks.animateComment;
-      }}
-    >
-      {comment.body}
-    </section>
-  ),
+  useUpdateComment: () => ({ mutate: vi.fn(), isPending: false }),
+  useDeleteComment: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 vi.mock("sonner", async (importOriginal) => ({
   ...(await importOriginal<typeof SonnerModule>()),
@@ -288,7 +278,13 @@ const sectionHeader = (path: string, expanded: boolean) =>
     .find((button) => !button.hasAttribute("aria-label"))!;
 
 describe("PullRequestChangesTab", () => {
+  const originalAnimate = Element.prototype.animate;
+  beforeEach(() => {
+    localStorage.clear();
+    Element.prototype.animate = mocks.animateComment;
+  });
   afterEach(() => {
+    Element.prototype.animate = originalAnimate;
     comments.data = [];
     comments.isSuccess = true;
     vi.restoreAllMocks();
@@ -339,6 +335,7 @@ describe("PullRequestChangesTab", () => {
         commitHistory: true,
         listing: { head_sha: "head" },
       });
+      expect(getSeenCommentIds().has(comment.id)).toBe(false);
       vi.useFakeTimers();
       try {
         act(() => requestLocalReviewNavigation(comment));
@@ -370,6 +367,7 @@ describe("PullRequestChangesTab", () => {
         expect(document.querySelector('[data-local-review-comment="local-comment"]')).toHaveFocus(),
       );
       await waitFor(() => expect(navigation.result.current).toBeUndefined());
+      expect(getSeenCommentIds().has(comment.id)).toBe(true);
       expect(view.result.current.mode).toBe("changes");
       expect(view.result.current.shownEarlierCommentPaths.has("b.ts")).toBe(earlier);
       expect(focus.mock.calls.length).toBeGreaterThan(1);
@@ -385,6 +383,60 @@ describe("PullRequestChangesTab", () => {
       expect(cancelHighlight).toHaveBeenCalledTimes(1);
       tab.unmount();
       expect(cancelHighlight).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it.each(["collapsed", "filtered", "commits"] as const)(
+    "keeps feedback unread while its surface is %s",
+    (hiddenBy) => {
+      const conversationId = `unread-${hiddenBy}`;
+      const view = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
+      comments.data = [
+        {
+          id: "unread-comment",
+          conversation_id: conversationId,
+          path: "b.ts",
+          body: "Unread feedback",
+          status: "draft",
+          anchor_metadata: {
+            pr_url: prUrlFor(conversationId),
+            side: "RIGHT",
+            line: 1,
+            head_sha: "head",
+            base_sha: "base",
+          },
+        } as Comment,
+      ];
+      const tab = renderTab({
+        conversationId,
+        loading: true,
+        commitHistory: true,
+        listing: { head_sha: "head" },
+      });
+      if (hiddenBy === "collapsed") {
+        fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
+      } else {
+        act(() =>
+          hiddenBy === "filtered"
+            ? view.result.current.setPathFilter("a.ts")
+            : view.result.current.setMode("commits"),
+        );
+      }
+      tab.rerender(PATCH);
+      expect(screen.queryByText("Unread feedback")).toBeNull();
+      expect(getSeenCommentIds().has("unread-comment")).toBe(false);
+
+      if (hiddenBy === "collapsed") {
+        fireEvent.click(sectionHeader("b.ts", false));
+      } else {
+        act(() =>
+          hiddenBy === "filtered"
+            ? view.result.current.setPathFilter("")
+            : view.result.current.setMode("changes"),
+        );
+      }
+      expect(screen.getByText("Unread feedback")).toBeInTheDocument();
+      expect(getSeenCommentIds().has("unread-comment")).toBe(true);
     },
   );
 
@@ -433,10 +485,14 @@ describe("PullRequestChangesTab", () => {
     expect(screen.queryByText("earlier-a")).toBeNull();
     expect(screen.queryByText("earlier-b")).toBeNull();
     expect(screen.queryByText("earlier-gone")).toBeNull();
+    expect([...getSeenCommentIds()]).toEqual(["current-a"]);
     expect(document.querySelector('[data-review-thread="outdated-thread"]')).toBeNull();
 
     await toggleEarlier("a.ts", "Show earlier comments");
     expect(screen.getByText("earlier-a")).toBeInTheDocument();
+    expect(getSeenCommentIds().has("earlier-a")).toBe(true);
+    expect(getSeenCommentIds().has("earlier-b")).toBe(false);
+    expect(getSeenCommentIds().has("earlier-gone")).toBe(false);
     expect(document.querySelector('[data-review-thread="outdated-thread"]')).not.toBeNull();
     expect(screen.getByText("current-a")).toBeInTheDocument();
     expect(screen.queryByText("earlier-b")).toBeNull();
@@ -447,8 +503,10 @@ describe("PullRequestChangesTab", () => {
     expect(document.querySelector('[data-review-thread="outdated-thread"]')).not.toBeNull();
     await toggleEarlier("b.ts", "Show earlier comments");
     expect(screen.getByText("earlier-b")).toBeInTheDocument();
+    expect(getSeenCommentIds().has("earlier-b")).toBe(true);
     await toggleEarlier("gone.ts", "Show earlier comments");
     expect(screen.getByText("earlier-gone")).toBeInTheDocument();
+    expect(getSeenCommentIds().has("earlier-gone")).toBe(true);
     await toggleEarlier("gone.ts", "Hide earlier comments");
     expect(screen.queryByText("earlier-gone")).toBeNull();
 

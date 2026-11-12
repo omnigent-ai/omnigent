@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { PencilIcon, Trash2Icon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { MessageResponse } from "@/components/ai-elements/message";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { useDeleteComment, useUpdateComment, type Comment } from "@/hooks/useComments";
+import { markCommentsSeen } from "@/hooks/useSeenComments";
 
 export function LocalReviewComment({
   comment,
@@ -22,6 +23,9 @@ export function LocalReviewComment({
   const own = canEdit && (!comment.created_by || comment.created_by === getCurrentAuthorId());
   const pending = update.isPending || remove.isPending;
   const anchor = comment.anchor_metadata!;
+  useEffect(() => {
+    markCommentsSeen([comment.id]);
+  }, [comment.id]);
   return (
     <section
       data-local-review-comment={comment.id}
