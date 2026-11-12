@@ -59,7 +59,7 @@ class GrokNativeExecutor(Executor):
         messages: list[Message],
         tools: list[ToolSpec],
         system_prompt: str,
-        config: ExecutorConfig,
+        config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         """Admit the latest web-UI user message as a ``session/prompt``."""
         del tools, system_prompt, config
@@ -83,10 +83,10 @@ class GrokNativeExecutor(Executor):
             return
         yield TurnComplete(response=None)
 
-    async def enqueue_session_message(self, content: EnqueuedContent) -> None:
-        """Reject mid-turn steering until the grok steer path is wired."""
-        del content
-        raise RuntimeError("grok-native does not support mid-turn steering yet")
+    async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
+        """Decline mid-turn steering until the grok steer path is wired."""
+        del session_key, content
+        return False
 
     async def stop(self) -> None:
         """Interrupt the active turn via ``session/cancel``."""
@@ -171,9 +171,7 @@ async def _answer_permission_request(
     return None
 
 
-async def _wait_bridge_state(
-    bridge_dir: Path, timeout_s: float = 60.0
-) -> GrokBridgeState | None:
+async def _wait_bridge_state(bridge_dir: Path, timeout_s: float = 60.0) -> GrokBridgeState | None:
     """Poll for published bridge state up to *timeout_s*."""
     import asyncio
     import time

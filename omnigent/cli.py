@@ -2128,6 +2128,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "doctor",
         "extensions",
         "goose",
+        "grok",
         "hermes",
         "host",
         "import",

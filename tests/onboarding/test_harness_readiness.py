@@ -549,6 +549,10 @@ def test_configured_harness_map_covers_all_spellings(
         "hermes",
         "hermes-native",
         "native-hermes",
+        # Native Grok (``omnigent grok``) — gates on the grok binary; the ACP
+        # row's spellings arrive via the ``ACP_CLI_HARNESSES`` expansion.
+        "grok-native",
+        "native-grok",
         # Generic ACP is config-gated; the empty fixture has no slug keys.
         "acp",
         # Builtin ACP CLI harnesses: every catalog row + alias, derived so a new
