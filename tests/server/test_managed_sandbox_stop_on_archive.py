@@ -216,7 +216,7 @@ async def test_keeps_the_sandbox_when_a_walk_page_is_full(db_uri, monkeypatch, f
     assert await _stop(fake, host_store, conversations, conv) is True
 
 
-async def test_archiving_the_last_side_chat_stops_its_sources_sandbox(db_uri):
+async def test_archiving_the_last_side_chat_stops_its_sources_sandbox(db_uri, monkeypatch):
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
     side_chat = conversations.create_conversation(
         side_chat_parent_id=conv.id,
@@ -227,6 +227,14 @@ async def test_archiving_the_last_side_chat_stops_its_sources_sandbox(db_uri):
     conversations.update_conversation(side_chat.id, archived=True)
     side_chat = conversations.get_conversation(side_chat.id)
     assert side_chat.host_id is None
+    # The walk to the source reads only the labels it needs, not all of them.
+    full_read = conversations.get_conversation
+
+    def no_full_source_read(conversation_id: str):
+        assert conversation_id != conv.id, "the source must be read without all its labels"
+        return full_read(conversation_id)
+
+    monkeypatch.setattr(conversations, "get_conversation", no_full_source_read)
 
     assert await _stop(fake, host_store, conversations, side_chat) is True
     assert fake.stopped == [host_store.get_host(conv.host_id).sandbox_id]

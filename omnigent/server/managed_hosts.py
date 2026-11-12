@@ -5240,14 +5240,29 @@ async def stop_archived_session_sandbox(
     :returns: ``True`` when the provider stopped the sandbox.
     """
     from omnigent.runner.routing import routing_host_session
-    from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+    from omnigent.stores.conversation_store import (
+        SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SIDE_CHAT_LABEL_KEY,
+        SIDE_CHAT_SOURCE_LABEL_KEY,
+    )
+
+    # The walk to the host session needs only these labels; reading no others
+    # keeps a source with many labels from growing the teardown's reads.
+    label_keys = (SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY, SCHEDULED_TASK_ORIGIN_LABEL_KEY)
 
     if config is None:
         return False
     if conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY):
         return False
     try:
-        owner = await asyncio.to_thread(routing_host_session, conv, conversation_store)
+        owner = await asyncio.to_thread(
+            routing_host_session,
+            conv,
+            conversation_store,
+            read=partial(
+                conversation_store.get_conversation_with_label_keys, label_keys=label_keys
+            ),
+        )
         if owner is None or owner.host_id is None:
             return False
         if owner.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY):

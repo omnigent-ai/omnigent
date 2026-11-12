@@ -25,6 +25,8 @@ from omnigent.spec import AgentSpec
 from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from omnigent.entities import Conversation
     from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
     from omnigent.runtime.agent_cache import AgentCache
@@ -100,10 +102,16 @@ def routing_host_session(
     conversation_store: ConversationStore,
     *,
     max_ancestor_reads: int = 16,
+    read: Callable[[str], Conversation | None] | None = None,
 ) -> Conversation | None:
-    """Return the session owning the routing host and its workspace together."""
+    """Return the session owning the routing host and its workspace together.
+
+    *read* loads an ancestor, ``conversation_store.get_conversation`` by default;
+    pass a narrower read when only some of the ancestors' labels are needed.
+    """
     if conv.host_id is not None:
         return conv
+    read = read or conversation_store.get_conversation
     reads = 0
     visited = {conv.id}
     current = conv
@@ -130,7 +138,7 @@ def routing_host_session(
             break
         reads += 1
         visited.add(ancestor_id)
-        ancestor = conversation_store.get_conversation(ancestor_id)
+        ancestor = read(ancestor_id)
         if ancestor is None:
             break
         if (
@@ -147,7 +155,7 @@ def routing_host_session(
     if root_id is not None and root_id not in visited:
         if reads >= max_ancestor_reads:
             return None
-        root = conversation_store.get_conversation(root_id)
+        root = read(root_id)
         if root is not None:
             return root if root.host_id is not None else None
     return None

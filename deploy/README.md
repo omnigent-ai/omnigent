@@ -412,7 +412,9 @@ its runner is stopped. It is a per-provider setting: in a `providers:` list, a
 value next to `providers` is every entry's default, and an entry can override it.
 The sandbox is stopped, not deleted, so unarchiving the session and sending a
 message resumes the same sandbox. It applies only to providers that can resume
-a stopped sandbox (`capabilities.resume_stopped`). A sandbox that another
+a stopped sandbox (`capabilities.resume_stopped`) and implement `stop()`; on a
+provider whose `stop()` raises `SandboxCapabilityError`, the option has no
+effect (the server logs that at debug level). A sandbox that another
 unarchived session still uses keeps running, and so does a scheduled task
 run's sandbox. Deleting the session still terminates the sandbox, and so does
 the reaper below once a stopped sandbox's host passes its offline limit; the

@@ -5,7 +5,7 @@ import math
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, TypedDict
 
 from omnigent.entities import (
@@ -662,6 +662,31 @@ class ConversationStore(ABC):
             ``None``.
         """
         ...
+
+    def get_conversation_with_label_keys(
+        self, conversation_id: str, label_keys: tuple[str, ...]
+    ) -> Conversation | None:
+        """
+        Return the conversation with only the labels named in *label_keys*.
+
+        For callers that need a few fixed labels, so a session's other labels,
+        which have no count limit, add no rows to the read. This default filters
+        :meth:`get_conversation`'s result; stores override it to read only those
+        keys.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param label_keys: The label keys to load, e.g.
+            ``("omnigent.side_chat",)``.
+        :returns: The :class:`Conversation` if found, otherwise ``None``.
+        """
+        conversation = self.get_conversation(conversation_id)
+        if conversation is None:
+            return None
+        labels = {
+            key: conversation.labels[key] for key in label_keys if key in conversation.labels
+        }
+        return replace(conversation, labels=labels)
 
     @abstractmethod
     def find_conversation_by_external_session_id(

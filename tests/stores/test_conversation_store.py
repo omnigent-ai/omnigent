@@ -490,6 +490,38 @@ def test_get_session_activity(
     assert conversation_store.get_session_activity([]) == {}
 
 
+def test_get_conversation_with_label_keys_reads_only_those_labels(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Other labels, which have no count limit, add no rows to the read."""
+    conv = conversation_store.create_conversation(title="source")
+    conversation_store.set_labels(
+        conv.id, {"wanted": "1", **{f"unrelated.{i}": "x" for i in range(20)}}
+    )
+
+    statements: list[str] = []
+
+    def record_query(_conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
+        statements.append(statement.lower())
+
+    event.listen(conversation_store._engine, "before_cursor_execute", record_query)
+    try:
+        result = conversation_store.get_conversation_with_label_keys(conv.id, ("wanted", "absent"))
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", record_query)
+
+    assert result is not None and result.id == conv.id and result.title == "source"
+    assert result.labels == {"wanted": "1"}
+    label_reads = [st for st in statements if "conversation_labels" in st]
+    assert label_reads and all(" in (" in st or " in(" in st for st in label_reads)
+    assert (
+        conversation_store.get_conversation_with_label_keys(
+            "5eca720dc2bc6cdc3a99028d7bd0f917", ("wanted",)
+        )
+        is None
+    )
+
+
 def test_list_latest_message_items_for_conversations(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
