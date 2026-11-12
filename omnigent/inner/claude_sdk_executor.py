@@ -1883,7 +1883,7 @@ def prepare_claude_cli_path(
     if spec is None:
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
     resolved_cwd = _resolve_sandbox_cwd(cwd if cwd is not None else spec.cwd)
-    validate_harness_sandbox(spec, "Claude SDK", cwd=resolved_cwd)
+    validate_harness_sandbox(spec, "Claude SDK", cwd=resolved_cwd if cwd is not None else None)
     sandbox_spec = spec.sandbox or OSEnvSandboxSpec()
     if sandbox_spec.type == "none":
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=True)

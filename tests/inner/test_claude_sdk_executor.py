@@ -5000,8 +5000,9 @@ def test_prepare_claude_cli_path_rejects_failed_wrap_probe(monkeypatch) -> None:
     launcher.assert_not_called()
 
 
+@pytest.mark.parametrize("cwd_source", ["default", "spec_relative", "spec_absolute", "explicit"])
 def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
-    monkeypatch,
+    monkeypatch, tmp_path: Path, cwd_source: str
 ) -> None:
     """
     The happy path is unchanged by the probe: the wrap still happens,
@@ -5010,6 +5011,22 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
     run-time wrap can build the same grants.
     """
     from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
+    spec = _wrap_probe_spec()
+    cwd = None
+    if cwd_source == "default":
+        spec.cwd = None
+        expected_cwd = tmp_path
+    elif cwd_source == "spec_relative":
+        spec.cwd = "repo"
+        expected_cwd = tmp_path / "repo"
+    elif cwd_source == "explicit":
+        spec.cwd = "."
+        expected_cwd = tmp_path / "repo"
+        cwd = str(expected_cwd)
+    else:
+        expected_cwd = Path(spec.cwd).resolve()
 
     monkeypatch.setattr(
         "omnigent.inner.claude_sdk_executor.resolve_sandbox",
@@ -5021,6 +5038,7 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
     class _OkBackend:
         def wrap_launcher_argv(self, argv, policy, cwd, chdir=None, target=None):
             seen["target"] = target
+            seen["cwd"] = cwd
             return ["bwrap", "--", *argv]
 
     monkeypatch.setattr(
@@ -5032,10 +5050,12 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
         lambda path, sandbox, **kwargs: "/tmp/launcher",
     )
 
-    prepared = prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
+    prepared = prepare_claude_cli_path("/usr/bin/claude", spec, cwd=cwd)
 
     assert prepared.cli_path == "/tmp/launcher"
     assert prepared.enable_native_tools is True
+    assert prepared.cwd == str(expected_cwd)
+    assert seen["cwd"] == expected_cwd
     assert seen["target"] == "/usr/bin/claude", (
         "The probe must exercise the target lane run_launcher will use."
     )

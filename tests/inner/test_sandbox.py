@@ -690,7 +690,7 @@ def test_exec_launcher_rejects_an_unnameable_interpreter(monkeypatch) -> None:
 
 @pytest.mark.parametrize("backend_type", ["linux_bwrap", "darwin_seatbelt"])
 def test_run_launcher_rejects_noop_spawn_wrap(
-    backend_type: str, monkeypatch: pytest.MonkeyPatch
+    backend_type: str, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
     from omnigent.inner import sandbox
 
@@ -699,7 +699,11 @@ def test_run_launcher_rejects_noop_spawn_wrap(
     backend.prepare_launcher_policy.side_effect = lambda policy: policy
     backend.wrap_launcher_argv.side_effect = lambda argv, *args, **kwargs: argv
     monkeypatch.setattr(sandbox, "get_backend", lambda name: backend)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(sandbox, "create_private_tmpdir", lambda: scratch)
     with (
+        mock.patch.dict(os.environ),
         mock.patch.object(os, "execvp") as execute,
         mock.patch.object(sandbox, "activate_sandbox") as activate,
         pytest.raises(OSError, match="did not wrap"),
@@ -709,3 +713,4 @@ def test_run_launcher_rejects_noop_spawn_wrap(
         )
     execute.assert_not_called()
     activate.assert_not_called()
+    assert not scratch.exists()
