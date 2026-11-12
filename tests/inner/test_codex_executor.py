@@ -7141,6 +7141,28 @@ async def test_disabled_mcp_not_applied_early_exit_does_not_retry(disabled_mcp_s
     assert RELAUNCH_WITHOUT_OVERRIDES_EVENT not in caplog.text
 
 
+async def test_strict_mcp_early_exit_keeps_disables(disabled_mcp_session, caplog):
+    from omnigent import mcp_disabled_servers as disabled
+    from omnigent.mcp_disabled_servers import RELAUNCH_WITHOUT_OVERRIDES_EVENT
+    from tests._helpers.mcp_disabled_servers import write_mcp_inheritance
+
+    harness = disabled_mcp_session
+    disabled.set_disabled(disabled.ServerKey("codex", "fixture"), False)
+    write_mcp_inheritance({"inherit": False})
+
+    async def initialize(*_args, **_kwargs):
+        harness.processes[-1].returncode = 1
+        raise BrokenPipeError
+
+    harness.initialize.side_effect = initialize
+    with pytest.raises(BrokenPipeError):
+        await harness.session.start()
+    assert harness.spawns == [
+        ("/bin/echo", "app-server", "-c", "base=true", "-c", "mcp_servers.fixture.enabled=false")
+    ]
+    assert RELAUNCH_WITHOUT_OVERRIDES_EVENT not in caplog.text
+
+
 @pytest.mark.parametrize("active", [None, [], ["codex"]])
 async def test_disabled_mcp_launch_activation(disabled_mcp_session, active):
     from tests._helpers.mcp_disabled_servers import launch_activation

@@ -18019,10 +18019,11 @@ def test_read_tmux_target_rejects_invalid_payloads(tmp_path: Path) -> None:
     assert claude_native_bridge.read_tmux_target(bridge_dir) is None
 
 
+@pytest.mark.parametrize("strict", [False, True])
 @pytest.mark.parametrize("saved", [False, True])
 @pytest.mark.parametrize("active", [None, [], ["claude"]])
-def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved):
-    from tests._helpers.mcp_disabled_servers import launch_activation
+def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved, strict):
+    from tests._helpers.mcp_disabled_servers import launch_activation, write_mcp_inheritance
 
     active = launch_activation(active)
 
@@ -18038,6 +18039,8 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved)
     original = settings_path.read_bytes()
     if saved:
         set_disabled(ServerKey("claude", "fixture"), True)
+    if strict:
+        write_mcp_inheritance({"inherit": False})
     with patch(
         "omnigent.mcp_disabled_servers.apply_claude_settings", wraps=apply_claude_settings
     ) as hook:
@@ -18047,11 +18050,13 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved)
     hook.assert_called_once()
     assert hook.call_args.kwargs == {"executor": "claude-native", "active_harnesses": active}
     assert args == original_args
+    expected = json.loads(original)
     if active and saved:
-        assert json.loads(settings_path.read_bytes()) == {
-            **json.loads(original),
-            "deniedMcpServers": [{"serverName": "fixture"}],
-        }
+        expected["deniedMcpServers"] = [{"serverName": "fixture"}]
+    if strict:
+        expected["allowedMcpServers"] = [{"serverName": "omnigent"}]
+    if (active and saved) or strict:
+        assert json.loads(settings_path.read_bytes()) == expected
     else:
         assert settings_path.read_bytes() == original
 

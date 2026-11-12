@@ -335,6 +335,17 @@ disable the master gate or a harness flag: switches disappear for that scope,
 future launches ignore its saved preferences, and running sessions remain
 unchanged. Saved preferences remain available when the flags are re-enabled.
 
+**MCP inheritance:** `mcp: {inherit: false, allow: [names]}` in the user's
+`~/.omnigent/config.yaml`, optionally overridden under `harness.<id>.mcp`, makes
+Claude and Codex launches load only the `omnigent` server plus the allowlist.
+It needs no server flag and has no UI. Project config cannot change it. Claude
+gets `allowedMcpServers` through `--settings`; Codex gets an `enabled=false`
+override for every other discovered server and no relaunch without them.
+Malformed values warn once and inherit. Claude 2.1.283 matches allowlisted
+names against configured servers only, so strict mode always blocks Claude
+plugin MCP servers. Codex plugin MCPs and macOS-managed preferences are not
+discovered.
+
 **Harness settings navigation:** Settings sidebar → Harnesses, a direct link to
 `/settings/harnesses` or its harness detail pages, or the import review modal
 shown once for the host desktop onboarding just connected → See more. It opens
@@ -1168,7 +1179,10 @@ Cross-harness journeys:
   For enablement, also run `tests/host/test_mcp_inventory.py` and
   `tests/server/routes/test_mcp_servers.py`. The non-browser journey
   `tests/e2e/test_mcp_disabled_servers.py` checks both native CLIs, a disabled
-  fixture, an enabled control, and the Omnigent relay without building the SPA.
+  fixture, an enabled control, and the Omnigent relay without building the SPA;
+  its `strict` cases do the same with `mcp: {inherit: false}` and no host flag.
+  Strict planning and config parsing are in `tests/test_mcp_disabled_servers*.py`
+  and `tests/test_mcp_inheritance.py`.
   Disabled plugin MCP rows stay visible without expansion or probes. Check
   same-name plugins from different marketplaces return their respective tools.
   HTTP probes honor the host's proxy and certificate environment settings.

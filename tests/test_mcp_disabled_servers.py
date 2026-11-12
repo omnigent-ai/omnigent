@@ -15,6 +15,7 @@ from omnigent.mcp_disabled_servers import (
     is_disabled,
     set_disabled,
 )
+from tests._helpers.mcp_disabled_servers import write_mcp_inheritance
 
 
 @pytest.fixture(autouse=True)
@@ -181,6 +182,62 @@ def test_malformed_sdk_settings_fail_open(settings):
         apply_claude_settings(settings, executor="claude-sdk", active_harnesses=["claude"])
         is settings
     )
+
+
+@pytest.mark.parametrize("executor", ["claude-native", "claude-sdk"])
+@pytest.mark.parametrize("active", [None, ["claude"]])
+def test_claude_strict_allowlist_replaces_caller_allowlist(executor, active):
+    write_mcp_inheritance({"inherit": False, "allow": ["zeta", "alpha", "omnigent"]})
+    set_disabled(ServerKey("claude", "github"), True)
+    original = {"allowedMcpServers": [{"serverName": "caller"}], "other": [1]}
+    settings = original if executor == "claude-native" else json.dumps(original)
+    result = apply_claude_settings(settings, executor=executor, active_harnesses=active)
+    parsed = result if isinstance(result, dict) else json.loads(result)
+    expected = {
+        "other": [1],
+        "allowedMcpServers": [
+            {"serverName": "omnigent"},
+            {"serverName": "alpha"},
+            {"serverName": "zeta"},
+        ],
+    }
+    if active:
+        expected["deniedMcpServers"] = [{"serverName": "github"}]
+    assert parsed == expected
+    assert original["allowedMcpServers"] == [{"serverName": "caller"}]
+    assert apply_claude_settings(result, executor=executor, active_harnesses=active) is result
+
+
+def test_claude_strict_starts_from_empty_sdk_settings():
+    write_mcp_inheritance({"inherit": False})
+    result = apply_claude_settings(None, executor="claude-sdk", active_harnesses=None)
+    assert json.loads(result) == {"allowedMcpServers": [{"serverName": "omnigent"}]}
+
+
+def test_claude_strict_follows_executor_override():
+    write_mcp_inheritance({"inherit": False})
+    path = global_config_path()
+    path.write_text(
+        path.read_text() + "harness:\n  claude-native:\n    mcp:\n      inherit: true\n"
+    )
+    assert apply_claude_settings({}, executor="claude-native", active_harnesses=None) == {}
+    assert "allowedMcpServers" in json.loads(
+        apply_claude_settings("{}", executor="claude-sdk", active_harnesses=None)
+    )
+
+
+def test_claude_loaded_anyway_reports_names_outside_strict_allowlist():
+    write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
+    set_disabled(ServerKey("claude", "kept"), True)
+    assert claude_loaded_anyway(
+        ["omnigent", "kept", "extra", "plugin:tools:notion", "extra"], active_harnesses=["claude"]
+    ) == ("kept", "extra", "plugin:tools:notion")
+
+
+def test_malformed_sdk_settings_warn_in_strict_mode(caplog):
+    write_mcp_inheritance({"inherit": False})
+    assert apply_claude_settings("[]", executor="claude-sdk", active_harnesses=None) == "[]"
+    assert "mcp_strict_not_applied executor=claude-sdk reason=settings" in caplog.text
 
 
 def test_thread_writers_do_not_lose_updates():

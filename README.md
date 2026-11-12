@@ -514,6 +514,36 @@ runs the session.
 
 </details>
 
+<details>
+<summary>Limit which MCP servers launched agents load</summary>
+
+By default, Claude Code and Codex sessions that Omnigent launches load the same
+MCP servers as the CLI on its own. To start them with only Omnigent's tools plus
+servers you name, add this to `~/.omnigent/config.yaml`:
+
+```yaml
+mcp:
+  inherit: false
+  allow: [github] # optional; Omnigent's own `omnigent` server is always kept
+harness:
+  codex-native:
+    mcp:
+      inherit: true # optional per-harness override
+```
+
+This applies to `omnigent claude`, `omnigent codex`, and Claude/Codex SDK
+sessions started on this machine, including new sessions and cold resumes.
+Claude receives an `allowedMcpServers` setting. Codex receives
+`-c mcp_servers.<name>.enabled=false` for every other server it would load from
+the system, user, trusted project, command-line, and managed config layers.
+Your own Claude and Codex configuration files are not modified, and project
+`.omnigent/config.yaml` files cannot change this setting. Per-harness keys are
+`claude-native`, `claude-sdk` (or `claude`), `codex-native`, and `codex`.
+Claude plugin MCP servers cannot be allowlisted by name, so strict mode blocks
+them.
+
+</details>
+
 ### 3. Choose & switch models
 
 ```bash

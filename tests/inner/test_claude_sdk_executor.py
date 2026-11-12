@@ -7683,10 +7683,11 @@ async def test_turn_options_expose_ask_user_question_only_with_its_hook(
     assert ("AskUserQuestion" in matchers) is bridge_wired
 
 
+@pytest.mark.parametrize("strict", [False, True])
 @pytest.mark.parametrize("saved", [False, True])
 @pytest.mark.parametrize("active", [None, [], ["claude"]])
-async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved):
-    from tests._helpers.mcp_disabled_servers import launch_activation
+async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved, strict):
+    from tests._helpers.mcp_disabled_servers import launch_activation, write_mcp_inheritance
 
     active = launch_activation(active)
 
@@ -7695,6 +7696,8 @@ async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     if saved:
         set_disabled(ServerKey("claude", "fixture"), True)
+    if strict:
+        write_mcp_inheritance({"inherit": False, "allow": ["fixture"]})
     original = ' {"other": true} '
     with (
         patch(
@@ -7707,11 +7710,13 @@ async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, 
         options = await _turn_options(_default_executor(active_harnesses=active))
     hook.assert_called_once()
     assert hook.call_args.kwargs == {"executor": "claude-sdk", "active_harnesses": active}
+    expected = {"other": True}
     if active and saved:
-        assert json.loads(options.settings) == {
-            "other": True,
-            "deniedMcpServers": [{"serverName": "fixture"}],
-        }
+        expected["deniedMcpServers"] = [{"serverName": "fixture"}]
+    if strict:
+        expected["allowedMcpServers"] = [{"serverName": "omnigent"}, {"serverName": "fixture"}]
+    if len(expected) > 1:
+        assert json.loads(options.settings) == expected
     else:
         assert options.settings is original
 

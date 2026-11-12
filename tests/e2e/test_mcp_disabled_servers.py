@@ -1,4 +1,4 @@
-"""Real native CLIs must omit disabled servers and retain the Omnigent relay.
+"""Real native CLIs must omit disabled or non-allowlisted servers and retain the Omnigent relay.
 
 CI pins Claude 2.1.295 and Codex 0.142.0 in setup-harness-cli/manifest.json.
 """
@@ -61,9 +61,10 @@ def server_version(mcp_enabled_server: str) -> str:
 @pytest.mark.min_server_version("0.22.0.dev0")
 @pytest.mark.min_runner_version("0.22.0.dev0")
 @pytest.mark.timeout(300)
+@pytest.mark.parametrize("control", ["switch", "strict"])
 @pytest.mark.parametrize("harness", ["claude", "codex"])
 def test_disabled_server_absent_from_real_native_session(
-    mcp_enabled_server: str, mock_llm_server_url: str, tmp_path: Path, harness: str
+    mcp_enabled_server: str, mock_llm_server_url: str, tmp_path: Path, harness: str, control: str
 ) -> None:
     if shutil.which(harness) is None:
         pytest.skip(f"needs the {harness} CLI")
@@ -88,7 +89,7 @@ def test_disabled_server_absent_from_real_native_session(
         # Exercise Codex's project layer as well as its private user-home copy.
         (workspace / ".codex").mkdir()
         (workspace / ".codex/config.toml").write_text(text)
-    model = f"mcp-disable-{harness}-{tmp_path.name}"
+    model = f"mcp-{control}-{harness}-{tmp_path.name}"
     family = "anthropic" if harness == "claude" else "openai"
     provider = {
         "base_url": mock_llm_server_url if harness == "claude" else f"{mock_llm_server_url}/v1",
@@ -113,12 +114,18 @@ def test_disabled_server_absent_from_real_native_session(
             },
         )
     configure_mock_llm(mock_llm_server_url, responses, key=model)
+    host_config: dict[str, object] = {
+        "providers": {"test": {"kind": "key", "default": [family], family: provider}}
+    }
+    if control == "strict":
+        # The user-config allowlist needs no host disable state or server feature flag.
+        host_config["mcp"] = {"inherit": False, "allow": ["on_fixture"]}
     with (
         httpx.Client(base_url=mcp_enabled_server, timeout=120) as client,
         isolated_host(
             tmp_path / "host",
             mcp_enabled_server,
-            config={"providers": {"test": {"kind": "key", "default": [family], family: provider}}},
+            config=host_config,
             env={
                 "CLAUDE_CONFIG_DIR": None,
                 "CODEX_HOME": None,
@@ -128,15 +135,16 @@ def test_disabled_server_absent_from_real_native_session(
             ready=lambda host: host.wait_online(client, timeout=90),
         ) as host,
     ):
-        response = client.put(
-            f"/v1/hosts/{host.host_id}/mcp-servers/enabled",
-            json={
-                "harness": harness,
-                "server": "off_fixture",
-                "enabled": False,
-            },
-        )
-        response.raise_for_status()
+        if control == "switch":
+            response = client.put(
+                f"/v1/hosts/{host.host_id}/mcp-servers/enabled",
+                json={
+                    "harness": harness,
+                    "server": "off_fixture",
+                    "enabled": False,
+                },
+            )
+            response.raise_for_status()
         session = create_native_session(
             client,
             mcp_enabled_server,
