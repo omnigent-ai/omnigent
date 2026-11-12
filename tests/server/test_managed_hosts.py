@@ -21,7 +21,7 @@ import click
 import pytest
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 from omnigent.db.utils import builtin_agent_id, generate_agent_id, now_epoch
 from omnigent.entities.agent import Agent
@@ -2360,9 +2360,73 @@ def test_provider_ui_capabilities_reports_multi_repo_per_provider() -> None:
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "single": {"multi_repo": False},
-        "multi": {"multi_repo": True},
+        "single": {"multi_repo": False, "accepts_session_move": True},
+        "multi": {"multi_repo": True, "accepts_session_move": True},
     }
+
+
+class _NoticeLauncher(FakeSandboxLauncher):
+    """A provider whose unattended runs need the owner to keep a credential fresh."""
+
+    automation_notice = "Keep your laptop's credentials fresh."
+
+
+def test_provider_automation_notices_list_only_launchable_providers_that_set_one() -> None:
+    """A launchable provider's automation notice reaches /v1/info for the automation
+    form; a provider without one, or one that can't launch, is absent."""
+
+    def unlaunchable_factory() -> _NoticeLauncher:
+        raise AssertionError("a provider that can't launch must not be instantiated")
+
+    deployment = ManagedSandboxDeployment(
+        configs=(
+            *(
+                ManagedSandboxConfig(
+                    server_url="https://s",
+                    provider=provider,
+                    token_ttl_s=3600,
+                    launcher_factory=factory,
+                )
+                for provider, factory in (
+                    ("noted", _NoticeLauncher),
+                    ("plain", FakeSandboxLauncher),
+                )
+            ),
+            ManagedSandboxConfig(
+                server_url="https://s",
+                provider="unlaunchable",
+                token_ttl_s=3600,
+                launcher_factory=unlaunchable_factory,
+                managed_launch_supported=False,
+            ),
+        )
+    )
+
+    assert deployment.provider_automation_notices() == {
+        "noted": "Keep your laptop's credentials fresh."
+    }
+
+
+def test_provider_ui_capabilities_report_which_providers_take_a_moved_session() -> None:
+    """A provider that manages sandbox profiles is reported as no destination for
+    a move, which the move route refuses, whether profile discovery is on or not."""
+    deployment = ManagedSandboxDeployment(
+        configs=tuple(
+            ManagedSandboxConfig(
+                server_url="https://s",
+                provider=provider,
+                token_ttl_s=3600,
+                launcher_factory=FakeSandboxLauncher,
+                manages_profiles=manages_profiles,
+            )
+            for provider, manages_profiles in (("plain", False), ("profiled", True))
+        )
+    )
+
+    capabilities = deployment.provider_ui_capabilities()
+
+    assert capabilities["plain"]["accepts_session_move"] is True
+    assert capabilities["profiled"]["accepts_session_move"] is False
 
 
 def test_provider_ui_capabilities_enable_inference_only_on_configured_target() -> None:
@@ -2388,9 +2452,13 @@ def test_provider_ui_capabilities_enable_inference_only_on_configured_target() -
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "kubernetes": {"multi_repo": False},
-        "modal": {"multi_repo": False},
-        "agent_sandbox": {"multi_repo": False, "inference_models": True},
+        "kubernetes": {"multi_repo": False, "accepts_session_move": True},
+        "modal": {"multi_repo": False, "accepts_session_move": True},
+        "agent_sandbox": {
+            "multi_repo": False,
+            "accepts_session_move": True,
+            "inference_models": True,
+        },
     }
 
 
@@ -2442,12 +2510,12 @@ def test_provider_ui_capabilities_advertise_default_models_for_unbound_discovery
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "hooked": {"multi_repo": False, "default_models": True},
-        "discovered": {"multi_repo": False, "default_models": True},
-        "static": {"multi_repo": False},
-        "bound": {"multi_repo": False, "inference_models": True},
-        "malformed": {"multi_repo": False},
-        "malformed-inference": {"multi_repo": False},
+        "hooked": {"multi_repo": False, "accepts_session_move": True, "default_models": True},
+        "discovered": {"multi_repo": False, "accepts_session_move": True, "default_models": True},
+        "static": {"multi_repo": False, "accepts_session_move": True},
+        "bound": {"multi_repo": False, "accepts_session_move": True, "inference_models": True},
+        "malformed": {"multi_repo": False, "accepts_session_move": True},
+        "malformed-inference": {"multi_repo": False, "accepts_session_move": True},
     }
 
 
@@ -2594,6 +2662,33 @@ async def test_info_reports_enabled_for_injected_custom_launcher(
     # No provider set on the injected config → the UI keeps the generic
     # label rather than inventing a name.
     assert body["sandbox_provider"] is None
+
+
+async def test_info_reports_a_providers_automation_notice_apart_from_its_flags(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """``GET /v1/info`` reports a provider's text notice in its own map, so the
+    capability map keeps its boolean-valued contract."""
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://s.example.com",
+            provider="noted",
+            launcher_factory=_NoticeLauncher,
+            token_ttl_s=3600,
+        )
+    )
+    app = _capability_probe_app(db_uri, tmp_path, config)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/v1/info")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["sandbox_provider_automation_notices"] == {
+        "noted": "Keep your laptop's credentials fresh."
+    }
+    capabilities = body["sandbox_provider_capabilities"]
+    assert capabilities == {"noted": {"multi_repo": False, "accepts_session_move": True}}
+    TypeAdapter(dict[str, dict[str, bool]]).validate_python(capabilities, strict=True)
 
 
 # ── launch_managed_host ─────────────────────────────────────

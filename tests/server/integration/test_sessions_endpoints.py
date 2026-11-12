@@ -5880,12 +5880,14 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     assert relay_bindings == [(sid, "runner_recovered")]
 
 
+@pytest.mark.parametrize("wire_output", [None, "HOOK_FINAL", ""])
 async def test_post_external_session_status_idle_forwards_persisted_assistant_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    wire_output: str | None,
 ) -> None:
     """
-    Native idle status forwarding includes AP-persisted assistant text.
+    A confirmed native idle keeps the hook reply; otherwise persisted text fills it.
 
     The native forwarder posts transcript items to Omnigent server, then posts
     ``external_session_status: idle``. The runner's sub-agent registry
@@ -5950,9 +5952,14 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
         assert item_resp.status_code == 202, item_resp.text
 
         forwarded.clear()
+        status_data: dict[str, Any] = {"status": "idle"}
+        if wire_output is not None:
+            # The Claude ``Stop`` edge carries its reply with ``turn_completed``.
+            status_data["output"] = wire_output
+            status_data["turn_completed"] = True
         status_resp = await client.post(
             f"/v1/sessions/{child['id']}/events",
-            json={"type": "external_session_status", "data": {"status": "idle"}},
+            json={"type": "external_session_status", "data": status_data},
         )
 
     assert status_resp.status_code == 202, status_resp.text
@@ -5961,7 +5968,11 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
             "path": f"/v1/sessions/{child['id']}/events",
             "body": {
                 "type": "external_session_status",
-                "data": {"status": "idle", "output": "AP_NATIVE_DONE"},
+                "data": (
+                    {"status": "idle", "output": "AP_NATIVE_DONE"}
+                    if wire_output is None
+                    else {"status": "idle", "output": wire_output, "turn_completed": True}
+                ),
                 "model_override": None,
                 "tools": None,
                 "created_by": None,

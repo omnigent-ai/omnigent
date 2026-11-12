@@ -1,3 +1,4 @@
+import { isAdminViewEnabled } from "@/lib/adminView";
 import { modelOptionSchema } from "./modelCatalogCache";
 import { z } from "zod";
 import { readRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
@@ -67,7 +68,7 @@ export function getNewChatPickerCacheKey(project?: string, userId?: string | nul
   const server = getOmnigentServerIdentity();
   const user = userId === undefined ? getCurrentUserId() : userId;
   if (server === null || user === null) return null;
-  return `omnigent:new-chat-picker:v2:${JSON.stringify([server, user, project])}`;
+  return `omnigent:new-chat-picker:v2:${JSON.stringify([server, user, project, isAdminViewEnabled()])}`;
 }
 
 function preferenceSignature(preview: { agent: NewChatPickerPreview["agent"] }): string {

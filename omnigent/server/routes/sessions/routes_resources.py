@@ -1085,7 +1085,8 @@ def register_resources_routes(
         :param op: Host-side write op — ``"github_set_preference"``,
             ``"github_prs_update"``, ``"github_labels_update"``,
             ``"github_reviewers_update"``, ``"github_details_update"``,
-            ``"github_comment_create"``, ``"github_attachment_upload"``, ``"github_merge"``, or
+            ``"github_comment_create"``, ``"github_attachment_upload"``, ``"github_merge"``,
+            ``"github_merge_as"``, or
             ``"github_disable_auto_merge"``.
         :param host_params: Op-specific args for the host writer.
         :param timeout: Seconds to wait for the host; the tunnel's default when ``None``.
@@ -3003,6 +3004,45 @@ def register_resources_routes(
         )
 
     @file_read_router.get(
+        "/sessions/{session_id}/resources/github/compare-diff",
+        # Internal (UI "Changes since" view) — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def read_github_compare_diff(
+        request: Request,
+        session_id: str,
+        pr_url: str | None = None,
+        head_sha: str | None = None,
+        from_sha: str | None = None,
+    ) -> Any:
+        """
+        Return the selected PR's changes after one of its commits, up to its head.
+
+        Falls back to the host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param head_sha: The PR head the panel shows, a full commit id.
+        :param from_sha: One of the PR's commits, a full commit id.
+        :returns: JSON with the ``patch`` text.
+        """
+        conv = await _authorize_browse_read(session_id, request)
+        params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        if head_sha is not None:
+            params["head_sha"] = head_sha
+        if from_sha is not None:
+            params["from_sha"] = from_sha
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_compare_diff",
+            host_params=params,
+            runner_params=params or None,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/compare-diff",
+        )
+
+    @file_read_router.get(
         "/sessions/{session_id}/resources/github/diff/{relative_path:path}",
         # Internal (UI GitHub diff view) — hidden from the public API reference.
         include_in_schema=False,
@@ -3958,6 +3998,44 @@ def register_resources_routes(
                 "pr_url": body["pr_url"],
                 "merge_method": body.get("merge_method"),
                 "expected_head": body.get("expected_head"),
+            },
+            failure_detail="Cannot merge the pull request",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/merge-as",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def merge_session_github_pr_as(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Merge the selected PR as the account the merge dialog showed.
+
+        A route apart from ``/merge``, so a server, runner, or host that can't
+        bind the account refuses the request instead of merging as the saved one.
+
+        :param request: JSON body with the ``/merge`` fields and ``account``, the
+            login the merge runs as.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_merge``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        account = body.get("account")
+        if not isinstance(account, str) or not account.strip():
+            raise HTTPException(status_code=400, detail="Expected an account to merge as")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/merge-as",
+            host_op="github_merge_as",
+            params={
+                "pr_url": body["pr_url"],
+                "merge_method": body.get("merge_method"),
+                "expected_head": body.get("expected_head"),
+                "account": account,
             },
             failure_detail="Cannot merge the pull request",
         )

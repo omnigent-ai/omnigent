@@ -1,6 +1,7 @@
 import type { ComponentType, ReactNode, Ref } from "react";
 
 import { getBasePath, withBasePath } from "./basePath.ts";
+import { clientRoutingKey, SLICE_KEY_HEADER, SLICE_KEY_PARAM } from "./routingKey.ts";
 
 /**
  * Embed host integration seam.
@@ -334,25 +335,62 @@ export function getThemeRoots(): HTMLElement[] {
   return typeof document !== "undefined" ? [document.documentElement] : [];
 }
 
+/** Routing options for a request to the Omnigent server. */
+export interface RoutingOptions {
+  /** Send no slice key, to reach a host whose tunnels connected without one. */
+  unkeyed?: boolean;
+}
+
+/**
+ * `init` with the client's slice key added when host routing is on and the
+ * request carries no key yet, so every request names a replica.
+ */
+export function withRoutingKey(
+  init?: RequestInit,
+  options?: RoutingOptions,
+): RequestInit | undefined {
+  if (options?.unkeyed || !isHostRoutingEnabled()) return init;
+  const headers = new Headers(init?.headers);
+  if (headers.has(SLICE_KEY_HEADER)) return init;
+  headers.set(SLICE_KEY_HEADER, clientRoutingKey());
+  return { ...init, headers };
+}
+
+/** `path` with the client's slice key as a query parameter when it carries none. */
+export function withRoutingKeyParam(path: string, options?: RoutingOptions): string {
+  if (options?.unkeyed || !isHostRoutingEnabled()) return path;
+  const [base, query = ""] = path.split("?", 2);
+  const params = new URLSearchParams(query);
+  if (params.has(SLICE_KEY_PARAM)) return path;
+  params.set(SLICE_KEY_PARAM, clientRoutingKey());
+  return `${base}?${params}`;
+}
+
 /**
  * Single network choke point. Delegates to the host fetcher when embedded,
  * otherwise calls native `fetch` with the path unchanged (standalone).
  */
-export function hostFetch(path: string, init?: RequestInit): Promise<Response> {
+export function hostFetch(
+  path: string,
+  init?: RequestInit,
+  options?: RoutingOptions,
+): Promise<Response> {
+  const routedInit = withRoutingKey(init, options);
   if (hostConfig.fetcher) {
     // The host owns path rebasing (it proxies onto its own API surface), so
     // the path is passed through untouched — `withBasePath` is standalone-only.
-    return hostConfig.fetcher(path, init);
+    return hostConfig.fetcher(path, routedInit);
   }
-  return fetch(withBasePath(path), init);
+  return fetch(withBasePath(path), routedInit);
 }
 
-export function resolveWebSocketUrl(path: string): string {
+export function resolveWebSocketUrl(path: string, options?: RoutingOptions): string {
+  const routedPath = withRoutingKeyParam(path, options);
   if (hostConfig.resolveWebSocketUrl) {
-    return hostConfig.resolveWebSocketUrl(path);
+    return hostConfig.resolveWebSocketUrl(routedPath);
   }
   const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${scheme}//${window.location.host}${withBasePath(path)}`;
+  return `${scheme}//${window.location.host}${withBasePath(routedPath)}`;
 }
 
 /** The host's directly loadable media URL for an API path, or null to fetch through `fetcher`. */
