@@ -17,6 +17,8 @@ import {
 import {
   ArrowUpIcon,
   CheckIcon,
+  ChevronRightIcon,
+  ChevronUpIcon,
   CopyIcon,
   CornerDownRightIcon,
   FileTextIcon,
@@ -64,7 +66,7 @@ import { RunningDot } from "@/components/RunningDot";
 import { cn } from "@/lib/utils";
 import { readableSentText, replaceSentMentions } from "@/lib/composerMentions";
 import { mentionPillMarkdown } from "@/lib/mentionPills";
-import { splitSessionMessageOrigin } from "@/lib/sessionMessageOrigin";
+import { splitSessionMessageOrigin, type SessionMessageOrigin } from "@/lib/sessionMessageOrigin";
 import { useSessionLabel } from "@/hooks/useSessionLabel";
 import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
@@ -104,6 +106,7 @@ import { codexAsyncQuestionReplyText } from "@/lib/codexAsyncQuestionReply";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
+import { usePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
 import type { BackgroundTaskInfo, PendingInput, SessionStatus } from "@/lib/types";
 import {
   TRANSCRIPT_SCROLLBAR_DRAG_EVENT,
@@ -127,6 +130,11 @@ function userMessageBody(content: MessageContentBlock[]): string {
   return codexAsyncQuestionReplyText(splitSessionMessageOrigin(text)?.body ?? text);
 }
 
+/** The sending session of a user message another session sent, or null. */
+export function userMessageOrigin(content: MessageContentBlock[]): SessionMessageOrigin | null {
+  return splitSessionMessageOrigin(stripAutomationContext(joinTextBlocks(content)));
+}
+
 /** A user message's text for reading and copying: mention markers become ``@name``. */
 export function extractUserText(content: MessageContentBlock[]): string {
   return readableSentText(userMessageBody(content)).trimEnd();
@@ -141,15 +149,17 @@ function userMarkdownText(content: MessageContentBlock[]): string {
 function SessionMessageOriginLine({
   sourceId,
   currentSessionId,
+  className,
 }: {
   sourceId: string;
   currentSessionId: string | null;
+  className?: string;
 }) {
   const label = useSessionLabel(sourceId, currentSessionId);
   return (
     <div
       data-testid="message-origin"
-      className="mb-1 flex items-center gap-1 text-xs text-muted-foreground"
+      className={cn("flex shrink-0 items-center gap-1 text-xs text-muted-foreground", className)}
     >
       <CornerDownRightIcon className="size-3 shrink-0" />
       <span>From</span>
@@ -161,6 +171,51 @@ function SessionMessageOriginLine({
         <span>another session</span>
       )}
     </div>
+  );
+}
+
+/** A collapsed message from another session: its sender and first line, expandable. */
+function CollapsedSessionMessage({
+  bubble,
+  origin,
+  text,
+  currentSessionId,
+  onExpand,
+}: {
+  bubble: Extract<Bubble, { kind: "user" }>;
+  origin: SessionMessageOrigin;
+  text: string;
+  currentSessionId: string | null;
+  onExpand: () => void;
+}) {
+  const preview = text.split("\n").find((line) => line.trim().length > 0) ?? "";
+  return (
+    <Message
+      from="user"
+      data-testid="message-bubble"
+      data-role="user"
+      data-user-message-id={bubble.itemId}
+      data-message-id={bubble.itemId}
+      className="max-w-[640px]"
+    >
+      <div
+        data-testid="collapsed-session-message"
+        className="ml-auto flex w-fit max-w-full items-center gap-2 rounded-lg bg-muted px-3 py-1.5"
+      >
+        <SessionMessageOriginLine sourceId={origin.sourceId} currentSessionId={currentSessionId} />
+        <button
+          type="button"
+          onClick={onExpand}
+          aria-expanded={false}
+          aria-label="Show message"
+          data-testid="expand-session-message"
+          className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <span className="min-w-0 truncate">{preview}</span>
+          <ChevronRightIcon className="size-3 shrink-0" />
+        </button>
+      </div>
+    </Message>
   );
 }
 
@@ -1009,9 +1064,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   //   previewed inline).
   const isShellCommand = bubble.shellCommand !== undefined;
   const text = isShellCommand ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
-  const origin = isShellCommand
-    ? null
-    : splitSessionMessageOrigin(stripAutomationContext(joinTextBlocks(bubble.content)));
+  const origin = isShellCommand ? null : userMessageOrigin(bubble.content);
+  const collapsesOrigin = usePeerSessionMessageDisplay() === "collapse" && origin !== null;
+  const [originExpanded, setOriginExpanded] = useState(false);
   const images = bubble.content.filter((c): c is ImageContentBlock => c.type === "input_image");
   const fileChips = bubble.content.filter(
     (c): c is Extract<MessageContentBlock, { type: "input_file" }> => c.type === "input_file",
@@ -1042,6 +1097,17 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   if (!origin && images.length === 0 && fileChips.length === 0) {
     const parsed = parseSystemMessage(text);
     if (parsed) return <SystemMessageView message={parsed} />;
+  }
+  if (origin && collapsesOrigin && !originExpanded) {
+    return (
+      <CollapsedSessionMessage
+        bubble={bubble}
+        origin={origin}
+        text={text}
+        currentSessionId={sessionId ?? null}
+        onExpand={() => setOriginExpanded(true)}
+      />
+    );
   }
   // Badge OTHER contributors' messages only (never your own).
   const author = bubble.createdBy;
@@ -1146,10 +1212,24 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 }
               >
                 {origin && (
-                  <SessionMessageOriginLine
-                    sourceId={origin.sourceId}
-                    currentSessionId={sessionId ?? null}
-                  />
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <SessionMessageOriginLine
+                      sourceId={origin.sourceId}
+                      currentSessionId={sessionId ?? null}
+                    />
+                    {collapsesOrigin && (
+                      <button
+                        type="button"
+                        onClick={() => setOriginExpanded(false)}
+                        aria-expanded
+                        aria-label="Collapse message"
+                        data-testid="collapse-session-message"
+                        className="text-muted-foreground transition-colors hover:text-foreground"
+                      >
+                        <ChevronUpIcon className="size-3" />
+                      </button>
+                    )}
+                  </div>
                 )}
                 {/* Non-image file chips */}
                 {fileChips.length > 0 && (
