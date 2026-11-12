@@ -94,6 +94,12 @@ def resolve_mcp_inheritance(
                 f"{type(error).__name__}; inheriting all MCP servers"
             )
             return McpInheritance()
+        if not isinstance(cfg, Mapping):
+            _warn_once(
+                f"cannot read MCP inheritance from {global_config_path()}: "
+                "not a mapping; inheriting all MCP servers"
+            )
+            return McpInheritance()
     if not isinstance(cfg, Mapping):
         return McpInheritance()
     fields = _parse(cfg.get("mcp"), "mcp")

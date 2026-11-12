@@ -238,12 +238,10 @@ def _claude_inherited_settings_paths(cwd: Path, executor: str) -> list[Path]:
     """List the user, project, local and managed settings files Claude merges from *cwd*."""
     from omnigent.onboarding import ambient
 
-    project_root = _claude_project_root(cwd)
-    paths = [
-        ambient.claude_user_settings_path(cwd),
-        project_root / ".claude" / "settings.json",
-        project_root / ".claude" / "settings.local.json",
-    ]
+    paths = [ambient.claude_user_settings_path(cwd)]
+    for directory in _claude_project_directories(cwd):
+        paths.append(directory / ".claude" / "settings.json")
+        paths.append(directory / ".claude" / "settings.local.json")
     for managed in ambient.claude_code_platform_managed_settings_paths():
         paths.append(managed)
         drop_ins = managed.with_name("managed-settings.d")
@@ -257,10 +255,16 @@ def _claude_inherited_settings_paths(cwd: Path, executor: str) -> list[Path]:
     return list(dict.fromkeys(paths))
 
 
-def _claude_project_root(cwd: Path) -> Path:
-    return next(
+def _claude_project_directories(cwd: Path) -> list[Path]:
+    """The launch directory, its Git root and, for a linked worktree, the main checkout.
+
+    Claude versions differ in which of these they read project and local settings
+    from, so strict mode reads all of them.
+    """
+    git_root = next(
         (directory for directory in (cwd, *cwd.parents) if (directory / ".git").exists()), cwd
     )
+    return list(dict.fromkeys(path for path in (cwd, git_root, _canonical_git_root(cwd)) if path))
 
 
 def _claude_allowlisted_servers(
@@ -288,9 +292,8 @@ def _claude_allowlisted_servers(
             cwd / Path(configured) / ".claude.json" if configured else Path.home() / ".claude.json"
         )
         projects = user.get("projects")
-        directories = list(dict.fromkeys((cwd, _claude_project_root(cwd))))
         tables.append(servers_in(user))
-        for directory in directories:
+        for directory in _claude_project_directories(cwd):
             tables.append(
                 servers_in(projects.get(str(directory)) if isinstance(projects, dict) else None)
             )
@@ -492,21 +495,26 @@ def _read_codex_config(path: Path, unreadable: list[Path]) -> dict[str, Any]:
         return {}
 
 
-def _codex_cli_overrides(overrides: Sequence[str], config_path: Path) -> dict[str, Any]:
-    """Build Codex's single CLI layer, assigning each dotted path in order."""
+def _codex_cli_overrides(
+    overrides: Sequence[str], config_path: Path, unreadable: list[Path] | None = None
+) -> dict[str, Any]:
+    """Build Codex's single CLI layer, assigning each dotted path in order.
+
+    An ``mcp_servers`` or ``mcp_servers.<name>`` override that is not a TOML table
+    goes to *unreadable*, since the servers it was meant to configure are unknown.
+    """
     result: dict[str, Any] = {}
     for override in overrides:
         key, separator, value = override.partition("=")
+        # Codex splits the key literally; TOML quoting applies only to the value.
+        *parents, name = key.strip().split(".")
+        server_table = [*parents, name][:1] == ["mcp_servers"] and len(parents) <= 1
         try:
             if not separator:
                 raise ValueError("Missing assignment")
-            try:
-                parsed = tomllib.loads(f"value={value}")["value"]
-            except ValueError:
-                # Codex accepts unquoted strings when a value is not valid TOML.
-                parsed = value.strip()
-            # Codex splits the key literally; TOML quoting applies only to the value.
-            *parents, name = key.strip().split(".")
+            parsed = _parse_codex_override_value(value)
+            if server_table and not isinstance(parsed, dict) and unreadable is not None:
+                unreadable.append(Path(f"-c {key.strip()}"))
             target = result
             for parent in parents:
                 if not isinstance(target.get(parent), dict):
@@ -518,10 +526,25 @@ def _codex_cli_overrides(overrides: Sequence[str], config_path: Path) -> dict[st
             _log_read_failure(
                 config_path, "InvalidOverride", event="mcp_disabled_codex_config_read_failed"
             )
+            if server_table and unreadable is not None:
+                unreadable.append(Path(f"-c {key.strip()}"))
     return result
 
 
-def _codex_git_root(cwd: Path) -> Path | None:
+def _parse_codex_override_value(value: str) -> object:
+    try:
+        return tomllib.loads(f"value={value}")["value"]
+    except ValueError:
+        pass
+    try:
+        # Codex accepts TOML 1.1 forms, such as multiline inline tables.
+        return tomlkit.parse(f"value={value}").unwrap()["value"]
+    except (TOMLKitError, ValueError, KeyError):
+        # Codex accepts unquoted strings when a value is not valid TOML.
+        return value.strip()
+
+
+def _canonical_git_root(cwd: Path) -> Path | None:
     """Resolve the trust root, including linked worktrees, without invoking git."""
     for directory in (cwd, *cwd.parents):
         dot_git = directory / ".git"
@@ -574,7 +597,7 @@ def _codex_server_names(
     if os.name == "posix":
         _merge_tables(config, _read_codex_config(CODEX_SYSTEM_CONFIG_PATH, unreadable))
     _merge_tables(config, _read_codex_config(config_path, unreadable))
-    cli = _codex_cli_overrides(config_overrides, config_path)
+    cli = _codex_cli_overrides(config_overrides, config_path, unreadable)
     discovery: dict[str, Any] = {}
     _merge_tables(discovery, config)
     _merge_tables(discovery, cli)
@@ -598,7 +621,7 @@ def _codex_server_names(
         ):
             root = directory
             break
-    git_root = _codex_git_root(cwd)
+    git_root = _canonical_git_root(cwd)
     projects = discovery.get("projects", {})
     layers = list(directories[: directories.index(root) + 1])
     for directory in reversed(layers):

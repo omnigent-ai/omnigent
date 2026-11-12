@@ -290,7 +290,7 @@ def test_claude_strict_denies_inherited_allow_entries(executor, tmp_path, claude
         managed.with_name("managed-settings.d") / "10-team.json",
         {"allowedMcpServers": [{"serverName": "drop_in_only"}]},
     )
-    # Project settings come from the repository root, not the launch subdirectory.
+    # Claude versions read project settings from the launch directory or the Git root.
     _write_json(
         claude_project / "sub/.claude/settings.json",
         {"allowedMcpServers": [{"serverName": "subdirectory_only"}]},
@@ -307,6 +307,7 @@ def test_claude_strict_denies_inherited_allow_entries(executor, tmp_path, claude
             {"serverName": "user_only"},
             command,
             url,
+            {"serverName": "subdirectory_only"},
             {"serverName": "project_only"},
             {"serverName": "local_only"},
             {"serverName": "managed_only"},
@@ -314,6 +315,39 @@ def test_claude_strict_denies_inherited_allow_entries(executor, tmp_path, claude
         ],
         "allowedMcpServers": [{"serverName": "omnigent"}, {"serverName": "kept"}],
     }
+
+
+@pytest.mark.parametrize("main_local", ["readable", "unreadable"])
+def test_claude_strict_reads_linked_worktree_and_main_checkout_settings(
+    claude_project, main_local
+):
+    write_mcp_inheritance({"inherit": False})
+    worktree = claude_project.parent / "worktree"
+    metadata = claude_project / ".git/worktrees/session"
+    _write_json(metadata / "commondir", "../..\n")
+    _write_json(metadata / "gitdir", str(worktree / ".git"))
+    _write_json(worktree / ".git", f"gitdir: {metadata}\n")
+    _write_json(
+        worktree / ".claude/settings.local.json",
+        {"allowedMcpServers": [{"serverName": "worktree_local"}]},
+    )
+    main_settings = claude_project / ".claude/settings.local.json"
+    if main_local == "unreadable":
+        main_settings.mkdir(parents=True)
+        with pytest.raises(McpStrictModeError) as raised:
+            apply_claude_settings(
+                {}, executor="claude-native", active_harnesses=None, cwd=worktree
+            )
+        assert raised.value.path == main_settings
+        return
+    _write_json(main_settings, {"allowedMcpServers": [{"serverName": "main_local"}]})
+    result = apply_claude_settings(
+        {}, executor="claude-native", active_harnesses=None, cwd=worktree
+    )
+    assert result["deniedMcpServers"] == [
+        {"serverName": "worktree_local"},
+        {"serverName": "main_local"},
+    ]
 
 
 def test_claude_strict_keeps_exact_transport_entries_of_allowlisted_servers(claude_project):

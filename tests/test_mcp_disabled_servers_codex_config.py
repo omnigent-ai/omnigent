@@ -431,11 +431,51 @@ def test_strict_refuses_launch_when_a_layer_is_unreadable(launch, caplog, strict
     assert f"mcp_strict_launch_refused executor=codex-native path={managed}" in caplog.text
 
 
+# Codex accepts these multiline inline tables as whole-table and dotted CLI overrides.
+_TOML_1_1_CLI_OVERRIDES = (
+    'mcp_servers={blocked={\ncommand="true",\n}}',
+    'mcp_servers.multiline={\ncommand="true",\n}',
+)
+
+
 def test_toml_1_1_layer_is_read(launch):
     home, repo = launch
     write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
     _write(home / "config.toml", _TOML_1_1_CONFIG)
     assert _plan(home, repo, active=None).config_overrides == ("mcp_servers.user.enabled=false",)
+
+
+@pytest.mark.parametrize("override", _TOML_1_1_CLI_OVERRIDES)
+def test_toml_1_1_cli_override_is_read(launch, override):
+    home, repo = launch
+    write_mcp_inheritance({"inherit": False})
+    name = "blocked" if override.startswith("mcp_servers={") else "multiline"
+    assert _plan(home, repo, [override], active=None).config_overrides == (
+        override,
+        f"mcp_servers.{name}.enabled=false",
+    )
+
+
+@pytest.mark.parametrize(
+    "override", ["mcp_servers={broken", "mcp_servers.named=[1]", "mcp_servers"]
+)
+@pytest.mark.parametrize("strict", [False, True])
+def test_strict_refuses_uninterpretable_server_override(launch, caplog, override, strict):
+    home, repo = launch
+    write_mcp_inheritance({"inherit": not strict})
+    set_disabled(ServerKey("codex", "user"), True)
+    _write(home / "config.toml", '[mcp_servers.user]\ncommand="true"\n')
+    if not strict:
+        assert _plan(home, repo, [override]).config_overrides[0] == override
+        assert "mcp_strict_launch_refused" not in caplog.text
+        return
+    key = override.partition("=")[0]
+    with pytest.raises(McpStrictModeError, match="codex launch") as refused:
+        _plan(home, repo, [override])
+    assert refused.value.path == Path(f"-c {key}")
+    # Override values may carry credentials, so the refusal names only the key.
+    assert "broken" not in caplog.text
+    assert "[1]" not in caplog.text
 
 
 def test_strict_with_switch_retry_keeps_strict_overrides(launch):
@@ -491,10 +531,12 @@ def test_real_codex_enables_only_allowlisted_servers_in_strict_mode(launch):
         _TOML_1_1_CONFIG
         + '[mcp_servers.omnigent]\ncommand="true"\n[mcp_servers."quoted.name"]\ncommand="true"\n',
     )
-    overrides = ['mcp_servers.cli.command="true"']
+    overrides = [*_TOML_1_1_CLI_OVERRIDES, 'mcp_servers.cli.command="true"']
     rows = _codex_mcp_list(home, repo, _plan(home, repo, overrides, active=None).config_overrides)
     assert {row["name"]: row["enabled"] for row in rows} == {
+        "blocked": False,
         "cli": False,
+        "multiline": False,
         "kept": True,
         "omnigent": True,
         "quoted.name": False,

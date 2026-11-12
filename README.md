@@ -535,7 +535,9 @@ This applies to `omnigent claude`, `omnigent codex`, and Claude/Codex SDK
 sessions started on this machine, including new sessions and cold resumes.
 Claude receives an `allowedMcpServers` setting, plus a `deniedMcpServers`
 entry for each other entry in the `allowedMcpServers` lists of your user,
-project, local and managed Claude settings; Claude would otherwise combine those
+project, local and managed Claude settings (project and local files are read
+from the launch directory, its Git root and, for a linked worktree, the main
+checkout); Claude would otherwise combine those
 lists with Omnigent's. A `serverCommand` or `serverUrl` entry there is denied
 too, unless it exactly matches an allowed server's command or URL in
 `~/.claude.json`, the project's `.mcp.json` or `managed-mcp.json`; a wildcard
@@ -543,12 +545,16 @@ too, unless it exactly matches an allowed server's command or URL in
 `-c mcp_servers.<name>.enabled=false` for every other server it would load from
 the system, user, trusted project, command-line, and managed config layers.
 If one of those Claude settings or Codex config files exists but cannot be
-read or parsed, the launch stops with an error naming the file. Your own Claude
+read or parsed, or a `-c mcp_servers` override is not a TOML table, the launch
+stops with an error naming it. A malformed `inherit` or `allow` value is
+ignored with a warning, so `inherit: false` with an invalid `allow` allows only
+`omnigent`; an unreadable `config.yaml` inherits everything. Your own Claude
 and Codex configuration files are not modified, and project
 `.omnigent/config.yaml` files cannot change this setting. Per-harness keys are
 `claude-native`, `claude-sdk` (or `claude`), `codex-native`, and `codex`.
 Claude plugin MCP servers cannot be allowlisted by name, so strict mode blocks
-them.
+them. Codex plugin MCP servers are not discovered, so strict mode does not
+disable them.
 
 </details>
 

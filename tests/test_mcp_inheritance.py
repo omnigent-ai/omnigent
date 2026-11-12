@@ -94,10 +94,11 @@ def test_reads_user_config_and_ignores_project_config(config_home, tmp_path, mon
     assert resolve_mcp_inheritance("codex") == McpInheritance(False, frozenset({"docs"}))
 
 
-@pytest.mark.parametrize("failure", ["malformed", "permission"])
+@pytest.mark.parametrize("failure", ["malformed", "not-a-mapping", "permission"])
 def test_unreadable_user_config_warns_once_and_inherits(config_home, caplog, monkeypatch, failure):
     path = config_home / "config.yaml"
-    path.write_text("mcp: [unclosed\n" if failure == "malformed" else "mcp: {inherit: false}\n")
+    contents = {"malformed": "mcp: [unclosed\n", "not-a-mapping": "- mcp: {inherit: false}\n"}
+    path.write_text(contents.get(failure, "mcp: {inherit: false}\n"))
     if failure == "permission":
         # Raised directly so the case also holds when tests run as root.
         def load_global_config():
