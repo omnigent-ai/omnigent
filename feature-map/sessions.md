@@ -102,6 +102,9 @@ the header menu), and each place is a separate entry point.
   rename, pin or archive
   sessions with `sys_session_update` (see
   [session orchestration](session-orchestration.md)).
+- `project-delete`: after the running-session check, Delete project closes its
+  dialog and removes the folder immediately. Failed archives restore those
+  sessions with a toast; successful archives remain in Settings.
 - `project-show-more`: an expanded project folder lists its five newest
   sessions; each Show more slides five more in until none remain. Re-expanding
   starts at five again, the open session stays listed once the sidebar has
@@ -321,7 +324,8 @@ caller, the session is deleted alone and its automation pauses at its next run.
 choose Rename project. Start typing as soon as the dialog opens. Delete project
 archives every session in the folder; when any of them has an agent working,
 awaiting approval, or running background work, the dialog says how many and
-that deleting stops them, then asks again with Delete anyway.
+that deleting stops them, then asks again with Delete anyway. Once deletion
+starts, the folder leaves the sidebar before the archive requests finish.
 
 **Project folder sessions:** expand a project with more than five sessions,
 then click Show more under its rows. Opening one of its older sessions from
@@ -819,6 +823,11 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`project-rename`, project header right-click and three-dot menus:**
   `tests/e2e_ui/sessions/test_project_rename_dialog_focus.py::test_rename_dialog_preselects_name_so_typing_replaces`
   covers typing across the menu's exit animation from both menus.
+- **`project-delete`, project header right-click and three-dot menus:**
+  `tests/e2e_ui/sessions/test_sidebar_project_context_menu.py::test_delete_project_paints_before_archive_and_commits`
+  holds the archive request and checks both menu entry points before releasing it.
+  `tests/e2e_ui/sessions/test_sidebar_project_context_menu.py::test_failed_project_archive_restores_folder_and_warns`
+  covers rollback and its toast. Both cross-check the resulting server state.
 - **`fork`, message cutoff:**
   `tests/e2e_ui/fork_session/test_fork_from_middle.py::test_fork_from_middle_truncates_history`,
   plus agent switching (own environment):

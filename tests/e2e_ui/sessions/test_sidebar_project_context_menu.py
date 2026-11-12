@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import time
 import uuid
 from collections.abc import Iterator
 
+import httpx
 import pytest
-from playwright.sync_api import Browser, Locator, Page, expect
+from playwright.sync_api import Browser, Locator, Page, Route, expect
 
 
 def _create_project(page: Page, name: str) -> None:
@@ -29,6 +32,24 @@ def _expanded(header: Locator) -> str:
     value = header.get_attribute("aria-expanded")
     assert value is not None, "folder header is missing aria-expanded"
     return value
+
+
+def _project_id(base_url: str, project: str) -> str:
+    """Resolve a fresh project's id for setup and server-side checks."""
+    response = httpx.get(f"{base_url}/v1/projects", timeout=10.0)
+    response.raise_for_status()
+    return next(item["id"] for item in response.json()["data"] if item["name"] == project)
+
+
+def _open_delete_dialog(page: Page, project: str, menu_kind: str) -> None:
+    """Open Delete project through the requested project-menu entry point."""
+    header = _folder_header(page, project)
+    if menu_kind == "context":
+        header.click(button="right")
+    else:
+        page.get_by_role("button", name=f"Project actions for {project}", exact=True).click()
+    page.get_by_test_id("delete-project").click()
+    expect(page.get_by_role("dialog")).to_be_visible()
 
 
 @pytest.fixture
@@ -223,3 +244,119 @@ def test_moving_touch_hold_does_not_open_project_folder_menu(
         cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
 
     expect(header).to_have_attribute("aria-expanded", before)
+
+
+@pytest.mark.parametrize("menu_kind", ["context", "dropdown"])
+def test_delete_project_paints_before_archive_and_commits(
+    project_page: tuple[Page, str],
+    seeded_session: tuple[str, str],
+    menu_kind: str,
+) -> None:
+    """The folder leaves before archive finishes, then the server converges."""
+    page, project = project_page
+    base_url, session_id = seeded_session
+    project_id = _project_id(base_url, project)
+    held: list[Route] = []
+    try:
+        httpx.patch(
+            f"{base_url}/v1/sessions/{session_id}",
+            json={"project_id": project_id},
+            timeout=10.0,
+        ).raise_for_status()
+        page.goto(base_url)
+        header = _folder_header(page, project)
+        if _expanded(header) == "false":
+            header.click()
+        expect(header).to_have_attribute("aria-expanded", "true")
+        row = page.locator(f'a[href="/c/{session_id}"]')
+        expect(row).to_be_visible()
+
+        def hold_archive(route: Route) -> None:
+            if route.request.method == "PATCH":
+                held.append(route)
+            else:
+                route.continue_()
+
+        page.route(f"**/v1/sessions/{session_id}", hold_archive)
+        _open_delete_dialog(page, project, menu_kind)
+        page.get_by_role("button", name="Delete project", exact=True).click()
+
+        deadline = time.monotonic() + 10.0
+        while not held and time.monotonic() < deadline:
+            page.wait_for_timeout(50)
+        assert len(held) == 1, "archive PATCH never reached the browser route"
+
+        # The request is still held, so these states cannot depend on a server response.
+        expect(page.get_by_role("dialog")).to_have_count(0)
+        expect(header).to_have_count(0)
+        expect(row).to_have_count(0)
+        snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
+        assert snapshot["archived"] is not True
+        assert snapshot["project_id"] == project_id
+
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "DELETE"
+                and response.url.endswith(f"/v1/projects/{project_id}")
+            )
+        ) as delete_response:
+            held.pop(0).continue_()
+        assert delete_response.value.ok
+
+        snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
+        assert snapshot["archived"] is True
+        assert snapshot.get("project_id") is None
+        assert httpx.get(f"{base_url}/v1/projects/{project_id}", timeout=10.0).status_code == 404
+        expect(header).to_have_count(0)
+    finally:
+        while held:
+            held.pop(0).continue_()
+        with contextlib.suppress(httpx.HTTPError):
+            httpx.delete(f"{base_url}/v1/projects/{project_id}", timeout=10.0)
+
+
+def test_failed_project_archive_restores_folder_and_warns(
+    project_page: tuple[Page, str],
+    seeded_session: tuple[str, str],
+) -> None:
+    """A rejected archive restores the optimistic removal and shows a toast."""
+    page, project = project_page
+    base_url, session_id = seeded_session
+    project_id = _project_id(base_url, project)
+    try:
+        httpx.patch(
+            f"{base_url}/v1/sessions/{session_id}",
+            json={"project_id": project_id},
+            timeout=10.0,
+        ).raise_for_status()
+        page.goto(base_url)
+        header = _folder_header(page, project)
+        if _expanded(header) == "false":
+            header.click()
+        expect(header).to_have_attribute("aria-expanded", "true")
+        row = page.locator(f'a[href="/c/{session_id}"]')
+        expect(row).to_be_visible()
+
+        def reject_archive(route: Route) -> None:
+            if route.request.method == "PATCH":
+                route.fulfill(status=500, json={"error": {"message": "Archive unavailable"}})
+            else:
+                route.continue_()
+
+        page.route(f"**/v1/sessions/{session_id}", reject_archive)
+        _open_delete_dialog(page, project, "dropdown")
+        page.get_by_role("button", name="Delete project", exact=True).click()
+
+        expect(page.get_by_role("dialog")).to_have_count(0)
+        expect(header).to_be_visible()
+        expect(row).to_be_visible()
+        expect(page.get_by_test_id("toast")).to_contain_text(f"Couldn't delete {project}")
+        expect(page.get_by_test_id("toast")).to_contain_text("1 session couldn't be archived")
+
+        snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
+        assert snapshot["archived"] is not True
+        assert snapshot["project_id"] == project_id
+        assert httpx.get(f"{base_url}/v1/projects/{project_id}", timeout=10.0).status_code == 200
+    finally:
+        with contextlib.suppress(httpx.HTTPError):
+            httpx.delete(f"{base_url}/v1/projects/{project_id}", timeout=10.0)
