@@ -35,11 +35,33 @@ don't have them, tell the user this agent can't run workflows and stop.
    the plan for its goal in a few words ("Cut GET /orders p95 by 20%"). Give
    each step a short, stable ID (`profile`, `opt-pool`), a name, and its
    dependencies. A new step needs an ID the journal hasn't used yet, since a
-   step's status is the newest one written under its ID. A single goal is a
-   one-step plan.
-3. Ask about the description first only if it's ambiguous: write the plan with
-   what you know, and ask with `sys_workflow_request_input` on its first step.
+   step's status is the newest one written under its ID.
+3. Make the first step exploring the work: ID `explore`, and a name that
+   starts with "Explore" ("Explore the open PRs and pick 3"), so the user can
+   tell it apart in the Tasks tab. Explore without changing anything, deeply
+   enough that the steps you add from it are reasonably specific: each a
+   concrete piece of work, such as one change or one PR, rather than a broad
+   phase like "implement the changes". A small, clear task needs only a quick
+   look.
+4. Once you've explored, replan: keep the exploration first and add the work
+   after it, depending on it. A single goal is one step after the exploration.
+5. Ask first only if the description is ambiguous: write the plan with what
+   you know, and ask with `sys_workflow_request_input` on its first step.
    Otherwise start.
+
+## Review the plan
+
+When the user asks to review the plan before the work starts:
+
+- Make the review the second step (`review`), depending on the exploration,
+  and make every step you add after it depend on the review. Keep those two
+  steps first in every version of the plan.
+- Once you've explored and added the work, ask the user to approve the plan
+  with `sys_workflow_request_input` on the review. Start none of the later
+  steps until they approve, then write `done` on the review.
+- If they ask for changes, write `started` on the review first, then restart
+  the exploration to look into what they asked, update the steps after the
+  review, and ask again.
 
 ## Work through it
 

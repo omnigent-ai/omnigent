@@ -268,9 +268,7 @@ def _check_acyclic(steps: list[dict[str, Any]]) -> None:
         )
 
 
-def normalize_plan(
-    steps: object, *, name: object, source: str = "agent", workflow: str | None = None
-) -> dict[str, Any]:
+def normalize_plan(steps: object, *, name: object, source: str = "agent") -> dict[str, Any]:
     """Check a plan's name and graph and return its payload, without its version.
 
     :param steps: The whole graph: a list of ``{"id", "name", "goal",
@@ -280,8 +278,7 @@ def normalize_plan(
     :param name: The plan's goal in a few words, e.g. ``"Cut GET /orders p95
         by 20%"``: one line of at most :data:`PLAN_NAME_MAX_CHARS`.
     :param source: Who drew it, one of :data:`PLAN_SOURCES`.
-    :param workflow: ``"<id>@<version>"`` for a copy of a user-drawn workflow.
-    :returns: ``{"name", "source", "workflow", "steps"}``; the store adds ``version``.
+    :returns: ``{"name", "source", "steps"}``; the store adds ``version``.
     :raises InvalidJournalEntryError: If the name, the graph or a step is invalid.
     """
     if name is None:
@@ -308,7 +305,7 @@ def normalize_plan(
                 f"step {step['id']!r} depends on steps not in the plan: {', '.join(missing)}"
             )
     _check_acyclic(normalized)
-    payload = {"name": plan_name, "source": source, "workflow": workflow, "steps": normalized}
+    payload = {"name": plan_name, "source": source, "steps": normalized}
     size = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
     if size > PLAN_MAX_RAW_BYTES:
         raise JournalEntryTooLargeError("the plan", size, PLAN_MAX_RAW_BYTES)
@@ -333,14 +330,13 @@ def normalize_payload(kind: str, payload: Mapping[str, Any]) -> dict[str, Any]:
             raise InvalidJournalEntryError("a note has exactly one field, body")
         return normalize_note(payload["body"])
     if kind == "plan":
-        unknown = set(payload) - {"name", "source", "workflow", "steps"}
+        unknown = set(payload) - {"name", "source", "steps"}
         if unknown:
             raise InvalidJournalEntryError(f"unknown plan fields: {', '.join(sorted(unknown))}")
         return normalize_plan(
             payload.get("steps"),
             name=payload.get("name"),
             source=payload.get("source", "agent"),
-            workflow=payload.get("workflow"),
         )
     if kind in JOURNAL_KINDS:
         raise InvalidJournalEntryError(f"{kind} entries can't be written yet")

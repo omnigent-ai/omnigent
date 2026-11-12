@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { type SessionJournalView, useSessionJournal } from "@/hooks/useSessionJournal";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { formatMessageTimestamp } from "@/lib/relativeTime";
 import type { JournalEntry } from "@/lib/sessionJournal";
 import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
@@ -115,6 +116,8 @@ describe("TasksPanel", () => {
     expect(rows[1].textContent).toContain("Documenting it");
     // Their rows have no history to open, and nothing waits on another.
     expect(within(rows[1]).queryByRole("button")).toBeNull();
+    // The list says nothing about what waits on what, so its strip's gaps mean nothing either.
+    expect(screen.getByTestId("tasks-progress").dataset.links).toBeUndefined();
     expect(within(rows[2]).getByRole("img", { name: "Not started" }).textContent).toBe("3");
     expect(screen.getByTestId("tasks-summary").textContent).toBe("1 of 3 finished");
     expect(screen.queryByTestId("tasks-plan-name")).toBeNull();
@@ -178,7 +181,7 @@ describe("TasksPanel", () => {
     expect(screen.getByText("1 failed")).toBeTruthy();
   });
 
-  it("marks every step that can start as ready", () => {
+  it("marks every step that can start as ready, and shows on the strip what waits on what", () => {
     showJournal([
       journalPlan(
         0,
@@ -194,6 +197,27 @@ describe("TasksPanel", () => {
     expect(steps.map((step) => step.dataset.state)).toEqual(["done", "ready", "ready", "waiting"]);
     expect(within(steps[1]).getByRole("img", { name: "Ready" }).textContent).toBe("2");
     expect(within(steps[1]).getByText("Ready")).toBeTruthy();
+    // batch and pool can run at the same time, so a gap separates them.
+    expect(screen.getByTestId("tasks-progress").dataset.links).toBe("true");
+    const segments = screen.getAllByTestId("tasks-progress-segment");
+    expect(segments.map((segment) => segment.dataset.linked === "true")).toEqual([
+      false,
+      true,
+      false,
+      true,
+    ]);
+    // Hovering batch arcs it to profile, which it waits on, and ship, which waits on it.
+    fireEvent.pointerEnter(segments[1]);
+    expect(screen.getAllByTestId("tasks-progress-arc")).toHaveLength(2);
+    expect(segments.map((segment) => segment.dataset.dimmed === "true")).toEqual([
+      false,
+      false,
+      true,
+      false,
+    ]);
+    fireEvent.pointerLeave(screen.getByTestId("tasks-progress"));
+    expect(screen.queryAllByTestId("tasks-progress-arc")).toHaveLength(0);
+    expect(segments.some((segment) => segment.dataset.dimmed)).toBe(false);
   });
 
   it("says on hover which task a progress segment is and where it stands", async () => {
@@ -390,42 +414,70 @@ describe("TasksPanel", () => {
     ).toEqual([expect.stringMatching(/^Started/), expect.stringMatching(/^Failed · Reverted/)]);
   });
 
-  it("shows a task's newest note under it, shortened until opened", () => {
-    const body = `## The pool didn't move p95\n${"Cold connects are the slowest requests. ".repeat(6)}**Next**: pre-warm it.`;
-    showJournal([journalPlan(0, ["pool"]), journalEntry(1, { step: "pool", payload: { body } })]);
+  it("shows when a finished task ended, stamped the way chat messages are", async () => {
+    const done = status(2, "build", "done");
+    const failed = status(4, "deploy", "failed", "Reverted");
+    const doneWithoutStart = status(5, "docs", "done");
+    showJournal([
+      journalPlan(0, ["build"], ["deploy", ["build"]], ["docs"]),
+      status(1, "build", "started"),
+      done,
+      status(3, "deploy", "started"),
+      failed,
+      doneWithoutStart,
+    ]);
     renderPanel();
-    const note = screen.getByTestId("tasks-note");
-    expect(within(note).getByText("The pool didn't move p95")).toBeTruthy();
-    expect(within(note).getByText("Next").tagName).toBe("STRONG");
-    const more = within(note).getByRole("button", { name: "Show more" });
-    fireEvent.click(more);
-    expect(more.textContent).toBe("Show less");
+    // ICU may put a narrow no-break space before AM/PM; queries collapse it.
+    const ended = (entry: JournalEntry) =>
+      formatMessageTimestamp(entry.created_at).replace(/\s/g, " ");
+    const [build, deploy, docs] = screen.getAllByTestId("tasks-row");
+    // The end time replaces how long the task ran, a minute here.
+    expect(within(build).getByText(ended(done)).tagName).toBe("TIME");
+    expect(within(build).queryByText("1m")).toBeNull();
+    expect(within(deploy).getByText(ended(failed))).toBeTruthy();
+    expect(within(docs).getByText(ended(doneWithoutStart))).toBeTruthy();
+    fireEvent.focus(screen.getAllByTestId("tasks-progress-segment")[0]);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(`Done · ${ended(done)}`);
   });
 
-  it("lists notes that aren't about one task, newest first, with no Runs section", () => {
+  it("leaves out the agent's notes, under a task, in its history and on their own", () => {
+    showJournal([
+      journalPlan(0, ["pool"]),
+      status(1, "pool", "started"),
+      journalEntry(2, { step: "pool", payload: { body: "Cold connects are the slowest" } }),
+      journalEntry(3, { payload: { body: "Measure first" } }),
+    ]);
+    renderPanel();
+    fireEvent.click(within(screen.getByTestId("tasks-row")).getAllByRole("button")[0]);
+    const history = screen.getByRole("list", { name: "pool history" });
+    expect(
+      within(history)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual([expect.stringMatching(/^Started/)]);
+    expect(screen.queryByText(/Cold connects|Measure first/)).toBeNull();
+    expect(screen.queryByRole("region", { name: "Notes" })).toBeNull();
+  });
+
+  it("has no tasks yet when the agent wrote only notes, and no Runs section", () => {
     showJournal([
       journalEntry(0, { payload: { body: "Measure first" } }),
       journalEntry(1, { scheduled_task_run_id: RUN, payload: { body: "Stopped at the try cap" } }),
     ]);
     renderPanel();
-    const notes = screen.getByRole("region", { name: "Notes" });
-    expect(
-      within(notes)
-        .getAllByTestId("tasks-note")
-        .map((note) => note.textContent),
-    ).toEqual(["Stopped at the try cap", "Measure first"]);
+    expect(screen.getByText("No tasks yet")).toBeTruthy();
+    expect(screen.queryByText(/Measure first|try cap/)).toBeNull();
     expect(screen.queryByRole("region", { name: "Runs" })).toBeNull();
   });
 
-  it("loads older entries on request, and names no workers", () => {
+  it("offers no older entries, and names no workers", () => {
     // Busy sub-agents show in the Agents tab; the Tasks tab lists only tasks.
     vi.mocked(useChildSessions).mockReturnValue({
       children: [{ id: "c1", busy: true, task_summary: "fix-3", title: "codex:fix-3" }],
     } as never);
-    const view = showJournal([journalEntry(5)], { hasOlder: true });
+    showJournal([journalPlan(0, ["a"])], { hasOlder: true });
     renderPanel();
     expect(screen.queryByText(/workers? running/)).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Show older notes" }));
-    expect(view.loadOlder).toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: /older/ })).toBeNull();
   });
 });

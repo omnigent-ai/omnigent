@@ -7,10 +7,9 @@ other sessions' appends and the session's metadata updates don't wait. An
 append carries an idempotency key, so a retried append returns the entry its
 first attempt wrote instead of writing it twice.
 
-Payloads are stored in an envelope private to this store: a version byte, a
-variant byte, then the variant's body. The plaintext variant's body is the
-kind's JSON in a :mod:`omnigent.db.compression` frame; the ciphertext variant
-wraps that frame for a store that encrypts (see :meth:`SessionJournalStore._seal`).
+Payloads are the kind's compressed JSON, at most
+:data:`~omnigent.db.db_models.MAX_STORED_VALUE_BYTES` bytes stored. The store
+checks the size before writing, so an agent gets ``entry_too_large``.
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ from sqlalchemy.orm import Session
 
 from omnigent.db import compression
 from omnigent.db.db_models import (
-    JOURNAL_PAYLOAD_MAX_STORED_BYTES,
+    MAX_STORED_VALUE_BYTES,
     SqlConversationMetadata,
     SqlSessionJournalEntry,
     SqlSessionJournalHead,
@@ -45,7 +44,6 @@ from omnigent.entities.session_journal import (
     IDEMPOTENCY_KEY_MAX_CHARS,
     JOURNAL_KINDS,
     JOURNAL_PAGE_MAX,
-    PLAN_MAX_RAW_BYTES,
     STATUSES_NEEDING_DEPENDENCIES,
     InvalidJournalEntryError,
     JournalAppend,
@@ -59,11 +57,8 @@ from omnigent.entities.session_journal import (
 from omnigent.errors import StaleCursorError
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
-_ENVELOPE_VERSION = 1
-_PLAINTEXT = 1
-_CIPHERTEXT = 2
-# Guards decompression of a damaged row; every kind's raw limit is well below it.
-_MAX_DECODED_BYTES = 2 * PLAN_MAX_RAW_BYTES
+# Headroom for compression framing on incompressible text.
+_FRAMING_BYTES = 32
 _PLAN_KIND = encode_journal_entry_kind("plan")
 _STATUS_KIND = encode_journal_entry_kind("status")
 # A fork doesn't own the parent's workers, so their dispatches stay behind.
@@ -101,26 +96,15 @@ class JournalSessionNotFoundError(Exception):
     """The session doesn't exist, or was deleted while the append ran."""
 
 
-class UnreadableJournalEntryError(Exception):
-    """A stored envelope can't be read by this store."""
-
-
-def _document(payload: Mapping[str, Any]) -> bytes:
-    """The kind's JSON in a compression frame."""
-    encoded = compression.encode(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-    assert encoded is not None
-    return encoded
-
-
-def _payload(document: bytes) -> dict[str, Any]:
-    try:
-        text = compression.decode(document, max_decoded_bytes=_MAX_DECODED_BYTES)
-        payload = json.loads(text or "")
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise UnreadableJournalEntryError("unreadable journal payload") from exc
-    if not isinstance(payload, dict):
-        raise UnreadableJournalEntryError("unrecognized journal payload")
-    return payload
+def _stored_payload(payload: Mapping[str, Any]) -> str:
+    """The payload's JSON, refused when it doesn't fit the column compressed."""
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if len(text.encode()) + _FRAMING_BYTES <= MAX_STORED_VALUE_BYTES:
+        return text
+    size = len(compression.encode(text) or b"")
+    if size > MAX_STORED_VALUE_BYTES:
+        raise JournalEntryTooLargeError("the stored entry", size, MAX_STORED_VALUE_BYTES)
+    return text
 
 
 def _entry_id(value: str, name: str) -> str:
@@ -149,48 +133,8 @@ class SessionJournalStore:
             engine, query_name_prefix="omnigent.session_journal", immediate=True
         )
 
-    # ── Payload envelope ──────────────────────────────
-
-    def _seal(self, documents: Sequence[bytes]) -> list[bytes]:
-        """Wrap compressed documents in the envelope's plaintext variant.
-
-        A store that encrypts overrides this and :meth:`_open`, sealing a whole
-        batch in one call and returning the ciphertext variant.
-        """
-        return [bytes((_ENVELOPE_VERSION, _PLAINTEXT)) + document for document in documents]
-
-    def _open(self, envelopes: Sequence[bytes]) -> list[bytes]:
-        """Return each envelope's compressed document.
-
-        :raises UnreadableJournalEntryError: For an unknown envelope, or a
-            ciphertext this store can't decrypt.
-        """
-        documents = []
-        for envelope in envelopes:
-            raw = bytes(envelope)
-            if len(raw) < 2 or raw[0] != _ENVELOPE_VERSION:
-                raise UnreadableJournalEntryError("unrecognized journal envelope")
-            if raw[1] == _CIPHERTEXT:
-                raise UnreadableJournalEntryError(
-                    "an encrypted journal entry needs a store that can decrypt it"
-                )
-            if raw[1] != _PLAINTEXT:
-                raise UnreadableJournalEntryError("unrecognized journal envelope variant")
-            documents.append(raw[2:])
-        return documents
-
-    def _seal_payload(self, payload: Mapping[str, Any]) -> bytes:
-        """Seal one payload, enforcing the stored-size limit."""
-        sealed = self._seal([_document(payload)])[0]
-        if len(sealed) > JOURNAL_PAYLOAD_MAX_STORED_BYTES:
-            raise JournalEntryTooLargeError(
-                "the stored entry", len(sealed), JOURNAL_PAYLOAD_MAX_STORED_BYTES
-            )
-        return sealed
-
     def _entries(self, rows: Sequence[SqlSessionJournalEntry]) -> list[JournalEntry]:
-        """Decode rows into entries, opening their payloads in one batch."""
-        documents = self._open([row.payload for row in rows]) if rows else []
+        """Decode rows into entries."""
         return [
             JournalEntry(
                 id=row.id,
@@ -200,9 +144,9 @@ class SessionJournalStore:
                 kind=decode_journal_entry_kind(row.kind),
                 step=row.step,
                 scheduled_task_run_id=row.scheduled_task_run_id,
-                payload=_payload(document),
+                payload=json.loads(row.payload),
             )
-            for row, document in zip(rows, documents, strict=True)
+            for row in rows
         ]
 
     # ── Appends ───────────────────────────────────────
@@ -356,8 +300,8 @@ class SessionJournalStore:
             if kind == "plan":
                 raise InvalidJournalEntryError("a plan names no step; its steps are in the graph")
             step = normalize_step_id(step)
-        # A plan's version is known only under the lock, so a plan is sealed there.
-        sealed = None if kind == "plan" else self._seal_payload(fields)
+        # A plan's version is known only under the lock, so its size is checked there.
+        stored = None if kind == "plan" else _stored_payload(fields)
         code = encode_journal_entry_kind(kind)
 
         def write(session: Session) -> tuple[SqlSessionJournalEntry, bool, dict[str, Any] | None]:
@@ -383,14 +327,14 @@ class SessionJournalStore:
                         "idempotency_key was already used for a different kind of entry"
                     )
                 return earlier, False, None
-            stored, entry_payload = sealed, fields
+            entry_text, entry_payload = stored, fields
             if kind == "plan":
                 previous = self._newest_plan_row(session, conversation_id)
                 version = (
                     1 if previous is None else self._entries([previous])[0].payload["version"] + 1
                 )
                 entry_payload = {"version": version, **fields}
-                stored = self._seal_payload(entry_payload)
+                entry_text = _stored_payload(entry_payload)
             entry_step = step
             if kind == "status":
                 plan = self._newest_plan_row(session, conversation_id)
@@ -413,7 +357,7 @@ class SessionJournalStore:
                 scheduled_task_run_id=scheduled_task_run_id,
                 step=entry_step,
                 idempotency_key=idempotency_key,
-                payload=stored,
+                payload=entry_text,
             )
             session.add(row)
             session.execute(
@@ -579,7 +523,6 @@ def copy_journal_for_fork(
             workflow_id=None,
             step=row.step,
             idempotency_key=row.idempotency_key,
-            # The sealed bytes as stored: the fork shares the parent's workspace key.
             payload=row.payload,
         )
         for position, row in enumerate(

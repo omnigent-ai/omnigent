@@ -4,11 +4,11 @@
 /** The framework skill that plans and runs a workflow (`/workflow <description>`). */
 export const WORKFLOW_SKILL = "workflow";
 
-/** Added to the workflow message when the user reviews the plan before work starts. */
-export const REVIEW_PLAN_FIRST =
-  "Make the plan's first step a review of the plan, and make every other step depend on it. " +
-  "Ask me to approve the plan before you start anything else; if I ask for changes, replan " +
-  "and ask again.";
+/**
+ * Added to the workflow message when the user reviews the plan before work starts. The
+ * workflow skill says how: the review comes right after the exploration every plan starts with.
+ */
+export const REVIEW_PLAN_FIRST = "Let me review the plan before you start the work.";
 
 /** Whether a skill list offers the workflow skill, so the composer can offer "Run a workflow". */
 export function offersWorkflow(skills: readonly { name: string }[]): boolean {
@@ -20,7 +20,7 @@ export function offersWorkflow(skills: readonly { name: string }[]): boolean {
  *
  * @param skillPrefix The harness's skill prefix, `"/"` or `"$"` for Codex's own CLI.
  * @param description What the user wants done, e.g. `"Add a --json flag"`.
- * @param reviewPlanFirst Whether the plan starts with a step that waits for the user's approval.
+ * @param reviewPlanFirst Whether the user reviews the plan before the work starts.
  * @returns e.g. `"/workflow Add a --json flag"`, plus {@link REVIEW_PLAN_FIRST} as its own
  *   paragraph when *reviewPlanFirst* is set.
  */

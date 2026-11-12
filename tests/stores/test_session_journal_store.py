@@ -10,7 +10,7 @@ import threading
 import pytest
 import sqlalchemy as sa
 
-from omnigent.db.db_models import JOURNAL_PAYLOAD_MAX_STORED_BYTES
+from omnigent.db.db_models import MAX_STORED_VALUE_BYTES
 from omnigent.db.utils import run_write_transaction
 from omnigent.entities.session_journal import InvalidJournalEntryError, StepNotReadyError
 from omnigent.errors import StaleCursorError
@@ -20,7 +20,6 @@ from omnigent.stores.session_journal_store import (
     JournalEntryTooLargeError,
     JournalSessionNotFoundError,
     SessionJournalStore,
-    UnreadableJournalEntryError,
     copy_journal_for_fork,
 )
 
@@ -161,7 +160,7 @@ def test_an_append_to_a_missing_session_writes_nothing(
     assert _count(db_uri, "session_journal_entries", MISSING) == 0
 
 
-def test_the_stored_payload_limit_counts_the_compressed_envelope(
+def test_the_stored_payload_limit_counts_compressed_bytes(
     journal: SessionJournalStore,
 ) -> None:
     # Random text barely compresses: within the raw limit, but not the stored one.
@@ -172,8 +171,8 @@ def test_the_stored_payload_limit_counts_the_compressed_envelope(
         journal.append(
             SESSION, "plan", {"name": "The plan", "steps": steps}, idempotency_key="tool:1"
         )
-    assert raised.value.limit == JOURNAL_PAYLOAD_MAX_STORED_BYTES
-    assert raised.value.size > JOURNAL_PAYLOAD_MAX_STORED_BYTES
+    assert raised.value.limit == MAX_STORED_VALUE_BYTES == 16 * 1024 - 1
+    assert raised.value.size > MAX_STORED_VALUE_BYTES
     assert journal.list_entries(SESSION).entries == []
 
 
@@ -336,10 +335,3 @@ def test_a_truncated_fork_copies_only_what_its_history_wrote(
     )
     assert copied == 2
     assert [e.created_at for e in journal.list_entries(fork.id).entries] == [100, 200]
-
-
-def test_an_encrypted_envelope_needs_a_store_that_decrypts(journal: SessionJournalStore) -> None:
-    with pytest.raises(UnreadableJournalEntryError, match="needs a store that can decrypt it"):
-        journal._open([bytes((1, 2)) + b"ciphertext"])
-    with pytest.raises(UnreadableJournalEntryError, match="unrecognized journal envelope"):
-        journal._open([b"\x09\x01payload"])

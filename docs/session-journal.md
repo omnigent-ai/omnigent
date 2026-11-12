@@ -75,9 +75,12 @@ reconnects, returns the entry the first attempt wrote instead of adding another.
 
 Pick **Run a workflow** from the composer's **+** menu, in a session or when
 starting one, describe the work, and choose **Run workflow**. The workflow goes
-straight to the chat. **Review the plan before work starts**, on by default,
-has the agent make its first step a review of the plan and wait for your
-approval before any other work. You can also type `/workflow` and a
+straight to the chat. The agent always explores first, in a task whose name
+starts with "Explore", without changing anything, deeply enough to plan the
+work as specific steps. **Review the plan
+before work starts**, on by default, adds your review right after the
+exploration: the agent waits for your approval before any of the work, and if
+you ask for changes, it explores again, updates the steps and asks again. You can also type `/workflow` and a
 description in the composer, for example:
 
 ```
@@ -121,24 +124,29 @@ plan replaces the agent's own list in both places.
 In the Tasks tab, the plan's name heads the list (the chat preview shows it on
 hover), and each task appears once, in order, with its state (not started,
 ready, running, stopped, waiting for you, done or failed), its newest
-result, how long it took and its newest note. A started task is running while
-the session's turn, a background task it left running or a sub-agent is still
-going, and stopped once nothing is. It waits for you while a question or
-permission prompt in the chat waits for your answer. A task that starts again
-shows only its new attempt's note, and its history marks a restart after the
-task was done or failed. Tasks waiting for you are pink, and an idle list
+result, and how long it has run while it runs. A done or failed task shows when
+it finished, stamped the way chat messages are ("8:56 PM" today, "Nov 11,
+8:56 PM" earlier). A started task is running while the session's turn, a
+background task it left running or a sub-agent is still going, and stopped once
+nothing is. It waits for you while a question or permission prompt in the chat
+waits for your answer. A task's history marks a restart after the task was done
+or failed. Tasks waiting for you are pink, and an idle list
 with tasks the agent could still run says "Stopped" ("Run ended" after an
 automation run), so it never looks about to run. A summary line and a strip
 count the tasks in each state, and stay at the top as you scroll: hover a
-segment of the strip for that task's status, or click it to jump to the task. When the agent replans, the new
+segment of the strip for that task's status, or click it to jump to the task. In
+a plan, the strip links two neighboring tasks when one waits on the other, so a
+gap between them means they can run at the same time; hovering a task's segment
+arcs it to the tasks it waits on and the tasks that wait on it. When the agent replans, the new
 tasks simply appear. Click a plan's task for what it waits on, its goal and its
-history: each status and note, oldest first. Tasks from the agent's own list
-show only their name and state.
+history: each status, oldest first. Tasks from the agent's own list show only
+their name and state.
 
-Notes that aren't about one task appear under Notes. With no tasks yet, the
-tab links to starting a workflow, the same as **Run a workflow** in the
-composer's **+** menu. On servers that don't keep journals, the tab appears once
-the agent makes a to-do list.
+The tab doesn't show the agent's notes; they're for the agent, which reads them
+back with `sys_journal_read`. With no tasks yet, the tab links to starting a
+workflow, the same as **Run a workflow** in the composer's **+** menu. On
+servers that don't keep journals, the tab appears once the agent makes a to-do
+list.
 
 New entries arrive live over the session's event stream. After a reconnect the
 tab fetches whatever it missed, and while the stream is down it checks every
@@ -165,5 +173,5 @@ Entries live in `session_journal_entries`, beside the session metadata, keyed by
 workspace, session, position and creation time; `session_journal_heads` holds
 each session's next position. An append locks only its session's heads row, so
 one session's appends run in order without slowing other sessions or the
-session's own metadata updates. Payloads are compressed JSON in an envelope that
-also has room for an encrypted variant.
+session's own metadata updates. Payloads are compressed JSON, at most 16,383
+bytes stored.

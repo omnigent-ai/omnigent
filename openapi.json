@@ -8544,7 +8544,7 @@
           },
           "payload": {
             "additionalProperties": true,
-            "description": "e.g. `{\"status\": \"done\", \"text\": \"PR merged\"}` for a status, `{\"body\": \"\u2026\"}` for a note, or `{\"version\": 2, \"source\": \"agent\", \"workflow\": null, \"steps\": [...]}` for a plan.",
+            "description": "e.g. `{\"status\": \"done\", \"text\": \"PR merged\"}` for a status, `{\"body\": \"\u2026\"}` for a note, or `{\"version\": 2, \"source\": \"agent\", \"steps\": [...]}` for a plan.",
             "title": "Payload",
             "type": "object"
           },

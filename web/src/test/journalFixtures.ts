@@ -23,7 +23,6 @@ export function journalPlan(position: number, ...steps: [string, string[]?][]): 
       name: "The plan",
       version: position + 1,
       source: "agent",
-      workflow: null,
       steps: steps.map(([id, depends_on = []]) => ({ id, name: id, goal: null, depends_on })),
     },
   });
