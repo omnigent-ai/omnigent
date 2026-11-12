@@ -1,4 +1,5 @@
 import { cn } from "@/lib/utils";
+import { APPROVAL_SKIPPING_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 import { pickerTriggerClass } from "./pickerStyles";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { Label } from "./Label";
@@ -32,7 +33,9 @@ export function TriggerWorkerHarnessField({
       <Select
         value={agentId}
         disabled={disabled}
-        onValueChange={(nextAgentId) => onChange({ agentId: nextAgentId, model: "", effort: "" })}
+        onValueChange={(nextAgentId) =>
+          onChange({ agentId: nextAgentId, model: "", effort: "", permissionMode: "" })
+        }
         componentId="tasks.scheduled.worker_harness"
         onOpenChange={onSelectOpenChange}
       >
@@ -64,6 +67,7 @@ export function TriggerWorkerHarnessField({
 export function TriggerWorkerSettingsFields({
   value,
   settings,
+  permissionModesSupported = false,
   taskSession = false,
   disabled,
   onChange,
@@ -71,19 +75,25 @@ export function TriggerWorkerSettingsFields({
 }: {
   value: TriggerWorkerSettings;
   settings: ReturnType<typeof useScheduledHarnessSettings>;
+  /** The server applies a session's requested permission mode. */
+  permissionModesSupported?: boolean;
   /** Every match goes to one task session, so changes wait for the next one. */
   taskSession?: boolean;
   disabled: boolean;
   onChange: (value: TriggerWorkerSettings) => void;
   onSelectOpenChange: (open: boolean) => void;
 }) {
+  // The server refuses these for a session an agent starts.
+  const permissions = permissionModesSupported
+    ? settings.permissions.filter((option) => !APPROVAL_SKIPPING_PERMISSION_MODES.has(option.value))
+    : [];
   return (
     <div className="space-y-3" data-testid="task-worker-settings">
       <ModelEffortFields
         model={value.model}
         effort={value.effort}
-        permissionMode=""
-        settings={{ ...settings, permissions: [] }}
+        permissionMode={value.permissionMode}
+        settings={{ ...settings, permissions }}
         disabled={disabled}
         onModelChange={(model) =>
           onChange({
@@ -95,7 +105,7 @@ export function TriggerWorkerSettingsFields({
           })
         }
         onEffortChange={(effort) => onChange({ ...value, effort })}
-        onPermissionModeChange={() => {}}
+        onPermissionModeChange={(permissionMode) => onChange({ ...value, permissionMode })}
         onSelectOpenChange={onSelectOpenChange}
       />
       {settings.blockedReason && (
@@ -108,6 +118,7 @@ export function TriggerWorkerSettingsFields({
           ? "Applies to the next task session. The current task session and the polling session keep their settings; archive the task session so the next match starts one with these. "
           : "Applies to new sessions started for matching items. Existing sessions, including the polling session, keep their settings. "}
         Default uses the selected harness&apos;s configuration.
+        {permissions.length > 0 && " Modes that skip approval aren't available here."}
       </p>
     </div>
   );

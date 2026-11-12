@@ -252,7 +252,13 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } = {}) {
+function render(
+  ui: Parameters<typeof renderBase>[0],
+  {
+    expandAdvanced = true,
+    info = {},
+  }: { expandAdvanced?: boolean; info?: Partial<typeof SERVER_INFO_OFFLINE_FALLBACK> } = {},
+) {
   const view = renderBase(ui, {
     wrapper: ({ children }) => (
       <CapabilitiesProvider
@@ -262,6 +268,7 @@ function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } 
           scheduled_task_harness_settings: true,
           scheduled_task_approval_skipping_modes: true,
           scheduled_task_worktrees: true,
+          ...info,
         }}
       >
         {children}
@@ -3297,7 +3304,7 @@ describe("automation trigger type", () => {
         { ...emptyTriggerFields("slack"), scope: "support", instructions: "Answer the question." },
         { placement: "same_host", sessionLink: "https://example.test/c/CONVERSATION_ID" },
       ),
-      { agentId: "ag_claude_native", model: "opus", effort: "" },
+      { agentId: "ag_claude_native", model: "opus", effort: "", permissionMode: "" },
     )!;
     const slackTask = scheduledTask({
       name: "Slack messages",
@@ -3571,6 +3578,7 @@ describe("automation trigger type", () => {
         agentId: "ag_claude_native",
         model: "opus",
         effort: "",
+        permissionMode: "",
       });
       expect(readTriggerWorkerPlacement(prompt)).toBe("managed");
     });
@@ -4172,6 +4180,39 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     );
   });
 
+  it.each([
+    ["the server applies it", { session_create_permission_modes: true }, "Auto", true],
+    ["the server would ignore it", {}, "Auto", false],
+    // The server refuses an approval-skipping mode for a session an agent starts.
+    [
+      "it skips approval",
+      { session_create_permission_modes: true, scheduled_task_approval_skipping_modes: true },
+      "Bypass permissions",
+      false,
+    ],
+  ])(
+    "gives new workers the automation's permission mode unless %s",
+    async (_case, extraInfo, permission, passed) => {
+      renderTrigger("jira", extraInfo);
+      if (permission !== "Auto") {
+        fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name: permission }));
+      }
+      type("task-trigger-scope", "ES");
+      type("task-trigger-instructions", "Triage it.");
+      const prompt = await submittedPrompt();
+      const mode = mutateAsync.mock.calls[0][0].permissionMode;
+      expect(mode).toBe(permission === "Auto" ? "auto" : "bypassPermissions");
+      if (passed) {
+        expect(prompt).toContain(
+          'title "Jira <ticket key>", permission_mode "auto", and a message',
+        );
+      } else {
+        expect(prompt).not.toContain("permission_mode");
+      }
+    },
+  );
+
   it("separates the rendered system and user prompts on Edit as prompt", async () => {
     renderTrigger("github");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Issue opened");
@@ -4263,6 +4304,7 @@ describe("editing template prompts", () => {
         agentId: "ag_claude_native",
         model: "opus",
         effort: "high",
+        permissionMode: "",
       });
       for (const key of [
         "agentId",
@@ -4295,7 +4337,48 @@ describe("editing template prompts", () => {
         agentId: "ag_1",
         model: "",
         effort: "",
+        permissionMode: "",
       });
+    },
+  );
+
+  it.each([true, false])(
+    "saves the workers' permission mode, offering only modes that keep approval (server applies it: %s)",
+    async (supported) => {
+      const task = scheduledTask({
+        prompt: original,
+        sessionMode: "continue",
+        sessionId: "poller",
+      });
+      render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />, {
+        info: { session_create_permission_modes: supported },
+      });
+      fireEvent.keyDown(screen.getByTestId("task-worker-agent-trigger"), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name: "Claude Code" }));
+      if (!supported) {
+        expect(screen.queryByTestId("task-permission-trigger")).not.toBeInTheDocument();
+        return;
+      }
+      expect(screen.getByTestId("task-worker-settings")).toHaveTextContent(
+        "Modes that skip approval aren't available here.",
+      );
+      fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+      expect(await screen.findByRole("option", { name: "Auto" })).toBeInTheDocument();
+      // The server refuses these for a session an agent starts.
+      for (const name of ["Bypass permissions", "Don't ask"])
+        expect(screen.queryByRole("option", { name })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("option", { name: "Auto" }));
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const input = updateMutateAsync.mock.calls[0][0].input;
+      expect(readTriggerWorkerSettings(input.prompt)).toEqual({
+        agentId: "ag_claude_native",
+        model: "",
+        effort: "",
+        permissionMode: "auto",
+      });
+      // The polling session's own mode is unchanged.
+      expect(input).not.toHaveProperty("permissionMode");
     },
   );
 
