@@ -1621,6 +1621,21 @@ def create_runner_app(
             return True
         return instance.screen_changed_within(PANE_OUTPUT_BUSY_WINDOW_S) is True
 
+    def _native_role_panes() -> list[tuple[str, str]]:
+        """Native-role terminal panes as ``(session_id, pane name)``, read on each call."""
+        terminals = resource_registry.terminal_registry
+        if terminals is None:
+            return []
+        return [
+            (session_id, name)
+            for session_id, name, _ in terminals.native_panes()
+            if is_native_harness(
+                resource_registry.terminal_resource_role(
+                    session_id, terminal_resource_id(name, "main")
+                )
+            )
+        ]
+
     # Sessions whose Claude pane reports a background shell still running after
     # its turn ended. Real work: it keeps the runner and its sandbox up, but only
     # while that session's native pane exists, so a lost "stopped" edge cannot
@@ -1644,21 +1659,14 @@ def create_runner_app(
         # Terminal ensure can start native work before any harness or web turn.
         # Read current resources so deleting a terminal also retires this pin.
         terminals = resource_registry.terminal_registry
-        if terminals is not None:
-            for session_id, name, _ in terminals.native_panes():
-                if not is_native_harness(
-                    resource_registry.terminal_resource_role(
-                        session_id, terminal_resource_id(name, "main")
-                    )
-                ):
-                    continue
-                session_ids.add(session_id)
-                if session_id in _sessions_with_background_shell:
-                    return True
-                if _native_pane_shows_live_work(
-                    terminals, session_id, name, include_pane_activity=include_pane_activity
-                ):
-                    return True
+        for session_id, name in _native_role_panes():
+            session_ids.add(session_id)
+            if session_id in _sessions_with_background_shell:
+                return True
+            if terminals is not None and _native_pane_shows_live_work(
+                terminals, session_id, name, include_pane_activity=include_pane_activity
+            ):
+                return True
         if process_manager is not None and any(
             process_manager.has_active_turn(session_id) for session_id in session_ids
         ):
@@ -1681,6 +1689,22 @@ def create_runner_app(
     # input or output also comes from someone just viewing it. A prompt typed into
     # the pane still counts once the harness reports its turn in flight.
     app.state.has_sandbox_work = lambda: _has_active_work(include_pane_activity=False)
+
+    def _has_turn_in_flight() -> bool:
+        # Narrower than _has_active_work: timers and approvals pending outside
+        # a turn can wait for hours and must not pin a laptop awake.
+        if _active_turns or _claude_prompt_waiters:
+            return True
+        session_ids = set(_session_start_cache) | set(_session_agent_ids)
+        # Terminal ensure can start native work with no cache entry (see _has_active_work).
+        session_ids.update(session_id for session_id, _name in _native_role_panes())
+        if process_manager is not None and any(
+            process_manager.has_active_turn(session_id) for session_id in session_ids
+        ):
+            return True
+        return any(_native_turn_in_flight(session_id) for session_id in session_ids)
+
+    app.state.has_turn_in_flight = _has_turn_in_flight
 
     def _drain_session_streams() -> None:
         for queue in list(_session_event_queues.values()):
