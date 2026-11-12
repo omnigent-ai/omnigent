@@ -5601,7 +5601,12 @@ print('0.80.4')
         cwd=str(workspace),
         os_env=OSEnvSpec(
             cwd=str(workspace),
-            sandbox=OSEnvSandboxSpec(type=sandbox_type, allow_network=False),
+            sandbox=OSEnvSandboxSpec(
+                type=sandbox_type,
+                read_paths=[str(workspace)],
+                write_paths=[],
+                allow_network=False,
+            ),
         ),
     )
     try:
