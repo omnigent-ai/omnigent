@@ -124,6 +124,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["scheduled_task_subhour"] is True
     assert data["automation_trigger_poll_minutes"] == 10
     assert data["scheduled_task_harness_settings"] is True
+    # Lets sys_session_create refuse permission_mode on servers that would ignore it.
+    assert data["session_create_permission_modes"] is True
     # Gates the automation picker's approval-skipping modes; older servers reject them.
     assert data["scheduled_task_approval_skipping_modes"] is True
     assert data["agent_detail"] is True

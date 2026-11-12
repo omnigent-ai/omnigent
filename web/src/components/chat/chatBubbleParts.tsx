@@ -41,6 +41,8 @@ import {
   type MessageResponseProps,
 } from "@/components/ai-elements/message";
 import { Shimmer } from "@/components/ai-elements/shimmer";
+import { renderLocalReviewComment } from "./LocalReviewCommentPreview";
+import { omitIncompleteLocalReviewComment } from "@/lib/localReviewComments";
 import { SessionMentionPill } from "@/components/blocks/ChatMarkdown";
 import {
   BlockRenderer,
@@ -1089,7 +1091,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const isLong = renderedText.length > COLLAPSE_THRESHOLD;
   const [isCollapsed, setIsCollapsed] = useState(isLong);
   const visibleText = isCollapsed
-    ? sliceByCodePoint(renderedText, COLLAPSE_THRESHOLD)
+    ? omitIncompleteLocalReviewComment(sliceByCodePoint(renderedText, COLLAPSE_THRESHOLD))
     : renderedText;
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
@@ -1263,6 +1265,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                           breaks
                           mode="static"
                           remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+                          renderLocalReviewComment={renderLocalReviewComment}
                         >
                           {visibleText}
                         </FilePathAwareMessageResponse>

@@ -46,7 +46,14 @@ from omnigent.entities import (
     synthesize_conversation_title,
 )
 from omnigent.entities.permission import SessionPermission
-from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.errors import (
+    ErrorCategory,
+    ErrorCode,
+    ErrorImpact,
+    ErrorPhase,
+    OmnigentError,
+    WrongReplicaError,
+)
 from omnigent.harnesses.codex_native.side_chat import EFFORT_RESET_LABEL, is_side_chat_child
 from omnigent.harnesses.codex_native.timeouts import (
     SETTINGS_FORWARD_TIMEOUT_SECONDS as _CODEX_SETTINGS_FORWARD_TIMEOUT_S,
@@ -3619,8 +3626,6 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
         if PINNED_LABEL_KEY in labels_to_set:
-            from omnigent.stores.conversation_store import family_pinned_label_key
-
             pin_source = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             owner_grant = (
                 await asyncio.to_thread(permission_store.get, user_id, session_id)
@@ -3644,16 +3649,10 @@ def register_core_routes(
                 )
                 active = [member for member in members if not member.archived]
                 retained = active or members
-                family_pin_key = family_pinned_label_key(user_id)
-                if (
-                    retained
-                    and retained[0].id == session_id
-                    and (
-                        family_pin_key in pin_source.labels
-                        or pinned_label_key(user_id) not in pin_source.labels
-                    )
-                ):
+                if retained and retained[0].id == session_id:
                     family_pin_value = labels_to_set.pop(PINNED_LABEL_KEY)
+                    if not family_pin_value:
+                        labels_to_set[pinned_label_key(user_id)] = ""
         # Pins are per-user. The client writes the canonical ``omnigent.pinned``
         # key; rewrite it to the caller's per-user key so one user's pin doesn't
         # pin the session for everyone with access. Empty value (unpin) carries
@@ -3848,9 +3847,9 @@ def register_core_routes(
                     if host_id is not None and await asyncio.to_thread(
                         runner_router.host_is_on_another_replica, host_id
                     ):
-                        raise OmnigentError(
+                        raise WrongReplicaError(
                             "side chat runner is connected to another server replica",
-                            code=ErrorCode.WRONG_REPLICA,
+                            host_id=host_id,
                         )
                 runner_id = _sf._registered_runner_id(
                     runner_router, body.runner_id, user_id=user_id

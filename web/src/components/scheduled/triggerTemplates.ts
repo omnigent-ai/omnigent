@@ -94,6 +94,8 @@ export interface TriggerPromptContext {
   model?: string;
   /** The task's reasoning effort override. */
   effort?: string;
+  /** The workers' permission mode; omitted, they use their agent's default. */
+  permissionMode?: string;
   /** The initial search must cover the wait until the first poll. */
   pollingIntervalMinutes?: number;
   /** "continue" sends every match to one task session; "new" is the default. */
@@ -659,6 +661,8 @@ export interface TriggerWorkerSettings {
   agentId: string | null;
   model: string;
   effort: string;
+  /** "" keeps the agent's default. */
+  permissionMode: string;
 }
 
 const QUOTED_WORKER_VALUE = String.raw`"(?:[^"\\]|\\.)*"`;
@@ -667,6 +671,7 @@ const WORKER_SETTINGS_PATTERN = new RegExp(
     `(placement "(?:same_host|managed)", title ${QUOTED_WORKER_VALUE})` +
     `(?:, model (${QUOTED_WORKER_VALUE}))?` +
     `(?:, reasoning_effort (${QUOTED_WORKER_VALUE}))?` +
+    `(?:, permission_mode (${QUOTED_WORKER_VALUE}))?` +
     `, and a message under 8000 characters\\.`,
   "g",
 );
@@ -688,6 +693,7 @@ function workerSettingsMatch(prompt: string) {
       agentId: match[1] === "set to your agent ID" ? null : JSON.parse(match[1]),
       model: match[3] === undefined ? "" : JSON.parse(match[3]),
       effort: match[4] === undefined ? "" : JSON.parse(match[4]),
+      permissionMode: match[5] === undefined ? "" : JSON.parse(match[5]),
     };
     return { parts, match, settings };
   } catch {
@@ -720,6 +726,9 @@ export function updateTriggerWorkerSettings(
     match[2],
     ...(settings.model ? [`model ${JSON.stringify(settings.model)}`] : []),
     ...(settings.effort ? [`reasoning_effort ${JSON.stringify(settings.effort)}`] : []),
+    ...(settings.permissionMode
+      ? [`permission_mode ${JSON.stringify(settings.permissionMode)}`]
+      : []),
   ];
   const systemPrompt = parts.systemPrompt!.replace(
     match[0],
@@ -1421,6 +1430,7 @@ export function renderTriggerPrompt(
     `title ${shared ? taskSessionTitle : text.title}`,
     ...(ctx.model ? [`model ${JSON.stringify(ctx.model)}`] : []),
     ...(ctx.effort ? [`reasoning_effort ${JSON.stringify(ctx.effort)}`] : []),
+    ...(ctx.permissionMode ? [`permission_mode ${JSON.stringify(ctx.permissionMode)}`] : []),
   ];
   const managerPostsLink = fields.linkBack && source !== "slack";
   const workerPostingInstructions =

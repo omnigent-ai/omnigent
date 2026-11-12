@@ -1048,6 +1048,22 @@ class ManagedSandboxDeployment:
                     caps[config.provider]["default_models"] = True
         return caps
 
+    def provider_automation_notices(self) -> dict[str, str]:
+        """
+        Each launchable provider's ``automation_notice``, for ``/v1/info``.
+
+        Kept apart from :meth:`provider_ui_capabilities`, whose values are flags.
+
+        :returns: Notice text keyed by provider name; a provider without one is absent.
+        """
+        notices: dict[str, str] = {}
+        for config in self.configs:
+            if config.managed_launch_supported and config.provider is not None:
+                notice = config.launcher_factory().automation_notice
+                if notice:
+                    notices[config.provider] = notice
+        return notices
+
 
 @dataclass
 class ManagedHostLaunch:

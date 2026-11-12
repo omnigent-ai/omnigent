@@ -3350,6 +3350,7 @@ _SESSION_CREATE_FIELDS = (
     ("title", "title"),
     ("model", "model_override"),
     ("reasoning_effort", "reasoning_effort"),
+    ("permission_mode", "permission_mode"),
 )
 
 
@@ -3375,6 +3376,7 @@ def _build_session_create_body(
     title: object,
     model: object = None,
     reasoning_effort: object = None,
+    permission_mode: object = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -3399,13 +3401,20 @@ def _build_session_create_body(
         written as ``model_override`` on the session.
     :param reasoning_effort: Optional reasoning level, e.g. ``"high"``;
         written as ``reasoning_effort`` on the session.
+    :param permission_mode: Optional native permission mode, e.g.
+        ``"approve-for-me"``; the server maps it to the harness's launch args.
     :returns: The JSON request body.
     """
     return {
         "agent_id": agent_id,
         "parent_session_id": conversation_id,
         **_session_create_fields(
-            {"title": title, "model": model, "reasoning_effort": reasoning_effort}
+            {
+                "title": title,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "permission_mode": permission_mode,
+            }
         ),
     }
 
@@ -3674,6 +3683,13 @@ async def _execute_session_create(
     if placement != "child" and message is not None:
         if not isinstance(message, str) or not message.strip() or len(message) > 8000:
             return json.dumps({"error": "Provide an initial message of 1–8000 characters"})
+    permission_mode = args.get("permission_mode")
+    if permission_mode is not None:
+        if not isinstance(permission_mode, str) or not permission_mode.strip():
+            return json.dumps({"error": "permission_mode must be a nonempty string"})
+        if has_config_path:
+            # A new agent's own config sets its permission mode.
+            return json.dumps({"error": "permission_mode requires agent_id"})
     if has_config_path:
         return await _session_create_from_config_path(
             str(config_path),
@@ -3690,6 +3706,7 @@ async def _execute_session_create(
         args.get("title"),
         model=args.get("model"),
         reasoning_effort=args.get("reasoning_effort"),
+        permission_mode=permission_mode,
     )
     headers: dict[str, str] = {}
     if placement != "child":
@@ -3722,10 +3739,26 @@ async def _execute_session_create(
         endpoint = "/v1/sessions" if placement == "child" else "/v1/sessions/orchestrated"
         host_id = None
         info_data: _JsonObject = {}
-        if placement == "managed" or args.get("project_name") is not None:
+        if (
+            placement == "managed"
+            or args.get("project_name") is not None
+            or permission_mode is not None
+        ):
             info = await server_client.get("/v1/info", timeout=30.0)
             info.raise_for_status()
             info_data = info.json()
+        # An older server ignores the field, so the session would quietly start in
+        # its agent's default mode instead.
+        if (
+            permission_mode is not None
+            and info_data.get("session_create_permission_modes") is not True
+        ):
+            return json.dumps(
+                {
+                    "error": "This Omnigent server can't set a new session's permission_mode; "
+                    "no session was created. Omit permission_mode to use the agent's default."
+                }
+            )
         if placement == "managed":
             if (
                 info_data.get("sibling_sessions") is True
@@ -4966,6 +4999,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "model_override",
     "reasoning_effort",
     "permission_mode",
+    "max_cost_usd",
     "session_mode",
     "session_id",
     "workspace",

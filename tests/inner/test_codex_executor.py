@@ -5209,6 +5209,73 @@ def test_materialize_inherited_gateway_name_preserves_explicit_values(
     assert "base_url" not in provider
 
 
+@pytest.mark.parametrize("inline_providers", [False, True])
+@pytest.mark.parametrize("configured_name", [None, "", " \t", "My Gateway", 7, False])
+def test_materialize_local_gateway_name_without_a_successful_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inline_providers: bool,
+    configured_name: str | int | bool | None,
+) -> None:
+    import tomllib
+
+    import tomlkit
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    monkeypatch.setattr(
+        "omnigent.databricks_ai_gateway.DATABRICKS_TRUSTED_HOST_SUFFIXES", (".example.test",)
+    )
+    gateway = {
+        "base_url": "https://gateway.example.test/ai-gateway/codex/v1",
+        "auth": {"command": "credential-helper", "args": ["token"]},
+    }
+    if configured_name is not None:
+        gateway["name"] = configured_name
+    providers = tomlkit.inline_table() if inline_providers else tomlkit.table()
+    providers["inactive_gateway"] = gateway
+    providers["selected"] = {"name": "Selected", "base_url": "https://other.example.test/v1"}
+    providers["amazon-bedrock"] = {"aws": {"region": "us-east-1"}}
+    providers["non_gateway"] = {"base_url": "https://other.example.test/v1"}
+    document = tomlkit.document()
+    document["model_provider"] = "selected"
+    document["model_providers"] = providers
+    source_home = tmp_path / "source"
+    source_home.mkdir()
+    source_path = source_home / "config.toml"
+    original = tomlkit.dumps(document)
+    source_path.write_text(original)
+    private_home = tmp_path / "private"
+    private_home.mkdir()
+    private_path = private_home / "config.toml"
+    private_path.write_text(original)
+
+    overrides = ['model_provider="selected"']
+    assert (
+        materialize_codex_provider_config(private_home, overrides, source_home=source_home)
+        == overrides
+    )
+
+    written = tomllib.loads(private_path.read_text())
+    expected_name = (
+        "inactive_gateway"
+        if configured_name is None
+        or (isinstance(configured_name, str) and not configured_name.strip())
+        else configured_name
+    )
+    repaired = written["model_providers"]["inactive_gateway"]
+    assert repaired["name"] == expected_name
+    assert repaired["base_url"] == gateway["base_url"]
+    assert repaired["auth"] == gateway["auth"]
+    assert written["model_provider"] == "selected"
+    assert written["model_providers"]["amazon-bedrock"] == providers["amazon-bedrock"]
+    assert "name" not in written["model_providers"]["non_gateway"]
+    assert source_path.read_text() == original
+    first_write = private_path.read_text()
+    assert materialize_codex_provider_config(private_home, overrides) == overrides
+    assert private_path.read_text() == first_write
+
+
 def test_materialize_ignores_non_gateway_effective_providers(
     tmp_path: Path,
 ) -> None:
