@@ -121,7 +121,7 @@ export function WorkflowDialog({
                 className="min-h-32 resize-y rounded-xl p-4 text-ui focus-visible:ring-0"
                 placeholder={
                   savedWorkflow
-                    ? "What this run is about"
+                    ? "Anything specific to this run"
                     : "Add retries to the uploader, with tests"
                 }
                 autoFocus

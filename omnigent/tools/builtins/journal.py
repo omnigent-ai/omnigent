@@ -390,8 +390,10 @@ class SysWorkflowSaveTool(Tool):
             "a detail that would differ next run (the repo, the PR, the module, a ticket, a "
             "date) comes out of the steps, and the description says what a run needs "
             "('Give it: …'). Use the name the user picked; if they gave none, suggest one and "
-            "save once they agree. Returns the workflow's id and name, or name_taken when the "
-            "user already has a workflow with that name."
+            "save once they agree. A workflow drafted from a description waits for the user's "
+            "go-ahead: show the draft first, offering to save it now or try it once. Returns the "
+            "workflow's id and name, or name_taken when the user already has a workflow with "
+            "that name."
         )
 
     def get_schema(self) -> dict[str, Any]:
