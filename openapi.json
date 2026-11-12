@@ -21824,6 +21824,48 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/github/merge-as": {
+      "post": {
+        "description": "Merge the selected PR as the account the merge dialog showed.\n\nA route apart from `/merge`, so a server, runner, or host that can't\nbind the account refuses the request instead of merging as the saved one.\n\n**Returns:** A `session.github.pr_merge`.",
+        "operationId": "merge_session_github_pr_as_v1_sessions__session_id__resources_github_merge_as_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Merge Session Github Pr As",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/github/merge-options": {
       "get": {
         "description": "List the merge methods the selected PR's repository allows, for the merge dialog.\n\nRequires edit access, like the merge it feeds. Falls back to the host\ntunnel when the runner is offline.\n\n**Returns:** A `session.github.merge_options` with `methods` and `default`.",
