@@ -17,7 +17,11 @@ from omnigent.server.managed_hosts import (
     stop_archived_session_sandbox,
 )
 from omnigent.server.routes._sessions import orchestration
-from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from tests.server.helpers import FakeSandboxLauncher, HostStartInvocation
@@ -106,29 +110,19 @@ async def test_the_providers_launcher_makes_the_final_call(db_uri, monkeypatch, 
     assert len(fake.stopped) == (0 if configured else 1)
 
 
-async def test_an_unarchive_while_the_launcher_decides_keeps_the_sandbox(db_uri, monkeypatch):
-    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
-
-    def stop_when_archived(**_kwargs: object) -> bool:
-        # The user unarchives (and may already be sending a message) while a
-        # slow decision, such as a flag lookup, is in flight.
-        conversations.update_conversation(conv.id, archived=False)
-        return True
-
-    monkeypatch.setattr(fake, "stop_when_archived", stop_when_archived)
-    assert await _stop(fake, host_store, conversations, conv) is False
-    assert fake.stopped == []
-
-
-async def test_a_sibling_unarchived_while_the_launcher_decides_keeps_the_sandbox(
-    db_uri, monkeypatch
+@pytest.mark.parametrize("unarchived", ["itself", "sibling"])
+async def test_an_unarchive_while_the_launcher_decides_keeps_the_sandbox(
+    db_uri, monkeypatch, unarchived
 ):
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
     sibling = conversations.create_conversation(host_id=conv.host_id, workspace="/workspace")
     conversations.update_conversation(sibling.id, archived=True)
 
     def stop_when_archived(**_kwargs: object) -> bool:
-        conversations.update_conversation(sibling.id, archived=False)
+        # The user unarchives (and may already be sending a message) while a
+        # slow decision, such as a flag lookup, is in flight.
+        target = conv.id if unarchived == "itself" else sibling.id
+        conversations.update_conversation(target, archived=False)
         return True
 
     monkeypatch.setattr(fake, "stop_when_archived", stop_when_archived)
@@ -182,18 +176,57 @@ async def test_keeps_a_sandbox_an_unarchived_side_chat_uses(
     assert len(fake.stopped) == (1 if side_chat_archived else 0)
 
 
-async def test_keeps_the_sandbox_when_the_walk_passes_the_session_cap(db_uri, monkeypatch):
+@pytest.mark.parametrize(("cap", "stops"), [(3, False), (4, True)], ids=["capped", "complete"])
+async def test_keeps_the_sandbox_when_the_walk_passes_the_session_cap(
+    db_uri, monkeypatch, cap, stops
+):
+    # Four sessions in all, and no page fills up: only the total count can trip.
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
-    for title in ("one", "two"):
-        conversations.create_conversation(
-            kind="sub_agent", title=title, parent_conversation_id=conv.id
-        )
-    monkeypatch.setattr(managed_hosts, "_ARCHIVE_STOP_MAX_SESSIONS", 3)
-    assert await _stop(fake, host_store, conversations, conv) is True
-    monkeypatch.setattr(managed_hosts, "_ARCHIVE_STOP_MAX_SESSIONS", 2)
-    fake.stopped.clear()
+    first = conversations.create_conversation(
+        kind="sub_agent", title="one", parent_conversation_id=conv.id
+    )
+    conversations.create_conversation(
+        kind="sub_agent", title="two", parent_conversation_id=conv.id
+    )
+    conversations.create_conversation(
+        kind="sub_agent", title="nested", parent_conversation_id=first.id
+    )
+    monkeypatch.setattr(managed_hosts, "_ARCHIVE_STOP_MAX_SESSIONS", cap)
+    assert await _stop(fake, host_store, conversations, conv) is stops
+    assert len(fake.stopped) == (1 if stops else 0)
+
+
+async def test_archiving_the_last_side_chat_stops_its_sources_sandbox(db_uri):
+    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
+    side_chat = conversations.create_conversation(
+        side_chat_parent_id=conv.id,
+        labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: conv.id},
+    )
+    # The source is archived first, while its side chat is still in use.
     assert await _stop(fake, host_store, conversations, conv) is False
-    assert fake.stopped == []
+    conversations.update_conversation(side_chat.id, archived=True)
+    side_chat = conversations.get_conversation(side_chat.id)
+    assert side_chat.host_id is None
+
+    assert await _stop(fake, host_store, conversations, side_chat) is True
+    assert fake.stopped == [host_store.get_host(conv.host_id).sandbox_id]
+    assert fake.terminated == []
+
+
+async def test_a_sandbox_that_gains_a_user_while_stopping_is_resumed(db_uri, monkeypatch):
+    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
+    sandbox_id = host_store.get_host(conv.host_id).sandbox_id
+    real_stop = fake.stop
+
+    def stop_while_unarchived(stopped_id: str) -> None:
+        # The user unarchives and messages the session while the provider stops.
+        conversations.update_conversation(conv.id, archived=False)
+        real_stop(stopped_id)
+
+    monkeypatch.setattr(fake, "stop", stop_while_unarchived)
+    assert await _stop(fake, host_store, conversations, conv) is False
+    assert fake.stopped == [sandbox_id]
+    assert fake.resumed == [sandbox_id]
 
 
 async def test_keeps_a_sandbox_its_provider_cannot_resume(db_uri):

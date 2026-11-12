@@ -5108,13 +5108,15 @@ async def _host_may_be_in_use(
     host_id: str, session_id: str, conversation_store: ConversationStore
 ) -> bool:
     """
-    Whether any session on *host_id*, *session_id* included, may still use it.
+    Whether any session on *host_id* may still use it.
+
+    *session_id* is a session bound to *host_id*, used to confirm the listing.
 
     The host's own sessions are those bound to it. Side chats and sub-agents
     have no host binding and run on their source's or parent's runner, so they
     are found by walking out from those sessions. An unarchived host session or
-    side chat counts as in use, which also covers *session_id* having been
-    unarchived since its teardown began. Sub-agents are not archived with their
+    side chat counts as in use, which also covers the archived session having
+    been unarchived since its teardown began. Sub-agents are not archived with their
     parent, so they are only walked for their own side chats.
 
     Fails closed: a session whose archived state can't be read, a host listing
@@ -5175,32 +5177,46 @@ async def stop_archived_session_sandbox(
     """
     Stop an archived session's managed sandbox, keeping it resumable.
 
-    Runs after the archive teardown. The host's provider decides: its
+    Runs after the archive teardown. The sandbox is the one the session runs on:
+    its own host's, or for a side chat or sub-agent without a host binding, its
+    source's or parent's. The host's provider decides: its
     :attr:`ManagedSandboxConfig.stop_on_archive` setting is passed to the
     launcher's ``stop_when_archived`` hook, which returns it unless the provider
     overrides it. The sandbox is only stopped, never deleted, and only when its
     provider can resume it, so an unarchived session's next message wakes it
     through :func:`resume_managed_host` (unless the reaper has terminated it
-    since). A sandbox another unarchived session is bound to (a ``/clear``
-    continuation, for example) keeps running, as does this session's if it was
-    unarchived meanwhile, and a scheduled task run's, whose sandbox the task's
-    own lifecycle manages. Best-effort: a failure leaves the sandbox running.
+    since). A sandbox another unarchived session uses keeps running, as does
+    this session's if it was unarchived meanwhile, and a scheduled task run's,
+    whose sandbox the task's own lifecycle manages. Best-effort: a failure
+    leaves the sandbox running.
+
+    Nothing holds new work off while the provider stops the sandbox, so a
+    session unarchived and messaged during that call can start a runner the
+    stop then ends. The check is repeated after the stop, and a sandbox that
+    gained a user meanwhile is resumed at once; the interrupted turn still
+    fails.
 
     :param conv: The archived session, as re-read by the teardown.
     :param host_store: Store holding the session's host row.
     :param conversation_store: Store used to find other sessions on the host.
     :param config: The deployment's sandbox config, or ``None`` when managed
         hosts are not configured.
-    :returns: ``True`` when the provider stopped the sandbox.
+    :returns: ``True`` when the provider stopped the sandbox and left it stopped.
     """
+    from omnigent.runner.routing import routing_host_session
     from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
 
-    if config is None or conv.host_id is None:
+    if config is None:
         return False
     if conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY):
         return False
     try:
-        host = await asyncio.to_thread(host_store.get_host, conv.host_id)
+        owner = await asyncio.to_thread(routing_host_session, conv, conversation_store)
+        if owner is None or owner.host_id is None:
+            return False
+        if owner.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY):
+            return False
+        host = await asyncio.to_thread(host_store.get_host, owner.host_id)
         if host is None or host.sandbox_id is None:
             return False
         launcher = _launcher_for_teardown(host, config)
@@ -5217,10 +5233,20 @@ async def stop_archived_session_sandbox(
         if not wanted:
             return False
         # After the hook, which may be slow: an unarchive can't cancel a started
-        # teardown. A wake that lands during the stop call can still race it.
-        if await _host_may_be_in_use(host.host_id, conv.id, conversation_store):
+        # teardown.
+        if await _host_may_be_in_use(host.host_id, owner.id, conversation_store):
             return False
         await asyncio.to_thread(launcher.stop, host.sandbox_id)
+        if await _host_may_be_in_use(host.host_id, owner.id, conversation_store):
+            _logger.info(
+                "Managed sandbox %s gained a user while stopping for archived session %s; "
+                "resuming it",
+                host.sandbox_id,
+                conv.id,
+                extra={"session_id": conv.id},
+            )
+            await asyncio.to_thread(launcher.resume, host.sandbox_id)
+            return False
     except SandboxCapabilityError:
         _logger.debug(
             "Managed sandbox provider cannot stop sandboxes; leaving archived "
@@ -5231,7 +5257,7 @@ async def stop_archived_session_sandbox(
         return False
     except Exception:
         _logger.warning(
-            "Failed to stop the managed sandbox of archived session %s",
+            "Failed to stop or resume the managed sandbox of archived session %s",
             conv.id,
             exc_info=True,
             extra={"session_id": conv.id},
