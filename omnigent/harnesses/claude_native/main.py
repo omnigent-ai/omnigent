@@ -7227,6 +7227,7 @@ def _websocket_connect(
 
     from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
     from omnigent.session_host import session_routing_headers
+    from omnigent.telemetry.request_headers import client_user_agent
     from omnigent.util.tls import client_ssl_context
 
     # Identify as a first-party client so the server's WebSocket origin
@@ -7239,8 +7240,7 @@ def _websocket_connect(
         "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
     }
     # websockets adds its own User-Agent on top of the handshake headers; send only ours.
-    user_agent = handshake_headers.pop("User-Agent", None)
-    ua_kwargs: dict[str, Any] = {"user_agent_header": user_agent} if user_agent else {}
+    user_agent = handshake_headers.pop("User-Agent", None) or client_user_agent()
     # A remote (https) workspace yields a wss:// attach URL; build a verifying
     # SSL context from a real CA bundle so verification works on interpreters
     # whose OpenSSL default cert path is empty. ws:// passes ssl=None (the
@@ -7254,7 +7254,7 @@ def _websocket_connect(
                 additional_headers=handshake_headers,
                 close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
                 ssl=ssl_ctx,
-                **ua_kwargs,
+                user_agent_header=user_agent,
             ),
         )
     except TypeError:
@@ -7265,7 +7265,7 @@ def _websocket_connect(
                 extra_headers=handshake_headers,
                 close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
                 ssl=ssl_ctx,
-                **ua_kwargs,
+                user_agent_header=user_agent,
             ),
         )
 

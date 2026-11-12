@@ -24,7 +24,7 @@ class SessionCreatedEvent:
     :param harness: Harness kind, e.g. ``"claude-native"`` or ``"pi"``.
     :param surface: Client surface: ``"web"``, ``"desktop"``, ``"ios"``,
         ``"android"``, ``"cli"``, ``"runner"``, ``"host"``, ``"harness"``,
-        ``"sdk"``, ``"script"``, or ``"unknown"``.
+        ``"sdk"``, ``"script"``, ``"slack"``, or ``"unknown"``.
     :param anon_user_id: First 16 hex chars of ``sha256("<installation_id>:<user_id>")``.
     :param host_installation_id: Installation ID of the host machine
         (``omnigent host``); ``None`` for CLI sessions.

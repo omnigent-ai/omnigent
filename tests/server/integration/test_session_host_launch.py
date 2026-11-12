@@ -548,7 +548,11 @@ async def test_inline_launch_stamps_terminal_view_label_for_custom_native_harnes
 
     assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
     body = resp.json()
-    expected_labels = {"env": "test", "omnigent.ui": "terminal", "omnigent.client_surface": "cli"}
+    expected_labels = {
+        "env": "test",
+        "omnigent.ui": "terminal",
+        "omnigent.client_surface": "script",
+    }
     assert body["labels"] == expected_labels
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.get_conversation(body["id"])

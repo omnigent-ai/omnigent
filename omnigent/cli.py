@@ -2250,6 +2250,13 @@ def _enforce_wrapper_guard() -> None:
 
 
 @capture_cli_entry
+def _client_identity_headers() -> dict[str, str]:
+    """Return the User-Agent naming this CLI, for ad-hoc requests to the server."""
+    from omnigent.telemetry.request_headers import client_identity_headers
+
+    return client_identity_headers()
+
+
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.
@@ -4150,7 +4157,9 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         workspace_host = load_databricks_workspace_host(server)
         if workspace_host is None and "Authorization" in headers:
             try:
-                unauthed_probe = _httpx.get(f"{server}/v1/me", timeout=10.0)
+                unauthed_probe = _httpx.get(
+                    f"{server}/v1/me", headers=_client_identity_headers(), timeout=10.0
+                )
             except _httpx.HTTPError as error:
                 if is_workspace_hosted_url(server) and org_id is None:
                     raise click.ClickException(
@@ -13268,7 +13277,7 @@ def _workspace_api_server_url(server: str) -> str:
     if parsed.path not in ("", "/") or parsed.scheme != "https":
         return server
     try:
-        probe = _httpx.get(f"{server}/v1/me", timeout=10.0)
+        probe = _httpx.get(f"{server}/v1/me", headers=_client_identity_headers(), timeout=10.0)
     except (_httpx.HTTPError, _httpx.InvalidURL):
         return server
     # Already something we understand at the root: an omnigent server
@@ -13283,7 +13292,9 @@ def _workspace_api_server_url(server: str) -> str:
         return server
     candidate = urlunsplit((parsed.scheme, parsed.netloc, WORKSPACE_API_PATH, "", ""))
     try:
-        api_probe = _httpx.get(f"{candidate}/v1/me", timeout=10.0)
+        api_probe = _httpx.get(
+            f"{candidate}/v1/me", headers=_client_identity_headers(), timeout=10.0
+        )
     except _httpx.HTTPError:
         return server
     if _workspace_mount_probe_matches(candidate, api_probe):
@@ -13302,7 +13313,7 @@ def _workspace_api_server_url(server: str) -> str:
         try:
             authed_probe = _httpx.get(
                 f"{candidate}/v1/me",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={**_client_identity_headers(), "Authorization": f"Bearer {token}"},
                 timeout=10.0,
             )
         except _httpx.HTTPError:
@@ -13410,7 +13421,7 @@ def _databricks_root_is_usable(server: str) -> bool:
 
     root = _probe_root(server)
     try:
-        probe = _httpx.get(f"{root}/v1/me", timeout=10.0)
+        probe = _httpx.get(f"{root}/v1/me", headers=_client_identity_headers(), timeout=10.0)
     except _httpx.HTTPError:
         return False
     if probe.status_code == 200:
@@ -13885,7 +13896,7 @@ def _verify_databricks_server_token(
     try:
         return _httpx.get(
             f"{server}/v1/me",
-            headers={"Authorization": f"Bearer {token}"},
+            headers={**_client_identity_headers(), "Authorization": f"Bearer {token}"},
             params={"o": org_id} if org_id else None,
             timeout=10.0,
         )
@@ -14048,6 +14059,7 @@ def login(server_url: str) -> None:
         probe = _httpx.get(
             f"{server}/v1/me",
             params={"o": org_id} if org_id else None,
+            headers=_client_identity_headers(),
             timeout=10.0,
             trust_env=_trust_env_for(server),
         )
@@ -14120,6 +14132,7 @@ def login(server_url: str) -> None:
         resp = _httpx.post(
             f"{server}/auth/cli-login",
             json={"code_challenge": code_challenge, "code_challenge_method": "S256"},
+            headers=_client_identity_headers(),
             timeout=10.0,
             trust_env=_trust_env_for(server),
         )
@@ -14168,7 +14181,7 @@ def login(server_url: str) -> None:
             poll_resp = _httpx.get(
                 poll_url,
                 params={"ticket": ticket},
-                headers={"X-Omnigent-Code-Verifier": code_verifier},
+                headers={**_client_identity_headers(), "X-Omnigent-Code-Verifier": code_verifier},
                 timeout=10.0,
                 trust_env=_trust_env_for(server),
             )
@@ -14300,6 +14313,7 @@ def _accounts_login(server: str) -> None:
         resp = _httpx.post(
             f"{server}/auth/login",
             json={"username": username, "password": password, "issue_refresh": True},
+            headers=_client_identity_headers(),
             timeout=10.0,
             trust_env=_trust_env_for(server),
         )

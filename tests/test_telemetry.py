@@ -53,6 +53,7 @@ def test_classify_surface_android() -> None:
         ("omnigent-host/0.22.0 python-httpx/0.28.1", "host"),
         ("omnigent-harness/0.22.0 (claude-sdk) python-httpx/0.28.1", "harness"),
         ("omnigent-client/0.22.0 python-httpx/0.28.1", "sdk"),
+        ("omnigent-slack/0.22.0 python-httpx/0.28.1", "slack"),
     ],
 )
 def test_classify_surface_omnigent_components(user_agent: str, surface: str) -> None:
@@ -116,6 +117,27 @@ def test_client_surface_invalid_header_uses_user_agent(header: str | None) -> No
     if header is not None:
         headers["x-omnigent-client"] = header
     assert resolve_client_surface(headers) == "runner"
+
+
+@pytest.mark.parametrize("component", ["runner", "host", "harness"])
+def test_internal_recreate_keeps_requested_surface(component: str) -> None:
+    """A runner/host/harness re-creating a session keeps the copied surface label."""
+    headers = {"user-agent": client_user_agent_for(component)}
+    requested = {CLIENT_SURFACE_LABEL_KEY: "desktop"}
+    assert resolve_client_surface(headers, requested_labels=requested) == "desktop"
+    # A bogus copied value is ignored.
+    bogus = {CLIENT_SURFACE_LABEL_KEY: "evil"}
+    assert resolve_client_surface(headers, requested_labels=bogus) == component
+
+
+@pytest.mark.parametrize("user_agent", ["omnigent-cli/0.22.0", "python-httpx/0.28.1", None])
+def test_external_create_ignores_requested_surface_label(user_agent: str | None) -> None:
+    """Only Omnigent's internal components may carry a surface over in the body."""
+    headers = {"user-agent": user_agent} if user_agent else {}
+    requested = {CLIENT_SURFACE_LABEL_KEY: "desktop"}
+    assert resolve_client_surface(headers, requested_labels=requested) == classify_surface(
+        user_agent
+    )
 
 
 def test_runner_spawned_child_session_keeps_parent_surface() -> None:
@@ -186,7 +208,8 @@ def test_client_component_is_inherited_by_child_processes(
 
     from omnigent.telemetry.request_headers import CLIENT_COMPONENT_ENV_VAR, set_client_component
 
-    monkeypatch.delenv(CLIENT_COMPONENT_ENV_VAR, raising=False)
+    # setenv first so monkeypatch restores the variable set_client_component writes.
+    monkeypatch.setenv(CLIENT_COMPONENT_ENV_VAR, "cli")
     set_client_component("runner")
     child = subprocess.run(
         [
@@ -206,6 +229,13 @@ def test_client_user_agent_names_harness_and_strips_unsafe_detail() -> None:
     assert " (claude-sdk) " in client_user_agent_for("harness", "claude-sdk")
     # Header-injection characters in the qualifier are dropped, not sent.
     assert " (claudesdkx) " in client_user_agent_for("harness", "claude sdk\r\nx")
+
+
+def test_set_client_component_rejects_unknown_component() -> None:
+    from omnigent.telemetry.request_headers import set_client_component
+
+    with pytest.raises(ValueError, match="unknown client component"):
+        set_client_component("serverless")
 
 
 def test_client_user_agent_unknown_component_falls_back_to_cli(

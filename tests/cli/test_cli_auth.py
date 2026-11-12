@@ -818,7 +818,7 @@ def test_refresh_stored_token_renews_and_rotates(token_dir, monkeypatch) -> None
 
     posted: dict[str, object] = {}
 
-    def _fake_post(url, *, data=None, timeout=None):
+    def _fake_post(url, *, data=None, headers=None, timeout=None):
         posted["url"] = url
         posted["data"] = data
         return httpx.Response(
@@ -869,7 +869,7 @@ def test_refresh_stored_token_refused_leaves_entry(token_dir, monkeypatch) -> No
         refresh_token="refresh-1",
     )
 
-    def _fake_post(url, *, data=None, timeout=None):
+    def _fake_post(url, *, data=None, headers=None, timeout=None):
         return httpx.Response(
             400, json={"error": "invalid_grant"}, request=httpx.Request("POST", url)
         )
@@ -902,7 +902,7 @@ def test_refresh_404_on_loopback_is_quiet(token_dir, monkeypatch, caplog) -> Non
         refresh_token="refresh-1",
     )
 
-    def _fake_post(url, *, data=None, timeout=None):
+    def _fake_post(url, *, data=None, headers=None, timeout=None):
         return httpx.Response(404, request=httpx.Request("POST", url))
 
     monkeypatch.setattr(httpx, "post", _fake_post)
@@ -938,7 +938,7 @@ def test_refresh_404_on_remote_warns_without_relogin_advice(
         refresh_token="refresh-1",
     )
 
-    def _fake_post(u, *, data=None, timeout=None):
+    def _fake_post(u, *, data=None, headers=None, timeout=None):
         return httpx.Response(404, request=httpx.Request("POST", u))
 
     monkeypatch.setattr(httpx, "post", _fake_post)
@@ -981,7 +981,7 @@ def test_refresh_refusal_log_redacts_url_credentials(token_dir, monkeypatch, cap
         refresh_token="refresh-1",
     )
 
-    def _fake_post(u, *, data=None, timeout=None):
+    def _fake_post(u, *, data=None, headers=None, timeout=None):
         return httpx.Response(403, json={"error": "denied"}, request=httpx.Request("POST", u))
 
     monkeypatch.setattr(httpx, "post", _fake_post)

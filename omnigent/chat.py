@@ -1037,10 +1037,13 @@ def _server_headers(
         already threaded the value here; runner affinity is now
         persisted through ``PATCH /v1/sessions/{id}``, not a
         request header.
-    :returns: Static headers for ``httpx`` / ``OmnigentClient``.
+    :returns: Static headers for ``httpx`` / ``OmnigentClient``: the client
+        identity ``User-Agent``, so an unauthenticated CLI isn't reported as the SDK.
     """
+    from omnigent.telemetry.request_headers import client_identity_headers
+
     del runner_id
-    return {}
+    return client_identity_headers()
 
 
 def _server_auth(

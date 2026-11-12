@@ -1966,6 +1966,7 @@ def register_core_routes(
                     CLIENT_SURFACE_LABEL_KEY: resolve_client_surface(
                         request.headers,
                         parent_labels=parent_conv.labels if parent_conv is not None else None,
+                        requested_labels=parsed_metadata.labels,
                     ),
                 }
             }

@@ -3579,7 +3579,7 @@ def test_server_headers_do_not_encode_runner_affinity() -> None:
     """Runner affinity is persisted by PATCH /v1/sessions, not headers."""
     headers = chat_module._server_headers(runner_id="runner_local_test")
 
-    assert headers == {}
+    assert headers == {"User-Agent": client_user_agent()}
 
 
 def test_run_chat_remote_dispatches_without_profile_plumbing(

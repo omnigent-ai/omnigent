@@ -12806,6 +12806,7 @@ async def _create_session_from_existing_agent(
     client_surface = resolve_client_surface(
         request.headers,
         parent_labels=_parent_for_routing.labels if _parent_for_routing is not None else None,
+        requested_labels=initial_labels,
     )
     initial_labels[CLIENT_SURFACE_LABEL_KEY] = client_surface
     if created_by_session_id is not None:

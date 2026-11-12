@@ -19,10 +19,11 @@ import uuid
 INSTALLATION_ID_HEADER = "X-Omnigent-Installation-Id"
 
 
-# Which Omnigent component this process is. Child processes (hooks, forwarders)
-# inherit it, so a helper a runner spawns identifies as that runner.
+# Which Omnigent component this process is, as a self-reported attribution hint
+# (not an authenticated identity). Child processes (hooks, forwarders) inherit
+# it, so a helper a runner spawns reports as that runner.
 CLIENT_COMPONENT_ENV_VAR = "OMNIGENT_CLIENT_COMPONENT"
-# ``omnigent-<component>/`` User-Agent product tokens; unknown values fall back to cli.
+# ``omnigent-<component>/`` User-Agent product tokens.
 CLIENT_COMPONENTS = frozenset({"cli", "host", "runner", "harness"})
 _DETAIL_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 
@@ -32,7 +33,10 @@ def set_client_component(component: str, detail: str | None = None) -> None:
 
     :param component: One of :data:`CLIENT_COMPONENTS`, e.g. ``"runner"``.
     :param detail: Optional qualifier, e.g. the harness name ``"claude-sdk"``.
+    :raises ValueError: If *component* is not in :data:`CLIENT_COMPONENTS`.
     """
+    if component not in CLIENT_COMPONENTS:
+        raise ValueError(f"unknown client component {component!r}")
     os.environ[CLIENT_COMPONENT_ENV_VAR] = f"{component}/{detail}" if detail else component
 
 
@@ -48,6 +52,7 @@ def client_user_agent() -> str:
     from omnigent.version import VERSION
 
     component, _, detail = os.environ.get(CLIENT_COMPONENT_ENV_VAR, "").partition("/")
+    # Unset (a library caller) or an env value we never wrote: report the default.
     if component not in CLIENT_COMPONENTS:
         component, detail = "cli", ""
     product = f"omnigent-{component}/{VERSION}"

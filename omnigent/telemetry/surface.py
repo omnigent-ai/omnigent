@@ -20,8 +20,11 @@ CLIENT_SURFACES = frozenset(
         "harness",
         "sdk",
         "script",
+        "slack",
     }
 )
+# Omnigent components acting for a session another surface created.
+_INTERNAL_SURFACES = frozenset({"runner", "host", "harness"})
 # User-Agent product tokens Omnigent's own Python clients send, e.g.
 # ``omnigent-runner/0.22.0 python-httpx/0.28.1``; ``omnigent-client`` is the SDK.
 _OMNIGENT_USER_AGENT_SURFACES = {
@@ -30,13 +33,25 @@ _OMNIGENT_USER_AGENT_SURFACES = {
     "omnigent-host/": "host",
     "omnigent-harness/": "harness",
     "omnigent-client/": "sdk",
+    "omnigent-slack/": "slack",
 }
 
 
 def resolve_client_surface(
-    headers: Mapping[str, str], *, parent_labels: Mapping[str, str] | None = None
+    headers: Mapping[str, str],
+    *,
+    parent_labels: Mapping[str, str] | None = None,
+    requested_labels: Mapping[str, str] | None = None,
 ) -> str:
-    """Identify the creating client; internal child requests inherit their parent's surface."""
+    """Identify the creating client; internal child requests inherit their parent's surface.
+
+    :param headers: Request headers (lower-cased keys).
+    :param parent_labels: The parent session's labels, for a child session.
+    :param requested_labels: Labels in the create body. A runner, host, or harness
+        re-creating a session (e.g. native ``/clear``) copies the original's labels,
+        so their surface is kept instead of naming the internal component.
+    :returns: A value in :data:`CLIENT_SURFACES`, or ``"unknown"``.
+    """
     surface = headers.get("x-omnigent-client")
     if surface is not None and surface in CLIENT_SURFACES:
         return surface
@@ -44,7 +59,12 @@ def resolve_client_surface(
         inherited = parent_labels.get(CLIENT_SURFACE_LABEL_KEY)
         if inherited is not None and inherited in CLIENT_SURFACES:
             return inherited
-    return classify_surface(headers.get("user-agent"))
+    classified = classify_surface(headers.get("user-agent"))
+    if classified in _INTERNAL_SURFACES and requested_labels is not None:
+        requested = requested_labels.get(CLIENT_SURFACE_LABEL_KEY)
+        if requested is not None and requested in CLIENT_SURFACES:
+            return requested
+    return classified
 
 
 def harness_client_surface() -> str | None:
@@ -64,7 +84,7 @@ def classify_surface(user_agent: str | None) -> str:
     Mapping:
     * ``None`` or absent → ``"unknown"``
     * ``"omnigent-<component>/"`` prefix → ``"cli"``, ``"runner"``, ``"host"``,
-      ``"harness"``, or ``"sdk"`` (``omnigent-client``)
+      ``"harness"``, ``"sdk"`` (``omnigent-client``), or ``"slack"``
     * ``"Electron"`` in UA → ``"desktop"``
     * ``"iPhone"`` or ``"iPad"`` in UA → ``"ios"``
     * ``"Android"`` in UA → ``"android"``

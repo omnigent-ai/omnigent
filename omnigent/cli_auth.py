@@ -493,9 +493,12 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
     import httpx
 
     try:
+        from omnigent.telemetry.request_headers import client_identity_headers
+
         resp = httpx.post(
             f"{normalized}/oauth/token",
             data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+            headers=client_identity_headers(),
             timeout=timeout,
         )
     except httpx.HTTPError as exc:

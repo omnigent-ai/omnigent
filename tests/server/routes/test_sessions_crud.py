@@ -86,6 +86,38 @@ async def test_creating_client_surface_survives_create_child_and_fork(
     assert fork_row.labels[CLIENT_SURFACE_LABEL_KEY] == "web"
 
 
+async def test_native_clear_replacement_keeps_creating_surface(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A runner-side ``/clear`` replacement keeps the desktop session's surface."""
+    from omnigent.native._native_supersession import clear_replacement_create_body
+    from omnigent.telemetry.request_headers import client_user_agent
+
+    store = SqlAlchemyConversationStore(db_uri)
+    client.headers["X-Omnigent-Client"] = "desktop"
+    agent = await create_test_agent(client, name="clear-surface")
+    old = (await client.get(f"/v1/sessions/{agent['_session_id']}")).json()
+    assert old["labels"][CLIENT_SURFACE_LABEL_KEY] == "desktop"
+    del client.headers["X-Omnigent-Client"]
+
+    # The hook copies the old labels and posts from the runner's environment.
+    body = clear_replacement_create_body(old, agent_id=agent["id"], labels=dict(old["labels"]))
+    runner_ua = {"User-Agent": client_user_agent().replace("omnigent-cli/", "omnigent-runner/")}
+    response = await client.post("/v1/sessions", json=body, headers=runner_ua)
+    assert response.status_code == 201, response.text
+    replacement = store.get_conversation(response.json()["id"])
+    assert replacement is not None
+    assert replacement.labels[CLIENT_SURFACE_LABEL_KEY] == "desktop"
+
+    # A non-Omnigent caller can't claim a surface through the body label.
+    response = await client.post("/v1/sessions", json=body, headers={"User-Agent": "curl/8"})
+    assert response.status_code == 201, response.text
+    scripted = store.get_conversation(response.json()["id"])
+    assert scripted is not None
+    assert scripted.labels[CLIENT_SURFACE_LABEL_KEY] == "script"
+
+
 async def test_list_sessions_empty(client: httpx.AsyncClient) -> None:
     """Empty database returns an empty list."""
     resp = await client.get("/v1/sessions")
