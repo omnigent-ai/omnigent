@@ -1,10 +1,8 @@
 import { lazy, Suspense } from "react";
-import { ArcaShutdownToast } from "@/components/ArcaShutdownToast";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { ImportReviewGate } from "@/components/onboarding/HostImportReview";
 import { Toaster } from "@/components/ui/sonner";
 import type { Conversation } from "@/hooks/useConversations";
-import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
 import { CommandPalette } from "./CommandPalette";
@@ -17,7 +15,6 @@ const ImportContextPreview = import.meta.env.DEV
 
 export interface AppShellOverlaysProps {
   isEmbedded: boolean;
-  serverInfo: ServerInfo | "loading";
   sessionSearch: boolean;
   commandPaletteOpen: boolean;
   setCommandPaletteOpen: (open: boolean) => void;
@@ -36,7 +33,6 @@ export interface AppShellOverlaysProps {
  */
 export function AppShellOverlays({
   isEmbedded,
-  serverInfo,
   sessionSearch,
   commandPaletteOpen,
   setCommandPaletteOpen,
@@ -54,8 +50,6 @@ export function AppShellOverlays({
       <KeyboardShortcutsDialog />
       {/* Opens the import modal once per newly connected host. */}
       {!isEmbedded && <ImportReviewGate />}
-      {/* Keep this after Outlet so a visible chat banner wins before the toast effect runs. */}
-      {isFeatureEnabled(serverInfo, "arca_shutdown_warnings") && <ArcaShutdownToast />}
       {/* Dev-only `?import-preview` for the post-setup import modal. */}
       {ImportContextPreview && (
         <Suspense fallback={null}>
