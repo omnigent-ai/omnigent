@@ -1,4 +1,4 @@
-"""Tests for ``omnigent setup --no-internal-beta`` (CLI model-provider config).
+"""Tests for ``omnigent setup`` (CLI model-provider config).
 
 Drives the click command tree with :class:`click.testing.CliRunner` and
 piped stdin, then asserts on the **exact config mutations** written to a
@@ -248,7 +248,7 @@ def test_configure_models_add_key_provider_writes_entry_and_secret(isolated_conf
     # 1="Anthropic — API key" → paste key → default model blank (= catalog
     # default) → L2: q=back → L1: q=exit.
     stdin = "\n".join(["1", "1", "1", "sk-ant-test-key", "", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -290,7 +290,7 @@ def test_configure_models_add_key_persists_catalog_default_when_declined(
     # default model blank (declined) → L2 q=back → L1 q=exit. Blank model
     # must still persist the catalog default rather than no pin.
     stdin = "\n".join(["1", "1", "1", "sk-ant-test-key", "", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -334,7 +334,7 @@ def test_configure_models_readd_key_does_not_drop_default(isolated_config) -> No
     # L1 1=Claude → L2 (1=anthropic 2=+Add): re-add via 2=+Add → anthropic
     # menu 1=Anthropic key → key → blank model → L2 q=back → L1 q=exit.
     stdin = "\n".join(["1", "2", "1", "sk-ant-new-key", "", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -376,7 +376,7 @@ def test_configure_models_add_gateway_openrouter_chat_wire(isolated_config) -> N
         )
         + "\n"
     )
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -435,7 +435,7 @@ def test_configure_models_set_default_preserves_other_family(isolated_config) ->
     # L1 2=Codex → L2 (1=openai 2=+Add): select openai (1) → L3 1=Make default
     # → back to L2 q=back → L1 q=exit.
     stdin = "\n".join(["2", "1", "1", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = load_config()
@@ -483,7 +483,7 @@ def test_configure_models_set_default_replaces_same_family_default(isolated_conf
     # select openrouter (2) → L3 1=Make default → it replaces openai as the
     # Codex default → back to L2 q=back → L1 q=exit.
     stdin = "\n".join(["2", "2", "1", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = load_config()
@@ -524,7 +524,7 @@ def test_configure_models_remove_drops_entry(isolated_config) -> None:
     # L1 1=Claude → L2 (1=anthropic 2=+Add): select anthropic (1) → L3
     # (1=Make default 2=Remove): 2=Remove → back to L2 q=back → L1 q=exit.
     stdin = "\n".join(["1", "1", "2", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -698,7 +698,7 @@ def test_configure_models_add_databricks_aborts_without_extra(
     # ("q") would be consumed as the workspace URL and the login stub would
     # raise, failing the invoke with a non-zero exit code.
     stdin = "\n".join(["1", "1", "4", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     # No provider entry was persisted — the add aborted cleanly.
@@ -799,7 +799,7 @@ def test_configure_models_add_subscription_via_flat_menu(isolated_config) -> Non
     # subscription (Pro/Max)" → harness login (stubbed True by the autouse
     # fixture) → name derived "<cli>-subscription", auto-default → L2 q → L1 q.
     stdin = "\n".join(["1", "1", "2", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -824,7 +824,7 @@ def test_add_subscription_invokes_harness_login(isolated_config, monkeypatch) ->
         lambda family: calls.append(family) or True,
     )
     stdin = "\n".join(["1", "1", "2", "q", "q"]) + "\n"  # Claude → +Add → subscription
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
     # Logged into Claude (anthropic) exactly once, before recording the entry.
     assert calls == ["anthropic"]
@@ -841,7 +841,7 @@ def test_add_subscription_aborts_when_login_fails(isolated_config, monkeypatch) 
     """
     monkeypatch.setattr("omnigent.onboarding.harness_install.harness_login", lambda family: False)
     stdin = "\n".join(["1", "1", "2", "q", "q"]) + "\n"  # Claude → +Add → subscription
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
     cfg = _config_yaml(isolated_config)
     # Nothing persisted — the failed login aborted the add.
@@ -868,7 +868,7 @@ def test_remove_subscription_signs_out_and_removes(isolated_config, monkeypatch)
     # L1 1=Claude → L2 1=select the subscription → L3 2=Remove → confirm 1=Yes
     # (sign out + remove) → L2 q → L1 q.
     stdin = "\n".join(["1", "1", "2", "1", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
     # Signed out of Claude (anthropic) …
     assert calls == ["anthropic"]
@@ -895,7 +895,7 @@ def test_remove_subscription_declined_keeps_it_and_login(isolated_config, monkey
     monkeypatch.setattr("omnigent.onboarding.harness_install.harness_logout", _no_logout)
     # L1 1=Claude → L2 1=select → L3 2=Remove → confirm 2=No → L2 q → L1 q.
     stdin = "\n".join(["1", "1", "2", "2", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
     cfg = _config_yaml(isolated_config)
     # The subscription survived the declined removal.
@@ -947,7 +947,7 @@ def test_remove_databricks_cleans_ucode_wiring_without_asking(isolated_config) -
     # L1 1=Claude → L2 1=select databricks → L3 2=Remove (acts immediately)
     # → L2 q → L1 q.
     stdin = "\n".join(["1", "1", "2", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
     cfg = _config_yaml(isolated_config)
     # The provider entry is gone from config.yaml.
@@ -980,7 +980,7 @@ def test_remove_databricks_gemini_preserves_other_harness_wiring(isolated_config
     wiring.write_text('model_provider = "ucode-databricks"\n')
     result = CliRunner().invoke(
         cli,
-        ["setup", "--no-internal-beta"],
+        ["setup"],
         input="\n".join(["7", "3", "1", "2", "q", "q", "q"]) + "\n",
     )
     assert result.exit_code == 0, result.output
@@ -998,7 +998,7 @@ def test_remove_databricks_without_ucode_wiring_still_removes(isolated_config) -
     _write_databricks_provider(isolated_config)
     # L1 1=Claude → L2 1=select databricks → L3 2=Remove → L2 q → L1 q.
     stdin = "\n".join(["1", "1", "2", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
     cfg = _config_yaml(isolated_config)
     # The provider entry is gone despite there being nothing to clean.
@@ -1117,7 +1117,7 @@ def test_add_subscription_replaces_existing_for_same_cli(isolated_config) -> Non
     # L1 1=Claude → L2 2=+Add → anthropic menu 2=Claude subscription → replace
     # prompt 1=Replace it → L2 q=back → L1 q=exit.
     stdin = "\n".join(["1", "2", "2", "1", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -1143,7 +1143,7 @@ def test_add_subscription_keep_current_aborts(isolated_config) -> None:
     # L1 1=Claude → L2 2=+Add → anthropic menu 2=Claude subscription → replace
     # prompt 2=Keep the current one (abort) → L2 q=back → L1 q=exit.
     stdin = "\n".join(["1", "2", "2", "2", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -1179,7 +1179,7 @@ def test_add_second_key_different_source_keeps_both(isolated_config) -> None:
     # env reuse — the add takes the paste path. L1 1=Claude → L2 2=+Add →
     # anthropic menu 1=Anthropic key → paste key → blank model → q, q.
     stdin = "\n".join(["1", "2", "1", "sk-ant-second", "", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -1217,7 +1217,7 @@ def test_readd_same_source_key_updates_in_place(isolated_config, monkeypatch) ->
     # L1 1=Claude → L2 2=+Add → anthropic menu 1=Anthropic key → "y" reuse the
     # detected env var → blank model → q, q.
     stdin = "\n".join(["1", "2", "1", "y", "", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -1257,7 +1257,7 @@ def test_multiple_keys_show_source_bracket(isolated_config) -> None:
     )
     # L1 1=Claude renders the level-2 credential rows; q=back, q=exit.
     stdin = "\n".join(["1", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     # Both source hints render, so the two keys are told apart.
@@ -1287,7 +1287,7 @@ def test_configure_models_add_other_provider_prompts_for_name(
     # provider → xAI(1) → NAME "my-xai" → key → default model blank → L2
     # q=back → L1 q=exit.
     stdin = "\n".join(["2", "1", "6", "1", "my-xai", "sk-xai-test", "", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -1314,7 +1314,7 @@ def test_configure_models_add_key_free_form_model(isolated_config) -> None:
     # L1 1=Claude → L2 1=+Add → anthropic menu 1=Anthropic key → key →
     # default model = <novel> (typed, not from catalog) → L2 q=back → L1 q=exit.
     stdin = "\n".join(["1", "1", "1", "sk-ant-test-key", novel, "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -1352,7 +1352,7 @@ def test_configure_models_add_gateway_serves_both_harnesses(isolated_config) -> 
         )
         + "\n"
     )
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     entry = _config_yaml(isolated_config)["providers"]["litellm"]
@@ -1384,7 +1384,7 @@ def test_configure_models_add_openrouter_key_uses_vendor_endpoint_and_chat_wire(
     # ChatGPT sub, Gateway, OpenRouter, Databricks, Other) → key → default
     # model blank → L2 q=back → L1 q=exit.
     stdin = "\n".join(["2", "1", "4", "sk-or-test", "", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     entry = _config_yaml(isolated_config)["providers"]["openrouter"]["openai"]
@@ -1532,7 +1532,7 @@ def test_configure_harnesses_add_databricks_normalizes_url_and_persists(
     # L1 1=Claude → L2 1=+Add → add menu <db>=Databricks → workspace URL (no
     # scheme + trailing slash, to exercise normalization) → L2 q=back → L1 q=exit.
     stdin = "\n".join(["1", "1", str(db), "example.cloud.databricks.com/", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     normalized = "https://example.cloud.databricks.com"
@@ -1587,7 +1587,7 @@ def test_configure_harnesses_add_databricks_fails_loud_when_ucode_records_no_sta
 
     db = _databricks_add_menu_index()
     stdin = "\n".join(["1", "1", str(db), "https://example.cloud.databricks.com", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
 
     # The branch raised ClickException → non-zero exit with an explanatory message.
     assert result.exit_code != 0
@@ -1626,7 +1626,7 @@ def test_configure_harnesses_add_databricks_under_codex_scopes_to_codex(
     db = next(i for i, o in enumerate(codex_opts) if o.kind == DATABRICKS_KIND) + 1
     # L1 2=Codex → L2 1=+Add → add menu <db>=Databricks → URL → q → q.
     stdin = "\n".join(["2", "1", str(db), "https://example.cloud.databricks.com", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     assert ucode_calls == [("https://example.cloud.databricks.com", ["codex"])]
@@ -1647,7 +1647,7 @@ def test_uninstalled_harness_shows_x_and_not_installed(isolated_config, monkeypa
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: False
     )
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    result = CliRunner().invoke(cli, ["setup"], input="q\n")
     assert result.exit_code == 0, result.output
     out = result.output
     assert "✗" in out
@@ -1685,7 +1685,7 @@ def test_overview_marks_unconfigured_with_x_and_configured_without_checkmark(
             f,
         )
 
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    result = CliRunner().invoke(cli, ["setup"], input="q\n")
     assert result.exit_code == 0, result.output
     out = result.output
     # Configured Claude: the green ✓ rides the aligned status column, not the
@@ -1735,7 +1735,7 @@ def _capture_setup_overview(
         return -1
 
     monkeypatch.setattr("omnigent.onboarding.interactive.select", _capture_select)
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"])
+    result = CliRunner().invoke(cli, ["setup"])
     assert result.exit_code == 0, result.output
     return (
         captured["options"],  # type: ignore[return-value]
@@ -1912,7 +1912,7 @@ def test_setup_reports_invalid_acp_omnigent_mcp(isolated_config) -> None:
             f,
         )
 
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    result = CliRunner().invoke(cli, ["setup"], input="q\n")
 
     assert result.exit_code != 0
     assert (
@@ -1967,7 +1967,7 @@ def test_setup_imports_openclaw_agents(isolated_config) -> None:
     # 16 is the OpenClaw import row: hiding Devin's builtin ACP row moved every
     # row after it one lower (see the dispatch table's note).
     stdin = "\n".join(["16", "", "", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
 
     assert result.exit_code == 0, result.output
     assert "~/.acpx/config.json" in result.output
@@ -1989,7 +1989,7 @@ def test_setup_imports_openclaw_agents_from_user_selected_path(isolated_config) 
     )
 
     stdin = "\n".join(["16", "", str(selected), "", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
 
     assert result.exit_code == 0, result.output
     assert "Choose another file" in result.output
@@ -2006,7 +2006,7 @@ def test_setup_rejects_user_selected_unrelated_file(isolated_config) -> None:
     selected.write_text('{"name": "unrelated"}', encoding="utf-8")
 
     stdin = "\n".join(["16", "", str(selected), "2", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
 
     assert result.exit_code == 0, result.output
     assert "file is not an OpenClaw/acpx agent registry" in result.output
@@ -2089,7 +2089,7 @@ def test_missing_cursor_cli_drillin_shows_install_and_login(isolated_config, mon
         lambda key: key != "cursor",
     )
 
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="3\n1\nq\nq\n")
+    result = CliRunner().invoke(cli, ["setup"], input="3\n1\nq\nq\n")
 
     assert result.exit_code == 0, result.output
     assert "curl https://cursor.com/install -fsS | bash" in result.output
@@ -2226,7 +2226,7 @@ def test_overview_dispatches_to_correct_manager(
     monkeypatch.setattr(
         f"omnigent.cli_config.{manager_attr}", lambda *a, **k: called.append(manager_attr)
     )
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=f"{choice}\nq\n")
+    result = CliRunner().invoke(cli, ["setup"], input=f"{choice}\nq\n")
     assert result.exit_code == 0, result.output
     assert called == [manager_attr]
 
@@ -2407,7 +2407,7 @@ def test_drill_into_uninstalled_installs_then_proceeds(isolated_config, monkeypa
     # L1 1=Claude → install prompt 1=Yes (install) → L2 credential menu q=back
     # → L1 q=exit.
     stdin = "\n".join(["1", "1", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
     assert installed == ["anthropic"]  # installed exactly the drilled-in harness
 
@@ -2426,7 +2426,7 @@ def test_decline_install_returns_without_installing(isolated_config, monkeypatch
     )
     # L1 1=Claude → install prompt 2=No → L1 q=exit.
     stdin = "\n".join(["1", "2", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
 
@@ -2501,7 +2501,7 @@ def test_configure_harnesses_pi_page_sets_explicit_pi_default(isolated_config) -
     # L1 6=Pi → L2 (1=anthropic 2=openai 3=+Add): select openai (2) → L3
     # 1=Make default for Pi → back to L2 q=back → L1 q=exit.
     stdin = "\n".join(["6", "2", "1", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = load_config()
@@ -2553,7 +2553,7 @@ def test_configure_harnesses_pi_page_excludes_subscription_rows(isolated_config)
     # L1 6=Pi → L2 renders its rows → q=back → L1 q=exit. The L2 frame is
     # cleared on exit under a TTY but the numbered fallback echoes options.
     stdin = "\n".join(["6", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     # Isolate the Pi level-2 frame (after the "Pi — select or add" title).
@@ -2600,7 +2600,7 @@ def test_configure_harnesses_add_databricks_under_pi_scopes_to_pi(
     db = next(i for i, o in enumerate(pi_opts) if o.kind == DATABRICKS_KIND) + 1
     # L1 6=Pi → L2 1=+Add → add menu <db>=Databricks → URL → q → q.
     stdin = "\n".join(["6", "1", str(db), "https://example.cloud.databricks.com", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     # ucode ran once, for the pi agent only — not the legacy claude,codex,pi.
@@ -2650,7 +2650,7 @@ def test_add_key_does_not_steal_pi_from_fallback_default(isolated_config) -> Non
     # L1 2=Codex → L2 1=+Add → 1=OpenAI key → decline detected env (none set)
     # → paste key → accept catalog default model (blank) → L2 q → L1 q.
     stdin = "\n".join(["2", "1", "1", "sk-test-openai", "", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = load_config()
@@ -2751,7 +2751,7 @@ def test_remove_cli_config_credential_dismisses_detection(isolated_config) -> No
     _write_codex_config_toml(isolated_config)
 
     # Open 1: plain open auto-adopts the detected config provider.
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    result = CliRunner().invoke(cli, ["setup"], input="q\n")
     assert result.exit_code == 0, result.output
     cfg = _config_yaml(isolated_config)
     # Adopted as a real entry — the feature's golden path. Absence means
@@ -2761,7 +2761,7 @@ def test_remove_cli_config_credential_dismisses_detection(isolated_config) -> No
     # Open 2: L1 2=Codex → L2 1=the credential → L3 1=Remove (it is the
     # codex default, so no "Make default" row precedes Remove) → q → q.
     stdin = "\n".join(["2", "1", "1", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
     cfg = _config_yaml(isolated_config)
     assert "codex-databricks" not in cfg["providers"]
@@ -2769,7 +2769,7 @@ def test_remove_cli_config_credential_dismisses_detection(isolated_config) -> No
     assert cfg["dismissed_detections"] == ["codex-databricks"]
 
     # Open 3: a plain reopen must NOT re-adopt the dismissed detection.
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    result = CliRunner().invoke(cli, ["setup"], input="q\n")
     assert result.exit_code == 0, result.output
     cfg = _config_yaml(isolated_config)
     assert "codex-databricks" not in cfg.get("providers", {})
@@ -2796,7 +2796,7 @@ def test_add_menu_readds_dismissed_cli_config_credential(isolated_config) -> Non
     # L1 2=Codex → L2 1=+Add (no credentials yet) → add menu: the appended
     # detected-config row → back to L2 q → L1 q.
     stdin = "\n".join(["2", "1", detected_row, "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -2852,7 +2852,7 @@ def test_cursor_set_api_key_paste_writes_block_and_secret(
     """
     # L1 Cursor → Cursor SDK → Set API key → paste key → back through both menus.
     stdin = "\n".join(["3", "2", "1", "crsr_test_key_123", "q", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -2873,7 +2873,7 @@ def test_cursor_adopt_env_api_key_writes_env_ref(
     monkeypatch.setenv("CURSOR_API_KEY", "crsr_env_key_456")
     # L1 Cursor → Cursor SDK → Set API key → adopt detected env key → back.
     stdin = "\n".join(["3", "2", "1", "y", "q", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -2893,7 +2893,7 @@ def test_cursor_remove_api_key_drops_block_and_secret(
 
     # L1 Cursor → Cursor SDK → Remove → back through both menus.
     stdin = "\n".join(["3", "2", "2", "q", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -2911,7 +2911,7 @@ def test_cursor_set_api_key_non_crsr_declined_is_not_stored(
     """
     # L1 Cursor → Cursor SDK → Set → decline the non-crsr_ warning → back.
     stdin = "\n".join(["3", "2", "1", "sk-not-a-cursor-key", "n", "q", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -2964,7 +2964,7 @@ def test_cursor_drillin_offers_install_when_sdk_missing(
     """
     # Cursor → Cursor SDK → show command → back through both menus.
     stdin = "\n".join(["3", "2", "3", "q", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
     out = result.output
     assert "isn't installed" in out
@@ -2980,7 +2980,7 @@ def test_cursor_key_settable_when_sdk_missing(isolated_config, _cursor_sdk_absen
     """
     # Cursor → Cursor SDK → set key anyway → Set → paste key → back.
     stdin = "\n".join(["3", "2", "2", "1", "crsr_key_no_sdk", "q", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -3010,7 +3010,7 @@ def test_cursor_install_now_invokes_runner_without_index(
 
     # Cursor → Cursor SDK → install now → back through both menus.
     stdin = "\n".join(["3", "2", "1", "q", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     assert len(calls) == 1, f"expected exactly one install invocation, got {calls}"
@@ -3058,7 +3058,7 @@ def test_antigravity_set_api_key_paste_writes_block_and_secret(
     # L1 7=Antigravity → antigravity menu 1=Set API key →
     # paste key (AIza → no warn) → antigravity menu q=back → L1 q=quit.
     stdin = "\n".join(["7", "1", "AIza_test_key_123", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -3080,7 +3080,7 @@ def test_antigravity_adopt_env_api_key_writes_env_ref(
     # L1 7=Antigravity → 1=Set API key →
     # "y" adopt detected $GEMINI_API_KEY → q back → q quit.
     stdin = "\n".join(["7", "1", "y", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -3098,7 +3098,7 @@ def test_antigravity_sign_in_runs_agy_auth_service(
     # L1 7=Antigravity → 2=Sign in → q back → q quit.
     result = CliRunner().invoke(
         cli,
-        ["setup", "--no-internal-beta"],
+        ["setup"],
         input="\n".join(["7", "2", "q", "q"]) + "\n",
     )
 
@@ -3119,7 +3119,7 @@ def test_antigravity_sign_in_skips_sdk_install_prompt(isolated_config, monkeypat
 
     result = CliRunner().invoke(
         cli,
-        ["setup", "--no-internal-beta"],
+        ["setup"],
         input="\n".join(["7", "2", "q", "q"]) + "\n",
     )
 
@@ -3141,7 +3141,7 @@ def test_antigravity_remove_api_key_drops_block_and_secret(
     # L1 7=Antigravity → antigravity menu (key set:
     # 1=Replace 2=Remove 3=Back) → 2=Remove → q back → q quit.
     stdin = "\n".join(["7", "2", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -3168,7 +3168,7 @@ def test_antigravity_remove_does_not_delete_foreign_keychain_secret(
     # L1 7=Antigravity → antigravity menu 2=Remove →
     # q back → q quit.
     stdin = "\n".join(["7", "2", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -3188,7 +3188,7 @@ def test_antigravity_set_api_key_non_aiza_declined_is_not_stored(
     # L1 7=Antigravity → 1=Set API key →
     # paste non-AIza key → "n" decline warning → q back → q quit.
     stdin = "\n".join(["7", "1", "sk-not-a-gemini-key", "n", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -3310,7 +3310,7 @@ def test_soft_sdk_install_prompt_abort_returns_to_overview(
     """
     monkeypatch.setattr(sdk_probe, lambda: False)
 
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=f"{choice}\nq\nq\nq\n")
+    result = CliRunner().invoke(cli, ["setup"], input=f"{choice}\nq\nq\nq\n")
 
     assert result.exit_code == 0, result.output
     assert unexpected_header not in result.output
@@ -3327,7 +3327,7 @@ def test_antigravity_drillin_offers_install_when_sdk_missing(
     # L1 7=Antigravity → install offer 3=show command →
     # key menu q=back → L1 q.
     stdin = "\n".join(["7", "3", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
     out = result.output
     assert "isn't installed" in out
@@ -3346,7 +3346,7 @@ def test_antigravity_key_settable_when_sdk_missing(
     # L1 7=Antigravity → install offer 2=set key anyway →
     # key menu 1=Set → paste AIza key → key menu q=back → L1 q=quit.
     stdin = "\n".join(["7", "2", "1", "AIza_key_no_sdk", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -3377,7 +3377,7 @@ def test_antigravity_install_now_invokes_runner_without_index(
     # L1 7=Antigravity → install offer 1=install now →
     # key menu q=back → L1 q.
     stdin = "\n".join(["7", "1", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     assert len(calls) == 1, f"expected exactly one install invocation, got {calls}"
@@ -3432,7 +3432,7 @@ def test_configure_harnesses_add_other_key_no_remaining_providers_aborts_cleanly
     other = _other_key_add_menu_index(PI_SURFACE)
     # L1 6=Pi → L2 1=+Add → add menu <other>=Other provider — API key → L2 q=back → L1 q=exit.
     stdin = "\n".join(["6", "1", str(other), "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
 
     # Pre-fix this exited non-zero with a ValueError; the guard makes it graceful.
     assert result.exit_code == 0, result.output
@@ -3490,7 +3490,7 @@ def test_configure_models_add_bedrock_writes_entry_and_secret(
         )
         + "\n"
     )
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
 
     cfg = _config_yaml(isolated_config)
@@ -3769,7 +3769,7 @@ def test_antigravity_gateway_setup_persists_native_provider(isolated_config, mon
         )
         + "\n"
     )
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
     config = _config_yaml(isolated_config)
     entry = load_providers(config)["corp-gemini"]
@@ -3788,7 +3788,7 @@ def test_native_gemini_key_setup_uses_agy_model_default(isolated_config) -> None
     from omnigent.onboarding.gemini_gateway import GEMINI_API_BASE_URL
 
     stdin = "\n".join(["7", "3", "1", "1", "gemini-fake-key", "", "q", "q", "q"]) + "\n"
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
     assert result.exit_code == 0, result.output
     credentials = resolve_antigravity_credentials()
     assert credentials is not None
@@ -3805,9 +3805,7 @@ def test_gemini_gateway_setup_recovers_from_invalid_url(isolated_config, correct
     else:
         inputs += [""]
     inputs += ["q", "q", "q"]
-    result = CliRunner().invoke(
-        cli, ["setup", "--no-internal-beta"], input="\n".join(inputs) + "\n"
-    )
+    result = CliRunner().invoke(cli, ["setup"], input="\n".join(inputs) + "\n")
     assert result.exit_code == 0, result.output
     assert "OpenAI Responses and Chat Completions" in " ".join(result.output.split())
     assert "Databricks — profile" in result.output
@@ -3843,7 +3841,7 @@ def test_gemini_databricks_setup_recovers_from_auth_failure(
     )
     result = CliRunner().invoke(
         cli,
-        ["setup", "--no-internal-beta"],
+        ["setup"],
         input="\n".join(["7", "3", "1", "3", "work", "q", "q", "q"]) + "\n",
     )
     assert result.exit_code == 0, result.output
@@ -3891,7 +3889,7 @@ def test_detected_gemini_key_invalid_endpoint_returns_to_setup(isolated_config, 
     monkeypatch.setattr("omnigent.cli_config._adopt_detected_providers", list)
     result = CliRunner().invoke(
         cli,
-        ["setup", "--no-internal-beta"],
+        ["setup"],
         input="\n".join(["7", "4", "1", "1", "y", "", "q", "q", "q"]) + "\n",
     )
     assert result.exit_code == 0, result.output
@@ -3925,7 +3923,7 @@ def test_setup_repairs_gemini_upgrade_default_conflict(isolated_config, choice, 
     }
     config_path.write_text(yaml.safe_dump(original))
     before = config_path.read_bytes()
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=f"{choice}\nq\n")
+    result = CliRunner().invoke(cli, ["setup"], input=f"{choice}\nq\n")
     assert result.exit_code == 0, result.output
     assert "Multiple defaults for Gemini" in result.output
     assert "Traceback" not in result.output
@@ -3964,7 +3962,7 @@ def test_databricks_setup_recovers_from_malformed_profile(
     )
     result = CliRunner().invoke(
         cli,
-        ["setup", "--no-internal-beta"],
+        ["setup"],
         input="\n".join(["7", "3", "1", "3", "broken", "q", "q", "q"]) + "\n",
     )
     assert result.exit_code == 0, result.output

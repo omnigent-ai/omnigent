@@ -5293,7 +5293,7 @@ def _build_model_readout_lines(
     configured:`` line lists them (friendly names + glyphs) with honest
     guidance: ``/model`` only changes the model within the active
     provider — switching the active provider mid-session is not wired, so
-    it goes through ``omnigent setup --no-internal-beta`` + a restart. Falls
+    it goes through ``omnigent setup`` + a restart. Falls
     back to the legacy ``(agent default)`` line when nothing is configured
     for the harness's surface.
 
@@ -5350,10 +5350,7 @@ def _build_model_readout_lines(
             lines.append(f"Active:  {model_override}  ·  (provider unresolved)")
         else:
             lines.append("Active:  None  ·  None")
-            lines.append(
-                f"no model configured — run `{cli_invocation()} setup --no-internal-beta` "
-                "to add one"
-            )
+            lines.append(f"no model configured — run `{cli_invocation()} setup` to add one")
         lines.append("usage: /model <name> · /model default | off | reset to clear")
         return lines
 
@@ -5519,7 +5516,7 @@ async def _cmd_model(
     a bare ``/model <active-provider>`` resolves that provider's default
     model. A value naming a **different** configured provider fails loud
     with guidance — switching the active provider mid-session is not wired
-    (it goes through ``omnigent setup --no-internal-beta`` + a restart).
+    (it goes through ``omnigent setup`` + a restart).
     ``/model default|off|reset`` clears the override.
     """
     from rich.text import Text
@@ -5594,7 +5591,7 @@ async def _cmd_model(
         host.output(
             Text.from_markup(
                 f"  [{fmt.muted}]Active provider: {active_label}. To use {target_label}, run "
-                f"`{cli_invocation()} setup --no-internal-beta` and select it as the "
+                f"`{cli_invocation()} setup` and select it as the "
                 f"default, then restart. "
                 f"(You can still change the model within {active_label}: /model <model-name>.)"
                 f"[/{fmt.muted}]"

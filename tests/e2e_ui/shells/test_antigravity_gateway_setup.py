@@ -247,7 +247,6 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                 )
             result = cli(
                 "setup",
-                "--no-internal-beta",
                 stdin="\n".join(
                     ["7", "3", "1", "3", "gateway-test", "q", "q", "q"]
                     if databricks

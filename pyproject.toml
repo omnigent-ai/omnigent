@@ -624,12 +624,8 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-# Classify first-party imports by NAME, not by file existence. Ruff's
-# default detection resolves each module against the filesystem, so an
-# import of an optional submodule absent from a given checkout (e.g.
-# omnigent.onboarding.internal_beta) would be reclassified as third-party
-# there, demanding a different import order per checkout. Pinning the
-# package name keeps one canonical order everywhere.
+# Classify first-party imports by NAME rather than file existence so optional
+# modules keep one canonical import order in every checkout.
 known-first-party = ["omnigent"]
 
 [tool.ruff.lint.per-file-ignores]

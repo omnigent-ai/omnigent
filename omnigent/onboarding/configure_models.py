@@ -1,9 +1,9 @@
-"""Rendering + flow helpers for ``omnigent setup --no-internal-beta``.
+"""Rendering + flow helpers for ``omnigent setup``.
 
 The user-facing model-selection surface (chunk 2b of
 ``designs/oss-cuj/04-model-selection-implementation.md``) has two pieces:
 
-- the ``omnigent setup --no-internal-beta`` CLI command (interactive
+- the ``omnigent setup`` CLI command (interactive
   add/set-default/remove + a scriptable ``list`` subcommand), and
 - the ``/model`` REPL readout/switch (in :mod:`omnigent.repl._repl`).
 

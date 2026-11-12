@@ -1,7 +1,7 @@
 """Theme-picker-styled interactive selectors for the onboarding CLI.
 
 This module is the shared home for the generic, REPL-theme-picker-styled
-selection primitives used by ``omnigent setup --no-internal-beta`` (and any
+selection primitives used by ``omnigent setup`` (and any
 future configure noun). The look reproduces
 :mod:`omnigent.repl._theme_picker`:
 

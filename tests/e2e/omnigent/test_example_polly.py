@@ -40,7 +40,7 @@ def test_orchestrator_executor(polly_spec: AgentSpec) -> None:
     """
     The orchestrator runs on claude-sdk with a 1M window and **no pinned
     model or profile**, so it inherits whatever Claude provider the user
-    configured via ``omnigent setup --no-internal-beta`` (Anthropic key,
+    configured via ``omnigent setup`` (Anthropic key,
     subscription, gateway, or Databricks) and resolves that provider's
     default Claude model.
 

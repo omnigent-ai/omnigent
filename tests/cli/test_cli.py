@@ -6852,21 +6852,15 @@ def test_setup_invalid_provider_is_a_user_error_not_a_crash(
 def test_setup_command_replaces_wizard(monkeypatch: pytest.MonkeyPatch) -> None:
     """``omnigent setup`` is the visible standard setup flow command."""
     configure_flow = Mock()
-    configure_databricks = Mock()
-    run_onboarding = Mock(return_value=True)
     monkeypatch.setattr(
         "omnigent.cli._run_configure_harnesses_interactive",
         configure_flow,
     )
-    monkeypatch.setattr("omnigent.cli._run_configure_databricks", configure_databricks)
-    monkeypatch.setattr("omnigent.onboarding.setup.run_onboarding", run_onboarding)
 
     result = CliRunner().invoke(cli, ["setup"])
 
     assert result.exit_code == 0, result.output
     configure_flow.assert_called_once_with()
-    configure_databricks.assert_not_called()
-    run_onboarding.assert_not_called()
 
     help_result = CliRunner().invoke(cli, ["--help"])
     assert help_result.exit_code == 0
@@ -6882,32 +6876,6 @@ def test_setup_command_replaces_wizard(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "No such command 'onboard'" in onboard_result.output
 
 
-def test_setup_no_internal_beta_runs_configure_flow(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``--no-internal-beta`` runs the model/credential picker, not the Databricks bootstrap.
-
-    The generic onboarding wizard was removed; ``setup --no-internal-beta``
-    now runs the same interactive flow as ``configure harnesses``.
-    """
-    configure_databricks = Mock()
-    run_onboarding = Mock()
-    configure_flow = Mock()
-    monkeypatch.setattr("omnigent.cli._run_configure_databricks", configure_databricks)
-    monkeypatch.setattr(
-        "omnigent.cli._run_configure_harnesses_interactive",
-        configure_flow,
-    )
-    monkeypatch.setattr("omnigent.onboarding.setup.run_onboarding", run_onboarding)
-
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"])
-
-    assert result.exit_code == 0, result.output
-    configure_flow.assert_called_once_with()
-    configure_databricks.assert_not_called()
-    run_onboarding.assert_not_called()
-
-
 def test_setup_uses_compact_branding_on_short_terminals(monkeypatch: pytest.MonkeyPatch) -> None:
     """A short first-run terminal should show the setup picker, not scroll past it."""
     configure_flow = Mock()
@@ -6921,7 +6889,7 @@ def test_setup_uses_compact_branding_on_short_terminals(monkeypatch: pytest.Monk
         lambda fallback: os.terminal_size((80, 24)),
     )
 
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"])
+    result = CliRunner().invoke(cli, ["setup"])
 
     assert result.exit_code == 0, result.output
     print_brandmark.assert_called_once_with("setup")
@@ -6942,7 +6910,7 @@ def test_setup_keeps_full_landing_on_tall_terminals(monkeypatch: pytest.MonkeyPa
         lambda fallback: os.terminal_size((120, 40)),
     )
 
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"])
+    result = CliRunner().invoke(cli, ["setup"])
 
     assert result.exit_code == 0, result.output
     print_landing.assert_called_once_with(tagline="all your agents, one cli")

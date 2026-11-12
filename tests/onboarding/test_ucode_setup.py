@@ -3,19 +3,15 @@
 from __future__ import annotations
 
 import subprocess
-import sys
-import types
 from unittest.mock import patch
 
 import pytest
 from click import ClickException
 
-from omnigent.onboarding.setup import ProfileSpec
 from omnigent.onboarding.ucode_setup import (
     build_ucode_configure_command,
     configure_ucode_for_workspace,
     find_ucode_command,
-    model_gateway_workspace_urls,
     ucode_workspace_exists,
 )
 
@@ -107,53 +103,6 @@ def test_build_ucode_configure_command_supports_uvx_prefix() -> None:
         "claude,codex,pi",
         "--enable-fable",
     ]
-
-
-def test_model_gateway_workspace_urls_excludes_mcp_only_workspaces(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Only gateway workspaces reach ucode; MCP-only profiles are excluded.
-
-    ucode configures the model-serving gateway, so the pre-fix behavior of
-    passing every profile made ucode do wasted gateway-discovery work against
-    MCP-only workspaces. This pins the result to exactly the
-    ``is_model_gateway`` workspace, so a regression that reverted to passing
-    all profiles (or that dropped the gateway) fails here. Uses a synthetic
-    catalog stubbed into ``sys.modules`` because the production function
-    lazy-imports ``internal_beta``, which is absent from the OSS build;
-    the real-catalog pins live in ``test_internal_beta.py``.
-    """
-    profiles = (
-        ProfileSpec(
-            name="gateway",
-            host="https://gateway.example.databricks.com/",
-            purpose="model-serving gateway",
-            is_model_gateway=True,
-        ),
-        ProfileSpec(
-            name="mcp-only-a",
-            host="https://mcp-a.example.databricks.com",
-            purpose="MCP auth only",
-            is_model_gateway=False,
-        ),
-        ProfileSpec(
-            name="mcp-only-b",
-            host="https://mcp-b.example.databricks.com",
-            purpose="MCP auth only",
-            is_model_gateway=False,
-        ),
-    )
-    stub = types.ModuleType("omnigent.onboarding.internal_beta")
-    stub.DEFAULT_PROFILES = profiles
-    monkeypatch.setitem(sys.modules, "omnigent.onboarding.internal_beta", stub)
-
-    urls = model_gateway_workspace_urls()
-
-    # Exactly the gateway workspace, trailing "/" stripped, nothing else.
-    # An MCP-only host appearing here means the filter regressed to the
-    # old "configure every profile"; a missing gateway host means the
-    # gateway flag stopped being honored.
-    assert urls == ["https://gateway.example.databricks.com"]
 
 
 def test_ucode_workspace_exists_checks_single_workspace() -> None:

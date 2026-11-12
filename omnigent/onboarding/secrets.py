@@ -3,7 +3,7 @@
 This is the storage layer behind ``keychain:<name>`` secret references in
 ``~/.omnigent/config.yaml`` (see
 :func:`omnigent.onboarding.provider_config.resolve_secret`). The
-``omnigent setup --no-internal-beta`` command writes a provider's API key here
+``omnigent setup`` command writes a provider's API key here
 under a stable name (e.g. ``"anthropic"``), and the runtime reads it back
 when a family's ``api_key_ref`` is ``keychain:anthropic``.
 

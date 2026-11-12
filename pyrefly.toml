@@ -48,7 +48,6 @@ ignore-missing-imports = [
     "modal.*",
     "numpy",
     "numpy.*",
-    "omnigent.onboarding.internal_beta",
     "openshell",
     "openshell.*",
 ]

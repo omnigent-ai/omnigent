@@ -9,7 +9,7 @@ A coding harness is "ready" along two independent axes:
   that axis, mirroring how ``ucode`` checks (``shutil.which(binary)``) and the
   npm packages it installs.
 
-``omni setup --no-internal-beta`` uses this to mark an uninstalled harness and
+``omni setup`` uses this to mark an uninstalled harness and
 offer to ``npm install`` it; the first-run ``omnigent run`` flow uses the
 same map so the two surfaces never disagree about what the machine can launch.
 
