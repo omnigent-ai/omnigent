@@ -5,6 +5,7 @@ import {
   createWorkflowPrompt,
   offersSaveWorkflow,
   offersWorkflow,
+  parseSavedWorkflowMessage,
   savedWorkflowMessage,
   saveWorkflowMessage,
   workflowMessage,
@@ -61,5 +62,24 @@ describe("createWorkflowPrompt", () => {
     expect(createWorkflowPrompt("  Triage flaky tests ", " Rerun the suite ")).toBe(
       'Use the save-workflow skill to create a workflow named "Triage flaky tests" from this description, without doing the work:\n\nRerun the suite',
     );
+  });
+});
+
+describe("parseSavedWorkflowMessage", () => {
+  const workflow = { id: "0123456789abcdef0123456789abcdef", name: 'Triage "flaky" tests' };
+
+  it("reads back a saved workflow's message, with or without details", () => {
+    expect(
+      parseSavedWorkflowMessage(savedWorkflowMessage("$", workflow, " The upload tests ", false)),
+    ).toEqual({ ...workflow, details: "The upload tests" });
+    expect(parseSavedWorkflowMessage(savedWorkflowMessage("/", workflow, "", false))).toEqual({
+      ...workflow,
+      details: "",
+    });
+  });
+
+  it("ignores other prompts", () => {
+    expect(parseSavedWorkflowMessage("Summarize overnight activity")).toBeNull();
+    expect(parseSavedWorkflowMessage("/workflow Add retries")).toBeNull();
   });
 });

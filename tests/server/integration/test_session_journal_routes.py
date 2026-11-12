@@ -524,7 +524,7 @@ async def test_a_retried_workflow_question_reuses_its_status_and_question(
 async def test_the_workflow_tools_save_and_load_through_the_real_routes(
     client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    """``sys_workflow_save`` and ``sys_workflow_load`` reach ``/v1/workflows`` as the owner."""
+    """The workflow tools reach ``/v1/workflows`` as the owner: save, load and list."""
     import json
 
     from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
@@ -566,3 +566,20 @@ async def test_the_workflow_tools_save_and_load_through_the_real_routes(
     missing = await run("sys_workflow_load", {"workflow": "Triage flaky test runs"})
     assert missing["error"] == "workflow_not_found"
     assert missing["similar"] == ["Triage flaky tests"]
+
+    notes = {**workflow, "name": "Release notes", "description": "Drafts the notes. " * 100}
+    assert (await run("sys_workflow_save", notes))["name"] == "Release notes"
+    page = await run("sys_workflow_list", {"limit": 1})
+    assert [item["name"] for item in page["workflows"]] == ["Release notes"]
+    assert page["workflows"][0]["description"].endswith("…")
+    rest = await run("sys_workflow_list", {"cursor": page["next_cursor"]})
+    assert rest == {
+        "workflows": [
+            {
+                "id": saved["id"],
+                "name": "Triage flaky tests",
+                "description": workflow["description"],
+            }
+        ],
+        "next_cursor": None,
+    }

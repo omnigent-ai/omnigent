@@ -52,9 +52,11 @@ describe("WorkflowDialog", () => {
     };
     const { onRunWorkflow } = renderDialog({ savedWorkflow });
     expect(screen.getByRole("dialog", { name: "Run Triage flaky tests" })).toBeInTheDocument();
-    expect(screen.getByTestId("workflow-dialog-about")).toHaveTextContent(
-      "Give it: the test suite.",
-    );
+    const about = screen.getByTestId("workflow-dialog-about");
+    expect(about).toHaveTextContent("Give it: the test suite.");
+    // A long description shows three lines; the tooltip has all of it.
+    expect(about).toHaveClass("line-clamp-3");
+    expect(about).toHaveAttribute("title", savedWorkflow.description);
     expect(screen.getByLabelText("Details")).toBe(description());
     expect(run()).toBeEnabled();
 
