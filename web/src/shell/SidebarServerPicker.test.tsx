@@ -89,6 +89,7 @@ beforeEach(() => {
   openServerSetup.mockReset();
   signOutOfServer.mockReset();
   signOutOfBrowserSession.mockReset();
+  signOutOfBrowserSession.mockResolvedValue(undefined);
   supportsNativeServerPicker.mockReset();
   supportsNativeServerPicker.mockReturnValue(true);
   viewer.id = "alice.smith@example.com";
@@ -150,6 +151,25 @@ describe("SidebarServerPicker", () => {
     await openMenu();
     fireEvent.click(await screen.findByTestId("sidebar-server-sign-out"));
     expect(signOutOfBrowserSession).toHaveBeenCalledWith(accountsEnabled);
+  });
+
+  it("reports when browser sign-out fails", async () => {
+    const errorToast = vi.spyOn(toast, "error").mockImplementation(() => "id");
+    signOutOfBrowserSession.mockRejectedValueOnce(
+      new Error("Sign-out failed: the server could not record it, so you are still signed in."),
+    );
+    supportsNativeServerPicker.mockReturnValue(false);
+    renderPicker(["/"], browserServer({ accounts_enabled: true, login_url: "/login" }));
+    await openMenu();
+
+    fireEvent.click(await screen.findByTestId("sidebar-server-sign-out"));
+
+    await waitFor(() =>
+      expect(errorToast).toHaveBeenCalledWith(
+        "Sign-out failed: the server could not record it, so you are still signed in.",
+      ),
+    );
+    errorToast.mockRestore();
   });
 
   it("hides Sign out in a browser whose server has no sign-in", async () => {

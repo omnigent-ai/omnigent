@@ -186,7 +186,9 @@ export function SidebarServerPicker() {
       return;
     }
     if (browserServerInfo === null || browserServerInfo.login_url === null) return;
-    void signOutOfBrowserSession(browserServerInfo.accounts_enabled);
+    void signOutOfBrowserSession(browserServerInfo.accounts_enabled).catch((error: unknown) => {
+      toast.error(error instanceof Error ? error.message : "Sign-out failed. Try again.");
+    });
   };
 
   return (
