@@ -5178,17 +5178,20 @@ async def stop_archived_session_sandbox(
     The sandbox is the session's own host's, or for a side chat or sub-agent its
     source's or parent's. The provider's ``stop_on_archive`` setting, passed
     through the launcher's ``stop_when_archived`` hook, decides; scheduled task
-    runs are skipped. :func:`_host_may_be_in_use` runs before the stop and again
-    after it, and a sandbox that gained a user meanwhile is woken at once (a turn
-    started during the stop call still fails). Any failure leaves the sandbox
-    running.
+    runs are skipped, and :func:`_host_may_be_in_use` must find no session still
+    using the sandbox. Any failure before the stop leaves the sandbox running.
+
+    Nothing holds new work off while the provider stops the sandbox: a session
+    unarchived and messaged during that call can start a runner the stop then
+    ends. That turn fails, and the session's next message wakes the sandbox
+    through the normal wake path, which restores its profile and routing.
 
     :param conv: The archived session, as re-read by the teardown.
     :param host_store: Store holding the session's host row.
     :param conversation_store: Store used to find other sessions on the host.
     :param config: The deployment's sandbox config, or ``None`` when managed
         hosts are not configured.
-    :returns: ``True`` when the provider stopped the sandbox and left it stopped.
+    :returns: ``True`` when the provider stopped the sandbox.
     """
     from omnigent.runner.routing import routing_host_session
     from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
@@ -5233,27 +5236,9 @@ async def stop_archived_session_sandbox(
                 extra={"session_id": conv.id},
             )
             return False
-        if await _host_may_be_in_use(host.host_id, owner.id, conversation_store):
-            _logger.info(
-                "Managed sandbox %s gained a user while stopping for archived session %s; "
-                "resuming it",
-                host.sandbox_id,
-                conv.id,
-                extra={"session_id": conv.id},
-            )
-            # Forced: this server just stopped the sandbox, so the host row can
-            # still look online. A wake also restarts the host inside it.
-            await resume_managed_host(
-                host.host_id,
-                host_store,
-                config,
-                force=True,
-                slice_key_enabled=host_slice_key_enabled(owner.labels, host.host_id),
-            )
-            return False
     except Exception:
         _logger.warning(
-            "Failed to stop or resume the managed sandbox of archived session %s",
+            "Failed to stop the managed sandbox of archived session %s",
             conv.id,
             exc_info=True,
             extra={"session_id": conv.id},

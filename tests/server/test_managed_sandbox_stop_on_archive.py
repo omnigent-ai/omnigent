@@ -7,13 +7,9 @@ from dataclasses import replace
 import click
 import pytest
 
-from omnigent.onboarding.sandboxes.base import (
-    SandboxCapabilityError,
-    render_host_config_write_command,
-)
+from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
 from omnigent.server import managed_hosts
 from omnigent.server.managed_hosts import (
-    REQUESTED_HOST_ID_LABEL_KEY,
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
     launch_managed_host,
@@ -235,33 +231,6 @@ async def test_archiving_the_last_side_chat_stops_its_sources_sandbox(db_uri):
     assert await _stop(fake, host_store, conversations, side_chat) is True
     assert fake.stopped == [host_store.get_host(conv.host_id).sandbox_id]
     assert fake.terminated == []
-
-
-async def test_a_sandbox_that_gains_a_user_while_stopping_is_resumed(db_uri, monkeypatch):
-    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
-    sandbox_id = host_store.get_host(conv.host_id).sandbox_id
-    # A host the create asked for routes by its own id; the wake keeps that.
-    conversations.set_labels(conv.id, {REQUESTED_HOST_ID_LABEL_KEY: conv.host_id})
-    conv = conversations.get_conversation(conv.id)
-    real_stop = fake.stop
-
-    def stop_while_unarchived(stopped_id: str) -> None:
-        # The user unarchives and messages the session while the provider stops.
-        conversations.update_conversation(conv.id, archived=False)
-        real_stop(stopped_id)
-
-    monkeypatch.setattr(fake, "stop", stop_while_unarchived)
-    starts_before = len(fake.host_starts)
-    commands_before = len(fake.commands)
-    assert await _stop(fake, host_store, conversations, conv) is False
-    assert fake.stopped == [sandbox_id]
-    # Woken through the normal wake path: the sandbox and the host inside it.
-    assert fake.resumed == [sandbox_id]
-    assert len(fake.host_starts) == starts_before + 1
-    assert (
-        render_host_config_write_command({"host": {"slice_key_enabled": True}})
-        in fake.commands[commands_before:]
-    )
 
 
 async def test_keeps_a_sandbox_its_provider_cannot_resume(db_uri):
