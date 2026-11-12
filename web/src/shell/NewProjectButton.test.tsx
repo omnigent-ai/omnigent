@@ -439,6 +439,32 @@ describe("NewProjectButton project repositories", () => {
     expect(alert).not.toHaveTextContent("Delete the partial folder");
   });
 
+  it("does not save a folder created for the previous Run on target", async () => {
+    mocks.serverInfo = projectServerInfo;
+    let resolveDirectory: ((path: string) => void) | undefined;
+    mocks.createDirectory.mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        resolveDirectory = resolve;
+      }),
+    );
+    renderButton([laptop, desktop]);
+
+    nameProject("Garden");
+    fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "Create a folder using the project name",
+      }),
+    );
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+    await waitFor(() => expect(mocks.createDirectory).toHaveBeenCalledTimes(1));
+
+    selectRunOn("host_2");
+    await act(async () => resolveDirectory?.("/Users/me/Garden"));
+
+    expect(mocks.createProject).not.toHaveBeenCalled();
+  });
+
   it("reuses a successful checkout when only the name changes after a failed save", async () => {
     mocks.serverInfo = projectServerInfo;
     mocks.createProject.mockImplementationOnce(

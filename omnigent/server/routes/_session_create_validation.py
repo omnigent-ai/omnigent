@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,17 +37,30 @@ class ProjectCreateResolution:
     project_id: str | None = None
 
 
+def server_sandbox_providers(request: Any) -> tuple[str, ...]:
+    """The sandbox providers this server can launch, to check a saved provider against.
+
+    :param request: The create request, whose app carries ``sandbox_config``.
+    :returns: Launchable provider names; empty when managed sandboxes are off.
+    """
+    sandbox_config = getattr(request.app.state, "sandbox_config", None)
+    return sandbox_config.launchable_providers() if sandbox_config is not None else ()
+
+
 async def resolve_project_session_create(
     *,
     body: Any,
     user_id: str | None,
     project_store: ProjectStore | None,
+    launchable_sandbox_providers: Collection[str] = (),
 ) -> ProjectCreateResolution:
     """Apply opt-in project defaults before any create-side validation.
 
     Field presence, rather than value, controls defaulting.  Consequently an
     explicit JSON ``null`` remains explicit and is never replaced by a project
     hint.  Unknown and foreign projects deliberately share one 404 response.
+    A saved sandbox provider is inherited only when it is in
+    ``launchable_sandbox_providers``; an unconfigured one is ignored.
     """
     fields_set = set(body.model_fields_set)
     project_id = getattr(body, "project_id", None)
@@ -80,7 +94,12 @@ async def resolve_project_session_create(
     if repository is not None and not {"workspace", "workspaces"} & fields_set:
         updates["workspaces"] = [repository]
     saved_provider = config.get("sandbox_provider")
-    if managed and "sandbox_provider" not in fields_set and isinstance(saved_provider, str):
+    if (
+        managed
+        and "sandbox_provider" not in fields_set
+        and isinstance(saved_provider, str)
+        and saved_provider in launchable_sandbox_providers
+    ):
         updates["sandbox_provider"] = saved_provider
     resolved_data = body.model_dump()
     resolved_data.update(updates)

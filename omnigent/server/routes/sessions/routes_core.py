@@ -1916,6 +1916,7 @@ def register_core_routes(
         )
         from omnigent.server.routes._session_create_validation import (
             resolve_project_session_create,
+            server_sandbox_providers,
         )
 
         if (
@@ -1928,6 +1929,7 @@ def register_core_routes(
             body=parsed_metadata,
             user_id=user_id,
             project_store=project_store,
+            launchable_sandbox_providers=server_sandbox_providers(request),
         )
         parsed_metadata = project_resolution.body
         await _check_initial_input(request, parsed_metadata.initial_input)

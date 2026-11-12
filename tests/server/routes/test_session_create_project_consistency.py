@@ -782,6 +782,46 @@ async def test_non_managed_and_placement_creates_take_no_saved_repository(db_uri
     assert external.body.workspace == "/work/project"
 
 
+async def test_unconfigured_saved_provider_creates_on_the_default_provider(
+    managed_project_app: FastAPI,
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    """A JSON managed create whose saved provider was removed still launches, on the default."""
+    project_id = await _project(
+        project_create_client,
+        {"agent_id": CUSTOM_AGENT_ID, "sandbox_provider": "withdrawn"},
+    )
+    response = await project_create_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "host_type": "managed"},
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    await _await_launch(managed_project_app)
+    assert _launched(managed_project_app) == ([], None)
+
+
+@pytest.mark.parametrize("launchable", [("modal",), ()], ids=["offered", "withdrawn"])
+async def test_saved_provider_is_inherited_only_while_the_server_offers_it(
+    db_uri: str, launchable: tuple[str, ...]
+) -> None:
+    """A saved provider that is no longer configured is not inherited into the create."""
+    project_store = SqlAlchemyProjectStore(db_uri)
+    project = project_store.create(
+        "987b7cb7ac30abf4debfaa578d052ec6",
+        f"provider-{len(launchable)}",
+        ALICE,
+        {**MANAGED_PROJECT_CONFIG, "repository": None},
+    )
+    resolved = await resolve_project_session_create(
+        body=ProjectSessionCreateRequest(project_id=project.id, host_type="managed"),
+        user_id=ALICE,
+        project_store=project_store,
+        launchable_sandbox_providers=launchable,
+    )
+    assert resolved.body.sandbox_provider == ("modal" if launchable else None)
+
+
 async def test_managed_child_inherits_its_parent_instead_of_project_defaults(db_uri: str) -> None:
     """A child of a managed session keeps its parent's placement, not the project's."""
     project_store = SqlAlchemyProjectStore(db_uri)
@@ -821,6 +861,7 @@ async def test_legacy_string_repository_is_ignored_without_failing_the_create(db
             body=ProjectSessionCreateRequest(project_id=project.id, host_type="managed"),
             user_id=ALICE,
             project_store=project_store,
+            launchable_sandbox_providers=("modal",),
         )
         assert resolved.body.workspaces is None
         assert resolved.body.sandbox_provider == "modal"

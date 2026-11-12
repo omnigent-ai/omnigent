@@ -12335,12 +12335,14 @@ async def _create_session_from_existing_agent(
     """
     from omnigent.server.routes._session_create_validation import (
         resolve_project_session_create,
+        server_sandbox_providers,
     )
 
     project_resolution = await resolve_project_session_create(
         body=body,
         user_id=user_id,
         project_store=project_store,
+        launchable_sandbox_providers=server_sandbox_providers(request),
     )
     body = project_resolution.body
     project_id = project_resolution.project_id

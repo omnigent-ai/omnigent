@@ -498,6 +498,8 @@ export function NewProjectButton({
                   const next = event.target.value;
                   runOnPicked.current = true;
                   if (next !== runOn) {
+                    // A submission still creating a folder for the old target must not save it.
+                    submissionGeneration.current += 1;
                     setWorkspace(null);
                     setCreatedWorkspace(null);
                     setCreateWorkspaceFolder(false);
@@ -540,6 +542,7 @@ export function NewProjectButton({
                   value="folder"
                   checked={sourceMode === "folder"}
                   onChange={() => {
+                    submissionGeneration.current += 1;
                     setSourceMode("folder");
                     setSubmitError(null);
                   }}
@@ -553,6 +556,7 @@ export function NewProjectButton({
                   value="repository"
                   checked={sourceMode === "repository"}
                   onChange={() => {
+                    submissionGeneration.current += 1;
                     setSourceMode("repository");
                     setSubmitError(null);
                   }}
