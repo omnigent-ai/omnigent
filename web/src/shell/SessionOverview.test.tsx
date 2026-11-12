@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { basenamedRouting, RoutingProvider, reactRouterRouting } from "@/lib/routing";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { beforeEach, expect, it, vi } from "vitest";
@@ -52,6 +52,54 @@ it("shows loading, true absence, zero, and never another session's known cost", 
   act(() => useChatStore.setState({ conversationId: "other", sessionCostUsd: 99 }));
   expect(screen.queryByText("$99.00")).toBeNull();
   expect(screen.getByRole("status")).toBeInTheDocument();
+});
+
+it.each([
+  { counts: [100, null], expected: "Unavailable" },
+  { counts: [0, null], expected: "Unavailable" },
+  { counts: [null, null], expected: "Unavailable" },
+  { counts: [], expected: "Unavailable" },
+  { counts: [0, 0], expected: "0" },
+  { counts: [100, 200], expected: "300" },
+])("requires complete cumulative tokens for $counts", ({ counts, expected }) => {
+  render(
+    <MemoryRouter>
+      <SessionOverview
+        sessionId="parent"
+        canBrowseFiles={false}
+        guard={(_path, _options, commit) => commit()}
+        onDismiss={vi.fn()}
+      />
+    </MemoryRouter>,
+  );
+  const total = screen.getByText("Cumulative tokens").nextElementSibling as HTMLElement;
+  expect(within(total).getByRole("status")).toBeInTheDocument();
+  act(() =>
+    useChatStore.setState({
+      sessionUsageLoading: false,
+      sessionUsageByModel: Object.fromEntries(
+        counts.map((totalTokens, index) => [
+          `model-${index}`,
+          {
+            totalTokens,
+            inputTokens: null,
+            outputTokens: null,
+            cacheReadInputTokens: null,
+            cacheCreationInputTokens: null,
+            totalCostUsd: 1,
+          },
+        ]),
+      ),
+    }),
+  );
+  expect(total.textContent).toBe(expected);
+  expect(within(total).queryByRole("status")).toBeNull();
+
+  act(() => useChatStore.setState({ sessionUsageLoading: true }));
+  if (expected === "Unavailable") expect(within(total).getByRole("status")).toBeInTheDocument();
+  else expect(total.textContent).toBe(expected);
+  act(() => useChatStore.setState({ conversationId: "other", sessionUsageLoading: false }));
+  expect(within(total).getByRole("status")).toBeInTheDocument();
 });
 
 it.each(["", "/embed"])(

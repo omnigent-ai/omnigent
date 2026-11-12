@@ -52,12 +52,11 @@ export function SessionOverview({
   const files = useWorkspaceChangedFiles(sessionId, { enabled: canBrowseFiles });
   const [showAll, setShowAll] = useState(false);
   const tokenValues =
-    id === sessionId
-      ? Object.values(models ?? {})
-          .map((model) => model.totalTokens)
-          .filter((value): value is number => value !== null)
-      : [];
-  const tokens = tokenValues.length ? tokenValues.reduce((sum, value) => sum + value, 0) : null;
+    id === sessionId ? Object.values(models ?? {}).map((model) => model.totalTokens) : [];
+  const tokens =
+    tokenValues.length > 0 && tokenValues.every((value) => value !== null)
+      ? tokenValues.reduce((sum, value) => sum + value, 0)
+      : null;
   const changed = files.data?.available ? files.data.data : null;
   const knownLines = changed?.every(
     (file) => file.lines_added !== null && file.lines_removed !== null,

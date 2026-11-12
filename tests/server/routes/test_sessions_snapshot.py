@@ -209,6 +209,11 @@ class _ConversationStore:
             has_more=False,
         )
 
+    def list_latest_message_items_for_conversations(
+        self, conversation_ids: list[str], limit: int
+    ) -> dict[str, list[ConversationItem]]:
+        return dict.fromkeys(conversation_ids, self.items[:limit])
+
 
 def _message_item(item_id: str, text: str) -> ConversationItem:
     return ConversationItem(
@@ -3111,8 +3116,11 @@ def test_publish_subtree_cost_to_ancestors_publishes_each_ancestor_subtree(
         tokens={"input_tokens": 40},
         by_model={"model-a": {"input_tokens": 40, "total_cost_usd": 4.0}},
     )
+    c.title = "research:report"
+    c.task_summary = "Review the report"
+    monkeypatch.setitem(_sessions_mod._session_status_cache, c.id, "running")
     conv_store = _ConversationStore(
-        [],
+        [_message_item("item_child", "Reviewing the report")],
         conversations={
             "8463f762110b86b1ba33ddf7a8fc1172": g,
             "b460374fc8e697b296708f52dc9d8179": p,
@@ -3129,13 +3137,27 @@ def test_publish_subtree_cost_to_ancestors_publishes_each_ancestor_subtree(
         for pub in recorder.published
         if pub.event["type"] == "session.child_session.updated"
     ]
+    assert len(patches) == 1
+    child_summary = patches[0]["child"]
+    assert isinstance(child_summary, dict)
+    assert child_summary["id"] == c.id
+    assert child_summary["parent_session_id"] == p.id
+    assert child_summary["agent_id"] == c.agent_id
+    assert child_summary["title"] == "research:report"
+    assert child_summary["tool"] == "research"
+    assert child_summary["session_name"] == "report"
+    assert child_summary["task_summary"] == "Review the report"
+    assert child_summary["busy"] is True
+    assert child_summary["current_task_status"] == "in_progress"
+    assert child_summary["last_message_preview"] == "Reviewing the report"
+    assert child_summary["own_cost_usd"] == 4.0
     assert patches == [
         {
             "type": "session.child_session.updated",
             "sequence_number": None,
             "conversation_id": p.id,
             "child_session_id": c.id,
-            "child": {"own_cost_usd": 4.0},
+            "child": child_summary,
         }
     ]
     assert len(recorder.published) == 3

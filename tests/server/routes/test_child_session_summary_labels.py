@@ -60,6 +60,8 @@ def test_child_summary_strips_per_user_pin_keys() -> None:
         ("claude-custom", 1.0, 1.0),
         ("codex", None, 3.0),
         ("claude-sdk", None, 3.0),
+        ("unknown", None, 3.0),
+        ("unknown-policy", None, None),
     ],
 )
 def test_own_cost_provenance_agrees_across_projections(
@@ -83,6 +85,8 @@ def test_own_cost_provenance_agrees_across_projections(
         )
     if source == "claude-override":
         conv.harness_override = "claude-native"
+    if source == "unknown-policy":
+        conv.session_usage["policy_cost_usd"] = 5.0
     harness = (
         "claude-native" if source.startswith("claude-") and source != "claude-sdk" else source
     )
@@ -94,7 +98,7 @@ def test_own_cost_provenance_agrees_across_projections(
 
     def get_many(ids: list[str]) -> dict[str, Agent]:
         reads.append(ids)
-        return {agent.id: agent}
+        return {agent.id: agent} if source in {"claude-custom", "codex", "claude-sdk"} else {}
 
     monkeypatch.setattr(
         "omnigent.runtime._globals._agent_store", SimpleNamespace(get_many=get_many)
@@ -107,6 +111,9 @@ def test_own_cost_provenance_agrees_across_projections(
     )
     resolved = helpers._cost_display_harnesses([conv, conv])
     assert reads == ([[agent.id]] if attribution is None else [])
+    if source in {"claude-wrapper", "claude-override", "unknown", "unknown-policy"}:
+        assert resolved.get(conv.id) == conv.harness_override
+        assert helpers._own_cost_for_display(conv) == expected
     summary = _child_session_summary_from_conversation(
         conv,
         "conv_parent",
@@ -134,7 +141,10 @@ def test_own_cost_provenance_agrees_across_projections(
             publish=lambda destination, event: events.append((destination, event)),
         ),
     )
-    orchestration._publish_subtree_cost_to_ancestors(SimpleNamespace(), conv.id)
+    orchestration._publish_subtree_cost_to_ancestors(
+        SimpleNamespace(list_latest_message_items_for_conversations=lambda ids, limit: {}),
+        conv.id,
+    )
     assert summary.own_cost_usd == item.own_cost_usd == expected
     assert events[0] == (
         "conv_parent",
@@ -143,7 +153,7 @@ def test_own_cost_provenance_agrees_across_projections(
             "sequence_number": None,
             "conversation_id": "conv_parent",
             "child_session_id": conv.id,
-            "child": {"own_cost_usd": expected},
+            "child": summary.model_dump(mode="json"),
         },
     )
     assert conv.session_usage["total_cost_usd"] == 3.0

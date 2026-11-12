@@ -22,7 +22,12 @@ import {
 // discovered while the socket handles watched-row freshness.
 
 import { type ReactNode, useCallback, useContext, useEffect, useRef } from "react";
-import { type QueryClient, useQueryClient } from "@tanstack/react-query";
+import {
+  CancelledError,
+  type Query,
+  type QueryClient,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { getCurrentUserId } from "@/lib/identity";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
 import {
@@ -369,6 +374,34 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     );
     const scheduleInvalidate = () => reconciler.schedule();
 
+    const childRefreshes = new Map<Query, Promise<unknown>>();
+    const refreshChildren = (parentId: string) => {
+      const filters = { queryKey: childSessionsQueryKey(parentId), exact: true };
+      const query = queryClient.getQueryCache().find(filters);
+      const pending = query?.state.fetchStatus !== "idle" ? query?.promise : undefined;
+      if (query && pending) {
+        if (childRefreshes.get(query) === pending) return;
+        childRefreshes.set(query, pending);
+        const settled = (error?: unknown) => {
+          // An older request must not retire a replacement's queued refresh.
+          if (childRefreshes.get(query) !== pending) return;
+          childRefreshes.delete(query);
+          if (
+            error instanceof CancelledError ||
+            query.promise !== pending ||
+            queryClient.getQueryCache().find(filters) !== query
+          )
+            return;
+          void queryClient.invalidateQueries(filters, { cancelRefetch: false });
+        };
+        void queryClient
+          .invalidateQueries(filters, { cancelRefetch: false, throwOnError: true })
+          .then(() => settled(), settled);
+        return;
+      }
+      void queryClient.invalidateQueries(filters, { cancelRefetch: false });
+    };
+
     // See commentsFingerprintsRef: invalidate `["comments", id]` (prefix —
     // covers the per-file variants too) when a session's fingerprint moves.
     const syncCommentsFingerprints = (items: SessionListWireItem[]) => {
@@ -475,10 +508,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
               parentIds.add(item.parent_session_id);
           }
           for (const parentId of parentIds) {
-            void queryClient.invalidateQueries(
-              { queryKey: childSessionsQueryKey(parentId) },
-              { cancelRefetch: false },
-            );
+            refreshChildren(parentId);
           }
           const { missingIds, needsRefetch } = applyItemsToCache(
             queryClient,
@@ -535,6 +565,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     pushWatched();
     const cache = queryClient.getQueryCache();
     const unsubscribeCache = cache.subscribe((event) => {
+      if (event.type === "removed") childRefreshes.delete(event.query);
       const key = event.query.queryKey;
       // Recompute the watch-set when either the global list or a project
       // folder's list changes (fetch, pagination, splice) so newly loaded
@@ -550,6 +581,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     });
 
     return () => {
+      childRefreshes.clear();
       unsubscribeFrames();
       unsubscribeMutations();
       unsubscribeCache();

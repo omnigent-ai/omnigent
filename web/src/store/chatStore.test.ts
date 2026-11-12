@@ -1298,9 +1298,12 @@ describe("chatStore — lazy subtree usage", () => {
       await useChatStore.getState().switchTo("conv_usage");
       await drainAsync();
       const initialSnapshots = metadataSnapshotCount();
+      const knownModels = useChatStore.getState().sessionUsageByModel;
+      expect(useChatStore.getState().sessionUsageLoading).toBe(false);
 
       await advanceReconcileInterval();
       expect(readUsage).toHaveBeenCalledTimes(2);
+      expect(useChatStore.getState().sessionUsageLoading).toBe(true);
       handleSessionEvent({
         type: "session_status",
         conversationId: "conv_usage",
@@ -1316,10 +1319,13 @@ describe("chatStore — lazy subtree usage", () => {
       expect(useChatStore.getState().sessionStatus).toBe("idle");
       expect(useChatStore.getState().loadingConversation).toBe(false);
       expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
+      expect(useChatStore.getState().sessionUsageByModel).toBe(knownModels);
+      expect(useChatStore.getState().sessionUsageLoading).toBe(true);
 
       finishUsage(usage("conv_usage", 8));
       await drainAsync();
       expect(useChatStore.getState().sessionCostUsd).toBe(8);
+      expect(useChatStore.getState().sessionUsageLoading).toBe(false);
     });
 
     it.each(["cost", "models"])(
@@ -3655,7 +3661,46 @@ describe("chatStore — send (first-send ordering)", () => {
           .map((block) => (block.type === "text_done" ? block.fullText : block.type));
       expect(preview()).toEqual(["Hello wor"]);
 
-      await retryConversationLoad("conv_down");
+      let finishHistory!: () => void;
+      const history = new Promise<void>((resolve) => {
+        finishHistory = resolve;
+      });
+      let finishUsage!: (response: Response) => void;
+      const usage = new Promise<Response>((resolve) => {
+        finishUsage = resolve;
+      });
+      const route = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input), "https://example.test");
+        if (
+          url.pathname === "/v1/sessions/conv_down" &&
+          url.searchParams.get("include_usage") === "true"
+        ) {
+          return usage;
+        }
+        const response = await route(input, init);
+        if (url.pathname === "/v1/sessions/conv_down") {
+          return mockResponse({ ...(await response.json()), usage_included: false });
+        }
+        if (url.pathname === "/v1/sessions/conv_down/items") await history;
+        return response;
+      });
+
+      const retried = retryConversationLoad("conv_down");
+      expect(entry.getState().sessionUsageLoading).toBe(true);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(entry.getState().loadingConversation).toBe(true);
+      expect(entry.getState().sessionCostUsd).toBeNull();
+
+      finishHistory();
+      await retried;
+      expect(entry.getState().loadingConversation).toBe(false);
+      expect(entry.getState().sessionUsageLoading).toBe(true);
+      expect(entry.getState().sessionCostUsd).toBeNull();
+      finishUsage(mockResponse({ id: "conv_down", total_cost_usd: 3.5 }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(entry.getState().sessionUsageLoading).toBe(false);
+      expect(entry.getState().sessionCostUsd).toBe(3.5);
       expect(streams).toHaveLength(2);
       // A new stream replays the reply so far as one cumulative chunk.
       streams[1]!.push(previewDelta("Hello world!", 2));

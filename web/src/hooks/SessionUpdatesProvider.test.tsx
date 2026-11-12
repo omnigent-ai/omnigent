@@ -583,6 +583,129 @@ describe("SessionUpdatesProvider project folders", () => {
   });
 });
 
+describe("SessionUpdatesProvider child refresh ownership", () => {
+  it.each([
+    "success",
+    "failure",
+    "membership replacement",
+    "refetch replacement",
+    "provider unmount",
+    "observer unmount",
+    "query removal",
+  ])("coalesces changed frames behind the physical request: %s", async (outcome) => {
+    const client = new QueryClient();
+    const options = childSessionsQueryOptions("refresh-parent");
+    client.setQueryData(
+      childSessionsQueryKey("refresh-parent"),
+      [{ id: "refresh-child", title: "cached" }, { id: "removed-child" }],
+      { updatedAt: 0 },
+    );
+    const reads: {
+      resolve: (response: Response) => void;
+      reject: (error: Error) => void;
+      signal: AbortSignal;
+    }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url: string, init: RequestInit) =>
+          new Promise<Response>((resolve, reject) => {
+            reads.push({ resolve, reject, signal: init.signal! });
+          }),
+      ),
+    );
+    const page = (data: Partial<ChildSessionInfo>[], hasMore = false) =>
+      new Response(JSON.stringify({ data, has_more: hasMore, last_id: data.at(-1)?.id }));
+    const view = renderProvider(client, ["/"]);
+    const observer = new QueryObserver(client, options);
+    const unobserve = observer.subscribe(() => {});
+    const query = client.getQueryCache().find({ queryKey: options.queryKey, exact: true })!;
+    const changed = () =>
+      frameHandler()({
+        type: "changed",
+        items: [
+          {
+            ...conv("refresh-child"),
+            parent_session_id: "refresh-parent",
+            title: "renamed",
+            labels: { purpose: "updated" },
+          },
+        ],
+      });
+    try {
+      await waitFor(() => expect(reads).toHaveLength(1));
+      reads[0].resolve(
+        page(
+          [
+            { id: "refresh-child", title: "stale HTTP", labels: { purpose: "old" } },
+            { id: "removed-child" },
+          ],
+          true,
+        ),
+      );
+      await waitFor(() => expect(reads).toHaveLength(2));
+      const firstRequest = query.promise!;
+      act(() => {
+        for (let index = 0; index < 5; index++) changed();
+      });
+      expect(reads[1].signal.aborted).toBe(false);
+      expect(query.state.data).toMatchObject([{ title: "cached" }, { id: "removed-child" }]);
+
+      if (outcome.endsWith("unmount") || outcome === "query removal") {
+        act(() => {
+          if (outcome === "provider unmount") view.unmount();
+          else if (outcome === "observer unmount") unobserve();
+          else client.removeQueries({ queryKey: options.queryKey, exact: true });
+        });
+        expect(reads[1].signal.aborted).toBe(outcome !== "provider unmount");
+        reads[1].resolve(page([]));
+        await firstRequest.catch(() => undefined);
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 0);
+        });
+        expect(reads).toHaveLength(2);
+        return;
+      }
+
+      const replaced = outcome.endsWith("replacement");
+      if (replaced) {
+        act(() => {
+          if (outcome === "membership replacement")
+            frameHandler()({ type: "removed", ids: ["removed-child"] });
+          else void client.refetchQueries({ queryKey: options.queryKey, exact: true });
+          expect(query.promise).not.toBe(firstRequest);
+          // Q2's changes arrive before Q1's cancellation callbacks can run.
+          for (let index = 0; index < 5; index++) changed();
+        });
+        expect(reads[1].signal.aborted).toBe(true);
+        await waitFor(() => expect(reads).toHaveLength(3));
+        reads[1].resolve(page([{ id: "refresh-child", title: "late Q1" }]));
+        reads[2].resolve(page([{ id: "refresh-child", title: "stale Q2" }]));
+      } else if (outcome === "failure") reads[1].reject(new Error("page two failed"));
+      else reads[1].resolve(page([]));
+
+      const expectedReads = replaced ? 4 : 3;
+      await waitFor(() => expect(reads).toHaveLength(expectedReads));
+      expect((query.state.data as ChildSessionInfo[])[0].title).not.toBe("renamed");
+      reads
+        .at(-1)!
+        .resolve(page([{ id: "refresh-child", title: "renamed", labels: { purpose: "updated" } }]));
+      await waitFor(() => expect(query.state.fetchStatus).toBe("idle"));
+      expect(query.state.data).toMatchObject([
+        { id: "refresh-child", title: "renamed", labels: { purpose: "updated" } },
+      ]);
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
+      expect(reads).toHaveLength(expectedReads);
+    } finally {
+      unobserve();
+      view.unmount();
+      client.clear();
+    }
+  });
+});
+
 describe("SessionUpdatesProvider child membership", () => {
   it.each(["removed", "archived"])(
     "orders %s, late SSE, and reappearance across held pagination without losing watches",
@@ -676,13 +799,10 @@ describe("SessionUpdatesProvider child membership", () => {
         // A completed read omitting the restoring child must not end its watch.
         setWatched.mockClear();
         reads[3].resolve(page([{ id: "member-b" }]));
-        await waitFor(() =>
-          expect(client.getQueryState(options.queryKey)?.fetchStatus).toBe("idle"),
-        );
+        // The repeated changed frame queued one follow-up; membership still owns cancellation.
+        await waitFor(() => expect(reads).toHaveLength(5));
         expect(rows().map((row) => row.id)).toEqual(["member-b"]);
         await waitFor(() => expect(lastWatched()).toContain("member-a"));
-        void observer.refetch();
-        await waitFor(() => expect(reads).toHaveLength(5));
         act(exclude);
         expect(reads[4].signal.aborted).toBe(true);
         await waitFor(() => expect(reads).toHaveLength(6));
@@ -700,9 +820,16 @@ describe("SessionUpdatesProvider child membership", () => {
         await waitFor(() => expect(reads).toHaveLength(7));
         reads[6].resolve(page([{ id: "member-a", title: "restored", own_cost_usd: 5 }]));
         await restored;
+        if (transition === "archived") {
+          await waitFor(() => expect(reads).toHaveLength(8));
+          reads[7].resolve(page([{ id: "member-a", title: "restored", own_cost_usd: 5 }]));
+          await waitFor(() =>
+            expect(client.getQueryState(options.queryKey)?.fetchStatus).toBe("idle"),
+          );
+        }
         act(() => send("member-a", { own_cost_usd: null }));
         expect(rows()).toMatchObject([{ id: "member-a", title: "restored", own_cost_usd: null }]);
-        expect(reads).toHaveLength(7);
+        expect(reads).toHaveLength(transition === "archived" ? 8 : 7);
 
         unobserve();
         act(exclude);
@@ -1191,7 +1318,7 @@ describe("SessionUpdatesProvider list invalidation", () => {
       expect(listInvalidations(invalidate)).toEqual([]);
       // Its tree view still refreshes.
       expect(invalidate).toHaveBeenCalledWith(
-        { queryKey: childSessionsQueryKey("conv_a") },
+        { queryKey: childSessionsQueryKey("conv_a"), exact: true },
         { cancelRefetch: false },
       );
     } finally {

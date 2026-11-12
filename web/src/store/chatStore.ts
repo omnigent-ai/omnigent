@@ -5204,6 +5204,7 @@ async function bindStream(
   if (entry === undefined || entry.disposed) return;
   const controller = new AbortController();
   sessionBindControllers.set(entry, controller);
+  set({ sessionUsageLoading: true });
   const ignoredNativeMessageIds = new Set<string>();
   nativePreviewTombstonesByController.set(controller, ignoredNativeMessageIds);
   // Take an origin-wide stream slot before opening the connection, evicting our
@@ -5534,6 +5535,7 @@ async function hydrateSessionUsage(id: string): Promise<void> {
     return;
   }
   sessionUsageHydrations.add(controller);
+  entrySetter(entry)({ sessionUsageLoading: true });
   const revisionsBeforeFetch = sessionUsageRevisions.get(entry) ?? { cost: 0, models: 0 };
   try {
     const usage = await getSessionUsage(id, { signal: controller.signal });

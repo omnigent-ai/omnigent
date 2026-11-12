@@ -1449,15 +1449,18 @@ def _publish_subtree_cost_to_ancestors(
     )
     child = next((row for row in tree if row.id == session_id), None)
     if child is not None and child.parent_conversation_id is not None:
+        items_by_child = conv_store.list_latest_message_items_for_conversations([child.id], 10)
+        summary = _child_session_summary_from_conversation(
+            child,
+            child.parent_conversation_id,
+            _latest_message_preview(items_by_child.get(child.id, [])),
+            harness=_cost_display_harnesses([child]).get(child.id),
+        )
         child_event = SessionChildSessionUpdatedEvent(
             type="session.child_session.updated",
             conversation_id=child.parent_conversation_id,
             child_session_id=session_id,
-            child={
-                "own_cost_usd": _own_cost_for_display(
-                    child, harness=_cost_display_harnesses([child]).get(child.id)
-                )
-            },
+            child=summary.model_dump(mode="json"),
         )
         session_stream.publish(child.parent_conversation_id, child_event.model_dump())
     for ancestor_id in ancestor_ids_from_tree(tree, session_id):
