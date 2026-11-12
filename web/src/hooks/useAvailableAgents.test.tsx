@@ -1798,6 +1798,48 @@ describe("useCuratedOutHarnesses", () => {
     expect([...result.current]).toEqual([]);
   });
 
+  // Each read returns these pages in turn, as `[agent names, has_more]`.
+  it.each([
+    ["49 names, then the end", [[49, false]], ["codex-native"]],
+    ["stopped at the 50-name cap", [[50, true]], []],
+    ["names skipped on the last page", [[51, false]], []],
+    [
+      "5 pages the server trimmed to copies",
+      [
+        [1, true],
+        [1, true],
+        [1, true],
+        [1, true],
+        [1, true],
+      ],
+      [],
+    ],
+  ] as const)(
+    "hides a suppressed harness only once every own agent is read: %s",
+    async (_, pages, expected) => {
+      // A Codex agent older than the last page read stays selectable from a recent session.
+      let next = 0;
+      const routes: Record<string, Response> = {
+        [BUILTINS_URL]: HIDES_CODEX,
+        [HARNESSES_URL]: mockResponse({ data: [] }),
+      };
+      let url = USER_AGENTS_URL;
+      pages.forEach(([count, hasMore]) => {
+        const data = Array.from({ length: count }, () => {
+          next += 1;
+          return { id: `ag_own_${next}`, name: `own-agent-${next}`, harness: "claude-sdk" };
+        });
+        routes[url] = mockResponse({ data, has_more: hasMore, last_id: data.at(-1)?.id });
+        url = `${USER_AGENTS_URL}&after=ag_own_${next}`;
+      });
+      routeFetch(routes);
+      const { client, result } = renderCuration(true);
+
+      await waitFor(() => expect(client.getQueryState(USER_AGENTS_KEY)?.status).toBe("success"));
+      await waitFor(() => expect([...result.current]).toEqual(expected));
+    },
+  );
+
   it("hides nothing while the user's own agents fail to load", async () => {
     routeFetch({
       [BUILTINS_URL]: HIDES_CODEX,

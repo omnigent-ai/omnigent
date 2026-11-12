@@ -5,11 +5,7 @@ import { NATIVE_CODING_AGENTS, nativeCodingAgentForHarness } from "@/lib/nativeC
 const NONE: ReadonlySet<string> = new Set();
 
 /**
- * Native harnesses the deployment has curated out of Settings.
- *
- * A harness is out when the server hid its built-in agent
- * (`OMNIGENT_SEEDED_AGENTS`) and no agent the user can still pick runs on it;
- * one that some pickable agent needs stays, so the user can set it up.
+ * Hide suppressed native harnesses unless a selectable agent uses them.
  *
  * @param suppressedNames - Built-in agent names the server hides, e.g. `{"codex-native-ui"}`.
  * @param agents - The agents the user can pick, e.g. from {@link useAgentCatalog}.
@@ -30,9 +26,8 @@ export function curatedOutHarnesses(
 
 /**
  * Native harness slugs Settings leaves out, per {@link curatedOutHarnesses}.
- * Empty until every pickable agent has loaded, and while either catalog
- * request fails, so a slow, failing or older server never hides a harness
- * an agent still needs.
+ * Empty unless every pickable agent is known: while either catalog request
+ * loads or fails, and when the user's own agents run past the read cap.
  *
  * @param enabled - Whether to fetch the agent catalog; defaults true.
  */

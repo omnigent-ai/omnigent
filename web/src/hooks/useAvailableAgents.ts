@@ -201,39 +201,61 @@ function agentFromWire(a: BuiltinAgentWire): AvailableAgent {
   };
 }
 
+// The caller's own agents are read until this many distinct names, or this many pages.
+const USER_AGENT_NAME_CAP = 50;
+const USER_AGENT_PAGE_CAP = 5;
+
+/** The caller's own agents, and whether the read stopped before the oldest of them. */
+export interface UserAgentList {
+  agents: AvailableAgent[];
+  truncated: boolean;
+}
+
 /**
  * Fetch the caller's own agents, `GET /v1/agents?scope=user` (installed with
  * `omnigent agent add` or uploaded). Follows the cursor until 50 agent names,
  * since a page can come back empty when the server skipped only copies, or
  * repeat one name (servers before shared uploads kept a row per run).
+ * Past 5 pages, or 50 names, older agents go unread and the list says so.
  */
-export async function fetchUserAgents(): Promise<AvailableAgent[]> {
+export async function fetchUserAgents(): Promise<UserAgentList> {
   const rows: BuiltinAgentWire[] = [];
   const names = new Set<string>();
   let after: string | null = null;
-  // ponytail: 5 pages (250 rows); copies or repeats beyond that can still hide an older agent.
+  let truncated = true;
   /* oxlint-disable no-await-in-loop */
-  for (let page = 0; page < 5 && names.size < 50; page++) {
+  for (let page = 0; page < USER_AGENT_PAGE_CAP && names.size < USER_AGENT_NAME_CAP; page++) {
     const params = new URLSearchParams({ scope: "user", limit: "50" });
     if (after !== null) params.set("after", after);
     const res = await authenticatedFetch(`/v1/agents?${params}`);
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     const body = (await res.json()) as BuiltinAgentsListWire;
+    let skipped = false;
     for (const row of body.data) {
       const name = agentRootName(row.name);
-      if (names.size >= 50 && !names.has(name)) continue;
+      if (names.size >= USER_AGENT_NAME_CAP && !names.has(name)) {
+        skipped = true;
+        continue;
+      }
       names.add(name);
       rows.push(row);
     }
-    if (body.has_more !== true || !body.last_id || body.last_id === after) break;
+    if (body.has_more !== true) {
+      truncated = skipped;
+      break;
+    }
+    if (!body.last_id || body.last_id === after) break;
     after = body.last_id;
   }
   /* oxlint-enable no-await-in-loop */
-  return rows.map((a) => ({
-    ...agentFromWire(a),
-    updated_at: a.updated_at ?? null,
-    mine: true as const,
-  }));
+  return {
+    agents: rows.map((a) => ({
+      ...agentFromWire(a),
+      updated_at: a.updated_at ?? null,
+      mine: true as const,
+    })),
+    truncated,
+  };
 }
 
 interface DiscoveredSessionAgent {
@@ -348,6 +370,7 @@ async function fetchAvailableAgents(
             queryFn: fetchUserAgents,
             staleTime: AVAILABLE_AGENTS_STALE_MS,
           })
+          .then((list) => list.agents)
           .catch(() => [] as AvailableAgent[])
       : ([] as AvailableAgent[]),
   ]);
@@ -493,8 +516,8 @@ export function useAgentCatalog(enabled = true): {
   suppressedNames: ReadonlySet<string>;
   /**
    * Whether *data* holds every agent the user can pick: the built-in catalog
-   * and, where the server has them, the user's own agents, neither failing
-   * its latest fetch.
+   * and, where the server has them, all of the user's own agents, neither
+   * failing its latest fetch.
    */
   complete: boolean;
   isLoading: boolean;
@@ -518,7 +541,8 @@ export function useAgentCatalog(enabled = true): {
   const acpHarnessIds = useAcpHarnessIds(enabled);
   const harnessLabels = useHarnessLabels(enabled);
   const catalog = catalogQuery.data;
-  const userAgents = userAgentsQuery.data;
+  const userAgentList = userAgentsQuery.data;
+  const userAgents = userAgentList?.agents;
   const data = useMemo(
     () =>
       catalog === undefined
@@ -533,9 +557,11 @@ export function useAgentCatalog(enabled = true): {
   const { refetch } = catalogQuery;
   const retry = useCallback(() => void refetch(), [refetch]);
   // A failed refetch keeps the last data, so the error flags count too.
+  // Past the read cap, an older agent a recent session still offers may be missing.
   const userAgentsComplete =
     serverInfo !== "loading" &&
-    (!includeUserAgents || (userAgents !== undefined && !userAgentsQuery.isError));
+    (!includeUserAgents ||
+      (userAgentList !== undefined && !userAgentsQuery.isError && !userAgentList.truncated));
   return {
     data,
     suppressedNames: catalog?.suppressedNames ?? NO_SUPPRESSED_NAMES,
