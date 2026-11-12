@@ -330,6 +330,24 @@ async def teardown_codex_native_app_server(session_id: str) -> None:
         await app_server.close()
 
 
+def capture_codex_native_hard_exit_cleanup() -> Callable[[], None]:
+    """Capture owned process handles before asynchronous teardown retires their entries."""
+    from omnigent.inner import _proc
+
+    processes = [
+        server.proc for server in list(_AUTO_CODEX_APP_SERVERS.values()) if server.proc is not None
+    ]
+    for process in processes:
+        _proc.refresh_process_tree(process)
+
+    def cleanup() -> None:
+        for process in processes:
+            with contextlib.suppress(Exception):
+                _proc.kill_tree(process)
+
+    return cleanup
+
+
 async def teardown_all_codex_native_app_servers() -> None:
     """
     Tear down every host-spawned codex-native app-server on this runner.
@@ -351,7 +369,14 @@ async def teardown_all_codex_native_app_servers() -> None:
 
     :returns: None.
     """
-    for session_id in list(_AUTO_CODEX_APP_SERVERS):
+    from omnigent.inner._proc import terminate_tree
+
+    servers = list(_AUTO_CODEX_APP_SERVERS.items())
+    # A forwarder's cancellation cleanup can outlast the runner's exit budget.
+    for _, app_server in servers:
+        with contextlib.suppress(Exception):
+            terminate_tree(app_server.proc)
+    for session_id, _ in servers:
         with contextlib.suppress(Exception):
             await teardown_codex_native_app_server(session_id)
 

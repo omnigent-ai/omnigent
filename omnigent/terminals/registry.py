@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -59,6 +60,7 @@ logger = logging.getLogger(__name__)
 # well-behaved tmux to flush and exit, short enough that cleanup
 # doesn't stall.
 _CLOSE_TIMEOUT_S = 5.0
+_HARD_EXIT_TMUX_TIMEOUT_S = 0.2
 
 
 def conversation_link_for_id(
@@ -711,24 +713,69 @@ class TerminalRegistry:
             # AP-shutdown clears all instance locks too — every
             # conversation's terminals are being torn down.
             self._instance_locks.clear()
-        for conversation_id, slot in slots:
-            for (name, key), instance in slot.items():
+
+        async def close_instance(
+            conversation_id: str, name: str, key: str, instance: TerminalInstance
+        ) -> None:
+            try:
+                await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
+            except TimeoutError:
+                logger.warning(
+                    "shutdown: close timed out for %s:%s in conv %s",
+                    name,
+                    key,
+                    conversation_id,
+                )
+            except Exception:
+                logger.exception(
+                    "shutdown: close failed for %s:%s in conv %s",
+                    name,
+                    key,
+                    conversation_id,
+                )
+
+        await asyncio.gather(
+            *(
+                close_instance(conversation_id, name, key, instance)
+                for conversation_id, slot in slots
+                for (name, key), instance in slot.items()
+            )
+        )
+
+    def capture_hard_exit_cleanup(self) -> Callable[[], None]:
+        """Capture owned private sockets for bounded cleanup after graceful shutdown expires."""
+        with self._lock:
+            instances = [
+                instance for slot in self._by_conversation.values() for instance in slot.values()
+            ]
+        claims: list[tuple[Path, tuple[int, int], list[str]]] = []
+        for instance in instances:
+            try:
+                stat = instance.socket_path.stat()
+            except OSError:
+                continue
+            claims.append(
+                (instance.socket_path, (stat.st_dev, stat.st_ino), instance._tmux_base_cmd())
+            )
+
+        def cleanup() -> None:
+            for socket_path, identity, command in claims:
                 try:
-                    await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
-                except TimeoutError:
-                    logger.warning(
-                        "shutdown: close timed out for %s:%s in conv %s",
-                        name,
-                        key,
-                        conversation_id,
+                    stat = socket_path.stat()
+                    if (stat.st_dev, stat.st_ino) != identity:
+                        continue
+                    subprocess.run(
+                        [*command, "kill-server"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=_HARD_EXIT_TMUX_TIMEOUT_S,
+                        check=False,
                     )
-                except Exception:
-                    logger.exception(
-                        "shutdown: close failed for %s:%s in conv %s",
-                        name,
-                        key,
-                        conversation_id,
-                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    continue
+
+        return cleanup
 
     def active_conversation_ids(self) -> list[str]:
         """Return ids of conversations with at least one registered terminal.

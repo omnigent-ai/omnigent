@@ -1640,7 +1640,7 @@ async def test_liveness_probe_before_first_watcher_tick_still_reports_exit(
     assert exits == [(2, "invalid argument")]
 
 
-@pytest.mark.parametrize("watcher", ["async", "threaded"])
+@pytest.mark.parametrize("watcher", ["async", "threaded", "held-async"])
 async def test_explicit_close_before_first_watcher_tick_does_not_report_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, watcher: str
 ) -> None:
@@ -1652,13 +1652,32 @@ async def test_explicit_close_before_first_watcher_tick_does_not_report_exit(
         running=True,
     )
     exits: list[bool] = []
-    monkeypatch.setattr(instance, "_tmux", AsyncMock())
+    terminated = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    monkeypatch.setattr(instance, "_tmux", AsyncMock(side_effect=lambda *_: terminated.set()))
     if watcher == "threaded":
         instance.start_idle_watcher_thread(on_exit=lambda: exits.append(True), poll_interval_s=1)
+    elif watcher == "held-async":
+        started = asyncio.Event()
+
+        async def held_watcher() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await release_cleanup.wait()
+
+        instance._idle_task = asyncio.create_task(held_watcher())
+        await started.wait()
     else:
         instance.start_idle_watcher(lambda: None, on_exit=lambda: exits.append(True))
 
-    await instance.close()
+    close = asyncio.create_task(instance.close())
+    try:
+        await asyncio.wait_for(terminated.wait(), timeout=1)
+    finally:
+        release_cleanup.set()
+        await close
 
     assert instance.running is False
     assert exits == []
