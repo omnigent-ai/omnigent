@@ -145,6 +145,40 @@ describe("resolveServerInfo sandbox_providers", () => {
     });
   });
 
+  it("keeps each provider's automation notice", async () => {
+    const result = await probe({
+      sandbox_provider_automation_notices: { agent_sandbox: "Keep your laptop signed in." },
+    });
+    expect(result.sandbox_provider_automation_notices).toEqual({
+      agent_sandbox: "Keep your laptop signed in.",
+    });
+  });
+
+  it.each([undefined, null, "invalid", ["note"]])(
+    "reads a missing or malformed notice map as no notices (%j)",
+    async (value) => {
+      expect(
+        (await probe({ sandbox_provider_automation_notices: value }))
+          .sandbox_provider_automation_notices,
+      ).toEqual({});
+    },
+  );
+
+  it("drops notices that aren't non-blank text", async () => {
+    const result = await probe({
+      sandbox_provider_automation_notices: {
+        kept: "Keep your laptop signed in.",
+        empty: "",
+        blank: "   ",
+        number: 42,
+        missing: null,
+      },
+    });
+    expect(result.sandbox_provider_automation_notices).toEqual({
+      kept: "Keep your laptop signed in.",
+    });
+  });
+
   it.each([undefined, false, "true", true])(
     "requires an explicit durable-input capability (%s)",
     async (value) => {

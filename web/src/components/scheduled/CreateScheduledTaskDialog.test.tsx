@@ -302,10 +302,13 @@ function renderDialog(onOpenChange: (open: boolean) => void = vi.fn()) {
 }
 
 /** Render inside a CapabilitiesProvider that advertises managed sandboxes. */
-function renderWithSandboxes(onOpenChange: (open: boolean) => void = vi.fn()) {
+function renderWithSandboxes(
+  onOpenChange: (open: boolean) => void = vi.fn(),
+  info: Partial<ServerInfo> = {},
+) {
   return render(
     <CapabilitiesProvider
-      info={{ ...SERVER_INFO_OFFLINE_FALLBACK, managed_sandboxes_enabled: true }}
+      info={{ ...SERVER_INFO_OFFLINE_FALLBACK, managed_sandboxes_enabled: true, ...info }}
     >
       <CreateScheduledTaskDialog open onOpenChange={onOpenChange} />
     </CapabilitiesProvider>,
@@ -1130,14 +1133,29 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
   });
 
   it("starts a new task in sandbox mode when sandboxes are offered, and a host pick sticks", () => {
-    renderWithSandboxes();
+    renderWithSandboxes(vi.fn(), {
+      sandbox_provider: "agent_sandbox",
+      sandbox_provider_automation_notices: {
+        agent_sandbox: "Keep your laptop's credentials fresh.",
+        other_sandbox: "Another provider's notice.",
+      },
+    });
     // The sandbox default wins over the online host and shows the fresh-sandbox
-    // copy; the connected-host workspace picker never appears.
+    // copy and the provider's notice; the connected-host workspace picker never appears.
     expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Sandbox");
+    // Only the run target's provider notice shows.
+    expect(screen.getByTestId("task-sandbox-automation-notice")).toHaveTextContent(
+      "Keep your laptop's credentials fresh.",
+    );
+    expect(screen.queryByText("Another provider's notice.")).not.toBeInTheDocument();
     expect(screen.queryByText("pick-workspace")).not.toBeInTheDocument();
     openHostSelect();
     fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
     expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("laptop");
+    expect(screen.queryByTestId("task-sandbox-automation-notice")).not.toBeInTheDocument();
+    openHostSelect();
+    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+    expect(screen.getByTestId("task-sandbox-automation-notice")).toBeInTheDocument();
   });
 
   it.each([

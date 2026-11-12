@@ -157,6 +157,12 @@ export interface ServerInfo {
     }
   >;
   /**
+   * What each launchable provider's unattended runs need from their owner, e.g.
+   * ``{ agent_sandbox: "Keep your laptop signed in." }``. The automation form
+   * shows the run target's notice; a provider absent from the map has none.
+   */
+  sandbox_provider_automation_notices?: Record<string, string>;
+  /**
    * Connection providers this deploy has wired (config + store present),
    * e.g. ``["github"]`` or ``["github", "databricks"]``. Non-empty shows the
    * Sandbox Integrations nav; the SPA renders one panel per provider via
@@ -448,6 +454,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   sandbox_provider: null,
   sandbox_providers: [],
   sandbox_provider_capabilities: {},
+  sandbox_provider_automation_notices: {},
   enabled_connections: [],
   // Sharing fails OPEN (opposite of the other caps): a failed probe must
   // not silently disable sharing, so the sentinel is the permissive "on".
@@ -568,6 +575,15 @@ function parseSandboxProviderCapabilities(
   );
 }
 
+function parseProviderAutomationNotices(value: unknown): Record<string, string> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].trim() !== "",
+    ),
+  );
+}
+
 /**
  * Fetch ``/v1/info`` once and cache the result.
  *
@@ -609,6 +625,9 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : [],
           sandbox_provider_capabilities: parseSandboxProviderCapabilities(
             data.sandbox_provider_capabilities,
+          ),
+          sandbox_provider_automation_notices: parseProviderAutomationNotices(
+            data.sandbox_provider_automation_notices,
           ),
           enabled_connections: Array.isArray(data.enabled_connections)
             ? data.enabled_connections.filter((p): p is string => typeof p === "string")
