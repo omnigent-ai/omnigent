@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
@@ -627,54 +628,61 @@ def register_resource_routes(
 
         # A CLI client's Claude pane: record which servers it starts without.
         claude_launch = bridge_inject and terminal_name == "claude" and session_key == "main"
-        claude_pane_before = (
-            terminal_registry.get(session_id, "claude", "main")
-            if claude_launch and terminal_registry is not None
-            else None
-        )
         cli_launch_token = object()
-        try:
-            if claude_launch:
-                await asyncio.to_thread(
-                    claude_mcp_sign_in.note_launching, session_id, cli_launch_token
+        # Under the shared launch lock, so an overlapping launch can't replace the
+        # record of the launch whose pane wins.
+        async with (
+            _claude_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            if claude_launch
+            else contextlib.nullcontext()
+        ):
+            claude_pane_before = (
+                terminal_registry.get(session_id, "claude", "main")
+                if claude_launch and terminal_registry is not None
+                else None
+            )
+            try:
+                if claude_launch:
+                    await asyncio.to_thread(
+                        claude_mcp_sign_in.note_launching, session_id, cli_launch_token
+                    )
+                launch_method = (
+                    resource_registry.launch_required_terminal
+                    if bridge_inject
+                    else resource_registry.launch_auxiliary_terminal
                 )
-            launch_method = (
-                resource_registry.launch_required_terminal
-                if bridge_inject
-                else resource_registry.launch_auxiliary_terminal
-            )
-            resource_view = await launch_method(
-                session_id=session_id,
-                terminal_name=terminal_name,
-                session_key=session_key,
-                spec=env_spec,
-                cwd_override=cwd_override,
-                sandbox_override=sandbox_override,
-                parent_os_env=agent_os_env,
-                resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
-            )
-        except RuntimeError as exc:
-            if launched_relay is not None:
-                _discard_comment_relay(session_id, launched_relay)
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "error": {
-                        "code": "terminal_launch_failed",
-                        "message": _client_safe_error_detail(exc, context="terminal launch"),
-                    }
-                },
-            )
-        finally:
-            if claude_launch:
-                claude_mcp_sign_in.note_launched(
-                    session_id,
-                    terminal_registry.get(session_id, "claude", "main")
-                    if terminal_registry is not None
-                    else None,
-                    launch=cli_launch_token,
-                    previous=claude_pane_before,
+                resource_view = await launch_method(
+                    session_id=session_id,
+                    terminal_name=terminal_name,
+                    session_key=session_key,
+                    spec=env_spec,
+                    cwd_override=cwd_override,
+                    sandbox_override=sandbox_override,
+                    parent_os_env=agent_os_env,
+                    resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
                 )
+            except RuntimeError as exc:
+                if launched_relay is not None:
+                    _discard_comment_relay(session_id, launched_relay)
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": {
+                            "code": "terminal_launch_failed",
+                            "message": _client_safe_error_detail(exc, context="terminal launch"),
+                        }
+                    },
+                )
+            finally:
+                if claude_launch:
+                    claude_mcp_sign_in.note_launched(
+                        session_id,
+                        terminal_registry.get(session_id, "claude", "main")
+                        if terminal_registry is not None
+                        else None,
+                        launch=cli_launch_token,
+                        previous=claude_pane_before,
+                    )
 
         if bridge_inject:
             _publish_tmux_target_for_bridge(
