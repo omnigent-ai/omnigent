@@ -2812,7 +2812,8 @@ function ComposerImpl(
   // A failed refetch keeps the last data; showing it would present old state as live.
   const liveMcp =
     !liveMcpQuery.isError && liveMcpQuery.data?.live ? liveMcpQuery.data.servers : undefined;
-  const liveMcpPartial = liveMcpQuery.data?.partial === true;
+  // A claude-native answer only lists what it knows; an older server drops the flag.
+  const liveMcpPartial = liveMcpQuery.data?.partial ?? sessionHarness === "claude-native";
   // claude-native's answer follows the host's sign-in report, so a sign-in that
   // completes while the panel is open must be re-read to offer Reconnect.
   const hostMcpAccounts = hostMcpQuery.data

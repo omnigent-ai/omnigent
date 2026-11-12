@@ -4844,6 +4844,35 @@ describe("Composer MCP status command", () => {
     expect(refetch).toHaveBeenCalledOnce();
   });
 
+  it("reads a claude-native live answer without the partial flag as partial", () => {
+    // An older server forwards the runner's answer without `partial`.
+    composerSessionSnapshot.hostId = "host_native";
+    setComposerState({ boundAgentId: "agent_native", sessionHarness: "claude-native" });
+    hostMcpQueryMock.mockReturnValue({
+      data: [
+        {
+          name: "mail",
+          harness: "claude",
+          transport: "http",
+          scope: "user",
+          auth_status: "connected",
+        },
+      ],
+      isLoading: false,
+      isError: false,
+    });
+    liveMcpQueryMock.mockReturnValue({ data: { live: true, servers: [] }, isError: false });
+    render(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [] })} />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+
+    expect(screen.getByTestId("mcp-server-row-mail")).toHaveTextContent("mailConnected");
+    expect(screen.queryByTestId("mcp-live-status-mail")).toBeNull();
+  });
+
   it("shows only the agent's servers in a claude-sdk session with no host", () => {
     setComposerState({ boundAgentId: "agent_sdk", sessionHarness: "claude-sdk" });
     render(

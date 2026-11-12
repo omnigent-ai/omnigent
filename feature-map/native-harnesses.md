@@ -174,6 +174,13 @@ implements them separately, so a fix for one harness does not reach the others.
 - `idle-reap`: a finished native pane left alone past the idle window closes
   with its forwarder, helper server and tool relay; the next message brings it
   back with the conversation. Kimi is exempt; live work and open prompts stay.
+- `claude-mcp-sign-in-restart`: when a Claude MCP server the pane started
+  without is signed in, the next message, or **Reconnect** in `/mcp`, restarts
+  that pane's Claude Code into the same conversation so it connects. Only while
+  it is idle: not during a turn, background work, an open prompt or launcher
+  sign-in, within 15 seconds of terminal activity, or while someone is attached
+  to it in a terminal on the host. See `session-mcp-status` in
+  [composer.md](./composer.md) and `docs/MCP_AUTH_STATUS.md`.
 - `subagent-discovery`: Claude children appear under the agent that spawned
   them, including forked slash commands and delayed spawns; an unresolved
   spawn does not keep an idle runner re-reading unchanged conversations.

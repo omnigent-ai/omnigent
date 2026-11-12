@@ -189,7 +189,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   sign-in, connecting, disabled, or not loaded when the CLI omits it),
   including servers only the CLI loaded; a failed or needs-sign-in row whose
   account needs no sign-in offers **Reconnect**, which shows reconnecting,
-  then the refreshed state or the reconnect error. Before the first turn the
+  then the refreshed state or the reconnect error. A claude-native session
+  shows only the servers its Claude Code started before they were signed in,
+  as failed with **Reconnect**, which restarts Claude Code while it is idle;
+  other rows keep their account state. Before the first turn the
   panel says live status appears once the agent is running. Read-only viewers
   see the state without Reconnect. **Go to Settings** keeps the session's host
   selected even when it is a sandbox host the host picker otherwise hides.

@@ -439,7 +439,7 @@ def _plant_live_claude_pane(
         private_dir=tmp_path / f"{label}_private",
     )
     live.running = True
-    (tmp_path / f"{label}_private").mkdir(exist_ok=True)
+    (tmp_path / f"{label}_private").mkdir(parents=True, exist_ok=True)
 
     async def _alive() -> bool:
         return True
@@ -1232,9 +1232,10 @@ async def test_a_message_queued_behind_a_reconnect_is_answered_when_the_session_
     monkeypatch.setattr(
         "omnigent.native.native_cost_popup._tmux_last_client_input_at", _held_attach_check
     )
-    app, _closes, _relaunched, statuses = await _open_claude_native_session_before_sign_in(
+    app, _closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
         monkeypatch, tmp_path, conv_id
     )
+    terminals = app.state.session_resource_registry.terminal_registry
     statuses["linear"] = "connected"
 
     async with _runner_client(app) as client:
@@ -1251,10 +1252,78 @@ async def test_a_message_queued_behind_a_reconnect_is_answered_when_the_session_
         assert deleted.status_code < 300, deleted.text
         answered = await asyncio.wait_for(message, timeout=5)
         release.set()
-        await reconnect
+        reconnected = await reconnect
 
     assert answered.status_code == 410, answered.text
     assert answered.json()["error"] == "session_gone"
+    assert reconnected.json()["reconnect_error"] == "This session was deleted."
+    # Nothing comes back for the deleted session.
+    assert relaunched == []
+    assert terminals.get(conv_id, "claude", "main") is None
+
+
+@pytest.mark.asyncio
+async def test_a_message_whose_restart_outlives_its_session_starts_no_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Deleting the session while a message restarts Claude Code answers that message 410."""
+    conv_id = "aab2c3d4e5f60718293a4b5c6d7e8f90"
+    checking, release = threading.Event(), threading.Event()
+
+    def _held_attach_check(_socket: str, _target: str) -> float | None:
+        checking.set()
+        release.wait(5)
+        return None
+
+    monkeypatch.setattr(
+        "omnigent.native.native_cost_popup._tmux_last_client_input_at", _held_attach_check
+    )
+    harness = _ScriptedHarnessClient([])
+    app, _closes, _relaunched, statuses = await _open_claude_native_session_before_sign_in(
+        monkeypatch, tmp_path, conv_id, harness_client=harness
+    )
+    statuses["linear"] = "connected"
+
+    async with _runner_client(app) as client:
+        message = asyncio.create_task(client.post(f"/v1/sessions/{conv_id}/events", json=_MESSAGE))
+        await poll_until_async(checking.is_set, timeout_s=5)
+        deleted = await client.delete(f"/v1/sessions/{conv_id}")
+        assert deleted.status_code < 300, deleted.text
+        release.set()
+        answered = await asyncio.wait_for(message, timeout=5)
+
+    assert answered.status_code == 410, answered.text
+    assert harness.posted_bodies == []
+
+
+@pytest.mark.asyncio
+async def test_deleting_the_session_during_a_reconnect_relaunch_leaves_no_pane(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Delete cancels and awaits a relaunch in progress before tearing the session down."""
+    conv_id = "a9b2c3d4e5f60718293a4b5c6d7e8f90"
+    gate = asyncio.Event()
+    app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
+        monkeypatch, tmp_path, conv_id, relaunch_gate=gate
+    )
+    terminals = app.state.session_resource_registry.terminal_registry
+    statuses["linear"] = "connected"
+
+    async with _runner_client(app) as client:
+        reconnect = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{conv_id}/live-mcp-servers/reconnect", json={"name": "linear"}
+            )
+        )
+        await poll_until_async(lambda: relaunched == [conv_id], timeout_s=5)
+        deleted = await client.delete(f"/v1/sessions/{conv_id}")
+        assert deleted.status_code < 300, deleted.text
+        gate.set()
+        reconnected = await asyncio.wait_for(reconnect, timeout=5)
+
+    assert closes == [conv_id]
+    assert reconnected.json()["reconnect_error"] == "This session was deleted."
+    assert terminals.get(conv_id, "claude", "main") is None
 
 
 @pytest.mark.asyncio

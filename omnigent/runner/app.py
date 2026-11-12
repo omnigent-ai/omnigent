@@ -1475,6 +1475,8 @@ def create_runner_app(
         tuple[str, str, str | None, str | None], asyncio.Task[JSONResponse]
     ] = {}
     _recovery_turn_ids: dict[str, set[str]] = {}
+    # session_id → claude-native MCP Reconnects in flight, which delete cancels first.
+    _claude_reconnect_tasks: dict[str, set[asyncio.Task[_JsonObject]]] = {}
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     # session_id → canonical reasoning effort, seeded from the session-init
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
@@ -4130,6 +4132,21 @@ def create_runner_app(
             # retirement sees it gone and ends instead of waiting forever.
             async with ingest_cond:
                 ingest_cond.notify_all()
+        # With the line gone, a Reconnect relaunching Claude Code must not bring a
+        # pane back after teardown, nor let a queued message through as it ends.
+        reconnects = _claude_reconnect_tasks.pop(session_id, set())
+        for reconnect_task in reconnects:
+            reconnect_task.cancel()
+        if reconnects:
+            _done, still_running = await asyncio.wait(
+                reconnects, timeout=_SESSION_INIT_CANCEL_TIMEOUT_S
+            )
+            if still_running:
+                _logger.warning(
+                    "Cancelled MCP reconnect for %s did not finish within %.0fs",
+                    session_id,
+                    _SESSION_INIT_CANCEL_TIMEOUT_S,
+                )
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -7945,6 +7962,15 @@ def create_runner_app(
                     # In this message's place in line, before its turn starts, so it
                     # keeps messages in order and only other work can hold the pane.
                     await _restart_claude_for_mcp_sign_in(conversation_id)
+                    if _ingest_cond.get(conversation_id) is not _cond:
+                        # Deleted during the restart: start no turn for it.
+                        return JSONResponse(
+                            status_code=410,
+                            content={
+                                "error": "session_gone",
+                                "detail": "The session was deleted.",
+                            },
+                        )
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
                     message_body["content"] = await _resolve_forwarded_message_content(
@@ -9584,12 +9610,13 @@ def create_runner_app(
             """Restart a claude-native session's Claude Code, which reconnects every MCP server.
 
             Only while *name* is one Claude Code started without and is now signed in:
-            a stale panel must not restart a pane that already connects it.
+            a stale panel must not restart a pane that already connects it. Deleting
+            the session cancels and awaits the restart before tearing the session down.
 
             :param name: The server to reconnect, as Claude Code names it, e.g. ``"linear"``.
             :returns: The live MCP state afterwards, with ``reconnect_error`` when the
-                pane was left running or did not start again; ``None`` when the session
-                has no running claude-native pane.
+                pane was left running, did not start again, or the session was deleted;
+                ``None`` when the session has no running claude-native pane.
             :raises LiveMcpServerUnknown: When the host has no Claude server named *name*.
             """
             if (
@@ -9597,6 +9624,27 @@ def create_runner_app(
                 and _session_harness_name(conv_id) != "claude-native"
             ):
                 return None
+            task = asyncio.create_task(
+                _reconnect_claude_in_line(conv_id, name), name=f"claude-mcp-reconnect-{conv_id}"
+            )
+            _claude_reconnect_tasks.setdefault(conv_id, set()).add(task)
+            try:
+                return await task
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                # Cancelled by the session's deletion, not by this request going away.
+                if task.cancelled() and current is not None and not current.cancelling():
+                    return {**_CLAUDE_NOT_RUNNING, "reconnect_error": "This session was deleted."}
+                raise
+            finally:
+                running = _claude_reconnect_tasks.get(conv_id)
+                if running is not None:
+                    running.discard(task)
+                    if not running:
+                        _claude_reconnect_tasks.pop(conv_id, None)
+
+        async def _reconnect_claude_in_line(conv_id: str, name: str) -> _JsonObject:
+            """Check *name* and restart the pane, holding the session's place in line."""
             # In the session's line of messages, so none is typed into the pane as it closes.
             async with _ingest_slot(conv_id) as live:
                 instance = await _live_claude_native_pane(conv_id) if live else None
