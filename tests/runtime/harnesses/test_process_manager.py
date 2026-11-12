@@ -56,6 +56,7 @@ from omnigent.runtime.harnesses.process_manager import (
     _HarnessHttpClient,
     _kill_orphan_runners,
     _model_env_key,
+    _os_env_key,
     _pid_alive,
     _pids_holding_socket,
     _SubprocessEntry,
@@ -1032,6 +1033,14 @@ async def test_get_client_respawns_on_model_change(
         ("hermes", "HARNESS_HERMES_OS_ENV"),
         *((name, "HARNESS_ACP_OS_ENV") for name in ACP_CLI_HARNESSES),
     ],
+)
+def test_os_env_key_uses_harness_policy_variable(harness: str, key: str) -> None:
+    assert _os_env_key(harness) == key
+
+
+@pytest.mark.parametrize(
+    ("harness", "key"),
+    [("codex", "HARNESS_CODEX_OS_ENV"), ("acp", "HARNESS_ACP_OS_ENV")],
 )
 async def test_get_client_replaces_only_changed_os_policy(
     monkeypatch: pytest.MonkeyPatch, harness: str, key: str
