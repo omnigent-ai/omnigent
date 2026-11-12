@@ -30,15 +30,16 @@ export function curatedOutHarnesses(
 
 /**
  * Native harness slugs Settings leaves out, per {@link curatedOutHarnesses}.
- * Empty until the agent catalog loads, and when it fails, so a slow or older
- * server never hides a harness.
+ * Empty until every pickable agent has loaded, and while either catalog
+ * request fails, so a slow, failing or older server never hides a harness
+ * an agent still needs.
  *
  * @param enabled - Whether to fetch the agent catalog; defaults true.
  */
 export function useCuratedOutHarnesses(enabled = true): ReadonlySet<string> {
-  const { data: agents, suppressedNames } = useAgentCatalog(enabled);
+  const { data: agents, suppressedNames, complete } = useAgentCatalog(enabled);
   return useMemo(
-    () => (agents === undefined ? NONE : curatedOutHarnesses(suppressedNames, agents)),
-    [agents, suppressedNames],
+    () => (!complete || agents === undefined ? NONE : curatedOutHarnesses(suppressedNames, agents)),
+    [agents, suppressedNames, complete],
   );
 }

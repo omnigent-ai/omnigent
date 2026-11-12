@@ -202,6 +202,7 @@ from omnigent.util.event_loop_watchdog import monitor_event_loop
 if TYPE_CHECKING:
     from omnigent.entities import Conversation
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
 
 _logger = logging.getLogger(__name__)
 
@@ -1217,8 +1218,9 @@ def _ensure_default_agents(
     returns the packaged names it owns (seeded or not), so whatever the
     allowlist leaves out is returned here and hidden from ``GET /v1/agents``
     by the caller that stores it. A built-in row an earlier version seeded,
-    which no helper owns any more, counts as packaged too. A row seeded by an earlier boot is
-    suppressed rather than deleted: sessions look their agent up by
+    which no helper or configured ACP agent owns any more, counts as packaged
+    too. A row seeded by an earlier boot is suppressed rather than deleted:
+    sessions look their agent up by
     ``conversations.agent_id``, so dropping the row would leave them without one.
 
     Extras from ``OMNIGENT_BUILTIN_AGENT_DIRS`` are deliberately outside
@@ -1242,7 +1244,11 @@ def _ensure_default_agents(
         return frozenset()
     # A built-in an earlier version seeded is still packaged roster, so the
     # allowlist hides it too; its row stays for the sessions bound to it.
-    retired = _retired_builtin_agent_names(agent_store, packaged | extras)
+    # Configured ACP agents and listed extras share built-in ids but are the
+    # operator's roster, even when an extra fails to seed this boot.
+    operator_owned = frozenset(agent.slug for agent in _configured_acp_agents()[0])
+    operator_owned |= _listed_extra_builtin_agent_names()
+    retired = _retired_builtin_agent_names(agent_store, packaged | extras | operator_owned)
     packaged |= retired
     unknown = allowlist - packaged
     if unknown:
@@ -1273,6 +1279,20 @@ def _ensure_default_agents(
 # or an e2e fixture — ship custom always-available agents (e.g. a plain
 # claude-sdk chat agent that a fork can switch into).
 _EXTRA_BUILTIN_AGENTS_ENV = "OMNIGENT_BUILTIN_AGENT_DIRS"
+
+
+def _listed_extra_builtin_agent_names() -> frozenset[str]:
+    """
+    Name every agent :data:`_EXTRA_BUILTIN_AGENTS_ENV` lists, seeded or not.
+
+    A path that is missing this boot may still name a row an earlier boot
+    seeded, as its stem (``house.yaml`` → ``house``) or directory name.
+
+    :returns: Candidate names, e.g. ``{"house", "house.yaml"}``.
+    """
+    raw = os.environ.get(_EXTRA_BUILTIN_AGENTS_ENV, "")
+    entries = [Path(entry.strip()) for entry in raw.split(os.pathsep) if entry.strip()]
+    return frozenset({entry.stem for entry in entries} | {entry.name for entry in entries})
 
 
 def _ensure_extra_builtin_agents(
@@ -1466,6 +1486,24 @@ def _build_acp_bundle(*, harness: str, name: str) -> bytes:
         return _tar_gz_dir(bundle_dir)
 
 
+def _configured_acp_agents() -> tuple[list["AcpAgentEntry"], frozenset[str]]:
+    """
+    Read the operator's ``acp:`` agents and the builtin ACP rows they shadow.
+
+    :returns: The configured agents, and the builtin ACP row keys they claim,
+        e.g. ``([AcpAgentEntry(slug="devin", ...)], {"devin"})``; empty when
+        the ``acp:`` block is unreadable, which must never break startup.
+    """
+    try:
+        from omnigent.onboarding.acp_auth import acp_agents, shadowed_builtin_acp_rows
+
+        configured = list(acp_agents())
+        return configured, shadowed_builtin_acp_rows(configured)
+    except Exception:
+        _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
+        return [], frozenset()
+
+
 def _ensure_default_acp_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
@@ -1513,15 +1551,7 @@ def _ensure_default_acp_agents(
     owned: set[str] = set()
 
     # (1) User-configured acp:<slug> agents — "set up" == present in config.
-    try:
-        from omnigent.onboarding.acp_auth import acp_agents, shadowed_builtin_acp_rows
-
-        configured = list(acp_agents())
-        shadowed: frozenset[str] = shadowed_builtin_acp_rows(configured)
-    except Exception:  # a malformed acp: block must never break startup
-        _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
-        configured = []
-        shadowed = frozenset()
+    configured, shadowed = _configured_acp_agents()
     for agent in configured:
         # Key the built-in by the slug, not the display label: agent names must be
         # ``[a-zA-Z0-9_-]+`` (the spec validator rejects spaces/dots), and a label

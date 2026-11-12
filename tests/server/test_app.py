@@ -1511,6 +1511,16 @@ def test_ensure_default_acp_agents_seeds_configured_agent(
     assert "grok" in owned
     assert (seed_stores.agent_store.get_by_name("grok") is not None) == (allowlist is None)
 
+    # Startup as a whole keeps it visible too, though its row has a built-in id.
+    if allowlist is None:
+        monkeypatch.delenv(SEEDED_AGENTS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(SEEDED_AGENTS_ENV, ",".join(sorted(allowlist)))
+    suppressed = server_app._ensure_default_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+    assert "gemini-cli" not in suppressed
+
 
 def test_ensure_default_acp_agents_seeds_builtin_cli_rows_without_a_local_binary(
     seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
@@ -2231,6 +2241,25 @@ def test_ensure_default_agents_never_suppresses_operator_extras(
     assert server_app._DEBBY_AGENT_NAME in suppressed
 
 
+def test_ensure_default_agents_keeps_an_extra_whose_path_is_gone(
+    seed_stores: _SeedStores, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An extra seeded on an earlier boot isn't retired when its mount goes missing."""
+    from omnigent.db.utils import builtin_agent_id
+
+    spec = tmp_path / "house-agent.yaml"
+    seed_stores.agent_store.create(builtin_agent_id("house-agent"), "house-agent", "old/bundle")
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "")
+    monkeypatch.setenv(server_app._EXTRA_BUILTIN_AGENTS_ENV, str(spec))
+
+    suppressed = server_app._ensure_default_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+    assert not spec.exists()
+    assert "house-agent" not in suppressed
+
+
 @pytest.mark.parametrize(
     ("allowlist", "devin_hidden"),
     [("claude-native-ui", True), ("claude-native-ui,devin", False)],
@@ -2245,9 +2274,16 @@ def test_ensure_default_agents_hides_a_built_in_row_an_earlier_version_seeded(
     """A retired built-in obeys the allowlist like a packaged one; other server agents don't."""
     from omnigent.db.utils import builtin_agent_id, generate_agent_id
 
-    # ``devin`` is the ACP row v0.14 seeded; no helper owns that name today.
-    seed_stores.agent_store.create(builtin_agent_id("devin"), "devin", "old/bundle")
+    # Later rows sort after earlier ones, so the retired row lands past the first page.
+    ticks = iter(range(1_000, 100_000))
+    monkeypatch.setattr(
+        "omnigent.stores.agent_store.sqlalchemy_store.now_epoch", lambda: next(ticks)
+    )
     seed_stores.agent_store.create(generate_agent_id(), "house-agent", "house/bundle")
+    for index in range(100):
+        seed_stores.agent_store.create(generate_agent_id(), f"filler-{index}", "filler/bundle")
+    # A server-owned row outside the current seed roster.
+    seed_stores.agent_store.create(builtin_agent_id("devin"), "devin", "old/bundle")
     monkeypatch.setenv(SEEDED_AGENTS_ENV, allowlist)
 
     suppressed = server_app._ensure_default_agents(

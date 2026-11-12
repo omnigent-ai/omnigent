@@ -232,6 +232,46 @@ def test_list_asc_with_after_cursor(agent_store: SqlAlchemyAgentStore) -> None:
     assert all_ids == [a.id for a in full_asc.data]
 
 
+@pytest.mark.parametrize("order", ["asc", "desc"])
+def test_list_pages_seek_the_cursor_among_rows_sharing_its_created_at(
+    agent_store: SqlAlchemyAgentStore, monkeypatch: pytest.MonkeyPatch, order: str
+) -> None:
+    """Rows sharing a timestamp page by id, and each page seeks the whole sort key."""
+    monkeypatch.setattr("omnigent.stores.agent_store.sqlalchemy_store.now_epoch", lambda: 1_000)
+    for i in range(7):
+        agent_store.create(uuid.uuid4().hex, f"agent-{i}", f"loc-{i}/hash")
+    everything = [a.id for a in agent_store.list(limit=100, order=order).data]
+    statements: list[tuple[str, object]] = []
+
+    def capture(
+        _conn: object, _cursor: object, statement: str, params: object, *_: object
+    ) -> None:
+        if "LIMIT" in statement:
+            statements.append((statement, params))
+
+    sa.event.listen(agent_store._engine, "before_cursor_execute", capture)
+    try:
+        walked, after = [], None
+        while True:
+            page = agent_store.list(limit=3, after=after, order=order)
+            walked += [a.id for a in page.data]
+            if not page.has_more:
+                break
+            after = page.last_id
+        back = agent_store.list(limit=3, before=everything[3], order=order)
+    finally:
+        sa.event.remove(agent_store._engine, "before_cursor_execute", capture)
+
+    assert walked == everything
+    assert [a.id for a in back.data] == everything[:3]
+    if agent_store._engine.dialect.name != "sqlite":
+        return
+    with agent_store._engine.connect() as connection:
+        for statement, params in statements[1:]:
+            plan = str(connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, params).all())
+            assert "ix_agents_kind_owner_created" in plan and "(created_at,id)" in plan, plan
+
+
 # ── Update tests ───────────────────────────────────────────────
 
 

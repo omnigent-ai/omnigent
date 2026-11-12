@@ -16,6 +16,7 @@ import {
   useAvailableAgents,
   prefetchAvailableAgentDetails,
 } from "./useAvailableAgents";
+import { useCuratedOutHarnesses } from "./useCuratedOutHarnesses";
 
 // The template catalog and sidebar Mine cache load through authenticatedFetch.
 // URL-keyed stubs exercise the real fetch and mapping path.
@@ -1745,5 +1746,88 @@ describe("useAgentCatalog", () => {
     act(() => result.current.retry());
     await waitFor(() => expect(result.current.data?.map((a) => a.name)).toEqual(["polly"]));
     expect(result.current.isError).toBe(false);
+  });
+});
+
+describe("useCuratedOutHarnesses", () => {
+  const USER_AGENTS_URL = "/v1/agents?scope=user&limit=50";
+  const USER_AGENTS_KEY = ["available-agents-user"];
+  const CATALOG_KEY = ["available-agents-catalog"];
+  // The deployment hides Codex's built-in; a user's own Codex agent still needs it.
+  const HIDES_CODEX = mockResponse({
+    data: [{ id: "ag_claude", name: "claude-native-ui", harness: "claude-native", builtin: true }],
+    has_more: false,
+    suppressed_agent_names: ["codex-native-ui"],
+  });
+  const OWN_CODEX_AGENT = mockResponse({
+    data: [{ id: "ag_mine", name: "my-codex", harness: "codex-native", builtin: false }],
+    has_more: false,
+  });
+
+  function renderCuration(agentInstall: boolean) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = renderHook(() => useCuratedOutHarnesses(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>
+          <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, agent_install: agentInstall }}>
+            {children}
+          </CapabilitiesProvider>
+        </QueryClientProvider>
+      ),
+    });
+    return { client, result: view.result };
+  }
+
+  it("hides nothing until the user's own agents load, then keeps the harness they use", async () => {
+    let answerUserAgents: (response: Response) => void = () => {};
+    fetchMock.mockImplementation((url: string) => {
+      if (url === BUILTINS_URL) return Promise.resolve(HIDES_CODEX);
+      if (url === HARNESSES_URL) return Promise.resolve(mockResponse({ data: [] }));
+      if (url === USER_AGENTS_URL)
+        return new Promise<Response>((resolve) => {
+          answerUserAgents = resolve;
+        });
+      return Promise.reject(new Error(`unrouted fetch in test: ${url}`));
+    });
+    const { client, result } = renderCuration(true);
+
+    await waitFor(() => expect(client.getQueryState(CATALOG_KEY)?.status).toBe("success"));
+    expect([...result.current]).toEqual([]);
+    act(() => answerUserAgents(OWN_CODEX_AGENT));
+    await waitFor(() => expect(client.getQueryState(USER_AGENTS_KEY)?.status).toBe("success"));
+    expect([...result.current]).toEqual([]);
+  });
+
+  it("hides nothing while the user's own agents fail to load", async () => {
+    routeFetch({
+      [BUILTINS_URL]: HIDES_CODEX,
+      [HARNESSES_URL]: mockResponse({ data: [] }),
+      [USER_AGENTS_URL]: mockResponse({ detail: "down" }, { ok: false, status: 503 }),
+    });
+    const { client, result } = renderCuration(true);
+
+    await waitFor(() => expect(client.getQueryState(USER_AGENTS_KEY)?.status).toBe("error"));
+    expect([...result.current]).toEqual([]);
+  });
+
+  it.each([
+    ["the catalog", BUILTINS_URL, CATALOG_KEY],
+    ["the user's own agents", USER_AGENTS_URL, USER_AGENTS_KEY],
+  ])("stops hiding a harness when a refetch of %s fails", async (_, failingUrl, queryKey) => {
+    const routes = {
+      [BUILTINS_URL]: HIDES_CODEX,
+      [USER_AGENTS_URL]: mockResponse({ data: [], has_more: false }),
+      [HARNESSES_URL]: mockResponse({ data: [] }),
+    };
+    routeFetch(routes);
+    const { client, result } = renderCuration(true);
+    await waitFor(() => expect([...result.current]).toEqual(["codex-native"]));
+
+    routeFetch({
+      ...routes,
+      [failingUrl]: mockResponse({ detail: "down" }, { ok: false, status: 503 }),
+    });
+    await act(() => client.refetchQueries({ queryKey }));
+    await waitFor(() => expect([...result.current]).toEqual([]));
   });
 });

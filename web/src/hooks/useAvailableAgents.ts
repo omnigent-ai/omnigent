@@ -491,6 +491,12 @@ export function useAgentCatalog(enabled = true): {
   data: AvailableAgent[] | undefined;
   /** Built-in names the deployment hides; empty until the catalog loads. */
   suppressedNames: ReadonlySet<string>;
+  /**
+   * Whether *data* holds every agent the user can pick: the built-in catalog
+   * and, where the server has them, the user's own agents, neither failing
+   * its latest fetch.
+   */
+  complete: boolean;
   isLoading: boolean;
   isError: boolean;
   retry: () => void;
@@ -526,9 +532,14 @@ export function useAgentCatalog(enabled = true): {
   );
   const { refetch } = catalogQuery;
   const retry = useCallback(() => void refetch(), [refetch]);
+  // A failed refetch keeps the last data, so the error flags count too.
+  const userAgentsComplete =
+    serverInfo !== "loading" &&
+    (!includeUserAgents || (userAgents !== undefined && !userAgentsQuery.isError));
   return {
     data,
     suppressedNames: catalog?.suppressedNames ?? NO_SUPPRESSED_NAMES,
+    complete: data !== undefined && !catalogQuery.isError && userAgentsComplete,
     isLoading: catalogQuery.isLoading,
     isError: catalogQuery.isError,
     retry,
