@@ -29,7 +29,7 @@ export interface NewWorkflowRequest {
 export interface NewWorkflowDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** Starts the new workflow; the dialog closes after. */
+  /** Moves on to choosing where the drafting session runs; the dialog closes after. */
   onCreate: (request: NewWorkflowRequest) => void;
   /** Names of the user's workflows; reusing one blocks Create. */
   takenNames?: readonly string[];
@@ -137,10 +137,10 @@ export function NewWorkflowDialog({
             <Button
               type="submit"
               disabled={!canCreate}
-              data-testid="new-workflow-create"
-              componentId="workflows.new.create"
+              data-testid="new-workflow-next"
+              componentId="workflows.new.next"
             >
-              Create
+              Next
             </Button>
           </DialogFooter>
         </form>

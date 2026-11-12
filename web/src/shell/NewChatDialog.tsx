@@ -652,9 +652,6 @@ export function ConnectHostInstructions({
  * Match session-create validation: accept absolute POSIX or drive-letter paths.
  * The host must expand tilde and relative paths before submission.
  */
-// How long a handed-off request waits for Start to be enabled before giving up.
-const HANDOFF_START_WAIT_MS = 5000;
-
 export function isValidWorkspace(workspace: string): boolean {
   return isHostAbsolutePath(workspace.trim());
 }
@@ -2265,8 +2262,6 @@ function NewChatLandingContent({
   // A copied message replaces the whole draft, even with no text or files. Read
   // once: the link effect below releases the token.
   const [handoff] = useState(() => peekNewSessionHandoff(handoffToken));
-  // A handoff that asks to start does so once Start is enabled; see the effect by handleCreateRef.
-  const [startPending, setStartPending] = useState(() => handoff?.start === true);
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
@@ -6690,19 +6685,6 @@ function NewChatLandingContent({
     setWorkflowToSend(null);
     void handleCreateRef.current();
   }, [workflowToSend, message]);
-  // Start a handed-off request as soon as the defaults allow it. If they don't
-  // within a few seconds (say no host is online), stop and leave the request in
-  // the composer with the reason Start is off.
-  useEffect(() => {
-    if (!startPending) return;
-    if (canSubmit) {
-      setStartPending(false);
-      void handleCreateRef.current();
-      return;
-    }
-    const timer = window.setTimeout(() => setStartPending(false), HANDOFF_START_WAIT_MS);
-    return () => window.clearTimeout(timer);
-  }, [startPending, canSubmit]);
 
   const placeholderText = siblingSourceId
     ? "What should this agent work on?"
@@ -7944,10 +7926,8 @@ function NewChatLandingContent({
                           >
                             <ComposerSendButton
                               disabled={!canSubmit}
-                              label={
-                                creating || startPending ? "Starting session" : "Start session"
-                              }
-                              busy={creating || startPending}
+                              label={creating ? "Starting session" : "Start session"}
+                              busy={creating}
                               data-testid="new-chat-landing-submit"
                             />
                           </span>

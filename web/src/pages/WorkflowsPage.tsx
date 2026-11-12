@@ -2,10 +2,9 @@
  * Workflows page (`/workflows`): the user's saved workflows, a search, and a
  * "New workflow" button. Laid out like the Automations page.
  *
- * New workflow starts a session, from the new-session page's defaults, that asks
- * the agent to draft and save the workflow. Run opens a dialog to pick where and
- * how the workflow's session runs. Delete removes one; Create automation isn't
- * connected yet.
+ * New workflow asks for a name and what it should do, then where the session
+ * that drafts it runs; Run asks where a saved one's session runs. Delete
+ * removes one; Create automation isn't connected yet.
  */
 
 import { useMemo, useState } from "react";
@@ -16,26 +15,25 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { showToast } from "@/components/ui/toast";
 import { NewWorkflowDialog } from "@/components/workflows/NewWorkflowDialog";
-import { RunWorkflowDialog } from "@/components/workflows/RunWorkflowDialog";
 import { WorkflowRow } from "@/components/workflows/WorkflowRow";
 import {
-  type SavedWorkflow,
-  useDeleteWorkflow,
-  useSavedWorkflows,
-} from "@/hooks/useSavedWorkflows";
-import { newSessionLocation } from "@/lib/newSessionHandoff";
-import { useNavigate } from "@/lib/routing";
-import { createWorkflowPrompt } from "@/lib/workflow";
+  type WorkflowSessionRequest,
+  WorkflowSessionDialog,
+} from "@/components/workflows/WorkflowSessionDialog";
+import { useDeleteWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 
 export function WorkflowsPage() {
   const { workflows, isLoading, isError, refresh } = useSavedWorkflows();
   const deleteWorkflow = useDeleteWorkflow();
-  const navigate = useNavigate();
   const [search, setSearch] = useState("");
   const [creating, setCreating] = useState(false);
-  // The workflow stays set while its Run dialog closes.
-  const [runTarget, setRunTarget] = useState<SavedWorkflow | null>(null);
-  const [runOpen, setRunOpen] = useState(false);
+  // The request stays set while its session dialog closes.
+  const [sessionRequest, setSessionRequest] = useState<WorkflowSessionRequest | null>(null);
+  const [sessionOpen, setSessionOpen] = useState(false);
+  const startSession = (request: WorkflowSessionRequest) => {
+    setSessionRequest(request);
+    setSessionOpen(true);
+  };
 
   const hasAnyWorkflows = workflows.length > 0;
   const filtered = useMemo(() => {
@@ -107,10 +105,7 @@ export function WorkflowsPage() {
             <WorkflowRow
               key={workflow.id}
               workflow={workflow}
-              onRun={() => {
-                setRunTarget(workflow);
-                setRunOpen(true);
-              }}
+              onRun={() => startSession({ kind: "run", workflow })}
               onCreateAutomation={() =>
                 showToast("Creating automations from workflows isn’t connected yet.")
               }
@@ -127,12 +122,14 @@ export function WorkflowsPage() {
       <NewWorkflowDialog
         open={creating}
         onOpenChange={setCreating}
-        onCreate={({ name, description }) =>
-          navigate(newSessionLocation(createWorkflowPrompt(name, description), [], { start: true }))
-        }
+        onCreate={({ name, description }) => startSession({ kind: "create", name, description })}
         takenNames={takenNames}
       />
-      <RunWorkflowDialog workflow={runTarget} open={runOpen} onOpenChange={setRunOpen} />
+      <WorkflowSessionDialog
+        request={sessionRequest}
+        open={sessionOpen}
+        onOpenChange={setSessionOpen}
+      />
     </PageScroll>
   );
 }

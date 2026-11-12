@@ -7,9 +7,8 @@ import {
   useDeleteWorkflow,
   useSavedWorkflows,
 } from "@/hooks/useSavedWorkflows";
-import { NEW_SESSION_HANDOFF_PARAM, peekNewSessionHandoff } from "@/lib/newSessionHandoff";
-import type * as RoutingModule from "@/lib/routing";
-import { createWorkflowPrompt } from "@/lib/workflow";
+
+import type { WorkflowSessionRequest } from "@/components/workflows/WorkflowSessionDialog";
 
 import { WorkflowsPage } from "./WorkflowsPage";
 
@@ -17,17 +16,14 @@ vi.mock("@/hooks/useSavedWorkflows", () => ({
   useSavedWorkflows: vi.fn(),
   useDeleteWorkflow: vi.fn(),
 }));
-// The dialog has its own tests; here it only shows which workflow it would run.
-vi.mock("@/components/workflows/RunWorkflowDialog", () => ({
-  RunWorkflowDialog: (props: { workflow: SavedWorkflow | null; open: boolean }) =>
-    props.open ? <div data-testid="run-workflow-dialog">{props.workflow?.name}</div> : null,
+// The dialog has its own tests; here it only shows what it would start a session for.
+vi.mock("@/components/workflows/WorkflowSessionDialog", () => ({
+  WorkflowSessionDialog: (props: { request: WorkflowSessionRequest | null; open: boolean }) =>
+    props.open ? (
+      <div data-testid="workflow-session-dialog">{JSON.stringify(props.request)}</div>
+    ) : null,
 }));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
-const navigate = vi.fn();
-vi.mock("@/lib/routing", async (importOriginal) => {
-  const actual = await importOriginal<typeof RoutingModule>();
-  return { ...actual, useNavigate: () => navigate };
-});
 
 function workflow(name: string, description: string): SavedWorkflow {
   return { id: name.toLowerCase().replaceAll(" ", "-"), name, description };
@@ -58,7 +54,6 @@ const openMenu = (row: HTMLElement) =>
 describe("WorkflowsPage", () => {
   beforeEach(() => {
     vi.mocked(showToast).mockClear();
-    navigate.mockClear();
     deleteWorkflow.mockClear();
     vi.mocked(useDeleteWorkflow).mockReturnValue({
       mutate: deleteWorkflow,
@@ -95,13 +90,15 @@ describe("WorkflowsPage", () => {
   it("opens the Run dialog for the workflow", () => {
     mockWorkflows({ workflows: WORKFLOWS });
     render(<WorkflowsPage />);
-    expect(screen.queryByTestId("run-workflow-dialog")).toBeNull();
+    expect(screen.queryByTestId("workflow-session-dialog")).toBeNull();
 
     openMenu(rows()[1]!);
     fireEvent.click(screen.getByTestId("workflow-run"));
 
-    expect(screen.getByTestId("run-workflow-dialog")).toHaveTextContent("Release a new version");
-    expect(navigate).not.toHaveBeenCalled();
+    expect(JSON.parse(screen.getByTestId("workflow-session-dialog").textContent!)).toEqual({
+      kind: "run",
+      workflow: WORKFLOWS[1],
+    });
   });
 
   it("says Create automation isn't connected yet", () => {
@@ -154,7 +151,7 @@ describe("WorkflowsPage", () => {
     expect(refresh).toHaveBeenCalledOnce();
   });
 
-  it("starts a session that drafts the new workflow", () => {
+  it("asks where the new workflow's drafting session runs, after its name", () => {
     mockWorkflows({ workflows: WORKFLOWS });
     render(<WorkflowsPage />);
 
@@ -173,16 +170,14 @@ describe("WorkflowsPage", () => {
     fireEvent.change(within(dialog).getByTestId("new-workflow-description"), {
       target: { value: "Bump one package and fix what breaks" },
     });
-    fireEvent.click(within(dialog).getByTestId("new-workflow-create"));
+    expect(screen.queryByTestId("workflow-session-dialog")).toBeNull();
+    fireEvent.click(within(dialog).getByTestId("new-workflow-next"));
 
-    // The new-session page starts the session itself, from its usual defaults.
-    const location = navigate.mock.calls[0]![0] as string;
-    const token = new URLSearchParams(location.split("?")[1]).get(NEW_SESSION_HANDOFF_PARAM);
-    expect(peekNewSessionHandoff(token)).toEqual({
-      text: createWorkflowPrompt("Upgrade a dependency", "Bump one package and fix what breaks"),
-      files: [],
-      start: true,
-    });
     expect(screen.queryByRole("dialog", { name: "New workflow" })).toBeNull();
+    expect(JSON.parse(screen.getByTestId("workflow-session-dialog").textContent!)).toEqual({
+      kind: "create",
+      name: "Upgrade a dependency",
+      description: "Bump one package and fix what breaks",
+    });
   });
 });

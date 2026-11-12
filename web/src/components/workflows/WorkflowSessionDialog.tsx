@@ -8,6 +8,7 @@ import {
   type SandboxProfileSelection,
 } from "@/components/SandboxProfilePicker";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -66,7 +67,7 @@ import {
   isValidSandboxWorkspaceLength,
 } from "@/lib/sandboxRepositories";
 import { createSession } from "@/lib/sessionsApi";
-import { runSavedWorkflowPrompt } from "@/lib/workflow";
+import { REVIEW_PLAN_FIRST, createWorkflowPrompt, runSavedWorkflowPrompt } from "@/lib/workflow";
 import { ForkRunConfig, HostLabel, type ForkRunConfigValue } from "@/shell/ForkSessionDialog";
 import { ConnectHostInstructions } from "@/shell/NewChatDialog";
 import { SandboxRepositoryPicker } from "@/shell/SandboxRepositoryPicker";
@@ -75,37 +76,47 @@ import { WorkspacePathField } from "@/shell/WorkspacePathField";
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 
-export interface RunWorkflowDialogProps {
-  /** The workflow to run. Keep it set while the dialog closes so the content doesn't blank. */
-  workflow: SavedWorkflow | null;
+/** What the dialog starts a session for: running a saved workflow, or drafting a new one. */
+export type WorkflowSessionRequest =
+  { kind: "run"; workflow: SavedWorkflow } | { kind: "create"; name: string; description: string };
+
+export interface WorkflowSessionDialogProps {
+  /** Keep it set while the dialog closes so the content doesn't blank. */
+  request: WorkflowSessionRequest | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }
 
 /**
- * Run a saved workflow: pick where a new session runs (a connected host and
- * directory, or a new sandbox and its repositories) and its agent, check its
- * first message, and start it. Laid out like the Clone session dialog, whose
- * host label and model, effort and permission fields it reuses.
+ * Start a session for a workflow, to run a saved one ("Run workflow") or have
+ * the agent draft a new one ("New workflow"): pick where it runs (a connected
+ * host and directory, or a new sandbox and its repositories) and its agent,
+ * check its first message, and start it. Laid out like the Clone session
+ * dialog, whose host label and model, effort and permission fields it reuses.
  */
-export function RunWorkflowDialog({ workflow, open, onOpenChange }: RunWorkflowDialogProps) {
+export function WorkflowSessionDialog({ request, open, onOpenChange }: WorkflowSessionDialogProps) {
+  const name = request?.kind === "run" ? request.workflow.name : request?.name;
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
-        data-testid="run-workflow-dialog"
+        data-testid="workflow-session-dialog"
         className="flex max-h-[85vh] flex-col gap-4 sm:max-w-lg"
       >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <WorkflowIcon className="size-4" />
-            <span>Run workflow</span>
+            <span>{request?.kind === "create" ? "New workflow" : "Run workflow"}</span>
           </DialogTitle>
-          <DialogDescription>Starts a session that runs “{workflow?.name}”.</DialogDescription>
+          <DialogDescription>
+            {request?.kind === "create"
+              ? `Starts a session where the agent drafts “${name}” with you.`
+              : `Starts a session that runs “${name}”.`}
+          </DialogDescription>
         </DialogHeader>
-        {workflow && (
-          <RunWorkflowForm
-            key={workflow.id}
-            workflow={workflow}
+        {request && (
+          <WorkflowSessionForm
+            key={request.kind === "run" ? request.workflow.id : `create:${request.name}`}
+            request={request}
             onClose={() => onOpenChange(false)}
           />
         )}
@@ -138,7 +149,13 @@ function pinnedValue(value: string | undefined): string | undefined {
   return value && value !== "default" ? value : undefined;
 }
 
-function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClose: () => void }) {
+function WorkflowSessionForm({
+  request,
+  onClose,
+}: {
+  request: WorkflowSessionRequest;
+  onClose: () => void;
+}) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const info = useServerInfo();
@@ -146,6 +163,9 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
   const directoryFieldId = useId();
   const agentFieldId = useId();
   const instructionsId = useId();
+  const reviewId = useId();
+  // Analytics ids, per flow.
+  const flow = request.kind === "run" ? "run" : "new";
 
   const { data: hosts } = useHosts();
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
@@ -276,7 +296,13 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
       ? (sandboxModels.data?.error ?? `${agent?.display_name} can’t run in this sandbox.`)
       : null;
 
-  const [instructions, setInstructions] = useState(() => runSavedWorkflowPrompt(workflow));
+  const [instructions, setInstructions] = useState(() =>
+    request.kind === "run"
+      ? runSavedWorkflowPrompt(request.workflow)
+      : createWorkflowPrompt(request.name, request.description),
+  );
+  // A saved workflow runs without a plan review unless asked.
+  const [reviewPlanFirst, setReviewPlanFirst] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const targetReady = sandboxSelected
@@ -288,7 +314,10 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
     if (!canRun || agent === undefined) return;
     setSubmitting(true);
     setError(null);
-    const text = instructions.trim();
+    const text =
+      request.kind === "run" && reviewPlanFirst
+        ? `${instructions.trim()}\n\n${REVIEW_PLAN_FIRST}`
+        : instructions.trim();
     // A sandbox create can carry the first message, which the server sends once the sandbox is up.
     const serverSendsText =
       sandboxSelected && info !== "loading" && info.durable_initial_input === true;
@@ -374,12 +403,12 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
             <Select
               value={target ?? ""}
               onValueChange={selectTarget}
-              componentId="workflows.run.host"
+              componentId={`workflows.${flow}.host`}
             >
               <SelectTrigger
                 id={hostFieldId}
                 className="w-full text-sm"
-                data-testid="run-workflow-host"
+                data-testid="workflow-session-host"
               >
                 <SelectValue
                   placeholder={
@@ -462,7 +491,7 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
               selections={sandboxRepos}
               onChange={(repos) => setSandboxRepos(repos)}
               maxRepos={maxRepos}
-              testIdPrefix="run-workflow-sandbox-repo"
+              testIdPrefix="workflow-session-sandbox-repo"
               pendingUrl={pendingRepoUrl}
               onPendingUrlChange={setPendingRepoUrl}
             />
@@ -483,12 +512,12 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
           <Select
             value={agent?.id ?? ""}
             onValueChange={setPickedAgentId}
-            componentId="workflows.run.agent"
+            componentId={`workflows.${flow}.agent`}
           >
             <SelectTrigger
               id={agentFieldId}
               className="w-full text-sm"
-              data-testid="run-workflow-agent"
+              data-testid="workflow-session-agent"
             >
               <SelectValue
                 placeholder={agents === undefined ? "Loading agents…" : "Select an agent"}
@@ -542,14 +571,34 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
             }}
             rows={4}
             className="min-h-24 resize-y text-sm focus-visible:ring-0"
-            data-testid="run-workflow-instructions"
-            componentId="workflows.run.instructions"
+            data-testid="workflow-session-instructions"
+            componentId={`workflows.${flow}.instructions`}
           />
         </Field>
+
+        {request.kind === "run" && (
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id={reviewId}
+                checked={reviewPlanFirst}
+                onCheckedChange={(checked) => setReviewPlanFirst(checked === true)}
+                data-testid="workflow-session-review-plan"
+                componentId="workflows.run.review_plan_first"
+              />
+              <label htmlFor={reviewId} className="cursor-pointer text-ui">
+                Review the plan before work starts
+              </label>
+            </div>
+            <p className="pl-6 text-sm text-muted-foreground">
+              After exploring, the agent shows you its plan and waits for your approval.
+            </p>
+          </div>
+        )}
       </div>
 
       {error !== null && (
-        <p role="alert" className="text-sm text-destructive" data-testid="run-workflow-error">
+        <p role="alert" className="text-sm text-destructive" data-testid="workflow-session-error">
           {error}
         </p>
       )}
@@ -559,7 +608,7 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
           variant="ghost"
           onClick={onClose}
           disabled={submitting}
-          componentId="workflows.run.cancel"
+          componentId={`workflows.${flow}.cancel`}
         >
           Cancel
         </Button>
@@ -567,10 +616,10 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
           onClick={() => void run()}
           disabled={!canRun}
           loading={submitting}
-          data-testid="run-workflow-submit"
-          componentId="workflows.run.submit"
+          data-testid="workflow-session-submit"
+          componentId={`workflows.${flow}.submit`}
         >
-          Run
+          {request.kind === "run" ? "Run" : "Create"}
         </Button>
       </DialogFooter>
     </>

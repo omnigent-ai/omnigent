@@ -74,8 +74,8 @@ export function saveWorkflowMessage(skillPrefix: string, name: string): string {
 
 /**
  * The first message of a session that drafts a new workflow from a description.
- * It names the save-workflow skill rather than invoking it: the new-session page
- * picks the agent, and with it the skill prefix, after this is written.
+ * It names the save-workflow skill rather than invoking it: the agent, and with
+ * it the skill prefix, can be changed after this is written.
  *
  * @param name The name the user picked, e.g. `"Triage flaky tests"`.
  * @param description What the workflow should do, e.g. `"Rerun the suite and file issues"`.
@@ -85,15 +85,13 @@ export function createWorkflowPrompt(name: string, description: string): string 
 }
 
 /**
- * The first message of a session that runs one of the user's saved workflows,
- * with the plan review the run dialog asks for by default. Like
- * {@link createWorkflowPrompt}, it names the skill rather than invoking it,
- * because the new-session page picks the agent after this is written.
+ * The first message of a session that runs one of the user's saved workflows.
+ * Like {@link createWorkflowPrompt}, it names the skill rather than invoking it.
  *
  * @param workflow The saved workflow, e.g. `{ id: "0123…", name: "Triage flaky tests" }`.
  */
 export function runSavedWorkflowPrompt(workflow: { id: string; name: string }): string {
-  return `Use the ${WORKFLOW_SKILL} skill to run the saved workflow "${workflow.name}" (ID ${workflow.id}).\n\n${REVIEW_PLAN_FIRST}`;
+  return `Use the ${WORKFLOW_SKILL} skill to run the saved workflow "${workflow.name}" (ID ${workflow.id}).`;
 }
 
 // A savedWorkflowMessage without the plan review, as New automation stores it.

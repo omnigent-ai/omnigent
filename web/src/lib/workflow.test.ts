@@ -86,14 +86,14 @@ describe("parseSavedWorkflowMessage", () => {
 });
 
 describe("runSavedWorkflowPrompt", () => {
-  it("asks the workflow skill to run the saved workflow by ID, with the plan review", () => {
+  it("asks the workflow skill to run the saved workflow by ID", () => {
     expect(
       runSavedWorkflowPrompt({
         id: "0123456789abcdef0123456789abcdef",
         name: "Triage flaky tests",
       }),
     ).toBe(
-      `Use the workflow skill to run the saved workflow "Triage flaky tests" (ID 0123456789abcdef0123456789abcdef).\n\n${REVIEW_PLAN_FIRST}`,
+      'Use the workflow skill to run the saved workflow "Triage flaky tests" (ID 0123456789abcdef0123456789abcdef).',
     );
   });
 });

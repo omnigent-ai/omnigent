@@ -16,11 +16,11 @@ import { nativeWrapperLabelsForAgent } from "@/lib/nativeCodingAgents";
 import type * as RoutingModule from "@/lib/routing";
 import { createSession } from "@/lib/sessionsApi";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
-import { runSavedWorkflowPrompt } from "@/lib/workflow";
+import { REVIEW_PLAN_FIRST, createWorkflowPrompt, runSavedWorkflowPrompt } from "@/lib/workflow";
 import { consumePendingInitialPrompt } from "@/store/chatStore";
 import { testAgent } from "@/test/agentFixtures";
 
-import { RunWorkflowDialog } from "./RunWorkflowDialog";
+import { type WorkflowSessionRequest, WorkflowSessionDialog } from "./WorkflowSessionDialog";
 
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn(), useHostModelOptions: vi.fn() }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
@@ -66,7 +66,14 @@ const SANDBOXES: Partial<ServerInfo> = {
   sandbox_providers: ["modal", "daytona"],
 };
 
-function renderDialog(info: Partial<ServerInfo> = {}) {
+const RUN: WorkflowSessionRequest = { kind: "run", workflow: WORKFLOW };
+const CREATE: WorkflowSessionRequest = {
+  kind: "create",
+  name: "Upgrade a dependency",
+  description: "Bump one package and fix what breaks",
+};
+
+function renderDialog(info: Partial<ServerInfo> = {}, request: WorkflowSessionRequest = RUN) {
   const onOpenChange = vi.fn();
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
@@ -74,7 +81,7 @@ function renderDialog(info: Partial<ServerInfo> = {}) {
       <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...info }}>
         <TooltipProvider>
           <MemoryRouter>
-            <RunWorkflowDialog workflow={WORKFLOW} open onOpenChange={onOpenChange} />
+            <WorkflowSessionDialog request={request} open onOpenChange={onOpenChange} />
           </MemoryRouter>
         </TooltipProvider>
       </CapabilitiesProvider>
@@ -91,13 +98,13 @@ function setSandboxModels(data: Partial<SandboxModelOptionsModule.SandboxModelOp
   } as unknown as ReturnType<typeof useSandboxModelOptions>);
 }
 
-const submit = () => screen.getByTestId("run-workflow-submit");
+const submit = () => screen.getByTestId("workflow-session-submit");
 const startedSession = () =>
   vi
     .mocked(createSession)
     .mockResolvedValue({ id: "conv_run" } as Awaited<ReturnType<typeof createSession>>);
 
-describe("RunWorkflowDialog", () => {
+describe("WorkflowSessionDialog", () => {
   beforeEach(() => {
     localStorage.clear();
     navigate.mockClear();
@@ -137,10 +144,10 @@ describe("RunWorkflowDialog", () => {
     >);
     const { onOpenChange } = renderDialog();
 
-    expect(screen.getByTestId("run-workflow-host")).toHaveTextContent("laptop");
+    expect(screen.getByTestId("workflow-session-host")).toHaveTextContent("laptop");
     expect(screen.getByPlaceholderText("Type a path or browse…")).toHaveValue("/home/you/app");
-    expect(screen.getByTestId("run-workflow-agent")).toHaveTextContent("Codex");
-    const instructions = screen.getByTestId("run-workflow-instructions");
+    expect(screen.getByTestId("workflow-session-agent")).toHaveTextContent("Codex");
+    const instructions = screen.getByTestId("workflow-session-instructions");
     expect(instructions).toHaveValue(runSavedWorkflowPrompt(WORKFLOW));
 
     fireEvent.change(instructions, { target: { value: "Run it on the flaky suite only." } });
@@ -171,7 +178,7 @@ describe("RunWorkflowDialog", () => {
 
     fireEvent.click(submit());
 
-    expect(await screen.findByTestId("run-workflow-error")).toHaveTextContent("Host is busy");
+    expect(await screen.findByTestId("workflow-session-error")).toHaveTextContent("Host is busy");
     expect(navigate).not.toHaveBeenCalled();
     expect(onOpenChange).not.toHaveBeenCalled();
     expect(submit()).toBeEnabled();
@@ -221,9 +228,9 @@ describe("RunWorkflowDialog", () => {
       request_managed_sandbox_host_id: true,
     });
 
-    expect(screen.getByTestId("run-workflow-host")).toHaveTextContent("Daytona Sandbox");
+    expect(screen.getByTestId("workflow-session-host")).toHaveTextContent("Daytona Sandbox");
     expect(screen.queryByPlaceholderText("Type a path or browse…")).toBeNull();
-    expect(screen.getByTestId("run-workflow-sandbox-repo-row")).toHaveTextContent("app");
+    expect(screen.getByTestId("workflow-session-sandbox-repo-row")).toHaveTextContent("app");
     fireEvent.click(submit());
 
     await waitFor(() => expect(navigate).toHaveBeenCalledWith("/c/conv_run"));
@@ -251,7 +258,7 @@ describe("RunWorkflowDialog", () => {
     startedSession();
     renderDialog(SANDBOXES);
 
-    expect(screen.getByTestId("run-workflow-host")).toHaveTextContent("Modal Sandbox");
+    expect(screen.getByTestId("workflow-session-host")).toHaveTextContent("Modal Sandbox");
     expect(screen.queryByText(/Reconnect one from your terminal/)).toBeNull();
     expect(screen.getByText(/starts in an empty workspace/)).toBeInTheDocument();
     fireEvent.click(submit());
@@ -272,14 +279,14 @@ describe("RunWorkflowDialog", () => {
     setHosts([]);
     renderDialog(SANDBOXES);
 
-    fireEvent.change(screen.getByTestId("run-workflow-sandbox-repo-input"), {
+    fireEvent.change(screen.getByTestId("workflow-session-sandbox-repo-input"), {
       target: { value: "https://github.com/example/app" },
     });
     expect(screen.getByText("Add or clear the repository URL to run.")).toBeInTheDocument();
     expect(submit()).toBeDisabled();
 
-    fireEvent.click(screen.getByTestId("run-workflow-sandbox-repo-add"));
-    expect(screen.getByTestId("run-workflow-sandbox-repo-row")).toHaveTextContent("app");
+    fireEvent.click(screen.getByTestId("workflow-session-sandbox-repo-add"));
+    expect(screen.getByTestId("workflow-session-sandbox-repo-row")).toHaveTextContent("app");
     expect(submit()).toBeEnabled();
   });
 
@@ -298,6 +305,63 @@ describe("RunWorkflowDialog", () => {
     renderDialog({ ...SANDBOXES, ...catalog });
 
     expect(screen.getByText("No sandbox model can run Claude Code.")).toBeInTheDocument();
+    expect(submit()).toBeDisabled();
+  });
+
+  it("asks for a plan review only when its box is checked", async () => {
+    setHosts([{ host_id: "host_1" }]);
+    localStorage.setItem("omnigent:recent-workspaces", JSON.stringify({ host_1: ["/srv/app"] }));
+    startedSession();
+    renderDialog();
+
+    expect(screen.getByTestId("workflow-session-review-plan")).not.toBeChecked();
+    fireEvent.click(submit());
+    await waitFor(() => expect(navigate).toHaveBeenCalled());
+    expect(consumePendingInitialPrompt("conv_run")?.text).toBe(runSavedWorkflowPrompt(WORKFLOW));
+
+    cleanup();
+    renderDialog();
+    fireEvent.click(screen.getByTestId("workflow-session-review-plan"));
+    fireEvent.click(submit());
+    await waitFor(() => expect(navigate).toHaveBeenCalledTimes(2));
+    expect(consumePendingInitialPrompt("conv_run")?.text).toBe(
+      `${runSavedWorkflowPrompt(WORKFLOW)}\n\n${REVIEW_PLAN_FIRST}`,
+    );
+  });
+
+  it("starts the session that drafts a new workflow, from New workflow", async () => {
+    setHosts([{ host_id: "host_1" }]);
+    localStorage.setItem("omnigent:recent-workspaces", JSON.stringify({ host_1: ["/srv/app"] }));
+    startedSession();
+    renderDialog({}, CREATE);
+
+    expect(screen.getByRole("dialog", { name: "New workflow" })).toBeInTheDocument();
+    expect(screen.getByTestId("workflow-session-instructions")).toHaveValue(
+      createWorkflowPrompt("Upgrade a dependency", "Bump one package and fix what breaks"),
+    );
+    // Drafting has no plan to review.
+    expect(screen.queryByTestId("workflow-session-review-plan")).toBeNull();
+    expect(submit()).toHaveTextContent("Create");
+    fireEvent.click(submit());
+
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith("/c/conv_run"));
+    expect(vi.mocked(createSession).mock.calls[0]![2]).toMatchObject({
+      hostId: "host_1",
+      workspace: "/srv/app",
+    });
+    expect(consumePendingInitialPrompt("conv_run")?.text).toBe(
+      createWorkflowPrompt("Upgrade a dependency", "Bump one package and fix what breaks"),
+    );
+  });
+
+  it("still asks where New workflow runs with no host online", () => {
+    setHosts([]);
+    renderDialog({}, CREATE);
+
+    expect(screen.getByRole("dialog", { name: "New workflow" })).toBeInTheDocument();
+    expect(
+      screen.getByText("No hosts connected yet. Connect one from your terminal:"),
+    ).toBeInTheDocument();
     expect(submit()).toBeDisabled();
   });
 });

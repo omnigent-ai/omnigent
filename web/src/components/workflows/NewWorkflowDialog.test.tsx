@@ -11,7 +11,7 @@ function renderDialog(props: Partial<NewWorkflowDialogProps> = {}) {
 
 const name = () => screen.getByTestId("new-workflow-name");
 const description = () => screen.getByTestId("new-workflow-description");
-const create = () => screen.getByTestId("new-workflow-create");
+const next = () => screen.getByTestId("new-workflow-next");
 
 describe("NewWorkflowDialog", () => {
   afterEach(cleanup);
@@ -20,11 +20,11 @@ describe("NewWorkflowDialog", () => {
     const { onCreate, onOpenChange } = renderDialog();
 
     expect(screen.getByRole("dialog", { name: "New workflow" })).toBeInTheDocument();
-    expect(create()).toBeDisabled();
+    expect(next()).toBeDisabled();
     fireEvent.change(name(), { target: { value: "  Fix flaky tests  " } });
-    expect(create()).toBeDisabled();
+    expect(next()).toBeDisabled();
     fireEvent.change(description(), { target: { value: " Rerun the suite and file issues " } });
-    fireEvent.click(create());
+    fireEvent.click(next());
 
     expect(onCreate).toHaveBeenCalledWith({
       name: "Fix flaky tests",
@@ -33,7 +33,7 @@ describe("NewWorkflowDialog", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("creates from Cmd+Enter in the description", () => {
+  it("moves on from Cmd+Enter in the description", () => {
     const { onCreate } = renderDialog();
 
     fireEvent.change(name(), { target: { value: "Fix flaky tests" } });
@@ -55,13 +55,13 @@ describe("NewWorkflowDialog", () => {
       "You already have a workflow with this name.",
     );
     expect(name()).toHaveAttribute("aria-invalid", "true");
-    expect(create()).toBeDisabled();
+    expect(next()).toBeDisabled();
     fireEvent.keyDown(description(), { key: "Enter", metaKey: true });
     expect(onCreate).not.toHaveBeenCalled();
 
     fireEvent.change(name(), { target: { value: "Fix flaky tests nightly" } });
     expect(screen.queryByRole("status")).toBeNull();
-    expect(create()).toBeEnabled();
+    expect(next()).toBeEnabled();
   });
 
   it("starts empty each time it opens", () => {

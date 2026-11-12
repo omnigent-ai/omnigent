@@ -1604,35 +1604,6 @@ describe("prompt URL handoff", () => {
     }
   });
 
-  it("starts a handed-off request that asks to start, once Start is enabled", async () => {
-    renderLanding({}, newSessionLocation("Draft the release workflow", [], { start: true }));
-
-    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Draft the release workflow");
-    const { body } = await readCreateBody();
-    expect(body).toMatchObject({ host_id: "host_1" });
-  });
-
-  it("stops waiting on a handed-off start that Start never allows, keeping the request", () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    onTestFinished(() => {
-      vi.useRealTimers();
-    });
-    mockHosts([host("offline")]);
-    renderLanding({}, newSessionLocation("Draft the release workflow", [], { start: true }));
-    const submit = screen.getByTestId("new-chat-landing-submit");
-    expect(submit).toHaveAttribute("aria-busy", "true");
-    expect(submit).toHaveAccessibleName("Starting session");
-
-    act(() => {
-      vi.advanceTimersByTime(5000);
-    });
-
-    expect(submit).toHaveAttribute("aria-busy", "false");
-    expect(submit).toHaveAccessibleName("Start session");
-    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Draft the release workflow");
-    expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(false);
-  });
-
   it("does not treat task as a prompt parameter", () => {
     renderLanding({}, "/?task=Unrelated");
     expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
