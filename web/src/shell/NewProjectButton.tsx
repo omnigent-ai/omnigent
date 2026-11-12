@@ -148,8 +148,12 @@ export function NewProjectButton({
   const [repositories, setRepositories] = useState<LastSandboxRepo[]>([]);
   const [pendingUrl, setPendingUrl] = useState("");
   // A typed URL counts without pressing Add.
-  const repository =
-    repositories[0] ?? (pendingUrl.trim() !== "" ? { url: pendingUrl.trim(), branch: "" } : null);
+  const pickedRepository =
+    repositories[0] ?? (pendingUrl.trim() !== "" ? { url: pendingUrl, branch: "" } : null);
+  const repository = pickedRepository && {
+    url: pickedRepository.url.trim(),
+    branch: pickedRepository.branch.trim(),
+  };
   const repositoryName = (repository && deriveRepoName(repository.url)) ?? "repository";
   // The destination follows the repository name until the user edits it.
   const [cloneParent, setCloneParent] = useState("~");
@@ -219,7 +223,7 @@ export function NewProjectButton({
 
     let selectedWorkspace = workspace;
     if (repositoryMode && repository && dialogHostId !== null) {
-      const request = { url: repository.url, branch: repository.branch, path: destination };
+      const request = { url: repository.url, branch: repository.branch, path: destination.trim() };
       const key = JSON.stringify([dialogHostId, request]);
       if (checkout?.key === key) {
         selectedWorkspace = { hostId: dialogHostId, path: checkout.path };
@@ -280,13 +284,17 @@ export function NewProjectButton({
       config.host_id = selectedWorkspace.hostId;
       config.workspace = selectedWorkspace.path;
     }
+    // Without a repository URL, the chosen host is still the project's default.
+    if (repositoryMode && !sandboxSelected && !repository && dialogHostId !== null) {
+      config.host_id = dialogHostId;
+    }
     if (repositoryMode && sandboxSelected) {
       config.host_id = SANDBOX_HOST_CHOICE;
       if (sandboxProvider) config.sandbox_provider = sandboxProvider;
     }
     if (repositoryMode && repository) {
       config.repository = { url: repository.url };
-      if (repository.branch.trim()) config.repository.branch = repository.branch.trim();
+      if (repository.branch) config.repository.branch = repository.branch;
     }
     createProject.mutate(
       { name: trimmed, config: Object.keys(config).length > 0 ? config : undefined },
@@ -439,6 +447,11 @@ export function NewProjectButton({
                       className="h-10 rounded-lg border border-input bg-transparent px-3 text-ui"
                     >
                       {runOn === null && <option value="">Choose a target…</option>}
+                      {runOn !== null &&
+                        !sandboxSelected &&
+                        !hosts.some((host) => host.host_id === runOn) && (
+                          <option value={runOn}>Loading hosts…</option>
+                        )}
                       {hosts
                         .filter((host) => host.status === "online" || host.host_id === runOn)
                         .map((host) => (

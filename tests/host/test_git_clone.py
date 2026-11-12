@@ -78,7 +78,7 @@ def test_clone_never_replaces_an_existing_destination(tmp_path: Path, kind: str)
     assert destination.lstat().st_ino == before.st_ino
 
 
-@pytest.mark.parametrize("path", ["relative/checkout", "~/..", ""])
+@pytest.mark.parametrize("path", ["relative/checkout", "~/..", "", "~no-such-user-here/checkout"])
 def test_clone_rejects_a_non_absolute_destination(tmp_path: Path, path: str) -> None:
     result = clone_repository(HostCloneRepositoryFrame("clone", REPOSITORY_URL, path))
     assert result.error_code == "invalid_input"

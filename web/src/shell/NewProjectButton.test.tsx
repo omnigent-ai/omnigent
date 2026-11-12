@@ -356,6 +356,45 @@ describe("NewProjectButton", () => {
       });
     });
 
+    it("trims the branch once for the clone and the saved project", async () => {
+      chooseRepository();
+      fireEvent.click(screen.getByTestId("new-project-repo-add"));
+      fireEvent.change(screen.getByLabelText("Branch for sample"), {
+        target: { value: " release " },
+      });
+      fireEvent.click(screen.getByTestId("new-project-confirm"));
+      await waitFor(() => expect(mocks.createProject).toHaveBeenCalled());
+      expect(mocks.cloneRepository).toHaveBeenCalledWith("host_1", {
+        url,
+        branch: "release",
+        path: "~/sample",
+      });
+      expect(mocks.createProject.mock.calls[0][0].config.repository).toEqual({
+        url,
+        branch: "release",
+      });
+    });
+
+    it("keeps the chosen host when no repository URL is entered", async () => {
+      renderButton();
+      fireEvent.change(screen.getByPlaceholderText("Project name…"), {
+        target: { value: "Sample" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
+      fireEvent.change(screen.getByRole("combobox", { name: "Run on" }), {
+        target: { value: "host_2" },
+      });
+      fireEvent.click(screen.getByRole("radio", { name: "Repository" }));
+      fireEvent.click(screen.getByTestId("new-project-confirm"));
+      await waitFor(() =>
+        expect(mocks.createProject).toHaveBeenCalledWith(
+          { name: "Sample", config: { host_id: "host_2" } },
+          expect.any(Object),
+        ),
+      );
+      expect(mocks.cloneRepository).not.toHaveBeenCalled();
+    });
+
     it("keeps the modal locked while cloning and keeps inputs after a failure", async () => {
       let rejectClone: (error: Error) => void = () => {};
       mocks.cloneRepository.mockReturnValue(

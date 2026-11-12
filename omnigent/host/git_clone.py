@@ -39,16 +39,19 @@ def clone_repository(frame: HostCloneRepositoryFrame) -> HostCloneRepositoryResu
             request_id=frame.request_id, status="failed", error=message, error_code=code
         )
 
-    destination = Path(frame.path).expanduser()
+    try:
+        destination = Path(frame.path).expanduser()
+    except RuntimeError:  # ~otheruser that this host can't resolve
+        destination = Path(frame.path)
     if not destination.is_absolute() or destination.name in ("", ".", ".."):
         return failed("invalid_input", "Choose an absolute or ~/ path for the new checkout")
     try:
         destination.mkdir()
+        reserved = destination.stat()
     except FileExistsError:
         return failed("clone_destination_conflict", "The clone destination already exists")
     except OSError:
         return failed("clone_destination_conflict", "The parent folder is unavailable")
-    reserved = destination.stat()
     command = [
         "git",
         "clone",
