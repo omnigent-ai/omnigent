@@ -259,12 +259,6 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
          */
         connectSshHost: (destination) => ipcRenderer.invoke("omnigent:ssh-connect", destination),
       }),
-  /**
-   * Renew this machine's dbcert. Resolves a `{ ok, error? }` result.
-   */
-  refreshDbcert: (options) => ipcRenderer.invoke("omnigent:dbcert-refresh", options),
-  /** Check this machine's dbcert without starting sign-in. */
-  checkDbcert: () => ipcRenderer.invoke("omnigent:dbcert-check"),
 
   /**
    * Subscribe to host status-change pings. Fired only on real events (a host
