@@ -993,7 +993,7 @@ def test_pi_version_parses_cli_output(
         calls.append(argv)
         return _Completed(stdout, stderr)
 
-    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("omnigent.inner._proc.run_isolated", fake_run)
 
     assert pi.pi_version("/bin/pi") == expected
     assert calls == [["/bin/pi", "--version"]]
@@ -1005,7 +1005,7 @@ def test_pi_version_is_none_when_the_probe_fails(
     def failing(argv: list[str], **kwargs: object) -> None:
         raise OSError("not executable")
 
-    monkeypatch.setattr("subprocess.run", failing)
+    monkeypatch.setattr("omnigent.inner._proc.run_isolated", failing)
 
     assert pi.pi_version("/bin/pi") is None
 

@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import Mock
 
+import psutil
 import pytest
 
 from omnigent.inner import claude_sdk_executor, codex_worker, sandbox
@@ -34,7 +35,7 @@ def _prepared_launch(
     runtime_home = executable.parent / "runtime-home"
     runtime_home.mkdir(exist_ok=True)
     worker = None
-    names = ["PATH", "HOME", "CODEX_HOME"]
+    names = ["PATH", "HOME", "CODEX_HOME", "TMPDIR"]
     if harness == "launcher":
         assert spec is not None
         policy = sandbox.resolve_sandbox(spec, workspace)
@@ -610,3 +611,63 @@ print('0.80.4')
         assert executor._pi_version == (0, 80, 4)
     finally:
         Path(executor._pi_launch_path).unlink(missing_ok=True)
+
+
+def test_pi_version_probe_timeout_cleans_process_tree_and_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, active_sandbox_type: str
+) -> None:
+    from omnigent.harnesses.pi_native.main import pi_version
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("TMPDIR", raising=False)
+    report = workspace / "probe.json"
+    executable = tmp_path / "install" / "bin" / "pi"
+    executable.parent.mkdir(parents=True)
+    marker = str(report)
+    script = f"""
+import os, pathlib, subprocess, sys, time
+subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', {marker!r}])
+pathlib.Path({str(report)!r}).write_text(os.environ['TMPDIR'])
+time.sleep(60)
+"""
+    executable.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(script)} "$@" '
+        f"{shlex.quote(marker)}\n"
+    )
+    executable.chmod(0o755)
+    spec = OSEnvSpec(
+        sandbox=OSEnvSandboxSpec(
+            type=active_sandbox_type,
+            read_paths=[str(workspace)],
+            write_paths=[str(workspace)],
+            allow_network=False,
+        )
+    )
+
+    def probe_processes() -> list[psutil.Process]:
+        return [
+            process
+            for process in psutil.process_iter(["cmdline"])
+            if marker in (process.info["cmdline"] or [])
+        ]
+
+    with _prepared_launch("pi", executable, workspace, spec) as launcher:
+        try:
+            assert (
+                pi_version(
+                    launcher, env={"PATH": os.environ["PATH"], "HOME": str(home)}, cwd=workspace
+                )
+                is None
+            )
+            scratch = Path(report.read_text())
+            assert not probe_processes(), "probe descendants survived their timeout"
+            assert not scratch.exists()
+            assert not scratch.parent.exists()
+        finally:
+            for process in probe_processes():
+                with contextlib.suppress(psutil.NoSuchProcess):
+                    process.kill()
