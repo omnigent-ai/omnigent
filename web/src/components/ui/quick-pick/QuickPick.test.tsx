@@ -132,17 +132,24 @@ describe("QuickPick rows", () => {
 
   it("shows the empty message and the caller's slots", () => {
     const { input } = renderPicker({
-      listStart: <p>Couldn&apos;t load sessions.</p>,
       listEnd: <button type="button">Search older sessions</button>,
       inputEnd: <button type="button">Close search</button>,
     });
     fireEvent.change(input, { target: { value: "zzzz" } });
     expect(screen.queryAllByRole("option")).toHaveLength(0);
-    expect(screen.getByText("No results found")).toBeTruthy();
     expect(screen.getByRole("status").textContent).toBe("No results found");
-    expect(screen.getByText("Couldn't load sessions.")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Search older sessions" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Close search" })).toBeTruthy();
+  });
+
+  it("shows the caller's status in place of the count or the empty message", () => {
+    const { input, rerender, onAccept } = renderPicker({ status: "Couldn't load sessions." });
+    expect(screen.getAllByRole("status")).toHaveLength(1);
+    expect(screen.getByRole("status").textContent).toBe("Couldn't load sessions.");
+    fireEvent.change(input, { target: { value: "zzzz" } });
+    expect(screen.getByRole("status").textContent).toBe("Couldn't load sessions.");
+    rerender(<Harness onAccept={onAccept} />);
+    expect(screen.getByRole("status").textContent).toBe("No results found");
   });
 });
 
@@ -233,6 +240,16 @@ describe("QuickPick pointer and query picks", () => {
     expect(activeOption(input)?.textContent).toContain("New session");
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ id: "new-session" }));
+  });
+});
+
+describe("QuickPick caller-chosen active row", () => {
+  it("activates the caller's row until the user moves, then reports the move", () => {
+    const onActiveIdChange = vi.fn();
+    const { input } = renderPicker({ activeId: "open-settings", onActiveIdChange });
+    expect(activeOption(input)?.textContent).toContain("Open settings");
+    fireEvent.pointerMove(screen.getByRole("option", { name: /New session/ }));
+    expect(onActiveIdChange).toHaveBeenCalledWith("new-session");
   });
 });
 

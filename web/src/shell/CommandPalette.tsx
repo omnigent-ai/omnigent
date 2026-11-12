@@ -3,38 +3,13 @@
 // cmdk filtering is off and the static actions are filtered here.
 
 import type React from "react";
-import { defaultFilter } from "cmdk";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
-import {
-  CalendarClockIcon,
-  InboxIcon,
-  type LucideIcon,
-  PanelLeftIcon,
-  PanelRightIcon,
-  SettingsIcon,
-  SquarePenIcon,
-  XIcon,
-} from "lucide-react";
+import { XIcon } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
-import {
-  type ConversationsPage,
-  useConversations,
-  useSessionSearch,
-} from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { rememberOpenSessionRow } from "@/hooks/useOpenSessionRow";
-import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
-import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
-import {
-  CompactShortcutKeys,
-  newSessionShortcutKeys,
-  rightSidebarToggleShortcutKeys,
-  settingsShortcutKeys,
-  sidebarToggleShortcutKeys,
-} from "@/components/KeyboardShortcut";
+import { CompactShortcutKeys } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
@@ -45,7 +20,8 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
-import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
+import { type ActionCommand, filterAppCommands, useAppCommands } from "./appCommands";
+import { type PaletteSession, usePaletteSessionSearch } from "./usePaletteSessionSearch";
 
 export interface CommandPaletteProps {
   sessionsOnly?: boolean;
@@ -58,21 +34,6 @@ export interface CommandPaletteProps {
   /** False on grid routes, where ⌘⌥] belongs to the grid's own workspace. */
   rightSidebarShortcutEnabled?: boolean;
 }
-
-interface ActionCommand {
-  id: string;
-  label: string;
-  /** Mirrors the icon on the equivalent button elsewhere in the UI. */
-  icon: LucideIcon;
-  /** Extra terms the client-side filter matches against (beyond the label). */
-  keywords: string[];
-  run: () => void;
-  /** Chord shown beside the row when the same action has a shortcut. */
-  shortcut?: readonly string[];
-}
-
-/** Debounce matches the sidebar search (300ms) so keystrokes don't each fetch. */
-const SEARCH_DEBOUNCE_MS = 300;
 
 /** Split `text` on case-insensitive occurrences of `query`, bolding the matches
     so a search hit is visible in the title / content snippet. Returns the raw
@@ -102,55 +63,8 @@ function HighlightedText({ text, query }: { text: string; query: string }): Reac
   });
 }
 
-/** How many recent sessions to show before the user types, so the Actions
-    group stays visible without scrolling. Typing lifts the cap. */
-const IDLE_SESSION_LIMIT = 5;
-const SESSION_SEARCH_PAGE_BATCH = 10;
-const SESSION_SEARCH_RESULT_LIMIT = 50;
-/** Rows per page of each search group; "Show more" loads the next page. */
-const SEARCH_GROUP_PAGE_SIZE = 8;
 /** Keys that move cmdk's selection; see `userMovedSelection`. */
 const SELECTION_KEYS = new Set(["ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"]);
-
-interface PaletteSession {
-  id: string;
-  label: string;
-  agent: string;
-  archived: boolean;
-  snippet: string | null;
-}
-
-/** Flatten list pages into palette rows, dropping repeated ids and, unless
-    `includeArchived`, archived sessions. `newestFirst` re-sorts the rows by
-    `updated_at`, because pushed updates reorder sessions without a refetch. */
-function paletteSessions(
-  pages: readonly ConversationsPage[],
-  {
-    includeArchived = false,
-    excludeIds = new Set(),
-    newestFirst = false,
-  }: { includeArchived?: boolean; excludeIds?: ReadonlySet<string>; newestFirst?: boolean } = {},
-): PaletteSession[] {
-  const seen = new Set(excludeIds);
-  const out: PaletteSession[] = [];
-  const rows = pages.flatMap((page) => page.data);
-  // Stable, so rows with the same timestamp keep the server's order.
-  if (newestFirst) rows.sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0));
-  for (const c of rows) {
-    if ((c.archived && !includeArchived) || seen.has(c.id)) continue;
-    seen.add(c.id);
-    out.push({
-      id: c.id,
-      label: conversationDisplayLabel(c),
-      agent: getConversationAgentType(c),
-      archived: c.archived === true,
-      // Present only when the match was in chat content (not the title);
-      // the server omits it otherwise. Shown as a dimmed second line.
-      snippet: c.search_snippet ?? null,
-    });
-  }
-  return out;
-}
 
 export function CommandPalette({
   sessionsOnly = false,
@@ -162,191 +76,39 @@ export function CommandPalette({
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
-  const [query, setQuery] = useState("");
-  const [debouncedQuery, setDebouncedQuery] = useState("");
-  const [pageLimit, setPageLimit] = useState(SESSION_SEARCH_PAGE_BATCH);
-
-  // Reset the query when the palette closes so it reopens clean.
-  useEffect(() => {
-    if (!open) {
-      setQuery("");
-      setDebouncedQuery("");
-      setPageLimit(SESSION_SEARCH_PAGE_BATCH);
-    }
-  }, [open]);
-
-  useEffect(() => {
-    const timer = setTimeout(() => setDebouncedQuery(query), SEARCH_DEBOUNCE_MS);
-    return () => clearTimeout(timer);
-  }, [query]);
+  const {
+    query,
+    setQuery,
+    debouncedQuery,
+    searching,
+    sessions,
+    visibleSessions,
+    contentSessions,
+    titleSearch,
+    contentSearch,
+    isFetching,
+    loadError,
+    loadMoreError,
+    searchFetching,
+    retrying,
+    retryLoad,
+    olderSessionsAvailable,
+    searchOlderSessions,
+    rememberSearchRow,
+  } = usePaletteSessionSearch({ open, sessionsOnly });
 
   const close = (): void => onOpenChange(false);
 
-  const actions = useMemo<ActionCommand[]>(
-    () => [
-      {
-        id: "new-chat",
-        label: "New chat",
-        icon: SquarePenIcon,
-        keywords: ["compose", "start", "new session"],
-        run: () => navigate("/"),
-        shortcut: newSessionShortcutKeys(),
-      },
-      {
-        id: "go-inbox",
-        label: "Go to Inbox",
-        icon: InboxIcon,
-        keywords: ["notifications", "comments", "needs response"],
-        run: () => navigate("/inbox"),
-      },
-      {
-        id: "go-tasks",
-        label: "Go to Automations",
-        icon: CalendarClockIcon,
-        keywords: ["scheduled", "recurring", "cron", "automation", "schedule"],
-        run: () => navigate("/tasks"),
-      },
-      {
-        id: "go-settings",
-        label: "Go to Settings",
-        icon: SettingsIcon,
-        keywords: ["preferences", "configuration", "account"],
-        run: () => navigate("/settings"),
-        shortcut: settingsShortcutKeys(),
-      },
-      {
-        id: "toggle-left-sidebar",
-        label: "Toggle conversations sidebar",
-        icon: PanelLeftIcon,
-        keywords: ["panel", "left", "sessions list"],
-        run: onToggleLeftSidebar,
-        shortcut: sidebarToggleShortcutKeys(),
-      },
-      {
-        id: "toggle-right-sidebar",
-        label: "Toggle workspace sidebar",
-        icon: PanelRightIcon,
-        keywords: ["panel", "right", "files", "terminal"],
-        run: onToggleRightSidebar,
-        shortcut: rightSidebarShortcutEnabled ? rightSidebarToggleShortcutKeys() : undefined,
-      },
-    ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar, rightSidebarShortcutEnabled],
-  );
-
-  const filteredActions = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (sessionsOnly) return [];
-    if (q === "") return actions;
-    return actions.filter(
-      (a) =>
-        a.label.toLowerCase().includes(q) || a.keywords.some((k) => k.toLowerCase().includes(q)),
-    );
-  }, [actions, query, sessionsOnly]);
-
-  const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
-    useConversations("", false, { enabled: open });
-  const serverInfo = useServerInfo();
-  // Older servers ignore `search_scope`, so they get one mixed group instead.
-  const groupedSearch = serverInfo !== "loading" && serverInfo.session_search_scope === true;
-  const searching = !sessionsOnly && debouncedQuery !== "";
-  // Wait briefly for server info so a supporting server never gets the mixed
-  // request; if it stalls, fall back to that request rather than never searching.
-  const serverInfoLoading = serverInfo === "loading";
-  const [serverInfoWaitExpired, setServerInfoWaitExpired] = useState(false);
-  useEffect(() => {
-    if (!serverInfoLoading || !searching || serverInfoWaitExpired) return;
-    const timer = setTimeout(() => setServerInfoWaitExpired(true), BOOT_PROBE_TIMEOUT_MS);
-    return () => clearTimeout(timer);
-  }, [serverInfoLoading, searching, serverInfoWaitExpired]);
-  const awaitingServerInfo = serverInfoLoading && !serverInfoWaitExpired;
-  const searchOptions = {
-    enabled: open && searching && !awaitingServerInfo,
-    limit: SEARCH_GROUP_PAGE_SIZE,
-  };
-  const titleSearch = useSessionSearch(
-    debouncedQuery,
-    groupedSearch ? "title" : "all",
-    searchOptions,
-  );
-  const contentSearch = useSessionSearch(debouncedQuery, "content", {
-    ...searchOptions,
-    enabled: searchOptions.enabled && groupedSearch,
+  const actions = useAppCommands({
+    onToggleLeftSidebar,
+    onToggleRightSidebar,
+    rightSidebarShortcutEnabled,
   });
-  const loadedPages = data?.pages.length ?? 0;
-  useEffect(() => {
-    if (
-      open &&
-      sessionsOnly &&
-      hasNextPage &&
-      loadedPages < pageLimit &&
-      !isFetching &&
-      !isError &&
-      !isFetchNextPageError
-    ) {
-      void fetchNextPage();
-    }
-  }, [
-    open,
-    sessionsOnly,
-    hasNextPage,
-    loadedPages,
-    pageLimit,
-    isFetching,
-    isError,
-    isFetchNextPageError,
-    fetchNextPage,
-  ]);
 
-  const sessions = useMemo(() => {
-    if (searching) return paletteSessions(titleSearch.data?.pages ?? [], { includeArchived: true });
-    // Rows archived after they loaded are still cached here, so drop them.
-    const out = paletteSessions(data?.pages ?? [], { newestFirst: true });
-    if (sessionsOnly) {
-      if (!query.trim()) return out;
-      return out
-        .map((session) => ({ ...session, score: defaultFilter(session.label, query.trim()) }))
-        .filter((session) => session.score > 0)
-        .sort((first, second) => second.score - first.score);
-    }
-    // The full first page would push Actions below the fold.
-    return out.slice(0, IDLE_SESSION_LIMIT);
-  }, [data, titleSearch.data, query, searching, sessionsOnly]);
-  // Excludes title matches again in case a rename moved a session between the
-  // two groups' requests: cmdk needs each item value to be unique.
-  const contentSessions = useMemo(
-    () =>
-      searching
-        ? paletteSessions(contentSearch.data?.pages ?? [], {
-            includeArchived: true,
-            excludeIds: new Set(sessions.map((s) => s.id)),
-          })
-        : [],
-    [contentSearch.data, searching, sessions],
+  const filteredActions = useMemo(
+    () => (sessionsOnly ? [] : filterAppCommands(actions, query)),
+    [actions, query, sessionsOnly],
   );
-  const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
-  const searchGroups = [titleSearch, contentSearch];
-  const loadError = searching
-    ? searchGroups.some((group) => group.isError)
-    : isError || isFetchNextPageError;
-  const loadMoreError = searching
-    ? searchGroups.some((group) => group.isFetchNextPageError)
-    : isFetchNextPageError;
-  const searchFetching =
-    (searching && awaitingServerInfo) || searchGroups.some((group) => group.isFetching);
-  const retrying = searching
-    ? searchGroups.some((group) => group.isError && group.isFetching)
-    : isFetching;
-  const retryLoad = (): void => {
-    if (!searching) {
-      void (isFetchNextPageError ? fetchNextPage() : refetch());
-      return;
-    }
-    for (const group of searchGroups) {
-      if (group.isFetchNextPageError) void group.fetchNextPage();
-      else if (group.isError) void group.refetch();
-    }
-  };
 
   // The two search groups resolve independently, so a title match can render
   // above an already-highlighted content match. Keep the top row selected
@@ -374,15 +136,8 @@ export function CommandPalette({
     action.run();
   };
 
-  const queryClient = useQueryClient();
   const goToSession = (id: string): void => {
-    // Search results are dropped when the palette closes; the sidebar lists
-    // the opened session from this copy, which keeps its owner.
-    const searchRow = [titleSearch.data, contentSearch.data]
-      .flatMap((results) => results?.pages ?? [])
-      .flatMap((page) => page.data)
-      .find((row) => row.id === id);
-    if (searchRow) rememberOpenSessionRow(queryClient, searchRow);
+    rememberSearchRow(id);
     close();
     navigate(`/c/${id}`);
   };
@@ -565,12 +320,12 @@ export function CommandPalette({
                 your search.
               </p>
             )}
-            {sessionsOnly && hasNextPage && loadedPages >= pageLimit && !loadError && (
+            {sessionsOnly && olderSessionsAvailable && !loadError && (
               <Button
                 variant="ghost"
                 className="w-full"
                 disabled={isFetching}
-                onClick={() => setPageLimit(loadedPages + SESSION_SEARCH_PAGE_BATCH)}
+                onClick={searchOlderSessions}
               >
                 Search older sessions
               </Button>
