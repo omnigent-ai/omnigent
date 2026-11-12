@@ -7317,9 +7317,9 @@ def signed_disabled_mcp_session(disabled_mcp_session, monkeypatch):
     return harness
 
 
-@pytest.mark.parametrize("discovery_fails", [False, True])
+@pytest.mark.parametrize("discovery_outcome", ["success", "failure", "cancelled"])
 async def test_provider_discovery_uses_prepared_worker_and_staged_environment(
-    disabled_mcp_session, tmp_path, monkeypatch, discovery_fails
+    disabled_mcp_session, tmp_path, monkeypatch, discovery_outcome
 ):
     from omnigent.inner.codex_worker import CodexWorkerLaunch
 
@@ -7329,6 +7329,9 @@ async def test_provider_discovery_uses_prepared_worker_and_staged_environment(
     session._env = {"HOST_ONLY": "parent-value"}
     launcher = tmp_path / "sandbox-launcher"
     launch = CodexWorkerLaunch(str(launcher), sandboxed=True, _owned_launcher=launcher)
+    discovery_started = asyncio.Event()
+    discovery_pending = asyncio.Event()
+    private_homes = []
 
     def prepare_worker(**kwargs):
         assert kwargs["os_env"] is session._os_env_spec
@@ -7342,6 +7345,7 @@ async def test_provider_discovery_uses_prepared_worker_and_staged_environment(
     monkeypatch.setattr("omnigent.inner.codex_executor.prepare_codex_worker", worker_prepare)
 
     async def prepare_provider(codex_home, overrides, **kwargs):
+        private_homes.append(codex_home)
         assert session._worker_launch is launch
         assert launcher.exists()
         assert (codex_home / "config.toml").is_file()
@@ -7352,7 +7356,10 @@ async def test_provider_discovery_uses_prepared_worker_and_staged_environment(
             "CODEX_HOME": str(codex_home),
             "HTTPS_PROXY": "http://127.0.0.1:12345",
         }
-        if discovery_fails:
+        if discovery_outcome == "cancelled":
+            discovery_started.set()
+            await discovery_pending.wait()
+        if discovery_outcome == "failure":
             raise RuntimeError("provider setup failed")
         return [*overrides, 'model_provider="configured"']
 
@@ -7362,7 +7369,23 @@ async def test_provider_discovery_uses_prepared_worker_and_staged_environment(
         provider_prepare,
     )
     try:
-        if discovery_fails:
+        if discovery_outcome == "cancelled":
+            start_task = asyncio.create_task(session.start())
+            try:
+                await asyncio.wait_for(discovery_started.wait(), timeout=5)
+                start_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(start_task, timeout=5)
+            finally:
+                if not start_task.done():
+                    start_task.cancel()
+                await asyncio.gather(start_task, return_exceptions=True)
+            assert harness.spawns == []
+            harness.initialize.assert_not_awaited()
+            assert session.cleaned
+            assert not launcher.exists()
+            assert not private_homes[0].exists()
+        elif discovery_outcome == "failure":
             with pytest.raises(RuntimeError, match="provider setup failed"):
                 await session.start()
             assert harness.spawns == []
@@ -7380,6 +7403,8 @@ async def test_provider_discovery_uses_prepared_worker_and_staged_environment(
         await session.close()
     assert not launcher.exists()
     assert session._codex_home_dir is None
+    assert len(private_homes) == 1
+    assert not private_homes[0].exists()
 
 
 @pytest.mark.parametrize(

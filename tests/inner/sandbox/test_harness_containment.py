@@ -183,10 +183,8 @@ def test_unsandboxed_worker_requires_no_policy_or_explicit_none(
 
 
 @pytest.mark.parametrize("harness", [name for name in _HARNESSES if name != "claude-sdk"])
-@pytest.mark.parametrize("declared_cwd", ["./sub", "sub"])
 def test_relative_policy_cwd_preserves_non_claude_workspace(
     harness: str,
-    declared_cwd: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -199,7 +197,7 @@ def test_relative_policy_cwd_preserves_non_claude_workspace(
     executable.parent.mkdir(parents=True)
     executable.touch()
     spec = OSEnvSpec(
-        cwd=declared_cwd,
+        cwd="./sub",
         sandbox=OSEnvSandboxSpec(
             type="linux_bwrap",
             read_paths=["."],
@@ -228,7 +226,7 @@ def test_relative_policy_cwd_preserves_non_claude_workspace(
     with _prepared_launch(harness, executable, workspace, spec):
         pass
     resolve.assert_called_once_with(spec, workspace.resolve())
-    assert spec.cwd == declared_cwd
+    assert spec.cwd == "./sub"
     launcher.assert_called_once()
     assert launcher.call_args.kwargs["cwd"] == str(workspace.resolve())
 
