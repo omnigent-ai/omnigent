@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -374,6 +378,124 @@ async def test_runner_busy_check_reads_output_from_the_screen_not_tmux_activity(
     assert not await reaper._is_busy(pane)
     instance._screen_changed_at = now - 1.0
     assert await reaper._is_busy(pane)
+
+
+@pytest.mark.parametrize("outcome", ["fresh", "stale", "new_turn", "replaced", "cancelled"])
+async def test_runner_busy_check_keeps_loop_responsive_during_approval_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
+    marker_root = tmp_path / "approval-waits"
+    monkeypatch.setattr(claude_native_bridge, "_APPROVAL_WAIT_ROOT", marker_root)
+    marker = claude_native_bridge.approval_wait_marker_path("conv_parked")
+    marker_root.mkdir()
+    marker.touch()
+    if outcome != "fresh":
+        stale_time = time.time() - claude_native_bridge.APPROVAL_WAIT_MARKER_TTL_S - 1
+        os.utime(marker, (stale_time, stale_time))
+    registry = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    registry._by_conversation["conv_parked"] = {("claude", "main"): instance}
+    resources = SessionResourceRegistry(terminal_registry=registry)
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=resources,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    pane = PaneRef(
+        "conv_parked", terminal_resource_id("claude", "main"), "claude", tmp_path, instance
+    )
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    loop = asyncio.get_running_loop()
+    original_glob = Path.glob
+
+    def glob(path: Path, pattern: str) -> object:
+        if path == marker_root:
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(2):
+                raise RuntimeError("approval scan blocked event-loop progress")
+            finished.set()
+        return original_glob(path, pattern)
+
+    monkeypatch.setattr(Path, "glob", glob)
+    close = AsyncMock()
+    monkeypatch.setattr(resources, "close_terminal", close)
+    task = asyncio.create_task(
+        reaper._is_busy(pane) if outcome in ("fresh", "stale") else reaper._reap(pane)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        if outcome == "new_turn":
+            # The turn may already have ended again before the scan finishes.
+            app.state.turn_bind_epoch["conv_parked"] = 1
+        elif outcome == "replaced":
+            replacement = make_test_terminal_instance("claude", "main", tmp_path / "new")
+            registry._by_conversation["conv_parked"][("claude", "main")] = replacement
+        elif outcome == "cancelled":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            close.assert_not_awaited()
+        release.set()
+        if outcome != "cancelled":
+            result = await task
+            if outcome in ("fresh", "stale"):
+                assert result is (outcome == "fresh")
+            assert finished.is_set()
+            if outcome != "fresh":
+                assert not marker.exists(), "stale approval markers must still be removed"
+        close.assert_not_awaited()
+    finally:
+        release.set()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.parametrize("probe", ["client_input", "screen_output"])
+async def test_runner_reap_preserves_a_turn_started_during_tmux_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probe: str
+) -> None:
+    loop = asyncio.get_running_loop()
+
+    def start_turn(*_args: object) -> None:
+        loop.call_soon_threadsafe(app.state.turn_bind_epoch.__setitem__, "conv_parked", 1)
+
+    monkeypatch.setattr(
+        native_cost_popup,
+        "_tmux_last_client_input_at",
+        start_turn if probe == "client_input" else lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        native_cost_popup,
+        "_tmux_window_activity_at",
+        start_turn if probe == "screen_output" else lambda *_args: None,
+    )
+    monkeypatch.setattr(claude_native_bridge, "_APPROVAL_WAIT_ROOT", tmp_path / "approval-waits")
+    registry = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    registry._by_conversation["conv_parked"] = {("claude", "main"): instance}
+    resources = SessionResourceRegistry(terminal_registry=registry)
+    close = AsyncMock()
+    monkeypatch.setattr(resources, "close_terminal", close)
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=resources,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    pane = PaneRef(
+        "conv_parked", terminal_resource_id("claude", "main"), "claude", tmp_path, instance
+    )
+
+    await app.state.native_pane_reaper._reap(pane)
+
+    assert app.state.turn_bind_epoch["conv_parked"] == 1
+    close.assert_not_awaited()
+    assert registry.get("conv_parked", "claude", "main") is instance
 
 
 class _SessionStatusServerClient(NullServerClient):
