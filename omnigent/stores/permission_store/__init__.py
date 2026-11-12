@@ -6,6 +6,7 @@ sentinel user ID represents public link access, capped by the live server policy
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 
 from omnigent.entities import Account, ResolvedAccess, SessionPermission
 
@@ -290,3 +291,25 @@ class PermissionStore(ABC):
         :returns: ``True`` if at least one grant exists.
         """
         ...
+
+    def validate_grants(self, grants: Sequence[tuple[str, int]]) -> list[tuple[str, int]]:
+        """Check a batch of ``(user_id, level)`` grants before they are saved.
+
+        The default accepts every grant and writes nothing, because :meth:`grant`
+        creates users on demand. Stores that resolve principals override this.
+        Overrides must follow this contract:
+
+        * Return the grants in input order with each ``user_id`` replaced by the
+          store's canonical name. Save the returned list, not the input, so one
+          person cannot be stored under two spellings.
+        * Raise ``OmnigentError(ErrorCode.INVALID_INPUT)`` that names every unknown
+          principal, not just the first.
+        * Raise ``OmnigentError(ErrorCode.FORBIDDEN)`` for a grant the store refuses.
+
+        :param grants: The ``(user_id, level)`` pairs to check, e.g.
+            ``[("alice@example.com", 1)]``.
+        :returns: The grants with canonical user IDs, in input order.
+        :raises OmnigentError: ``INVALID_INPUT`` for unknown principals, or
+            ``FORBIDDEN`` for a refused grant.
+        """
+        return list(grants)

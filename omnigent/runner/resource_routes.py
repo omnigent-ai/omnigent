@@ -1562,6 +1562,25 @@ def register_resource_routes(
             default_pr_url=default_pr_url,
         )
 
+    @app.get("/v1/sessions/{session_id}/resources/github/compare-diff")
+    async def read_github_compare_diff(
+        session_id: str,
+        pr_url: str | None = None,
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+        head_sha: str | None = None,
+        from_sha: str | None = None,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_compare_diff",
+            head_sha=head_sha,
+            from_sha=from_sha,
+            pr_url=pr_url,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
+
     @app.get("/v1/sessions/{session_id}/resources/github/diff/{relative_path:path}")
     async def read_github_file_diff(
         session_id: str,
@@ -1658,6 +1677,21 @@ def register_resource_routes(
             **_server_tracking_fields(body),
             merge_method=body.get("merge_method"),
             expected_head=body.get("expected_head"),
+        )
+
+    @app.post("/v1/sessions/{session_id}/resources/github/merge-as")
+    async def merge_github_pr_as_route(session_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id,
+            "merge_pr_as",
+            pr_url=body["pr_url"],
+            **_server_tracking_fields(body),
+            merge_method=body.get("merge_method"),
+            expected_head=body.get("expected_head"),
+            account=body.get("account"),
         )
 
     @app.post("/v1/sessions/{session_id}/resources/github/disable-auto-merge")

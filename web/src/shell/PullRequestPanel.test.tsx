@@ -1,9 +1,22 @@
+import type { FileDiff } from "@pierre/diffs/react";
+import type { Comment } from "@/hooks/useComments";
+import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 // Tests for PullRequestPanel — the stacked "Files changed" view. The GitHub data
 // hooks and the heavy MonacoDiffViewer are mocked; IntersectionObserver (absent
 // in jsdom) is stubbed to fire immediately so lazy sections mount.
 
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
-import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  render,
+  renderHook,
+  screen,
+  fireEvent,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { parsePatchFiles } from "@pierre/diffs";
 import type * as DiffsModule from "@pierre/diffs";
 import userEvent from "@testing-library/user-event";
@@ -186,8 +199,20 @@ vi.mock("@pierre/diffs", () => ({
   parsePatchFiles: vi.fn(() => [{ files: state.parsedFiles }]),
 }));
 vi.mock("@pierre/diffs/react", () => ({
-  FileDiff: ({ fileDiff }: { fileDiff: { name: string } }) => (
-    <div data-testid="diff" data-path={fileDiff.name} />
+  FileDiff: ({
+    fileDiff,
+    renderGutterUtility,
+    lineAnnotations,
+    renderAnnotation,
+  }: React.ComponentProps<typeof FileDiff>) => (
+    <div data-testid="diff" data-path={fileDiff.name}>
+      {renderGutterUtility?.(() => ({ lineNumber: 1, side: "additions" }))}
+      {lineAnnotations?.map((annotation) => (
+        <div key={`${annotation.side}:${annotation.lineNumber}`}>
+          {renderAnnotation?.(annotation)}
+        </div>
+      ))}
+    </div>
   ),
 }));
 // The resolved theme mode drives @pierre/diffs' themeType.
@@ -255,15 +280,17 @@ function renderPanel(mobile = false, active?: boolean) {
     client,
     ...render(<PullRequestPanel conversationId="conv_1" active={active} />, {
       wrapper: ({ children }) => (
-        <QueryClientProvider client={client}>
-          {mobile ? (
-            <MobilePanelDrawer open title="Pull Requests" onClose={() => {}}>
-              {children}
-            </MobilePanelDrawer>
-          ) : (
-            children
-          )}
-        </QueryClientProvider>
+        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, comment_anchor_metadata: true }}>
+          <QueryClientProvider client={client}>
+            {mobile ? (
+              <MobilePanelDrawer open title="Pull Requests" onClose={() => {}}>
+                {children}
+              </MobilePanelDrawer>
+            ) : (
+              children
+            )}
+          </QueryClientProvider>
+        </CapabilitiesProvider>
       ),
     }),
   };
@@ -1143,6 +1170,40 @@ describe("PullRequestPanel", () => {
       fireEvent.click(within(merge).getByRole("button", { name: "Merge pull request" }));
       expect(screen.getByText("Merge pull request #6000?")).toBeInTheDocument();
     });
+
+    it.each([
+      [true, true, true],
+      [false, true, false],
+      // An older host would merge as its saved account, whatever the dialog sent.
+      [true, undefined, false],
+    ])(
+      "offers the PR's accounts to merge as (switching: %s, merge as account: %s)",
+      (switching, mergeAsAccount, offered) => {
+        state.info!.data!.capabilities!.account_switching = switching;
+        state.info!.data!.capabilities!.merge_as_account = mergeAsAccount;
+        state.info!.data!.accounts = ["work", "personal"].map((login) => ({
+          login,
+          active: login === "work",
+          state: "success",
+          host: "github.com",
+        }));
+        state.info!.data!.selected_account = "work";
+        renderPanel();
+
+        // The repository resolved, so only the merge dialog asks for an account.
+        expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
+        const merge = screen.getByRole("region", { name: "Merge" });
+        fireEvent.click(within(merge).getByRole("button", { name: "Merge pull request" }));
+        const picker = within(screen.getByRole("dialog")).queryByRole("combobox", {
+          name: "Merge as",
+        });
+        if (offered) {
+          expect(picker).toHaveTextContent("work (active)");
+        } else {
+          expect(picker).toBeNull();
+        }
+      },
+    );
 
     it("divides the metadata from the description", () => {
       renderPanel();
@@ -2841,6 +2902,51 @@ describe("session PR selection", () => {
     },
   );
 
+  it("offers the PR's accounts to merge as from its compact row", () => {
+    const pr = {
+      ...state.info!.data!.pr!,
+      checks: { total: 1, passing: 1, failing: 0, pending: 0, runs: [] },
+      merge_state_status: "CLEAN",
+      head_sha: "head",
+    };
+    Object.assign(state.info!.data!, {
+      pr,
+      capabilities: {
+        account_switching: true,
+        base_remote_selection: true,
+        line_counts: true,
+        linked_pr_diff: true,
+        merging: true,
+        merge_as_account: true,
+      },
+      accounts: ["work", "personal"].map((login) => ({
+        login,
+        active: login === "work",
+        state: "success",
+        host: "github.com",
+      })),
+      selected_account: "work",
+      tracking_available: true,
+      prs: [
+        OTHER_PR,
+        {
+          url: pr.url,
+          repository: "example/repo",
+          host: "github.com",
+          number: pr.number,
+          relationship: "created",
+        },
+      ],
+    });
+    renderPanel();
+
+    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Merge" }));
+    expect(
+      within(screen.getByRole("dialog")).getByRole("combobox", { name: "Merge as" }),
+    ).toHaveTextContent("work (active)");
+  });
+
   it.each(["failing", "pending", "cancelled", "skipped", "partial", "read-only"])(
     "keeps check details and uses mergeability for %s",
     async (reason) => {
@@ -3518,3 +3624,146 @@ it.each(["capabilities", "selected_pr_url"] as const)(
     expect(screen.getByText("No comments yet.").parentElement).toHaveClass("pb-16");
   },
 );
+
+it("saves a local comment as agent context and retains earlier revisions", async () => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+  const diffs = await vi.importActual<typeof DiffsModule>("@pierre/diffs");
+  state.parsedFiles = diffs.parsePatchFiles(
+    "diff --git a/hello.py b/hello.py\n--- a/hello.py\n+++ b/hello.py\n@@ -1 +1 @@\n-old\n+new\n",
+  )[0]!.files;
+  state.changes!.data!.data = [file("hello.py", "modified")];
+  state.diff = {
+    object: "session.github.pr_diff",
+    patch: "PATCH",
+    head_sha: "a".repeat(40),
+    base_sha: "b".repeat(40),
+  };
+  const comments: Comment[] = [];
+  const requests: string[] = [];
+  let failMutation = false;
+  const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const url = String(input);
+    requests.push(`${init?.method ?? "GET"} ${url}`);
+    if (failMutation && (init?.method === "PATCH" || init?.method === "DELETE"))
+      return new Response(null, { status: 500, statusText: "Try again" });
+    if (url.endsWith("/comments") && init?.method === "POST") {
+      const comment = {
+        ...JSON.parse(String(init.body)),
+        id: "local-1",
+        conversation_id: "conv_1",
+        status: "draft",
+        created_by: null,
+        created_at: 0,
+        updated_at: 1,
+        anchor_content: null,
+      } as Comment;
+      comments.push(comment);
+      return new Response(JSON.stringify(comment));
+    }
+    if (url.endsWith("/comments/local-1") && init?.method === "PATCH") {
+      Object.assign(comments[0]!, JSON.parse(String(init.body)));
+      return new Response(JSON.stringify(comments[0]));
+    }
+    if (url.endsWith("/comments/local-1") && init?.method === "DELETE") {
+      comments.splice(0);
+      return new Response(null, { status: 204 });
+    }
+    return new Response(JSON.stringify(comments));
+  });
+  onTestFinished(() => {
+    fetch.mockRestore();
+    clearLocalReviewContexts("conv_1");
+  });
+  const { client } = renderChanges();
+  const contexts = renderHook(() => usePendingLocalReviewContexts("conv_1"));
+  await userEvent.click(screen.getByRole("button", { name: "Start a new review conversation" }));
+  expect(
+    within(screen.getByRole("group", { name: "Comment destination" }))
+      .getAllByRole("button")
+      .map((button) => button.textContent),
+  ).toEqual(["GitHub", "Agent"]);
+  expect(screen.getByRole("button", { name: "Agent" })).toHaveAttribute("aria-pressed", "true");
+  await userEvent.hover(screen.getByRole("button", { name: "Agent" }));
+  expect(await screen.findByRole("tooltip")).toHaveTextContent(
+    "Leave a comment for your agent in this session.",
+  );
+  await userEvent.unhover(screen.getByRole("button", { name: "Agent" }));
+  await userEvent.type(
+    screen.getByRole("textbox", { name: "New review comment" }),
+    "Handle empty input",
+  );
+  fireEvent.keyDown(screen.getByRole("textbox", { name: "New review comment" }), {
+    key: "Enter",
+    metaKey: true,
+  });
+  await screen.findByRole("region", { name: "Local review comment" });
+  expect(comments[0]?.anchor_metadata).toMatchObject({
+    side: "RIGHT",
+    line: 1,
+    head_sha: "a".repeat(40),
+  });
+  expect(requests.filter((request) => request.startsWith("POST"))).toEqual([
+    "POST /v1/sessions/conv_1/comments",
+  ]);
+  expect(contexts.result.current).toHaveLength(1);
+  expect(contexts.result.current[0]).toMatchObject({ id: "local-1", body: "Handle empty input" });
+  expect(requests.some((request) => request.includes("/comments/send"))).toBe(false);
+  const other = {
+    ...comments[0]!,
+    id: "other",
+    body: "Feedback on a different PR",
+    anchor_metadata: { ...comments[0]!.anchor_metadata!, pr_url: "https://example.com/pr/other" },
+  };
+  const addressed = { ...comments[0]!, id: "addressed", status: "addressed" as const };
+  await act(async () => {
+    client.setQueryData(["comments", "conv_1"], [...comments, other, addressed]);
+  });
+  expect(screen.queryByText("Feedback on a different PR")).not.toBeInTheDocument();
+  expect(screen.queryByText(/Add to chat/)).not.toBeInTheDocument();
+  state.diff = { ...state.diff!, head_sha: "c".repeat(40) };
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Summary" }));
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+  expect(screen.queryByText(/Earlier revision/)).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "More actions for hello.py" }));
+  await userEvent.click(screen.getByRole("menuitem", { name: "Show earlier comments" }));
+  expect(screen.getAllByText(/Earlier revision/).length).toBeGreaterThan(0);
+  const card = within(screen.getAllByRole("region", { name: "Local review comment" })[0]!);
+  expect(
+    card.queryByRole("button", { name: /Attach to agent|Mark addressed|Reopen/ }),
+  ).not.toBeInTheDocument();
+  await userEvent.click(card.getByRole("button", { name: "Edit local comment" }));
+  await userEvent.clear(card.getByRole("textbox", { name: "Edit local comment" }));
+  await userEvent.type(
+    card.getByRole("textbox", { name: "Edit local comment" }),
+    "Validate empty input",
+  );
+  const originalAnchor = { ...comments[0]!.anchor_metadata! };
+  failMutation = true;
+  await userEvent.click(card.getByRole("button", { name: "Save" }));
+  expect(await card.findByRole("alert")).toHaveTextContent("Try again");
+  expect(card.getByRole("textbox", { name: "Edit local comment" })).toHaveValue(
+    "Validate empty input",
+  );
+  expect(contexts.result.current[0]).toMatchObject({
+    body: "Handle empty input",
+    anchor_metadata: originalAnchor,
+  });
+  failMutation = false;
+  await userEvent.click(card.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(comments[0]?.body).toBe("Validate empty input"));
+  expect(contexts.result.current[0]?.body).toBe("Validate empty input");
+  expect(contexts.result.current[0]?.anchor_metadata).toEqual(originalAnchor);
+  failMutation = true;
+  await userEvent.click(card.getByRole("button", { name: "Delete local comment" }));
+  expect(await card.findByRole("alert")).toHaveTextContent("Try again");
+  expect(contexts.result.current[0]).toMatchObject({
+    body: "Validate empty input",
+    anchor_metadata: originalAnchor,
+  });
+  failMutation = false;
+  await userEvent.click(card.getByRole("button", { name: "Delete local comment" }));
+  await waitFor(() =>
+    expect(screen.queryByRole("region", { name: "Local review comment" })).not.toBeInTheDocument(),
+  );
+  expect(contexts.result.current).toHaveLength(0);
+});

@@ -31,7 +31,13 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
-from omnigent.db.utils import generate_agent_id, generate_conversation_id, generate_file_id
+from omnigent.db.utils import (
+    generate_agent_id,
+    generate_conversation_id,
+    generate_file_id,
+    rollback_shared_reads,
+    shared_read_scope,
+)
 from omnigent.debug_logging import (
     add_audit_attrs,
     debug_event,
@@ -45,8 +51,16 @@ from omnigent.entities import (
     StoredFile,
     synthesize_conversation_title,
 )
+from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import SessionPermission
-from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.errors import (
+    ErrorCategory,
+    ErrorCode,
+    ErrorImpact,
+    ErrorPhase,
+    OmnigentError,
+    WrongReplicaError,
+)
 from omnigent.harnesses.codex_native.side_chat import EFFORT_RESET_LABEL, is_side_chat_child
 from omnigent.harnesses.codex_native.timeouts import (
     SETTINGS_FORWARD_TIMEOUT_SECONDS as _CODEX_SETTINGS_FORWARD_TIMEOUT_S,
@@ -90,6 +104,7 @@ from omnigent.server.creation_logging import creation_metadata, creation_stage, 
 from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
+from omnigent.server.routes._auth_helpers import SessionAccess
 from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
 )
@@ -213,6 +228,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_external_conversation_item,
     _persist_model_change_note,
     _publish_runner_recovered_status,
+    _read_session_snapshot_inputs,
     _run_managed_launch,
     _session_is_moving,
     _session_is_starting,
@@ -232,6 +248,7 @@ from omnigent.server.schemas import (
     ResetSessionModelOverrideResponse,
     SessionCreateRequest,
     SessionEventInput,
+    SessionFamily,
     SessionForkRequest,
     SessionLabelsResponse,
     SessionList,
@@ -258,6 +275,7 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
@@ -268,6 +286,7 @@ from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.stores.session_pull_request_store import SessionSummary
 from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_client_surface
 from omnigent.util.cost_plan import (
     reserved_cost_control_keys,
@@ -280,6 +299,7 @@ from omnigent.util.reasoning_effort import (
 from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
 )
+from omnigent.util.uuid import normalize_uuid
 from omnigent.version import VERSION
 
 # Continues a claude-sdk session in a fresh session on ``/clear`` once the
@@ -483,6 +503,30 @@ def _unsupported_model_detail(result: _RunnerForwardResult | None) -> str | None
         return None
     detail = _runner_reply_field(result.body, "detail")
     return detail if isinstance(detail, str) and detail else "This terminal cannot use that model."
+
+
+@dataclasses.dataclass(frozen=True)
+class _SessionBatchReads:
+    """Per-batch enrichment reads behind one ``GET /sessions`` page."""
+
+    conversations: list[Conversation]
+    conv_ids: list[str]
+    perms_by_conv: dict[str, list[SessionPermission]]
+    agents_by_id: dict[str, Agent]
+    child_ids_by_parent: dict[str, list[str]]
+    comments_fingerprints: dict[str, CommentsFingerprint]
+    pull_request_summaries: dict[str, SessionSummary]
+
+
+@dataclasses.dataclass(frozen=True)
+class _SessionPageReads:
+    """Store reads behind one ``GET /sessions`` page, taken in a single read burst."""
+
+    page: PagedList[Conversation]
+    page_boundary: dict[str, Any] | None = None
+    family_info: dict[str, SessionFamily] = dataclasses.field(default_factory=dict)
+    user_is_admin: bool = False
+    batches: list[_SessionBatchReads] = dataclasses.field(default_factory=list)
 
 
 def register_core_routes(
@@ -1291,6 +1335,15 @@ def register_core_routes(
             )
         return runner_id, launch_failed
 
+    def _side_chat_allowed_sync(user_id: str | None, conversation: Conversation) -> bool:
+        """Synchronous :func:`side_chat_allowed` for an already-read *conversation*."""
+        return _is_session_owner(
+            user_id,
+            conversation,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        )
+
     async def side_chat_allowed(
         user_id: str | None, session_id: str, conversation: Conversation | None = None
     ) -> bool:
@@ -1300,14 +1353,15 @@ def register_core_routes(
         conv = conversation or await asyncio.to_thread(
             conversation_store.get_conversation, session_id
         )
-        return conv is not None and await asyncio.to_thread(
-            _is_session_owner,
-            user_id,
-            conv,
-            auth_provider=auth_provider,
-            permission_store=permission_store,
-        )
+        return conv is not None and await asyncio.to_thread(_side_chat_allowed_sync, user_id, conv)
 
+    @router.post(
+        "/sessions/orchestrated/host",
+        status_code=201,
+        response_model=None,
+        include_in_schema=False,
+        dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+    )
     @router.post(
         "/sessions/orchestrated",
         status_code=201,
@@ -1323,6 +1377,10 @@ def register_core_routes(
             raise OmnigentError(
                 "Independent sessions require an orchestration source", code=ErrorCode.FORBIDDEN
             )
+        if request.url.path.endswith("/sessions/orchestrated/host") and not (
+            request.app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS)
+        ):
+            raise OmnigentError("Scripted sessions are disabled", code=ErrorCode.FORBIDDEN)
         return await create_session(request)
 
     @router.post(
@@ -1418,6 +1476,14 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
+        explicit_host = request.url.path.endswith("/sessions/orchestrated/host")
+        if explicit_host and (
+            body.host_type != "external" or not body.host_id or not body.workspace
+        ):
+            raise OmnigentError(
+                "Explicit host placement requires host_id and workspace on an external host",
+                code=ErrorCode.INVALID_INPUT,
+            )
         orchestration_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
         source = None
         if orchestration_source is not None:
@@ -1480,16 +1546,30 @@ def register_core_routes(
                 placement = await asyncio.to_thread(
                     routing_host_session, source, conversation_store
                 )
-                if placement is None or not placement.host_id or not placement.workspace:
+                destination_host = body.host_id
+                destination_workspace = body.workspace
+                if explicit_host:
+                    from omnigent.server.session_families import require_sibling_destination
+
+                    require_sibling_destination(
+                        request,
+                        placement.host_id if placement is not None else None,
+                        host_id=body.host_id,
+                        host_type=body.host_type,
+                    )
+                elif placement is None or not placement.host_id or not placement.workspace:
                     raise OmnigentError(
                         "Sender needs a connected host and workspace", code=ErrorCode.INVALID_INPUT
                     )
+                else:
+                    destination_host = placement.host_id
+                    destination_workspace = placement.workspace
                 try:
                     body = type(body).model_validate(
                         {
                             **body.model_dump(exclude_unset=True),
-                            "host_id": placement.host_id,
-                            "workspace": placement.workspace,
+                            "host_id": destination_host,
+                            "workspace": destination_workspace,
                         }
                     )
                 except ValidationError as exc:
@@ -1553,6 +1633,9 @@ def register_core_routes(
             project_store=project_store,
             created_by_session_id=source.id if source is not None else None,
             created_by_project_id=source.project_id if source is not None else None,
+            created_by_scheduled_task_id=(
+                source.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY) if source is not None else None
+            ),
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
@@ -2259,21 +2342,30 @@ def register_core_routes(
         """
         response.headers["Cache-Control"] = "no-store"
         user_id = _get_user_id(request, auth_provider)
-        # Single permission pass: authorize + resolve the display level +
-        # fetch the conversation once, then reuse the conversation in the
-        # snapshot (the snapshot's read is skipped). Replaces the former
-        # require_access + get_permission_level + snapshot-get_conversation
-        # sequence, which made ~5-6 separate store round-trips.
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
-        )
+
+        # One read burst over a single pool checkout: authorization, the
+        # conversation row, the bound agent row and the side-chat owner
+        # grant, each reused by the snapshot instead of re-read.
+        def _read_inputs() -> tuple[SessionAccess, Conversation, Agent | None, bool]:
+            with shared_read_scope():
+                access, conv, agent = _read_session_snapshot_inputs(
+                    user_id,
+                    session_id,
+                    permission_store,
+                    conversation_store,
+                    agent_store,
+                )
+                return access, conv, agent, _side_chat_allowed_sync(user_id, conv)
+
+        access, conv, agent, side_chat_ok = await asyncio.to_thread(_read_inputs)
         snapshot = await _get_session_snapshot(
             conversation_store,
             session_id,
             access.level,
             agent_store,
             agent_cache,
-            conversation=access.conversation,
+            conversation=conv,
+            agent=agent,
             liveness_lookup=liveness_lookup if include_liveness else None,
             include_items=include_items,
             include_live_status=include_live_status,
@@ -2285,9 +2377,7 @@ def register_core_routes(
             viewer_id=user_id,
             request=request,
         )
-        snapshot.side_chat_allowed = await side_chat_allowed(
-            user_id, session_id, access.conversation
-        )
+        snapshot.side_chat_allowed = side_chat_ok
         return snapshot
 
     @router.get(
@@ -2333,13 +2423,23 @@ def register_core_routes(
 
     # ── GET /sessions ───────────────────────────────────────────
 
-    def _session_agent_metadata(
-        conversations: Sequence[Conversation],
-    ) -> tuple[dict[str, str], dict[str, str | None]]:
-        """Resolve list metadata off the event loop with one batched agent read."""
-        agents = agent_store.get_many(
+    def _session_agents(conversations: Sequence[Conversation]) -> dict[str, Agent]:
+        """Read the agents bound to *conversations* in one batched store call."""
+        return agent_store.get_many(
             list({conv.agent_id for conv in conversations if conv.agent_id is not None})
         )
+
+    def _session_agent_metadata(
+        conversations: Sequence[Conversation],
+        agents: dict[str, Agent] | None = None,
+    ) -> tuple[dict[str, str], dict[str, str | None]]:
+        """Resolve list metadata off the event loop with one batched agent read.
+
+        Pass already-read *agents* to skip the store read; spec loads for the
+        harness may still fetch bundles, so keep this outside a read scope.
+        """
+        if agents is None:
+            agents = _session_agents(conversations)
         harnesses_by_id: dict[str, str | None] = {}
         for conv in conversations:
             try:
@@ -2513,99 +2613,121 @@ def register_core_routes(
             shared_only_param = False
             include_archived_param = include_archived
             archived_only_param = False
-        page = await asyncio.to_thread(
-            conversation_store.list_conversations,
-            limit=limit,
-            after=after,
-            before=before,
-            agent_id=agent_id,
-            agent_name=agent_name,
-            accessible_by=accessible_by_param,
-            owned_by=owned_by_param,
-            shared_only=shared_only_param,
-            has_agent_id=True,
-            # The store treats ``None`` as "no kind filter"; the API
-            # spells that ``kind=any`` to keep the param required-ish
-            # and pattern-validated.
-            kind=None if kind == "any" else kind,
-            order=order,
-            sort_by=sort_by,
-            search_query=normalized_query,
-            search_scope=search_scope,
-            include_archived=include_archived_param,
-            archived_only=archived_only_param,
-            project=project,
-            pinned=pinned,
-            # Pins are per-user: filter to the caller's own pin key.
-            pinned_owner=user_id,
-        )
-        # Side chats surface only as Workspace-rail tabs, so drop any
-        # side-chat-labeled fork from the sidebar list (it is still a normal
-        # session, just not listed as a top-level one here).
-        page.data = [conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})]
-        boundary_row = page.data[-1] if page.data else None
-        page_boundary = (
-            {
-                "id": boundary_row.id,
-                "created_at": boundary_row.created_at,
-                "updated_at": boundary_row.updated_at,
-            }
-            if boundary_row
-            else None
-        )
-        from omnigent.server.session_families import project_families
 
-        page.data, family_info = await asyncio.to_thread(
-            project_families,
-            conversation_store,
-            permission_store,
-            page.data,
-            user_id,
-            expand=expand_families and not normalized_query,
-            include_archived=include_archived_param,
-            archived_only=archived_only_param,
-        )
+        def _read_page() -> _SessionPageReads:
+            # One read-only burst over a single pool checkout per engine: the
+            # page query, family projection and every per-row enrichment read
+            # they feed. Nothing here waits on a runner or host.
+            with shared_read_scope():
+                page = conversation_store.list_conversations(
+                    limit=limit,
+                    after=after,
+                    before=before,
+                    agent_id=agent_id,
+                    agent_name=agent_name,
+                    accessible_by=accessible_by_param,
+                    owned_by=owned_by_param,
+                    shared_only=shared_only_param,
+                    has_agent_id=True,
+                    # The store treats ``None`` as "no kind filter"; the API
+                    # spells that ``kind=any`` to keep the param required-ish
+                    # and pattern-validated.
+                    kind=None if kind == "any" else kind,
+                    order=order,
+                    sort_by=sort_by,
+                    search_query=normalized_query,
+                    search_scope=search_scope,
+                    include_archived=include_archived_param,
+                    archived_only=archived_only_param,
+                    project=project,
+                    pinned=pinned,
+                    # Pins are per-user: filter to the caller's own pin key.
+                    pinned_owner=user_id,
+                )
+                # Side chats surface only as Workspace-rail tabs, so drop any
+                # side-chat-labeled fork from the sidebar list (it is still a
+                # normal session, just not listed as a top-level one here).
+                page.data = [
+                    conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})
+                ]
+                boundary_row = page.data[-1] if page.data else None
+                page_boundary = (
+                    {
+                        "id": boundary_row.id,
+                        "created_at": boundary_row.created_at,
+                        "updated_at": boundary_row.updated_at,
+                    }
+                    if boundary_row
+                    else None
+                )
+                from omnigent.server.session_families import project_families
+
+                page.data, family_info = project_families(
+                    conversation_store,
+                    permission_store,
+                    page.data,
+                    user_id,
+                    expand=expand_families and not normalized_query,
+                    include_archived=include_archived_param,
+                    archived_only=archived_only_param,
+                )
+                user_is_admin = (
+                    permission_store.is_admin(user_id)
+                    if page.data and permission_store is not None and user_id is not None
+                    else False
+                )
+                batches: list[_SessionBatchReads] = []
+                # Expanded families can contain many more rows than the source page.
+                for list_batch in batched(page.data, _SESSION_LIST_BATCH_SIZE):
+                    # list_conversations may return rows with agent_id=None for
+                    # legacy conversations; skip them before building the batch IDs.
+                    conv_ids = [conv.id for conv in list_batch if conv.agent_id is not None]
+                    if not conv_ids:
+                        continue
+                    batches.append(
+                        _SessionBatchReads(
+                            conversations=list(list_batch),
+                            conv_ids=conv_ids,
+                            perms_by_conv=(
+                                permission_store.list_for_sessions(conv_ids)
+                                if permission_store is not None
+                                else {}
+                            ),
+                            agents_by_id=_session_agents(list_batch),
+                            child_ids_by_parent=(
+                                conversation_store.list_child_conversation_ids_by_parent(conv_ids)
+                            ),
+                            comments_fingerprints=_comments_fingerprints_sync(conv_ids),
+                            pull_request_summaries=_pull_request_summaries_sync(conv_ids),
+                        )
+                    )
+                return _SessionPageReads(
+                    page=page,
+                    page_boundary=page_boundary,
+                    family_info=family_info,
+                    user_is_admin=user_is_admin,
+                    batches=batches,
+                )
+
+        reads = await asyncio.to_thread(_read_page)
+        page = reads.page
+        family_info = reads.family_info
+        user_is_admin = reads.user_is_admin
         items: list[SessionListItem] = []
-        user_is_admin = (
-            await asyncio.to_thread(permission_store.is_admin, user_id)
-            if page.data and permission_store is not None and user_id is not None
-            else False
-        )
-        # Expanded families can contain many more rows than the source page.
-        for list_batch in batched(page.data, _SESSION_LIST_BATCH_SIZE):
-            # list_conversations may return rows with agent_id=None for
-            # legacy conversations; skip them before building the batch IDs.
-            conv_ids = [conv.id for conv in list_batch if conv.agent_id is not None]
-            if not conv_ids:
-                continue
-            # Batch-fetch permissions and agent metadata concurrently.
-            # The tasks table has been removed — status comes exclusively from
-            # the relay-fed ``_session_status_cache``.
-            perms_by_conv: dict[str, list[SessionPermission]]
-            if permission_store is not None:
-                perms_by_conv, agent_metadata, child_ids_by_parent = await asyncio.gather(
-                    asyncio.to_thread(permission_store.list_for_sessions, conv_ids),
-                    asyncio.to_thread(_session_agent_metadata, list_batch),
-                    asyncio.to_thread(
-                        conversation_store.list_child_conversation_ids_by_parent,
-                        conv_ids,
-                    ),
-                )
-            else:
-                agent_metadata, child_ids_by_parent = await asyncio.gather(
-                    asyncio.to_thread(_session_agent_metadata, list_batch),
-                    asyncio.to_thread(
-                        conversation_store.list_child_conversation_ids_by_parent,
-                        conv_ids,
-                    ),
-                )
-                perms_by_conv = {}
-            agent_names_by_id, harnesses_by_id = agent_metadata
+        for batch in reads.batches:
+            list_batch = batch.conversations
+            conv_ids = batch.conv_ids
+            perms_by_conv = batch.perms_by_conv
+            child_ids_by_parent = batch.child_ids_by_parent
+            comments_fingerprints = batch.comments_fingerprints
+            # Harness resolution may load agent bundles, so it runs after the scope closes.
+            agent_names_by_id, harnesses_by_id = await asyncio.to_thread(
+                _session_agent_metadata, list_batch, batch.agents_by_id
+            )
             # In-memory lookup — no I/O, so batching avoids re-acquiring
             # the index's lock per row but otherwise has no DB cost.
             pending_counts = pending_elicitations.counts_for(conv_ids)
-            comments_fingerprints = await _comments_fingerprints_for(conv_ids)
-            pull_requests = await _pull_requests_for(conv_ids)
+            pull_requests = _pull_requests_from_summaries(batch.pull_request_summaries)
             # Settle orphaned running/waiting rows only after stale heartbeats
             # and a missing local cache entry justify a cross-replica probe.
             if liveness_lookup is not None:
@@ -2697,17 +2819,17 @@ def register_core_routes(
             last_id=page.last_id,
             has_more=page.has_more,
         ).model_dump()
-        result["page_boundary"] = page_boundary
+        result["page_boundary"] = reads.page_boundary
         return result
 
-    async def _comments_fingerprints_for(
+    def _comments_fingerprints_sync(
         conv_ids: list[str],
     ) -> dict[str, CommentsFingerprint]:
         """
         Batch-fetch comment change fingerprints for the given sessions.
 
-        Shared by the ``GET /v1/sessions`` page builder and
-        ``WS /v1/sessions/updates`` so both emit the same
+        Shared by the ``GET /v1/sessions`` page builder (inside its read
+        burst) and ``WS /v1/sessions/updates`` so both emit the same
         ``comments_count`` / ``comments_updated_at`` values and the
         stream's diff fires when a comment is added, edited, addressed,
         or deleted.
@@ -2720,9 +2842,34 @@ def register_core_routes(
         """
         if comment_store is None or not conv_ids:
             return {}
-        return await asyncio.to_thread(comment_store.get_comments_fingerprints, conv_ids)
+        return comment_store.get_comments_fingerprints(conv_ids)
+
+    async def _comments_fingerprints_for(
+        conv_ids: list[str],
+    ) -> dict[str, CommentsFingerprint]:
+        """Threaded :func:`_comments_fingerprints_sync` for the updates stream."""
+        return await asyncio.to_thread(_comments_fingerprints_sync, conv_ids)
 
     pull_request_store = server_prs.open_store(conversation_store)
+
+    def _pull_request_summaries_sync(conv_ids: list[str]) -> dict[str, SessionSummary]:
+        """
+        Read each session's first linked pull request in one query.
+
+        Safe inside :func:`shared_read_scope`: a failed read rolls the shared
+        session back so the enclosing burst's later reads still run.
+
+        :param conv_ids: Session ids to summarize, e.g. ``["conv_abc123"]``.
+        :returns: Raw store summaries; empty without PR storage or on failure.
+        """
+        if pull_request_store is None or not conv_ids:
+            return {}
+        try:
+            return pull_request_store.summaries(conv_ids)
+        except Exception:  # The list must load even if PR storage fails.
+            rollback_shared_reads()
+            _logger.warning("Could not load session pull requests", exc_info=True)
+            return {}
 
     async def _pull_requests_for(
         conv_ids: list[str],
@@ -2740,13 +2887,18 @@ def register_core_routes(
         :returns: Map from session id to its first PR (or ``None``) and whether
             it is synced; the map is empty without PR storage.
         """
-        if pull_request_store is None or not conv_ids:
-            return {}
-        try:
-            summaries = await asyncio.to_thread(pull_request_store.summaries, conv_ids)
-        except Exception:  # The list must load even if PR storage fails.
-            _logger.warning("Could not load session pull requests", exc_info=True)
-            return {}
+        summaries = await asyncio.to_thread(_pull_request_summaries_sync, conv_ids)
+        return _pull_requests_from_summaries(summaries)
+
+    def _pull_requests_from_summaries(
+        summaries: dict[str, SessionSummary],
+    ) -> dict[str, tuple[SessionPullRequestSummary | None, bool]]:
+        """Shape store summaries for list items, requesting refreshes of stale ones.
+
+        :param summaries: Output of :func:`_pull_request_summaries_sync`.
+        :returns: Map from session id to its first PR (or ``None``) and whether
+            it is synced.
+        """
         now = time.time()
         if pull_request_refresher is not None:
             for conv_id, summary in summaries.items():
@@ -3618,8 +3770,6 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
         if PINNED_LABEL_KEY in labels_to_set:
-            from omnigent.stores.conversation_store import family_pinned_label_key
-
             pin_source = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             owner_grant = (
                 await asyncio.to_thread(permission_store.get, user_id, session_id)
@@ -3643,16 +3793,10 @@ def register_core_routes(
                 )
                 active = [member for member in members if not member.archived]
                 retained = active or members
-                family_pin_key = family_pinned_label_key(user_id)
-                if (
-                    retained
-                    and retained[0].id == session_id
-                    and (
-                        family_pin_key in pin_source.labels
-                        or pinned_label_key(user_id) not in pin_source.labels
-                    )
-                ):
+                if retained and retained[0].id == session_id:
                     family_pin_value = labels_to_set.pop(PINNED_LABEL_KEY)
+                    if not family_pin_value:
+                        labels_to_set[pinned_label_key(user_id)] = ""
         # Pins are per-user. The client writes the canonical ``omnigent.pinned``
         # key; rewrite it to the caller's per-user key so one user's pin doesn't
         # pin the session for everyone with access. Empty value (unpin) carries
@@ -3847,9 +3991,9 @@ def register_core_routes(
                     if host_id is not None and await asyncio.to_thread(
                         runner_router.host_is_on_another_replica, host_id
                     ):
-                        raise OmnigentError(
+                        raise WrongReplicaError(
                             "side chat runner is connected to another server replica",
-                            code=ErrorCode.WRONG_REPLICA,
+                            host_id=host_id,
                         )
                 runner_id = _sf._registered_runner_id(
                     runner_router, body.runner_id, user_id=user_id
@@ -4447,18 +4591,24 @@ def register_core_routes(
             _prune_session_read_state(session_id)
             # Stop asynchronously after the archive commits and Undo grace elapses.
             # The deferred archived-flag check keeps an undone session's runner alive.
+            # A session that archives itself is still mid-turn, so its teardown also
+            # waits for that turn to end. The canonical id keys the pending stop and
+            # the store and status reads, whatever spelling the path used.
+            lifecycle_id = normalize_uuid(session_id) or session_id
             _spawn_archive_stop(
-                session_id,
+                lifecycle_id,
                 conversation_store,
                 runner_router,
                 getattr(request.app.state, "host_registry", None),
                 delete_worktree=body.delete_worktree,
                 host_store=getattr(request.app.state, "host_store", None),
+                after_turn=normalize_uuid(request.headers.get(ORCHESTRATION_SOURCE_HEADER))
+                == lifecycle_id,
             )
         elif body.archived is False:
             # Cancel local teardown immediately; the deferred flag check handles
             # Undo arriving on another replica.
-            _cancel_pending_archive_stop(session_id)
+            _cancel_pending_archive_stop(normalize_uuid(session_id) or session_id)
         # Some labels are cleared by DELETE, not by upserting an empty value:
         # the project membership (empty = "remove from project") and the pinned
         # flag (empty = "unpin"). Split any empty-valued clear keys out before

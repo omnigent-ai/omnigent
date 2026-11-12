@@ -1507,7 +1507,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         unique_ids = list(set(conversation_ids))
         with self._conv_session("get_session_activity") as session:
             updated = session.execute(
-                select(SqlConversation.id, SqlConversation.updated_at).where(
+                select(
+                    SqlConversation.id, SqlConversation.updated_at, SqlConversation.archived
+                ).where(
                     SqlConversation.workspace_id == current_workspace_id(),
                     SqlConversation.id.in_(unique_ids),
                 )
@@ -1549,6 +1551,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 total_cost_usd=costs.get(row.id),
                 pending_elicitation_count=pending_counts.get(row.id),
                 runner_id=runner_ids.get(row.id),
+                archived=bool(row.archived),
             )
         return activity
 
@@ -3657,11 +3660,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
 
         with self._conv_session("list_conversations") as session:
-            # Bound the content-search scan server-side (Postgres only). SET
-            # LOCAL scopes to this transaction and reverts on commit, so it
-            # can't leak to the connection's next pooled use. See
-            # _SEARCH_STATEMENT_TIMEOUT_MS. A worker-thread query is not stopped
-            # by a client disconnect, so this is the only server-side bound.
+            # Bound the content-search scan server-side (Postgres only), the only
+            # bound a client disconnect can't skip; see _SEARCH_STATEMENT_TIMEOUT_MS.
+            # SET LOCAL ends with the transaction (a shared_read_scope commit), not later.
             is_postgres = session.bind is not None and is_postgresql_family(
                 session.bind.dialect.name
             )

@@ -71,6 +71,7 @@ from omnigent.errors import (
     ErrorImpact,
     ErrorPhase,
     OmnigentError,
+    WrongReplicaError,
     category_for_code,
     restart_on_stale_cursor,
 )
@@ -124,6 +125,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
+    effective_admin,
 )
 from omnigent.server.host_registry import (
     HostConnection,
@@ -1302,7 +1304,7 @@ def _permission_level_from_grants(
     """
     if user_id is None:
         return None
-    if is_admin:
+    if effective_admin(is_admin):
         return LEVEL_OWNER
     user_grant = next((g for g in grants if g.user_id == user_id), None)
     if user_grant is not None:
@@ -2041,6 +2043,7 @@ def _resolve_harness_impl(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     agents_by_id: Mapping[str, Agent] | None = None,
+    agent: Agent | None = None,
 ) -> str | None:
     """
     Resolve the canonical harness for a conversation's bound agent.
@@ -2058,6 +2061,8 @@ def _resolve_harness_impl(
     :param agent_store: Optional store for resolving the bound agent.
     :param agent_cache: Optional cache for loading the bound agent spec.
     :param agents_by_id: Optional preloaded agents, avoiding per-session store reads.
+    :param agent: The bound agent row when the caller already holds it, so
+        the store is not read again. Ignored unless it is ``conv``'s agent.
     :returns: The canonical harness (e.g. ``"openai-agents"`` or
         ``"claude-sdk"``), or ``None`` when unavailable.
     """
@@ -2076,7 +2081,7 @@ def _resolve_harness_impl(
 
         if agents_by_id is not None:
             agent = agents_by_id.get(conv.agent_id)
-        else:
+        elif agent is None or agent.id != conv.agent_id:
             if agent_store is None:
                 from omnigent.runtime._globals import _agent_store
 
@@ -9604,14 +9609,15 @@ def _load_agent_spec_for_session(*args: Any, **kwargs: Any) -> AgentSpec | None:
 def _load_agent_spec_for_session_impl(
     conv: Conversation,
     agent_store: AgentStore,
+    agent: Agent | None = None,
 ) -> AgentSpec | None:
-    # Split from _build_policy_engine_from_spec so the caller can run the
-    # cheap guardrails/default-policy skip check between the two and avoid
-    # paying for engine construction when no policy could fire. Both halves
-    # are blocking DB/IO, so each is run under asyncio.to_thread.
+    # Split from _build_policy_engine_from_spec so callers can skip engine
+    # construction when no policy could fire; both halves run in to_thread.
+    # A caller already holding conv's agent row passes it to skip the store read.
     if conv.agent_id is None:
         return None
-    agent = agent_store.get(conv.agent_id)
+    if agent is None or agent.id != conv.agent_id:
+        agent = agent_store.get(conv.agent_id)
     if agent is None:
         return None
     agent_cache = cast(AgentCache, get_agent_cache())
@@ -9781,7 +9787,8 @@ def _build_evaluation_context(
 
     - ``TOOL_CALL``: ``content = {"name": name, "arguments": args}``,
       ``tool_name = name``.
-    - ``TOOL_RESULT``: ``content = {"result": result_str}``,
+    - ``TOOL_RESULT``: ``content = {"result": result_str}``, plus
+      ``"is_error": True`` when the producer reported the call failed,
       ``tool_name`` from ``request_data.name``,
       ``request_data`` from the event's ``request_data`` field.
     - ``REQUEST`` / ``RESPONSE``: ``content = str(data)``.
@@ -9833,11 +9840,14 @@ def _build_evaluation_context(
         if request_data is not None:
             raw_tool_name = request_data.get("name")
             result_tool_name = raw_tool_name if isinstance(raw_tool_name, str) else None
+        result_content: dict[str, Any] = {
+            "result": tool_result if isinstance(tool_result, str) else json.dumps(tool_result),
+        }
+        if structured_data.get("is_error") is True:
+            result_content["is_error"] = True
         return EvaluationContext(
             phase=phase,
-            content={
-                "result": tool_result if isinstance(tool_result, str) else json.dumps(tool_result),
-            },
+            content=result_content,
             tool_name=result_tool_name,
             request_data=request_data,
             actor=actor,
@@ -12354,9 +12364,9 @@ def require_filesystem_attachment_runtime(
     if host is not None or runner is not None:
         return
     if host_id and runner_router is not None and runner_router.host_is_on_another_replica(host_id):
-        raise OmnigentError(
+        raise WrongReplicaError(
             "Attachment support must be checked on the host's server replica",
-            code=ErrorCode.WRONG_REPLICA,
+            host_id=host_id,
         )
     raise OmnigentError(
         "Connect an updated Omnigent host before attaching archives, Office documents, "

@@ -33,6 +33,7 @@ from starlette.routing import Match, Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
+from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 from omnigent.db.db_models import InvalidUuidError
 from omnigent.debug_logging import (
     add_audit_attrs,
@@ -53,6 +54,7 @@ from omnigent.errors import (
     ErrorImpact,
     ErrorPhase,
     OmnigentError,
+    WrongReplicaError,
     is_cancelled_rpc_error,
     is_permission_denied_rpc_error,
 )
@@ -87,6 +89,7 @@ from omnigent.server import (
 )
 from omnigent.server.auth import (
     RESERVED_USER_LOCAL,
+    AdminViewMiddleware,
     AuthProvider,
     SharingMode,
     auth_mode,
@@ -108,6 +111,7 @@ from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_gateway import McpGatewayBackend
 from omnigent.server.mcp_pool import ServerMcpPool
+from omnigent.server.openapi_stream_events import install_stream_event_schemas
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
     ServerPerformanceMetrics,
@@ -268,6 +272,10 @@ class ServerInfoResponse(BaseModel):
     # ``{"agent_sandbox": {"multi_repo": true}}``. The web branches on these
     # (multi-repo picker vs single). Providers absent from the map default off.
     sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
+    # What each launchable provider's unattended runs need from their owner, e.g.
+    # ``{"agent_sandbox": "Keep your laptop signed in."}``. The automation form
+    # shows the run target's notice. Providers without one are absent.
+    sandbox_provider_automation_notices: dict[str, str] = {}
     enabled_connections: list[str]
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
@@ -304,6 +312,9 @@ class ServerInfoResponse(BaseModel):
     automation_trigger_poll_minutes: int = 10
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
+    # Session creates accept ``permission_mode``; older servers ignore it.
+    session_create_permission_modes: bool = True
+    scripted_sessions: bool = False
     # Scheduled tasks accept explicit modes that skip approval; servers that omit
     # this may reject them, so clients hide those modes.
     scheduled_task_approval_skipping_modes: bool = True
@@ -335,12 +346,18 @@ class ServerInfoResponse(BaseModel):
     # A claude-sdk ``clear`` continues in a new session; older servers only clear native
     # sessions, so clients treat absent as unsupported.
     session_claude_sdk_clear: bool = False
+    # Declining a non-blocking Codex question card leaves the turn running; older
+    # servers interrupt Codex, so the forwarder keeps those questions in the terminal.
+    codex_nonblocking_decline: bool = False
     # GET/DELETE /v1/sessions/{id}/pull-requests and SessionListItem.pull_request;
     # absent on older servers, which clients treat as unsupported.
     session_pull_requests: bool = False
     # GET/PUT /v1/settings/session-title-instructions; absent on older servers,
     # which clients treat as unsupported.
     session_title_instructions: bool = False
+    admin_view: bool = False
+    # Session comments accept and preserve immutable PR coordinates.
+    comment_anchor_metadata: bool = True
     # Absent on older servers, which clients treat as the default extensions.
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     # Scheduled tasks accept ``project_id``; older servers reject it.
@@ -709,6 +726,41 @@ def _error_audit_extra(
         phase=phase,
         **attributes,
     )
+
+
+def _wrong_replica_error_body(request: Request, exc: WrongReplicaError) -> dict[str, Any]:
+    """Name the slice key that reaches the replica holding the host's tunnel.
+
+    A request not keyed to the host must resend keyed to it. A request already
+    keyed to it missed because the tunnel dialed the default route, so it must
+    resend without the key in either form, as first-party clients do.
+
+    :param request: The rejected request; its slice-key header, or the query
+        parameter ingress falls back to when the header is empty, is compared
+        with the host.
+    :param exc: The wrong-replica error naming the host.
+    :returns: The ``error`` object: code, message ending in the remedy,
+        ``slice_key_header``, and ``slice_key`` to resend with (``None`` to
+        resend without the header).
+    """
+    request_slice_key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER) or (
+        request.query_params.get("omnigent_slice_key")
+    )
+    if request_slice_key == exc.host_id:
+        resend_slice_key = None
+        remedy = (
+            f"resend without the {OMNIGENT_SLICE_KEY_HEADER} header "
+            "or omnigent_slice_key query parameter"
+        )
+    else:
+        resend_slice_key = exc.host_id
+        remedy = f"resend with header {OMNIGENT_SLICE_KEY_HEADER}: {exc.host_id}"
+    return {
+        "code": exc.code,
+        "message": f"{exc.message}; {remedy}",
+        "slice_key_header": OMNIGENT_SLICE_KEY_HEADER,
+        "slice_key": resend_slice_key,
+    }
 
 
 # polly's and debby's multi-file bundles are packaged under
@@ -1812,9 +1864,8 @@ def create_app(
         and runner tunnels by host_id. When ``True``, a host-scoped request
         for a live host whose tunnel is on another replica returns 400
         ``wrong_replica``; otherwise it returns 409 "host is offline". The
-        400 recovers only for a client that sent the slice-key header and
-        retries without it, which the web client does only for requests it
-        keyed itself.
+        400 names the slice key to resend with, or says to resend without it
+        when the request was already keyed to the host.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
@@ -2353,6 +2404,7 @@ def create_app(
     app.state.startup_inputs = startup_inputs
     app.state.permission_store = permission_store
     app.state.host_store = host_store
+    app.state.scheduled_task_store = scheduled_task_store
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
     app.state.mcp_registry_auth = auth_provider
@@ -2659,6 +2711,11 @@ def create_app(
     # outermost WS middleware — a forbidden origin is closed without even
     # reaching the metrics counter (which only counts on accept anyway).
     app.add_middleware(WebSocketOriginMiddleware)
+    admin_view_supported = (
+        authentication_requires_identity(auth_provider) and permission_store is not None
+    )
+    if admin_view_supported:
+        app.add_middleware(AdminViewMiddleware)
     # Give the tool-policy ASK gate (which forwards the native-terminal
     # approval popup from a parked-gate background task, off any
     # request/route closure) the runner router so it can reach the bound
@@ -2951,10 +3008,12 @@ def create_app(
                     error_phase=exc.phase.value,
                 ),
             )
-        return JSONResponse(
-            status_code=exc.http_status,
-            content={"error": {"code": exc.code, "message": exc.message}},
+        error = (
+            _wrong_replica_error_body(request, exc)
+            if isinstance(exc, WrongReplicaError)
+            else {"code": exc.code, "message": exc.message}
         )
+        return JSONResponse(status_code=exc.http_status, content={"error": error})
 
     @app.exception_handler(RequestValidationError)
     async def _handle_validation_error(
@@ -3631,11 +3690,13 @@ def create_app(
         sandbox_provider = None
         sandbox_providers: list[str] = []
         sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
+        sandbox_provider_automation_notices: dict[str, str] = {}
         if sandbox_config is not None and sandbox_config.managed_launch_supported:
             managed_sandboxes_enabled = True
             sandbox_provider = sandbox_config.default.provider
             sandbox_providers = list(sandbox_config.launchable_providers())
             sandbox_provider_capabilities = sandbox_config.provider_ui_capabilities()
+            sandbox_provider_automation_notices = sandbox_config.provider_automation_notices()
         # enabled_connections lists the connection providers this deploy has
         # wired (config + store present), in a stable order. The web UI shows
         # the Sandbox Integrations nav when the list is non-empty and renders
@@ -3716,6 +3777,7 @@ def create_app(
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
+                "sandbox_provider_automation_notices": sandbox_provider_automation_notices,
                 "enabled_connections": enabled_connections,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
@@ -3732,6 +3794,7 @@ def create_app(
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
                 "session_list_scoped_archives": True,
+                "scripted_sessions": app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS),
                 "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
@@ -3743,9 +3806,11 @@ def create_app(
                 and artifact_store is not None,
                 "session_event_types": sorted(CLIENT_SESSION_EVENT_TYPES),
                 "session_claude_sdk_clear": True,
+                "codex_nonblocking_decline": True,
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
                 is not None,
                 "session_title_instructions": user_settings_store is not None,
+                "admin_view": admin_view_supported,
                 "filesystem_attachments": {
                     "extensions": sorted(filesystem_attachment_policy.extensions),
                     "all_types": filesystem_attachment_policy.all_types,
@@ -5495,6 +5560,7 @@ def create_app(
         # no per-request cost.
         app.add_middleware(BasePathMiddleware, base_path=resolved_base_path)
 
+    install_stream_event_schemas(app)
     return app
 
 
