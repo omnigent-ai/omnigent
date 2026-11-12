@@ -66,8 +66,8 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_session_list",
         "sys_session_get_info",
         "sys_session_rename",
-        # Peer messaging is advertised for every agent; the server
-        # enforces the orchestration flag and source authorization.
+        # Peer messaging is advertised unless the runner disables
+        # peer_session_messaging; the server enforces its own flags.
         "sys_session_message",
         "ui_open_file",
         # Read-only agent discovery tools are likewise always available
@@ -76,6 +76,11 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_agent_get",
         "sys_agent_download",
         "sys_agent_list",
+        # Project and session organizing proxy owner-gated endpoints.
+        "sys_project_list",
+        "sys_session_link_pr",
+        "sys_session_update",
+        "sys_project_update",
         # Policy tools are always auto-registered so agents can
         # browse the registry and add policies at runtime.
         "sys_add_policy",
@@ -126,11 +131,25 @@ def _non_lifecycle_schemas(
     ]
 
 
-@pytest.mark.parametrize("tool_name", ["sys_session_rename", "sys_session_message"])
-def test_session_tools_are_registered_for_every_agent(tool_name: str) -> None:
-    names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
+@pytest.mark.parametrize("peer_messaging", [True, False])
+@pytest.mark.parametrize("spawn", [True, False])
+def test_session_tools_are_registered_for_every_agent(
+    monkeypatch: pytest.MonkeyPatch, peer_messaging: bool, spawn: bool
+) -> None:
+    monkeypatch.setenv("OMNIGENT_FEATURES", "" if peer_messaging else "-peer_session_messaging")
+    spec = _make_spec()
+    spec.spawn = spawn
+    names = {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
 
-    assert tool_name in names
+    assert ("sys_session_message" in names) is peer_messaging
+    assert {
+        "sys_session_rename",
+        "sys_session_list",
+        "sys_session_get_info",
+        "sys_session_get_history",
+    } <= names
+    assert ("sys_session_send" in names) is spawn
+    assert ("sys_session_close" in names) is spawn
 
 
 @pytest.fixture()
@@ -1711,6 +1730,9 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
     "comments": frozenset({"list_comments", "update_comment"}),
     "policies": frozenset({"sys_add_policy", "sys_policy_registry"}),
     "agent_discovery": frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list"}),
+    "projects": frozenset(
+        {"sys_project_list", "sys_session_update", "sys_project_update", "sys_session_link_pr"}
+    ),
 }
 
 
@@ -1725,7 +1747,7 @@ def _grouped_spec(**groups: bool) -> AgentSpec:
 
 
 def test_tool_groups_default_registers_every_group() -> None:
-    """An absent ``tool_groups:`` block changes nothing: all 16 register."""
+    """An absent ``tool_groups:`` block changes nothing: all 19 register."""
     names = _tool_names(_grouped_spec())
     for group, members in _TOOL_GROUP_MEMBERS.items():
         assert members <= names, f"{group} members missing by default: {members - names}"
@@ -1743,13 +1765,13 @@ def test_tool_groups_false_drops_only_that_group(group: str) -> None:
 
 def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
     """
-    With every group off, the 16 gated tools are gone but the session
+    With every group off, the 20 gated tools are gone but the session
     reads, ``sys_session_rename`` and ``sys_cancel_task`` stay: multi-agent
     participation and async handles depend on them, so they have no key.
     """
     names = _tool_names(_grouped_spec(**dict.fromkeys(_TOOL_GROUP_MEMBERS, False)))
     gated = frozenset().union(*_TOOL_GROUP_MEMBERS.values())
-    assert len(gated) == 16
+    assert len(gated) == 20
     assert not (gated & names)
     assert {
         "sys_session_list",

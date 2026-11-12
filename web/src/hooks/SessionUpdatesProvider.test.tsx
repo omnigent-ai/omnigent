@@ -15,6 +15,7 @@ import {
   clearSessionTombstones,
   useArchiveConversation,
   useConversations,
+  useMoveToProject,
   type Conversation,
   type ConversationsPage,
 } from "@/hooks/useConversations";
@@ -665,6 +666,70 @@ describe("SessionUpdatesProvider archive tombstone", () => {
   });
 });
 
+describe("SessionUpdatesProvider move-to-project in flight", () => {
+  it("does not let a stale changed frame move a moving row back to its old project", async () => {
+    let resolvePatch: (value: unknown) => void = () => {};
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            object: "list",
+            data: [
+              { id: "p_old", name: "Old" },
+              { id: "p_new", name: "New" },
+            ],
+          }),
+        })
+        .mockReturnValueOnce(
+          new Promise((resolve) => {
+            resolvePatch = resolve;
+          }),
+        ),
+    );
+    const client = new QueryClient();
+    client.setQueryData(
+      ["projects"],
+      [
+        { id: "p_old", name: "Old" },
+        { id: "p_new", name: "New" },
+      ],
+    );
+    const moving = { ...conv("conv_a"), project_id: "p_old" };
+    client.setQueryData<ConversationsInfiniteData>(["conversations", "", false], {
+      pages: [{ data: [moving], first_id: "conv_a", last_id: "conv_a", has_more: false }],
+      pageParams: [undefined],
+    });
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const move = renderHook(() => useMoveToProject(), { wrapper });
+    const row = () =>
+      client
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+        .pages[0].data.find((c) => c.id === "conv_a");
+
+    move.result.current.mutate({ id: "conv_a", project: "New" });
+    await waitFor(() => expect(row()?.project_id).toBe("p_new"));
+
+    // Built from a read that predates the PATCH commit.
+    act(() => handler({ type: "changed", items: [{ ...moving, title: "Late edit" }] }));
+    expect(row()).toMatchObject({ project_id: "p_new", title: "Late edit" });
+
+    resolvePatch({
+      ok: true,
+      status: 200,
+      json: async () => ({ ...moving, project_id: "p_new", updated_at: 10 }),
+    });
+    await waitFor(() => expect(move.result.current.isSuccess).toBe(true));
+  });
+});
+
 describe("SessionUpdatesProvider open-session row", () => {
   it.each([true, false])(
     "applies a remote archive change (archived: %s) to the fetched row, keeping its owner",
@@ -1155,28 +1220,66 @@ describe("SessionUpdatesProvider projects_changed frames", () => {
   });
 });
 
-it("updates pending counts on a pinned row outside the scope windows", () => {
-  const client = new QueryClient();
-  client.setQueryData(["pinned-conversations"], {
-    conversations: [
-      { ...conv("old-pin"), labels: { "omnigent.pinned": "123" }, pending_elicitations_count: 0 },
-    ],
-    filterHonored: true,
-  });
-  renderProvider(client, ["/"]);
-  act(() =>
-    frameHandler()({
-      type: "changed",
-      items: [{ ...wireItem("old-pin", 2, 100), pending_elicitations_count: 3 }],
-    }),
-  );
-  const data = client.getQueryData<{ conversations: Conversation[] }>(["pinned-conversations"]);
-  expect(data?.conversations[0]).toMatchObject({
-    pending_elicitations_count: 3,
-    comments_count: 2,
-    labels: { "omnigent.pinned": "123" },
-  });
-});
+it.each(["pin", "family"])(
+  "reconciles streamed updates and removals for an off-window %s row",
+  (kind) => {
+    const client = new QueryClient();
+    const family = { id: "family", representative_id: "older", pinned: true };
+    const original = {
+      conversations: [
+        {
+          ...conv("old-pin"),
+          family: kind === "family" ? family : undefined,
+          labels: kind === "family" ? {} : { "omnigent.pinned": "123" },
+          pending_elicitations_count: 0,
+        },
+      ],
+      filterHonored: true,
+    };
+    client.setQueryData(["pinned-conversations"], original);
+    renderProvider(client, ["/"]);
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [
+          {
+            ...wireItem("old-pin", 2, 100),
+            pending_elicitations_count: 3,
+            ...(kind === "family"
+              ? {
+                  family: { ...family, representative_id: "old-pin" },
+                  labels: { "omnigent.pinned": "456" },
+                }
+              : {}),
+          },
+        ],
+      }),
+    );
+    const data = client.getQueryData<{ conversations: Conversation[] }>(["pinned-conversations"]);
+    expect(data?.conversations[0]).toMatchObject({
+      pending_elicitations_count: 3,
+      comments_count: 2,
+      labels: { "omnigent.pinned": kind === "family" ? "456" : "123" },
+    });
+    if (kind === "family") expect(data?.conversations[0].family?.representative_id).toBe("old-pin");
+    act(() => frameHandler()({ type: "removed", ids: ["old-pin"] }));
+    expect(
+      client.getQueryData<{ conversations: Conversation[] }>(["pinned-conversations"])
+        ?.conversations,
+    ).toEqual([]);
+    client.setQueryData(["pinned-conversations"], original);
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [{ ...wireItem("old-pin", 2, 100), archived: true }],
+      }),
+    );
+    expect(
+      client.getQueryData<{ conversations: Conversation[] }>(["pinned-conversations"])
+        ?.conversations,
+    ).toEqual([]);
+  },
+);
 
 it("keeps a directly opened shared session watched and permission-aware with the Shared list inactive", async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });

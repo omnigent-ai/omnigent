@@ -124,6 +124,54 @@ def test_fork_drops_sandbox_repo_label(
     assert REQUESTED_HOST_ID_LABEL_KEY not in fork.labels
 
 
+def test_fork_drops_the_automation_source_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Deleting a session deletes the automation its label names, so a fork of an
+    automation's copy must not name that automation too."""
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id, {SCHEDULED_TASK_SOURCE_LABEL_KEY: "st_1", "kept": "yes"}
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert SCHEDULED_TASK_SOURCE_LABEL_KEY not in fork.labels
+
+
+@pytest.mark.parametrize("closed_by", ["label", "legacy_title"])
+def test_fork_of_a_closed_child_is_open(
+    conversation_store: SqlAlchemyConversationStore,
+    closed_by: str,
+) -> None:
+    """Forking a closed child (a stopped side chat, a closed sub-agent) is how
+    the user continues it, so the fork must not inherit the seal."""
+    from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, is_session_closed
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title="researcher:auth"
+    )
+    if closed_by == "label":
+        conversation_store.set_labels(child.id, {CLOSED_LABEL_KEY: "true", "kept": "yes"})
+    else:
+        conversation_store.set_labels(child.id, {"kept": "yes"})
+        conversation_store.update_conversation(
+            child.id, title=f"researcher:auth:closed:{child.id}"
+        )
+
+    fork = conversation_store.fork_conversation(child.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert not is_session_closed(fork.labels, fork.title)
+    assert fork.title == "Fork of researcher:auth"
+    saved = conversation_store.get_conversation(child.id)
+    assert saved is not None and is_session_closed(saved.labels, saved.title)
+
+
 def test_fork_drops_per_repo_sandbox_labels(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -407,10 +455,24 @@ def test_get_session_activity(
         kind="sub_agent", title="child", parent_conversation_id=a.id
     )
     conversation_store.set_session_usage(child.id, {"total_cost_usd": 5.0})
+    conversation_store.update_conversation(b.id, archived=True)
 
-    result = conversation_store.get_session_activity(
-        [a.id, b.id, child.id, a.id, "5eca720dc2bc6cdc3a99028d7bd0f917"]
-    )
+    statements: list[str] = []
+
+    def record_query(_conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
+        statements.append(statement.lower())
+
+    event.listen(conversation_store._engine, "before_cursor_execute", record_query)
+    try:
+        result = conversation_store.get_session_activity(
+            [a.id, b.id, child.id, a.id, "5eca720dc2bc6cdc3a99028d7bd0f917"]
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", record_query)
+
+    reads = [statement for statement in statements if statement.startswith("select")]
+    assert len(reads) == 2
+    assert all("conversation_labels" not in statement for statement in reads)
 
     assert set(result) == {a.id, b.id, child.id}
     assert result[a.id].updated_at == conversation_store.get_conversation(a.id).updated_at  # type: ignore[union-attr]
@@ -423,6 +485,8 @@ def test_get_session_activity(
     assert result[b.id].live_status is None
     assert result[b.id].runner_id is None
     assert result[b.id].total_cost_usd is None
+    assert result[a.id].archived is False
+    assert result[b.id].archived is True
     assert conversation_store.get_session_activity([]) == {}
 
 
@@ -3492,6 +3556,44 @@ def test_list_conversations_filtered_by_agent_id_returns_matching_only(
     assert returned_ids == {conv1.id, conv2.id}
 
 
+def test_list_conversations_agent_name_holds_one_connection_at_a_time(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+    db_uri: str,
+) -> None:
+    """
+    Filtering by agent name resolves the agent ids in their own session before
+    the listing session opens. Holding both at once would take two pooled
+    connections per request and can exhaust the pool under concurrency.
+
+    :param conversation_store: The conversation store fixture.
+    :param agent_store: The agent store fixture.
+    :param db_uri: The shared single-DB URI behind both stores.
+    """
+    gamma = agent_store.create(
+        agent_id="3c1f0e9b2a7d4c6e8f0a1b2c3d4e5f60",
+        name="gamma",
+        bundle_location="3c1f0e9b2a7d4c6e8f0a1b2c3d4e5f60/h",
+    )
+    conv = conversation_store.create_conversation(agent_id=gamma.id)
+    conversation_store.create_conversation()
+    engine = get_or_create_engine(db_uri)
+    peak_checked_out: list[int] = []
+
+    def _on_checkout(_dbapi: object, _record: object, _proxy: object) -> None:
+        peak_checked_out.append(engine.pool.checkedout())
+
+    event.listen(engine, "checkout", _on_checkout)
+    try:
+        page = conversation_store.list_conversations(agent_name="gamma")
+    finally:
+        event.remove(engine, "checkout", _on_checkout)
+
+    assert {c.id for c in page.data} == {conv.id}
+    assert peak_checked_out, "the listing must check out a connection"
+    assert max(peak_checked_out) == 1
+
+
 def test_list_conversations_agent_id_none_disables_filter(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
@@ -6371,6 +6473,47 @@ def test_fork_conversation_truncated_drops_external_session_directive(
     assert fork.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
 
 
+@pytest.mark.parametrize("cutoff", ["up_to_response_id", "before_item_id", "cross_family"])
+def test_fork_of_a_fork_drops_inherited_native_directive(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+    cutoff: str,
+) -> None:
+    """A truncated or cross-family fork drops the native directive its source inherited.
+
+    Fork A into B, then truncate B or fork it the way a cross-family fork
+    does (``resume_source_native_session=False``): an inherited directive
+    naming A's native session would make the runner clone A's full
+    transcript, bringing back discarded turns or handing the target a
+    transcript in the wrong format.
+    """
+    from omnigent.stores.conversation_store import FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY
+
+    agent_store.create(
+        agent_id="9d1f0e2c3b4a49588f7e6d5c4b3a2910",
+        name="fork-of-fork-trunc",
+        bundle_location="9d1f0e2c3b4a49588f7e6d5c4b3a2910/fakehash",
+    )
+    chat_a = conversation_store.create_conversation(agent_id="9d1f0e2c3b4a49588f7e6d5c4b3a2910")
+    conversation_store.set_external_session_id(chat_a.id, "claude-uuid-a")
+    _append_three_responses(conversation_store, chat_a.id)
+    chat_b = conversation_store.fork_conversation(chat_a.id)
+    assert chat_b.labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY) == "claude-uuid-a"
+    conversation_store.set_external_session_id(chat_b.id, "claude-uuid-b")
+
+    second_prompt_id = conversation_store.list_items(chat_b.id).data[2].id
+    cutoff_kwargs: dict[str, Any] = {
+        "up_to_response_id": {"up_to_response_id": "resp_001"},
+        "before_item_id": {"before_item_id": second_prompt_id},
+        "cross_family": {"resume_source_native_session": False},
+    }[cutoff]
+    fork = conversation_store.fork_conversation(chat_b.id, **cutoff_kwargs)
+
+    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in fork.labels, fork.labels
+    if cutoff == "cross_family":
+        assert len(conversation_store.list_items(fork.id).data) == 6
+
+
 def test_fork_conversation_cross_family_drops_external_session_directive(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
@@ -6474,6 +6617,7 @@ def test_fork_conversation_up_to_unknown_response_raises(
 def test_fork_conversation_before_item_drops_the_item_and_later_history(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
+    db_uri: str,
 ) -> None:
     """``before_item_id`` copies only the items positioned before that item.
 
@@ -6505,6 +6649,20 @@ def test_fork_conversation_before_item_drops_the_item_and_later_history(
     fork = conversation_store.fork_conversation(source.id, before_item_id=second_prompt.id)
     assert fork_texts(fork.id) == ["Q1", "A1"]
     assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in fork.labels
+
+    # A rewind continues the source in place: the cutoff holds, and the fork
+    # is born on the source's host.
+    HostStore(db_uri).upsert_on_connect("f" * 32, "laptop", RESERVED_USER_LOCAL)
+    conversation_store.set_host_id(source.id, "f" * 32, "/work/repo", "main")
+    rewound = conversation_store.fork_conversation(
+        source.id, before_item_id=second_prompt.id, continue_source=True
+    )
+    assert fork_texts(rewound.id) == ["Q1", "A1"]
+    assert (rewound.host_id, rewound.workspace, rewound.git_branch) == (
+        "f" * 32,
+        "/work/repo",
+        "main",
+    )
 
     first = conversation_store.fork_conversation(source.id, before_item_id=first_prompt.id)
     assert fork_texts(first.id) == []
@@ -7691,8 +7849,12 @@ def test_list_conversations_project_none_disables_filter(
 
 def test_set_conversation_project_files_and_unfiles(
     conversation_store: SqlAlchemyConversationStore,
+    monkeypatch,
 ) -> None:
     """``set_conversation_project`` sets and clears first-class membership."""
+    from omnigent.db.db_models import SqlPreference, current_workspace_id
+    from omnigent.errors import OmnigentError
+
     project_id = "b" * 32
     conv = conversation_store.create_conversation()
     assert conv.project_id is None
@@ -7705,13 +7867,40 @@ def test_set_conversation_project_files_and_unfiles(
     unfiled = conversation_store.set_conversation_project(conv.id, None)
     assert unfiled is True
     assert conversation_store.get_conversation(conv.id).project_id is None
+    with Session(conversation_store._engine) as session:
+        assert (
+            session.get(SqlPreference, (current_workspace_id(), "__session_families__", conv.id))
+            is None
+        )
+
+    standalone = conversation_store.get_conversation(conv.id)
+    sibling = conversation_store.create_conversation()
+    conversation_store.add_new_sibling(conv.id, sibling.id, user_id="alice")
+    with monkeypatch.context() as patch:
+        patch.setattr(conversation_store, "get_conversation", lambda _: standalone)
+        with pytest.raises(OmnigentError, match="family changed"):
+            conversation_store.set_conversation_project(conv.id, project_id)
+    assert all(
+        member.project_id is None for member in conversation_store.get_session_family(conv.id)
+    )
 
 
+@pytest.mark.parametrize("history_exists", [False, True])
 def test_set_conversation_project_unknown_session_returns_false(
     conversation_store: SqlAlchemyConversationStore,
+    history_exists: bool,
 ) -> None:
-    """Filing a non-existent session updates nothing and returns ``False``."""
-    result = conversation_store.set_conversation_project("f" * 32, "b" * 32)
+    """Filing a session without metadata updates nothing and returns ``False``."""
+    from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+
+    session_id = "f" * 32
+    if history_exists:
+        conversation_store.create_conversation(conversation_id=session_id)
+        with Session(conversation_store._engine) as session:
+            metadata = session.get(SqlConversationMetadata, (current_workspace_id(), session_id))
+            session.delete(metadata)
+            session.commit()
+    result = conversation_store.set_conversation_project(session_id, "b" * 32)
     assert result is False
 
 
@@ -7748,8 +7937,10 @@ def test_list_conversations_filters_by_project_name_dual_read(
     assert labelled.id not in unfiled_ids
 
 
+@pytest.mark.parametrize("user_id", ["alice", "a" * 112])
 def test_list_conversations_filters_by_pinned_label(
     conversation_store: SqlAlchemyConversationStore,
+    user_id: str,
 ) -> None:
     """``list_conversations(pinned=True, pinned_owner=<user>)`` returns only the
     sessions THAT user has pinned — matched by their per-user
@@ -7762,12 +7953,12 @@ def test_list_conversations_filters_by_pinned_label(
     other = conversation_store.create_conversation(title="other")
     also_pinned_by_bob = conversation_store.create_conversation(title="bob's pin")
     # Alice pins one; Bob pins a different one — each under their own key.
-    conversation_store.set_labels(pinned.id, {pinned_label_key("alice"): "1721760000000"})
+    conversation_store.set_labels(pinned.id, {pinned_label_key(user_id): "1721760000000"})
     conversation_store.set_labels(
         also_pinned_by_bob.id, {pinned_label_key("bob"): "1721760000000"}
     )
 
-    alice_page = conversation_store.list_conversations(pinned=True, pinned_owner="alice")
+    alice_page = conversation_store.list_conversations(pinned=True, pinned_owner=user_id)
     alice_ids = {c.id for c in alice_page.data}
     assert alice_ids == {pinned.id}
     # Bob's pin and the never-pinned row must not surface for Alice.
@@ -7775,27 +7966,30 @@ def test_list_conversations_filters_by_pinned_label(
     assert other.id not in alice_ids
 
     # Unpin (Alice's key deleted) removes it from her pinned filter.
-    conversation_store.delete_label(pinned.id, pinned_label_key("alice"))
-    assert conversation_store.list_conversations(pinned=True, pinned_owner="alice").data == []
+    conversation_store.delete_label(pinned.id, pinned_label_key(user_id))
+    assert conversation_store.list_conversations(pinned=True, pinned_owner=user_id).data == []
+
+    conversation_store.add_new_sibling(pinned.id, other.id, user_id=user_id)
+    conversation_store.set_family_pin(pinned.id, "1721760000001", user_id=user_id)
+    assert {
+        row.id
+        for row in conversation_store.list_conversations(pinned=True, pinned_owner=user_id).data
+    } == {pinned.id, other.id}
+    conversation_store.set_family_pin(pinned.id, "", user_id=user_id)
+    assert conversation_store.list_conversations(pinned=True, pinned_owner=user_id).data == []
 
 
-def test_pinned_label_key_fits_column_for_long_user_ids() -> None:
-    """The per-user pin key must never overflow the ``String(128)`` label-key
-    column. Short ids stay verbatim (DB-readable); an over-long id (e.g. a long
-    SSO subject) falls back to a fixed-width hash suffix, deterministic in the
-    id so writes and the pinned filter still agree."""
-    from omnigent.stores.conversation_store import PINNED_LABEL_KEY, pinned_label_key
+@pytest.mark.parametrize("length", [105, 106, 112, 113, 128, 200])
+@pytest.mark.parametrize("family", [False, True])
+def test_pinned_label_key_fits_column_for_long_user_ids(length, family) -> None:
+    from omnigent.stores.conversation_store import family_pinned_label_key, pinned_label_key
 
-    # A normal email is used verbatim.
-    assert pinned_label_key("alice@example.com") == f"{PINNED_LABEL_KEY}.alice@example.com"
-
-    # A 200-char id can't fit raw; the key must still be ≤ 128 and deterministic.
-    long_id = "u" * 200
-    key = pinned_label_key(long_id)
+    key_for = family_pinned_label_key if family else pinned_label_key
+    assert key_for("alice@example.com").endswith(".alice@example.com")
+    key = key_for("u" * length)
     assert len(key) <= 128
-    assert key == pinned_label_key(long_id)  # deterministic
-    # Distinct long ids don't collide.
-    assert pinned_label_key("u" * 200) != pinned_label_key("v" * 200)
+    assert key == key_for("u" * length)
+    assert key != key_for("v" * length)
 
 
 def test_list_projects_owned_by_excludes_shared_only_projects(
@@ -8107,8 +8301,9 @@ def test_runner_change_resets_a_flag_stored_after_the_row_was_read(
     assert reported is not None and reported.background_work_running is True
 
 
+@pytest.mark.parametrize("deleted_host", [False, True])
 def test_runner_reassignment_and_its_rollback_reset_the_background_flag(
-    conversation_store: SqlAlchemyConversationStore, db_uri: str
+    conversation_store: SqlAlchemyConversationStore, db_uri: str, deleted_host: bool
 ) -> None:
     """
     Moving a session to another host's runner, and moving it back, reset the flag.
@@ -8118,7 +8313,16 @@ def test_runner_reassignment_and_its_rollback_reset_the_background_flag(
     """
     store = conversation_store
     host_id = "c" * 32
-    _register_host(db_uri, host_id)
+    hosts = HostStore(db_uri)
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="reassignment-host",
+        user_id=RESERVED_USER_LOCAL,
+        token="launch-token",
+        provider="modal",
+        sandbox_id="sandbox",
+        token_expires_at=2_000_000_000,
+    )
     store.create_conversation(
         runner_id="runner_b", host_id=host_id, workspace="/repo", git_branch="main"
     )
@@ -8137,9 +8341,16 @@ def test_runner_reassignment_and_its_rollback_reset_the_background_flag(
     store.set_background_work_running(target.id, True, runner_id="runner_b", reported_at=10)
     assert flag() is True
 
+    if deleted_host:
+        hosts.delete_host(host_id)
+    before_rollback = store.get_conversation(target.id)
     assert store.rollback_runner_reassignment(
         previous, expected_runner_id="runner_b", expected_host_id=host_id
-    )
+    ) is (not deleted_host)
+    if deleted_host:
+        assert store.get_conversation(target.id) == before_rollback
+        assert before_rollback is not None and before_rollback.host_id is None
+        return
     assert flag() is None
     store.set_background_work_running(target.id, False, runner_id="runner_a", reported_at=1)
     assert flag() is False
@@ -9608,9 +9819,9 @@ def test_profiled_host_binding_commits_atomically(conversation_store, db_uri, fa
 
 
 @pytest.mark.parametrize("accepted", [False, True])
-@pytest.mark.parametrize("newer_binding", [False, True])
+@pytest.mark.parametrize("binding_state", ["unchanged", "newer_runner", "deleted_host"])
 def test_profiled_host_rollback_preserves_prior_and_newer_bindings(
-    conversation_store, db_uri, accepted, newer_binding
+    conversation_store, db_uri, accepted, binding_state
 ):
     from omnigent.stores.sandbox_profile_store import SandboxProfileStore
 
@@ -9618,6 +9829,18 @@ def test_profiled_host_rollback_preserves_prior_and_newer_bindings(
     conversation = conversation_store.create_conversation()
     snapshot = _ACCEPTED_PROFILE
     host_id = uuid.uuid4().hex
+    if binding_state == "deleted_host":
+        hosts = HostStore(db_uri)
+        hosts.register_managed_host(
+            host_id=host_id,
+            name="profiled-host",
+            user_id=RESERVED_USER_LOCAL,
+            token="launch-token",
+            provider="modal",
+            sandbox_id="sandbox",
+            token_expires_at=2_000_000_000,
+        )
+        conversation_store.set_host_id(conversation.id, host_id, "/previous")
     if accepted:
         profiles.bind_session(conversation.id, snapshot)
     conversation = conversation_store.get_conversation(conversation.id)
@@ -9629,13 +9852,19 @@ def test_profiled_host_rollback_preserves_prior_and_newer_bindings(
         runner_id="attempt",
         git_branch="launch",
     )
-    if newer_binding:
+    if binding_state == "newer_runner":
         conversation_store.replace_runner_id(conversation.id, "replacement")
+    elif binding_state == "deleted_host":
+        hosts.delete_host(host_id)
+    before_rollback = conversation_store.get_conversation(conversation.id)
     assert conversation_store.rollback_profiled_host(
         previous, expected_host_id=host_id, expected_runner_id="attempt"
-    ) is (not newer_binding)
+    ) is (binding_state == "unchanged")
     current = conversation_store.get_conversation(conversation.id)
-    if newer_binding:
+    if binding_state == "deleted_host":
+        assert current == before_rollback and current.host_id is None
+        assert profiles.get_session_snapshot(conversation.id) == snapshot
+    elif binding_state == "newer_runner":
         assert current.runner_id == "replacement" and current.host_id == host_id
         assert current.workspace == "/workspace" and current.git_branch == "launch"
         assert profiles.get_session_host_id(conversation.id) == host_id
@@ -9644,6 +9873,40 @@ def test_profiled_host_rollback_preserves_prior_and_newer_bindings(
         assert current == conversation
         assert profiles.get_session_snapshot(conversation.id) == (snapshot if accepted else None)
         assert profiles.get_session_host_id(conversation.id) is None
+
+
+@pytest.mark.parametrize("sandbox_id", [None, "sandbox"])
+def test_host_transfer_rollback_keeps_session_rebindable_after_source_deletion(
+    conversation_store, db_uri, sandbox_id
+):
+    hosts = HostStore(db_uri)
+    previous_host_id, target_host_id = uuid.uuid4().hex, uuid.uuid4().hex
+    hosts.register_managed_host(
+        host_id=previous_host_id,
+        name="previous-host",
+        user_id=RESERVED_USER_LOCAL,
+        token="launch-token",
+        provider="modal",
+        sandbox_id=sandbox_id,
+        token_expires_at=2_000_000_000,
+    )
+    hosts.upsert_on_connect(target_host_id, "target-host", RESERVED_USER_LOCAL)
+    conversation = conversation_store.create_conversation(
+        host_id=previous_host_id, workspace="/previous"
+    )
+    previous = conversation_store.get_profile_host_binding(conversation.id)
+    assert conversation_store.set_runner_id(conversation.id, "attempt")
+    conversation_store.set_host_id(conversation.id, target_host_id, "/workspace", "launch")
+    hosts.delete_host(previous_host_id)
+
+    assert conversation_store.rollback_profiled_host(
+        previous, expected_host_id=target_host_id, expected_runner_id="attempt"
+    )
+    current = conversation_store.get_conversation(conversation.id)
+    assert current.runner_id is None and current.host_id is None
+    assert current.workspace is None and current.git_branch is None
+    assert conversation_store.set_runner_id(conversation.id, "retry")
+    conversation_store.set_host_id(conversation.id, target_host_id, "/workspace")
 
 
 @pytest.mark.parametrize("change", ["profile", "workspace"])
@@ -9750,3 +10013,362 @@ def test_spawn_tree_read_examines_rows_through_the_root_index(
             )
             assert "ix_conversations_root_conversation_id" in plan, plan
             assert "TEMP B-TREE" not in plan, plan
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("split_database", [False, True])
+@pytest.mark.parametrize("user_id", ["alice", "a" * 112])
+async def test_sibling_family_lifecycle(tmp_path, split_database, user_id, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.errors import OmnigentError
+    from omnigent.stores.conversation_store import (
+        FAMILY_PIN_LABEL_PREFIX,
+        family_pinned_label_key,
+        pinned_label_key,
+    )
+
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}",
+        f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None,
+    )
+    source = store.create_conversation(conversation_id="1" * 32, title="Coordinator")
+    first = store.create_conversation(
+        conversation_id="2" * 32, title="Research", labels={"omni_project": "Other project"}
+    )
+    second = store.create_conversation(conversation_id="3" * 32, title="Implementation")
+    store.set_labels(
+        source.id,
+        {
+            pinned_label_key(user_id): "123",
+            "omni_project": "Family project",
+            "unrelated": "keep private",
+        },
+    )
+    label_copy_queries = []
+
+    def capture_label_copy(_conn, _cursor, statement, parameters, context, _many):
+        columns = getattr(context.compiled.statement, "selected_columns", None)
+        if columns is not None and list(columns.keys()) == ["key", "value"]:
+            label_copy_queries.append((statement, parameters))
+
+    event.listen(store._conv_engine, "before_cursor_execute", capture_label_copy)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(store.add_new_sibling, source.id, member.id, user_id=user_id)
+                for member in (first, second)
+            ]
+            for future in futures:
+                future.result()
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", capture_label_copy)
+    assert label_copy_queries
+    assert (
+        sum(
+            ".key IN (" in statement.replace('"', "")
+            and set(parameters[-3:])
+            == {"omni_project", pinned_label_key(user_id), family_pinned_label_key(user_id)}
+            for statement, parameters in label_copy_queries
+        )
+        >= 2
+    )
+    family = store.get_session_family(first.id)
+    assert [member.id for member in family] == [source.id, first.id, second.id]
+    assert all(member.family_id == source.id for member in family)
+    assert all(member.labels.get("omni_project") == "Family project" for member in family)
+    assert all("unrelated" not in member.labels for member in family[1:])
+    assert {
+        row.id for row in store.list_conversations(pinned=True, pinned_owner=user_id).data
+    } == {
+        source.id,
+        first.id,
+        second.id,
+    }
+    assert all("omnigent.session_family_id" not in member.labels for member in family)
+    with workspace_scope(424242):
+        other_source = store.create_conversation(conversation_id=source.id)
+        other_sibling = store.create_conversation(conversation_id="6" * 32)
+        store.add_new_sibling(other_source.id, other_sibling.id, user_id=user_id)
+        assert {member.id for member in store.get_session_family(other_source.id)} == {
+            other_source.id,
+            other_sibling.id,
+        }
+    assert {member.id for member in store.get_session_family(source.id)} == {
+        source.id,
+        first.id,
+        second.id,
+    }
+    assert all(
+        member.parent_conversation_id is None and member.root_conversation_id == member.id
+        for member in family
+    )
+    assert all(family_pinned_label_key(user_id) in member.labels for member in family)
+    assert pinned_label_key(user_id) not in family[0].labels
+    fork = store.fork_conversation(source.id)
+    assert fork.family_id is None
+    assert [member.id for member in store.get_session_family(fork.id)] == [fork.id]
+    assert not any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in fork.labels)
+    for parent in (source, fork):
+        with pytest.raises(OmnigentError, match="no longer available"):
+            store.add_new_sibling(parent.id, first.id, user_id=user_id)
+    store.set_labels(first.id, {pinned_label_key(user_id): "234"})
+    store.set_family_pin(source.id, "", user_id=user_id)
+    assert store.get_conversation(first.id).labels[pinned_label_key(user_id)] == "234"
+    project_id = "4" * 32
+    with pytest.raises(OmnigentError, match="representative"):
+        store.set_conversation_project(first.id, project_id)
+    store.set_conversation_project(source.id, project_id)
+    assert all(member.project_id == project_id for member in store.get_session_family(second.id))
+    store.update_conversation(source.id, archived=True)
+    store.set_family_pin(first.id, "345", user_id=user_id)
+    assert await store.delete_conversation(source.id)
+    assert [member.id for member in store.get_session_family(second.id)] == [first.id, second.id]
+    assert store.get_conversation(second.id).labels[family_pinned_label_key(user_id)] == "345"
+    later = store.create_conversation(
+        conversation_id="5" * 32, title="Follow-up", labels={"omni_project": "Other project"}
+    )
+    store.add_new_sibling(second.id, later.id, user_id=user_id)
+    assert store.get_conversation(later.id).family_id == source.id
+    assert store.get_conversation(later.id).project_id == project_id
+    assert "omni_project" not in store.get_conversation(later.id).labels
+    assert store.get_conversation(later.id).labels[family_pinned_label_key(user_id)] == "345"
+    reopened = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}",
+        f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None,
+    )
+    assert {member.id for member in reopened.get_session_family(later.id)} == {
+        first.id,
+        second.id,
+        later.id,
+    }
+
+    replacement = store.create_conversation(conversation_id=source.id)
+    store.set_conversation_project(replacement.id, None)
+    assert store.get_conversation(replacement.id).project_id is None
+    assert all(member.project_id == project_id for member in store.get_session_family(later.id))
+    candidate = store.create_conversation()
+    with pytest.raises(OmnigentError, match="another family"):
+        store.add_new_sibling(replacement.id, candidate.id, user_id=user_id)
+    assert store.get_conversation(replacement.id).family_id is None
+    assert store.get_conversation(candidate.id).family_id is None
+
+    another = store.create_conversation()
+    another_sibling = store.create_conversation(labels={"omni_project": "Other project"})
+    store.add_new_sibling(another.id, another_sibling.id, user_id=user_id)
+    assert store.get_conversation(another_sibling.id).project_id is None
+    assert "omni_project" not in store.get_conversation(another_sibling.id).labels
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store._FAMILY_READ_BATCH_SIZE", 1
+    )
+    query_sizes = []
+
+    def capture_size(_conn, _cursor, _statement, parameters, _context, _many):
+        query_sizes.append(len(parameters))
+
+    engines = {store._engine, store._conv_engine}
+    for engine in engines:
+        event.listen(engine, "before_cursor_execute", capture_size)
+    try:
+        families = store.get_session_families([source.id, another.id])
+    finally:
+        for engine in engines:
+            event.remove(engine, "before_cursor_execute", capture_size)
+    assert query_sizes and max(query_sizes) <= 4
+    assert [member.id for member in families[source.id]] == [first.id, second.id, later.id]
+    assert [member.id for member in families[another.id]] == [another.id, another_sibling.id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_failed", [False, True])
+async def test_family_limit_counts_archived_members_and_cleans_up_rejected_creation(
+    conversation_store, monkeypatch, cleanup_failed, caplog
+):
+    from omnigent.errors import OmnigentError
+    from omnigent.server.session_families import complete_sibling_creation
+    from omnigent.stores.conversation_store import MAX_SESSION_FAMILY_MEMBERS
+
+    store = conversation_store
+    source = store.create_conversation()
+    for _ in range(MAX_SESSION_FAMILY_MEMBERS - 1):
+        member = store.create_conversation()
+        store.add_new_sibling(source.id, member.id, user_id="alice")
+        store.update_conversation(member.id, archived=True)
+    retained = {member.id for member in store.get_session_family(source.id)}
+    assert len(retained) == MAX_SESSION_FAMILY_MEMBERS
+    rejected = store.create_conversation()
+    if cleanup_failed:
+
+        async def fail_cleanup(session_id):
+            assert session_id == rejected.id
+            raise RuntimeError("cleanup database unavailable")
+
+        monkeypatch.setattr(store, "delete_conversation", fail_cleanup)
+    with pytest.raises(OmnigentError, match=f"up to {MAX_SESSION_FAMILY_MEMBERS}"):
+        await complete_sibling_creation(store, source.id, rejected.id, user_id="alice")
+    if cleanup_failed:
+        assert "Failed to discard rejected sibling" in caplog.text
+        assert store.get_conversation(rejected.id).family_id is None
+    else:
+        assert store.get_conversation(rejected.id) is None
+    assert {member.id for member in store.get_session_family(source.id)} == retained
+
+
+@pytest.mark.parametrize(
+    "split_database,retry_from_member", [(False, False), (True, False), (True, True)]
+)
+def test_failed_family_membership_preserves_source_pin(
+    tmp_path, monkeypatch, split_database, retry_from_member
+):
+    import asyncio
+
+    from omnigent.server.session_families import complete_sibling_creation
+    from omnigent.stores.conversation_store import (
+        family_pinned_label_key,
+        pinned_label_key,
+        sqlalchemy_store,
+    )
+
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}",
+        f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None,
+    )
+    source = store.create_conversation()
+    target = store.create_conversation()
+    store.set_labels(source.id, {pinned_label_key("alice"): "123"})
+    original = store._session_immediate
+
+    @contextmanager
+    def fail_membership_commit(operation):
+        with original(operation) as session:
+            yield session
+            if operation == "create_sibling_membership":
+                raise RuntimeError("metadata commit failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            store,
+            "_session_immediate",
+            MagicMock(side_effect=fail_membership_commit, engine=original.engine),
+        )
+        with pytest.raises(RuntimeError, match="metadata commit failed"):
+            store.add_new_sibling(source.id, target.id, user_id="alice")
+    for session_id in (source.id, target.id):
+        saved = store.get_conversation(session_id)
+        assert saved.family_id is None
+        assert family_pinned_label_key("alice") not in saved.labels
+    assert store.get_conversation(source.id).labels[pinned_label_key("alice")] == "123"
+    retry_source_id = source.id
+    if split_database:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                sqlalchemy_store,
+                "_upsert_prepared_labels",
+                MagicMock(side_effect=RuntimeError("label commit failed")),
+            )
+            with pytest.raises(RuntimeError, match="label commit failed"):
+                if retry_from_member:
+                    store.add_new_sibling(source.id, target.id, user_id="alice")
+                else:
+                    asyncio.run(
+                        complete_sibling_creation(store, source.id, target.id, user_id="alice")
+                    )
+        if retry_from_member:
+            retry_source_id = target.id
+        else:
+            assert store.get_conversation(target.id) is None
+        assert store.get_conversation(source.id).labels[pinned_label_key("alice")] == "123"
+        target = store.create_conversation()
+    store.add_new_sibling(retry_source_id, target.id, user_id="alice")
+    for member in store.get_session_family(source.id):
+        assert member.labels[family_pinned_label_key("alice")] == "123"
+        assert pinned_label_key("alice") not in member.labels
+    store.set_family_pin(source.id, "", user_id="alice")
+    assert not store.list_conversations(pinned=True, pinned_owner="alice").data
+
+
+@pytest.mark.parametrize("split_database", [False, True])
+def test_failed_family_project_move_preserves_legacy_membership(
+    tmp_path, monkeypatch, split_database
+):
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}",
+        f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None,
+    )
+    source = store.create_conversation(labels={"omni_project": "Original"})
+    sibling = store.create_conversation()
+    store.add_new_sibling(source.id, sibling.id, user_id="alice")
+    original = store._session_immediate
+
+    @contextmanager
+    def fail_project_commit(operation):
+        with original(operation) as session:
+            yield session
+            if operation == "move_session_family":
+                raise RuntimeError("metadata commit failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            store,
+            "_session_immediate",
+            MagicMock(side_effect=fail_project_commit, engine=original.engine),
+        )
+        with pytest.raises(RuntimeError, match="metadata commit failed"):
+            store.set_conversation_project(source.id, "a" * 32)
+    for member in store.get_session_family(source.id):
+        assert member.project_id is None
+        assert member.labels["omni_project"] == "Original"
+    if split_database:
+
+        def fail_cleanup(_connection, _cursor, statement, _parameters, _context, _many):
+            if statement.startswith("DELETE FROM conversation_labels"):
+                raise RuntimeError("label cleanup failed")
+
+        event.listen(store._conv_engine, "before_cursor_execute", fail_cleanup)
+        try:
+            with pytest.raises(RuntimeError, match="label cleanup failed"):
+                store.set_conversation_project(source.id, "a" * 32)
+        finally:
+            event.remove(store._conv_engine, "before_cursor_execute", fail_cleanup)
+        for member in store.get_session_family(source.id):
+            assert member.project_id == "a" * 32
+            assert member.labels["omni_project"] == "Original"
+    assert store.set_conversation_project(source.id, "a" * 32)
+    for member in store.get_session_family(source.id):
+        assert member.project_id == "a" * 32
+        assert "omni_project" not in member.labels
+
+
+def test_generic_label_writes_cannot_change_family_pins(conversation_store) -> None:
+    from omnigent.errors import OmnigentError
+
+    store = conversation_store
+    source = store.create_conversation()
+    key = "omnigent.family_pinned.alice"
+    for operation in (
+        lambda: store.create_conversation(labels={key: source.id}),
+        lambda: store.set_labels(source.id, {key: source.id}),
+        lambda: store.update_conversation_with_changes(source.id, label_updates={key: source.id}),
+        lambda: store.delete_label(source.id, key),
+    ):
+        with pytest.raises(OmnigentError, match="server-owned"):
+            operation()
+
+
+def test_family_membership_is_independent_of_labels(conversation_store) -> None:
+    store = conversation_store
+    source = store.create_conversation()
+    sibling = store.create_conversation()
+    key = "omnigent.session_family_id"
+    standalone = store.create_conversation(labels={key: source.id})
+    assert standalone.family_id is None
+    assert [member.id for member in store.get_session_family(standalone.id)] == [standalone.id]
+    store.add_new_sibling(source.id, sibling.id, user_id="alice")
+    store.set_labels(sibling.id, {key: standalone.id})
+    assert store.get_conversation(sibling.id).family_id == source.id
+    store.delete_label(sibling.id, key)
+    assert {member.id for member in store.get_session_family(sibling.id)} == {
+        source.id,
+        sibling.id,
+    }

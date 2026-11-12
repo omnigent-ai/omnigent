@@ -75,7 +75,15 @@ integration evidence separately; the browser test does not exercise them.
 ## Gotchas
 
 - Empty catalogs for participating providers block launch. There is no Default
-  fallback. Nonparticipating providers have no profile picker.
+  fallback in the picker. Nonparticipating providers have no profile picker.
+- `sandbox.default_profile_id` gives a participating provider a server-side default
+  for creates that name no profile (API clients, scheduled fresh sandboxes). It is
+  authorized and saved like an explicit pick. `GET /v1/sandbox-profiles` reports it as
+  `default_profile_ids`, and the composer and fork dialog preselect it when nothing else
+  is chosen.
+- The composer starts on the profile last picked on that provider (saved on pick, per
+  provider in `localStorage`), resolved by id on its current revision, ahead of the
+  default. A profile the provider no longer lists falls back to the default.
 - Discovery is scoped to the selected provider so unrelated outages do not block
   ordinary launches. Listing is advisory; the server reauthorizes selection.
 - A stale or revoked choice requires explicit reselection. Saved sessions cannot
@@ -86,7 +94,8 @@ integration evidence separately; the browser test does not exercise them.
   profile availability. Resource location must survive catalog changes.
 - The example owns image/resource configuration. Core has no configuration schema,
   admin editor, catalog writes, directory connector or identity management.
-- Scheduled fresh sandboxes reject profile-requiring defaults at task create/update.
+- Scheduled fresh sandboxes reject profile-requiring defaults at task create/update
+  unless the default provider has a default profile, which each fire then saves.
   The session-create tool accepts explicit provider/profile/revision fields for managed placement.
   Native `/clear` and `/fork` reauthorize and
   bind the replacement before detaching the source; the last directly bound
@@ -96,6 +105,13 @@ integration evidence separately; the browser test does not exercise them.
   so it keeps the source's `omnigent.sandbox.*` labels: a relaunch re-clones
   the same repositories and routes by the same host id. No history or files
   are copied, and a fork that cannot be bound is deleted again.
+  claude-sdk and Claude Code native `/rewind` continue the same way, in a fork
+  holding the history before the chosen prompt and the source's files. Both
+  reauthorize the source's accepted profile on the continuation, so with no
+  live runner it still wakes the sandbox after the source is deleted; a
+  profile revoked since it was accepted refuses the command with a 403 and
+  leaves no continuation
+  (`tests/server/integration/test_sandbox_profile_launch.py::test_offline_clear_continuation_keeps_the_accepted_profile`).
 - Missing sandboxes use the bound session's reference for replacement. Legacy host
   recovery rejects histories over 200 sessions; use controller lookup for larger
   histories. Runner-host discovery and reconnect liveness have a separate limit
@@ -110,5 +126,11 @@ integration evidence separately; the browser test does not exercise them.
   changes or new indexes are involved.
   Before first opt-in, complete the [legacy-label audit](../docs/extending/provider_profiles.md#rollout-rollback-and-verification)
   after upgrading every writer. Enable the flag before configuring a provider that requires profiles.
+- Existing unprofiled sessions retain wake, relaunch, missing-sandbox replacement
+  and runner rotation after opt-in. The provider must retain its unselected
+  lifecycle path; scoped lookup returns `None` only for an authorized legacy
+  resource. Fresh sandbox creation still requires an explicit selection or a
+  configured provider default, and saved profiles never fall back to defaults. The rollout regression lives in
+  `tests/server/integration/test_sandbox_profile_launch.py::test_unprofiled_session_survives_provider_opt_in`.
 
 Controller recovery is covered in `tests/server/integration/test_sandbox_profile_controller.py`: last-session deletion, restart, historical revision, revocation and missing-sandbox replacement. The [controller walkthrough](../examples/sandbox-profile-provider/README.md#controller-recovery-demo) is runnable without a cluster.

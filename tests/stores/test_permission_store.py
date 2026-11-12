@@ -1112,6 +1112,12 @@ def test_list_for_sessions_returns_grouped_grants(
     assert len(result[conv_b]) == 1
     assert result[conv_b][0].user_id == "alice"
 
+    for user_id in {grant.user_id for grants in result.values() for grant in grants}:
+        assert store.list_for_sessions([conv_a, conv_b], user_id=user_id) == {
+            conversation_id: [grant for grant in grants if grant.user_id == user_id]
+            for conversation_id, grants in result.items()
+        }
+
 
 def test_list_for_sessions_empty_input(store: SqlAlchemyPermissionStore) -> None:
     """list_for_sessions with empty list returns empty dict."""
@@ -1346,3 +1352,16 @@ def test_resolve_access_cache_evicts_least_recently_used_over_cap(
     finally:
         detach()
     assert count[0] == 1, f"only the LRU-evicted entry should re-read, got {count[0]}"
+
+
+# ── validate_grants (default) ─────────────────────────────────────────────────
+
+
+def test_validate_grants_default_keeps_order_and_creates_no_users(
+    store: SqlAlchemyPermissionStore,
+) -> None:
+    """The base default accepts every grant in input order and writes nothing."""
+    grants = [("bob@example.com", 1), ("alice@example.com", 2), ("__public__", 1)]
+    assert store.validate_grants(grants) == grants
+    assert store.validate_grants([]) == []
+    assert store.user_exists("bob@example.com") is False

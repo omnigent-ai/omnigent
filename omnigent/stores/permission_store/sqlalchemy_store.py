@@ -29,6 +29,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
+    effective_admin,
 )
 from omnigent.server.sharing_settings import effective_public_level
 from omnigent.stores.permission_store import PermissionStore
@@ -379,7 +380,9 @@ class SqlAlchemyPermissionStore(PermissionStore):
             next_cursor = None
         return [_to_entity(r) for r in rows], next_cursor
 
-    def list_for_sessions(self, conversation_ids: list[str]) -> dict[str, list[SessionPermission]]:
+    def list_for_sessions(
+        self, conversation_ids: list[str], *, user_id: str | None = None
+    ) -> dict[str, list[SessionPermission]]:
         """Return all grants for multiple sessions.  See base class for contract."""
         if not conversation_ids:
             return {}
@@ -392,6 +395,11 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     select(SqlSessionPermission).where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.conversation_id.in_(conversation_ids),
+                        *(
+                            [SqlSessionPermission.user_id == user_id]
+                            if user_id is not None
+                            else []
+                        ),
                     )
                 )
                 .scalars()
@@ -534,7 +542,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """Return the user's effective permission level. See base class for contract."""
         if user_id is None:
             return None
-        if self.is_admin(user_id):
+        if effective_admin(self.is_admin(user_id)):
             return LEVEL_OWNER
         grant = self.get(user_id, conversation_id)
         public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
