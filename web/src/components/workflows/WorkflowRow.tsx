@@ -14,16 +14,16 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import type { WorkflowSummary } from "@/hooks/useWorkflows";
+import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { cn } from "@/lib/utils";
 
 export interface WorkflowRowProps {
-  workflow: WorkflowSummary;
-  onRun: (workflow: WorkflowSummary) => void;
-  onEdit: (workflow: WorkflowSummary) => void;
-  onCreateAutomation: (workflow: WorkflowSummary) => void;
-  onDelete: (workflow: WorkflowSummary) => void;
+  workflow: SavedWorkflow;
+  onRun: (workflow: SavedWorkflow) => void;
+  onEdit: (workflow: SavedWorkflow) => void;
+  onCreateAutomation: (workflow: SavedWorkflow) => void;
+  onDelete: (workflow: SavedWorkflow) => void;
 }
 
 /**
@@ -101,11 +101,11 @@ function WorkflowMenuItems({
   onDelete,
 }: {
   Item: ComponentType<MenuItemProps>;
-  workflow: WorkflowSummary;
-  onRun: (workflow: WorkflowSummary) => void;
-  onEdit: (workflow: WorkflowSummary) => void;
-  onCreateAutomation: (workflow: WorkflowSummary) => void;
-  onDelete: (workflow: WorkflowSummary) => void;
+  workflow: SavedWorkflow;
+  onRun: (workflow: SavedWorkflow) => void;
+  onEdit: (workflow: SavedWorkflow) => void;
+  onCreateAutomation: (workflow: SavedWorkflow) => void;
+  onDelete: (workflow: SavedWorkflow) => void;
 }) {
   const { trackClick } = useOmnigentAnalytics();
   return (

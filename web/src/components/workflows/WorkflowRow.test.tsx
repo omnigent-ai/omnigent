@@ -1,22 +1,17 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { WorkflowSummary } from "@/hooks/useWorkflows";
+import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 
 import { WorkflowRow } from "./WorkflowRow";
 
-// Nov 12, 2026, in Unix epoch seconds.
-const SAVED_S = 1_794_484_800;
-
-const WORKFLOW: WorkflowSummary = {
+const WORKFLOW: SavedWorkflow = {
   id: "6f1c2b9a4d8e4f30a1b2c3d4e5f60718",
   name: "Fix flaky tests",
   description: "Reruns the suite and files an issue for each flaky test.",
-  created_at: SAVED_S,
-  updated_at: SAVED_S,
 };
 
-function renderRow(workflow: WorkflowSummary = WORKFLOW) {
+function renderRow(workflow: SavedWorkflow = WORKFLOW) {
   const handlers = {
     onRun: vi.fn(),
     onEdit: vi.fn(),

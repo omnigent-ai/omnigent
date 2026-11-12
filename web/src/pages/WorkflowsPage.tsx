@@ -2,8 +2,9 @@
  * Workflows page (`/workflows`): the user's saved workflows, a search, and a
  * "New workflow" button. Laid out like the Automations page.
  *
- * Data comes from `useWorkflows`. Creating a workflow will start a session
- * where the agent drafts it; that and the rows' actions aren't connected yet.
+ * New workflow opens the new-session page with a request for the agent to draft
+ * and save the workflow. Delete removes one; Run, Edit and Create automation
+ * aren't connected yet.
  */
 
 import { useMemo, useState } from "react";
@@ -15,25 +16,28 @@ import { Input } from "@/components/ui/input";
 import { showToast } from "@/components/ui/toast";
 import { NewWorkflowDialog } from "@/components/workflows/NewWorkflowDialog";
 import { WorkflowRow } from "@/components/workflows/WorkflowRow";
-import { useWorkflows } from "@/hooks/useWorkflows";
+import { useDeleteWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import { useNavigate } from "@/lib/routing";
+import { createWorkflowPrompt } from "@/lib/workflow";
 
 export function WorkflowsPage() {
-  const { data: workflows, isLoading, isError, refetch } = useWorkflows();
+  const { workflows, isLoading, isError, refresh } = useSavedWorkflows();
+  const deleteWorkflow = useDeleteWorkflow();
+  const navigate = useNavigate();
   const [search, setSearch] = useState("");
   const [creating, setCreating] = useState(false);
 
-  const hasAnyWorkflows = (workflows?.length ?? 0) > 0;
+  const hasAnyWorkflows = workflows.length > 0;
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();
-    const all = workflows ?? [];
-    if (!query) return all;
-    return all.filter(
+    if (!query) return workflows;
+    return workflows.filter(
       (workflow) =>
         workflow.name.toLowerCase().includes(query) ||
         workflow.description.toLowerCase().includes(query),
     );
   }, [workflows, search]);
-  const takenNames = useMemo(() => (workflows ?? []).map((workflow) => workflow.name), [workflows]);
+  const takenNames = useMemo(() => workflows.map((workflow) => workflow.name), [workflows]);
 
   return (
     <PageScroll className="[scrollbar-gutter:stable]" contentClassName="px-4 md:px-6">
@@ -76,7 +80,7 @@ export function WorkflowsPage() {
         >
           <TriangleAlertIcon className="size-4 shrink-0 text-destructive" />
           <span className="flex-1">Couldn’t load workflows.</span>
-          <Button variant="outline" size="sm" onClick={refetch} componentId="workflows.retry">
+          <Button variant="outline" size="sm" onClick={refresh} componentId="workflows.retry">
             Retry
           </Button>
         </div>
@@ -98,7 +102,11 @@ export function WorkflowsPage() {
               onCreateAutomation={() =>
                 showToast("Creating automations from workflows isn’t connected yet.")
               }
-              onDelete={() => showToast("Deleting workflows isn’t connected yet.")}
+              onDelete={() =>
+                deleteWorkflow.mutate(workflow.id, {
+                  onError: () => showToast(`Couldn’t delete “${workflow.name}”.`),
+                })
+              }
             />
           ))}
         </div>
@@ -107,7 +115,9 @@ export function WorkflowsPage() {
       <NewWorkflowDialog
         open={creating}
         onOpenChange={setCreating}
-        onCreate={() => showToast("Creating workflows isn’t connected yet.")}
+        onCreate={({ name, description }) =>
+          navigate(`/?prompt=${encodeURIComponent(createWorkflowPrompt(name, description))}`)
+        }
         takenNames={takenNames}
       />
     </PageScroll>

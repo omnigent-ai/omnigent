@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   REVIEW_PLAN_FIRST,
+  createWorkflowPrompt,
   offersSaveWorkflow,
   offersWorkflow,
   savedWorkflowMessage,
@@ -52,5 +53,13 @@ describe("saveWorkflowMessage", () => {
     );
     expect(offersSaveWorkflow([{ name: "save-workflow" }])).toBe(true);
     expect(offersSaveWorkflow([{ name: "workflow" }])).toBe(false);
+  });
+});
+
+describe("createWorkflowPrompt", () => {
+  it("asks the save-workflow skill to draft the named workflow without doing the work", () => {
+    expect(createWorkflowPrompt("  Triage flaky tests ", " Rerun the suite ")).toBe(
+      'Use the save-workflow skill to create a workflow named "Triage flaky tests" from this description, without doing the work:\n\nRerun the suite',
+    );
   });
 });

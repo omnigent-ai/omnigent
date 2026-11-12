@@ -2,55 +2,66 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { showToast } from "@/components/ui/toast";
-import { type WorkflowSummary, type WorkflowsQuery, useWorkflows } from "@/hooks/useWorkflows";
+import {
+  type SavedWorkflow,
+  useDeleteWorkflow,
+  useSavedWorkflows,
+} from "@/hooks/useSavedWorkflows";
+import type * as RoutingModule from "@/lib/routing";
+import { createWorkflowPrompt } from "@/lib/workflow";
 
 import { WorkflowsPage } from "./WorkflowsPage";
 
-vi.mock("@/hooks/useWorkflows", () => ({ useWorkflows: vi.fn() }));
+vi.mock("@/hooks/useSavedWorkflows", () => ({
+  useSavedWorkflows: vi.fn(),
+  useDeleteWorkflow: vi.fn(),
+}));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
+const navigate = vi.fn();
+vi.mock("@/lib/routing", async (importOriginal) => {
+  const actual = await importOriginal<typeof RoutingModule>();
+  return { ...actual, useNavigate: () => navigate };
+});
 
-const HOUR_S = 60 * 60;
-
-function workflow(name: string, description: string, ageS: number): WorkflowSummary {
-  const nowS = Math.floor(Date.now() / 1000);
-  return {
-    id: name.toLowerCase().replaceAll(" ", "-"),
-    name,
-    description,
-    created_at: nowS - ageS,
-    updated_at: nowS - ageS,
-  };
+function workflow(name: string, description: string): SavedWorkflow {
+  return { id: name.toLowerCase().replaceAll(" ", "-"), name, description };
 }
 
 const WORKFLOWS = [
-  workflow(
-    "Fix flaky tests",
-    "Reruns the suite and files an issue for each flaky test.",
-    2.5 * HOUR_S,
-  ),
-  workflow("Release a new version", "Tags the release and drafts the notes.", 3.5 * 24 * HOUR_S),
+  workflow("Fix flaky tests", "Reruns the suite and files an issue for each flaky test."),
+  workflow("Release a new version", "Tags the release and drafts the notes."),
 ];
 
-function mockWorkflows(query: Partial<WorkflowsQuery>) {
-  const refetch = vi.fn();
-  vi.mocked(useWorkflows).mockReturnValue({
-    data: undefined,
+function mockWorkflows(state: Partial<ReturnType<typeof useSavedWorkflows>>) {
+  const refresh = vi.fn();
+  vi.mocked(useSavedWorkflows).mockReturnValue({
+    workflows: [],
     isLoading: false,
     isError: false,
-    refetch,
-    ...query,
+    refresh,
+    ...state,
   });
-  return refetch;
+  return refresh;
 }
 
+const deleteWorkflow = vi.fn();
 const rows = () => screen.queryAllByTestId("workflow-row");
+const openMenu = (row: HTMLElement) =>
+  fireEvent.pointerDown(within(row).getByTestId("workflow-row-menu"), { button: 0 });
 
 describe("WorkflowsPage", () => {
-  beforeEach(() => vi.mocked(showToast).mockClear());
+  beforeEach(() => {
+    vi.mocked(showToast).mockClear();
+    navigate.mockClear();
+    deleteWorkflow.mockClear();
+    vi.mocked(useDeleteWorkflow).mockReturnValue({
+      mutate: deleteWorkflow,
+    } as unknown as ReturnType<typeof useDeleteWorkflow>);
+  });
   afterEach(cleanup);
 
   it("lists workflows with their descriptions", () => {
-    mockWorkflows({ data: WORKFLOWS });
+    mockWorkflows({ workflows: WORKFLOWS });
     render(<WorkflowsPage />);
 
     expect(screen.getByRole("heading", { name: "Workflows" })).toBeInTheDocument();
@@ -62,33 +73,40 @@ describe("WorkflowsPage", () => {
     ).toBeInTheDocument();
   });
 
-  it("says the row actions aren't connected yet", () => {
-    mockWorkflows({ data: WORKFLOWS });
+  it("deletes a workflow from its menu, and says when that fails", () => {
+    mockWorkflows({ workflows: WORKFLOWS });
     render(<WorkflowsPage />);
-    const openFirstMenu = () =>
-      fireEvent.pointerDown(within(rows()[0]!).getByTestId("workflow-row-menu"), { button: 0 });
 
-    openFirstMenu();
+    openMenu(rows()[0]!);
+    fireEvent.click(screen.getByTestId("workflow-delete"));
+    expect(deleteWorkflow).toHaveBeenCalledWith("fix-flaky-tests", expect.anything());
+
+    const { onError } = deleteWorkflow.mock.calls[0]![1] as { onError: () => void };
+    onError();
+    expect(showToast).toHaveBeenCalledWith("Couldn’t delete “Fix flaky tests”.");
+  });
+
+  it("says Run, Edit and Create automation aren't connected yet", () => {
+    mockWorkflows({ workflows: WORKFLOWS });
+    render(<WorkflowsPage />);
+
+    openMenu(rows()[0]!);
     fireEvent.click(screen.getByTestId("workflow-run"));
     expect(showToast).toHaveBeenLastCalledWith("Running workflows isn’t connected yet.");
 
-    openFirstMenu();
+    openMenu(rows()[0]!);
     fireEvent.click(screen.getByTestId("workflow-edit"));
     expect(showToast).toHaveBeenLastCalledWith("Editing workflows isn’t connected yet.");
 
-    openFirstMenu();
+    openMenu(rows()[0]!);
     fireEvent.click(screen.getByTestId("workflow-create-automation"));
     expect(showToast).toHaveBeenLastCalledWith(
       "Creating automations from workflows isn’t connected yet.",
     );
-
-    openFirstMenu();
-    fireEvent.click(screen.getByTestId("workflow-delete"));
-    expect(showToast).toHaveBeenLastCalledWith("Deleting workflows isn’t connected yet.");
   });
 
   it("searches names and descriptions", () => {
-    mockWorkflows({ data: WORKFLOWS });
+    mockWorkflows({ workflows: WORKFLOWS });
     render(<WorkflowsPage />);
 
     fireEvent.change(screen.getByTestId("workflows-search"), { target: { value: "release" } });
@@ -105,7 +123,7 @@ describe("WorkflowsPage", () => {
   });
 
   it("invites creating one when there are none, without a search", () => {
-    mockWorkflows({ data: [] });
+    mockWorkflows({ workflows: [] });
     render(<WorkflowsPage />);
 
     expect(screen.getByTestId("workflows-empty-state")).toHaveTextContent("No workflows yet");
@@ -118,16 +136,16 @@ describe("WorkflowsPage", () => {
     expect(screen.getByText("Loading workflows…")).toBeInTheDocument();
     unmount();
 
-    const refetch = mockWorkflows({ isError: true });
+    const refresh = mockWorkflows({ isError: true });
     render(<WorkflowsPage />);
     const error = screen.getByTestId("workflows-load-error");
     expect(error).toHaveTextContent("Couldn’t load workflows.");
     fireEvent.click(within(error).getByRole("button", { name: "Retry" }));
-    expect(refetch).toHaveBeenCalledOnce();
+    expect(refresh).toHaveBeenCalledOnce();
   });
 
-  it("opens New workflow, which checks names against the list", () => {
-    mockWorkflows({ data: WORKFLOWS });
+  it("creates a workflow in a new session that drafts it", () => {
+    mockWorkflows({ workflows: WORKFLOWS });
     render(<WorkflowsPage />);
 
     fireEvent.click(screen.getByTestId("new-workflow-button"));
@@ -147,7 +165,11 @@ describe("WorkflowsPage", () => {
     });
     fireEvent.click(within(dialog).getByTestId("new-workflow-create"));
 
-    expect(showToast).toHaveBeenCalledWith("Creating workflows isn’t connected yet.");
+    expect(navigate).toHaveBeenCalledWith(
+      `/?prompt=${encodeURIComponent(
+        createWorkflowPrompt("Upgrade a dependency", "Bump one package and fix what breaks"),
+      )}`,
+    );
     expect(screen.queryByRole("dialog", { name: "New workflow" })).toBeNull();
   });
 });

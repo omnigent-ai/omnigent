@@ -71,3 +71,15 @@ export function savedWorkflowMessage(
 export function saveWorkflowMessage(skillPrefix: string, name: string): string {
   return `${skillPrefix}${SAVE_WORKFLOW_SKILL} Save this session's plan as a workflow named "${name.trim()}".`;
 }
+
+/**
+ * The first message of a session that drafts a new workflow from a description.
+ * It names the save-workflow skill rather than invoking it: the new-session page
+ * picks the agent, and with it the skill prefix, after this is written.
+ *
+ * @param name The name the user picked, e.g. `"Triage flaky tests"`.
+ * @param description What the workflow should do, e.g. `"Rerun the suite and file issues"`.
+ */
+export function createWorkflowPrompt(name: string, description: string): string {
+  return `Use the ${SAVE_WORKFLOW_SKILL} skill to create a workflow named "${name.trim()}" from this description, without doing the work:\n\n${description.trim()}`;
+}
