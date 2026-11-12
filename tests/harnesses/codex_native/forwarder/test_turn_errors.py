@@ -1067,10 +1067,10 @@ async def test_provider_token_command_failure_posts_without_codex_login_hint(
     """A failed model provider token command is not a Codex login problem."""
     _seed_active_turn(tmp_path, "turn_123")
     message = (
-        "provider auth command `isaac` exited with status exit status: 1: [INFO] Access token "
+        "provider auth command `token` exited with status exit status: 1: [INFO] Access token "
         "expiring. Attempting silent refresh.\n[ERROR] Silent token refresh failed: Failed to "
         "refresh token: HTTP Error 400: Bad Request.\nError: Could not get an AI DevTools "
-        "access token. Run `isaac` to log in and try again."
+        "access token. Run `token` to log in and try again."
     )
     params = {
         "turn": {
@@ -1421,7 +1421,7 @@ async def test_handle_event_fails_retrying_turn_on_launcher_certificate_failure(
         "Codex could not connect to its model endpoint for gpt-5: the TLS certificate has expired"
     )
     assert "SSLV3_ALERT_CERTIFICATE_EXPIRED" in output
-    assert "run dbcert" in output
+    assert "Renew the TLS certificate" in output
     state = read_bridge_state(tmp_path)
     assert state is not None and state.active_turn_id is None
 

@@ -291,7 +291,7 @@ def test_codex_launcher_certificate_failure_fails_fast_with_actionable_error(
     assert "the TLS certificate has expired" in error["message"]
     assert "SSLV3_ALERT_CERTIFICATE_EXPIRED" in error["message"]
     assert error["code"] == "model_endpoint_certificate_rejected"
-    assert "run dbcert" in error["remediation"]
+    assert "Renew the TLS certificate" in error["remediation"]
     assert error["retryable"] is False
     assert "harness idle watchdog" not in output
     assert "wedged LLM" not in output
