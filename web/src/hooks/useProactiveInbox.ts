@@ -45,7 +45,10 @@ interface ScopeState {
    * must land in request order too, or an older total overwrites a newer one.
    */
   chain: Promise<unknown>;
-  /** Items the viewer resolved here; a later read or unread mark must not reopen them. */
+  /**
+   * Items the viewer resolved here, until their PATCH settles; a read or unread
+   * mark queued behind the resolution must not reopen them.
+   */
   resolved: Set<string>;
   /**
    * The status the server last agreed to for each pending item, so a list
@@ -214,6 +217,7 @@ export function useProactiveInbox(
             scope.pending.delete(id);
             scope.confirmed.delete(id);
             scope.started.delete(id);
+            scope.resolved.delete(id);
           }
           scope.inFlight -= 1;
           notify();

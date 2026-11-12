@@ -771,11 +771,10 @@ export function useMigrateLocalPinsToServer(
 }
 
 function inboxBadgeLabel(count: number, incomplete: boolean, capped: boolean): string {
-  const label = count === 1 ? "1 inbox item waiting" : `${count} inbox items waiting`;
-  if (incomplete) return `${label}; more automations not yet checked`;
-  // The server stops counting at its limit, so the total is a floor, not an excess.
-  if (capped) return `At least ${label}`;
-  return label;
+  const items = count === 1 ? "1 inbox item waiting" : `${count} inbox items waiting`;
+  // The server stops counting suggestions at its limit, so the total is a floor.
+  const label = capped ? `At least ${items}` : items;
+  return incomplete ? `${label}; more automations not yet checked` : label;
 }
 
 function SidebarImpl({

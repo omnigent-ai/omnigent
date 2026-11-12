@@ -15,11 +15,8 @@ const COPY: Record<ProactiveAgentSettingScope, string> = {
 };
 
 /**
- * On/off switch for the proactive agent (Omni Advisor): the viewer's own
- * setting, or the workspace-wide one for an admin. Renders nothing where the
- * server does not offer the agent, or for a workspace switch the viewer
- * cannot manage. While the settings load it says so, and a failed initial
- * read offers a retry instead of dropping the switch from the page.
+ * The viewer's or the workspace's Omni Advisor switch, gated by capability and
+ * permission; a failed initial read offers a retry.
  */
 export function ProactiveAgentSettingControl({ scope }: { scope: ProactiveAgentSettingScope }) {
   const { available, settings, query } = useProactiveAgentSettings();

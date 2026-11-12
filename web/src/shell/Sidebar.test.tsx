@@ -1234,6 +1234,25 @@ describe("Sidebar session list", () => {
       renderSidebar();
       const inbox = within(screen.getByTestId("inbox-button"));
       expect(inbox.getByLabelText("At least 100 inbox items waiting")).toHaveTextContent("100+");
+      cleanup();
+
+      // Unchecked automations qualify the same label rather than replacing it.
+      const automationInbox = vi.spyOn(automationInboxHook, "useAutomationInbox");
+      automationInbox.mockReturnValue({
+        items: [],
+        hasNextPage: true,
+      } as unknown as ReturnType<typeof automationInboxHook.useAutomationInbox>);
+      try {
+        mockConversations([]);
+        renderSidebar();
+        expect(
+          within(screen.getByTestId("inbox-button")).getByLabelText(
+            "At least 100 inbox items waiting; more automations not yet checked",
+          ),
+        ).toHaveTextContent("100+");
+      } finally {
+        automationInbox.mockRestore();
+      }
     } finally {
       proactiveInbox.mockRestore();
     }

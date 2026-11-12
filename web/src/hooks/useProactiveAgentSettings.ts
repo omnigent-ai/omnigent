@@ -48,6 +48,8 @@ export function useProactiveAgentSettings() {
     queryKey,
     enabled: available,
     staleTime: 60_000,
+    // Another client or an admin can change these; poll like the suggestions do.
+    refetchInterval: 300_000,
     queryFn: async () => readJson(await authenticatedFetch("/v1/proactive-agent/settings")),
   });
   return { available, settings: available ? query.data : undefined, query };
