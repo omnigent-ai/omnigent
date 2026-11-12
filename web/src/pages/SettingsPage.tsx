@@ -42,6 +42,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import { useViewerId } from "@/hooks/useViewerId";
 import {
@@ -118,7 +119,13 @@ import {
   fetchDatabricksStatus,
   type DatabricksConnectionStatus,
 } from "@/lib/databricksIntegration";
-import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import {
+  getCurrentIsAdmin,
+  getCurrentAdminEligibility,
+  resolveIdentity,
+  subscribeIdentity,
+} from "@/lib/identity";
+import { isAdminViewEnabled, setAdminViewEnabled } from "@/lib/adminView";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
@@ -277,7 +284,7 @@ import {
   writeCustomTheme,
 } from "@/lib/customTheme";
 import { useHostTheme } from "@/lib/embedded";
-import { getOmnigentThemeSettingsUrl } from "@/lib/host";
+import { getOmnigentThemeSettingsUrl, isDatabricksWorkspace } from "@/lib/host";
 import {
   applyImportedSettings,
   collectSettings,
@@ -1966,6 +1973,34 @@ function TerminalClipboardControl() {
   );
 }
 
+function AdminViewControl() {
+  const eligible = useSyncExternalStore(subscribeIdentity, getCurrentAdminEligibility, () => false);
+  const info = useServerInfo();
+  if (!eligible || info === "loading" || info.single_user || isDatabricksWorkspace()) return null;
+  return (
+    <SettingsGroup title="Administration">
+      <div className="flex items-center justify-between gap-4">
+        <SettingsLabel
+          label="Admin view"
+          description="Turn off to use your normal session access."
+        />
+        <Switch
+          aria-label="Admin view"
+          checked={isAdminViewEnabled()}
+          onCheckedChange={(enabled) => {
+            try {
+              setAdminViewEnabled(enabled);
+            } catch (error) {
+              toast.error(error instanceof Error ? error.message : "Could not change admin view.");
+            }
+          }}
+          componentId="settings.general.admin_view"
+        />
+      </div>
+    </SettingsGroup>
+  );
+}
+
 /** App-wide behavior settings. */
 function GeneralSection() {
   const info = useServerInfo();
@@ -2003,6 +2038,7 @@ function GeneralSection() {
             <GlobalShortcutControl />
           </SettingsGroup>
         )}
+        <AdminViewControl />
       </div>
     </Section>
   );

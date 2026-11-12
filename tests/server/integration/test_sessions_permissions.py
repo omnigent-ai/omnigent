@@ -1223,6 +1223,40 @@ async def test_admin_user_bypasses_permission_checks(
         f"admin user should be able to list permissions, got {resp.status_code}."
     )
 
+    auth_client.cookies.set("omnigent_admin_view", "off")
+    headers = {"X-Forwarded-Email": "admin-user"}
+    session_url = f"/v1/sessions/{session_id}"
+    assert (await auth_client.get(session_url, headers=headers)).status_code in (403, 404)
+    assert (
+        await auth_client.patch(session_url, headers=headers, json={"title": "Denied"})
+    ).status_code in (403, 404)
+    assert perm_store.is_admin("admin-user")
+
+    own = await _create_session_as(auth_client, agent["id"], "admin-user")
+    assert (
+        await auth_client.patch(
+            f"/v1/sessions/{own['id']}", headers=headers, json={"title": "Mine"}
+        )
+    ).status_code == 200
+    await _grant_permission(
+        auth_client, session_id, granter="user-a", target_user="admin-user", level=LEVEL_READ
+    )
+    assert (await auth_client.get(session_url, headers=headers)).json()[
+        "permission_level"
+    ] == LEVEL_READ
+    assert (
+        await auth_client.patch(session_url, headers=headers, json={"title": "Denied"})
+    ).status_code == 403
+
+    auth_client.cookies.set("omnigent_admin_view", "on")
+    assert (
+        await auth_client.patch(session_url, headers=headers, json={"title": "Admin edit"})
+    ).status_code == 200
+    auth_client.cookies.set("omnigent_admin_view", "off")
+    assert (
+        await auth_client.patch(session_url, headers=headers, json={"title": "Denied"})
+    ).status_code == 403
+
 
 # ── Revoke nonexistent: idempotent 204 ──────────────────────
 

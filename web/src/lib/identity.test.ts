@@ -33,6 +33,22 @@ afterEach(() => {
 });
 
 describe("resolveIdentity", () => {
+  it.each([true, false])(
+    "preserves admin eligibility=%s while admin view is off",
+    async (eligible) => {
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice", is_admin: eligible }));
+      const identity = await import("./identity");
+      await identity.resolveIdentity();
+      document.cookie = "omnigent_admin_view=off; Path=/";
+      try {
+        expect(identity.getCurrentIsAdmin()).toBe(false);
+        expect(identity.getCurrentAdminEligibility()).toBe(eligible);
+      } finally {
+        document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
+      }
+    },
+  );
+
   it("calls GET /v1/me and caches the user id", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice@example.com" }));
     const { resolveIdentity, getCurrentUserId } = await import("./identity");

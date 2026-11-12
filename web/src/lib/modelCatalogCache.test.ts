@@ -27,6 +27,7 @@ beforeEach(() => {
   vi.mocked(getCurrentUserId).mockReturnValue("alice");
 });
 afterEach(() => {
+  document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
@@ -47,12 +48,13 @@ it("does not restore Fusion configurations as selectable model IDs", () => {
   expect(readModelCatalogCache(key())?.models).toEqual(models);
 });
 
-it.each(["server", "user", "target", "kind", "harness", "agent"])(
+it.each(["server", "user", "target", "kind", "harness", "agent", "view"])(
   "isolates catalogs by %s",
   (dimension) => {
     writeModelCatalogCache(key(), models, true);
     if (dimension === "server") vi.mocked(getOmnigentServerIdentity).mockReturnValue("server-b");
     if (dimension === "user") vi.mocked(getCurrentUserId).mockReturnValue("bob");
+    if (dimension === "view") document.cookie = "omnigent_admin_view=off; Path=/";
     const other = modelCatalogCacheKey(
       dimension === "kind" ? "host" : "sandbox",
       dimension === "target" ? "other-provider" : "company",

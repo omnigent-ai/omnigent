@@ -372,8 +372,8 @@ describe("useCanvasSessions", () => {
     );
     expect(keys).toEqual(
       expect.arrayContaining([
-        expect.stringMatching(/:server-a:me$/),
-        expect.stringMatching(/:server-b:me$/),
+        expect.stringMatching(/:server-a:me:true$/),
+        expect.stringMatching(/:server-b:me:true$/),
       ]),
     );
   });
@@ -440,7 +440,7 @@ describe("useCanvasSessions", () => {
 
   it("waits for identity before restoring only owned rows from a legacy reload cache", async () => {
     window.sessionStorage.setItem(
-      "omnigent:canvas-sessions:server-a:me",
+      "omnigent:canvas-sessions:server-a:me:true",
       JSON.stringify({
         version: 1,
         sessions: [
@@ -501,7 +501,7 @@ describe("useCanvasSessions", () => {
       window.sessionStorage.key(index),
     );
     expect(keys).toHaveLength(1);
-    expect(keys[0]).toMatch(/:me$/);
+    expect(keys[0]).toMatch(/:me:true$/);
     expect(keys[0]).not.toContain(":anonymous");
   });
 

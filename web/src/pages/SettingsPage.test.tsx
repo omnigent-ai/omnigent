@@ -29,6 +29,7 @@ import {
 } from "@/lib/projectFolderPaginationPreferences";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import * as host from "@/lib/host";
+import * as adminView from "@/lib/adminView";
 import { UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
 import {
   readTerminalClipboardPreference,
@@ -101,6 +102,7 @@ vi.mock("@/lib/accountsApi", () => ({
 vi.mock("@/lib/identity", () => ({
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () => mocks.me?.is_admin ?? false,
+  getCurrentAdminEligibility: () => mocks.me?.is_admin ?? false,
   getCurrentUserId: () => mocks.me?.id ?? null,
   subscribeIdentity: () => () => {},
 }));
@@ -374,6 +376,22 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 }
 
 describe("SettingsPage", () => {
+  it("keeps the admin-view switch available while admin view is off", () => {
+    mocks.me = { id: "admin", is_admin: true };
+    mocks.singleUser = false;
+    document.cookie = "omnigent_admin_view=off; Path=/";
+    const update = vi.spyOn(adminView, "setAdminViewEnabled").mockImplementation(() => {});
+    try {
+      renderPage("/settings/general");
+      const control = screen.getByRole("switch", { name: "Admin view" });
+      expect(control).not.toBeChecked();
+      fireEvent.click(control);
+      expect(update).toHaveBeenCalledWith(true);
+    } finally {
+      document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
+    }
+  });
+
   beforeEach(() => {
     localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);
     localStorage.removeItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY);
@@ -383,6 +401,7 @@ describe("SettingsPage", () => {
     renderPage("/settings/general");
 
     expect(screen.getByText("Configure general Omnigent behavior.")).toHaveClass("max-md:hidden");
+    expect(screen.queryByRole("switch", { name: "Admin view" })).toBeNull();
 
     for (const testId of [
       "settings-group-composer",

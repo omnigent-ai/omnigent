@@ -1,3 +1,4 @@
+import { isAdminViewEnabled } from "@/lib/adminView";
 // Session loading for the Canvas page. The sidebar pages through the list 30
 // rows at a time, which is right for a scrolling list but makes a canvas of
 // several hundred sessions take dozens of sequential requests to fill. The
@@ -74,7 +75,7 @@ function sessionCachePrefix(serverId: string = currentServerId()): string {
 }
 
 function sessionCacheKey(viewerId: string, serverId: string = currentServerId()): string {
-  return `${sessionCachePrefix(serverId)}:${viewerId}`;
+  return `${sessionCachePrefix(serverId)}:${viewerId}:${isAdminViewEnabled()}`;
 }
 
 function hasStoredSessionsForServer(): boolean {
