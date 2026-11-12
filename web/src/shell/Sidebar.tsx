@@ -2230,16 +2230,21 @@ function ConversationList({
       ),
     [draftBackfills],
   );
-  const authoritativeRows = useMemo(
-    () =>
-      dedupeConversationsById([
-        ...pagedConversations,
-        ...pinnedConversations,
-        ...(openSessionRow ? [openSessionRow] : []),
-        ...draftRows,
-      ]),
-    [pagedConversations, pinnedConversations, openSessionRow, draftRows],
-  );
+  const authoritativeRows = useMemo(() => {
+    const listRows = dedupeConversationsById([
+      ...pagedConversations,
+      ...pinnedConversations,
+      ...(openSessionRow ? [openSessionRow] : []),
+    ]);
+    return dedupeConversationsById([
+      ...listRows.map((row) =>
+        row.family
+          ? row
+          : (draftRows.find((detail) => detail.id === row.id && detail.family) ?? row),
+      ),
+      ...draftRows,
+    ]);
+  }, [pagedConversations, pinnedConversations, openSessionRow, draftRows]);
   const unavailableDraftRows = useMemo(
     () =>
       new Set([
@@ -2722,7 +2727,8 @@ function ConversationList({
     if (nestedDrafts.length === 0) revealedDrafts.current.clear();
     for (const draft of nestedDrafts) {
       if (revealedDrafts.current.has(draft.key)) continue;
-      const source = draft.source;
+      const source = allConversations.find((row) => row.id === draft.source.id) ?? draft.source;
+      const pinned = isSessionPinned(source, pinnedSet);
       const projectName =
         projects.find((project) => project.id !== null && project.id === source.project_id)?.name ??
         source.labels[PROJECT_LABEL_KEY];
@@ -2731,8 +2737,8 @@ function ConversationList({
       setCollapsedFamilies(
         (previous) => new Set([...previous].filter((id) => id !== source.family?.id)),
       );
-      if (!source.family?.pinned && !grouped && projectName) expandProject(projectName);
-      const section = source.family?.pinned
+      if (!pinned && !grouped && projectName) expandProject(projectName);
+      const section = pinned
         ? "Pinned"
         : (loadedSections.groupTitles?.get(source.id) ?? "Sessions");
       setCollapsedSections((previous) => {
@@ -2742,7 +2748,15 @@ function ConversationList({
         return next;
       });
     }
-  }, [nestedDrafts, projects, grouped, expandProject, loadedSections.groupTitles]);
+  }, [
+    nestedDrafts,
+    allConversations,
+    pinnedSet,
+    projects,
+    grouped,
+    expandProject,
+    loadedSections.groupTitles,
+  ]);
 
   // ── Drag-and-drop: file sessions into / out of projects ────────────────────
   // A session row can be dragged onto a project folder (file it there), onto the

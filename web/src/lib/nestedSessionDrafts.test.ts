@@ -55,6 +55,12 @@ describe("nested draft sidebar rows", () => {
       pinned_at: "50",
     });
     expect(withNestedSessionDrafts([row], drafts(client))[1].family?.pinned).toBe(false);
+    const projectSource = { ...row, labels: { omni_project: "Old project" } };
+    const optimistic = { ...row, id: "temp:nested", labels: {}, project_id: undefined };
+    expect(withNestedSessionDrafts([projectSource, optimistic], drafts(client))[1]).toMatchObject({
+      labels: { omni_project: "Old project" },
+      project_id: "project",
+    });
     updateNestedSessionDraft(client, "temp:nested");
     expect(
       withNestedSessionDrafts([row], drafts(client))[1].nested_draft_source_id,
@@ -66,6 +72,9 @@ describe("nested draft sidebar rows", () => {
       ).map((item) => item.id),
     ).toEqual(["parent", "temp:nested"]);
     updateNestedSessionDraft(client, "temp:nested", "created");
+    expect(
+      withNestedSessionDrafts([projectSource, { ...optimistic, id: "created" }], drafts(client))[1],
+    ).toMatchObject({ labels: { omni_project: "Old project" }, project_id: "project" });
     const pushed = {
       ...row,
       id: "created",

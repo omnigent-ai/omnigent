@@ -2084,18 +2084,22 @@ describe("Sidebar sections", () => {
     "source-off-page",
     "pinned-local-backfill",
     "pinned-bundled-backfill",
+    "project-local-backfill",
+    "pinned-legacy",
   ])(
     "expands a collapsed family for its draft in %s, replaces it in place, and removes cancelled drafts",
     async (scope) => {
       const family = {
         id: "family",
         representative_id: "conv_parent",
-        pinned: scope.startsWith("pinned"),
+        pinned: scope.startsWith("pinned") && scope !== "pinned-legacy",
       };
-      const labels: Record<string, string> =
-        scope === "project" ? { omni_project: "Example project" } : {};
-      if (scope === "project") projectsMock.push("Example project");
-      if (family.pinned) seedPins(["conv_parent", "conv_peer", "created"]);
+      const labels: Record<string, string> = scope.startsWith("project")
+        ? { omni_project: "Example project" }
+        : {};
+      if (scope.startsWith("project")) projectsMock.push("Example project");
+      if (scope === "pinned-legacy") labels[PINNED_LABEL_KEY] = "1";
+      if (scope.startsWith("pinned")) seedPins(["conv_parent", "conv_peer", "created"]);
       const members = [
         conv("conv_parent", "Claude Code", { family, labels }),
         conv("conv_peer", "Codex", { family, labels }),
@@ -2108,11 +2112,13 @@ describe("Sidebar sections", () => {
       load(members.filter((row) => scope !== "source-off-page" || row.id !== "conv_peer"));
       const { queryClient, refresh } = renderSidebar();
       if (scope === "pinned-shared") showSharedTab();
-      if (scope === "project")
+      if (scope.startsWith("project"))
         fireEvent.click(screen.getByRole("button", { name: /^Example project/ }));
       fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
-      if (scope === "project")
+      if (scope.startsWith("project"))
         fireEvent.click(screen.getByRole("button", { name: /^Example project/ }));
+      if (scope === "pinned-legacy")
+        fireEvent.click(screen.getByRole("button", { name: /^Pinned/ }));
       const source = {
         id: scope === "source-off-page" ? "conv_peer" : "conv_parent",
         title: "conv_parent",
@@ -2135,23 +2141,36 @@ describe("Sidebar sections", () => {
       const rowNode = placeholder.closest("li");
       expect(rowNode).toHaveClass("ml-9");
       if (scope.endsWith("backfill")) {
-        const fetch = vi
-          .spyOn(identity, "authenticatedFetch")
-          .mockResolvedValue(
-            new Response(
-              JSON.stringify(
-                conv("created", "Codex", { family, permission_level: 4, title: "New task" }),
-              ),
+        const fetch = vi.spyOn(identity, "authenticatedFetch").mockResolvedValue(
+          new Response(
+            JSON.stringify(
+              conv("created", "Codex", {
+                family,
+                labels,
+                permission_level: 4,
+                title: "New task",
+              }),
             ),
-          );
+          ),
+        );
         onTestFinished(() => fetch.mockRestore());
+      }
+      if (scope === "project-local-backfill") {
+        load([...members, conv("temp:nested", "Codex", { title: null, provisional: true })]);
+        refresh();
+        expect(screen.getByText("New nested agent").closest("li")).toBe(rowNode);
+        expect(
+          within(screen.getByText("Example project").closest("section")!).getByText(
+            "New nested agent",
+          ),
+        ).toBeInTheDocument();
       }
       act(() => updateNestedSessionDraft(queryClient, "temp:nested", "created"));
       if (scope.endsWith("backfill")) {
         load([
           ...members,
-          ...(scope === "pinned-local-backfill"
-            ? [conv("created", "Codex", { title: "New task" })]
+          ...(scope.endsWith("local-backfill")
+            ? [conv("created", "Codex", { title: "Optimistic title" })]
             : []),
         ]);
         refresh();
@@ -2166,7 +2185,11 @@ describe("Sidebar sections", () => {
         expect(screen.getByText("New task").closest("li")).toBe(rowNode);
         expect(rowNode).toHaveAttribute("data-sibling-session", "true");
         expect(
-          within(screen.getByText("Pinned").closest("section")!).getByText("New task"),
+          within(
+            screen
+              .getByText(scope.startsWith("project") ? "Example project" : "Pinned")
+              .closest("section")!,
+          ).getByText("New task"),
         ).toBeInTheDocument();
       }
       load([

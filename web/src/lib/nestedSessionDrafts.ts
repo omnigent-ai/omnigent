@@ -115,13 +115,14 @@ export function withNestedSessionDrafts(
       created_at: existing?.created_at ?? draft.createdAt,
       // Opening the composer must not move the family above unrelated sessions.
       updated_at: existing?.updated_at ?? source.updated_at,
-      labels: existing
-        ? existing.labels
-        : source.labels[PROJECT_LABEL_KEY]
+      labels: {
+        ...(!existing?.family && source.labels[PROJECT_LABEL_KEY]
           ? { [PROJECT_LABEL_KEY]: source.labels[PROJECT_LABEL_KEY] }
-          : {},
+          : {}),
+        ...existing?.labels,
+      },
       permission_level: existing ? existing.permission_level : source.permission_level,
-      project_id: existing ? existing.project_id : source.project_id,
+      project_id: existing?.family ? existing.project_id : source.project_id,
       family: existing?.family ?? family,
       provisional: !draft.created,
       nested_draft_source_id: draft.creating ? undefined : source.id,
