@@ -11915,6 +11915,23 @@ async def test_patch_approval_mode_forwards_and_persists_label(
     ]
     assert len(mode_events) == 1
     assert mode_events[0]["approval_mode"] == "full-access"
+    if queued:
+        corrected = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_codex_approval_mode_change",
+                "data": {"approval_mode": "ask-for-approval"},
+            },
+        )
+        assert corrected.status_code == 202, corrected.text
+        snapshot = await client.get(f"/v1/sessions/{session['id']}")
+        assert snapshot.json()["labels"]["omnigent.codex_native.approval_mode"] == (
+            "ask-for-approval"
+        )
+        mode_events = [
+            event for _, event in published if event["type"] == "session.codex_approval_mode"
+        ]
+        assert mode_events[-1]["approval_mode"] == "ask-for-approval"
 
 
 @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
