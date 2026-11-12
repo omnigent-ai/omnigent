@@ -11273,38 +11273,51 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
           last_task_error: null,
           busy: true,
           last_message_preview: "looking…",
+          own_cost_usd: null,
           // Insert path defaults the count to 0 when the delta omits it.
           pending_elicitations_count: 0,
         },
       ]);
     });
 
-    it("merges an existing child in place on a status change", () => {
-      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), [
-        {
-          id: "conv_child1",
-          title: "researcher:auth",
-          task_summary: null,
-          tool: "researcher",
-          session_name: "auth",
-          current_task_status: "in_progress",
-          busy: true,
-          last_message_preview: null,
-          pending_elicitations_count: 0,
-        },
-      ]);
-      handleSessionEvent({
-        type: "session_child_session_updated",
-        conversationId: "conv_parent",
-        childSessionId: "conv_child1",
-        child: child({ current_task_status: "completed", busy: false }),
-      });
-      const cached = client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"));
-      // Still one row (merged, not appended); busy flipped to false.
-      expect(cached).toHaveLength(1);
-      expect(cached?.[0].busy).toBe(false);
-      expect(cached?.[0].current_task_status).toBe("completed");
-    });
+    it.each([
+      { costDelta: {}, expectedCost: 1.25, label: "omitted" },
+      { costDelta: { own_cost_usd: 2.5 }, expectedCost: 2.5, label: "updated" },
+      { costDelta: { own_cost_usd: 0 }, expectedCost: 0, label: "zero" },
+      { costDelta: { own_cost_usd: null }, expectedCost: null, label: "null" },
+    ])(
+      "merges an existing child in place on a status change with $label cost",
+      ({ costDelta, expectedCost }) => {
+        client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), [
+          {
+            id: "conv_child1",
+            title: "researcher:auth",
+            task_summary: null,
+            tool: "researcher",
+            session_name: "auth",
+            current_task_status: "in_progress",
+            busy: true,
+            last_message_preview: null,
+            own_cost_usd: 1.25,
+            pending_elicitations_count: 0,
+          },
+        ]);
+        handleSessionEvent({
+          type: "session_child_session_updated",
+          conversationId: "conv_parent",
+          childSessionId: "conv_child1",
+          child: child({ current_task_status: "completed", busy: false, ...costDelta }),
+        });
+        const cached = client.getQueryData<ChildSessionInfo[]>(
+          childSessionsQueryKey("conv_parent"),
+        );
+        // Still one row (merged, not appended); busy flipped to false.
+        expect(cached).toHaveLength(1);
+        expect(cached?.[0].busy).toBe(false);
+        expect(cached?.[0].current_task_status).toBe("completed");
+        expect(cached?.[0].own_cost_usd).toBe(expectedCost);
+      },
+    );
 
     it("merges a PARTIAL status delta without clobbering the preview", () => {
       // Runner status deltas omit last_message_preview; the merge must
@@ -11443,20 +11456,26 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       expect(row?.last_task_error).toBeNull();
     });
 
-    it("initializes a cold child-sessions cache from a full delta", () => {
-      // Snapshot-on-connect / spawn deltas carry full rows, so a cold
-      // cache is seeded (lets child status update without a mounted hook).
-      handleSessionEvent({
-        type: "session_child_session_updated",
-        conversationId: "conv_parent",
-        childSessionId: "conv_child1",
-        child: child(),
-      });
-      const cached = client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"));
-      expect(cached).toHaveLength(1);
-      expect(cached?.[0].id).toBe("conv_child1");
-      expect(cached?.[0].busy).toBe(true);
-    });
+    it.each([1.25, 0, null, undefined])(
+      "initializes a cold child-sessions cache with cost %s",
+      (ownCost) => {
+        // Snapshot-on-connect / spawn deltas carry full rows, so a cold
+        // cache is seeded (lets child status update without a mounted hook).
+        handleSessionEvent({
+          type: "session_child_session_updated",
+          conversationId: "conv_parent",
+          childSessionId: "conv_child1",
+          child: child(ownCost === undefined ? {} : { own_cost_usd: ownCost }),
+        });
+        const cached = client.getQueryData<ChildSessionInfo[]>(
+          childSessionsQueryKey("conv_parent"),
+        );
+        expect(cached).toHaveLength(1);
+        expect(cached?.[0].id).toBe("conv_child1");
+        expect(cached?.[0].busy).toBe(true);
+        expect(cached?.[0].own_cost_usd).toBe(ownCost ?? null);
+      },
+    );
 
     it("refetches the parent's child list when a child goes idle without a preview", () => {
       // claude-native turn-complete deltas carry busy=false but no preview

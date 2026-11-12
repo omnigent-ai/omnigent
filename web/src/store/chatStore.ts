@@ -9793,6 +9793,8 @@ function applyChildSessionUpdated(
   if (child.busy !== undefined) patch.busy = child.busy === true;
   if (child.last_message_preview !== undefined)
     patch.last_message_preview = strOrNull(child.last_message_preview);
+  if (child.own_cost_usd !== undefined)
+    patch.own_cost_usd = typeof child.own_cost_usd === "number" ? child.own_cost_usd : null;
   if (child.pending_elicitations_count !== undefined)
     patch.pending_elicitations_count =
       typeof child.pending_elicitations_count === "number" ? child.pending_elicitations_count : 0;
@@ -9812,6 +9814,7 @@ function applyChildSessionUpdated(
       last_task_error: patch.last_task_error ?? null,
       busy: patch.busy ?? false,
       last_message_preview: patch.last_message_preview ?? null,
+      own_cost_usd: patch.own_cost_usd ?? null,
       pending_elicitations_count: patch.pending_elicitations_count ?? 0,
     };
     queryClient.setQueryData<ChildSessionInfo[]>(key, [inserted, ...current]);
