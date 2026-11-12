@@ -83,6 +83,7 @@ import {
   BRAIN_HARNESS_LABELS,
   SMART_ROUTING_LABEL,
   useBrainHarnessLabels,
+  useFileMentionHarnesses,
   useHarnessEffortFamilies,
 } from "@/lib/agentLabels";
 import { useCanStartSideChat, usePermissions, useSessionOwner } from "@/hooks/usePermissions";
@@ -155,6 +156,7 @@ import {
   type TaggedMentions,
   withSessionMentionHint,
   detectMentionAt,
+  harnessSupportsFileMentions,
   type MentionItem,
   mentionMarkerFor,
   MENTION_MATCH_CAP,
@@ -2580,10 +2582,9 @@ function ComposerImpl(
   const [inputFocused, setInputFocused] = useState(false);
   // Active "@"-file-mention being typed, plus its highlighted row and the
   // workspace paths the user has already tagged. ``@``-mention is wired for
-  // the native coding-agent sessions (see ``mentionEnabled``): those harnesses
-  // run in the workspace and read a file from an "[Attached: …]" marker, so a
-  // tagged path is delivered by prepending that marker at send time — no
-  // upload, the agent reads the on-disk file directly.
+  // sessions whose agent reads a workspace file from an "[Attached: ...]" marker
+  // (see ``mentionEnabled``), so a tagged path is delivered by prepending that
+  // marker at send time - no upload, the agent reads the on-disk file directly.
   // Active "@"-mention token (owned here; the shared useMentionBrowser hook
   // owns the selection index, tagged chips, and attach/drill/keyboard glue).
   const [mention, setMention] = useState<MentionState | null>(null);
@@ -2933,18 +2934,13 @@ function ComposerImpl(
     composerSessionId,
     showGoalControl && runnerOnline === true,
   );
-  // "@"-file-mention is scoped to the native coding-agent harnesses: their
-  // vendor CLIs run in the workspace and read an on-disk file from an
-  // attachment marker the executor already emits. In-process SDK sessions
-  // get no mention menu, so the workspace listing is never fetched for them
-  // (``enabled`` gate below). Codex's marker says "Attached file:" while the
-  // others say "Attached:" — see ``mentionMarkerFor``. ``sessionHarness`` is
-  // already read above for the status-tray harness label.
-  // Derive from the canonical native-agent registry (which folds reversed
-  // spellings like ``native-pi``) rather than a literal harness-string compare,
-  // so the composer's "@" entry point can't split-brain from the file viewer's
-  // "Attach to agent" gate (``canAttachToAgent``), which already uses it.
-  const mentionEnabled = nativeCodingAgentForHarness(sessionHarness) !== undefined;
+  // "@"-file-mention is scoped to harnesses whose agent opens an on-disk file
+  // from the attachment marker (``harnessSupportsFileMentions``); others get no
+  // menu, so the workspace listing is never fetched for them. Codex's marker
+  // says "Attached file:" while the others say "Attached:" - see
+  // ``mentionMarkerFor``. FileViewer's "Attach to agent" gate uses the same helper.
+  const fileMentionHarnesses = useFileMentionHarnesses();
+  const mentionEnabled = harnessSupportsFileMentions(sessionHarness, fileMentionHarnesses);
   const workspaceFilesQuery = useWorkspaceAllFiles(composerSessionId ?? undefined, {
     enabled: mentionEnabled,
   });
@@ -4589,7 +4585,7 @@ function ComposerImpl(
                   mcpReconnectError={liveMcpReconnect.error}
                 />
               )}
-              {/* "@"-file-mention browser — native coding-agent sessions only.
+              {/* "@"-file-mention browser - sessions gated by ``mentionEnabled``.
             Also shown (as a loading row) while the listing is still fetching,
             so "@" isn't silently dead during runner cold-boot or a drill-in. */}
               {(mentionOpen || mentionListingPending) && (
