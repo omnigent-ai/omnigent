@@ -3399,6 +3399,7 @@ class WorkflowRun(BaseModel):
     """
     One run of a saved workflow: a session that started it.
 
+    :param id: The run's ID: that of the plan entry that started it.
     :param session_id: The session that ran it.
     :param title: The session's title; empty when it has none yet.
     :param started_at: Unix epoch seconds when the run's plan was written.
@@ -3408,6 +3409,7 @@ class WorkflowRun(BaseModel):
     :param progress: Where the run's steps stand.
     """
 
+    id: str
     session_id: str
     title: str
     started_at: int

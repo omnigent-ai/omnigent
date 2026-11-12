@@ -301,6 +301,7 @@ def create_workflows_router(
             live = activity.get(plan.conversation_id)
             runs.append(
                 WorkflowRun(
+                    id=plan.id,
                     session_id=plan.conversation_id,
                     title=session.title or "",
                     started_at=plan.created_at,

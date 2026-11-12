@@ -652,6 +652,8 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
     by_session = {run["session_id"]: run for run in runs["data"]}
     assert set(by_session) == {first, second} and runs["next_cursor"] is None
     assert by_session[first]["title"] == "Fix the upload test"
+    first_plan = SessionJournalStore(db_uri).current_plan(first)
+    assert by_session[first]["id"] == first_plan.id
     assert by_session[first]["session_status"] == "idle"
     assert by_session[first]["progress"] == {
         "total": 2,
