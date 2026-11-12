@@ -13,6 +13,21 @@ import { ScheduleSelect as Select } from "./ScheduleSelect";
 import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 
+export const INHERITED_PERMISSION_LABEL = "Same as polling session";
+
+/** Whether matching sessions without a mode of their own run in the polling session's. */
+export function inheritsPollingPermission(
+  settings: ReturnType<typeof useScheduledHarnessSettings>,
+  permissionModesSupported: boolean,
+  pollingPermissionMode: string,
+): boolean {
+  return (
+    permissionModesSupported &&
+    pollingPermissionMode !== "" &&
+    settings.permissions.some((option) => option.value === pollingPermissionMode)
+  );
+}
+
 export function TriggerWorkerHarnessField({
   value,
   pollingAgentId,
@@ -106,15 +121,17 @@ export function TriggerWorkerSettingsFields({
     value.permissionMode && !permissions.some((option) => option.value === value.permissionMode)
       ? value.permissionMode
       : "";
-  // An omitted mode inherits the automation's, so choosing Default names the harness's own.
+  const pollingInherited = inheritsPollingPermission(
+    settings,
+    permissionModesSupported,
+    pollingPermissionMode,
+  );
+  // An omitted mode would inherit the polling session's, so Default names the harness's own.
   const defaultMode = nativeDefaultPermissionMode(settings.harness);
-  const chosenDefault = permissions.some((option) => option.value === defaultMode)
-    ? (defaultMode ?? "")
-    : "";
-  const inheritsPolling =
-    permissions.length > 0 &&
-    value.permissionMode === "" &&
-    settings.permissions.some((option) => option.value === pollingPermissionMode);
+  const chosenDefault =
+    pollingInherited && permissions.some((option) => option.value === defaultMode)
+      ? (defaultMode ?? "")
+      : "";
   const unappliedLabel =
     settings.permissions.find((option) => option.value === unappliedMode)?.label ?? unappliedMode;
   return (
@@ -126,7 +143,8 @@ export function TriggerWorkerSettingsFields({
         settings={{ ...settings, permissions }}
         disabled={disabled}
         idPrefix="task-worker"
-        inheritedPermissionLabel={inheritsPolling ? "Same as polling session" : undefined}
+        inheritedPermissionLabel={pollingInherited ? INHERITED_PERMISSION_LABEL : undefined}
+        defaultPermissionMode={chosenDefault}
         onModelChange={(model) =>
           onChange({
             ...value,
@@ -137,9 +155,7 @@ export function TriggerWorkerSettingsFields({
           })
         }
         onEffortChange={(effort) => onChange({ ...value, effort })}
-        onPermissionModeChange={(permissionMode) =>
-          onChange({ ...value, permissionMode: permissionMode || chosenDefault })
-        }
+        onPermissionModeChange={(permissionMode) => onChange({ ...value, permissionMode })}
         onSelectOpenChange={onSelectOpenChange}
       />
       {unappliedMode && (
@@ -181,7 +197,7 @@ export function TriggerWorkerSettingsFields({
         {followsPolling && "They match the polling session until you change them. "}
         Default uses the selected harness&apos;s configuration.
         {permissions.length > 0 &&
-          " Default permissions start the harness's own default mode. Modes that skip approval aren't available here."}
+          " With Default permissions, they don't take the polling session's mode. Modes that skip approval aren't available here."}
       </p>
     </div>
   );

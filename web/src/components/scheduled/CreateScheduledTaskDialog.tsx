@@ -37,6 +37,8 @@ import {
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
 import {
+  INHERITED_PERMISSION_LABEL,
+  inheritsPollingPermission,
   TriggerWorkerHarnessField,
   TriggerWorkerSettingsFields,
 } from "./TriggerWorkerSettingsFields";
@@ -1030,6 +1032,15 @@ export function CreateScheduledTaskDialog({
           workerSettings.effort,
           workerSettings.permissionMode,
         ).filter(Boolean);
+  if (
+    workerSettings?.permissionMode === "" &&
+    inheritsPollingPermission(
+      workerHarnessSettings,
+      sessionPermissionModesSupported,
+      effectivePermission,
+    )
+  )
+    workerLabels.push(INHERITED_PERMISSION_LABEL);
   const workerGroupName = sendsToTaskSession ? "Task session" : "Matching sessions";
   const overrideSummary = [
     // Trigger polling and matching sessions run with separate settings.

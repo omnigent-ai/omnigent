@@ -4333,13 +4333,22 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "Bypass permissions" }));
     // Without a mode of their own, workers would inherit the polling session's bypass.
-    const workerPermission = screen.getByTestId("task-worker-permission-trigger");
-    expect(workerPermission).toHaveTextContent("Same as polling session");
-    fireEvent.keyDown(workerPermission, { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "Default" }));
-    expect(screen.getByTestId("task-worker-permission-trigger")).toHaveTextContent("Manual");
+    const workerPermission = () => screen.getByTestId("task-worker-permission-trigger");
+    const pickWorkerPermission = async (name: string) => {
+      fireEvent.keyDown(workerPermission(), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name }));
+    };
+    expect(workerPermission()).toHaveTextContent("Same as polling session");
+    expect(screen.getByRole("button", { name: "Advanced" })).toHaveTextContent(
+      "Same as polling session",
+    );
+    await pickWorkerPermission("Default");
+    expect(workerPermission()).toHaveTextContent("Manual");
+    await pickWorkerPermission("Same as polling session");
+    expect(workerPermission()).toHaveTextContent("Same as polling session");
+    await pickWorkerPermission("Default");
     expect(screen.getByTestId("task-worker-settings")).toHaveTextContent(
-      "Default permissions start the harness's own default mode.",
+      "With Default permissions, they don't take the polling session's mode.",
     );
     type("task-trigger-scope", "ES");
     type("task-trigger-instructions", "Triage it.");
@@ -4658,6 +4667,8 @@ describe("editing template prompts", () => {
       );
       fireEvent.keyDown(screen.getByTestId("task-worker-permission-trigger"), { key: "Enter" });
       expect(await screen.findByRole("option", { name: "Auto" })).toBeInTheDocument();
+      // With no polling mode, workers without one start in their agent's default.
+      expect(screen.queryByRole("option", { name: "Same as polling session" })).toBeNull();
       // The server refuses these for a session an agent starts.
       for (const name of ["Bypass permissions", "Don't ask"])
         expect(screen.queryByRole("option", { name })).not.toBeInTheDocument();

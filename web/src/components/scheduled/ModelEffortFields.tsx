@@ -27,6 +27,7 @@ export function ModelEffortFields({
   onSelectOpenChange,
   idPrefix = "task",
   inheritedPermissionLabel,
+  defaultPermissionMode = "",
 }: {
   /** Selected model id/alias, or "" = agent default (nothing overridden). */
   model: string;
@@ -44,8 +45,10 @@ export function ModelEffortFields({
   onSelectOpenChange?: (open: boolean) => void;
   /** Prefix for element ids and test ids, so two groups can share a form. */
   idPrefix?: string;
-  /** Label for an empty mode that inherits another session's instead of the default. */
+  /** Offers an empty mode under this label because it inherits another session's. */
   inheritedPermissionLabel?: string;
+  /** The mode Default saves; "" leaves the mode empty. */
+  defaultPermissionMode?: string;
 }) {
   const modelOptions = settings.models.map((option) => ({
     id: option.id,
@@ -62,6 +65,10 @@ export function ModelEffortFields({
     (option) => settings.harness === "claude-native" || option.value !== "default",
   );
   const inheritsPermission = Boolean(inheritedPermissionLabel) && permissionMode === "";
+  const permissionForSelectValue = (value: string) => {
+    if (value === PERMISSION_SELECT_INHERITED) return "";
+    return value === PERMISSION_SELECT_DEFAULT ? defaultPermissionMode : value;
+  };
   let permissionSelectValue = permissionMode;
   if (inheritsPermission) permissionSelectValue = PERMISSION_SELECT_INHERITED;
   else if (
@@ -168,10 +175,7 @@ export function ModelEffortFields({
             value={permissionSelectValue}
             componentId="tasks.scheduled.permission_mode"
             valueHasNoPii
-            onValueChange={(v) => {
-              if (v !== PERMISSION_SELECT_INHERITED)
-                onPermissionModeChange(v === PERMISSION_SELECT_DEFAULT ? "" : v);
-            }}
+            onValueChange={(v) => onPermissionModeChange(permissionForSelectValue(v))}
             onOpenChange={onSelectOpenChange}
           >
             <SelectTrigger
@@ -189,7 +193,7 @@ export function ModelEffortFields({
               align="end"
               className="w-[min(20rem,calc(100vw-2rem))]"
             >
-              {inheritsPermission && (
+              {inheritedPermissionLabel && (
                 <SelectItem value={PERMISSION_SELECT_INHERITED}>
                   {inheritedPermissionLabel}
                 </SelectItem>
