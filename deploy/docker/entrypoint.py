@@ -306,6 +306,10 @@ def _build_routing(
     settings = parse_routing_settings(routing_cfg)
     if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
         return _build_external_routing_client(routing_cfg, settings), settings
+    if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "host":
+        from omnigent.server.smart_routing import HostRoutingClient
+
+        return HostRoutingClient(), settings
     return _build_local_llm_routing_client(server_llm), settings
 
 

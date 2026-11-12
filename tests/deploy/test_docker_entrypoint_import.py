@@ -215,6 +215,14 @@ def test_build_routing_carries_the_configured_settings() -> None:
     assert client._model_prefixes == ["databricks-", "system.ai."]
 
 
+def test_build_routing_host_provider_needs_no_llm_block() -> None:
+    from deploy.docker.entrypoint import _build_routing
+    from omnigent.server.smart_routing import HostRoutingClient
+
+    client, _settings = _build_routing({"routing": {"provider": "host"}}, None)
+    assert isinstance(client, HostRoutingClient)
+
+
 def test_build_routing_defaults_without_a_routing_block() -> None:
     from deploy.docker.entrypoint import _build_routing
     from omnigent.server.smart_routing import RoutingSettings
