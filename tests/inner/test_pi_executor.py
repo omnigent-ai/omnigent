@@ -4792,7 +4792,6 @@ def test_models_json_attributes_only_unity_gateway_providers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Providers on ``/ai-gateway/`` paths name Pi and Omnigent; serving endpoints don't."""
-    monkeypatch.delenv("OMNIGENT_CLIENT_SURFACE", raising=False)
     monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
     monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
     providers = _build_models_json("https://dbc-1.cloud.databricks.com", "tok")["providers"]

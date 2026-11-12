@@ -23,6 +23,7 @@ from omnigent.inner.datamodel import (
     OSEnvSpec,
 )
 from omnigent.inner.os_env import _build_credential_proxy_parent_env
+from omnigent.inner.os_env_serialization import resolve_harness_os_env
 from omnigent.inner.sandbox import resolve_sandbox
 from omnigent.runtime.workflow import _serialize_os_env
 
@@ -164,7 +165,6 @@ def test_harness_rejects_invalid_nested_credential_policy(
         harness._resolve_os_env()
 
 
-@pytest.mark.parametrize("harness_name", _HARNESSES)
 @pytest.mark.parametrize(
     "payload",
     [
@@ -189,11 +189,20 @@ def test_harness_rejects_invalid_nested_credential_policy(
         '"source": {"kind": "env", "env": "API_TOKEN", "refresh_interval_second": 60}}]}}}',
     ],
 )
+def test_shared_decoder_rejects_malformed_os_policy(
+    payload: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEST_HARNESS_OS_ENV", payload)
+    with pytest.raises(ValueError):
+        resolve_harness_os_env("TEST_HARNESS_OS_ENV")
+
+
+@pytest.mark.parametrize("harness_name", _HARNESSES)
 def test_harness_rejects_malformed_os_policy(
-    harness_name: str, payload: str, monkeypatch: pytest.MonkeyPatch
+    harness_name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     harness = importlib.import_module(f"omnigent.inner.{harness_name}_harness")
-    monkeypatch.setenv(harness._ENV_OS_ENV, payload)
+    monkeypatch.setenv(harness._ENV_OS_ENV, '{"sandbox": {"allow_netwrok": false}}')
     with pytest.raises(ValueError):
         harness._resolve_os_env()
 

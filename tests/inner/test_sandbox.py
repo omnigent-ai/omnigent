@@ -714,3 +714,55 @@ def test_run_launcher_rejects_noop_spawn_wrap(
     execute.assert_not_called()
     activate.assert_not_called()
     assert not scratch.exists()
+
+
+@pytest.mark.parametrize("feature", ["fork", "start_in_scratch", "git_ssh"])
+def test_harness_policy_validation_rejects_unsupported_features(feature: str) -> None:
+    from omnigent.inner.datamodel import GitSshBinding, OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import validate_harness_sandbox
+
+    policy = OSEnvSandboxSpec(type="linux_bwrap")
+    spec = OSEnvSpec(sandbox=policy)
+    if feature == "git_ssh":
+        policy.git_ssh = [
+            GitSshBinding(
+                host="git.example.test",
+                port=22,
+                username="git",
+                repository="org/repo.git",
+                operations=frozenset({"fetch"}),
+                identity_file="/keys/id",
+                known_hosts_file="/keys/known_hosts",
+            )
+        ]
+    else:
+        setattr(spec, feature, True)
+    with pytest.raises(ValueError, match=feature):
+        validate_harness_sandbox(spec, "Example")
+
+
+@pytest.mark.parametrize(
+    "feature", ["credential_proxy", "none_network", "none_copy_on_write", "windows_jobobject"]
+)
+def test_harness_policy_validation_rejects_unenforceable_network_or_backend(feature: str) -> None:
+    from omnigent.inner.datamodel import (
+        CredentialProxySpec,
+        OSEnvSandboxSpec,
+        OSEnvSpec,
+        WritePathSpec,
+    )
+    from omnigent.inner.sandbox import validate_harness_sandbox
+
+    policy = OSEnvSandboxSpec(type="linux_bwrap")
+    if feature == "credential_proxy":
+        policy.credential_proxy = CredentialProxySpec(entries=[])
+    elif feature == "none_network":
+        policy.type = "none"
+        policy.allow_network = False
+    elif feature == "none_copy_on_write":
+        policy.type = "none"
+        policy.write_paths = [WritePathSpec(path="/workspace", copy_on_write=True)]
+    else:
+        policy.type = feature
+    with pytest.raises(ValueError, match=r"does not support|cannot enforce"):
+        validate_harness_sandbox(OSEnvSpec(sandbox=policy), "Example")
