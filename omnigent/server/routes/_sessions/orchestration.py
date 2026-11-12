@@ -1158,7 +1158,10 @@ def _spawn_archive_stop(
         tunnels, or ``None`` when host support is not wired.
     :param delete_worktree: Forwarded to :func:`_archive_stop`.
     :param after_turn: Also wait for the session's current turn to end before
-        tearing it down; set when the session archived itself.
+        tearing it down; set when the session archived itself. That wait, like
+        the grace, lives only in this replica's memory: if the replica restarts
+        first, the archived session's runner keeps running until its idle
+        timeout or a later stop.
     """
     # Replace any pending stop from an earlier archive of this session.
     _cancel_pending_archive_stop(session_id)

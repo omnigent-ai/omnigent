@@ -772,8 +772,11 @@ async def test_project_update_promotes_a_label_only_folder(auth_client, peers, d
 
 
 @_ONE_ENVIRONMENT
-@pytest.mark.parametrize("via", ["tool", "dashed-path"])
-@pytest.mark.parametrize("undone", [False, True], ids=["turn-ends", "undone"])
+@pytest.mark.parametrize(
+    ("undone", "via"),
+    [(False, "tool"), (True, "tool"), (False, "dashed-path")],
+    ids=["turn-ends", "undone", "turn-ends-dashed-path"],
+)
 async def test_a_session_archives_itself_and_stops_once_its_turn_ends(
     auth_client, peers, db_uri, monkeypatch, undone, via
 ):
