@@ -261,7 +261,8 @@ def _write_with_cte(session: Session, user_id: str) -> None:
         pytest.skip("MySQL does not accept a WITH clause before INSERT")
     session.execute(
         text(
-            "WITH source AS (SELECT :user_id AS id) "
+            # CockroachDB cannot infer an untyped placeholder inside a CTE.
+            "WITH source AS (SELECT CAST(:user_id AS VARCHAR(128)) AS id) "
             "INSERT INTO users (workspace_id, id) SELECT 0, id FROM source"
         ),
         {"user_id": user_id},
