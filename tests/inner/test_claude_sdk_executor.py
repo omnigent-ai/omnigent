@@ -5545,14 +5545,31 @@ async def test_sandboxed_sdk_exposes_bash_for_skill_expansion(
 
 
 @pytest.mark.parametrize("allow_network", [True, False], ids=["network-allowed", "network-denied"])
+@pytest.mark.parametrize("cwd_source", ["default", "spec_relative", "spec_absolute", "explicit"])
 def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
-    monkeypatch, allow_network: bool
+    monkeypatch, tmp_path: Path, allow_network: bool, cwd_source: str
 ) -> None:
     """
     The probe uses the CLI target and policy even when networking is denied.
     A passing probe must still produce a contained launcher with native tools.
     """
     from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
+    spec = _wrap_probe_spec(allow_network=allow_network)
+    cwd = None
+    if cwd_source == "default":
+        spec.cwd = None
+        expected_cwd = tmp_path
+    elif cwd_source == "spec_relative":
+        spec.cwd = "repo"
+        expected_cwd = tmp_path / "repo"
+    elif cwd_source == "explicit":
+        spec.cwd = "."
+        expected_cwd = tmp_path / "repo"
+        cwd = str(expected_cwd)
+    else:
+        expected_cwd = Path(spec.cwd).resolve()
 
     monkeypatch.setattr(
         "omnigent.inner.claude_sdk_executor.resolve_sandbox",
@@ -5577,11 +5594,13 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
     )
 
     prepared = prepare_claude_cli_path(
-        "/usr/bin/claude", _wrap_probe_spec(allow_network=allow_network)
+        "/usr/bin/claude", spec, cwd=cwd
     )
 
     assert prepared.cli_path == "/tmp/launcher"
     assert prepared.enable_native_tools is True
+    assert prepared.cwd == str(expected_cwd)
+    assert backend.wrap_launcher_argv.call_args.args[2] == expected_cwd
     backend.wrap_launcher_argv.assert_called_once()
     assert backend.wrap_launcher_argv.call_args.kwargs["target"] == "/usr/bin/claude", (
         "The probe must exercise the target lane run_launcher will use."

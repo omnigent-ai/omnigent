@@ -2104,7 +2104,7 @@ def prepare_claude_cli_path(
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
     resolved_cwd = _resolve_sandbox_cwd(cwd if cwd is not None else spec.cwd)
     validate_harness_sandbox(
-        spec, "Claude SDK", cwd=resolved_cwd,
+        spec, "Claude SDK", cwd=resolved_cwd if cwd is not None else None,
         supports_egress_rules=worker_env is not None,
         supports_credential_proxy=worker_env is not None,
     )
