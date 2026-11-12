@@ -26,7 +26,7 @@ fresh preview. Failed requests leave the local configuration unchanged.
 
 Arguments copy verbatim: review any secrets or local paths in them before saving.
 A missing model/default in the snapshot clears that portable setting on import.
-Selecting Pi does not install it or make it available on Arclets.
+Selecting Pi does not install it on any connected host or sandbox.
 
 A launcher can include its existing plugin preferences:
 
