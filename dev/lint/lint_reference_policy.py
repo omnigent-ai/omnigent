@@ -104,7 +104,13 @@ def check(
         ancestor = git(root, "merge-base", base, target).decode().strip()
         if remote:
             try:
-                upstream = git(root, "symbolic-ref", "--quiet", f"refs/remotes/{remote}/HEAD")
+                upstream = git(
+                    root,
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    f"refs/remotes/{remote}/HEAD^{{commit}}",
+                )
             except subprocess.CalledProcessError as error:
                 if error.returncode != 1:
                     raise

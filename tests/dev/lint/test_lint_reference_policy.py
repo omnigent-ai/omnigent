@@ -299,7 +299,9 @@ def test_missing_base_fails_closed(repository: Path) -> None:
 
 
 @pytest.mark.parametrize("push_context", ["flag", "hook"])
-@pytest.mark.parametrize("upstream_state", ["missing", "rebased", "ahead", "stale", "stacked"])
+@pytest.mark.parametrize(
+    "upstream_state", ["missing", "dangling", "rebased", "ahead", "stale", "stacked"]
+)
 def test_cli_uses_push_range_and_does_not_echo_values(
     repository: Path, prohibited_name: str, push_context: str, upstream_state: str
 ) -> None:
@@ -308,7 +310,9 @@ def test_cli_uses_push_range_and_does_not_echo_values(
     (repository / "notes.txt").write_text(f"{prohibited_name}\n", encoding="utf-8")
     git(repository, "add", ".")
     git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "change")
-    if upstream_state != "missing":
+    if upstream_state == "dangling":
+        git(repository, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    elif upstream_state != "missing":
         old_head = git(repository, "rev-parse", "HEAD").decode().strip()
         git(repository, "switch", "-c", "upstream", base)
         (repository / "upstream.txt").write_text(f"{prohibited_name}\n", encoding="utf-8")
