@@ -4366,6 +4366,36 @@ describe("editing template prompts", () => {
     },
   );
 
+  it("lets a saved worker mode be cleared on a server that can't apply it", async () => {
+    const saved = updateTriggerWorkerSettings(original, {
+      agentId: "ag_claude_native",
+      model: "",
+      effort: "",
+      permissionMode: "auto",
+    })!;
+    const task = scheduledTask({ prompt: saved, sessionMode: "continue", sessionId: "poller" });
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />);
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Auto");
+    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+    await screen.findByRole("option", { name: "Default" });
+    // Only the saved mode and Default: picking another would be refused there too.
+    expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual([
+      "Default",
+      "Auto",
+    ]);
+    fireEvent.click(screen.getByRole("option", { name: "Default" }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    expect(readTriggerWorkerSettings(input.prompt)).toEqual({
+      agentId: "ag_claude_native",
+      model: "",
+      effort: "",
+      permissionMode: "",
+    });
+    expect(input.prompt).not.toContain("permission_mode");
+  });
+
   it.each([true, false])(
     "saves the workers' permission mode, offering only modes that keep approval (server applies it: %s)",
     async (supported) => {

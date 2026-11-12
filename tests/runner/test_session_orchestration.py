@@ -24,30 +24,27 @@ def test_native_message_schema(spec, runner_features, monkeypatch):
     assert schema["parameters"]["required"] == ["session_id", "message"]
 
 
-def test_create_schema_exposes_project_name():
+def test_create_schema_exposes_project_name_and_permission_mode():
     schemas = build_native_relay_tool_schemas(AgentSpec(spec_version=1, spawn=True))
     schema = next(s for s in schemas if s["name"] == "sys_session_create")
-    # The schema forbids unlisted properties, so the project argument must be declared.
+    # The schema forbids unlisted properties, so each argument must be declared.
     assert schema["parameters"]["additionalProperties"] is False
     assert schema["parameters"]["properties"]["project_name"]["type"] == "string"
+    assert schema["parameters"]["properties"]["permission_mode"]["type"] == "string"
     assert "project_id" not in schema["parameters"]["properties"]
 
 
-def test_create_schema_exposes_permission_mode():
-    schemas = build_native_relay_tool_schemas(AgentSpec(spec_version=1, spawn=True))
-    schema = next(s for s in schemas if s["name"] == "sys_session_create")
-    assert schema["parameters"]["properties"]["permission_mode"]["type"] == "string"
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize("advertised", [True, False])
+# None is an older server, which omits the field.
+@pytest.mark.parametrize("advertised", [True, False, None])
 async def test_create_sends_permission_mode_only_to_a_server_that_applies_it(advertised):
     requests = []
 
     def respond(request):
         requests.append(request)
         if request.url.path == "/v1/info":
-            return httpx.Response(200, json={"session_create_permission_modes": advertised})
+            info = {} if advertised is None else {"session_create_permission_modes": advertised}
+            return httpx.Response(200, json=info)
         return httpx.Response(201, json={"id": "conv_worker", "agent_id": "worker"})
 
     async with httpx.AsyncClient(

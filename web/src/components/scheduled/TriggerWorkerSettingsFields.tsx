@@ -83,10 +83,19 @@ export function TriggerWorkerSettingsFields({
   onChange: (value: TriggerWorkerSettings) => void;
   onSelectOpenChange: (open: boolean) => void;
 }) {
-  // The server refuses these for a session an agent starts.
+  // The server refuses these for a session an agent starts. A server that can't apply a
+  // saved mode still shows it, so it can be cleared: a newer runner refuses the call there.
   const permissions = permissionModesSupported
     ? settings.permissions.filter((option) => !APPROVAL_SKIPPING_PERMISSION_MODES.has(option.value))
-    : [];
+    : value.permissionMode
+      ? [
+          settings.permissions.find((option) => option.value === value.permissionMode) ?? {
+            value: value.permissionMode,
+            label: value.permissionMode,
+            description: "",
+          },
+        ]
+      : [];
   return (
     <div className="space-y-3" data-testid="task-worker-settings">
       <ModelEffortFields
