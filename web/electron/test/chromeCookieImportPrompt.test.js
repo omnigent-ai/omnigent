@@ -1,4 +1,4 @@
-// Tests for the native Chrome-cookie import prompt (src/browserIpc.js), run
+// Tests for the native Chrome-cookie import prompt (src/browserIpc.ts), run
 // with `node --test`.
 //
 // The prompt is the consent gate for copying Chrome's cookies into a
@@ -10,18 +10,11 @@
 
 const { describe, it, afterEach, mock } = require("node:test");
 const assert = require("node:assert/strict");
-const Module = require("node:module");
 
-// browserIpc requires electron lazily, only inside askToImportChromeCookies.
+// Electron's dialog is injected; main passes its own.
 const electronStub = { dialog: { showMessageBox: async () => ({ response: 0 }) } };
-// Bracket-access `_load` so no-underscore-dangle doesn't flag the Node API name.
-const origLoad = Module["_load"];
-Module["_load"] = function (request, ...rest) {
-  if (request === "electron") return electronStub;
-  return origLoad.call(this, request, ...rest);
-};
 
-const { buildCookieImportPrompt, askToImportChromeCookies } = require("../src/browserIpc");
+const { buildCookieImportPrompt, askToImportChromeCookies } = require("../src/browserIpc.ts");
 
 afterEach(() => mock.restoreAll());
 
@@ -102,13 +95,16 @@ describe("askToImportChromeCookies", () => {
       calls.push(args);
       return { response: 1 };
     });
-    const approved = await askToImportChromeCookies({
-      host: "mail.example.com",
-      scope: "example.com",
-      profileName: "Work",
-      cookieCount: 3,
-      parentWindow,
-    });
+    const approved = await askToImportChromeCookies(
+      {
+        host: "mail.example.com",
+        scope: "example.com",
+        profileName: "Work",
+        cookieCount: 3,
+        parentWindow,
+      },
+      electronStub.dialog,
+    );
     assert.equal(approved, true);
     assert.equal(calls.length, 1);
     assert.equal(calls[0][0], parentWindow);
@@ -123,15 +119,28 @@ describe("askToImportChromeCookies", () => {
       calls.push(args);
       return { response: 0 };
     });
-    const approved = await askToImportChromeCookies({
+    const approved = await askToImportChromeCookies(
+      {
+        host: "example.com",
+        scope: "example.com",
+        profileName: "Work",
+        cookieCount: 3,
+        parentWindow: { isDestroyed: () => true },
+      },
+      electronStub.dialog,
+    );
+    assert.equal(approved, false);
+    assert.equal(calls[0].length, 1);
+    assert.match(calls[0][0].detail, /example\.com/);
+  });
+
+  it("declines without a dialog to ask with", async () => {
+    const request = {
       host: "example.com",
       scope: "example.com",
       profileName: "Work",
       cookieCount: 3,
-      parentWindow: { isDestroyed: () => true },
-    });
-    assert.equal(approved, false);
-    assert.equal(calls[0].length, 1);
-    assert.match(calls[0][0].detail, /example\.com/);
+    };
+    assert.equal(await askToImportChromeCookies(request, undefined), false);
   });
 });

@@ -35,7 +35,7 @@ it("imports browser IPC and checks injected identities without desktop js-yaml",
        { readLocalHostId: () => "local", liveDaemonRecordFor: () => ({ host_id: "local" }) },
      ), true);`,
     path.join(import.meta.dirname, "../src/hostIdentity.ts"),
-    path.join(import.meta.dirname, "../src/browserIpc.js"),
+    path.join(import.meta.dirname, "../src/browserIpc.ts"),
   ]);
 });
 

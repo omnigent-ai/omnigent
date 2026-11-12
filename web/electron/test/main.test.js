@@ -658,7 +658,7 @@ function loadNavigationHarness({
       : {
           createBrowserViewBoundsController: () => ({ attach: () => {}, detach: () => {} }),
         },
-    "./browserIpc": {
+    "./browserIpc.ts": {
       registerBrowserIpc: (deps) => {
         browserIpcDeps = deps;
       },
@@ -4562,6 +4562,16 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         chromeCookieImport: true,
       },
     );
+  });
+
+  it("gives the browser IPC Electron's dialog for the cookie-import prompt", (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: "https://server.example",
+      internalFeatures: false,
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    assert.equal(h.browserIpcDeps().dialog, h.electron.dialog);
   });
 
   it("points old renderers at their visible Run on Arca action", async (t) => {

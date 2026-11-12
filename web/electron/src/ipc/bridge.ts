@@ -67,7 +67,8 @@ export interface BrowserViewBounds {
 
 export interface BrowserCallResult {
   ok: boolean;
-  error?: string;
+  /** Some handlers send `error: undefined` on success. */
+  error?: string | undefined;
 }
 
 export interface BrowserOpenResult extends BrowserCallResult {
@@ -87,7 +88,8 @@ export interface BrowserScreenshotResult extends BrowserCallResult {
 
 /** Result of a fixed browser action; `result` is the page's reply as a string. */
 export interface BrowserScriptResult extends BrowserCallResult {
-  result?: string;
+  /** Undefined when the page's reply has no JSON form. */
+  result?: string | undefined;
 }
 
 export interface BrowserCloseResult extends BrowserCallResult {
@@ -134,7 +136,8 @@ export interface BrowserNavState {
 
 /** Design-mode element info from the page, plus a cropped screenshot of it. */
 export interface BrowserElementSelection {
-  conversationId: string;
+  /** The enable request's view ID, unchecked; the page's JSON can replace it. */
+  conversationId: unknown;
   /** PNG data URL, or null when the element had no visible area. */
   screenshot: string | null;
   [field: string]: unknown;
@@ -142,8 +145,14 @@ export interface BrowserElementSelection {
 
 /** A design-mode prompt submit; the page supplies `id`, `element` and `prompt`. */
 export interface BrowserElementPromptSubmit {
-  conversationId: string;
+  /** The enable request's view ID, unchecked; the page's JSON can replace it. */
+  conversationId: unknown;
   [field: string]: unknown;
+}
+
+export interface BrowserElementPromptDismiss {
+  /** The enable request's view ID, unchecked. */
+  conversationId: unknown;
 }
 
 /** Result a design-mode submit paints into the page's popup. */
@@ -652,7 +661,7 @@ export interface ElectronDesktopBridge {
   ) => Unsubscribe;
   /** Subscribe to design-mode prompt dismissals (× / Escape). */
   onBrowserElementPromptDismiss: (
-    callback: (payload: { conversationId: string }) => void,
+    callback: (payload: BrowserElementPromptDismiss) => void,
   ) => Unsubscribe;
 }
 

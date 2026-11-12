@@ -1,6 +1,6 @@
-// Main-side modules register and push most channels with raw strings the compiler
-// can't tie to src/ipc/contract.ts. This checks every main-side site against the
-// contract both ways; a site it cannot classify fails the test.
+// Main-side modules register and push channels with raw strings or the
+// src/ipc/main.ts helpers. This checks every such site against
+// src/ipc/contract.ts both ways; a site it cannot classify fails the test.
 
 import { it } from "node:test";
 import assert from "node:assert/strict";
@@ -18,8 +18,9 @@ const CONTRACT_INTERFACES: Record<Direction, string> = {
 };
 
 /**
- * Pushes whose channel is a parameter: `site` is the forwarding call in `file`;
- * its channels are the string literals passed to `callee` in `callerFile`.
+ * Pushes whose channel is a parameter: `site` is the forwarding call in `file`
+ * (a raw `.send(` or a helper `push(`); its channels are the string literals
+ * passed to `callee` in `callerFile`.
  */
 const FORWARDERS = [
   {
@@ -29,9 +30,9 @@ const FORWARDERS = [
     callee: "sendToRenderer",
   },
   {
-    file: "browserIpc.js",
-    site: "event.sender.send(channel, payload)",
-    callerFile: "browserIpc.js",
+    file: "browserIpc.ts",
+    site: "push(event.sender, channel, ...args)",
+    callerFile: "browserIpc.ts",
     callee: "send",
   },
   {
@@ -95,6 +96,93 @@ function firstArguments(source: string, callee: RegExp, file: string) {
   });
 }
 
+/** The argument list of the call whose `(` ends just before `start`, split at top-level commas. */
+function callArguments(source: string, start: number, where: string): string[] {
+  const args: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (let index = start; index < source.length; index += 1) {
+    const char = source[index]!;
+    if (char === '"' || char === "'" || char === "`") {
+      let end = index + 1;
+      while (end < source.length && source[end] !== char) end += source[end] === "\\" ? 2 : 1;
+      current += source.slice(index, end + 1);
+      index = end;
+      continue;
+    }
+    if (depth === 0 && (char === "," || char === ")")) {
+      if (current.trim()) args.push(current.trim());
+      if (char === ")") return args;
+      current = "";
+      continue;
+    }
+    if ("([{".includes(char)) depth += 1;
+    if (")]}".includes(char)) depth -= 1;
+    current += char;
+  }
+  assert.fail(`${where}: unterminated call`);
+}
+
+const HELPER_DIRECTIONS: Record<string, Direction> = { handle: "invoke", on: "send", push: "push" };
+
+/** The src/ipc/main.ts helpers a file imports; renamed or unknown imports fail. */
+function helperImports(source: string, file: string): string[] {
+  const names: string[] = [];
+  for (const match of source.matchAll(/\bimport\s+([^;]*?)\s+from\s+"\.\/ipc\/main\.ts"/g)) {
+    const where = `${file}:${lineOf(source, match.index)}`;
+    const clause = /^(type\s+)?\{([^}]*)\}$/.exec(match[1]!.trim());
+    if (!clause) assert.fail(`${where}: import the ipc/main.ts helpers by name`);
+    if (clause[1]) continue;
+    for (const specifier of clause[2]!.split(",").map((part) => part.trim())) {
+      if (!specifier || specifier.startsWith("type ")) continue;
+      if (!(specifier in HELPER_DIRECTIONS)) {
+        assert.fail(`${where}: cannot classify the ipc/main.ts import \`${specifier}\``);
+      }
+      names.push(specifier);
+    }
+  }
+  return names;
+}
+
+/** Channel sites made through the src/ipc/main.ts helpers; the channel is the second argument. */
+function helperSites(
+  source: string,
+  file: string,
+  sites: ChannelSite[],
+): { index: number; where: string }[] {
+  const forwarded: { index: number; where: string }[] = [];
+  const imports = [...source.matchAll(/\bimport\s+[^;]*?\s+from\s+"\.\/ipc\/main\.ts"/g)];
+  const inImport = (index: number) =>
+    imports.some(
+      (statement) => index >= statement.index && index < statement.index + statement[0].length,
+    );
+  for (const reference of source.matchAll(/ipc\/main(\.[jt]s)?["']/g)) {
+    const where = `${file}:${lineOf(source, reference.index)}`;
+    if (!inImport(reference.index))
+      assert.fail(`${where}: load ipc/main.ts only by a named import`);
+  }
+  for (const name of helperImports(source, file)) {
+    for (const match of source.matchAll(new RegExp(`(?<![.\\w$])${name}\\b`, "g"))) {
+      if (inImport(match.index)) continue;
+      const where = `${file}:${lineOf(source, match.index)}`;
+      if (source[match.index + name.length] !== "(") {
+        assert.fail(`${where}: uses \`${name}\` other than as a direct call`);
+      }
+      const args = callArguments(source, match.index + name.length + 1, where);
+      const channel = channelArgument(source, args[1] ?? "", where);
+      const direction = HELPER_DIRECTIONS[name]!;
+      if (channel !== null) {
+        sites.push({ direction, channel, where });
+      } else if (direction === "push") {
+        forwarded.push({ index: match.index, where });
+      } else {
+        assert.fail(`${where}: registers a non-literal channel`);
+      }
+    }
+  }
+  return forwarded;
+}
+
 /** Every main-process source file under src/, as a `/`-separated path; ipc/ holds the contract. */
 function mainSideFiles(): string[] {
   return fs
@@ -123,23 +211,22 @@ function mainSideSites(): ChannelSite[] {
       }
     }
     assert.doesNotMatch(source, /\bsendSync\(|\.sendTo\(/, `${file}: unexpected IPC call`);
-    assert.doesNotMatch(
-      source,
-      /ipc\/main(\.[jt]s)?["']/,
-      `${file}: extend this test for ipc/main.ts`,
-    );
 
     const forwarders = FORWARDERS.filter((forwarder) => forwarder.file === file);
-    const pushes = firstArguments(source, /\.send\(/g, file);
-    let forwardingSites = 0;
-    for (const { argument, where, index } of pushes) {
+    const forwardingCalls: { index: number; where: string; token: string }[] = helperSites(
+      source,
+      file,
+      sites,
+    ).map((call) => ({ ...call, token: "push(" }));
+    for (const { argument, where, index } of firstArguments(source, /\.send\(/g, file)) {
       const channel = channelArgument(source, argument, where);
-      if (channel !== null) {
-        sites.push({ direction: "push", channel, where });
-        continue;
-      }
-      const forwarder = forwarders.find(({ site }) =>
-        source.startsWith(site, index - site.indexOf(".send(")),
+      if (channel !== null) sites.push({ direction: "push", channel, where });
+      else forwardingCalls.push({ index, where, token: ".send(" });
+    }
+    let forwardingSites = 0;
+    for (const { where, index, token } of forwardingCalls) {
+      const forwarder = forwarders.find(
+        ({ site }) => site.includes(token) && source.startsWith(site, index - site.indexOf(token)),
       );
       if (!forwarder) assert.fail(`${where}: pushes a non-literal channel outside FORWARDERS`);
       forwardingSites += 1;
