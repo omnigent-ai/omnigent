@@ -3275,6 +3275,10 @@ describe("CreateScheduledTaskDialog session mode", () => {
         expect(screen.queryByTestId("schedule-preset-trigger")).toBeNull();
         expect(screen.queryByTestId("task-trigger-cadence")).toBeNull();
         expect(screen.queryByTestId("task-session-mode-trigger")).toBeNull();
+        if (!supported) {
+          expect(submit).toBeDisabled();
+          fireEvent.click(screen.getByRole("button", { name: "Use supported schedule" }));
+        }
         await waitFor(() => expect(submit).toBeEnabled());
         fireEvent.click(submit);
         await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
@@ -3935,12 +3939,16 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     },
   );
 
-  it("keeps trigger cadence hidden after converting a template to new-session mode", async () => {
+  it("keeps trigger cadence hidden and selects a compatible sandbox schedule after conversion", async () => {
     renderTrigger("jira", {
       features: { automations_v2: true },
       scheduled_task_subhour: true,
+      managed_sandboxes_enabled: true,
     });
     fillJira();
+    await waitFor(() =>
+      expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Sandbox"),
+    );
     fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
     expect(screen.queryByTestId("task-trigger-cadence")).not.toBeInTheDocument();
     expect(screen.queryByTestId("task-schedule-trigger")).not.toBeInTheDocument();
@@ -3949,8 +3957,9 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     fireEvent.click(screen.getByRole("menuitemradio", { name: "New session each run" }));
     expect(screen.queryByTestId("task-trigger-cadence")).not.toBeInTheDocument();
     expect(screen.queryByTestId("task-schedule-trigger")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-trigger-schedule-replacement")).not.toBeInTheDocument();
     await submittedPrompt();
-    expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=MINUTELY;INTERVAL=10");
+    expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=HOURLY;BYMINUTE=0");
     expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
   });
 
@@ -4979,7 +4988,7 @@ describe("editing template prompts", () => {
 });
 
 describe("scheduler capabilities", () => {
-  it("normalizes hidden trigger polling errors without opening unrelated sections", async () => {
+  it("offers an explicit replacement for unsupported hidden trigger schedules", async () => {
     const prompt = renderTriggerPrompt(
       "jira",
       { ...emptyTriggerFields("jira"), scope: "ES", instructions: "Triage it." },
@@ -5004,14 +5013,66 @@ describe("scheduler capabilities", () => {
     expect(screen.queryByRole("button", { name: "Schedule" })).not.toBeInTheDocument();
     expect(screen.getByTestId("task-worker-agent-trigger")).toBeVisible();
     expect(screen.queryByTestId("task-ending-trigger")).not.toBeInTheDocument();
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "saved schedule isn't supported by the current run setup",
+    );
     expect(screen.queryByLabelText("Schedule ends")).not.toBeInTheDocument();
     const submit = screen.getByTestId("create-scheduled-task-submit");
+    expect(submit).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Use supported schedule" }));
     await waitFor(() => expect(submit).toBeEnabled());
     fireEvent.click(submit);
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe("FREQ=HOURLY;BYMINUTE=0");
     expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("sessionMode");
+  });
+
+  it("preserves a saved trigger cadence while capabilities resolve", async () => {
+    const prompt = renderTriggerPrompt(
+      "jira",
+      { ...emptyTriggerFields("jira"), scope: "ES", instructions: "Triage it." },
+      { placement: "same_host", sessionLink: "https://omni.example.com/c/CONVERSATION_ID" },
+    );
+    const dialog = (
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          prompt,
+          sessionMode: "continue",
+          rrule: "FREQ=MINUTELY;INTERVAL=10",
+        })}
+      />
+    );
+    const view = render(<CapabilitiesProvider info="loading">{dialog}</CapabilitiesProvider>, {
+      expandAdvanced: false,
+    });
+    expect(screen.queryByTestId("task-trigger-schedule-replacement")).not.toBeInTheDocument();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Your prompt"), {
+      target: { value: "Triage it and summarize the result." },
+    });
+
+    view.rerender(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          features: { automations_v2: true },
+          scheduled_task_subhour: true,
+          scheduled_task_session_modes: true,
+          scheduled_task_harness_settings: true,
+        }}
+      >
+        {dialog}
+      </CapabilitiesProvider>,
+    );
+
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    expect(screen.queryByTestId("task-trigger-schedule-replacement")).not.toBeInTheDocument();
+    fireEvent.click(submit);
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe("FREQ=MINUTELY;INTERVAL=10");
   });
 
   it.each([false, undefined, "loading"] as const)(

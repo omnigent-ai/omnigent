@@ -969,6 +969,20 @@ export function CreateScheduledTaskDialog({
     (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));
   const usesTriggerSchedule =
     triggerMode || triggerType !== "schedule" || editedTriggerSource !== null;
+  const compatibleTriggerSchedule =
+    validateSchedule(defaultTriggerSchedule, {
+      sessionMode,
+      subhourSupported,
+      executionTarget,
+    }) === null
+      ? defaultTriggerSchedule
+      : HOURLY_SCHEDULE_MODEL;
+  const hiddenTriggerScheduleNeedsReplacement =
+    usesTriggerSchedule &&
+    !curationPending &&
+    scheduleInvalid &&
+    editingTask !== null &&
+    !triggerSourceSwitched;
   const sendsToTaskSession =
     trigger !== null
       ? triggerTaskSessionMode === "continue"
@@ -987,8 +1001,8 @@ export function CreateScheduledTaskDialog({
     if (!open) return;
     if (usesTriggerSchedule) {
       setScheduleMenuOpen(false);
-      if (scheduleInvalid) {
-        setSchedule(defaultTriggerSchedule);
+      if (!curationPending && scheduleInvalid && !hiddenTriggerScheduleNeedsReplacement) {
+        setSchedule(compatibleTriggerSchedule);
         setScheduleUnsupported(false);
       }
       return;
@@ -1003,8 +1017,10 @@ export function CreateScheduledTaskDialog({
   }, [
     open,
     usesTriggerSchedule,
+    curationPending,
     scheduleInvalid,
-    defaultTriggerSchedule,
+    hiddenTriggerScheduleNeedsReplacement,
+    compatibleTriggerSchedule,
     recurrenceValid,
     scheduleUnsupported,
     unsupportedByScheduler,
@@ -1703,6 +1719,30 @@ export function CreateScheduledTaskDialog({
                       </div>
                     )}
                   </div>
+                  {hiddenTriggerScheduleNeedsReplacement && (
+                    <div
+                      className="flex items-center justify-between gap-3 rounded-lg bg-muted/50 px-3 py-2 text-ui"
+                      role="alert"
+                      data-testid="task-trigger-schedule-replacement"
+                    >
+                      <p>
+                        This automation&apos;s saved schedule isn&apos;t supported by the current
+                        run setup.
+                      </p>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="shrink-0"
+                        onClick={() => {
+                          setSchedule(compatibleTriggerSchedule);
+                          setScheduleUnsupported(false);
+                        }}
+                      >
+                        Use supported schedule
+                      </Button>
+                    </div>
+                  )}
                   <div className="grid min-w-0 grid-cols-1 gap-3 sm:col-span-6 sm:grid-cols-6">
                     <Select
                       value={sandboxMode ? SANDBOX_HOST : hostId}
