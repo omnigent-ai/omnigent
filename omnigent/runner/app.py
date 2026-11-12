@@ -1673,10 +1673,17 @@ def create_runner_app(
     _human_wait_lock = threading.Lock()
 
     def _record_native_pane_status(
-        session_id: str, status: str, blocked_on: object = None
+        session_id: str, status: str, blocked_on: object = None, *, inferred: object = False
     ) -> None:
-        """Record a native session's status edge, ending a dialog wait it leaves."""
+        """Record a native session's status edge, ending a dialog wait it leaves.
+
+        A reason inferred from the pane, such as a hidden input box, does not show
+        that the turn stopped, so an inferred ``running`` edge leaves the dialog
+        record as it was.
+        """
         _native_pane_status[session_id] = status
+        if inferred is True and status == "running":
+            return
         dialog = (
             blocked_on
             if status == "running" and isinstance(blocked_on, str) and blocked_on
@@ -1848,7 +1855,12 @@ def create_runner_app(
         if event_body.get("type") == "session.status":
             _status_value = event_body.get("status")
             if isinstance(_status_value, str):
-                _record_native_pane_status(session_id, _status_value, event_body.get("blocked_on"))
+                _record_native_pane_status(
+                    session_id,
+                    _status_value,
+                    event_body.get("blocked_on"),
+                    inferred=event_body.get("inferred"),
+                )
         _fan_out_child_delta_to_parent(session_id, event_body)
 
     def _child_preview_from_status(
@@ -2064,7 +2076,7 @@ def create_runner_app(
         if wire_status != status:
             # Only the server's copy is downgraded: the agent still works in
             # this pane, so the runner keeps counting the session as busy.
-            _record_native_pane_status(session_id, status, blocked_on)
+            _record_native_pane_status(session_id, status, blocked_on, inferred=inferred)
 
     resource_registry.set_session_status_publisher(
         _publish_session_status,

@@ -9,7 +9,10 @@ the pin so a short idle timeout can shut down.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -416,6 +419,24 @@ async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(
         )
 
 
+class _AdvanceableClock:
+    """Stand-in for the runner module's ``time`` whose monotonic clock can jump ahead."""
+
+    def __init__(self) -> None:
+        self._ahead_s = 0.0
+
+    def advance(self, seconds: float) -> None:
+        """Move the monotonic clock forward by *seconds*."""
+        self._ahead_s += seconds
+
+    def monotonic(self) -> float:
+        """Return the real monotonic time plus every advance so far."""
+        return time.monotonic() + self._ahead_s
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
 def _publish_native_status(
     app: FastAPI, conv_id: str, status: str, blocked_on: str | None
 ) -> None:
@@ -432,101 +453,19 @@ def _publish_native_status(
     publish(conv_id, status, blocked_on)
 
 
-@pytest.mark.asyncio
-async def test_native_dialog_hold_is_bounded_but_running_is_not(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A turn parked on a dialog stops holding the watchdog after the hold.
+@contextlib.asynccontextmanager
+async def _claude_native_pane_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, conv_id: str
+) -> AsyncIterator[tuple[FastAPI, Any]]:
+    """Serve a runner app whose session has a claude-native pane and no turn.
 
-    An unanswered dialog is not agent work, so it must not pin the runner
-    forever; once the dialog is gone the running turn holds it again.
+    The pane shows no recent output or input until a test sets its mocks, and
+    approval-wait markers live under ``tmp_path / "approval-waits"``.
 
+    :param tmp_path: Pytest temp dir for the pane and the marker root.
     :param monkeypatch: Pytest monkeypatch fixture.
-    :returns: None.
-    """
-    from tests.runner.conftest import _runner_client
-
-    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0.05")
-    conv_id = "conv_native_dialog_bounded"
-    app = await _native_app_with_session(conv_id)
-    async with _runner_client(app) as client:
-        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
-        assert created.status_code == 201, created.text
-        _publish_native_status(app, conv_id, "running", "permission prompt")
-        assert app.state.has_active_work() is True
-        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
-
-        _publish_native_status(app, conv_id, "running", None)
-        assert app.state.has_active_work() is True
-
-
-@pytest.mark.asyncio
-async def test_native_dialog_hold_zero_keeps_it_unbounded(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``0`` restores the old behavior: a dialog holds the watchdog until it settles.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :returns: None.
-    """
-    from tests.runner.conftest import _runner_client
-
-    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0")
-    conv_id = "conv_native_dialog_unbounded"
-    app = await _native_app_with_session(conv_id)
-    async with _runner_client(app) as client:
-        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
-        assert created.status_code == 201, created.text
-        _publish_native_status(app, conv_id, "running", "permission prompt")
-        assert app.state.has_active_work() is True
-        await asyncio.sleep(0.05)  # custom-lint: disable=sleep-then-assert -- no hold to outlast
-        assert app.state.has_active_work() is True
-
-
-@pytest.mark.asyncio
-async def test_new_dialog_after_running_gets_a_fresh_hold(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """dialog (hold expires) -> running -> the same dialog again starts a fresh hold.
-
-    The watchdog does not poll while a turn runs, so the episode must end when
-    the status changes, not when a poll happens to see it.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :returns: None.
-    """
-    from tests.runner.conftest import _runner_client
-
-    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0.05")
-    conv_id = "conv_native_dialog_episode"
-    app = await _native_app_with_session(conv_id)
-    async with _runner_client(app) as client:
-        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
-        assert created.status_code == 201, created.text
-        _publish_native_status(app, conv_id, "running", "permission prompt")
-        assert app.state.has_active_work() is True
-        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
-
-        # The answered dialog resumes the turn, which then parks on another dialog;
-        # nothing polls the watchdog in between.
-        _publish_native_status(app, conv_id, "running", None)
-        _publish_native_status(app, conv_id, "running", "permission prompt")
-        assert app.state.has_active_work() is True
-
-
-@pytest.mark.asyncio
-async def test_permission_hook_wait_is_bounded_per_hook(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A permission hook parked on its verdict holds the watchdog only for the hold.
-
-    The parked turn still reads ``running``, so the hook's marker marks the human
-    wait. Each hook owns its marker, so a later hook gets a fresh hold, and a
-    hook that hands off to Claude's own prompt leaves a dialog with its own.
-
-    :param tmp_path: Pytest temp dir for the approval-wait marker root.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :returns: None.
+    :param conv_id: Session id, e.g. ``"conv_native"``.
+    :returns: The app and the pane's terminal instance.
     """
     from omnigent.harnesses.claude_native import bridge
     from omnigent.runner.native import NativeLaunchContext
@@ -536,8 +475,6 @@ async def test_permission_hook_wait_is_bounded_per_hook(
     from tests.runner.conftest import _runner_client, _spec_resolver_returning
     from tests.runner.helpers import make_test_terminal_instance
 
-    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0.05")
-    conv_id = "conv_parked_permission_hook"
     terminals = TerminalRegistry()
     instance = make_test_terminal_instance("claude", "main", tmp_path)
     monkeypatch.setattr(instance, "start_idle_watcher_thread", Mock())
@@ -547,8 +484,6 @@ async def test_permission_hook_wait_is_bounded_per_hook(
     approval_root = tmp_path / "approval-waits"
     approval_root.mkdir()
     monkeypatch.setattr(bridge, "_APPROVAL_WAIT_ROOT", approval_root)
-    first_hook = bridge.approval_wait_marker_path(conv_id)
-    second_hook = first_hook.with_name(f"{first_hook.name.split('.')[0]}.999999.wait")
     spec = AgentSpec(
         spec_version=1,
         name="claude-native-ui",
@@ -577,26 +512,113 @@ async def test_permission_hook_wait_is_bounded_per_hook(
                 json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},
             )
             assert ensured.status_code == 200, ensured.text
-            _publish_native_status(app, conv_id, "running", None)
-            bridge.touch_approval_wait_marker(first_hook)
-            assert app.state.has_active_work() is True
-            await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
-            assert app.state.has_sandbox_work() is False
+            yield app, instance
 
-            bridge.touch_approval_wait_marker(second_hook)
-            assert app.state.has_active_work() is True
-            await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
 
-            # Both hooks give up and Claude shows its own permission prompt.
-            bridge.clear_approval_wait_marker(first_hook)
-            bridge.clear_approval_wait_marker(second_hook)
-            _publish_native_status(app, conv_id, "running", "permission prompt")
-            assert app.state.has_active_work() is True
-            await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
+@pytest.mark.asyncio
+async def test_native_dialog_hold_zero_keeps_it_unbounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``0`` restores the old behavior: a dialog holds the watchdog until it settles.
 
-            # Answering it resumes the running turn, which is agent work again.
-            _publish_native_status(app, conv_id, "running", None)
-            assert app.state.has_active_work() is True
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0")
+    clock = _AdvanceableClock()
+    monkeypatch.setattr("omnigent.runner.app.time", clock)
+    conv_id = "conv_native_dialog_unbounded"
+    app = await _native_app_with_session(conv_id)
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        _publish_native_status(app, conv_id, "running", "permission prompt")
+        assert app.state.has_active_work() is True
+        clock.advance(10 * 24 * 60 * 60)
+        assert app.state.has_active_work() is True
+
+
+@pytest.mark.asyncio
+async def test_native_dialog_hold_is_bounded_and_fresh_after_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn parked on a dialog holds the watchdog only for the hold, per dialog.
+
+    An unanswered dialog is not agent work, so it must not pin the runner
+    forever; once it is answered the running turn holds the watchdog again. The
+    watchdog does not check while a turn runs, so the next dialog's hold must
+    start fresh from its own edge, not from a check that happens to see it.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0.05")
+    conv_id = "conv_native_dialog_episode"
+    app = await _native_app_with_session(conv_id)
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        _publish_native_status(app, conv_id, "running", "permission prompt")
+        assert app.state.has_active_work() is True
+        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
+
+        # The answered dialog resumes the turn, which then parks on another dialog;
+        # nothing polls the watchdog in between.
+        _publish_native_status(app, conv_id, "running", None)
+        _publish_native_status(app, conv_id, "running", "permission prompt")
+        assert app.state.has_active_work() is True
+        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
+
+        _publish_native_status(app, conv_id, "running", None)
+        assert app.state.has_active_work() is True
+
+
+@pytest.mark.asyncio
+async def test_permission_hook_wait_is_bounded_per_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A permission hook parked on its verdict holds the watchdog only for the hold.
+
+    The parked turn still reads ``running``, so the hook's marker marks the human
+    wait. Each hook owns its marker, so a later hook gets a fresh hold, and a
+    hook that hands off to Claude's own prompt leaves a dialog with its own.
+
+    :param tmp_path: Pytest temp dir for the approval-wait marker root.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.harnesses.claude_native import bridge
+
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0.05")
+    conv_id = "conv_parked_permission_hook"
+    async with _claude_native_pane_app(tmp_path, monkeypatch, conv_id) as (app, _instance):
+        first_hook = bridge.approval_wait_marker_path(conv_id)
+        assert first_hook.parent == tmp_path / "approval-waits"
+        second_hook = first_hook.with_name(f"{first_hook.name.split('.')[0]}.999999.wait")
+        _publish_native_status(app, conv_id, "running", None)
+        bridge.touch_approval_wait_marker(first_hook)
+        assert app.state.has_active_work() is True
+        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
+        assert app.state.has_sandbox_work() is False
+
+        bridge.touch_approval_wait_marker(second_hook)
+        assert app.state.has_active_work() is True
+        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
+
+        # Both hooks give up and Claude shows its own permission prompt.
+        bridge.clear_approval_wait_marker(first_hook)
+        bridge.clear_approval_wait_marker(second_hook)
+        _publish_native_status(app, conv_id, "running", "permission prompt")
+        assert app.state.has_active_work() is True
+        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
+
+        # Answering it resumes the running turn, which is agent work again.
+        _publish_native_status(app, conv_id, "running", None)
+        assert app.state.has_active_work() is True
 
 
 @pytest.mark.asyncio
@@ -858,11 +880,24 @@ async def test_native_pane_idle_after_mid_turn_follow_up_releases_pin() -> None:
 
 
 @pytest.mark.asyncio
-async def test_only_pane_inferred_status_is_marked_inferred() -> None:
-    """The server checks this mark before an edge may reopen a turn."""
+async def test_only_pane_inferred_status_is_marked_inferred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server checks this mark before an edge may reopen a turn.
+
+    The runner checks it too: an inferred reason (a hidden input box, as in a
+    transcript view while a reply streams) does not show that the turn stopped,
+    so it never starts a bounded human wait.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
     from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.conftest import _runner_client
 
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "60")
+    clock = _AdvanceableClock()
+    monkeypatch.setattr("omnigent.runner.app.time", clock)
     conv_id = "conv_native_inferred_reason"
     app = await _native_app_with_session(conv_id)
     publish = app.state.session_resource_registry._session_status_publisher
@@ -874,6 +909,14 @@ async def test_only_pane_inferred_status_is_marked_inferred() -> None:
         publish(conv_id, "running", "terminal prompt", inferred=True)
         queue = _session_event_queues_ref[conv_id]
         events = [queue.get_nowait() for _ in range(queue.qsize())]
+
+        # The dialog is answered, then the pane hides its input box mid-reply.
+        publish(conv_id, "running", None)
+        publish(conv_id, "running", "terminal prompt", inferred=True)
+        assert app.state.has_sandbox_work() is True
+        clock.advance(120)
+        assert app.state.has_sandbox_work() is True
+        assert app.state.has_active_work() is True
     assert [
         (event["blocked_on"], event.get("inferred"))
         for event in events
@@ -1075,83 +1118,35 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
     :returns: None.
     """
     from omnigent.harnesses.claude_native import bridge
-    from omnigent.runner.native import NativeLaunchContext
-    from omnigent.runner.resource_registry import CLAUDE_NATIVE_TERMINAL_ROLE
-    from omnigent.spec.types import AgentSpec, ExecutorSpec
-    from omnigent.terminals import TerminalRegistry
-    from tests.runner.conftest import _runner_client, _spec_resolver_returning
-    from tests.runner.helpers import make_test_terminal_instance
 
     conv_id = "conv_idle_edge_live_pane"
-    terminals = TerminalRegistry()
-    instance = make_test_terminal_instance("claude", "main", tmp_path)
-    monkeypatch.setattr(instance, "start_idle_watcher_thread", Mock())
-    monkeypatch.setattr(instance, "close", AsyncMock())
-    monkeypatch.setattr(
-        instance, "screen_changed_within", Mock(return_value=evidence == "pane_output")
-    )
-    monkeypatch.setattr(
-        instance, "client_interaction_within", Mock(return_value=evidence == "pane_input")
-    )
-    approval_root = tmp_path / "approval-waits"
-    approval_root.mkdir()
-    monkeypatch.setattr(bridge, "_APPROVAL_WAIT_ROOT", approval_root)
-    if evidence == "permission_prompt":
-        bridge.touch_approval_wait_marker(bridge.approval_wait_marker_path(conv_id))
-    spec = AgentSpec(
-        spec_version=1,
-        name="claude-native-ui",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
-
-    async def launch(ctx: NativeLaunchContext):
-        terminals._by_conversation.setdefault(conv_id, {})[("claude", "main")] = instance
-        return await ctx.resource_registry.observe_required_terminal(
-            conv_id,
-            "claude",
-            "main",
-            instance,
-            resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
-        )
-
-    monkeypatch.setattr("omnigent.runner.native._launch_claude", launch)
-    transport = httpx.MockTransport(
-        lambda request: httpx.Response(200, json={"id": conv_id, "agent_id": "ag"})
-    )
-    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as server_client:
-        app = create_runner_app(
-            spec_resolver=await _spec_resolver_returning(spec),
-            server_client=server_client,
-            terminal_registry=terminals,
-        )
+    async with _claude_native_pane_app(tmp_path, monkeypatch, conv_id) as (app, instance):
+        instance.screen_changed_within.return_value = evidence == "pane_output"
+        instance.client_interaction_within.return_value = evidence == "pane_input"
+        if evidence == "permission_prompt":
+            bridge.touch_approval_wait_marker(bridge.approval_wait_marker_path(conv_id))
         monkeypatch.setattr(
             app.state.session_resource_registry,
             "session_has_background_agents",
             lambda session_id: evidence == "background_agent" and session_id == conv_id,
         )
-        async with _runner_client(app) as client:
-            ensured = await client.post(
-                f"/v1/sessions/{conv_id}/resources/terminals",
-                json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},
-            )
-            assert ensured.status_code == 200, ensured.text
-            publish = app.state.session_resource_registry._session_status_publisher
-            publish(conv_id, "running", None)
-            publish(conv_id, "idle", None)
-            background = app.state.session_resource_registry._session_background_publisher
-            if evidence == "background_shell":
-                # Claude reports ``shell`` (idle) while a background command it
-                # started outlives the turn; that command is still agent work.
-                background(conv_id, True)
-            assert app.state.native_pane_status[conv_id] == "idle"
-            assert app.state.has_active_work() is (evidence != "no_evidence")
-            # Sandbox keepalive counts agent work only: recent pane input or output
-            # also comes from someone viewing the pane, so only the prompt, a
-            # background agent and a background shell count.
-            assert app.state.has_sandbox_work() is (
-                evidence in ("permission_prompt", "background_agent", "background_shell")
-            )
-            if evidence == "background_shell":
-                background(conv_id, False)
-                assert app.state.has_active_work() is False
-                assert app.state.has_sandbox_work() is False
+        publish = app.state.session_resource_registry._session_status_publisher
+        publish(conv_id, "running", None)
+        publish(conv_id, "idle", None)
+        background = app.state.session_resource_registry._session_background_publisher
+        if evidence == "background_shell":
+            # Claude reports ``shell`` (idle) while a background command it
+            # started outlives the turn; that command is still agent work.
+            background(conv_id, True)
+        assert app.state.native_pane_status[conv_id] == "idle"
+        assert app.state.has_active_work() is (evidence != "no_evidence")
+        # Sandbox keepalive counts agent work only: recent pane input or output
+        # also comes from someone viewing the pane, so only the prompt, a
+        # background agent and a background shell count.
+        assert app.state.has_sandbox_work() is (
+            evidence in ("permission_prompt", "background_agent", "background_shell")
+        )
+        if evidence == "background_shell":
+            background(conv_id, False)
+            assert app.state.has_active_work() is False
+            assert app.state.has_sandbox_work() is False
