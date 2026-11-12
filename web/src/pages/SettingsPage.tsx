@@ -1979,6 +1979,7 @@ function AdminViewControl() {
   if (
     !eligible ||
     info === "loading" ||
+    info.admin_view === false ||
     (isAdminViewEnabled() && (!info.admin_view || info.single_user || isDatabricksWorkspace()))
   )
     return null;

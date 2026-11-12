@@ -381,12 +381,24 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 }
 
 describe("SettingsPage", () => {
-  it.each([false, undefined])("hides admin view when server support is %s", (supported) => {
-    mocks.me = { id: "admin", is_admin: true };
-    mocks.adminViewSupported = supported;
-    renderPage("/settings/general");
-    expect(screen.queryByRole("switch", { name: "Admin view" })).toBeNull();
-  });
+  it.each([
+    { supported: false, enabled: true },
+    { supported: false, enabled: false },
+    { supported: undefined, enabled: true },
+  ])(
+    "hides admin view with support=$supported and preference=$enabled",
+    ({ supported, enabled }) => {
+      mocks.me = { id: "admin", is_admin: true };
+      mocks.adminViewSupported = supported;
+      if (!enabled) document.cookie = "omnigent_admin_view=off; Path=/";
+      try {
+        renderPage("/settings/general");
+        expect(screen.queryByRole("switch", { name: "Admin view" })).toBeNull();
+      } finally {
+        document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
+      }
+    },
+  );
 
   it("hides admin view in a workspace while on", () => {
     mocks.me = { id: "admin", is_admin: true };
