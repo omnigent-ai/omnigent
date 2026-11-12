@@ -1025,6 +1025,8 @@ describe("run history", () => {
     expect(within(row).getByTestId("run-failure")).toHaveTextContent(
       "Runner · The agent didn't start.",
     );
+    // A run that recorded no failure detail shows no detail line.
+    expect(within(row).queryByTestId("run-failure-detail")).toBeNull();
   });
 
   it("shows a failed run's detail under its reason", () => {
@@ -1045,14 +1047,6 @@ describe("run history", () => {
     expect(within(row).getByTestId("run-failure-detail")).toHaveTextContent(
       "the sandbox did not register within 720 seconds — refresh your credentials",
     );
-  });
-
-  it("shows no detail line for a failed run without one", () => {
-    setTask(task());
-    setRuns([run({ status: "failed", errorCode: "runner_start_failed", conversationId: "c_7" })]);
-    renderPage();
-    const row = screen.getByTestId("task-detail-run");
-    expect(within(row).queryByTestId("run-failure-detail")).toBeNull();
   });
 
   it("labels a run that hasn't started yet as Queued", () => {

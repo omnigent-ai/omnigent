@@ -2365,13 +2365,15 @@ def test_provider_ui_capabilities_reports_multi_repo_per_provider() -> None:
     }
 
 
+class _NoticeLauncher(FakeSandboxLauncher):
+    """A provider whose unattended runs need the owner to keep a credential fresh."""
+
+    automation_notice = "Keep your laptop's credentials fresh."
+
+
 def test_provider_ui_capabilities_carry_a_providers_automation_notice() -> None:
     """A provider's automation notice reaches /v1/info for the automation form; a
     provider without one adds no key."""
-
-    class _NoticeFake(FakeSandboxLauncher):
-        automation_notice = "Keep your laptop's credentials fresh."
-
     deployment = ManagedSandboxDeployment(
         configs=tuple(
             ManagedSandboxConfig(
@@ -2380,7 +2382,7 @@ def test_provider_ui_capabilities_carry_a_providers_automation_notice() -> None:
                 token_ttl_s=3600,
                 launcher_factory=factory,
             )
-            for provider, factory in (("noted", _NoticeFake), ("plain", FakeSandboxLauncher))
+            for provider, factory in (("noted", _NoticeLauncher), ("plain", FakeSandboxLauncher))
         )
     )
 
@@ -2645,6 +2647,32 @@ async def test_info_reports_enabled_for_injected_custom_launcher(
     # No provider set on the injected config → the UI keeps the generic
     # label rather than inventing a name.
     assert body["sandbox_provider"] is None
+
+
+async def test_info_reports_a_providers_automation_notice_beside_its_flags(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """``GET /v1/info`` keeps a provider's text notice next to its boolean flags."""
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://s.example.com",
+            provider="noted",
+            launcher_factory=_NoticeLauncher,
+            token_ttl_s=3600,
+        )
+    )
+    app = _capability_probe_app(db_uri, tmp_path, config)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/v1/info")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["sandbox_provider_capabilities"] == {
+        "noted": {
+            "multi_repo": False,
+            "accepts_session_move": True,
+            "automation_notice": "Keep your laptop's credentials fresh.",
+        }
+    }
 
 
 # ── launch_managed_host ─────────────────────────────────────
