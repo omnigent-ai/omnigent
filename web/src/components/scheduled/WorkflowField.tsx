@@ -16,21 +16,43 @@ import { pickerTriggerClass } from "./pickerStyles";
 /**
  * New automation's optional Workflow field: one of the user's saved workflows
  * for each run to follow. Its menu is as wide as the field, so a long
- * description is cut off as in the composer's Run a workflow list.
+ * description is cut off as in the composer's Run a workflow list. An
+ * automation created from a workflow shows it `locked`.
  */
 export function WorkflowField({
   workflows,
   value,
   onChange,
   onOpenChange,
+  locked = false,
 }: {
   workflows: readonly SavedWorkflow[];
   value: SavedWorkflow | null;
   onChange: (workflow: SavedWorkflow | null) => void;
   /** Reports the menu opening and closing, as the dialog's other pickers do. */
   onOpenChange?: (open: boolean) => void;
+  /** Shows `value` with no menu, so it can't be changed or cleared. */
+  locked?: boolean;
 }) {
   const [open, setOpen] = useState(false);
+  if (locked && value) {
+    return (
+      <div className="flex flex-col gap-1.5" data-testid="task-workflow-field">
+        <Label>Workflow</Label>
+        {/* The chosen field's look, in full color, without its chevron or menu. */}
+        <Button
+          type="button"
+          variant="outline"
+          disabled
+          className="w-full justify-start gap-2 text-foreground disabled:opacity-100"
+          data-testid="task-workflow-trigger"
+        >
+          <WorkflowIcon className="size-3.5 shrink-0" />
+          <span className="flex-1 truncate text-left">{value.name}</span>
+        </Button>
+      </div>
+    );
+  }
   return (
     <div className="flex flex-col gap-1.5" data-testid="task-workflow-field">
       <Label>Workflow (optional)</Label>
