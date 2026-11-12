@@ -12,6 +12,7 @@ import {
   WorkflowIcon,
   XIcon,
 } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -21,7 +22,10 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useNow } from "@/hooks/useNow";
+import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import { useSessionTasks } from "@/hooks/useSessionTasks";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   absoluteTime,
   formatDuration,
@@ -46,7 +50,7 @@ import {
   type StepStatus,
 } from "@/lib/sessionJournal";
 import { messageDeepLinkParams } from "@/lib/messageDeepLink";
-import { useSearchParams } from "@/lib/routing";
+import { Link, useSearchParams } from "@/lib/routing";
 import { taskMarkerTarget } from "@/lib/taskActivity";
 import { cn } from "@/lib/utils";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
@@ -649,6 +653,54 @@ function ProgressStrip({
 }
 
 /**
+ * Marks a plan that runs a saved workflow, or was saved as one, with the
+ * workflow's name on hover. It opens the Workflows page when there is one.
+ */
+function WorkflowChip({ workflowId }: { workflowId: string }) {
+  const { workflows } = useSavedWorkflows();
+  const name = workflows.find((workflow) => workflow.id === workflowId)?.name;
+  const linked = isFeatureEnabled(useServerInfo(), "workflows_page");
+  const className = "h-5 gap-1 px-1.5 text-xs font-normal text-muted-foreground";
+  const label = (
+    <>
+      <WorkflowIcon className="size-3" />
+      Workflow
+    </>
+  );
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          {linked ? (
+            <Badge asChild variant="outline" className={className}>
+              <Link
+                to="/workflows"
+                componentId="tasks.plan.workflow"
+                data-testid="tasks-plan-workflow"
+              >
+                {label}
+              </Link>
+            </Badge>
+          ) : (
+            <Badge
+              variant="outline"
+              className={className}
+              tabIndex={0}
+              data-testid="tasks-plan-workflow"
+            >
+              {label}
+            </Badge>
+          )}
+        </TooltipTrigger>
+        <TooltipContent>
+          {name ? `Saved workflow “${name}”` : "From a saved workflow"}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
+/**
  * The tasks' summary and progress strip. It stays at the top of the panel while
  * the rest scrolls, with a hairline under it once something scrolls beneath.
  */
@@ -696,12 +748,16 @@ function TasksHeader({
         {(name || updatedAt > 0) && (
           <div className="flex items-baseline justify-between gap-3">
             {name && (
-              <h3
-                className="line-clamp-2 min-w-0 break-words text-ui font-semibold leading-snug"
-                data-testid="tasks-plan-name"
-              >
-                {name}
-              </h3>
+              // The chip follows the name, and wraps under it when the panel is narrow.
+              <div className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1">
+                <h3
+                  className="line-clamp-2 min-w-0 break-words text-ui font-semibold leading-snug"
+                  data-testid="tasks-plan-name"
+                >
+                  {name}
+                </h3>
+                {plan?.workflow_id && <WorkflowChip workflowId={plan.workflow_id} />}
+              </div>
             )}
             <span className="ml-auto flex shrink-0 items-center gap-1">
               {updatedAt > 0 && (

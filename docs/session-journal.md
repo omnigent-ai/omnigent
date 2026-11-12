@@ -62,7 +62,7 @@ spec can drop it with `tool_groups.journal: false` (see
 | `sys_journal_write_status(status, step?, text?)`                    | Records a step's status. `step` may be left out when the plan has one step. `started` and `done` need every step it depends on to be done first; otherwise the write fails with `step_not_ready`, naming them.                                                                  |
 | `sys_journal_write_note(body, step?)`                               | Adds a note.                                                                                                                                                                                                                                                                    |
 | `sys_workflow_request_input(step, questions)`                      | Asks the user about a task in the current plan and waits for the answer. It marks the task `needs_input` with the first question, raises the questions as an elicitation in the Inbox with the options as buttons, and returns `{answered, answers}`.                           |
-| `sys_workflow_save(name, description, steps)` | Saves a reusable workflow for the session's owner through `POST /v1/workflows`, and returns `{id, name}`, or `name_taken`. The `save-workflow` skill says how to make the steps generic. A save from a session shared with edit access is refused. |
+| `sys_workflow_save(name, description, steps)` | Saves a reusable workflow for the session's owner through `POST /v1/workflows`, and returns `{id, name}`, or `name_taken`. The session's current plan is then written again naming the workflow, with no new chat line. The `save-workflow` skill says how to make the steps generic. A save from a session shared with edit access is refused. |
 | `sys_workflow_load(workflow)` | Loads one of the owner's saved workflows by ID or name, with its steps. A name with no exact match returns `workflow_not_found` with the closest names. |
 | `sys_workflow_list(cursor?, limit?)` | Lists the owner's saved workflows by name, 20 at a time unless `limit` says otherwise (at most 50): each one's ID, name and the start of its description, without steps. `next_cursor` pages to the rest. |
 
@@ -251,8 +251,10 @@ servers that keep journals.
 A saved workflow is a named plan its owner can run, private to that owner, with
 steps in the plan's step format. Running one will copy its steps into the
 session's journal as the plan, and the entries written under it carry its ID in
-`workflow_id`. Workflows have no versions: an edit rewrites the workflow, and
-each run's journal keeps the plan it ran.
+`workflow_id`. Saving a session's plan as a workflow names it the same way, so
+the Tasks tab marks the plan with a Workflow chip either way. Workflows have no
+versions: an edit rewrites the workflow, and each run's journal keeps the plan
+it ran.
 
 - `GET /v1/workflows`: the caller's workflows by name, without their steps.
   `limit` (1–200, default 50), `after` (the previous page's `last_id`) and

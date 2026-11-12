@@ -597,6 +597,53 @@ async def test_the_workflow_tools_save_and_load_through_the_real_routes(
     assert [run["session_id"] for run in runs["data"]] == [session_id]
 
 
+async def test_saving_a_workflow_names_the_sessions_plan_after_it(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """The plan a session saves is then the workflow: it names it, with no new chat line."""
+    import json
+
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.runner.journal_tools import execute_journal_tool
+
+    session_id = _session(db_uri)
+    token = "save-names-plan-runner"
+    conversations = SqlAlchemyConversationStore(db_uri)
+    assert conversations.set_runner_id(session_id, token_bound_runner_id(token)) is True
+    client.headers.update({**_headers(), RUNNER_TUNNEL_TOKEN_HEADER: token})
+
+    async def run(tool: str, args: dict[str, object]) -> dict:
+        output = await execute_journal_tool(
+            tool, json.dumps(args), server_client=client, conversation_id=session_id
+        )
+        return json.loads(output)
+
+    steps = [
+        {"id": "explore", "name": "Explore the failing tests", "depends_on": []},
+        {"id": "fix", "name": "Fix the failing tests", "depends_on": ["explore"]},
+    ]
+    plan = {"name": "Fix the upload flakes", "steps": steps}
+    assert (await run("sys_journal_write_plan", plan))["version"] == 1
+    workflow = {
+        "name": "Triage flaky tests",
+        "description": "Finds and fixes them.",
+        "steps": steps,
+    }
+    saved = await run("sys_workflow_save", workflow)
+
+    url = f"/v1/sessions/{session_id}/journal"
+    plans = (await client.get(url, params={"kind": "plan"})).json()["data"]
+    assert [(entry["payload"]["version"], entry["workflow_id"]) for entry in plans] == [
+        (1, None),
+        (2, saved["id"]),
+    ]
+    assert plans[1]["payload"]["name"] == "Fix the upload flakes"
+    assert [step["id"] for step in plans[1]["payload"]["steps"]] == ["explore", "fix"]
+    items = conversations.list_items(session_id, limit=50).data
+    markers = [item.data.resource for item in items if item.type == "resource_event"]
+    assert [marker.get("change") for marker in markers] == ["made"]
+
+
 async def test_a_workflows_runs_list_the_sessions_that_ran_it(
     client: httpx.AsyncClient, db_uri: str
 ) -> None:
