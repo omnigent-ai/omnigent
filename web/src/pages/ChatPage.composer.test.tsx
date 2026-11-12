@@ -6445,6 +6445,26 @@ describe("Composer workflow entry point", () => {
     expect(onSendSlashCommand).not.toHaveBeenCalled();
   });
 
+  it("continues a stopped task for the Tasks tab, or says why it can't", () => {
+    setComposerState({ conversationId: "conv_test", sessionHarness: "openai-agents", skills: [] });
+    const onSend = vi.fn();
+    const error = vi.spyOn(toast, "error");
+    const { rerender } = renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+
+    act(() => useSessionTasksActions.getState().continueTask.conv_test?.("Run the tests"));
+    expect(onSend).toHaveBeenCalledWith('Continue the task "Run the tests".');
+
+    rerender(
+      <TooltipProvider>
+        <Composer {...composerProps({ onSend, unreachable: true })} />
+      </TooltipProvider>,
+    );
+    act(() => useSessionTasksActions.getState().continueTask.conv_test?.("Run the tests"));
+    expect(error).toHaveBeenCalledWith("The session is offline. Reconnect it to continue.");
+    expect(onSend).toHaveBeenCalledTimes(1);
+    error.mockRestore();
+  });
+
   it("opens the dialog for the Tasks tab's empty state", async () => {
     setComposerState({
       conversationId: "conv_test",
