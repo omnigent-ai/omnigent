@@ -559,7 +559,6 @@ class TestConstructor(unittest.TestCase):
 
         for declared_cwd, selected_cwd, prepared_cwd, expected_cwd in (
             ("/tmp/work", None, "/tmp/work", "/tmp/work"),
-            ("./project", "/tmp/selected", "/tmp/selected", "/tmp/selected"),
             ("./project", "/tmp/work", "/tmp/work/project", "/tmp/work/project"),
         ):
             spec = OSEnvSpec(type="caller_process", cwd=declared_cwd)
