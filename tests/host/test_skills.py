@@ -105,21 +105,23 @@ def test_session_catalog_matches_invocation_scope(
     assert resolved[0].skill_dir == runner_bundle / "skills" / "bundled"
 
 
-def test_session_catalog_ends_with_the_framework_workflow_skill(tmp_path: Path) -> None:
-    """Agents with the journal tools get ``/workflow``; their own skill of that name wins."""
+def test_session_catalog_ends_with_the_framework_workflow_skills(tmp_path: Path) -> None:
+    """Agents with the journal tools get ``/workflow`` and ``/save-workflow``; their own wins."""
     plain = _bundle({"skills/bundled/SKILL.md": _skill("bundled")}, tool_groups={})
     own = _bundle({"skills/workflow/SKILL.md": _skill("workflow")}, tool_groups={})
     frame = HostSkillsFrame("request", "session", str(tmp_path), "session", "agent", "1")
 
     catalog = HostSkillDiscovery(lambda _: _response(plain)).discover(frame, tmp_path)
-    assert [skill["name"] for skill in catalog] == ["bundled", "workflow"]
-    assert catalog[1]["description"].startswith("Plan and run a multi-step workflow")
+    assert [skill["name"] for skill in catalog] == ["bundled", "save-workflow", "workflow"]
+    assert catalog[1]["description"].startswith("Save this session's plan")
+    assert catalog[2]["description"].startswith("Plan and run a multi-step workflow")
     spec = load(plain, dest=tmp_path / "runner-bundle", expand_env=False)
     resolved = resolve_session_skills(spec, (tmp_path,), tmp_path / "runner-bundle")
     assert catalog == [{"name": s.name, "description": s.description} for s in resolved]
 
     overridden = HostSkillDiscovery(lambda _: _response(own)).discover(frame, tmp_path)
-    assert overridden == [{"name": "workflow", "description": "workflow description"}]
+    assert {"name": "workflow", "description": "workflow description"} in overridden
+    assert [skill["name"] for skill in overridden].count("workflow") == 1
 
 
 @pytest.mark.parametrize("remove_link", [True, False], ids=["removed", "permission-denied"])

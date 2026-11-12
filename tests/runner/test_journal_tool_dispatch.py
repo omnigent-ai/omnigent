@@ -1,4 +1,4 @@
-"""Runner-side journal tools: registration, retries, older servers, and questions.
+"""Runner-side journal tools: registration, retries, older servers, questions, workflows.
 
 The tools' behavior against real routes is covered end to end in
 ``tests/server/integration/test_session_journal_routes.py``.
@@ -42,6 +42,8 @@ def test_every_agent_gets_the_journal_tools_unless_its_spec_opts_out() -> None:
         "sys_journal_write_plan",
         "sys_journal_write_status",
         "sys_workflow_request_input",
+        "sys_workflow_save",
+        "sys_workflow_load",
     }
     assert names == JOURNAL_TOOL_NAMES
     assert names <= _ALL_LOCAL_TOOLS and names <= _NATIVE_RELAY_BUILTIN_TOOLS
@@ -267,3 +269,131 @@ async def test_a_dismissed_question_tells_the_agent_not_to_ask_again() -> None:
         await answer
     assert result["answered"] is False
     assert "don't ask again this turn" in result["detail"]
+
+
+# ── Saved workflows ───────────────────────────────────
+
+_WORKFLOW_ID = "0123456789abcdef0123456789abcdef"
+_STEPS = [
+    {"id": "explore", "name": "Explore the failing tests", "depends_on": []},
+    {"id": "fix", "name": "Fix the failing tests", "depends_on": ["explore"]},
+]
+_WORKFLOW = {
+    "id": _WORKFLOW_ID,
+    "object": "workflow",
+    "name": "Triage flaky tests",
+    "description": "Finds and fixes flaky tests. Give it: the test suite.",
+    "created_at": 1_762_534_860,
+    "updated_at": 1_762_534_860,
+    "steps": _STEPS,
+}
+_SAVE_ARGS = {key: _WORKFLOW[key] for key in ("name", "description", "steps")}
+
+
+async def test_a_save_posts_the_workflow_as_the_session_and_returns_its_id() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=_WORKFLOW)
+
+    args = {**_SAVE_ARGS, "name": " Triage  flaky tests "}
+    async with _client(handler) as client:
+        result = await _run(client, "sys_workflow_save", args)
+    assert result == {"id": _WORKFLOW_ID, "name": "Triage flaky tests"}
+    (request,) = seen
+    assert (request.method, request.url.path) == ("POST", "/v1/workflows")
+    # The server refuses a save from a session shared with edit access, so the call names it.
+    assert request.headers[ORCHESTRATION_SOURCE_HEADER] == SESSION
+    body = json.loads(request.content)
+    assert body["name"] == "Triage flaky tests"
+    assert [step["id"] for step in body["steps"]] == ["explore", "fix"]
+
+
+async def test_a_save_with_a_taken_name_or_bad_fields_says_so() -> None:
+    async with _client(lambda request: httpx.Response(409, json={})) as client:
+        taken = await _run(client, "sys_workflow_save", _SAVE_ARGS)
+    assert taken["error"] == "name_taken"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request expected")
+
+    async with _client(handler) as client:
+        missing = await _run(client, "sys_workflow_save", {"name": "x", "steps": _STEPS})
+        cyclic = await _run(
+            client,
+            "sys_workflow_save",
+            {
+                "name": "x",
+                "description": "y",
+                "steps": [{"id": "a", "name": "A", "depends_on": ["a"]}],
+            },
+        )
+    assert missing["error"].startswith("invalid_workflow: description")
+    assert cyclic["error"].startswith("invalid_workflow:")
+
+
+@pytest.mark.parametrize(
+    ("wanted", "requests"),
+    [
+        (_WORKFLOW_ID, [f"/v1/workflows/{_WORKFLOW_ID}"]),
+        (
+            "Triage flaky tests",
+            ["/v1/workflows?name=Triage+flaky+tests&limit=100", f"/v1/workflows/{_WORKFLOW_ID}"],
+        ),
+        (
+            "triage FLAKY tests",
+            [
+                "/v1/workflows?name=triage+FLAKY+tests&limit=100",
+                "/v1/workflows?limit=100",
+                f"/v1/workflows/{_WORKFLOW_ID}",
+            ],
+        ),
+    ],
+    ids=["by-id", "by-name", "by-name-in-another-case"],
+)
+async def test_a_load_finds_the_workflow_and_returns_its_steps(
+    wanted: str, requests: list[str]
+) -> None:
+    seen: list[str] = []
+    summary = {key: value for key, value in _WORKFLOW.items() if key != "steps"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url).removeprefix("http://server.test"))
+        assert request.headers[ORCHESTRATION_SOURCE_HEADER] == SESSION
+        if request.url.path == f"/v1/workflows/{_WORKFLOW_ID}":
+            return httpx.Response(200, json=_WORKFLOW)
+        exact = request.url.params.get("name") == "Triage flaky tests"
+        listed = [summary] if exact or "name" not in request.url.params else []
+        return httpx.Response(200, json={"data": listed, "has_more": False})
+
+    async with _client(handler) as client:
+        result = await _run(client, "sys_workflow_load", {"workflow": wanted})
+    assert result == {key: _WORKFLOW[key] for key in ("id", "name", "description", "steps")}
+    assert seen == requests
+
+
+async def test_a_load_of_an_unknown_name_suggests_the_closest_ones() -> None:
+    names = ["Triage flaky tests", "Release notes", "Triage CI failures"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "name" in request.url.params:
+            return httpx.Response(200, json={"data": [], "has_more": False})
+        data = [{"id": f"{index:032x}", "name": name} for index, name in enumerate(names)]
+        return httpx.Response(200, json={"data": data, "has_more": False})
+
+    async with _client(handler) as client:
+        result = await _run(client, "sys_workflow_load", {"workflow": "triage flaky test"})
+    assert result["error"] == "workflow_not_found"
+    assert result["similar"][0] == "Triage flaky tests"
+    assert "Release notes" not in result["similar"]
+
+
+async def test_an_older_server_without_workflows_says_so() -> None:
+    async with _client(
+        lambda request: httpx.Response(404, json={"detail": "Not Found"})
+    ) as client:
+        save = await _run(client, "sys_workflow_save", _SAVE_ARGS)
+        load = await _run(client, "sys_workflow_load", {"workflow": "Triage flaky tests"})
+    assert save["error"] == "sys_workflow_save: this Omnigent server has no saved workflows"
+    assert load["error"] == "sys_workflow_load: this Omnigent server has no saved workflows"

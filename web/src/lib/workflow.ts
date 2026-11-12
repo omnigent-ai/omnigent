@@ -32,3 +32,42 @@ export function workflowMessage(
   const command = `${skillPrefix}${WORKFLOW_SKILL} ${description.trim()}`;
   return reviewPlanFirst ? `${command}\n\n${REVIEW_PLAN_FIRST}` : command;
 }
+
+/** The framework skill that saves a session's plan as a reusable workflow. */
+export const SAVE_WORKFLOW_SKILL = "save-workflow";
+
+/** Whether a skill list offers the save-workflow skill, so the Tasks tab can offer Save as workflow. */
+export function offersSaveWorkflow(skills: readonly { name: string }[]): boolean {
+  return skills.some((skill) => skill.name === SAVE_WORKFLOW_SKILL);
+}
+
+/**
+ * The message that runs one of the user's saved workflows; the workflow skill
+ * loads it by ID.
+ *
+ * @param skillPrefix The harness's skill prefix, `"/"` or `"$"` for Codex's own CLI.
+ * @param workflow The saved workflow, e.g. `{ id: "0123…", name: "Triage flaky tests" }`.
+ * @param details What this run is about, e.g. `"The upload tests"`; may be empty.
+ * @param reviewPlanFirst Whether the user reviews the plan before the work starts.
+ */
+export function savedWorkflowMessage(
+  skillPrefix: string,
+  workflow: { id: string; name: string },
+  details: string,
+  reviewPlanFirst: boolean,
+): string {
+  const paragraphs = [`Run the saved workflow "${workflow.name}" (ID ${workflow.id}).`];
+  if (details.trim()) paragraphs.push(details.trim());
+  if (reviewPlanFirst) paragraphs.push(REVIEW_PLAN_FIRST);
+  return `${skillPrefix}${WORKFLOW_SKILL} ${paragraphs.join("\n\n")}`;
+}
+
+/**
+ * The message that saves the session's plan as a workflow named *name*.
+ *
+ * @param skillPrefix The harness's skill prefix, `"/"` or `"$"` for Codex's own CLI.
+ * @param name The name the user picked, e.g. `"Triage flaky tests"`.
+ */
+export function saveWorkflowMessage(skillPrefix: string, name: string): string {
+  return `${skillPrefix}${SAVE_WORKFLOW_SKILL} Save this session's plan as a workflow named "${name.trim()}".`;
+}

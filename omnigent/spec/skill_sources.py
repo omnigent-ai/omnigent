@@ -280,7 +280,7 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
 
 # Skills Omnigent ships, each for agents that have the tool group it drives.
 FRAMEWORK_SKILLS_DIR = Path(__file__).resolve().parent.parent / "resources" / "skills"
-_FRAMEWORK_SKILL_GROUPS = {"workflow": "journal"}
+_FRAMEWORK_SKILL_GROUPS = {"workflow": "journal", "save-workflow": "journal"}
 
 
 def framework_skill_names(spec: AgentSpec) -> list[str]:

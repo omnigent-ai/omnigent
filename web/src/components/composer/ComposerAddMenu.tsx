@@ -15,8 +15,11 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { WorkflowPicker } from "@/components/composer/WorkflowPicker";
+import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 
 const EMPTY_PROJECTS: readonly { name: string }[] = [];
+const EMPTY_WORKFLOWS: readonly SavedWorkflow[] = [];
 
 function ActionText({ label, description }: { label: string; description: string }) {
   // A description that doesn't fit beside the label wraps onto the clipped
@@ -47,6 +50,9 @@ export function ComposerAddMenu({
   planActive,
   onSideChat,
   onWorkflow,
+  savedWorkflows = EMPTY_WORKFLOWS,
+  onRunSavedWorkflow,
+  onOpen,
   projects = EMPTY_PROJECTS,
   onProjectSelect,
 }: {
@@ -68,14 +74,22 @@ export function ComposerAddMenu({
   /** Start a new side chat (a fork of this conversation opened as a rail tab).
    *  Absent when the session can't host one. */
   onSideChat?: () => void;
-  /** Open the "Run a workflow" dialog, once the menu has closed.
-   *  Absent when the agent has no `workflow` skill. */
-  onWorkflow?: () => void;
+  /** Open the "Run a workflow" dialog, once the menu has closed, with an optional
+   *  description to start from. Absent when the agent has no `workflow` skill. */
+  onWorkflow?: (description?: string) => void;
+  /** The user's saved workflows; when there are some, Run a workflow lists them. */
+  savedWorkflows?: readonly SavedWorkflow[];
+  /** Open the dialog that runs a saved workflow, once the menu has closed. */
+  onRunSavedWorkflow?: (workflow: SavedWorkflow) => void;
+  /** Called as the menu opens, e.g. to refresh the saved workflows. */
+  onOpen?: () => void;
   projects?: readonly { name: string }[];
   onProjectSelect?: (name: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
+  const [showWorkflows, setShowWorkflows] = useState(false);
+  const listsSavedWorkflows = savedWorkflows.length > 0 && onRunSavedWorkflow !== undefined;
   const pendingActionRef = useRef<(() => void) | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [geometry, setGeometry] = useState({ width: 456, alignOffset: 0, sideOffset: 6 });
@@ -108,8 +122,13 @@ export function ComposerAddMenu({
     <DropdownMenu
       open={open}
       onOpenChange={(nextOpen) => {
-        if (nextOpen) measure();
-        else setShowProjects(false);
+        if (nextOpen) {
+          measure();
+          onOpen?.();
+        } else {
+          setShowProjects(false);
+          setShowWorkflows(false);
+        }
         setOpen(nextOpen);
       }}
     >
@@ -175,6 +194,16 @@ export function ComposerAddMenu({
               </DropdownMenuItem>
             ))}
           </div>
+        ) : showWorkflows ? (
+          <WorkflowPicker
+            workflows={savedWorkflows}
+            onSelect={(workflow) => {
+              pendingActionRef.current = () => onRunSavedWorkflow?.(workflow);
+            }}
+            onDescribe={(description) => {
+              pendingActionRef.current = () => onWorkflow?.(description);
+            }}
+          />
         ) : (
           <div className="flex flex-col gap-3">
             <div className="flex flex-col gap-0.5">
@@ -215,8 +244,13 @@ export function ComposerAddMenu({
                     <DropdownMenuItem
                       className="mobile-touch-target"
                       data-testid="composer-workflow-action"
-                      onSelect={() => {
-                        pendingActionRef.current = onWorkflow;
+                      onSelect={(event) => {
+                        if (listsSavedWorkflows) {
+                          event.preventDefault();
+                          setShowWorkflows(true);
+                          return;
+                        }
+                        pendingActionRef.current = () => onWorkflow();
                       }}
                     >
                       <span className="flex size-4 shrink-0 items-center justify-center">
@@ -224,7 +258,11 @@ export function ComposerAddMenu({
                       </span>
                       <ActionText
                         label="Run a workflow"
-                        description="Describe it, and the agent plans and runs it"
+                        description={
+                          listsSavedWorkflows
+                            ? "Run a saved one, or describe a new one"
+                            : "Describe it, and the agent plans and runs it"
+                        }
                       />
                     </DropdownMenuItem>
                   )}

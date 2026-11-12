@@ -96,6 +96,10 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so bare Composer renders don't need a QueryClientProvider.
+// Run a workflow lists saved workflows from a TanStack query; none here.
+vi.mock("@/hooks/useSavedWorkflows", () => ({
+  useSavedWorkflows: () => ({ workflows: [], refresh: () => {} }),
+}));
 vi.mock("@/hooks/usePullRequests", () => ({
   usePullRequestInfo: () => ({ data: undefined }),
 }));

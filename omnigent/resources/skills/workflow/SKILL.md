@@ -1,17 +1,19 @@
 ---
 name: workflow
-description: Plan and run a multi-step workflow from a description. Keeps the plan and every step's status in the session's journal, so people can follow along in the Tasks tab and the work resumes cleanly.
+description: Plan and run a multi-step workflow from a description or one of the user's saved workflows. Keeps the plan and every step's status in the session's journal, so people can follow along in the Tasks tab and the work resumes cleanly.
 ---
 
 # Run a workflow
 
-The user described the work after `/workflow`. Turn it into a plan, then work
-through the plan, recording where each step stands as you go. The user watches
+The user described the work after `/workflow`, or named one of their saved
+workflows. Turn it into a plan, then work through the plan, recording where
+each step stands as you go. The user watches
 the plan's steps as tasks in the session's Tasks tab and can steer or stop you
 in chat at any time.
 
-You need the `sys_journal_*` tools and `sys_workflow_request_input`. If you
-don't have them, tell the user this agent can't run workflows and stop.
+You need the `sys_journal_*` tools and `sys_workflow_request_input`, and
+`sys_workflow_load` for a saved workflow. If you don't have them, tell the user
+this agent can't run workflows and stop.
 
 ## When another workflow started you
 
@@ -58,6 +60,24 @@ message.
 5. Ask first only if the description is ambiguous: write the plan with what
    you know, and ask with `sys_workflow_request_input` on its first step.
    Otherwise start.
+
+## Run a saved workflow
+
+When the user names a saved workflow ("Run the saved workflow "Triage flaky
+tests" (ID …)", or "run my triage workflow" in chat):
+
+- Do the plan's step 1 first: ask before you replace a plan with steps left.
+- Load it with `sys_workflow_load`, by its ID when you have one, otherwise by
+  name. On `workflow_not_found`, ask the user which of the similar names they
+  meant, or whether to describe the work instead.
+- Its steps are your plan: write them with `sys_journal_write_plan`, named
+  after the workflow, keeping their IDs and dependencies. Rename an ID only if
+  this session's journal already used it. Fill the run's details into the step
+  names and goals.
+- Its description says what a run needs. If the details the user gave leave
+  something out, ask with `sys_workflow_request_input` on the first step.
+- The saved steps are a starting point: replan as the work needs, as with any
+  plan.
 
 ## Review the plan
 
@@ -174,3 +194,6 @@ reply, lead with anything the user needs to decide, then summarize what was
 done and what is left. If another session started this workflow and your plan
 is finished, report back to it now (see "When another workflow started
 you").
+
+To reuse a workflow later, the user can save it: the save-workflow skill does
+that, and so does Save as workflow in the Tasks tab's ⋯ menu.

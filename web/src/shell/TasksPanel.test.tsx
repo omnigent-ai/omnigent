@@ -14,6 +14,7 @@ import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import {
   openTasksTab,
+  registerSaveWorkflow,
   registerStartWorkflow,
   useSessionTasksActions,
 } from "@/store/sessionTasksActions";
@@ -314,6 +315,26 @@ describe("TasksPanel", () => {
       expect(useSessionTasksActions.getState().taskToShow).toBeNull();
     } finally {
       delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+    }
+  });
+
+  it("offers Save as workflow in the plan's menu once the composer can save", async () => {
+    const named = journalPlan(0, ["baseline"]);
+    named.payload.name = "Cut GET /orders p95 by 20%";
+    showJournal([named]);
+    renderPanel();
+    expect(screen.queryByTestId("tasks-plan-menu")).toBeNull();
+    cleanup();
+
+    const save = vi.fn();
+    const withdraw = registerSaveWorkflow("conv", save);
+    try {
+      renderPanel();
+      fireEvent.pointerDown(screen.getByTestId("tasks-plan-menu"), { button: 0 });
+      fireEvent.click(screen.getByTestId("tasks-save-workflow"));
+      await waitFor(() => expect(save).toHaveBeenCalledWith("Cut GET /orders p95 by 20%"));
+    } finally {
+      act(withdraw);
     }
   });
 

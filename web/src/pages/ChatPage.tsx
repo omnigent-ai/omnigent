@@ -119,7 +119,7 @@ import {
   type PendingUserMessage,
   useChatStore,
 } from "@/store/chatStore";
-import { registerStartWorkflow } from "@/store/sessionTasksActions";
+import { registerSaveWorkflow, registerStartWorkflow } from "@/store/sessionTasksActions";
 import { isRetryableRequestError } from "@/lib/queryRetry";
 import { useTrueForAtMost } from "@/hooks/useTrueForAtMost";
 import {
@@ -350,8 +350,16 @@ import { isPermissionModeCycleKey, nextCycledPermissionMode } from "@/lib/permis
 import { getCliServerUrl } from "@/lib/host";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
 import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/components/goal";
+import { SaveWorkflowDialog } from "@/components/composer/SaveWorkflowDialog";
 import { WorkflowDialog, type WorkflowRequest } from "@/components/composer/WorkflowDialog";
-import { offersWorkflow, workflowMessage } from "@/lib/workflow";
+import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import {
+  offersSaveWorkflow,
+  offersWorkflow,
+  savedWorkflowMessage,
+  saveWorkflowMessage,
+  workflowMessage,
+} from "@/lib/workflow";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ConnectionIndicator } from "./ChatIndicators";
@@ -3125,16 +3133,38 @@ function ComposerImpl(
   // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
   const canStartSideChat = useCanStartSideChat(composerSessionId, permissionLevel);
   const showSide = supportsSideChat(sessionHarness, canStartSideChat);
-  // "Run a workflow" opens a dialog that asks for the goal and sends the
-  // workflow. The "+" menu offers it, and so does the Tasks tab's empty
-  // state, which reaches it through the registry below.
+  // "Run a workflow" opens a dialog that asks for the goal, or a saved workflow's
+  // details, and sends the workflow. The "+" menu offers it, and so does the
+  // Tasks tab's empty state, which reaches it through the registry below.
   const canStartWorkflow = !isReadOnly && offersWorkflow(skills);
+  const savedWorkflows = useSavedWorkflows({ enabled: canStartWorkflow });
   const [workflowDialogOpen, setWorkflowDialogOpen] = useState(false);
-  useEffect(() => setWorkflowDialogOpen(false), [conversationId]);
+  const [workflowDialogDescription, setWorkflowDialogDescription] = useState("");
+  const [savedWorkflowToRun, setSavedWorkflowToRun] = useState<SavedWorkflow | null>(null);
+  const openWorkflowDialog = useCallback(
+    (description = "", savedWorkflow: SavedWorkflow | null = null) => {
+      setWorkflowDialogDescription(description);
+      setSavedWorkflowToRun(savedWorkflow);
+      setWorkflowDialogOpen(true);
+    },
+    [],
+  );
+  // The Tasks tab's Save as workflow opens a dialog for the name, then asks the
+  // agent to save the plan.
+  const canSaveWorkflow = !isReadOnly && offersSaveWorkflow(skills);
+  const [saveWorkflowName, setSaveWorkflowName] = useState<string | null>(null);
+  useEffect(() => {
+    setWorkflowDialogOpen(false);
+    setSaveWorkflowName(null);
+  }, [conversationId]);
   useEffect(() => {
     if (!canStartWorkflow || composerSessionId === null) return;
-    return registerStartWorkflow(composerSessionId, () => setWorkflowDialogOpen(true));
-  }, [canStartWorkflow, composerSessionId]);
+    return registerStartWorkflow(composerSessionId, () => openWorkflowDialog());
+  }, [canStartWorkflow, composerSessionId, openWorkflowDialog]);
+  useEffect(() => {
+    if (!canSaveWorkflow || composerSessionId === null) return;
+    return registerSaveWorkflow(composerSessionId, setSaveWorkflowName);
+  }, [canSaveWorkflow, composerSessionId]);
   const slashCommands = useMemo(
     () =>
       buildSlashCommandMap(
@@ -4183,9 +4213,8 @@ function ComposerImpl(
     setMention(null);
   };
 
-  // The workflow dialog sends straight to the chat and leaves the draft alone.
-  const runWorkflow = (request: WorkflowRequest) => {
-    const message = workflowMessage(skillPrefix, request.description, request.reviewPlanFirst);
+  // The workflow dialogs send straight to the chat and leave the draft alone.
+  const sendWorkflowMessage = (message: string) => {
     const skill = onSendSlashCommand
       ? matchSlashCommandInvocation(message, slashCommandNames)
       : null;
@@ -4194,6 +4223,19 @@ function ComposerImpl(
     if (skill !== null) onSendSlashCommand?.(skill.command.slice(1), skill.args);
     else onSend(message);
   };
+  const runWorkflow = (request: WorkflowRequest) =>
+    sendWorkflowMessage(
+      request.savedWorkflow
+        ? savedWorkflowMessage(
+            skillPrefix,
+            request.savedWorkflow,
+            request.description,
+            request.reviewPlanFirst,
+          )
+        : workflowMessage(skillPrefix, request.description, request.reviewPlanFirst),
+    );
+  const saveWorkflow = (name: string) =>
+    sendWorkflowMessage(saveWorkflowMessage(skillPrefix, name));
   const workflowBlockedReason = composerLockedByBtw
     ? "Close the side question first."
     : hasPendingElicitation
@@ -4731,7 +4773,12 @@ function ComposerImpl(
                       }
                     : undefined
                 }
-                onWorkflow={canStartWorkflow ? () => setWorkflowDialogOpen(true) : undefined}
+                onWorkflow={canStartWorkflow ? openWorkflowDialog : undefined}
+                savedWorkflows={savedWorkflows.workflows}
+                onRunSavedWorkflow={
+                  canStartWorkflow ? (workflow) => openWorkflowDialog("", workflow) : undefined
+                }
+                onOpen={savedWorkflows.refresh}
               />
               {!subAgentLabel && composerSessionId && (
                 <MobileHeaderControlPortal sessionId={composerSessionId}>
@@ -4903,6 +4950,19 @@ function ComposerImpl(
           open={workflowDialogOpen}
           onOpenChange={setWorkflowDialogOpen}
           onRunWorkflow={runWorkflow}
+          initialDescription={workflowDialogDescription}
+          savedWorkflow={savedWorkflowToRun}
+          blockedReason={workflowBlockedReason}
+        />
+      )}
+      {canSaveWorkflow && (
+        <SaveWorkflowDialog
+          open={saveWorkflowName !== null}
+          onOpenChange={(open) => {
+            if (!open) setSaveWorkflowName(null);
+          }}
+          initialName={saveWorkflowName ?? ""}
+          onSave={saveWorkflow}
           blockedReason={workflowBlockedReason}
         />
       )}

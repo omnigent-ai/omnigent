@@ -6,10 +6,13 @@
 * ``sys_journal_write_note`` adds a Markdown note.
 * ``sys_workflow_request_input`` asks the user about a task and waits for the
   answer, marking the task ``needs_input`` meanwhile.
+* ``sys_workflow_save`` saves a reusable workflow for the user.
+* ``sys_workflow_load`` loads one of the user's saved workflows.
 
-All five are schema-only: the runner sends them to the server's
-``/v1/sessions/{id}/journal`` routes. They make up the ``journal`` tool group,
-which every agent has unless its spec sets ``tool_groups.journal: false``.
+All seven are schema-only: the runner sends the journal tools to the server's
+``/v1/sessions/{id}/journal`` routes and the workflow tools to
+``/v1/workflows``. They make up the ``journal`` tool group, which every agent
+has unless its spec sets ``tool_groups.journal: false``.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from omnigent.entities.session_journal import (
     STEP_NAME_MAX_CHARS,
     STEP_STATUSES,
 )
+from omnigent.entities.workflow import WORKFLOW_DESCRIPTION_MAX_CHARS, WORKFLOW_NAME_MAX_CHARS
 from omnigent.entities.workflow_questions import (
     HEADER_MAX_CHARS,
     OPTION_DESCRIPTION_MAX_CHARS,
@@ -159,46 +163,45 @@ class SysJournalWritePlanTool(Tool):
                         "The plan's goal in a few words, e.g. 'Cut GET /orders p95 by 20%'."
                     ),
                 },
-                "steps": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": PLAN_MAX_STEPS,
-                    "description": (
-                        "Every step of the plan, with unique IDs and no dependency cycles."
-                    ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "type": "string",
-                                "pattern": _STEP_ID_PATTERN,
-                                "description": _STEP_DESC,
-                            },
-                            "name": {
-                                "type": "string",
-                                "maxLength": STEP_NAME_MAX_CHARS,
-                                "description": "A short name, e.g. 'Profile the endpoint'.",
-                            },
-                            "goal": {
-                                "type": "string",
-                                "maxLength": STEP_GOAL_MAX_CHARS,
-                                "description": "What done means for this step.",
-                            },
-                            "depends_on": {
-                                "type": "array",
-                                "items": {"type": "string", "pattern": _STEP_ID_PATTERN},
-                                "description": (
-                                    "IDs of steps that must be done before this one starts."
-                                ),
-                            },
-                        },
-                        "required": ["id", "name", "depends_on"],
-                        "additionalProperties": False,
-                    },
-                },
+                "steps": _steps_schema(
+                    "Every step of the plan, with unique IDs and no dependency cycles."
+                ),
             },
             ["name", "steps"],
         )
+
+
+def _steps_schema(description: str) -> dict[str, Any]:
+    """The schema of a plan's steps, which a saved workflow's steps share."""
+    return {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": PLAN_MAX_STEPS,
+        "description": description,
+        "items": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "pattern": _STEP_ID_PATTERN, "description": _STEP_DESC},
+                "name": {
+                    "type": "string",
+                    "maxLength": STEP_NAME_MAX_CHARS,
+                    "description": "A short name, e.g. 'Profile the endpoint'.",
+                },
+                "goal": {
+                    "type": "string",
+                    "maxLength": STEP_GOAL_MAX_CHARS,
+                    "description": "What done means for this step.",
+                },
+                "depends_on": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": _STEP_ID_PATTERN},
+                    "description": "IDs of steps that must be done before this one starts.",
+                },
+            },
+            "required": ["id", "name", "depends_on"],
+            "additionalProperties": False,
+        },
+    }
 
 
 class SysJournalWriteStatusTool(Tool):
@@ -370,10 +373,99 @@ class SysWorkflowRequestInputTool(Tool):
         )
 
 
+class SysWorkflowSaveTool(Tool):
+    """Save a reusable workflow. Runner-dispatched to ``POST /v1/workflows``."""
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_workflow_save"``."""
+        return "sys_workflow_save"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Save a reusable workflow for the user: from this session's plan, or one they "
+            "describe. Load the save-workflow skill first and follow it. Make the steps generic: "
+            "a detail that would differ next run (the repo, the PR, the module, a ticket, a "
+            "date) comes out of the steps, and the description says what a run needs "
+            "('Give it: …'). Use the name the user picked; if they gave none, suggest one and "
+            "save once they agree. Returns the workflow's id and name, or name_taken when the "
+            "user already has a workflow with that name."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """:returns: The OpenAI-format tool schema."""
+        return _schema(
+            self.name(),
+            self.description(),
+            {
+                "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": WORKFLOW_NAME_MAX_CHARS,
+                    "description": "The name the user picked, e.g. 'Triage flaky tests'.",
+                },
+                "description": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": WORKFLOW_DESCRIPTION_MAX_CHARS,
+                    "description": (
+                        "What the workflow does and what a run needs, e.g. 'Finds and fixes "
+                        "flaky tests. Give it: the test suite.'"
+                    ),
+                },
+                "steps": _steps_schema(
+                    "The workflow's steps, written generically, with unique IDs and no "
+                    "dependency cycles."
+                ),
+            },
+            ["name", "description", "steps"],
+        )
+
+
+class SysWorkflowLoadTool(Tool):
+    """Load a saved workflow. Runner-dispatched to ``GET /v1/workflows``."""
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_workflow_load"``."""
+        return "sys_workflow_load"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Load one of the user's saved workflows by ID or name: its name, its description "
+            "(what a run needs), and its steps. To run it, follow the workflow skill: write "
+            "its steps as your plan with sys_journal_write_plan, keeping their IDs and "
+            "dependencies, and fill the run's details into step names and goals. A name with "
+            "no exact match returns workflow_not_found with the user's closest workflow names."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """:returns: The OpenAI-format tool schema."""
+        return _schema(
+            self.name(),
+            self.description(),
+            {
+                "workflow": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": WORKFLOW_NAME_MAX_CHARS,
+                    "description": "The saved workflow's ID, or its exact name.",
+                },
+            },
+            ["workflow"],
+        )
+
+
 JOURNAL_TOOLS: tuple[type[Tool], ...] = (
     SysJournalReadTool,
     SysJournalWritePlanTool,
     SysJournalWriteStatusTool,
     SysJournalWriteNoteTool,
     SysWorkflowRequestInputTool,
+    SysWorkflowSaveTool,
+    SysWorkflowLoadTool,
 )
