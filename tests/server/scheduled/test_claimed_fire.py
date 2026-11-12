@@ -1685,3 +1685,53 @@ async def test_failed_run_releases_its_binding_without_deleting_a_peers_sandbox(
     assert launcher.terminated == ([] if shared else ["sb-failed"])
     if shared:
         assert conversations.get_conversation(peer.id).host_id == host.host_id
+
+
+async def test_an_event_run_sends_the_prompt_with_its_events(store) -> None:
+    from omnigent.server.scheduled.schedule import event_trigger_key
+
+    created = store.create(
+        uuid.uuid4().hex,
+        "watcher",
+        "Review the finished session.",
+        None,
+        None,
+        _AGENT_ID,
+        "UTC",
+        workspace="/repo",
+        host_id=_HOST_ID,
+        trigger_config={"provider": "omnigent", "events": ["turn.completed"]},
+    )
+    key = event_trigger_key("omnigent", "s1:turn.completed:resp_1")
+    assert (
+        store.record_event_run(
+            created,
+            now=1_000,
+            trigger_key=key,
+            host_id=_HOST_ID,
+            event={"type": "turn.completed", "session_id": "s1"},
+            coalesce=False,
+            max_runs_per_minute=10,
+        )
+        == "recorded"
+    )
+    [pending] = store.list_pending_runs()
+    claimed = store.claim_pending_run(pending, now=1_001, lease_seconds=_LEASE_SECONDS)
+    assert claimed is not None
+    task, run = claimed
+    clock = FakeClock(1_001)
+    prompts: list[str] = []
+
+    async def dispatch(conv: Any, fired: ScheduledTask) -> None:
+        prompts.append(fired.prompt)
+
+    executor = ClaimedRunExecutor(_deps(store), launch_dispatch=dispatch)
+    await executor.fire(
+        task, StartupLease(store, run, now=clock.now, lease_seconds=_LEASE_SECONDS)
+    )
+
+    [prompt] = prompts
+    assert prompt.startswith("Review the finished session.\n\n<omnigent-trigger-events>\n")
+    assert '{"session_id": "s1", "type": "turn.completed"}' in prompt
+    # The saved task keeps its own prompt.
+    assert store.get(task.id).prompt == "Review the finished session."

@@ -45,6 +45,7 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.server.routes import _session_create_validation as create_validation
 from omnigent.server.routes.sessions import create_sessions_router, routes_core
+from omnigent.server.scheduled import session_triggers
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     FORK_SOURCE_LABEL_KEY,
@@ -645,8 +646,14 @@ def _build_app(
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("source_runner", [None, "runner_shared"])
 def test_side_chat_records_its_source_without_a_persisted_workspace(
-    nested: bool, source_runner: str | None
+    nested: bool, source_runner: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    created: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        session_triggers,
+        "notify",
+        lambda event_type, session_id, **_: created.append((event_type, session_id)),
+    )
     source = _make_conversation(
         labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: "original"} if nested else {}
     )
@@ -665,6 +672,8 @@ def test_side_chat_records_its_source_without_a_persisted_workspace(
     assert response.json()["kind"] == "default"
     assert response.json()["host_id"] is None
     assert response.json()["parent_session_id"] is None
+    # Hidden from the sidebar, but still a new session for the owner's automations.
+    assert created == [("session.created", response.json()["id"])]
 
 
 def test_normal_fork_does_not_copy_side_chat_routing_source() -> None:

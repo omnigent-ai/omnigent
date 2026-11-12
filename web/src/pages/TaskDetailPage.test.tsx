@@ -251,6 +251,12 @@ function openConfiguration() {
 }
 
 describe("header, prompt, configuration", () => {
+  it("renders an automation that runs on events and has no schedule", () => {
+    setTask(task({ rrule: null, nextRunAt: null }));
+    renderPage();
+    expect(screen.getByText("Runs on events")).toBeVisible();
+  });
+
   it("shows where a session-based automation's runs start and its additional instructions", () => {
     setTask(task({ prompt: "", sourceSessionId: "conv_copy" }));
     renderPage();

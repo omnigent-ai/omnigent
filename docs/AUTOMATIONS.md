@@ -163,11 +163,40 @@ Firing is fire-and-forget: the guard steps run synchronously so a dead fire cost
 
 The transcript hides only the exact tagged unattended-run note appended by the scheduler. The agent still receives it, and stored messages retain it. Modified notes, other text inside the tags, and older untagged messages remain visible and copyable.
 
+## Running on session events
+
+An automation can run when something happens to an Omnigent session instead of on a schedule. In the web UI, choose **Session events** as the **Trigger type**, pick the events, and optionally limit it to sessions whose title contains some text; the automation list shows it as, for example, "When a turn finishes". Over the API, send `trigger_config` in place of `rrule` to `POST /v1/scheduled-tasks`; a task has exactly one of the two. This needs the database scheduler (`automations_v2`) and the `session_triggers` feature, and the server advertises `scheduled_task_session_triggers` in `/v1/info` when it accepts the field. `GET /v1/scheduled-tasks` and `GET /v1/scheduled-tasks/{id}` return such an automation only with `?event_triggers=1`, because older clients expect every automation to have an `rrule`. Enable `session_triggers` only after every server on the database runs a version with it: an older server pauses an automation that has no `rrule`. To roll back to such a version, delete the session-triggered automations first.
+
+```json
+{"provider": "omnigent", "events": ["turn.completed", "input.requested"],
+ "agent_id": "<optional agent id>", "project_id": "<optional project id>",
+ "title_contains": "<optional text>", "include_own_sessions": false}
+```
+
+| Event | When |
+| --- | --- |
+| `session.created` | A session is created, forked or started by an automation. |
+| `session.renamed` | A session's title changes, by the user, the agent or automatic titling. |
+| `session.archived` | A session is archived. |
+| `session.deleted` | A session is deleted. |
+| `turn.completed` | A turn finishes, including native Claude Code and Codex turns. |
+| `turn.failed` | A turn fails. |
+| `input.requested` | The agent asks for an approval or asks a question. |
+| `comment.created` | Someone comments on the session's files. |
+
+- An event fires only for sessions the automation's owner owns or that were shared with them. Admin access and public sessions don't count; a sub-agent session counts when its root session does.
+- By default an automation ignores the sessions it created or continues, and their sub-agents, so its own turns don't start it again. Set `include_own_sessions` to change that.
+- An automation starts a new run only while it has accepted fewer than 10 events in the last minute. An event that would start a run past that is dropped, and the run history shows one `skipped` run with `error_code` `rate_limited` for that minute. Events that join a run still waiting to start (below) are always accepted and count toward the 10.
+- With `session_mode: "continue"`, events that arrive while a run waits to start join it, and a run waits while the continued session is busy (at most 10 minutes), so the session gets one message per batch. On a managed sandbox, session triggers must use `continue`.
+- A run sends the automation's prompt followed by one JSON line per event, with IDs and metadata only: event type, session, response, approval or comment ID, agent, project and parent session. Titles and message text are never included; the agent reads them with its session tools. The run's `event` field in run history holds the same list.
+- The server records a pending run in the database shortly after it sees the event, and the next scheduler poll starts it. A recorded run survives a server restart; an event the server had not recorded yet when it stopped is lost. A repeated event (for example the same turn reported twice) records nothing, also when it had joined a run that already started. Receipts of accepted events are kept for 7 days, so the same event repeated later can start another run. An event recorded before the automation was paused is `skipped` with `error_code` `trigger_inactive`.
+- `PATCH` with `trigger_config` switches a scheduled automation to events, and `PATCH` with an `rrule` (or `trigger_config: null` and an `rrule`) switches it back. Run now works as for a schedule and sends the prompt without events.
+
 ## Run history
 
 `GET /v1/scheduled-tasks/{id}/runs` returns history in descending `scheduled_at` order as `{"runs": [...], "next_cursor": ...}`. The `limit` query parameter defaults to 100 and accepts 1–1,000. Pass the returned `next_cursor` as `after` to fetch the next page; a null cursor marks the end. For example, request `/runs?limit=1`, then `/runs?limit=1&after=<next_cursor>`.
 
-Each run carries `status`, `scheduled_at`, `fired_at`, `finished_at`, `conversation_id`, and `error_code`. The free-text `error` blob is deliberately not returned; `error_code` is the queryable classification.
+Each run carries `status`, `scheduled_at`, `fired_at`, `finished_at`, `conversation_id`, `error_code`, and, for a run that session events started, `event`. The free-text `error` blob is deliberately not returned; `error_code` is the queryable classification.
 
 | `status` | Meaning |
 | --- | --- |
@@ -200,7 +229,7 @@ Switching to `execution_target: "managed_sandbox"` clears both stored pins. Omit
 | `POST` | `/v1/scheduled-tasks/{id}/run` | Run now (202). |
 | `GET` | `/v1/scheduled-tasks/{id}/runs` | Run history. |
 
-A task response carries `id`, `name`, `prompt`, `rrule`, `owner_user_id`, `agent_id`, `timezone`, `created_at`, `model_override`, `reasoning_effort`, `permission_mode`, `max_cost_usd`, `session_mode`, `session_id`, `source_session_id`, `workspace`, `host_id`, `execution_target`, `project_id`, `state`, `last_run_at`, `last_run_status`, `last_run_conversation_id`, `next_run_at`, and `updated_at`.
+A task response carries `id`, `name`, `prompt`, `rrule` (null for an event-triggered task), `trigger_config`, `owner_user_id`, `agent_id`, `timezone`, `created_at`, `model_override`, `reasoning_effort`, `permission_mode`, `max_cost_usd`, `session_mode`, `session_id`, `source_session_id`, `workspace`, `host_id`, `execution_target`, `project_id`, `state`, `last_run_at`, `last_run_status`, `last_run_conversation_id`, `next_run_at`, and `updated_at`.
 
 ## Current limits
 

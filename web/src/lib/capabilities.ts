@@ -268,6 +268,8 @@ export interface ServerInfo {
   automation_trigger_poll_minutes?: number;
   /** Sandbox automations accept a repository URL as their workspace. */
   scheduled_task_sandbox_workspaces?: boolean;
+  /** Automations accept an Omnigent session-event trigger in place of a schedule. */
+  scheduled_task_session_triggers?: boolean;
   /**
    * True when a managed create accepts ``host_id`` naming its new sandbox
    * host. Older servers reject it, so the create omits it there. Fails to
@@ -465,6 +467,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
   scheduled_task_sandbox_workspaces: false,
+  scheduled_task_session_triggers: false,
   request_managed_sandbox_host_id: false,
   session_fork_workspaces: false,
   move_to_managed_sandbox: false,
@@ -641,6 +644,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
               ? data.automation_trigger_poll_minutes
               : 10,
           scheduled_task_sandbox_workspaces: data.scheduled_task_sandbox_workspaces === true,
+          scheduled_task_session_triggers: data.scheduled_task_session_triggers === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           session_fork_workspaces: data.session_fork_workspaces === true,
           move_to_managed_sandbox: data.move_to_managed_sandbox === true,

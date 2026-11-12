@@ -251,6 +251,10 @@ class ScheduledTaskScheduler:
 
     def _register(self, task: ScheduledTask) -> None:
         """Validate the task's rrule and arm its timer, replacing any existing."""
+        if task.rrule is None:
+            # Event-triggered tasks run only under the database scheduler.
+            self.remove(task.id)
+            return
         trigger = validate_rrule(
             task.rrule, session_mode=task.session_mode, execution_target=task.execution_target
         )

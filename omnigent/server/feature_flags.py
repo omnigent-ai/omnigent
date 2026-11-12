@@ -42,6 +42,7 @@ class Feature(StrEnum):
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS_V2 = "automations_v2"
+    SESSION_TRIGGERS = "session_triggers"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
 
@@ -106,6 +107,16 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         ),
         owner="server",
         review_by_release="0.20.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.SESSION_TRIGGERS,
+        description=(
+            "Automations that run on session events; needs automations_v2, and every server "
+            "on the database must understand event-triggered tasks"
+        ),
+        owner="server",
+        review_by_release="0.26.0",
+        frontend_visible=False,
     ),
     FeatureDefinition(
         feature=Feature.GRID_SESSIONS_DISPLAY_UI,

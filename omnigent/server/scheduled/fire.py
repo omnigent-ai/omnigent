@@ -103,6 +103,7 @@ from omnigent.server.routes._sessions.helpers import (
     _announce_session_added,
     _session_status_from_cache,
 )
+from omnigent.server.scheduled import session_triggers
 from omnigent.server.scheduled.dispatch_scheduler import (
     FireIdentity,
     FireIdentityRevoked,
@@ -114,6 +115,7 @@ from omnigent.server.scheduled.harness_settings import (
     validate_scheduled_permission_mode,
 )
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id, is_trigger_automation
+from omnigent.server.scheduled.session_triggers import render_event_prompt
 from omnigent.server.scheduled.source_session import (
     SourceCopyIncompleteError,
     SourceHistoryUnsupportedError,
@@ -510,6 +512,37 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
     return busy_until
 
 
+def build_event_session_busy(
+    deps: FireDeps,
+) -> Callable[[ScheduledTaskRun], Awaitable[bool]]:
+    """Build the persistent scheduler's check that holds an event run for a busy session.
+
+    Only a task that continues a recorded session waits, while that session shows as
+    running or has an approval or question pending, so the events that arrive
+    meanwhile join the waiting run and reach the session as one prompt.
+    """
+
+    async def event_session_busy(run: ScheduledTaskRun) -> bool:
+        from omnigent.server.routes._sessions.helpers import _session_status_from_cache
+
+        task = await asyncio.to_thread(deps.scheduled_task_store.get, run.scheduled_task_id)
+        if task is None or not task.continues_session:
+            return False
+        session_id = task.session_id
+        assert session_id is not None
+        activity = await asyncio.to_thread(
+            deps.conversation_store.get_session_activity, [session_id]
+        )
+        session = activity.get(session_id)
+        if session is None:
+            return False
+        if _session_status_from_cache(session_id, session.live_status) == "running":
+            return True
+        return session.runner_id is not None and bool(session.pending_elicitation_count)
+
+    return event_session_busy
+
+
 def build_run_now(
     deps: FireDeps,
     *,
@@ -838,6 +871,7 @@ async def _run_fire_for_task(
     _announce_session_added(
         effective.user_id if effective.user_id is not None else deps.single_user_owner, conv.id
     )
+    session_triggers.notify("session.created", conv.id, occurrence="created")
 
     # Default-public access is optional decoration on top of the owner
     # grant, so a failure here must not cancel an otherwise-ready run — the
@@ -2842,6 +2876,8 @@ class ClaimedRunExecutor:
 
     async def fire(self, task: ScheduledTask, lease: StartupLease) -> None:
         """``on_fire``: start the claimed run and record its startup outcome."""
+        if lease.run.event is not None:
+            task = replace(task, prompt=render_event_prompt(task.prompt, lease.run.event))
         recorder = _ClaimedRunRecorder(
             self._deps, task, lease, registration_timeout_s=self._registration_timeout_s
         )

@@ -19,8 +19,11 @@ _logger = logging.getLogger(__name__)
 
 
 def next_scheduled_time(task: ScheduledTask, after: int) -> int | None:
-    """Next occurrence; search-budget errors propagate so callers preserve the cursor."""
-    if task.state != "active":
+    """Next occurrence; search-budget errors propagate so callers preserve the cursor.
+
+    An event-triggered task has no schedule, so it has no next occurrence.
+    """
+    if task.state != "active" or task.rrule is None:
         return None
     try:
         timezone = ZoneInfo(task.timezone or "UTC")
@@ -47,6 +50,28 @@ def next_scheduled_time(task: ScheduledTask, after: int) -> int | None:
 def scheduled_trigger_key(scheduled_at: int) -> str:
     """Canonical occurrence key, distinct from manual requests and event deliveries."""
     return f"schedule:{scheduled_at}"
+
+
+# Event-triggered runs are keyed ``event:<provider>:<occurrence>``, unique per task, so a
+# redelivered event records no second run.
+EVENT_TRIGGER_KEY_PREFIX = "event:"
+# The column is 256 characters; an occurrence must fit after the prefix and provider.
+_MAX_TRIGGER_KEY_CHARS = 256
+
+
+def event_trigger_key(provider: str, occurrence: str) -> str:
+    """The occurrence key of one provider event, distinct from schedules and Run now."""
+    key = f"{EVENT_TRIGGER_KEY_PREFIX}{provider}:{occurrence}"
+    if len(key) > _MAX_TRIGGER_KEY_CHARS:
+        raise ValueError(
+            f"event occurrence key is longer than {_MAX_TRIGGER_KEY_CHARS} characters"
+        )
+    return key
+
+
+def is_event_trigger_key(trigger_key: str | None) -> bool:
+    """Whether a run was recorded for a provider event."""
+    return trigger_key is not None and trigger_key.startswith(EVENT_TRIGGER_KEY_PREFIX)
 
 
 def manual_trigger_key() -> str:

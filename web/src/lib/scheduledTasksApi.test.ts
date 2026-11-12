@@ -90,7 +90,7 @@ describe("listScheduledTasks", () => {
         mockResponse({ scheduled_tasks: [{ ...TASK_WIRE, ...extra }] }),
       );
       const tasks = await listScheduledTasks();
-      expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks");
+      expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks?event_triggers=1");
       expect(tasks).toHaveLength(1);
       expect(tasks[0]).toMatchObject({
         id: "st_1",
@@ -116,7 +116,7 @@ describe("getScheduledTask", () => {
   it("GETs /v1/scheduled-tasks/{id} and encodes the id", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
     const task = await getScheduledTask("st 1");
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks/st%201");
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks/st%201?event_triggers=1");
     expect(task.id).toBe("st_1");
   });
 });
@@ -354,7 +354,9 @@ describe("error path", () => {
 it("requests bounded automation Inbox pages and preserves empty continuations", async () => {
   fetchMock.mockResolvedValue(mockResponse({ data: [], next_cursor: "100:task" }));
   expect(await listAutomationFailures(null)).toEqual({ data: [], nextCursor: "100:task" });
-  expect(String(fetchMock.mock.calls[0]![0])).toBe("/v1/scheduled-tasks/inbox?limit=50");
+  expect(String(fetchMock.mock.calls[0]![0])).toBe(
+    "/v1/scheduled-tasks/inbox?limit=50&event_triggers=1",
+  );
   fetchMock.mockResolvedValue(
     mockResponse({
       data: [
@@ -384,7 +386,7 @@ it("requests bounded automation Inbox pages and preserves empty continuations", 
     nextCursor: null,
   });
   expect(String(fetchMock.mock.calls[1]![0])).toBe(
-    "/v1/scheduled-tasks/inbox?limit=50&after=100%3Atask",
+    "/v1/scheduled-tasks/inbox?limit=50&after=100%3Atask&event_triggers=1",
   );
 });
 
@@ -394,5 +396,87 @@ describe("random worktree setting", () => {
     const task = await updateScheduledTask("st_1", { baseBranch });
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ base_branch: baseBranch });
     expect(task.baseBranch).toBe(baseBranch);
+  });
+});
+
+describe("session triggers", () => {
+  const TRIGGER_WIRE = {
+    ...TASK_WIRE,
+    rrule: null,
+    trigger_config: {
+      provider: "omnigent",
+      events: ["turn.completed"],
+      title_contains: "deploy",
+      include_own_sessions: false,
+    },
+  };
+
+  it("reads an omnigent trigger and ignores other providers", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(TRIGGER_WIRE));
+    const task = await getScheduledTask("st_1");
+    expect(task.rrule).toBeNull();
+    expect(task.sessionTrigger).toEqual({
+      events: ["turn.completed"],
+      agentId: null,
+      projectId: null,
+      titleContains: "deploy",
+      includeOwnSessions: false,
+    });
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ ...TRIGGER_WIRE, trigger_config: { provider: "jira" } }),
+    );
+    expect((await getScheduledTask("st_1")).sessionTrigger).toBeNull();
+    fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+    expect((await getScheduledTask("st_1")).sessionTrigger).toBeNull();
+  });
+
+  it("sends trigger_config instead of rrule on create, and on update", async () => {
+    fetchMock.mockResolvedValue(mockResponse(TRIGGER_WIRE));
+    await createScheduledTask({
+      name: "Reviewer",
+      prompt: "Review it.",
+      agentId: "ag_1",
+      sessionTrigger: { events: ["turn.failed"], titleContains: "", includeOwnSessions: true },
+    });
+    const created = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(created).not.toHaveProperty("rrule");
+    expect(created.trigger_config).toEqual({
+      provider: "omnigent",
+      events: ["turn.failed"],
+      include_own_sessions: true,
+    });
+    await updateScheduledTask("st_1", { sessionTrigger: { events: ["session.created"] } });
+    const updated = JSON.parse(fetchMock.mock.calls[1][1].body as string);
+    expect(updated).toEqual({
+      trigger_config: { provider: "omnigent", events: ["session.created"] },
+    });
+  });
+
+  it("reads the events a run was started by", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        runs: [
+          {
+            id: "r1",
+            scheduled_task_id: "st_1",
+            status: "scheduled",
+            scheduled_at: 1,
+            conversation_id: null,
+            fired_at: null,
+            finished_at: null,
+            error_code: null,
+            event: {
+              events: [{ type: "turn.completed", session_id: "s1", key: "k" }, { type: 3 }],
+            },
+            conversation_updated_at: null,
+            conversation_status: null,
+            viewer_last_seen: null,
+            viewer_unread: null,
+          },
+        ],
+      }),
+    );
+    const [run] = await listScheduledTaskRuns("st_1");
+    expect(run.events).toEqual([{ type: "turn.completed", sessionId: "s1" }]);
   });
 });

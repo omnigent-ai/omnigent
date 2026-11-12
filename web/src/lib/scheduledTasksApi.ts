@@ -27,6 +27,41 @@ export type ScheduledTaskExecutionTarget = "connected_host" | "managed_sandbox";
 /** Whether each run starts a new session or continues one. */
 export type ScheduledTaskSessionMode = "new" | "continue";
 
+/** Omnigent session events a session-triggered automation can run on. */
+export const SESSION_TRIGGER_EVENTS = [
+  "turn.completed",
+  "turn.failed",
+  "input.requested",
+  "comment.created",
+  "session.created",
+  "session.renamed",
+  "session.archived",
+  "session.deleted",
+] as const;
+export type SessionTriggerEvent = (typeof SESSION_TRIGGER_EVENTS)[number];
+
+/**
+ * An automation that runs on Omnigent session events instead of a schedule,
+ * camelCased from the server's `trigger_config` with provider `omnigent`.
+ */
+export interface SessionTrigger {
+  events: SessionTriggerEvent[];
+  /** Only sessions of this agent. */
+  agentId?: string | null;
+  /** Only sessions filed in this project. */
+  projectId?: string | null;
+  /** Only sessions whose title contains this text, ignoring case. */
+  titleContains?: string | null;
+  /** Also run for sessions this automation created or continues. */
+  includeOwnSessions?: boolean;
+}
+
+/** One event a session-triggered run was recorded for: IDs and metadata only. */
+export interface ScheduledTaskRunEvent {
+  type: string;
+  sessionId: string;
+}
+
 /** Terminal + in-flight statuses a single run can hold. */
 export type ScheduledTaskRunStatus =
   "scheduled" | "starting" | "running" | "succeeded" | "failed" | "skipped" | "incomplete";
@@ -40,8 +75,13 @@ export interface ScheduledTask {
   id: string;
   name: string;
   prompt: string;
-  /** RFC-5545 recurrence rule, e.g. `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0`. */
-  rrule: string;
+  /**
+   * RFC-5545 recurrence rule, e.g. `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0`,
+   * or `null` for an automation that runs on session events (`sessionTrigger`).
+   */
+  rrule: string | null;
+  /** The session events this automation runs on; `null`/absent for a scheduled one. */
+  sessionTrigger?: SessionTrigger | null;
   /** Owning user, or `null` in single-user / auth-disabled deployments. */
   ownerUserId: string | null;
   agentId: string;
@@ -112,6 +152,8 @@ export interface ScheduledTaskRun {
   finishedAt: number | null;
   /** Queryable failure classification, e.g. `no_online_host`; `null` on success. */
   errorCode: string | null;
+  /** The session events that started this run; empty/absent for scheduled and Run now runs. */
+  events?: ScheduledTaskRunEvent[];
   /** Epoch seconds of the conversation's last update; `null` for runs without a conversation. */
   conversationUpdatedAt: number | null;
   /**
@@ -143,6 +185,7 @@ export const AUTOMATION_TEMPLATE_IDS = [
   "follow-up-monitor",
   "pr-sweep",
   "news-digest",
+  "session",
 ] as const;
 export type AutomationTemplateId = (typeof AUTOMATION_TEMPLATE_IDS)[number];
 
@@ -152,7 +195,9 @@ export interface CreateScheduledTaskInput {
   templateId?: AutomationTemplateId;
   name: string;
   prompt: string;
-  rrule: string;
+  /** Exactly one of `rrule` and `sessionTrigger`. */
+  rrule?: string;
+  sessionTrigger?: SessionTrigger;
   agentId: string;
   timezone?: string;
   modelOverride?: string | null;
@@ -191,7 +236,10 @@ export interface CreateScheduledTaskInput {
 export interface UpdateScheduledTaskInput {
   name?: string;
   prompt?: string;
+  /** A rule on a session-triggered automation switches it to that schedule. */
   rrule?: string;
+  /** Switches the automation to session events, replacing its schedule. */
+  sessionTrigger?: SessionTrigger;
   /**
    * Rebind the task to a different agent, switching the harness its future
    * firings run. The server clears `modelOverride` / `reasoningEffort` /
@@ -222,11 +270,22 @@ export interface UpdateScheduledTaskInput {
 }
 
 /** Wire shape of a task row (snake_case), matching `_to_response`. */
+interface SessionTriggerWire {
+  provider: "omnigent";
+  events: SessionTriggerEvent[];
+  agent_id?: string | null;
+  project_id?: string | null;
+  title_contains?: string | null;
+  include_own_sessions?: boolean;
+}
+
 interface ScheduledTaskWire {
   id: string;
   name: string;
   prompt: string;
-  rrule: string;
+  rrule: string | null;
+  // Absent on servers without event triggers; other providers are not shown here.
+  trigger_config?: { provider: string } | null;
   owner_user_id: string | null;
   agent_id: string;
   timezone: string;
@@ -263,6 +322,7 @@ interface ScheduledTaskRunWire {
   fired_at: number | null;
   finished_at: number | null;
   error_code: string | null;
+  event?: { events?: { type?: unknown; session_id?: unknown }[] } | null;
   conversation_updated_at: number | null;
   conversation_status: string | null;
   viewer_last_seen: number | null;
@@ -309,12 +369,42 @@ async function readJsonOrThrow<T>(res: Response): Promise<T> {
   return (await res.json()) as T;
 }
 
+function sessionTriggerFromWire(wire: ScheduledTaskWire["trigger_config"]): SessionTrigger | null {
+  if (wire?.provider !== "omnigent") return null;
+  const config = wire as SessionTriggerWire;
+  return {
+    events: config.events ?? [],
+    agentId: config.agent_id ?? null,
+    projectId: config.project_id ?? null,
+    titleContains: config.title_contains ?? null,
+    includeOwnSessions: config.include_own_sessions ?? false,
+  };
+}
+
+function sessionTriggerToWire(trigger: SessionTrigger): SessionTriggerWire {
+  const wire: SessionTriggerWire = { provider: "omnigent", events: trigger.events };
+  if (trigger.agentId) wire.agent_id = trigger.agentId;
+  if (trigger.projectId) wire.project_id = trigger.projectId;
+  if (trigger.titleContains) wire.title_contains = trigger.titleContains;
+  if (trigger.includeOwnSessions) wire.include_own_sessions = true;
+  return wire;
+}
+
+function runEventsFromWire(wire: ScheduledTaskRunWire["event"]): ScheduledTaskRunEvent[] {
+  return (wire?.events ?? []).flatMap((event) =>
+    typeof event.type === "string" && typeof event.session_id === "string"
+      ? [{ type: event.type, sessionId: event.session_id }]
+      : [],
+  );
+}
+
 function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
   return {
     id: wire.id,
     name: wire.name,
     prompt: wire.prompt,
     rrule: wire.rrule,
+    sessionTrigger: sessionTriggerFromWire(wire.trigger_config),
     ownerUserId: wire.owner_user_id,
     agentId: wire.agent_id,
     timezone: wire.timezone,
@@ -351,6 +441,7 @@ function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
     firedAt: wire.fired_at,
     finishedAt: wire.finished_at,
     errorCode: wire.error_code,
+    events: runEventsFromWire(wire.event),
     conversationUpdatedAt: wire.conversation_updated_at ?? null,
     conversationStatus: wire.conversation_status ?? null,
     viewerLastSeen: wire.viewer_last_seen ?? null,
@@ -360,14 +451,17 @@ function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
 
 /** List the caller's scheduled tasks (owner-scoped server-side). */
 export async function listScheduledTasks(): Promise<ScheduledTask[]> {
-  const res = await authenticatedFetch("/v1/scheduled-tasks");
+  // Ask for event-triggered tasks too; older clients don't see them.
+  const res = await authenticatedFetch("/v1/scheduled-tasks?event_triggers=1");
   const body = await readJsonOrThrow<{ scheduled_tasks: ScheduledTaskWire[] }>(res);
   return (body.scheduled_tasks ?? []).map(taskFromWire);
 }
 
 /** Fetch one of the caller's scheduled tasks (404 if not owned). */
 export async function getScheduledTask(id: string): Promise<ScheduledTask> {
-  const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`);
+  const res = await authenticatedFetch(
+    `/v1/scheduled-tasks/${encodeURIComponent(id)}?event_triggers=1`,
+  );
   return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
 }
 
@@ -388,9 +482,13 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   const body: Record<string, unknown> = {
     name: input.name,
     prompt: input.prompt,
-    rrule: input.rrule,
     agent_id: input.agentId,
   };
+  if (input.sessionTrigger !== undefined) {
+    body.trigger_config = sessionTriggerToWire(input.sessionTrigger);
+  } else {
+    body.rrule = input.rrule;
+  }
   if (input.timezone !== undefined) body.timezone = input.timezone;
   if (input.modelOverride != null) body.model_override = input.modelOverride;
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
@@ -436,6 +534,9 @@ export async function updateScheduledTask(
   if (input.name !== undefined) body.name = input.name;
   if (input.prompt !== undefined) body.prompt = input.prompt;
   if (input.rrule !== undefined) body.rrule = input.rrule;
+  if (input.sessionTrigger !== undefined) {
+    body.trigger_config = sessionTriggerToWire(input.sessionTrigger);
+  }
   if (input.agentId !== undefined) body.agent_id = input.agentId;
   if (input.timezone !== undefined) body.timezone = input.timezone;
   if (input.modelOverride !== undefined) body.model_override = input.modelOverride;
@@ -522,6 +623,8 @@ const AUTOMATION_INBOX_PAGE_SIZE = 50;
 export async function listAutomationFailures(after: string | null): Promise<AutomationFailurePage> {
   const params = new URLSearchParams({ limit: String(AUTOMATION_INBOX_PAGE_SIZE) });
   if (after !== null) params.set("after", after);
+  // Include event-triggered automations; older clients don't see them.
+  params.set("event_triggers", "1");
   const response = await authenticatedFetch(`/v1/scheduled-tasks/inbox?${params}`);
   const page = await readJsonOrThrow<{
     data: AutomationFailureWire[];

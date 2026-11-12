@@ -6,7 +6,13 @@ import { useScheduleEscape } from "./useScheduleEscape";
 import { cn } from "@/lib/utils";
 import { pickerTriggerClass } from "./pickerStyles";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ChevronDownIcon, ClockIcon, FolderOpenIcon, TriangleAlertIcon } from "lucide-react";
+import {
+  ChevronDownIcon,
+  ClockIcon,
+  FolderOpenIcon,
+  MessagesSquareIcon,
+  TriangleAlertIcon,
+} from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -36,6 +42,10 @@ import {
 } from "./useScheduledHarnessSettings";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
+import {
+  DEFAULT_SESSION_TRIGGER,
+  SessionTriggerFields,
+} from "@/components/scheduled/SessionTriggerFields";
 import {
   TriggerWorkerHarnessField,
   TriggerWorkerSettingsFields,
@@ -96,6 +106,7 @@ import {
   type AutomationTemplateId,
   type ScheduledTaskExecutionTarget,
   type ScheduledTaskSessionMode,
+  type SessionTrigger,
 } from "@/lib/scheduledTasksApi";
 import {
   isValidSandboxRepoUrl,
@@ -114,8 +125,19 @@ import type { Session } from "@/lib/types";
 const PROVIDER_DEFAULT = "provider-default";
 const DEFAULT_AUTOMATION_PROJECT = "Omnigent Automation";
 
-type AutomationTriggerType = "schedule" | TriggerSource;
+// "session" runs on Omnigent session events; it has neither a schedule nor a template.
+type AutomationTriggerType = "schedule" | "session" | TriggerSource;
 const AUTOMATION_TRIGGER_TYPES: readonly AutomationTriggerType[] = ["schedule", ...TRIGGER_SOURCES];
+const AUTOMATION_TRIGGER_TYPES_WITH_SESSION: readonly AutomationTriggerType[] = [
+  "schedule",
+  "session",
+  ...TRIGGER_SOURCES,
+];
+
+/** The integration template a trigger type starts from, if any. */
+function templateSource(type: AutomationTriggerType): TriggerSource | null {
+  return type === "schedule" || type === "session" ? null : type;
+}
 
 /** A Trigger type option: the integration's brand mark, or a clock for a schedule. */
 function TriggerTypeOption({ type }: { type: AutomationTriggerType }) {
@@ -124,6 +146,14 @@ function TriggerTypeOption({ type }: { type: AutomationTriggerType }) {
       <>
         <ClockIcon className="text-muted-foreground" />
         Schedule
+      </>
+    );
+  }
+  if (type === "session") {
+    return (
+      <>
+        <MessagesSquareIcon className="text-muted-foreground" />
+        Session events
       </>
     );
   }
@@ -279,12 +309,18 @@ export function CreateScheduledTaskDialog({
   const sessionModesSupported = info !== "loading" && info.scheduled_task_session_modes === true;
   const triggersSupported =
     sessionModesSupported && isFeatureEnabled(info, "session_orchestration");
+  const sessionTriggersSupported =
+    info !== "loading" && info.scheduled_task_session_triggers === true;
   // Provider-named label for the sandbox host option (e.g. "Modal Sandbox"),
   // falling back to the generic "New Sandbox" — same helper the New Chat picker uses.
   const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
   const createMutation = useCreateScheduledTask();
   const updateMutation = useUpdateScheduledTask();
   const isEdit = editingTask !== null;
+  // A task without a rule and without a session trigger runs on another provider's
+  // events, which this form has no fields for.
+  const editsEventTrigger =
+    editingTask !== null && editingTask.rrule === null && editingTask.sessionTrigger == null;
   // Runs start from a copy of a session: the one being copied on create, or the
   // saved session copy on edit. They use a schedule and start each run in a new
   // session.
@@ -497,6 +533,11 @@ export function CreateScheduledTaskDialog({
   // switches the trigger to another integration.
   const [trigger, setTrigger] = useState<TriggerSource | null>(null);
   const [triggerType, setTriggerType] = useState<AutomationTriggerType>("schedule");
+  const [sessionTrigger, setSessionTrigger] = useState<SessionTrigger>(DEFAULT_SESSION_TRIGGER);
+  // A session-triggered automation stays one on edit; its schedule fields are hidden.
+  const sessionTriggerMode = editingTask
+    ? editingTask.sessionTrigger != null
+    : triggerType === "session";
   const typeDrafts = useRef<Partial<Record<AutomationTriggerType, AutomationTypeDraft>>>({});
   const [triggerFields, setTriggerFields] = useState<TriggerFields>(() =>
     emptyTriggerFields("jira"),
@@ -527,7 +568,7 @@ export function CreateScheduledTaskDialog({
     [anchoredScheduling, subhourSupported, triggerPollMinutes],
   );
   const savedSchedule = useMemo(
-    () => (editingTask ? parseRRuleToScheduleModel(editingTask.rrule) : null),
+    () => (editingTask?.rrule != null ? parseRRuleToScheduleModel(editingTask.rrule) : null),
     [editingTask],
   );
 
@@ -567,7 +608,8 @@ export function CreateScheduledTaskDialog({
         setPickedEffort(editingTask.reasoningEffort ?? "");
         setPickedPermission(editingTask.permissionMode ?? "");
         setSchedule(parsedSchedule ?? DEFAULT_SCHEDULE_MODEL);
-        setScheduleUnsupported(parsedSchedule === null);
+        setScheduleUnsupported(parsedSchedule === null && editingTask.rrule !== null);
+        setSessionTrigger(editingTask.sessionTrigger ?? DEFAULT_SESSION_TRIGGER);
         setHostId(editingTask.hostId ?? "");
         setWorkspace(savedWorkspace);
         setBaseBranch(editingTask.baseBranch ?? null);
@@ -597,6 +639,7 @@ export function CreateScheduledTaskDialog({
           initialTrigger && !sourceSession ? defaultTriggerSchedule : DEFAULT_SCHEDULE_MODEL,
         );
         setScheduleUnsupported(false);
+        setSessionTrigger(DEFAULT_SESSION_TRIGGER);
         setHostId("");
         setWorkspace("");
         setBaseBranch(null);
@@ -901,10 +944,25 @@ export function CreateScheduledTaskDialog({
   const requiresAnchoredScheduling = schedule.preset === "custom" || schedule.end?.type === "count";
   const unsupportedByScheduler = !anchoredScheduling && requiresAnchoredScheduling;
   const scheduleInvalid =
-    scheduleUnsupported ||
-    unsupportedByScheduler ||
-    validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
-      null;
+    !sessionTriggerMode &&
+    !editsEventTrigger &&
+    (scheduleUnsupported ||
+      unsupportedByScheduler ||
+      validateSchedule(schedule, {
+        allowPastEnd,
+        sessionMode,
+        subhourSupported,
+        executionTarget,
+      }) !== null);
+  // The server starts at most one new sandbox an hour on a schedule; events have no such
+  // bound, so a sandbox session trigger continues one session.
+  const sessionTriggerBlockedReason = !sessionTriggerMode
+    ? null
+    : sessionTrigger.events.length === 0
+      ? "Choose at least one event."
+      : sandboxMode && sessionMode === "new"
+        ? "On a sandbox, a session-events automation continues one session."
+        : null;
   const renderedTemplatePrompt =
     trigger !== null && triggerFieldsComplete(triggerFields, trigger)
       ? renderTriggerPrompt(trigger, triggerFields, {
@@ -995,12 +1053,19 @@ export function CreateScheduledTaskDialog({
     (isEdit || sandboxMode || hostId !== "") &&
     !workspaceWithoutHost &&
     !scheduleInvalid &&
+    !sessionTriggerBlockedReason &&
     !pollingBlockedReason &&
     !(workerSettings !== null && workerHarnessSettings.blockedReason) &&
     !mutationPending;
 
   function handleTriggerTypeChange(next: AutomationTriggerType) {
-    if (isEdit || next === triggerType || (next !== "schedule" && !triggersSupported)) return;
+    if (
+      isEdit ||
+      next === triggerType ||
+      (templateSource(next) !== null && !triggersSupported) ||
+      (next === "session" && !sessionTriggersSupported)
+    )
+      return;
     typeDrafts.current[triggerType] = {
       name,
       prompt,
@@ -1011,10 +1076,12 @@ export function CreateScheduledTaskDialog({
       timezone,
       sessionMode,
     };
+    const previousSource = templateSource(triggerType);
+    const nextSource = templateSource(next);
     const previousDefaultName =
-      triggerType === "schedule" ? (initialName ?? "") : TRIGGER_TEMPLATES[triggerType].name;
+      previousSource === null ? (initialName ?? "") : TRIGGER_TEMPLATES[previousSource].name;
     const nextDefaultName =
-      next === "schedule" ? (initialName ?? "") : TRIGGER_TEMPLATES[next].name;
+      nextSource === null ? (initialName ?? "") : TRIGGER_TEMPLATES[nextSource].name;
     const customName = name.trim() !== "" && name !== previousDefaultName;
     const draft = typeDrafts.current[next];
     const nextPrompt = trigger !== null ? triggerFields.instructions : prompt;
@@ -1022,18 +1089,18 @@ export function CreateScheduledTaskDialog({
     setName(draft?.name ?? (customName ? name : nextDefaultName));
     setPrompt(draft?.prompt ?? nextPrompt);
     setSystemPrompt(draft?.systemPrompt ?? null);
-    setTrigger(draft ? draft.trigger : next === "schedule" ? null : next);
+    setTrigger(draft ? draft.trigger : nextSource);
     setTriggerFields(
       draft?.triggerFields ?? {
-        ...emptyTriggerFields(next === "schedule" ? "jira" : next),
+        ...emptyTriggerFields(nextSource ?? "jira"),
         instructions: nextPrompt,
       },
     );
     setSchedule(
-      draft?.schedule ?? (next === "schedule" ? DEFAULT_SCHEDULE_MODEL : defaultTriggerSchedule),
+      draft?.schedule ?? (nextSource === null ? DEFAULT_SCHEDULE_MODEL : defaultTriggerSchedule),
     );
     setTimezone(draft?.timezone ?? timezone);
-    setSessionMode(draft?.sessionMode ?? (next === "schedule" ? "new" : "continue"));
+    setSessionMode(draft?.sessionMode ?? (nextSource === null ? "new" : "continue"));
     setScheduleUnsupported(false);
     setSystemPromptOpen(false);
     setEditingSystemPrompt(false);
@@ -1158,7 +1225,17 @@ export function CreateScheduledTaskDialog({
       const input = {
         name: name.trim(),
         prompt: systemPrompt === null ? effectivePrompt.trim() : effectivePrompt,
-        rrule: buildRRule(schedule),
+        ...(sessionTriggerMode
+          ? {
+              sessionTrigger: {
+                ...sessionTrigger,
+                titleContains: sessionTrigger.titleContains?.trim() || null,
+              },
+            }
+          : // Another provider's event trigger has no fields here; saving keeps it.
+            editsEventTrigger
+            ? {}
+            : { rrule: buildRRule(schedule) }),
         timezone,
         ...(executionTargetChanged ? { executionTarget } : {}),
         ...(worktreesSupported && baseBranch !== (editingTask?.baseBranch ?? null)
@@ -1211,7 +1288,12 @@ export function CreateScheduledTaskDialog({
       } else {
         if (effectiveAgentId === null) return;
         const scheduleTemplateId = initialTrigger ? undefined : initialTemplateId;
-        const templateId = triggerType === "schedule" ? scheduleTemplateId : triggerType;
+        const templateId =
+          triggerType === "schedule"
+            ? scheduleTemplateId
+            : triggerType === "session"
+              ? "session"
+              : triggerType;
         const created = await createMutation.mutateAsync({
           ...(templateId ? { templateId } : {}),
           ...input,
@@ -1313,8 +1395,12 @@ export function CreateScheduledTaskDialog({
           {!isEdit && !fromSession && (
             <TriggerTypeSelect
               value={triggerType}
-              types={AUTOMATION_TRIGGER_TYPES}
-              isTypeDisabled={(type) => type !== "schedule" && !triggersSupported}
+              types={
+                sessionTriggersSupported
+                  ? AUTOMATION_TRIGGER_TYPES_WITH_SESSION
+                  : AUTOMATION_TRIGGER_TYPES
+              }
+              isTypeDisabled={(type) => templateSource(type) !== null && !triggersSupported}
               onChange={handleTriggerTypeChange}
               onOpenChange={handleSelectOpenChange}
               disabled={curationPending || mutationPending}
@@ -1628,7 +1714,29 @@ export function CreateScheduledTaskDialog({
                       </div>
                     )}
                 </div>
-                {!triggerMode && recurrenceFields}
+                {sessionTriggerMode ? (
+                  <>
+                    <SessionTriggerFields
+                      value={sessionTrigger}
+                      onChange={setSessionTrigger}
+                      disabled={mutationPending}
+                    />
+                    {sessionTriggerBlockedReason !== null && sessionTrigger.events.length > 0 && (
+                      <p role="status" className="text-sm text-warning">
+                        {sessionTriggerBlockedReason}
+                      </p>
+                    )}
+                  </>
+                ) : editsEventTrigger ? (
+                  <p
+                    className="text-sm text-muted-foreground"
+                    data-testid="task-event-trigger-note"
+                  >
+                    This automation runs on events. Saving keeps its trigger.
+                  </p>
+                ) : (
+                  !triggerMode && recurrenceFields
+                )}
                 {triggerMode && !scheduleInvalid && (
                   <p className="text-sm text-muted-foreground" data-testid="task-trigger-cadence">
                     Checks for new matches: {describeSchedule(buildRRule(schedule))}.{" "}
@@ -2024,7 +2132,7 @@ export function CreateScheduledTaskDialog({
                         </>
                       )}
                     </div>
-                    {!triggerMode && endingFields}
+                    {!triggerMode && !sessionTriggerMode && !editsEventTrigger && endingFields}
                   </CollapsibleContent>
                 </Collapsible>
               </>

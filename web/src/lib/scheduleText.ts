@@ -337,6 +337,9 @@ const MONTH_NAMES = [
  * formatter doesn't special-case, so a valid-but-unusual rule still renders
  * something readable rather than blank.
  */
+/** Summary for an automation that runs on events and has no schedule to describe. */
+export const EVENT_TRIGGER_SUMMARY = "Runs on events";
+
 export function describeSchedule(rrule: string): string {
   const rule = tryParse(rrule);
   if (!rule) return rrule;
