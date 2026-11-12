@@ -356,7 +356,7 @@ def create_auth_router(
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
         }
-        if reauth:
+        if reauth and config.reauth_prompt:
             # Ask the IdP to force the user to re-enter credentials
             # rather than silently reusing an existing IdP session.
             params["prompt"] = "login"
