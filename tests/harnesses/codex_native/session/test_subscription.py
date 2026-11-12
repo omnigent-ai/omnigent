@@ -526,6 +526,50 @@ def test_subscribe_history_fallback_is_bounded_and_specific(
     assert "failed to subscribe to Codex thread thread_123" in caplog.text
 
 
+@pytest.mark.parametrize("pending_shell", [False, True])
+def test_history_free_resume_preserves_unconfirmed_recovery_state(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, pending_shell: bool
+) -> None:
+    """An idle snapshot without turns cannot prove which saved work completed."""
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    if pending_shell:
+        state = replace(state, pending_shell_command_id="shell_123")
+        codex_native_forwarder.write_bridge_state(tmp_path, state)
+
+    class HistoryRefusingClient(_FakeCodexAppServerClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if not params.get("excludeTurns"):
+                raise codex_native_app_server.CodexAppServerResponseError(
+                    {"code": -32601, "message": "list_turns is not supported yet"}
+                )
+            return {
+                "result": {
+                    "active_turn_present": False,
+                    "thread": {"id": "thread_123", "status": {"type": "idle"}, "turns": []},
+                }
+            }
+
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with _recording_forwarder_client(posted) as client:
+            await codex_native_forwarder._subscribe_until_ready(
+                HistoryRefusingClient(),  # type: ignore[arg-type]
+                client,
+                **_forwarder_context(client, tmp_path),
+                thread_id="thread_123",
+            )
+
+    asyncio.run(run())
+
+    assert read_bridge_state(tmp_path) == state
+    assert posted == []
+    assert "Items before this subscription cannot be replayed" in caplog.text
+    assert "missing from resume response" not in caplog.text
+
+
 @pytest.mark.parametrize(
     ("failure_source", "close_fails"),
     [
