@@ -2463,7 +2463,7 @@ def _codex_items_with_outputs_after_their_calls(
         if item_type == "function_call_output":
             if position in moved_positions:
                 continue
-            if call_id in waiting_call_ids:
+            if isinstance(call_id, str) and call_id in waiting_call_ids:
                 waiting_call_ids.remove(call_id)
             exchange_has_output = True
         elif item_type == "function_call":
