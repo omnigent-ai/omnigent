@@ -53,7 +53,25 @@ describe("layoutWorkflowSteps", () => {
     expect(at.fix!.x).toBeLessThan(at.history!.x);
     expect(at.explore!.x).toBe((at.fix!.x + at.history!.x) / 2);
     expect(at.history!.x - at.fix!.x).toBe(STEP_NODE_WIDTH + 32);
-    expect(nodes.find((node) => node.id === "fix")?.data).toEqual({ name: "fix", goal: null });
+    expect(nodes.find((node) => node.id === "fix")?.data).toEqual({
+      name: "fix",
+      goal: null,
+      number: 3,
+    });
+  });
+
+  it("gives each node its run state, and moves the edges into a running step", () => {
+    const states = new Map([
+      ["explore", "done" as const],
+      ["reproduce", "running" as const],
+    ]);
+    const { nodes, edges } = layoutWorkflowSteps(STEPS, states);
+
+    expect(nodes.find((node) => node.id === "reproduce")?.data.state).toBe("running");
+    expect(nodes.find((node) => node.id === "fix")?.data.state).toBeUndefined();
+    expect(edges.filter((edge) => edge.animated).map((edge) => edge.id)).toEqual([
+      "explore->reproduce",
+    ]);
   });
 
   it("draws an edge from each step to each step that waits for it", () => {

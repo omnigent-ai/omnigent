@@ -14,6 +14,9 @@ import {
 } from "@/hooks/useWorkflow";
 import type * as WorkflowHooks from "@/hooks/useWorkflow";
 import type * as RoutingModule from "@/lib/routing";
+import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
+import { openTasksTab } from "@/store/sessionTasksActions";
+import type * as TasksActions from "@/store/sessionTasksActions";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
 import type { WorkflowRun } from "@/lib/workflowRuns";
 
@@ -23,14 +26,34 @@ vi.mock("@/hooks/useWorkflow", async (importOriginal) => {
   const actual = await importOriginal<typeof WorkflowHooks>();
   return { ...actual, useWorkflow: vi.fn(), useWorkflowRuns: vi.fn() };
 });
-vi.mock("@/hooks/useSavedWorkflows", () => ({ useDeleteWorkflow: vi.fn() }));
+vi.mock("@/hooks/useSavedWorkflows", () => ({
+  useDeleteWorkflow: vi.fn(),
+  useSavedWorkflows: vi.fn(),
+}));
+vi.mock("@/store/sessionTasksActions", async (importOriginal) => {
+  const actual = await importOriginal<typeof TasksActions>();
+  return { ...actual, openTasksTab: vi.fn() };
+});
 vi.mock("@/hooks/useNow", () => ({ useNow: () => new Date("2026-11-12T18:00:00Z") }));
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => "loading" }));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
-// The graph has its own tests; here it lists the steps it was given.
+// The graph has its own tests; here it lists the steps it was given, and the
+// full-screen view where each stands.
 vi.mock("@/components/workflows/WorkflowStepsGraph", () => ({
   WorkflowStepsGraph: ({ steps }: { steps: WorkflowStep[] }) => (
     <div data-testid="workflow-steps-graph">{steps.map((step) => step.name).join(", ")}</div>
+  ),
+  WorkflowGraphOverlay: (props: {
+    title: string;
+    progress?: StepProgress[];
+    onClose: () => void;
+  }) => (
+    <div data-testid="workflow-graph-overlay" data-title={props.title}>
+      {props.progress?.map((item) => `${item.step.id}:${item.state}`).join(" ")}
+      <button type="button" onClick={props.onClose}>
+        Close graph
+      </button>
+    </div>
   ),
 }));
 vi.mock("@/components/workflows/WorkflowSessionDialog", () => ({
@@ -63,7 +86,25 @@ const WORKFLOW: WorkflowDetail = {
   ],
 };
 
-function run(sessionId: string, title: string, progress: Partial<WorkflowRun["progress"]>) {
+function status(step: string, value: string): JournalEntry {
+  return {
+    id: `${step}-${value}`,
+    position: 1,
+    created_at: Date.parse("2026-11-12T15:05:00Z") / 1000,
+    scheduled_task_run_id: null,
+    step,
+    author: { type: "agent" },
+    kind: "status",
+    payload: { status: value, text: "x" },
+  };
+}
+
+function run(
+  sessionId: string,
+  title: string,
+  progress: Partial<WorkflowRun["progress"]>,
+  statuses: JournalEntry[] = [],
+): WorkflowRun {
   return {
     id: `plan-${sessionId}`,
     sessionId,
@@ -72,6 +113,8 @@ function run(sessionId: string, title: string, progress: Partial<WorkflowRun["pr
     sessionStatus: "idle" as const,
     archived: false,
     progress: { total: 2, started: 0, done: 0, needsInput: 0, failed: 0, ...progress },
+    steps: WORKFLOW.steps,
+    statuses,
   };
 }
 
@@ -116,6 +159,7 @@ describe("WorkflowDetailPage", () => {
   beforeEach(() => {
     navigate.mockClear();
     deleteWorkflow.mockClear();
+    vi.mocked(openTasksTab).mockClear();
     vi.mocked(showToast).mockClear();
     vi.mocked(useDeleteWorkflow).mockReturnValue({
       mutate: deleteWorkflow,
@@ -170,6 +214,42 @@ describe("WorkflowDetailPage", () => {
       scroll.mockRestore();
       client.mockRestore();
     }
+  });
+
+  it("shows each run's tasks as the Tasks tab's timeline, and opens a task in its session", () => {
+    mockWorkflow({});
+    const session = "a".repeat(32);
+    mockRuns([run(session, "Fix the upload test", { done: 1 }, [status("explore", "done")])]);
+    renderPage();
+
+    const row = screen.getByTestId("workflow-run");
+    const segments = within(row).getAllByTestId("tasks-progress-segment");
+    expect(segments.map((segment) => segment.getAttribute("aria-label"))).toEqual([
+      "Task 1, Explore the failures: Done",
+      "Task 2, Fix the test: Ready",
+    ]);
+    fireEvent.click(segments[1]!);
+    expect(openTasksTab).toHaveBeenCalledWith(session, "fix");
+    expect(navigate).toHaveBeenCalledWith(`/c/${session}`);
+  });
+
+  it("shows a run on the workflow's graph, where each task stands", () => {
+    mockWorkflow({});
+    mockRuns([
+      run("a".repeat(32), "Fix the upload test", { needsInput: 1 }, [
+        status("explore", "done"),
+        status("fix", "needs_input"),
+      ]),
+    ]);
+    renderPage();
+    expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "View Fix the upload test on the graph" }));
+    const overlay = screen.getByTestId("workflow-graph-overlay");
+    expect(overlay).toHaveAttribute("data-title", "Triage flaky tests");
+    expect(overlay).toHaveTextContent("explore:done fix:needs_input");
+    fireEvent.click(within(overlay).getByRole("button", { name: "Close graph" }));
+    expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
   });
 
   it("says when nothing ran it yet, and loads older runs on request", () => {

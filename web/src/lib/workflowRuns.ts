@@ -1,3 +1,10 @@
+import {
+  type JournalEntry,
+  type JournalPlanStep,
+  type StepProgress,
+  stepProgress,
+} from "@/lib/sessionJournal";
+
 /** One run of a saved workflow: a session that started it. */
 export interface WorkflowRun {
   /** The ID of the plan entry that started the run. */
@@ -17,6 +24,15 @@ export interface WorkflowRun {
     needsInput: number;
     failed: number;
   };
+  /** The steps of the plan that started the run. */
+  steps: JournalPlanStep[];
+  /** Each of those steps' newest status entry. */
+  statuses: JournalEntry[];
+}
+
+/** Where each of the run's steps stands, as the Tasks tab works it out. */
+export function runStepProgress(run: WorkflowRun): StepProgress[] {
+  return stepProgress(run.steps, run.statuses, run.sessionStatus === "running");
 }
 
 /** How a run's row looks: its icon and its one-line state. */

@@ -2,6 +2,7 @@ import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 import { authenticatedFetch } from "@/lib/identity";
+import type { JournalEntry, JournalPlanStep } from "@/lib/sessionJournal";
 import type { WorkflowRun } from "@/lib/workflowRuns";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
 
@@ -65,6 +66,8 @@ interface RawRun {
     needs_input: number;
     failed: number;
   };
+  steps?: JournalPlanStep[];
+  statuses?: JournalEntry[];
 }
 
 /**
@@ -99,6 +102,8 @@ export function useWorkflowRuns(workflowId: string) {
             needsInput: run.progress.needs_input,
             failed: run.progress.failed,
           },
+          steps: run.steps ?? [],
+          statuses: run.statuses ?? [],
         })),
         nextCursor: body.next_cursor ?? null,
       };

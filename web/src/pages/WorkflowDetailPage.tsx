@@ -4,16 +4,15 @@
  * its steps as a graph, and the sessions that ran it, newest first.
  */
 
-import { useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
-  CheckIcon,
   ChevronDownIcon,
   ChevronLeftIcon,
   ClockIcon,
   Loader2Icon,
   PlayIcon,
   Trash2Icon,
-  TriangleAlertIcon,
+  WorkflowIcon,
 } from "lucide-react";
 
 import { PageScroll } from "@/components/PageScroll";
@@ -24,7 +23,10 @@ import {
   type WorkflowSessionRequest,
   WorkflowSessionDialog,
 } from "@/components/workflows/WorkflowSessionDialog";
-import { WorkflowStepsGraph } from "@/components/workflows/WorkflowStepsGraph";
+import {
+  WorkflowGraphOverlay,
+  WorkflowStepsGraph,
+} from "@/components/workflows/WorkflowStepsGraph";
 import { useNow } from "@/hooks/useNow";
 import { useDeleteWorkflow } from "@/hooks/useSavedWorkflows";
 import { useWorkflow, useWorkflowRuns, WorkflowNotFoundError } from "@/hooks/useWorkflow";
@@ -33,7 +35,15 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { Link, useNavigate, useParams } from "@/lib/routing";
 import { formatRunTimestamp } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
-import { describeWorkflowRun, type WorkflowRun, type WorkflowRunState } from "@/lib/workflowRuns";
+import type { StepState } from "@/lib/sessionJournal";
+import {
+  describeWorkflowRun,
+  runStepProgress,
+  type WorkflowRun,
+  type WorkflowRunState,
+} from "@/lib/workflowRuns";
+import { ProgressStrip, StepGlyph } from "@/shell/TasksPanel";
+import { openTasksTab } from "@/store/sessionTasksActions";
 
 export function WorkflowDetailPage() {
   const { workflowId = "" } = useParams<{ workflowId: string }>();
@@ -147,7 +157,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
 
       <section className="mt-6">
         <h2 className="mb-2 text-sm font-medium text-muted-foreground">Steps</h2>
-        <WorkflowStepsGraph steps={workflow.steps} />
+        <WorkflowStepsGraph steps={workflow.steps} title={workflow.name} />
       </section>
 
       <hr className="my-6 border-border" />
@@ -170,7 +180,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
         <>
           <ul className="flex flex-col gap-1" data-testid="workflow-runs">
             {runList.map((run) => (
-              <WorkflowRunRow key={run.id} run={run} now={now} />
+              <WorkflowRunRow key={run.id} run={run} now={now} workflowName={workflow.name} />
             ))}
           </ul>
           {runs.hasNextPage && (
@@ -276,46 +286,111 @@ function BackLink() {
   );
 }
 
-/** One run: its session's title, when it started and where it stands, opening the session. */
-function WorkflowRunRow({ run, now }: { run: WorkflowRun; now: Date }) {
+// A run's glyph: the Tasks tab's, for the step state its run state matches.
+const RUN_GLYPHS: Record<WorkflowRunState["kind"], StepState> = {
+  running: "running",
+  waiting: "needs_input",
+  done: "done",
+  failed: "failed",
+  stopped: "stopped",
+};
+
+/**
+ * One run: its session's title, when it started and where it stands, over the
+ * Tasks tab's timeline of its tasks. The row opens the session; a segment opens
+ * that task there, and the graph button shows the run on the workflow's graph.
+ */
+function WorkflowRunRow({
+  run,
+  now,
+  workflowName,
+}: {
+  run: WorkflowRun;
+  now: Date;
+  workflowName: string;
+}) {
+  const navigate = useNavigate();
   const state = describeWorkflowRun(run);
+  const progress = useMemo(() => runStepProgress(run), [run]);
+  const [graphOpen, setGraphOpen] = useState(false);
+  const sessionPath = `/c/${encodeURIComponent(run.sessionId)}`;
+  const title = run.title || "Untitled session";
+  const started = formatRunTimestamp(run.startedAt, now) ?? "—";
+  const stateLabel = (
+    <span
+      className={cn(state.kind === "waiting" && "text-brand-accent")}
+      data-testid="workflow-run-state"
+    >
+      {state.label}
+    </span>
+  );
   return (
-    <li data-testid="workflow-run" data-run-state={state.kind}>
-      <Link
-        to={`/c/${encodeURIComponent(run.sessionId)}`}
-        className="flex items-center gap-3 rounded-lg px-2 py-2 transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none"
-      >
+    <li
+      className="relative rounded-lg px-2 py-2.5 transition-colors hover:bg-muted/60 has-[a:focus-visible]:bg-muted/60"
+      data-testid="workflow-run"
+      data-run-state={state.kind}
+    >
+      <div className="flex items-start gap-3">
         <span className="flex size-5 shrink-0 items-center justify-center">
-          <RunStateIcon state={state} />
+          <StepGlyph state={RUN_GLYPHS[state.kind]} />
         </span>
-        <span className="flex min-w-0 flex-1 flex-col">
-          <span className="truncate text-sm">{run.title || "Untitled session"}</span>
-          <span className="flex flex-wrap items-baseline gap-x-2 text-xs text-muted-foreground">
-            <span>{formatRunTimestamp(run.startedAt, now) ?? "—"}</span>
-            <span
-              className={cn(state.kind === "waiting" && "text-amber-600 dark:text-amber-400")}
-              data-testid="workflow-run-state"
-            >
-              {state.label}
-            </span>
+        <div className="min-w-0 flex-1">
+          {/* The link covers the row; the timeline and the graph button sit above it. */}
+          <Link
+            to={sessionPath}
+            className="block truncate text-sm leading-5 after:absolute after:inset-0 after:rounded-lg after:content-[''] focus-visible:outline-none"
+          >
+            {title}
+          </Link>
+          <p className="mt-0.5 flex flex-wrap items-baseline gap-x-2 text-xs text-muted-foreground">
+            <span>{started}</span>
+            {stateLabel}
             {run.archived && <span>Archived</span>}
-          </span>
-        </span>
-      </Link>
+          </p>
+          {progress.length > 0 && (
+            <div className="relative z-10 mt-3 pr-1">
+              <ProgressStrip
+                progress={progress}
+                fromPlan
+                onSelect={(stepId) => {
+                  openTasksTab(run.sessionId, stepId);
+                  navigate(sessionPath);
+                }}
+              />
+            </div>
+          )}
+        </div>
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          className="relative z-10 -my-1 shrink-0 text-muted-foreground hover:text-foreground"
+          aria-label={`View ${title} on the graph`}
+          title="View this run on the graph"
+          data-testid="workflow-run-graph"
+          onClick={() => setGraphOpen(true)}
+        >
+          <WorkflowIcon className="size-4" />
+        </Button>
+      </div>
+      {graphOpen && (
+        <WorkflowGraphOverlay
+          title={workflowName}
+          subtitle={
+            <>
+              <Link to={sessionPath} className="text-foreground hover:underline">
+                {title}
+              </Link>
+              <span aria-hidden>·</span>
+              <span>{started}</span>
+              <span aria-hidden>·</span>
+              {stateLabel}
+            </>
+          }
+          steps={run.steps}
+          progress={progress}
+          onClose={() => setGraphOpen(false)}
+        />
+      )}
     </li>
   );
-}
-
-function RunStateIcon({ state }: { state: WorkflowRunState }) {
-  switch (state.kind) {
-    case "running":
-      return <Loader2Icon className="size-3.5 animate-spin text-muted-foreground" />;
-    case "waiting":
-    case "failed":
-      return <TriangleAlertIcon className="size-4 text-amber-500" strokeWidth={1.75} />;
-    case "done":
-      return <CheckIcon className="size-4 text-muted-foreground" />;
-    case "stopped":
-      return <span aria-hidden className="size-2 rounded-full bg-muted-foreground/40" />;
-  }
 }

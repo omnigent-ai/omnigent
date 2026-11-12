@@ -14,6 +14,8 @@ function run(
     sessionStatus,
     archived: false,
     progress: { total: 5, started: 0, done: 0, needsInput: 0, failed: 0, ...progress },
+    steps: [],
+    statuses: [],
   };
 }
 

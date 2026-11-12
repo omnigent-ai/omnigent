@@ -1,4 +1,7 @@
-import { type Edge, MarkerType, type Node } from "@xyflow/react";
+// Types only: @xyflow/react itself is too heavy to load in jsdom tests.
+import type { Edge, MarkerType, Node } from "@xyflow/react";
+
+import type { StepState } from "@/lib/sessionJournal";
 
 /** One step of a saved workflow, as `GET /v1/workflows/{id}` returns it. */
 export interface WorkflowStep {
@@ -16,6 +19,10 @@ export interface WorkflowStep {
 export interface StepNodeData extends Record<string, unknown> {
   name: string;
   goal: string | null;
+  /** The step's place in the workflow, from 1. */
+  number: number;
+  /** Where the step stands in a run; absent for the workflow itself. */
+  state?: StepState;
 }
 
 export const STEP_NODE_WIDTH = 220;
@@ -57,10 +64,15 @@ export function stepRows(steps: readonly WorkflowStep[]): Map<string, number> {
  * Lay a workflow's steps out top to bottom by dependency, for React Flow.
  * Within a row, steps keep the workflow's order, and each row is centered.
  *
+ * @param states - Where each step stands in a run, by step ID; the edges into a
+ *   running step move.
  * @returns The nodes, an edge from each step to each step that waits for it,
  *   and how many rows the steps take.
  */
-export function layoutWorkflowSteps(steps: readonly WorkflowStep[]): {
+export function layoutWorkflowSteps(
+  steps: readonly WorkflowStep[],
+  states?: ReadonlyMap<string, StepState>,
+): {
   nodes: Node<StepNodeData>[];
   edges: Edge[];
   rowCount: number;
@@ -72,6 +84,7 @@ export function layoutWorkflowSteps(steps: readonly WorkflowStep[]): {
     byRow.set(row, [...(byRow.get(row) ?? []), step]);
   }
   const widest = Math.max(0, ...[...byRow.values()].map((row) => row.length));
+  const numbers = new Map(steps.map((step, index) => [step.id, index + 1]));
   const nodes: Node<StepNodeData>[] = [];
   for (const [row, members] of byRow) {
     const offset = ((widest - members.length) * (STEP_NODE_WIDTH + COLUMN_GAP)) / 2;
@@ -83,7 +96,12 @@ export function layoutWorkflowSteps(steps: readonly WorkflowStep[]): {
           x: offset + index * (STEP_NODE_WIDTH + COLUMN_GAP),
           y: row * (STEP_NODE_HEIGHT + ROW_GAP),
         },
-        data: { name: step.name, goal: step.goal },
+        data: {
+          name: step.name,
+          goal: step.goal,
+          number: numbers.get(step.id) ?? 0,
+          ...(states?.has(step.id) ? { state: states.get(step.id) } : {}),
+        },
       });
     });
   }
@@ -96,7 +114,8 @@ export function layoutWorkflowSteps(steps: readonly WorkflowStep[]): {
         source: dependency,
         target: step.id,
         style: EDGE_STYLE,
-        markerEnd: { type: MarkerType.ArrowClosed, color: "var(--muted-foreground)" },
+        animated: states?.get(step.id) === "running",
+        markerEnd: { type: "arrowclosed" as MarkerType, color: "var(--muted-foreground)" },
       })),
   );
   return { nodes, edges, rowCount: byRow.size };
