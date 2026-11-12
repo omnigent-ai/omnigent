@@ -4412,6 +4412,37 @@ describe("editing template prompts", () => {
     },
   );
 
+  it.each([
+    // Claude's mode, written by hand into a Codex worker call.
+    ["auto", "Matching sessions are set to start in auto, which this harness doesn't offer here"],
+    // Codex's own default is valid; it overrides the agent's opt-ins, so nothing to warn about.
+    ["default", null],
+  ])(
+    "flags a saved Codex worker mode %s only when Codex doesn't offer it",
+    async (permissionMode, warning) => {
+      withCodexAgent();
+      const saved = updateTriggerWorkerSettings(original, {
+        agentId: "ag_codex",
+        model: "",
+        effort: "",
+        permissionMode,
+      })!;
+      const task = scheduledTask({ prompt: saved, sessionMode: "continue", sessionId: "poller" });
+      render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />, {
+        info: { session_create_permission_modes: true },
+      });
+      if (warning === null) {
+        expect(screen.queryByTestId("task-worker-permission-unapplied")).not.toBeInTheDocument();
+        return;
+      }
+      expect(screen.getByTestId("task-worker-permission-unapplied")).toHaveTextContent(warning);
+      fireEvent.click(screen.getByTestId("task-worker-permission-clear"));
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      expect(updateMutateAsync.mock.calls[0][0].input.prompt).not.toContain("permission_mode");
+    },
+  );
+
   it("clears the workers' permission mode when their harness changes", async () => {
     withCodexAgent();
     const task = scheduledTask({ prompt: original, sessionMode: "continue", sessionId: "poller" });

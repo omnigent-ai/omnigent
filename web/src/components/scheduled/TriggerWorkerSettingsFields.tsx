@@ -88,8 +88,12 @@ export function TriggerWorkerSettingsFields({
   const permissions = permissionModesSupported
     ? settings.permissions.filter((option) => !APPROVAL_SKIPPING_PERMISSION_MODES.has(option.value))
     : [];
-  // A newer runner refuses a saved mode on a server that can't apply it, so offer to drop it.
-  const unappliedMode = permissionModesSupported ? "" : value.permissionMode;
+  // The call would be refused when the server can't apply a saved mode, or (for a
+  // hand-written prompt) the harness has no such mode, so offer to drop it.
+  const unappliedMode =
+    value.permissionMode && !permissions.some((option) => option.value === value.permissionMode)
+      ? value.permissionMode
+      : "";
   const unappliedLabel =
     settings.permissions.find((option) => option.value === unappliedMode)?.label ?? unappliedMode;
   return (
@@ -119,8 +123,11 @@ export function TriggerWorkerSettingsFields({
           data-testid="task-worker-permission-unapplied"
         >
           <p className="text-sm text-destructive">
-            Matching sessions are set to start in {unappliedLabel}, which this server can&apos;t
-            apply, so they won&apos;t start.
+            Matching sessions are set to start in {unappliedLabel},{" "}
+            {permissionModesSupported
+              ? "which this harness doesn't offer here"
+              : "which this server can't apply"}
+            , so they won&apos;t start.
           </p>
           <Button
             type="button"
