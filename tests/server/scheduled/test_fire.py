@@ -63,6 +63,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
     SessionActivity,
+    TreeUsageNode,
 )
 from tests.server.helpers import build_agent_bundle
 
@@ -2693,11 +2694,12 @@ class _ExistingConversationStore(FakeConversationStore):
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
         return self.existing.get(conversation_id)
 
-    def list_conversations(self, *, root_conversation_id: str, **_: Any) -> SimpleNamespace:
-        tree = [
-            c for c in self.existing.values() if c.root_conversation_id == root_conversation_id
+    def list_tree_usage(self, root_conversation_id: str) -> list[TreeUsageNode]:
+        return [
+            TreeUsageNode(c.id, c.parent_conversation_id, c.session_usage)
+            for c in self.existing.values()
+            if c.root_conversation_id == root_conversation_id
         ]
-        return SimpleNamespace(data=tree, has_more=False, last_id=None)
 
 
 def _continuing_task(**overrides: Any) -> ScheduledTask:
