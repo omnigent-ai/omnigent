@@ -12,7 +12,6 @@ import {
   Loader2Icon,
   PlayIcon,
   Trash2Icon,
-  WorkflowIcon,
 } from "lucide-react";
 
 import { PageScroll } from "@/components/PageScroll";
@@ -23,6 +22,7 @@ import {
   type WorkflowSessionRequest,
   WorkflowSessionDialog,
 } from "@/components/workflows/WorkflowSessionDialog";
+import { RunGraphButton, RunTimeline } from "@/components/workflows/RunTasks";
 import {
   WorkflowGraphOverlay,
   WorkflowStepsGraph,
@@ -42,8 +42,7 @@ import {
   type WorkflowRun,
   type WorkflowRunState,
 } from "@/lib/workflowRuns";
-import { ProgressStrip, StepGlyph } from "@/shell/TasksPanel";
-import { openTasksTab } from "@/store/sessionTasksActions";
+import { StepGlyph } from "@/shell/TasksPanel";
 
 export function WorkflowDetailPage() {
   const { workflowId = "" } = useParams<{ workflowId: string }>();
@@ -309,7 +308,6 @@ function WorkflowRunRow({
   now: Date;
   workflowName: string;
 }) {
-  const navigate = useNavigate();
   const state = describeWorkflowRun(run);
   const progress = useMemo(() => runStepProgress(run), [run]);
   const [graphOpen, setGraphOpen] = useState(false);
@@ -348,29 +346,14 @@ function WorkflowRunRow({
             {run.archived && <span>Archived</span>}
           </p>
           {progress.length > 0 && (
-            <div className="relative z-10 mt-3 pr-1">
-              <ProgressStrip
-                progress={progress}
-                fromPlan
-                onSelect={(stepId) => {
-                  openTasksTab(run.sessionId, stepId);
-                  navigate(sessionPath);
-                }}
-              />
-            </div>
+            <RunTimeline sessionId={run.sessionId} progress={progress} className="mt-3 pr-1" />
           )}
         </div>
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          className="relative z-10 -my-1 shrink-0 text-muted-foreground hover:text-foreground"
-          aria-label={`View ${title} on the graph`}
-          title="View this run on the graph"
-          data-testid="workflow-run-graph"
+        <RunGraphButton
+          runName={title}
+          className="relative -my-1"
           onClick={() => setGraphOpen(true)}
-        >
-          <WorkflowIcon className="size-4" />
-        </Button>
+        />
       </div>
       {graphOpen && (
         <WorkflowGraphOverlay
