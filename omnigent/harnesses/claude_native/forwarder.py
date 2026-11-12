@@ -2319,7 +2319,7 @@ async def _forward_one_subagent(
         # large child transcript on every poll while its capped backoff runs.
         return
     jsonl_path = subagents_dir / f"agent-{entry.subagent_id}.jsonl"
-    if not jsonl_path.exists():
+    if not await asyncio.to_thread(jsonl_path.exists):
         return
     result = await asyncio.to_thread(
         read_transcript_items_from_offset,
@@ -2821,7 +2821,7 @@ async def _forward_available_subagents(
         existing sub-agents' cursors advanced.
     """
     subagents_dir = _subagents_dir_for_transcript(transcript_path)
-    if not subagents_dir.is_dir():
+    if not await asyncio.to_thread(subagents_dir.is_dir):
         return state
     if batch_capability is None:
         batch_capability = _SessionEventBatchCapability()

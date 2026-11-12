@@ -29,8 +29,11 @@ from tests.harnesses.claude_native.forwarder._support import (
 )
 
 
+@pytest.mark.parametrize("slow_probe", [None, "directory", "transcript"])
 async def test_subagent_watcher_forwards_transcript_items_to_child_session(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slow_probe: str | None,
 ) -> None:
     """
     After registering a sub-agent, the forwarder tails its
@@ -40,7 +43,7 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
-    _seed_subagent_on_disk(
+    child_transcript = _seed_subagent_on_disk(
         transcript_path=transcript_path,
         subagent_id="b6d8fff",
         agent_type="Explore",
@@ -93,6 +96,31 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
             return {"queued": False, "child_session_id": "conv_child_beta"}
         return {}
 
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    loop = asyncio.get_running_loop()
+    original_is_dir = Path.is_dir
+    original_exists = Path.exists
+
+    def hold_probe() -> None:
+        if not finished.is_set():
+            loop.call_soon_threadsafe(entered.set)
+            release.wait(timeout=5.0)
+            finished.set()
+
+    def slow_is_dir(path: Path) -> bool:
+        if slow_probe == "directory" and path == child_transcript.parent:
+            hold_probe()
+        return original_is_dir(path)
+
+    def slow_exists(path: Path) -> bool:
+        if slow_probe == "transcript" and path == child_transcript:
+            hold_probe()
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "is_dir", slow_is_dir)
+    monkeypatch.setattr(Path, "exists", slow_exists)
     server, _thread, base_url = _start_recording_server_with_responses(response_for)
     task = asyncio.create_task(
         forwarder.forward_claude_transcript_to_session(
@@ -106,6 +134,10 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         )
     )
     try:
+        if slow_probe is not None:
+            await asyncio.wait_for(entered.wait(), timeout=10.0)
+            assert not finished.is_set(), "child transcript probe blocked the event loop"
+            release.set()
         # We need the start event plus one event array addressed to the child.
         child_path = "/v1/sessions/conv_child_beta/events"
         batch: list[dict[str, Any]] | None = None
@@ -118,6 +150,7 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         assert len(batch) == 2
         assert all(event["type"] == "external_conversation_item" for event in batch)
     finally:
+        release.set()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
