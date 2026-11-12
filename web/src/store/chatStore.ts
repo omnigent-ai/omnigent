@@ -1527,13 +1527,11 @@ const sessionUsageHydrations = new WeakSet<AbortController>();
 const sessionUsageRevisions = new WeakMap<ConversationEntry, { cost: number; models: number }>();
 
 function ownsSessionBind(entry: ConversationEntry, controller: AbortController): boolean {
-  const liveController = entry.getState().abortController;
   return (
     !entry.disposed &&
     conversationRegistry.peek(entry.id) === entry &&
     !controller.signal.aborted &&
-    sessionBindControllers.get(entry) === controller &&
-    (liveController === null || liveController === controller)
+    sessionBindControllers.get(entry) === controller
   );
 }
 

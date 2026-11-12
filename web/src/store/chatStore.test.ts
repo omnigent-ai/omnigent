@@ -783,37 +783,71 @@ describe("chatStore — lazy subtree usage", () => {
     });
   }
 
-  it.each([false, true])(
-    "ignores a superseded successful initial bind (usage included=%s)",
-    async (usageIncluded) => {
-      let finishMetadata!: (response: Response) => void;
-      const metadata = new Promise<Response>((resolve) => {
-        finishMetadata = resolve;
+  it.each([
+    ["resolve", false],
+    ["resolve", true],
+    ["reject", false],
+  ] as const)(
+    "ignores a superseded initial bind (%s, usage included=%s)",
+    async (outcome, usageIncluded) => {
+      let finishOldHistory!: (response: Response) => void;
+      let finishNewHistory!: (response: Response) => void;
+      const oldHistory = new Promise<Response>((resolve) => {
+        finishOldHistory = resolve;
+      });
+      const newHistory = new Promise<Response>((resolve) => {
+        finishNewHistory = resolve;
       });
       const readUsage = vi.fn(() => usage("conv_usage", 99));
-      routeUsage("conv_usage", readUsage, metadata);
+      routeUsage(
+        "conv_usage",
+        readUsage,
+        snapshot("conv_usage", { usage_included: usageIncluded, total_cost_usd: 99 }),
+      );
+      const routed = fetchMock.getMockImplementation()!;
+      let historyReads = 0;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).split("?")[0] === "/v1/sessions/conv_usage/items") {
+          return historyReads++ === 0 ? oldHistory : newHistory;
+        }
+        return routed(input, init);
+      });
       const binding = useChatStore.getState().switchTo("conv_usage");
       await tick();
       const entry = conversationRegistry.peek("conv_usage")!;
       const oldController = entry.getState().abortController!;
-      onTestFinished(() => oldController.abort());
-      const replacement = new AbortController();
-      entry.setState({
-        abortController: replacement,
-        boundAgentId: "agent_replacement",
-        loadingConversation: true,
-        sessionUsageLoading: true,
-      });
-      finishMetadata(snapshot("conv_usage", { usage_included: usageIncluded, total_cost_usd: 99 }));
+      entry.setState({ conversationLoadError: new Error("Reload requested") });
+      const retrying = retryConversationLoad("conv_usage");
+      await tick();
+      const replacement = entry.getState().abortController!;
+      expect(replacement).not.toBe(oldController);
+      expect(oldController.signal.aborted).toBe(true);
+
+      finishOldHistory(
+        outcome === "resolve"
+          ? defaultFetchHandler("/v1/sessions/conv_usage/items")
+          : mockResponse({}, { ok: false, status: 404 }),
+      );
       await binding;
       expect(entry.getState()).toMatchObject({
         abortController: replacement,
-        boundAgentId: "agent_replacement",
+        boundAgentId: null,
         loadingConversation: true,
         sessionUsageLoading: true,
         sessionCostUsd: null,
+        conversationLoadError: null,
       });
       expect(readUsage).not.toHaveBeenCalled();
+
+      finishNewHistory(defaultFetchHandler("/v1/sessions/conv_usage/items"));
+      await retrying;
+      await tick();
+      expect(entry.getState()).toMatchObject({
+        loadingConversation: false,
+        sessionUsageLoading: false,
+        sessionCostUsd: 99,
+      });
+      expect(readUsage).toHaveBeenCalledTimes(usageIncluded ? 0 : 1);
     },
   );
 
@@ -3259,6 +3293,43 @@ describe("chatStore — send (first-send ordering)", () => {
     ).toBe(false);
   });
 
+  it("binds a new session after navigating to a live session during creation", async () => {
+    seedSession("conv_new", [userMessage("resp_new", "saved history")]);
+    seedSession("conv_other");
+    let finishCreation!: () => void;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "/v1/sessions" && init?.method === "POST") {
+        return new Promise<Response>((resolve) => {
+          finishCreation = () => resolve(defaultFetchHandler(input, init));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const sending = useChatStore.getState().send("first message", "agent_xyz");
+    await tick();
+    expect(finishCreation).toBeDefined();
+    await useChatStore.getState().switchTo("conv_other");
+    const otherController = conversationRegistry.peek("conv_other")!.getState().abortController!;
+    expect(otherController).not.toBeNull();
+
+    finishCreation();
+    await sending;
+
+    const created = conversationRegistry.peek("conv_new")!.getState();
+    expect(created.loadingConversation).toBe(false);
+    expect(created.conversationLoadError).toBeNull();
+    expect(created.blocks.some((block) => block.type === "user_message")).toBe(true);
+    expect(created.abortController).not.toBeNull();
+    expect(created.abortController).not.toBe(otherController);
+    expect(otherController.signal.aborted).toBe(false);
+    const requests = fetchMock.mock.calls.map(([input]) => String(input).split("?")[0]);
+    expect(requests.indexOf("/v1/sessions/conv_new/items")).toBeGreaterThan(-1);
+    expect(requests.indexOf("/v1/sessions/conv_new/events")).toBeGreaterThan(
+      requests.indexOf("/v1/sessions/conv_new/items"),
+    );
+  });
+
   it("existing-session send only posts an event (no createSession, no stream open)", async () => {
     // Simulate a session already bound: state has conversationId +
     // abortController set. send must NOT createSession or openStream.
@@ -3549,38 +3620,17 @@ describe("chatStore — send (first-send ordering)", () => {
       expect(sessionReads).toHaveLength(1);
     });
 
-    it.each([
-      [403, false],
-      [404, false],
-      [404, true],
-    ] as const)(
-      "ends initial usage loading on %s only for its request owner (replaced=%s)",
-      async (status, replaced) => {
-        seedSession("conv_missing", []);
-        const { gets } = failSnapshots("conv_missing", [status]);
-        const failingFetch = fetchMock.getMockImplementation()!;
-        let previousController: AbortController | null = null;
-        onTestFinished(() => previousController?.abort());
-        if (replaced) {
-          fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-            if (String(input).split("?")[0] === "/v1/sessions/conv_missing") {
-              const entry = conversationRegistry.peek("conv_missing")!;
-              previousController = entry.getState().abortController;
-              entry.setState({ abortController: new AbortController() });
-            }
-            return failingFetch(input, init);
-          });
-        }
+    it.each([403, 404])("ends initial usage loading on terminal %s", async (status) => {
+      seedSession("conv_missing", []);
+      const { gets } = failSnapshots("conv_missing", [status]);
 
-        await useChatStore.getState().switchTo("conv_missing");
+      await useChatStore.getState().switchTo("conv_missing");
 
-        const state = conversationRegistry.peek("conv_missing")!.getState();
-        expect(state.sessionUsageLoading).toBe(replaced);
-        if (replaced) expect(state.conversationLoadError).toBeNull();
-        else expect(state.conversationLoadError).toMatchObject({ status });
-        expect(gets.metadata).toHaveLength(1);
-      },
-    );
+      const state = conversationRegistry.peek("conv_missing")!.getState();
+      expect(state.sessionUsageLoading).toBe(false);
+      expect(state.conversationLoadError).toMatchObject({ status });
+      expect(gets.metadata).toHaveLength(1);
+    });
 
     it("loads again in place once the retries run out", async () => {
       vi.useFakeTimers();
