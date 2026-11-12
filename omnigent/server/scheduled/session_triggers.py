@@ -26,6 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event
 from omnigent.entities import Conversation, ScheduledTask
+from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.scheduled.schedule import event_trigger_key, occurrence_host_id
 from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
@@ -281,14 +282,22 @@ def readers_of(conversation: Conversation, event_type: SessionEventType) -> froz
     if wiring is None or wiring.permission_store is None:
         return None
     owners = {
-        task.user_id
+        _effective_owner(task)
         for task in _session_triggered_tasks(wiring)
-        if task.user_id is not None
-        and (config := parse_session_trigger(task.trigger_config)) is not None
+        if (config := parse_session_trigger(task.trigger_config)) is not None
         and event_type in config.events
     }
     root_id = _access_root_id(conversation)
     return frozenset(owner for owner in owners if _holds_grant(wiring, owner, root_id))
+
+
+def _effective_owner(task: ScheduledTask) -> str:
+    """The principal a task acts as: a task without an owner is the local user's.
+
+    That is the identity it fires as. Enabling accounts moves the local user's
+    grants to the first admin, so such a task then hears of no session at all.
+    """
+    return task.user_id or RESERVED_USER_LOCAL
 
 
 def _holds_grant(wiring: _Wiring, user_id: str, session_id: str) -> bool:
@@ -425,12 +434,13 @@ def _record_for_task(
         return
     if not config.include_own_sessions and _is_own_session(task, conv, root):
         return
-    # Single-user servers have no grants: every session is the owner's.
-    if task.user_id is not None and wiring.permission_store is not None:
+    # Without a permission store there are no grants: every session is the owner's.
+    if wiring.permission_store is not None:
+        owner = _effective_owner(task)
         if readers is not None:
-            if task.user_id not in readers:
+            if owner not in readers:
                 return
-        elif not _holds_grant(wiring, task.user_id, root_id):
+        elif not _holds_grant(wiring, owner, root_id):
             return
     trigger_key = event.trigger_key
     outcome = wiring.scheduled_task_store.record_event_run(
@@ -470,17 +480,21 @@ def render_event_prompt(prompt: str, event: dict[str, Any] | None) -> str:
     :returns: The prompt, followed by one JSON line per event.
     """
     events = (event or {}).get("events")
-    if not isinstance(events, list) or not events:
-        return prompt
+    raw_omitted = (event or {}).get("omitted")
+    omitted = raw_omitted if isinstance(raw_omitted, int) and raw_omitted > 0 else 0
     lines = [
         json.dumps({k: v for k, v in e.items() if k != "key"}, sort_keys=True)
-        for e in events
+        for e in (events if isinstance(events, list) else [])
         if isinstance(e, dict)
     ]
-    omitted = int((event or {}).get("omitted") or 0)
-    if omitted:
+    if not lines and not omitted:
+        return prompt
+    noun = "event" if len(lines) + omitted == 1 else "events"
+    if omitted and lines:
         lines.append(f"(and {omitted} more events, not listed)")
-    noun = "event" if len(lines) == 1 else "events"
+    elif omitted:
+        # Events too large to list are still counted, so the run says they happened.
+        lines.append(f"({omitted} {noun}, too large to list)")
     return (
         f"{prompt.rstrip()}\n\n<omnigent-trigger-events>\n"
         f"This run was started by the following session {noun}. They hold IDs only; "

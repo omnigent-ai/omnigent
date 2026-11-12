@@ -14,7 +14,12 @@ from typing import Any
 import pytest
 
 from omnigent.entities import Conversation, ScheduledTask
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_PUBLIC
+from omnigent.server.auth import (
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
+)
 from omnigent.server.scheduled import session_triggers
 from omnigent.server.scheduled.session_triggers import (
     parse_session_trigger,
@@ -39,7 +44,7 @@ class _Stores:
         for user in (ALICE, BOB):
             self.permissions.ensure_user(user)
 
-    def task(self, *, owner: str = ALICE, **trigger: Any) -> ScheduledTask:
+    def task(self, *, owner: str | None = ALICE, **trigger: Any) -> ScheduledTask:
         session_mode = trigger.pop("session_mode", "new")
         session_id = trigger.pop("session_id", None)
         config = {"provider": "omnigent", "events": ["turn.completed"], **trigger}
@@ -234,6 +239,26 @@ def test_only_sessions_the_owner_holds_a_grant_on_fire(stores: _Stores) -> None:
     )
 
 
+@pytest.mark.parametrize("event_type", ["turn.completed", "session.deleted"])
+async def test_a_task_without_an_owner_hears_only_the_local_users_sessions(
+    stores: _Stores, event_type: str
+) -> None:
+    """A task from before accounts were enabled acts as the local user, as when it fires."""
+    stores.permissions.ensure_user(RESERVED_USER_LOCAL)
+    task = stores.task(owner=None, events=[event_type])
+    local = stores.session(owner=RESERVED_USER_LOCAL)
+    # Another account's unshared session, for example after accounts were enabled.
+    bobs = stores.session(owner=BOB)
+    for conv in (local, bobs):
+        readers = None
+        if event_type == "session.deleted":
+            # Deletion fires from the readers captured before the grants went away.
+            readers = session_triggers.readers_of(conv, "session.deleted")
+            assert await stores.conversations.delete_conversation(conv.id)
+        _notify(event_type, conv.id, occurrence="r", conversation=conv, readers=readers)
+    assert [e["session_id"] for e in stores.events(task)] == [local.id]
+
+
 async def test_a_deleted_session_fires_from_what_the_route_captured(stores: _Stores) -> None:
     task = stores.task(events=["session.deleted"])
     stores.task(owner=BOB, events=["session.deleted"])
@@ -282,6 +307,14 @@ def test_the_prompt_lists_events_after_the_task_prompt() -> None:
         '{"session_id": "s1", "type": "turn.completed"}\n'
         '{"session_id": "s2", "type": "turn.failed"}\n'
         "(and 3 more events, not listed)\n"
+        "</omnigent-trigger-events>"
+    )
+    # Every event too large to list: the run still says that events started it.
+    assert render_event_prompt("Review.", {"events": [], "omitted": 1}) == (
+        "Review.\n\n<omnigent-trigger-events>\n"
+        "This run was started by the following session event. They hold IDs only; "
+        "use your session tools to read the sessions.\n"
+        "(1 event, too large to list)\n"
         "</omnigent-trigger-events>"
     )
 
