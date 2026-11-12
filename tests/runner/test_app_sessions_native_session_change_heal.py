@@ -855,6 +855,21 @@ async def _open_claude_native_session_before_sign_in(
     return app, closes, relaunched, statuses
 
 
+class _PaneAtDeliveryHarnessClient(_ScriptedHarnessClient):
+    """Record the session's Claude pane at the moment each turn is forwarded."""
+
+    def __init__(self, conv_id: str) -> None:
+        super().__init__([])
+        self._conv_id = conv_id
+        self.terminals: TerminalRegistry | None = None
+        self.panes_at_delivery: list[TerminalInstance | None] = []
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        assert self.terminals is not None
+        self.panes_at_delivery.append(self.terminals.get(self._conv_id, "claude", "main"))
+        return super().stream(method, url, json=json, timeout=timeout)
+
+
 _MESSAGE = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
 # A turn someone typed in the terminal, as the forwarder reports it.
 _TERMINAL_TURN = {"type": "external_session_status", "data": {"status": "running"}}
@@ -1135,10 +1150,12 @@ async def test_a_message_restarts_claude_code_for_a_server_signed_in_since_launc
     A turn someone typed in the terminal is never cut off for it.
     """
     conv_id = "d1b2c3d4e5f60718293a4b5c6d7e8f90"
-    harness = _ScriptedHarnessClient([])
+    harness = _PaneAtDeliveryHarnessClient(conv_id)
     app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
         monkeypatch, tmp_path, conv_id, harness_client=harness
     )
+    harness.terminals = app.state.session_resource_registry.terminal_registry
+    original = harness.terminals.get(conv_id, "claude", "main")
     statuses["linear"] = status
 
     async with _runner_client(app) as client:
@@ -1154,6 +1171,10 @@ async def test_a_message_restarts_claude_code_for_a_server_signed_in_since_launc
     assert harness.posted_bodies, "the message never reached the harness"
     expected = [conv_id] if restarted else []
     assert (closes, relaunched) == (expected, expected)
+    # Delivered to the relaunched pane, so the restart came first.
+    [delivered_to] = harness.panes_at_delivery
+    assert delivered_to is not None
+    assert (delivered_to is not original) is restarted
 
 
 @pytest.mark.asyncio
@@ -1220,10 +1241,12 @@ async def test_a_message_waits_for_a_reconnect_and_reaches_the_relaunched_pane(
     monkeypatch.setattr(
         "omnigent.native.native_cost_popup._tmux_last_client_input_at", _held_attach_check
     )
-    harness = _ScriptedHarnessClient([])
+    harness = _PaneAtDeliveryHarnessClient(conv_id)
     app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
         monkeypatch, tmp_path, conv_id, harness_client=harness
     )
+    harness.terminals = app.state.session_resource_registry.terminal_registry
+    original = harness.terminals.get(conv_id, "claude", "main")
     statuses["linear"] = "connected"
 
     async with _runner_client(app) as client:
@@ -1243,6 +1266,8 @@ async def test_a_message_waits_for_a_reconnect_and_reaches_the_relaunched_pane(
         await poll_until_async(lambda: bool(harness.posted_bodies), timeout_s=5)
 
     assert (closes, relaunched) == ([conv_id], [conv_id])
+    [delivered_to] = harness.panes_at_delivery
+    assert delivered_to is not None and delivered_to is not original
 
 
 @pytest.mark.asyncio
@@ -1412,6 +1437,49 @@ async def test_deleting_the_session_during_a_reconnect_relaunch_leaves_no_pane(
     assert closes == [conv_id]
     assert reconnected.json()["reconnect_error"] == "This session was deleted."
     assert terminals.get(conv_id, "claude", "main") is None
+
+
+@pytest.mark.asyncio
+async def test_a_reconnect_past_its_deadline_frees_the_line_and_starts_nothing_late(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A stalled relaunch is cancelled at the deadline, so later messages go through."""
+    conv_id = "acb2c3d4e5f60718293a4b5c6d7e8f90"
+    # Long enough to reach the relaunch, which then stalls past it.
+    monkeypatch.setattr(runner_app, "_CLAUDE_RECONNECT_DEADLINE_S", 1.5)
+    gate = asyncio.Event()
+    harness = _ScriptedHarnessClient([])
+    app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
+        monkeypatch, tmp_path, conv_id, relaunch_gate=gate, harness_client=harness
+    )
+    terminals = app.state.session_resource_registry.terminal_registry
+    statuses["linear"] = "connected"
+
+    async with _runner_client(app) as client:
+        reconnected = await asyncio.wait_for(
+            client.post(
+                f"/v1/sessions/{conv_id}/live-mcp-servers/reconnect", json={"name": "linear"}
+            ),
+            timeout=5,
+        )
+        assert reconnected.status_code == 200, reconnected.text
+        assert reconnected.json()["reconnect_error"].startswith(
+            "Claude Code didn't start again in time."
+        )
+        # The cancelled relaunch brings no pane up once its launch could go on.
+        gate.set()
+        for _ in range(20):
+            await asyncio.sleep(0)  # custom-lint: disable=sleep-then-assert -- let it run
+        assert terminals.get(conv_id, "claude", "main") is None
+        # Reconnect retries nothing after its deadline.
+        assert relaunched == [conv_id]
+        message = await asyncio.wait_for(
+            client.post(f"/v1/sessions/{conv_id}/events", json=_MESSAGE), timeout=5
+        )
+        assert message.status_code < 300, message.text
+        await poll_until_async(lambda: bool(harness.posted_bodies), timeout_s=5)
+
+    assert closes == [conv_id]
 
 
 @pytest.mark.asyncio
