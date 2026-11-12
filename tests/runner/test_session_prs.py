@@ -1965,6 +1965,14 @@ def test_quoted_operator_characters_do_not_split_a_simple_command(
         ),
         pytest.param(
             "Bash",
+            {"command": "cd /w/topic && git pp |& tail -3; git status"},
+            "/repo",
+            {},
+            ["/w/topic"],
+            id="bash-pipe-ampersand-does-not-restore-the-directory",
+        ),
+        pytest.param(
+            "Bash",
             {"command": "(case x in\n x) cd /a ;;\nesac\n); git status"},
             "/start",
             {},

@@ -280,7 +280,7 @@ def _prepare_shell_text(command: str, *, model_syntax: bool = True) -> tuple[str
 # quoting. A command containing any of it keeps the flat parse the observer had before.
 _UNMODELED_SHELL = re.compile(
     r"\b(?:case|esac|function|eval|if|then|else|elif|fi|do|done|while|until|for|select)\b"
-    r"|[{}]|\(\s*\)|\(\s*\(|=\s*\(|\[\[|[@?*+!]\("
+    r"|[{}]|\(\s*\)|\(\s*\(|=\s*\(|\[\[|[@?*+!]\(|\|&"
 )
 
 
