@@ -1581,6 +1581,9 @@ def test_an_array_literal_is_not_a_command_for_pr_attribution() -> None:
     )
     assert refs == []
     assert was_created is False
+    # An escaped quote inside an array element does not end its quoted region.
+    segments = _shell_segments('msg=("say \\"hi\\"") && gh pr view 41')
+    assert [segment.invocation_tokens for segment in segments] == [("gh", "pr", "view", "41")]
 
 
 def test_redirect_ampersand_stays_in_its_word_and_the_pipeline_still_splits() -> None:
@@ -1803,6 +1806,14 @@ def test_quoted_operator_characters_do_not_split_a_simple_command(
             {},
             ["/w/a"],
             id="exit-in-an-unexecuted-branch-does-not-end-tracking",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": 'x=("a\\"b") && cd /w/a && git pp'},
+            "/repo",
+            {},
+            ["/w/a"],
+            id="escaped-quote-inside-an-array-keeps-the-cd",
         ),
         pytest.param(
             "Bash",

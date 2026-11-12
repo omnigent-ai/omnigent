@@ -339,10 +339,12 @@ def _array_literal_end(command: str, start: int) -> int | None:
     index = start
     while index < len(command):
         char = command[index]
-        if quote is not None:
-            quote = None if char == quote else quote
+        if quote == "'":
+            quote = None if char == "'" else quote
         elif char == "\\":
             index += 1
+        elif quote == '"':
+            quote = None if char == '"' else quote
         elif char in "'\"":
             quote = char
         elif char == "(":
