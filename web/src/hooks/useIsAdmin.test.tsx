@@ -73,13 +73,16 @@ it.each([true, undefined, "failed"])(
       await import("@/lib/identity");
     const pendingIdentity = resolveRealIdentity();
     const { useIsAdmin: useRealIsAdmin } = await import("./useIsAdmin");
-    const { CapabilitiesProvider: RealCapabilitiesProvider } =
+    const { CapabilitiesProvider: RealCapabilitiesProvider, useServerInfo: useRealServerInfo } =
       await import("@/lib/CapabilitiesContext");
+    const { createBootServerInfo, isBootFallbackInfo } = await import("@/lib/bootCapabilities");
+    const boot = createBootServerInfo(info, 0);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     function Wrapper({ children }: PropsWithChildren) {
       const [serverInfo, setServerInfo] = useState<ServerInfo | "loading">("loading");
       useEffect(() => {
-        void info.then(setServerInfo);
+        void boot.initial.then(setServerInfo);
+        void boot.settled.then(setServerInfo);
       }, []);
       return (
         <RealCapabilitiesProvider info={serverInfo}>
@@ -87,11 +90,15 @@ it.each([true, undefined, "failed"])(
         </RealCapabilitiesProvider>
       );
     }
-    const { result } = renderHook(useRealIsAdmin, { wrapper: Wrapper });
+    const { result } = renderHook(() => ({ admin: useRealIsAdmin(), info: useRealServerInfo() }), {
+      wrapper: Wrapper,
+    });
 
     await waitFor(() => expect(getCurrentAdminEligibility()).toBe(true));
     await expect(pendingIdentity).resolves.toBe("admin");
-    expect(result.current).toBe(false);
+    await waitFor(() => expect(isBootFallbackInfo(result.current.info)).toBe(true));
+    expect(result.current.admin).toBe(false);
+    expect(client.getQueryState(["identity-is-admin"])?.dataUpdatedAt).toBe(0);
     await act(async () => {
       finishInfo(
         new Response(
@@ -106,6 +113,6 @@ it.each([true, undefined, "failed"])(
     await waitFor(() =>
       expect(client.getQueryState(["identity-is-admin"])?.dataUpdatedAt).toBeGreaterThan(0),
     );
-    await waitFor(() => expect(result.current).toBe(supported === undefined));
+    await waitFor(() => expect(result.current.admin).toBe(supported === undefined));
   },
 );

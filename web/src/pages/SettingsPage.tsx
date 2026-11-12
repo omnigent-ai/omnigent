@@ -127,6 +127,7 @@ import {
 } from "@/lib/identity";
 import { isAdminViewEnabled, setAdminViewEnabled } from "@/lib/adminView";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
@@ -1976,6 +1977,7 @@ function TerminalClipboardControl() {
 function AdminViewControl() {
   const eligible = useSyncExternalStore(subscribeIdentity, getCurrentAdminEligibility, () => false);
   const info = useServerInfo();
+  // Failed discovery has no capability flag; keep an existing off cookie recoverable.
   if (
     !eligible ||
     info === "loading" ||
@@ -2766,7 +2768,7 @@ function UpdatesSection() {
 
 function AccountSection() {
   const info = useServerInfo();
-  const capabilitiesLoading = info === "loading";
+  const capabilitiesLoading = info === "loading" || isBootFallbackInfo(info);
   const accountsEnabled = info !== "loading" && info.accounts_enabled;
   // Identity for display. Sourced from the mode-agnostic `/v1/me` probe so it
   // works under OIDC too (the accounts-only `/auth/me` doesn't exist there).

@@ -408,25 +408,26 @@ describe("SettingsPage", () => {
   });
 
   it.each([
-    { workspace: false, supported: true },
-    { workspace: true, supported: true },
-    { workspace: false, supported: undefined },
+    { workspace: false, supported: true, enabled: true },
+    { workspace: false, supported: true, enabled: false },
+    { workspace: true, supported: true, enabled: false },
+    { workspace: false, supported: undefined, enabled: false },
   ])(
-    "keeps admin view recoverable while off (workspace=$workspace, support=$supported)",
-    ({ workspace, supported }) => {
+    "changes admin view from $enabled (workspace=$workspace, support=$supported)",
+    ({ workspace, supported, enabled }) => {
       mocks.me = { id: "admin", is_admin: true };
-      mocks.effectiveAdmin = false;
+      mocks.effectiveAdmin = enabled;
       mocks.adminViewSupported = supported;
       mocks.singleUser = false;
       vi.spyOn(host, "isDatabricksWorkspace").mockReturnValue(workspace);
-      document.cookie = "omnigent_admin_view=off; Path=/";
+      if (!enabled) document.cookie = "omnigent_admin_view=off; Path=/";
       const update = vi.spyOn(adminView, "setAdminViewEnabled").mockImplementation(() => {});
       try {
         renderPage("/settings/general");
         const control = screen.getByRole("switch", { name: "Admin view" });
-        expect(control).not.toBeChecked();
+        expect(control).toHaveAttribute("aria-checked", String(enabled));
         fireEvent.click(control);
-        expect(update).toHaveBeenCalledWith(true);
+        expect(update).toHaveBeenCalledWith(!enabled);
       } finally {
         document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
       }

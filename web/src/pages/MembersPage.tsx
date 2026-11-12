@@ -48,12 +48,13 @@ import {
 } from "@/lib/accountsApi";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { withBasePath } from "@/lib/basePath";
 import { isSingleUserMode } from "@/lib/capabilities";
 
 export function MembersPage() {
   const info = useServerInfo();
-  const capabilitiesLoading = info === "loading";
+  const capabilitiesLoading = info === "loading" || isBootFallbackInfo(info);
   // Password-based management (invite / reset / remove) only exists in
   // accounts mode — OIDC identities are owned by the IdP, so under OIDC
   // this page is a read-only user list (no action column, no modals).

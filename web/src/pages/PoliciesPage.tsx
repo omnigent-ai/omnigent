@@ -37,6 +37,7 @@ import { usePolicyRegistry, type PolicyRegistryEntry } from "@/hooks/usePolicies
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isSingleUserMode } from "@/lib/capabilities";
 import { coercePolicyParams } from "@/lib/policyParams";
 
@@ -425,7 +426,7 @@ function AddDefaultPolicyDialog({
 
 export function PoliciesPage() {
   const info = useServerInfo();
-  const capabilitiesLoading = info === "loading";
+  const capabilitiesLoading = info === "loading" || isBootFallbackInfo(info);
   // Explicit single-user local runtime: no auth endpoints exist, so skip the
   // admin probe. A multi-user header-auth deploy (same accounts_enabled:false
   // / login_url:null shape) is NOT single-user and keeps its admin gate.
