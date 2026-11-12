@@ -1232,23 +1232,8 @@ def run_launcher(
     # can see env vars the spawner didn't deliberately pass.
     _prune_environ_to_spawn_allowlist(sandbox)
 
-    # Spawn-time wrap re-exec for backends whose sandbox enforcement
-    # is installed by the spawning process (``bwrap`` /
-    # ``sandbox-exec``).
-    # Previously every caller of ``create_exec_launcher`` outside
-    # :class:`_HelperProcessClient` (notably the tmux terminal path)
-    # skipped the wrap entirely — the launcher script ran in the
-    # host namespace with no enforcement.
-    # On macOS seatbelt and Linux bwrap, that collapsed to ZERO
-    # sandboxing for the spawned target.
-    #
-    # We re-exec self under ``backend.wrap_launcher_argv``. The
-    # wrapped invocation re-enters this function (via the launcher
-    # script's ``__main__``) with a private argument to prevent wrapping twice
-    # and we proceed to the in-process ``activate_sandbox`` +
-    # ``subprocess.run`` path. The wrap inherits HTTP_PROXY / CA
-    # env vars set by the parent (terminal path) so the relay
-    # daemon spun up by ``activate_sandbox`` is reachable.
+    # Re-exec under the backend wrap before activating the sandbox or target.
+    # Only the trusted inner pass may skip this step.
     if sandbox.active and sandbox.backend_type in _SPAWN_WRAP_BACKENDS and not _spawn_wrapped:
         backend = get_backend(sandbox.backend_type)
         # Mint the private scratch tmpdir HERE, on the host, before the
