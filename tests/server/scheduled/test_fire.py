@@ -3332,16 +3332,21 @@ async def test_a_sandbox_task_whose_session_was_deleted_starts_a_new_one_on_its_
         ("failed", None, "archived", False),
         ("failed", None, "bound", False),
         ("failed", None, "connected_host", False),
+        # A failed move also leaves a session hostless, after it ran elsewhere.
+        ("failed", None, "moved", False),
     ],
 )
 async def test_only_a_sandbox_session_whose_launch_failed_unbound_is_replaced(
     startup: str, launch: str | None, change: str | None, released: bool
 ) -> None:
     """Nothing ran in it; a session that started, or that the owner changed, is kept."""
-    from omnigent.server.managed_hosts import ManagedLaunchTracker
-    from omnigent.server.startup_inputs import STARTUP_LABEL
+    from omnigent.server.managed_hosts import ManagedLaunchTracker, new_move_claim
+    from omnigent.server.startup_inputs import STARTUP_LABEL, STARTUP_SETTLED_BY_LABEL
 
     task = _sandbox_continue_task(session_id="conv_prev")
+    labels = {fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id, STARTUP_LABEL: startup}
+    if change == "moved":
+        labels[STARTUP_SETTLED_BY_LABEL] = new_move_claim()
     if change == "connected_host":
         task = replace(task, execution_target="connected_host")
     own = continued_sandbox_host_id(task.id, task.workspace_id)
@@ -3349,7 +3354,7 @@ async def test_only_a_sandbox_session_whose_launch_failed_unbound_is_replaced(
         host_id=own if change == "bound" else None,
         workspace=None,
         archived=change == "archived",
-        labels={fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id, STARTUP_LABEL: startup},
+        labels=labels,
     )
     tracker = ManagedLaunchTracker()
     if launch is not None:

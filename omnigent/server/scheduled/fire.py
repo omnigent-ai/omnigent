@@ -953,11 +953,12 @@ async def _release_replaceable_session(deps: FireDeps, task: ScheduledTask) -> S
 
 async def _sandbox_never_started(deps: FireDeps, task: ScheduledTask, conv: Conversation) -> bool:
     """Whether *conv* is the task's sandbox session whose launch failed before binding a host."""
-    from omnigent.server.startup_inputs import STARTUP_LABEL
+    from omnigent.server.startup_inputs import STARTUP_LABEL, STARTUP_SETTLED_BY_LABEL
 
     if task.execution_target != "managed_sandbox" or conv.host_id is not None:
         return False
-    if conv.labels.get(STARTUP_LABEL) != "failed":
+    # Only a create's launch fails without a move claim; a failed move ran elsewhere first.
+    if conv.labels.get(STARTUP_LABEL) != "failed" or STARTUP_SETTLED_BY_LABEL in conv.labels:
         return False
     # A launch abandoned at its registration timeout fails the prompt before its
     # sandbox is torn down; a replacement must not start under that host meanwhile.
