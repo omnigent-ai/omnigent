@@ -261,6 +261,12 @@ class FakeScheduledTaskStore:
                 return SimpleNamespace(id=run["run_id"])
         return None
 
+    def has_starting_run_for_conversation(self, conversation_id: str) -> bool:
+        return any(
+            run.get("conversation_id") == conversation_id and run["status"] == "starting"
+            for run in self.runs
+        )
+
     def update_run(self, run_id: str, **kwargs: Any) -> Any:
         self.run_updates.append({"id": run_id, **kwargs})
         for conversation_id, seeded in self.running_runs.items():
@@ -3322,12 +3328,13 @@ async def test_a_sandbox_task_whose_session_was_deleted_starts_a_new_one_on_its_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("startup", "launch", "change", "released"),
+    ("startup", "creating_run", "change", "released"),
     [
         ("failed", None, None, True),
         ("failed", "failed", None, True),
-        # Its sandbox is still being torn down after the registration timeout.
-        ("failed", "running", None, False),
+        # Its run, on any replica, is still tearing the sandbox down after the
+        # registration timeout.
+        ("failed", "starting", None, False),
         ("pending", None, None, False),
         ("failed", None, "archived", False),
         ("failed", None, "bound", False),
@@ -3337,10 +3344,10 @@ async def test_a_sandbox_task_whose_session_was_deleted_starts_a_new_one_on_its_
     ],
 )
 async def test_only_a_sandbox_session_whose_launch_failed_unbound_is_replaced(
-    startup: str, launch: str | None, change: str | None, released: bool
+    startup: str, creating_run: str | None, change: str | None, released: bool
 ) -> None:
     """Nothing ran in it; a session that started, or that the owner changed, is kept."""
-    from omnigent.server.managed_hosts import ManagedLaunchTracker, new_move_claim
+    from omnigent.server.managed_hosts import new_move_claim
     from omnigent.server.startup_inputs import STARTUP_LABEL, STARTUP_SETTLED_BY_LABEL
 
     task = _sandbox_continue_task(session_id="conv_prev")
@@ -3356,15 +3363,12 @@ async def test_only_a_sandbox_session_whose_launch_failed_unbound_is_replaced(
         archived=change == "archived",
         labels=labels,
     )
-    tracker = ManagedLaunchTracker()
-    if launch is not None:
-        tracker.begin(session.id)
-        if launch == "failed":
-            tracker.fail(session.id, "The sandbox didn't connect in time.")
     store = FakeScheduledTaskStore(rows={"task_1": task})
-    deps = _deps(
-        store, conversation_store=_ExistingConversationStore(session), managed_launches=tracker
-    )
+    if creating_run is not None:
+        store.runs.append(
+            {"run_id": "run_prev", "status": creating_run, "conversation_id": "conv_prev"}
+        )
+    deps = _deps(store, conversation_store=_ExistingConversationStore(session))
 
     continued = await fire_mod._release_replaceable_session(deps, task)
 

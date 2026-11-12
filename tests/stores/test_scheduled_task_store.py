@@ -1363,6 +1363,32 @@ def test_get_running_run_by_conversation_is_workspace_scoped(
         assert found is not None and found.id == _uid("run_ws")
 
 
+@pytest.mark.parametrize(("status", "starting"), [("starting", True), ("running", False)])
+def test_has_starting_run_for_conversation_finds_only_its_unsettled_startup(
+    store: SqlAlchemyScheduledTaskStore, status: str, starting: bool
+) -> None:
+    with workspace_scope(11):
+        store.create(
+            scheduled_task_id=_uid("task_startup"),
+            name="startup",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="a",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+        store.create_run(
+            run_id=_uid("run_startup"),
+            scheduled_task_id=_uid("task_startup"),
+            status=status,
+            scheduled_at=100,
+            conversation_id=_uid("conv_startup"),
+        )
+        assert store.has_starting_run_for_conversation(_uid("conv_startup")) is starting
+        assert store.has_starting_run_for_conversation(_uid("conv_other")) is False
+    assert store.has_starting_run_for_conversation(_uid("conv_startup")) is False
+
+
 def _due_task(store: SqlAlchemyScheduledTaskStore, seed: str = "dispatch"):
     store.configure_dispatch(True)
     task = store.create(

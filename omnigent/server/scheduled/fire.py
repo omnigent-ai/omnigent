@@ -960,10 +960,11 @@ async def _sandbox_never_started(deps: FireDeps, task: ScheduledTask, conv: Conv
     # Only a create's launch fails without a move claim; a failed move ran elsewhere first.
     if conv.labels.get(STARTUP_LABEL) != "failed" or STARTUP_SETTLED_BY_LABEL in conv.labels:
         return False
-    # A launch abandoned at its registration timeout fails the prompt before its
-    # sandbox is torn down; a replacement must not start under that host meanwhile.
-    launch = deps.managed_launches.get(conv.id) if deps.managed_launches is not None else None
-    if launch is not None and not launch.settled.is_set():
+    # A run abandoning its unregistered sandbox fails the prompt before tearing the
+    # sandbox down; until that run finishes, no replica may start a replacement.
+    if await asyncio.to_thread(
+        deps.scheduled_task_store.has_starting_run_for_conversation, conv.id
+    ):
         return False
     problem = await continued_session_problem(
         task, conv, host_store=deps.host_store, permission_store=deps.permission_store

@@ -978,6 +978,23 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             row = session.execute(stmt).scalars().first()
             return _run_to_entity(row) if row is not None else None
 
+    def has_starting_run_for_conversation(self, conversation_id: str) -> bool:
+        """Whether a run that recorded this conversation is still ``starting``.
+
+        Overlapping continue runs can each record the same session, so only
+        existence is checked.
+        """
+        starting_code = encode_scheduled_task_run_status("starting")
+        with self._session("select_starting_run_by_conversation") as session:
+            stmt = (
+                select(SqlScheduledTaskRun.id)
+                .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
+                .where(SqlScheduledTaskRun.conversation_id == conversation_id)
+                .where(SqlScheduledTaskRun.status == starting_code)
+                .limit(1)
+            )
+            return session.execute(stmt).first() is not None
+
     def list_running_runs_for_tasks(
         self,
         scheduled_task_ids: builtins.list[str],
