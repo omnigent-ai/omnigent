@@ -239,9 +239,13 @@ _CLAUDE_NOT_RUNNING: _JsonObject = {"running": False, "servers": []}
 # A restart needs Claude Code this long without output or input. Shorter than the
 # pane reaper's window: a person signs in, then asks again right away.
 _RESTART_ACTIVITY_WINDOW_S = 15.0
-# Reconnect's checks, close and relaunch, under the server's 70 s request timeout,
-# so a stalled relaunch frees the session's line of messages and says so.
+# Reconnect, from waiting for its place in the session's line to its answer. The
+# server's request timeout isn't enforced over the runner tunnel, so the runner
+# bounds it: a stalled check or relaunch frees the line and says so.
 _CLAUDE_RECONNECT_DEADLINE_S = 50.0
+# A message's automatic restart, which runs while that message holds the line;
+# past it the message is delivered without the restart.
+_CLAUDE_AUTO_RESTART_DEADLINE_S = 15.0
 _CLAUDE_START_IT = "Send a message to start it."
 # What /mcp shows for a server that signed in after a claude-native session's
 # Claude Code started.
@@ -9585,15 +9589,24 @@ def create_runner_app(
         async def _restart_claude_for_mcp_sign_in_impl(conv_id: str) -> None:
             """Restart an idle pane that started before an MCP server it can now use signed in."""
             try:
-                instance = await _live_claude_native_pane(conv_id)
-                if instance is None:
-                    return
-                signed_in = await asyncio.to_thread(
-                    _claude_mcp_sign_in.signed_in_since_launch, conv_id, instance
+                async with asyncio.timeout(_CLAUDE_AUTO_RESTART_DEADLINE_S):
+                    instance = await _live_claude_native_pane(conv_id)
+                    if instance is None:
+                        return
+                    signed_in = await asyncio.to_thread(
+                        _claude_mcp_sign_in.signed_in_since_launch, conv_id, instance
+                    )
+                    if not signed_in:
+                        return
+                    refusal = await _restart_idle_claude_pane(conv_id, instance)
+            except TimeoutError:
+                _logger.warning(
+                    "Restarting Claude Code for %s took over %.0fs; sending the message as is",
+                    conv_id,
+                    _CLAUDE_AUTO_RESTART_DEADLINE_S,
+                    extra={"session_id": conv_id},
                 )
-                if not signed_in:
-                    return
-                refusal = await _restart_idle_claude_pane(conv_id, instance)
+                return
             except Exception:
                 _logger.warning(
                     "Restarting Claude Code after an MCP sign-in failed for %s",
@@ -9636,29 +9649,37 @@ def create_runner_app(
                 ``None`` when the session has no running claude-native pane.
             :raises LiveMcpServerUnknown: When the host has no Claude server named *name*.
             """
-            if (
-                await _live_claude_native_pane(conv_id) is None
-                and _session_harness_name(conv_id) != "claude-native"
-            ):
-                return None
-            # Checked with no await before registering, so delete either refuses it or cancels it.
-            if conv_id in _deleting_sessions:
-                return {**_CLAUDE_NOT_RUNNING, "reconnect_error": "This session was deleted."}
-            task = asyncio.create_task(
-                _reconnect_claude_in_line(conv_id, name), name=f"claude-mcp-reconnect-{conv_id}"
-            )
-            _claude_reconnect_tasks.setdefault(conv_id, set()).add(task)
+            task: asyncio.Task[_JsonObject] | None = None
             try:
-                return await task
+                # The whole request: the pane check, the wait in line, the work and the answer.
+                async with asyncio.timeout(_CLAUDE_RECONNECT_DEADLINE_S):
+                    if (
+                        await _live_claude_native_pane(conv_id) is None
+                        and _session_harness_name(conv_id) != "claude-native"
+                    ):
+                        return None
+                    # Checked with no await before registering: delete refuses it or cancels it.
+                    if conv_id in _deleting_sessions:
+                        return {
+                            **_CLAUDE_NOT_RUNNING,
+                            "reconnect_error": "This session was deleted.",
+                        }
+                    task = asyncio.create_task(
+                        _reconnect_claude_in_line(conv_id, name),
+                        name=f"claude-mcp-reconnect-{conv_id}",
+                    )
+                    _claude_reconnect_tasks.setdefault(conv_id, set()).add(task)
+                    return await task
             except TimeoutError:
-                # The deadline cancelled the work, which freed the line as it ended.
+                # The deadline cancelled the work, which gave up or freed its place in line.
                 _logger.warning(
                     "MCP reconnect for %s did not finish within %.0fs; cancelled it",
                     conv_id,
                     _CLAUDE_RECONNECT_DEADLINE_S,
                     extra={"session_id": conv_id},
                 )
-                pane = await _live_claude_native_pane(conv_id)
+                # The registry alone: a liveness probe could stall like the work did.
+                pane = _pane_reaper_registry.get(conv_id, "claude", "main")
                 if pane is None:
                     late = f"Claude Code didn't start again in time. {_CLAUDE_START_IT}"
                     return {**_CLAUDE_NOT_RUNNING, "reconnect_error": late}
@@ -9667,12 +9688,17 @@ def create_runner_app(
             except asyncio.CancelledError:
                 current = asyncio.current_task()
                 # Cancelled by the session's deletion, not by this request going away.
-                if task.cancelled() and current is not None and not current.cancelling():
+                if (
+                    task is not None
+                    and task.cancelled()
+                    and current is not None
+                    and not current.cancelling()
+                ):
                     return {**_CLAUDE_NOT_RUNNING, "reconnect_error": "This session was deleted."}
                 raise
             finally:
                 running = _claude_reconnect_tasks.get(conv_id)
-                if running is not None:
+                if task is not None and running is not None:
                     running.discard(task)
                     if not running:
                         _claude_reconnect_tasks.pop(conv_id, None)
@@ -9681,35 +9707,33 @@ def create_runner_app(
             """Check *name* and restart the pane, holding the session's place in line."""
             # In the session's line of messages, so none is typed into the pane as it closes.
             async with _ingest_slot(conv_id) as live:
-                # Bounded only once it holds the line: the checks, close and relaunch.
-                async with asyncio.timeout(_CLAUDE_RECONNECT_DEADLINE_S):
-                    instance = await _live_claude_native_pane(conv_id) if live else None
-                    if instance is None:
-                        not_running = f"Claude Code isn't running. {_CLAUDE_START_IT}"
-                        return {**_CLAUDE_NOT_RUNNING, "reconnect_error": not_running}
-                    # Checked in line: a message or Reconnect ahead may have restarted it.
-                    sign_in = await asyncio.to_thread(claude_sign_in_by_live_name)
-                    # An empty report is a failed discovery, which says nothing about the name.
-                    if sign_in and name not in sign_in:
-                        raise LiveMcpServerUnknown(name)
-                    signed_in = await asyncio.to_thread(
-                        _claude_mcp_sign_in.signed_in_since_launch, conv_id, instance
-                    )
-                    if name not in signed_in:
-                        body = await asyncio.to_thread(_claude_live_mcp_body, conv_id, instance)
-                        if sign_in.get(name) == "sign_in_required":
-                            return {**body, "reconnect_error": f"Sign in to {name} first."}
-                        return body
-                    refusal = await _restart_idle_claude_pane(conv_id, instance)
-                    if refusal is not None:
-                        body = await asyncio.to_thread(_claude_live_mcp_body, conv_id, instance)
-                        return {**body, "reconnect_error": refusal}
-                    _logger.info(
-                        "Restarting Claude Code for %s to reconnect its MCP servers",
-                        conv_id,
-                        extra={"session_id": conv_id},
-                    )
-                    await _ensure_native_terminal_for_turn(conv_id, "claude-native")
+                instance = await _live_claude_native_pane(conv_id) if live else None
+                if instance is None:
+                    not_running = f"Claude Code isn't running. {_CLAUDE_START_IT}"
+                    return {**_CLAUDE_NOT_RUNNING, "reconnect_error": not_running}
+                # Checked in line: a message or Reconnect ahead may have restarted it.
+                sign_in = await asyncio.to_thread(claude_sign_in_by_live_name)
+                # An empty report is a failed discovery, which says nothing about the name.
+                if sign_in and name not in sign_in:
+                    raise LiveMcpServerUnknown(name)
+                signed_in = await asyncio.to_thread(
+                    _claude_mcp_sign_in.signed_in_since_launch, conv_id, instance
+                )
+                if name not in signed_in:
+                    body = await asyncio.to_thread(_claude_live_mcp_body, conv_id, instance)
+                    if sign_in.get(name) == "sign_in_required":
+                        return {**body, "reconnect_error": f"Sign in to {name} first."}
+                    return body
+                refusal = await _restart_idle_claude_pane(conv_id, instance)
+                if refusal is not None:
+                    body = await asyncio.to_thread(_claude_live_mcp_body, conv_id, instance)
+                    return {**body, "reconnect_error": refusal}
+                _logger.info(
+                    "Restarting Claude Code for %s to reconnect its MCP servers",
+                    conv_id,
+                    extra={"session_id": conv_id},
+                )
+                await _ensure_native_terminal_for_turn(conv_id, "claude-native")
             relaunched = await _live_claude_native_pane(conv_id)
             if relaunched is None:
                 return {

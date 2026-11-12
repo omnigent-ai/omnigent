@@ -4693,23 +4693,26 @@ describe("Composer MCP status command", () => {
     );
   });
 
-  it("notes why a claude-sdk session shows no live state", () => {
-    const data = { live: false, reason: "not_running" as const, servers: [] };
-    composerSessionSnapshot.hostId = "host_sdk";
-    setComposerState({ boundAgentId: "agent_sdk", sessionHarness: "claude-sdk" });
-    const agent = { id: "agent_sdk", name: "SDK agent", mcp_servers: [] };
-    sessionAgentQueryMock.mockReturnValue({ data: agent, isError: false });
-    liveMcpQueryMock.mockReturnValue({ data, isError: false });
-    render(
-      <MemoryRouter>
-        <Composer {...composerProps({ agents: [agent] })} />
-      </MemoryRouter>,
-    );
-    fireEvent.change(textarea(), { target: { value: "/mcp" } });
-    expect(screen.getByRole("status")).toHaveTextContent(
-      "Live connection status appears once this session’s agent is running; send a message to start it.",
-    );
-  });
+  it.each(["claude-sdk", "claude-native"])(
+    "notes why a %s session shows no live state",
+    (harness) => {
+      const data = { live: false, reason: "not_running" as const, servers: [] };
+      composerSessionSnapshot.hostId = "host_sdk";
+      setComposerState({ boundAgentId: "agent_sdk", sessionHarness: harness });
+      const agent = { id: "agent_sdk", name: "SDK agent", mcp_servers: [] };
+      sessionAgentQueryMock.mockReturnValue({ data: agent, isError: false });
+      liveMcpQueryMock.mockReturnValue({ data, isError: false });
+      render(
+        <MemoryRouter>
+          <Composer {...composerProps({ agents: [agent] })} />
+        </MemoryRouter>,
+      );
+      fireEvent.change(textarea(), { target: { value: "/mcp" } });
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Live connection status appears once this session’s agent is running; send a message to start it.",
+      );
+    },
+  );
 
   it("does not re-read a claude-sdk session's live state when account states change", () => {
     composerSessionSnapshot.hostId = "host_sdk";
