@@ -2,8 +2,15 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
+import type * as RoutingModule from "@/lib/routing";
 
 import { WorkflowRow } from "./WorkflowRow";
+
+const navigate = vi.fn();
+vi.mock("@/lib/routing", async (importOriginal) => {
+  const actual = await importOriginal<typeof RoutingModule>();
+  return { ...actual, useNavigate: () => navigate };
+});
 
 const WORKFLOW: SavedWorkflow = {
   id: "6f1c2b9a4d8e4f30a1b2c3d4e5f60718",
@@ -26,7 +33,21 @@ const openMenu = () =>
 const itemNames = () => screen.getAllByRole("menuitem").map((item) => item.textContent);
 
 describe("WorkflowRow", () => {
-  afterEach(cleanup);
+  afterEach(() => {
+    cleanup();
+    navigate.mockClear();
+  });
+
+  it("opens the workflow's page, but not from its menu", () => {
+    renderRow();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Fix flaky tests" }));
+    expect(navigate).toHaveBeenCalledWith(`/workflows/${WORKFLOW.id}`);
+    navigate.mockClear();
+    openMenu();
+    fireEvent.click(screen.getByTestId("workflow-run"));
+    expect(navigate).not.toHaveBeenCalled();
+  });
 
   it("shows the name and description, without a time", () => {
     renderRow();

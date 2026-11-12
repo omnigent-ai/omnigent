@@ -6,19 +6,27 @@
 // (no async search index), so a plain invalidate can't resurrect a just-deleted
 // row — no patch-in-place gymnastics are needed here.
 
-import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
 import { LIST_ROW_QUERY_ROOTS } from "@/lib/sessionListCache";
 import {
   createScheduledTask,
   deleteScheduledTask,
   getScheduledTask,
   listScheduledTaskRuns,
+  listScheduledTaskRunSteps,
   listScheduledTasks,
   runScheduledTaskNow,
   updateScheduledTask,
   type CreateScheduledTaskInput,
   type ScheduledTask,
   type ScheduledTaskRun,
+  type ScheduledTaskRunSteps,
   type UpdateScheduledTaskInput,
 } from "@/lib/scheduledTasksApi";
 
@@ -164,6 +172,44 @@ export function useScheduledTaskRuns(id: string, enabled = true, awaitingRun = f
       awaitingRun || hasUnsettledRun(query.state.data)
         ? RUNS_REFETCH_INTERVAL_MS
         : RUNS_IDLE_REFETCH_INTERVAL_MS,
+  });
+}
+
+/** How many runs one request for their plans covers. */
+const RUN_STEPS_PAGE = 20;
+
+/**
+ * The plans an automation's runs started with, by run ID, for their timelines.
+ * Asks for the given runs 20 at a time, paging as the run list does; only the
+ * newest 20 refresh, and only while one of them is in flight.
+ *
+ * @param runs - The task's runs, most recent first, from `useScheduledTaskRuns`.
+ * @param enabled - Whether to ask, e.g. when the automation runs a saved workflow.
+ */
+export function useScheduledTaskRunSteps(
+  id: string,
+  runs: readonly ScheduledTaskRun[] | undefined,
+  enabled: boolean,
+): ReadonlyMap<string, ScheduledTaskRunSteps> {
+  const pages: ScheduledTaskRun[][] = [];
+  for (let start = 0; start < (runs?.length ?? 0); start += RUN_STEPS_PAGE) {
+    pages.push((runs ?? []).slice(start, start + RUN_STEPS_PAGE));
+  }
+  const newestUnsettled = hasUnsettledRun(pages[0]);
+  return useQueries({
+    queries: pages.map((page, index) => {
+      // Each page starts after the previous page's last run, as the run list pages.
+      const after = index === 0 ? undefined : pages[index - 1]!.at(-1)!.id;
+      return {
+        queryKey: ["scheduled-task-run-steps", id, after ?? null, page.length],
+        queryFn: () => listScheduledTaskRunSteps(id, { limit: RUN_STEPS_PAGE, after }),
+        enabled,
+        staleTime: 30_000,
+        refetchInterval: index === 0 && newestUnsettled ? RUNS_REFETCH_INTERVAL_MS : false,
+      };
+    }),
+    combine: (results) =>
+      new Map(results.flatMap((result) => result.data ?? []).map((steps) => [steps.runId, steps])),
   });
 }
 

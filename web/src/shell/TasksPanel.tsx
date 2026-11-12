@@ -59,7 +59,7 @@ import { useSessionTasksActions } from "@/store/sessionTasksActions";
 
 const NO_ENTRIES: JournalEntry[] = [];
 
-const STATE_LABELS: Record<StepState, string> = {
+export const STATE_LABELS: Record<StepState, string> = {
   waiting: "Not started",
   ready: "Ready",
   running: "Running",
@@ -69,7 +69,7 @@ const STATE_LABELS: Record<StepState, string> = {
   failed: "Failed",
 };
 
-const SEGMENT_COLORS: Record<StepState, string> = {
+export const SEGMENT_COLORS: Record<StepState, string> = {
   waiting: "bg-foreground/10",
   ready: "bg-session-active/25",
   running: "bg-session-active animate-pulse motion-reduce:animate-none",
@@ -106,7 +106,7 @@ function Elapsed({ since }: { since: number }) {
 }
 
 /** A step's state as a small circle: numbered while it waits, filled once it ends. */
-function StepGlyph({ state, number }: { state: StepState; number?: number }) {
+export function StepGlyph({ state, number }: { state: StepState; number?: number }) {
   const shape = "flex size-[18px] shrink-0 items-center justify-center rounded-full";
   const label = STATE_LABELS[state];
   switch (state) {
@@ -541,7 +541,7 @@ const ARC_HEIGHT = 14;
  * means the two can run at the same time, and hovering one of its segments
  * draws arcs to the tasks it waits on and the tasks that wait on it.
  */
-function ProgressStrip({
+export function ProgressStrip({
   progress,
   fromPlan,
   onSelect,

@@ -32,7 +32,11 @@ import {
 import type * as UnseenModule from "@/hooks/useUnseenConversations";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
 import type * as RoutingModule from "@/lib/routing";
-import type { ScheduledTask, ScheduledTaskRun } from "@/lib/scheduledTasksApi";
+import type {
+  ScheduledTask,
+  ScheduledTaskRun,
+  ScheduledTaskRunSteps,
+} from "@/lib/scheduledTasksApi";
 
 const navigate = vi.fn();
 let routeParams = { taskId: "st_1" };
@@ -48,9 +52,26 @@ vi.mock("@/lib/routing", async (importOriginal) => {
 vi.mock("@/hooks/useScheduledTasks", () => ({
   useScheduledTask: vi.fn(),
   useScheduledTaskRuns: vi.fn(),
+  useScheduledTaskRunSteps: vi.fn(() => new Map()),
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
+}));
+// The graph has its own tests (React Flow runs out of memory in jsdom); here the
+// full-screen view lists where each task stands.
+vi.mock("@/components/workflows/WorkflowStepsGraph", () => ({
+  WorkflowGraphOverlay: (props: {
+    title: string;
+    progress?: { step: { id: string }; state: string }[];
+    onClose: () => void;
+  }) => (
+    <div data-testid="workflow-graph-overlay" data-title={props.title}>
+      {props.progress?.map((item) => `${item.step.id}:${item.state}`).join(" ")}
+      <button type="button" onClick={props.onClose}>
+        Close graph
+      </button>
+    </div>
+  ),
 }));
 
 const showToast = vi.fn();
@@ -1319,3 +1340,74 @@ it.each(["continue", "new"] as const)(
     }
   },
 );
+
+describe("runs of a saved workflow", () => {
+  const WORKFLOW_PROMPT = `/workflow Run the saved workflow "Triage" (ID ${"9".repeat(32)}).`;
+  const STEPS: ScheduledTaskRunSteps = {
+    runId: "run_1",
+    workflowId: "9".repeat(32),
+    steps: [
+      { id: "explore", name: "Explore", goal: null, depends_on: [] },
+      { id: "fix", name: "Fix", goal: null, depends_on: ["explore"] },
+    ],
+    statuses: [
+      {
+        id: "s1",
+        position: 1,
+        created_at: 1_700_000_100,
+        scheduled_task_run_id: "run_1",
+        step: "explore",
+        author: { type: "agent" },
+        kind: "status",
+        payload: { status: "done", text: "Found it" },
+      },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map());
+  });
+
+  it("shows each run's tasks as the Tasks timeline, and the run on the graph", () => {
+    setTask(task({ prompt: WORKFLOW_PROMPT }));
+    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", STEPS]]));
+    renderPage();
+
+    expect(screen.getByRole("heading", { name: "Runs" })).toBeInTheDocument();
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      true,
+    );
+    const row = screen.getByTestId("task-detail-run");
+    // The row still opens its session.
+    expect(within(row).getByTestId("run-open")).toHaveAttribute("href", "/c/c_9");
+    const segments = within(row).getAllByTestId("tasks-progress-segment");
+    expect(segments.map((segment) => segment.getAttribute("aria-label"))).toEqual([
+      "Task 1, Explore: Done",
+      "Task 2, Fix: Ready",
+    ]);
+
+    fireEvent.click(within(row).getByTestId("run-graph-button"));
+    const overlay = screen.getByTestId("workflow-graph-overlay");
+    expect(overlay).toHaveAttribute("data-title", "Triage");
+    expect(overlay).toHaveTextContent("explore:done fix:ready");
+    fireEvent.click(within(overlay).getByRole("button", { name: "Close graph" }));
+    expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
+  });
+
+  it("asks for no plans when the automation runs no saved workflow", () => {
+    setTask(task());
+    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
+    renderPage();
+
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      false,
+    );
+    expect(screen.queryByTestId("tasks-progress-segment")).toBeNull();
+    expect(screen.queryByTestId("run-graph-button")).toBeNull();
+  });
+});

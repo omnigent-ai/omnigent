@@ -558,7 +558,7 @@ class SessionJournalStore:
                         entries.conversation_id == conversation_id,
                         entries.position < position,
                     ),
-                )
+                ),
             )
         stmt = stmt.order_by(
             entries.created_at.desc(), entries.conversation_id.desc(), entries.position.desc()
@@ -572,24 +572,55 @@ class SessionJournalStore:
             plans=plans, next_cursor=_run_cursor(plans[-1]) if len(rows) > limit else None
         )
 
-    def plan_step_statuses(self, plans: Sequence[JournalEntry]) -> list[dict[str, str]]:
-        """For each plan, its steps' current statuses in its session.
+    def run_start_plans(self, runs: Sequence[tuple[str, str]]) -> list[JournalEntry | None]:
+        """Each automation run's first plan: the one it started with.
+
+        One run-index lookup per run, e.g. for a page of an automation's runs.
+
+        :param runs: ``(scheduled_task_run_id, conversation_id)`` pairs; each
+            run serves one session.
+        :returns: Each run's first plan entry in order, or ``None`` for a run
+            that wrote no plan.
+        """
+        entries = SqlSessionJournalEntry
+        plans: list[JournalEntry | None] = []
+        with self._session("read_run_start_plans") as session:
+            for run_id, conversation_id in runs:
+                row = session.execute(
+                    _using(
+                        select(entries)
+                        .where(
+                            entries.workspace_id == current_workspace_id(),
+                            entries.scheduled_task_run_id == run_id,
+                            entries.conversation_id == conversation_id,
+                            entries.kind == _PLAN_KIND,
+                        )
+                        .order_by(entries.position)
+                        .limit(1),
+                        "ix_session_journal_entries_scheduled_task_run_id",
+                    )
+                ).scalar_one_or_none()
+                plans.append(None if row is None else self._entries([row])[0])
+        return plans
+
+    def plan_step_statuses(self, plans: Sequence[JournalEntry]) -> list[dict[str, JournalEntry]]:
+        """For each plan, its steps' newest status entries in its session.
 
         One kind-and-step lookup per step, the reads behind the Tasks tab's step
         summary, for a page of plans at once.
 
         :param plans: Plan entries, e.g. a page of a workflow's runs.
-        :returns: One ``{step: status}`` per plan, in order, e.g.
-            ``{"tests": "done"}``; a step with no status yet is left out.
+        :returns: One ``{step: entry}`` per plan, in order, e.g. the ``done``
+            status of ``"tests"``; a step with no status yet is left out.
         """
-        statuses: list[dict[str, str]] = []
+        statuses: list[dict[str, JournalEntry]] = []
         with self._session("read_plan_step_statuses") as session:
             for plan in plans:
-                current: dict[str, str] = {}
+                current: dict[str, JournalEntry] = {}
                 for step in plan.payload.get("steps", []):
                     row = self._newest_status_row(session, plan.conversation_id, step["id"])
                     if row is not None:
-                        current[step["id"]] = self._entries([row])[0].payload["status"]
+                        current[step["id"]] = self._entries([row])[0]
                 statuses.append(current)
         return statuses
 

@@ -424,4 +424,24 @@ def test_plan_step_statuses_reads_each_steps_newest_status(journal: SessionJourn
         )
     other = journal.append(OTHER, "plan", _plan("a"), idempotency_key="k4").entry
 
-    assert journal.plan_step_statuses([plan, other]) == [{"a": "done", "b": "failed"}, {}]
+    statuses = journal.plan_step_statuses([plan, other])
+    assert [{step: e.payload["status"] for step, e in s.items()} for s in statuses] == [
+        {"a": "done", "b": "failed"},
+        {},
+    ]
+    assert statuses[0]["a"].kind == "status" and statuses[0]["a"].step == "a"
+
+
+def test_an_automation_runs_start_plan_is_its_first(journal: SessionJournalStore) -> None:
+    other_run = "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f"
+    journal.append(SESSION, "plan", _plan("old"), idempotency_key="k0")
+    first = journal.append(
+        SESSION, "plan", _plan("a"), idempotency_key="k1", scheduled_task_run_id=RUN
+    ).entry
+    journal.append(
+        SESSION, "plan", _plan("a", "b"), idempotency_key="k2", scheduled_task_run_id=RUN
+    )
+    journal.append(OTHER, "note", {"body": "x"}, idempotency_key="k3", scheduled_task_run_id=RUN)
+
+    plans = journal.run_start_plans([(RUN, SESSION), (other_run, SESSION), (RUN, OTHER)])
+    assert [plan.id if plan else None for plan in plans] == [first.id, None, None]

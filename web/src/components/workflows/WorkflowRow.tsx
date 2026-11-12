@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 import { useOmnigentAnalytics } from "@/lib/analytics";
+import { useNavigate } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 
 export interface WorkflowRowProps {
@@ -26,10 +27,12 @@ export interface WorkflowRowProps {
 }
 
 /**
- * One saved workflow: its name and description, with Run, Create automation and
- * Delete in a ⋯ menu and on right-click, like an automation's row.
+ * One saved workflow: its name and description, opening its page, with Run,
+ * Create automation and Delete in a ⋯ menu and on right-click, like an
+ * automation's row.
  */
 export function WorkflowRow({ workflow, onRun, onCreateAutomation, onDelete }: WorkflowRowProps) {
+  const navigate = useNavigate();
   const actions = { workflow, onRun, onCreateAutomation, onDelete };
 
   return (
@@ -37,14 +40,21 @@ export function WorkflowRow({ workflow, onRun, onCreateAutomation, onDelete }: W
       <ContextMenuTrigger asChild>
         <div
           data-testid="workflow-row"
-          className="group relative flex items-center gap-3 rounded-xl border border-border bg-card py-3 pr-12 pl-4"
+          className="group relative flex items-center gap-3 rounded-xl border border-border bg-card py-3 pr-12 pl-4 transition-colors hover:bg-muted/40"
         >
-          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+          {/* The body's hit area stretches across the card, under the ⋯ trigger. */}
+          <button
+            type="button"
+            data-testid="workflow-row-open"
+            aria-label={`Open ${workflow.name}`}
+            onClick={() => navigate(`/workflows/${encodeURIComponent(workflow.id)}`)}
+            className="flex min-w-0 flex-1 cursor-pointer flex-col gap-0.5 text-left after:absolute after:inset-0 after:content-['']"
+          >
             <span className="truncate text-[15px] font-semibold">{workflow.name}</span>
             <span className="line-clamp-2 text-ui text-muted-foreground/80">
               {workflow.description}
             </span>
-          </div>
+          </button>
           {/* Hidden until the row is hovered or focused on desktop, as on automation rows. */}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -55,7 +65,7 @@ export function WorkflowRow({ workflow, onRun, onCreateAutomation, onDelete }: W
                 aria-label={`Actions for ${workflow.name}`}
                 data-testid="workflow-row-menu"
                 className={cn(
-                  "-translate-y-1/2 absolute top-1/2 right-3 transition-opacity",
+                  "-translate-y-1/2 absolute top-1/2 right-3 z-10 transition-opacity",
                   "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
                   "md:aria-expanded:opacity-100",
                 )}
