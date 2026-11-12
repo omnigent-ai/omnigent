@@ -87,6 +87,7 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Create nested agents on shared or separate compute",
         owner="server",
         review_by_release="0.24.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.PEER_SESSION_MESSAGING,

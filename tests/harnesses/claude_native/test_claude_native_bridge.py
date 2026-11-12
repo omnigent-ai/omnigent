@@ -4389,7 +4389,7 @@ def test_generated_claude_subprocesses_pin_runner_tmpdir(
         for hook in entry["hooks"]
         if "/venv/bin/python" in hook["command"]
     ]
-    assert len(python_commands) == 20
+    assert len(python_commands) == 21
     expected_tmpdir = f"env TMPDIR={shlex.quote(str(runner_tmpdir))}"
     assert all(expected_tmpdir in command for command in python_commands)
 
@@ -5162,6 +5162,27 @@ def test_augment_claude_args_registers_user_prompt_submit_policy_hook(
     assert any("evaluate-policy" not in command for command in commands), (
         "The transcript forwarder's UserPromptSubmit hook must not be replaced."
     )
+
+
+def test_augment_claude_args_registers_policy_hook_for_failed_tool_calls(
+    tmp_path: Path,
+) -> None:
+    """
+    Failed tool calls reach TOOL_RESULT policies through PostToolUseFailure.
+
+    Claude Code fires PostToolUseFailure instead of PostToolUse when a tool
+    fails, so result policies such as ``detect_thrashing`` need a catch-all
+    evaluate-policy hook there too. The hook stays gated on a server URL.
+    """
+    settings = _load_invocation_settings(
+        augment_claude_args((), bridge_dir=tmp_path, ap_server_url="http://127.0.0.1:8787")
+    )
+    entries = settings["hooks"].get("PostToolUseFailure", [])
+    assert ["matcher" in entry for entry in entries] == [False]
+    assert "evaluate-policy" in entries[0]["hooks"][0]["command"]
+
+    ungoverned = _load_invocation_settings(augment_claude_args((), bridge_dir=tmp_path))
+    assert "PostToolUseFailure" not in ungoverned["hooks"]
 
 
 def test_augment_claude_args_omits_user_prompt_submit_policy_hook_without_server(
@@ -17968,6 +17989,34 @@ async def test_relay_keeps_high_descriptor_connections_alive(
         release.set()
         await asyncio.wait_for(call, 2)
         relay.close()
+
+
+def test_read_tmux_target_reads_back_a_written_advertisement(tmp_path: Path) -> None:
+    """A written advertisement reads back with both fields; a missing one reads as None."""
+    bridge_dir = tmp_path / "bridge"
+    assert claude_native_bridge.read_tmux_target(bridge_dir) is None
+    write_tmux_target(
+        bridge_dir,
+        socket_path=tmp_path / "tmux.sock",
+        tmux_target="main",
+    )
+    assert claude_native_bridge.read_tmux_target(bridge_dir) == {
+        "socket_path": str(tmp_path / "tmux.sock"),
+        "tmux_target": "main",
+    }
+
+
+def test_read_tmux_target_rejects_invalid_payloads(tmp_path: Path) -> None:
+    """Malformed or field-less tmux.json is not a usable advertisement."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    tmux_file = bridge_dir / "tmux.json"
+    tmux_file.write_text("not json", encoding="utf-8")
+    assert claude_native_bridge.read_tmux_target(bridge_dir) is None
+    tmux_file.write_text(json.dumps({"socket_path": "/tmp/x.sock"}), encoding="utf-8")
+    assert claude_native_bridge.read_tmux_target(bridge_dir) is None
+    tmux_file.write_text(json.dumps({"socket_path": 1, "tmux_target": "main"}), encoding="utf-8")
+    assert claude_native_bridge.read_tmux_target(bridge_dir) is None
 
 
 @pytest.mark.parametrize("saved", [False, True])

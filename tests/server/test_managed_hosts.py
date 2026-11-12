@@ -2360,9 +2360,31 @@ def test_provider_ui_capabilities_reports_multi_repo_per_provider() -> None:
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "single": {"multi_repo": False},
-        "multi": {"multi_repo": True},
+        "single": {"multi_repo": False, "accepts_session_move": True},
+        "multi": {"multi_repo": True, "accepts_session_move": True},
     }
+
+
+def test_provider_ui_capabilities_report_which_providers_take_a_moved_session() -> None:
+    """A provider that manages sandbox profiles is reported as no destination for
+    a move, which the move route refuses, whether profile discovery is on or not."""
+    deployment = ManagedSandboxDeployment(
+        configs=tuple(
+            ManagedSandboxConfig(
+                server_url="https://s",
+                provider=provider,
+                token_ttl_s=3600,
+                launcher_factory=FakeSandboxLauncher,
+                manages_profiles=manages_profiles,
+            )
+            for provider, manages_profiles in (("plain", False), ("profiled", True))
+        )
+    )
+
+    capabilities = deployment.provider_ui_capabilities()
+
+    assert capabilities["plain"]["accepts_session_move"] is True
+    assert capabilities["profiled"]["accepts_session_move"] is False
 
 
 def test_provider_ui_capabilities_enable_inference_only_on_configured_target() -> None:
@@ -2388,9 +2410,13 @@ def test_provider_ui_capabilities_enable_inference_only_on_configured_target() -
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "kubernetes": {"multi_repo": False},
-        "modal": {"multi_repo": False},
-        "agent_sandbox": {"multi_repo": False, "inference_models": True},
+        "kubernetes": {"multi_repo": False, "accepts_session_move": True},
+        "modal": {"multi_repo": False, "accepts_session_move": True},
+        "agent_sandbox": {
+            "multi_repo": False,
+            "accepts_session_move": True,
+            "inference_models": True,
+        },
     }
 
 
@@ -2442,12 +2468,12 @@ def test_provider_ui_capabilities_advertise_default_models_for_unbound_discovery
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "hooked": {"multi_repo": False, "default_models": True},
-        "discovered": {"multi_repo": False, "default_models": True},
-        "static": {"multi_repo": False},
-        "bound": {"multi_repo": False, "inference_models": True},
-        "malformed": {"multi_repo": False},
-        "malformed-inference": {"multi_repo": False},
+        "hooked": {"multi_repo": False, "accepts_session_move": True, "default_models": True},
+        "discovered": {"multi_repo": False, "accepts_session_move": True, "default_models": True},
+        "static": {"multi_repo": False, "accepts_session_move": True},
+        "bound": {"multi_repo": False, "accepts_session_move": True, "inference_models": True},
+        "malformed": {"multi_repo": False, "accepts_session_move": True},
+        "malformed-inference": {"multi_repo": False, "accepts_session_move": True},
     }
 
 

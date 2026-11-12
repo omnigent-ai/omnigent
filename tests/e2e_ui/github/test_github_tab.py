@@ -1564,7 +1564,9 @@ def test_changes_commits_view_lists_and_opens_a_commit(
     """Switch the Changes tab to Commits, open one commit, and step between commits.
 
     Only the commit's own files are listed, the viewed controls are absent there, and
-    Back returns to the commit list. The commit list and patches are stubbed routes.
+    Back returns to the commit list. Back in Changes, **Changes since** narrows the tab to
+    the changes after a picked commit and the PR base restores them all. The commit list
+    and patches are stubbed routes.
     """
     base_url, session_id = seeded_session
     pr_url = _INFO["pr"]["url"]
@@ -1616,6 +1618,16 @@ def test_changes_commits_view_lists_and_opens_a_commit(
         lambda route: route.fulfill(json={**_PR_DIFF, "head_sha": "head", "base_sha": "base"}),
     )
     page.route(re.compile(r"/resources/github/commit-diff\?"), commit_patch)
+    compare_urls: list[str] = []
+
+    def changes_since_patch(route: Route) -> None:
+        compare_urls.append(route.request.url)
+        # After the first commit, only the second commit's changes reach the head.
+        route.fulfill(
+            json={"object": "session.github.pr_diff", "patch": _COMMIT_PATCHES[_COMMIT_TWO]}
+        )
+
+    page.route(re.compile(r"/resources/github/compare-diff\?"), changes_since_patch)
     page.goto(f"{base_url}/c/{session_id}")
     open_right_rail(page)
     panel = page.get_by_role("complementary", name="Workspace")
@@ -1652,3 +1664,21 @@ def test_changes_commits_view_lists_and_opens_a_commit(
     expect(files).to_have_attribute("data-github-file", "README.md")
     panel.get_by_role("button", name="Back to commits").click()
     expect(panel.get_by_text("2 commits", exact=True)).to_be_visible()
+
+    panel.get_by_role("group", name="Show changes or commits").get_by_role(
+        "button", name="Changes", exact=True
+    ).click()
+    expect(files).to_have_count(2)
+    panel.get_by_role("combobox", name="Changes since").click()
+    page.get_by_role("option", name=re.compile("Add the parser")).click()
+    expect(files).to_have_count(1)
+    expect(files).to_have_attribute("data-github-file", "README.md")
+    # The narrowed patch is pinned to the head the Changes list shows, after the picked commit.
+    assert "head_sha=head" in compare_urls[-1], compare_urls
+    assert f"from_sha={_COMMIT_ONE}" in compare_urls[-1], compare_urls
+    expect(panel.get_by_role("checkbox", name="Hide viewed")).to_have_count(0)
+    page.screenshot(path=str(tmp_path / f"commits-{entry}-since.png"), animations="disabled")
+    panel.get_by_role("combobox", name="Changes since").click()
+    page.get_by_role("option", name="PR base (all changes)").click()
+    expect(files).to_have_count(2)
+    expect(panel.get_by_role("checkbox", name="Hide viewed")).to_be_visible()
