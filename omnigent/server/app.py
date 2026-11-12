@@ -1627,8 +1627,7 @@ def _ensure_default_proactive_agent(
     feature stays off: tasks, hiding, and provisioning all use the built-in id.
 
     :param prompt_override: An admin's replacement for the bundled prompt. It
-        becomes a new bundle version, so runs and the Inbox items they post
-        (``prompt_version``) record which prompt they used.
+        becomes a new bundle version, which the agent's next runs load.
     """
     import tempfile
 
