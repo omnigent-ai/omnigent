@@ -5533,7 +5533,7 @@ async def test_sandboxed_sdk_exposes_bash_for_skill_expansion(
 
 
 @pytest.mark.parametrize("allow_network", [True, False], ids=["network-allowed", "network-denied"])
-@pytest.mark.parametrize("cwd_source", ["default", "spec_relative", "spec_absolute", "explicit_none", "explicit_dot"])
+@pytest.mark.parametrize("cwd_source", ["default", "spec_relative", "spec_absolute", "explicit_none", "explicit_dot", "explicit_relative", "explicit_conflict"])
 def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
     monkeypatch, tmp_path: Path, allow_network: bool, cwd_source: str
 ) -> None:
@@ -5553,7 +5553,12 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
         spec.cwd = "repo"
         expected_cwd = tmp_path / "repo"
     elif cwd_source.startswith("explicit"):
-        spec.cwd = None if cwd_source == "explicit_none" else "."
+        spec.cwd = {
+            "explicit_none": None,
+            "explicit_dot": ".",
+            "explicit_relative": "repo",
+            "explicit_conflict": "other",
+        }[cwd_source]
         expected_cwd = tmp_path / "repo"
         cwd = str(expected_cwd)
     else:
@@ -5579,9 +5584,14 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
         launcher,
     )
 
-    prepared = prepare_claude_cli_path(
-        "/usr/bin/claude", spec, cwd=cwd
-    )
+    if cwd_source == "explicit_conflict":
+        with pytest.raises(ValueError, match="working directory conflicts"):
+            prepare_claude_cli_path("/usr/bin/claude", spec, cwd=cwd)
+        resolve.assert_not_called()
+        backend.wrap_launcher_argv.assert_not_called()
+        launcher.assert_not_called()
+        return
+    prepared = prepare_claude_cli_path("/usr/bin/claude", spec, cwd=cwd)
 
     assert prepared.cli_path == "/tmp/launcher"
     assert prepared.enable_native_tools is True
