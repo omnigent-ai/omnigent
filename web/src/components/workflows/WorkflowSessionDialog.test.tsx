@@ -99,6 +99,8 @@ function setSandboxModels(data: Partial<SandboxModelOptionsModule.SandboxModelOp
 }
 
 const submit = () => screen.getByTestId("workflow-session-submit");
+// Where the dialog keeps each workflow's, and New workflow's, last choices.
+const CHOICES = "omnigent:workflow-session-choices";
 const startedSession = () =>
   vi
     .mocked(createSession)
@@ -193,15 +195,14 @@ describe("WorkflowSessionDialog", () => {
       reasoningEffort: "high",
       terminalLaunchArgs: ["--permission-mode", "acceptEdits"],
     };
-    localStorage.setItem(
-      "omnigent:workflow-session-defaults",
-      JSON.stringify({
-        target: "host_2",
-        workspace: "/home/you/other",
-        agentId: CLAUDE_CODE.id,
-        settings: { [CLAUDE_CODE.id]: settings },
-      }),
-    );
+    const choices = {
+      target: "host_2",
+      workspaces: { host_2: "/home/you/other" },
+      repos: null,
+      agentId: CLAUDE_CODE.id,
+      settings: { [CLAUDE_CODE.id]: settings },
+    };
+    localStorage.setItem(CHOICES, JSON.stringify({ [`run:${WORKFLOW.id}`]: choices }));
     vi.mocked(useHostModelOptions).mockReturnValue({
       data: [
         { id: "opus", displayName: "Opus" },
@@ -225,13 +226,51 @@ describe("WorkflowSessionDialog", () => {
       ...settings,
     });
     expect(consumePendingInitialPrompt("conv_run")?.text).toBe(runSavedWorkflowPrompt(WORKFLOW));
-    // What this session started with becomes the next dialog's defaults.
-    expect(JSON.parse(localStorage.getItem("omnigent:workflow-session-defaults")!)).toEqual({
-      target: "host_2",
-      workspace: "/home/you/other",
-      agentId: CLAUDE_CODE.id,
-      settings: { [CLAUDE_CODE.id]: settings },
+    // What this run started with becomes this workflow's next defaults.
+    expect(JSON.parse(localStorage.getItem(CHOICES)!)).toEqual({
+      [`run:${WORKFLOW.id}`]: choices,
     });
+  });
+
+  it("keeps each workflow's choices, and New workflow's, to themselves", async () => {
+    setHosts([
+      { host_id: "host_1", name: "desk" },
+      { host_id: "host_2", name: "laptop" },
+    ]);
+    localStorage.setItem("omnigent:last-host-choice", "host_1");
+    localStorage.setItem("omnigent:last-agent-id", CLAUDE_CODE.id);
+    const recents = JSON.stringify({ host_1: ["/srv/app"] });
+    localStorage.setItem("omnigent:recent-workspaces", recents);
+    const elsewhere = (workspace: string) => ({
+      target: "host_2",
+      workspaces: { host_2: workspace },
+      repos: null,
+      agentId: CODEX.id,
+      settings: {},
+    });
+    const others = { create: elsewhere("/drafts"), "run:another-workflow": elsewhere("/other") };
+    localStorage.setItem(CHOICES, JSON.stringify(others));
+    startedSession();
+    renderDialog();
+
+    // Nothing remembered for this workflow: the new-session page's choices, not another scope's.
+    expect(screen.getByTestId("workflow-session-host")).toHaveTextContent("desk");
+    expect(screen.getByPlaceholderText("Type a path or browse…")).toHaveValue("/srv/app");
+    expect(screen.getByTestId("workflow-session-agent")).toHaveTextContent("Claude Code");
+    fireEvent.click(submit());
+    await waitFor(() => expect(navigate).toHaveBeenCalled());
+    consumePendingInitialPrompt("conv_run");
+
+    const stored = JSON.parse(localStorage.getItem(CHOICES)!);
+    expect(stored).toMatchObject({ ...others, [`run:${WORKFLOW.id}`]: { target: "host_1" } });
+    // Nor does a run change the new-session page's recent directories.
+    expect(localStorage.getItem("omnigent:recent-workspaces")).toBe(recents);
+
+    cleanup();
+    renderDialog({}, CREATE);
+    expect(screen.getByTestId("workflow-session-host")).toHaveTextContent("laptop");
+    expect(screen.getByPlaceholderText("Type a path or browse…")).toHaveValue("/drafts");
+    expect(screen.getByTestId("workflow-session-agent")).toHaveTextContent("Codex");
   });
 
   it("keeps the dialog open with the server's reason when the session can't start", async () => {

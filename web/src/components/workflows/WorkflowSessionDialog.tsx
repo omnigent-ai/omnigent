@@ -52,11 +52,7 @@ import {
 } from "@/lib/nativeCodingAgents";
 import { CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY } from "@/lib/nativeHarnessModes";
 import { randomUUID } from "@/lib/randomUUID";
-import {
-  readLastSandboxRepos,
-  writeLastSandboxRepos,
-  type LastSandboxRepo,
-} from "@/lib/repoPreferences";
+import { readLastSandboxRepos, type LastSandboxRepo } from "@/lib/repoPreferences";
 import { useNavigate } from "@/lib/routing";
 import { readLastSandboxProfile } from "@/lib/sandboxProfilePreferences";
 import { SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
@@ -149,17 +145,26 @@ function pinnedValue(value: string | undefined): string | undefined {
   return value && value !== "default" ? value : undefined;
 }
 
-// What the dialog last started a session with, so the next one starts there.
-const DEFAULTS_KEY = "omnigent:workflow-session-defaults";
+// What the dialog last started a session with, per scope (see choicesScope), so
+// the next one in the same scope starts there. Nothing here is shared with the
+// new-session page or another scope.
+const CHOICES_KEY = "omnigent:workflow-session-choices";
 
-interface SessionDefaults {
+interface SessionChoices {
   /** A host ID, or a sandbox row's `sandboxHostChoice` value. */
   target: string | null;
-  /** The directory last used on `target`, when it's a host. */
-  workspace: string | null;
+  /** The directory last used on each host, by host ID. */
+  workspaces: Record<string, string>;
+  /** The repositories a sandbox last cloned; null when never chosen. */
+  repos: LastSandboxRepo[] | null;
   agentId: string | null;
   /** Each agent's last model, effort and permission settings, by agent ID. */
   settings: Record<string, ForkRunConfigValue>;
+}
+
+/** Each saved workflow's runs remember their own choices; New workflow has one set. */
+function choicesScope(request: WorkflowSessionRequest): string {
+  return request.kind === "run" ? `run:${request.workflow.id}` : "create";
 }
 
 const asString = (value: unknown): string | undefined =>
@@ -180,30 +185,54 @@ function storedSettings(value: unknown): ForkRunConfigValue {
   };
 }
 
-/** The last session's choices; empty when nothing (or nothing readable) is stored. */
-function readSessionDefaults(): SessionDefaults {
-  let stored: unknown = null;
-  try {
-    stored = JSON.parse(window.localStorage.getItem(DEFAULTS_KEY) ?? "null");
-  } catch {
-    // Unreadable storage only costs the dialog its defaults.
-  }
-  const record = isRecord(stored) ? stored : {};
+/** One scope's stored choices, keeping only well-formed fields. */
+function storedChoices(value: unknown): SessionChoices {
+  const record = isRecord(value) ? value : {};
+  const workspaces = isRecord(record.workspaces) ? record.workspaces : {};
+  const repos = Array.isArray(record.repos)
+    ? record.repos.filter(
+        (repo): repo is LastSandboxRepo =>
+          isRecord(repo) && typeof repo.url === "string" && typeof repo.branch === "string",
+      )
+    : null;
   return {
     target: asString(record.target) ?? null,
-    workspace: asString(record.workspace) ?? null,
+    workspaces: Object.fromEntries(
+      Object.entries(workspaces).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    ),
+    repos,
     agentId: asString(record.agentId) ?? null,
     settings: isRecord(record.settings)
       ? Object.fromEntries(
-          Object.entries(record.settings).map(([id, value]) => [id, storedSettings(value)]),
+          Object.entries(record.settings).map(([id, stored]) => [id, storedSettings(stored)]),
         )
       : {},
   };
 }
 
-function writeSessionDefaults(defaults: SessionDefaults): void {
+function readAllChoices(): Record<string, unknown> {
   try {
-    window.localStorage.setItem(DEFAULTS_KEY, JSON.stringify(defaults));
+    const stored: unknown = JSON.parse(window.localStorage.getItem(CHOICES_KEY) ?? "null");
+    return isRecord(stored) ? stored : {};
+  } catch {
+    // Unreadable storage only costs the dialog its defaults.
+    return {};
+  }
+}
+
+/** *scope*'s last choices; empty when nothing (or nothing readable) is stored. */
+function readSessionChoices(scope: string): SessionChoices {
+  return storedChoices(readAllChoices()[scope]);
+}
+
+function writeSessionChoices(scope: string, choices: SessionChoices): void {
+  try {
+    window.localStorage.setItem(
+      CHOICES_KEY,
+      JSON.stringify({ ...readAllChoices(), [scope]: choices }),
+    );
   } catch {
     // A full or blocked storage only costs the next dialog its defaults.
   }
@@ -246,11 +275,12 @@ function WorkflowSessionForm({
     ? (sandboxRow ?? (info !== "loading" ? info.sandbox_provider : null))
     : null;
 
-  // The last session's choices, read once as the dialog opens.
-  const [defaults] = useState(readSessionDefaults);
+  // This scope's last choices, read once as the dialog opens.
+  const scope = choicesScope(request);
+  const [choices] = useState(() => readSessionChoices(scope));
   const [workspace, setWorkspace] = useState("");
   const [browsing, setBrowsing] = useState(false);
-  const { recent, addRecent } = useRecentWorkspaces(hostId);
+  const { recent } = useRecentWorkspaces(hostId);
   const home = useResolvedHostHome(hostId);
   const workspacePath = resolveWorkspacePath(workspace, home);
   const typedWorkspace = workspace.trim();
@@ -259,23 +289,22 @@ function WorkflowSessionForm({
     typedWorkspace !== "" && workspacePath === null && !typedWorkspace.startsWith("~");
   const hostOnline = onlineHosts.some((h) => h.host_id === hostId);
 
-  // A host starts in the directory this dialog last used there, else its most recent one.
+  // A host starts in the directory this scope last used there, else its most recent one.
   const startingWorkspace = useCallback(
-    (id: string) =>
-      (id === defaults.target ? defaults.workspace : null) ?? readRecentWorkspaces(id)[0] ?? "",
-    [defaults],
+    (id: string) => choices.workspaces[id] ?? readRecentWorkspaces(id)[0] ?? "",
+    [choices],
   );
   const selectTarget = (value: string) => {
     setTarget(value);
     setBrowsing(false);
     if (sandboxHostChoiceProvider(value) === undefined) setWorkspace(startingWorkspace(value));
   };
-  // Start where this dialog last ran a session, if it's still offered; else where
+  // Start where this scope last ran a session, if it's still offered; else where
   // the new-session page last ran, a sandbox or an online host; else on a sandbox,
   // as that page does, or the first online host.
   useEffect(() => {
     if (target !== null || hosts === undefined || info === "loading") return;
-    const remembered = defaults.target;
+    const remembered = choices.target;
     const rememberedOffered =
       remembered !== null &&
       (sandboxRows.some((row) => sandboxHostChoice(row) === remembered) ||
@@ -298,10 +327,12 @@ function WorkflowSessionForm({
     if (next === null) return;
     setTarget(next);
     if (sandboxHostChoiceProvider(next) === undefined) setWorkspace(startingWorkspace(next));
-  }, [target, hosts, info, onlineHosts, sandboxRows, defaults, startingWorkspace]);
+  }, [target, hosts, info, onlineHosts, sandboxRows, choices, startingWorkspace]);
 
-  // Repositories the sandbox clones, starting on the new-session page's last ones.
-  const [sandboxRepos, setSandboxRepos] = useState<LastSandboxRepo[]>(readLastSandboxRepos);
+  // Repositories the sandbox clones: this scope's last ones, else the new-session page's.
+  const [sandboxRepos, setSandboxRepos] = useState<LastSandboxRepo[]>(
+    () => choices.repos ?? readLastSandboxRepos(),
+  );
   const [pendingRepoUrl, setPendingRepoUrl] = useState("");
   const capabilities =
     info !== "loading" && sandboxProvider !== null
@@ -339,18 +370,18 @@ function WorkflowSessionForm({
   );
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
   const [lastAgentId] = useState(readLastAgentId);
-  // The user's pick, else this dialog's last agent, else the new-session page's, else the default.
+  // The user's pick, else this scope's last agent, else the new-session page's, else the default.
   const agent =
     agentList.find((a) => a.id === pickedAgentId) ??
-    agentList.find((a) => a.id === defaults.agentId) ??
+    agentList.find((a) => a.id === choices.agentId) ??
     agentList.find((a) => a.id === lastAgentId) ??
     agentList.find((a) => a.name === curation.defaultAgentName) ??
     agentList[0];
   const [runConfig, setRunConfig] = useState<ForkRunConfigValue>({});
-  // The agent's model, effort and permission settings from this dialog's last session.
+  // The agent's model, effort and permission settings from this scope's last session.
   const rememberedSettings = useMemo(
-    () => (agent ? (defaults.settings[agent.id] ?? {}) : {}),
-    [agent, defaults],
+    () => (agent ? (choices.settings[agent.id] ?? {}) : {}),
+    [agent, choices],
   );
 
   // A sandbox's models come from its provider; a host lists its own.
@@ -436,14 +467,17 @@ function WorkflowSessionForm({
       });
       // Otherwise the session page sends it as the first message once the session is ready.
       if (!serverSendsText) setPendingInitialPrompt(session.id, { text, skill: null, files: [] });
-      writeSessionDefaults({
+      writeSessionChoices(scope, {
         target,
-        workspace: sandboxSelected ? null : workspacePath,
+        workspaces:
+          hostId !== null && workspacePath !== null
+            ? { ...choices.workspaces, [hostId]: workspacePath }
+            : choices.workspaces,
+        repos: sandboxSelected ? sandboxRepos : choices.repos,
         agentId: agent.id,
-        settings: { ...defaults.settings, [agent.id]: runConfig },
+        settings: { ...choices.settings, [agent.id]: runConfig },
       });
       if (sandboxSelected) {
-        writeLastSandboxRepos(sandboxRepos);
         // The session page drops a picked model or effort the new sandbox doesn't offer.
         const launchedModel = sandboxModels.data?.models.find((m) => m.id === modelOverride);
         markSandboxLaunch(session.id, {
@@ -451,8 +485,6 @@ function WorkflowSessionForm({
           effort: reasoningEffort ?? null,
           modelLabel: launchedModel ? nativeModelLabel(launchedModel) : null,
         });
-      } else if (workspacePath !== null) {
-        addRecent(workspacePath);
       }
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       onClose();
