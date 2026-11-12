@@ -367,6 +367,28 @@ describe("side-chat working indicator", () => {
     expect(useChatStore.getState().sideChatSelectionTarget?.childId).toBe("pending:side");
     expect(screen.getByRole("button", { name: "Send side question" })).toBeEnabled();
   });
+
+  it("starts a typed /side question's fork once under StrictMode", () => {
+    const onStart = vi.fn(() => new Promise<void>(() => {}));
+    useChatStore.setState({
+      sideChatComposers: { "pending:slash": { text: "why?", files: [], autoStart: true } },
+    });
+
+    renderPane(
+      <StrictMode>
+        <SideChatPane childId="pending:slash" onStart={onStart} />
+      </StrictMode>,
+    );
+
+    expect(onStart).toHaveBeenCalledExactlyOnceWith("why?");
+    expect(useChatStore.getState().sideChatComposers["pending:slash"]).toMatchObject({
+      autoStart: false,
+      starting: true,
+    });
+    expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
+    expect(screen.getByTestId("side-chat-input")).toBeDisabled();
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("why?");
+  });
 });
 
 it.each(["confirmed", "rejected"])(

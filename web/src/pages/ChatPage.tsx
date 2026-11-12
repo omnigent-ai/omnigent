@@ -104,7 +104,7 @@ import {
 } from "@/lib/permissionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { toast } from "sonner";
-import { ApiError, createSideChat, retrySession } from "@/lib/sessionsApi";
+import { ApiError, retrySession } from "@/lib/sessionsApi";
 import { getProject } from "@/lib/projectsApi";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
@@ -2953,6 +2953,12 @@ function ComposerImpl(
   // the input, which would delete the draft. Only save when the user
   // has actually changed the value since the last restore.
   const dirtyRef = useRef(false);
+  // The pending tab a typed `/side <question>` opened, reused if the same command repeats.
+  const slashSideChatRef = useRef<{
+    pendingId: string;
+    parentId: string;
+    question: string;
+  } | null>(null);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   // While dictation listens, Esc cancels the take instead of interrupting the turn.
@@ -4026,27 +4032,47 @@ function ComposerImpl(
     // guard so guarded no-ops don't emit, matching the disabled Send button.
     trackClick("chat.composer.send", "button");
 
-    // A generic (non-Codex) side chat forks the conversation and runs it on the
-    // SAME host/sandbox as the source (no new sandbox), then opens it as a rail
-    // tab; the typed text seeds the new side chat's composer so it isn't fired
-    // at a still-launching runner. Codex forks in-process instead (its /side
-    // reaches the runner as plaintext).
+    // A generic (non-Codex) side chat forks on the SAME host/sandbox as the source.
+    // Its pending tab opens at once and forks with the typed question; a bare /side
+    // opens it focused. Codex forks in-process (its /side reaches the runner as plaintext).
     const openGenericSideChat = (question: string) => {
       const sourceId = useChatStore.getState().conversationId;
       if (sourceId === null) return;
       setCommandError(null);
-      createSideChat(sourceId).then(
-        ({ childSessionId }) => {
-          // Clear the composer only once the side chat exists, so a failed
-          // create keeps the user's typed question instead of dropping it.
-          dirtyRef.current = true;
-          setValue("");
-          useChatStore.getState().openSideChatWithDraft(childSessionId, question, sourceId);
-        },
-        // Surface the failure as a toast, not an inline composer error; the
-        // composer text is left intact for a retry.
-        () => toast.error("Couldn't start a side chat for this session."),
-      );
+      dirtyRef.current = true;
+      setValue("");
+      const store = useChatStore.getState();
+      const previous = slashSideChatRef.current;
+      const previousComposer = previous && store.sideChatComposers[previous.pendingId];
+      if (
+        question &&
+        previous?.parentId === sourceId &&
+        previous.question === question &&
+        previousComposer?.text === question
+      ) {
+        // The same question's tab hasn't forked yet: reveal it (retrying a
+        // failed start) instead of opening a duplicate.
+        if (!previousComposer.starting) {
+          store.updateSideChatComposer(previous.pendingId, (current) => ({
+            ...current,
+            autoStart: true,
+          }));
+        }
+        store.openSideChatWithDraft(previous.pendingId, "", sourceId);
+        return;
+      }
+      const pendingId = newPendingSideChatId();
+      if (question) {
+        store.updateSideChatComposer(pendingId, (current) => ({
+          ...current,
+          text: question,
+          autoStart: true,
+        }));
+        slashSideChatRef.current = { pendingId, parentId: sourceId, question };
+      } else {
+        store.requestSideChatFocus(pendingId);
+      }
+      store.openSideChatWithDraft(pendingId, "", sourceId);
     };
 
     // Slash command path: text that reads as "/name ..." (not a file path) or

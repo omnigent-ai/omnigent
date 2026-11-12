@@ -1176,6 +1176,9 @@ export interface SideChatComposerDraft {
   /** Focus the input once it accepts text; set by a `+` that opened the tab,
    *  consumed by the composer. */
   autoFocus?: boolean;
+  /** Start a pending tab's fork with `text` once it mounts; set by a typed
+   *  `/side <question>`, consumed by the pane. */
+  autoStart?: boolean;
   quotes?: ReplyQuote[];
   text: string;
   files: File[];

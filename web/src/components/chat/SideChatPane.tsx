@@ -410,6 +410,19 @@ export function SideChatPane({
       }));
     }
   };
+  // A typed `/side <question>` starts its pending tab's fork. Consume the LIVE
+  // flag so a replayed mount effect (React StrictMode) starts it only once.
+  const autoStart = useChatStore((s) => s.sideChatComposers[childId]?.autoStart === true);
+  useEffect(() => {
+    if (!autoStart || !pending || !onStart) return;
+    const composer = useChatStore.getState().sideChatComposers[childId];
+    if (!composer?.autoStart) return;
+    useChatStore.getState().updateSideChatComposer(childId, (current) => ({
+      ...current,
+      autoStart: false,
+    }));
+    void startSideChat(composer.text);
+  });
 
   return (
     <ConversationScopeContext.Provider value={childId}>
