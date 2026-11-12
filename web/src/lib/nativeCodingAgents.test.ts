@@ -75,7 +75,7 @@ describe("nativeCodingAgentForHarness", () => {
     expect(nativeCodingAgentForHarness("native-agy")).toBe(canonical);
   });
 
-  // agy's only pre-emptive control is the all-or-nothing bypass, so it must
+  // agy has its own mode vocabulary (`--mode`, skip), so it must
   // declare `skipPermissions` and NOT Claude's graded `permissionMode` — the
   // latter would emit `--permission-mode <mode>`, a flag agy does not accept.
   it("gives antigravity-native the skipPermissions capability, not permissionMode", () => {

@@ -1058,6 +1058,8 @@ def _claude_agent_deps(
         ("cursor-native", "ask", ["--mode", "ask"], False),
         ("cursor-native", "yolo", ["--yolo"], False),
         ("antigravity-native", "skip", ["--dangerously-skip-permissions"], False),
+        ("antigravity-native", "accept-edits", ["--mode", "accept-edits"], False),
+        ("antigravity-native", "plan", ["--mode", "plan"], False),
         ("devin-native", "normal", None, False),
         ("devin-native", "accept-edits", ["--permission-mode", "accept-edits"], False),
         ("devin-native", "smart", ["--permission-mode", "smart"], False),

@@ -40,7 +40,12 @@ PERMISSION_LAUNCH_ARGS: dict[str, dict[str, list[str]]] = {
         "ask": ["--mode", "ask"],
         "yolo": ["--yolo"],
     },
-    "antigravity-native": {"default": [], "skip": ["--dangerously-skip-permissions"]},
+    "antigravity-native": {
+        "default": [],
+        "accept-edits": ["--mode", "accept-edits"],
+        "plan": ["--mode", "plan"],
+        "skip": ["--dangerously-skip-permissions"],
+    },
     "devin-native": {
         "normal": [],
         "accept-edits": ["--permission-mode", "accept-edits"],

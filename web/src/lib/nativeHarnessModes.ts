@@ -48,6 +48,8 @@ const PERMISSION_MODE_CONCEPTS: Record<string, Record<string, PermissionModeConc
   },
   "antigravity-native": {
     default: "manual",
+    "accept-edits": "edit-automatic",
+    plan: "read-only",
     skip: "full-access",
   },
 };
@@ -84,11 +86,11 @@ export function permissionModeConcept(
   return PERMISSION_MODE_CONCEPTS[canonicalHarness]?.[value] ?? "default";
 }
 
-// Antigravity (agy) permission control. agy exposes exactly ONE pre-emptive
-// knob — `--dangerously-skip-permissions`, an all-or-nothing bypass — with no
-// per-tool equivalent of acceptEdits/plan, so this is a two-value toggle rather
-// than Claude's graded selector. "default" sends no flags and leaves agy's own
-// request-review prompt in place. Keep in sync with `agy --help`.
+// Antigravity (agy) permission control: `--mode accept-edits|plan` and the
+// all-or-nothing `--dangerously-skip-permissions`. "default" sends no flags and
+// leaves agy's own request-review prompt in place. agy's `--mode auto` is left
+// out: agy accepts it only on some accounts and otherwise silently falls back to
+// the default mode. Keep in sync with `agy --help`.
 export const AGY_NATIVE_DEFAULT_SKIP_MODE = "default";
 export const AGY_NATIVE_SKIP_VALUE = "skip";
 export const AGY_NATIVE_SKIP_MODES: NativeHarnessMode[] = [
@@ -97,6 +99,18 @@ export const AGY_NATIVE_SKIP_MODES: NativeHarnessMode[] = [
     label: "Ask every time",
     description: "Prompts before each tool runs",
     args: [],
+  },
+  {
+    value: "accept-edits",
+    label: "Accept edits",
+    description: "Auto-approves file edits; prompts before commands",
+    args: ["--mode", "accept-edits"],
+  },
+  {
+    value: "plan",
+    label: "Plan",
+    description: "Read-only planning; proposes a plan before any edits",
+    args: ["--mode", "plan"],
   },
   {
     value: "skip",
