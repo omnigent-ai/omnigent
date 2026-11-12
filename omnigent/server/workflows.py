@@ -137,14 +137,12 @@ def create_workflows_router(
         limit: int = Query(default=_DEFAULT_PAGE, ge=1, le=WORKFLOW_PAGE_MAX),
         after: str | None = None,
         name: str | None = None,
-        name_prefix: str | None = None,
     ) -> WorkflowList:
         """List the caller's workflows by name, without their steps.
 
         :param limit: Page size, e.g. ``50``.
         :param after: The previous page's ``last_id``.
         :param name: Only the workflow with this exact name, for ``/workflow <name>``.
-        :param name_prefix: Only names starting with this, for autocomplete.
         :raises OmnigentError: 401 if unauthenticated in multi-user mode, 400 for
             an ``after`` that isn't one of the caller's workflows.
         """
@@ -157,7 +155,6 @@ def create_workflows_router(
                 limit=limit,
                 after=after,
                 name=name,
-                name_prefix=name_prefix,
             )
         except InvalidWorkflowError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc

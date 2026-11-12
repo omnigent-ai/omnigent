@@ -23783,23 +23783,6 @@
               ],
               "title": "Name"
             }
-          },
-          {
-            "description": "Only names starting with this, for autocomplete.",
-            "in": "query",
-            "name": "name_prefix",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Name Prefix"
-            }
           }
         ],
         "responses": {

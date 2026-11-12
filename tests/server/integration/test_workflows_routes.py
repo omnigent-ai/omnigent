@@ -64,7 +64,7 @@ async def test_a_workflow_round_trips_and_stays_private(client: httpx.AsyncClien
     assert [item["name"] for item in page["data"]] == ["nightly-build"]
     assert "steps" not in page["data"][0]
     assert page["first_id"] == page["last_id"] == workflow["id"]
-    found = await client.get("/v1/workflows?name_prefix=nightly", headers=_headers(ALICE))
+    found = await client.get("/v1/workflows?name=nightly-build", headers=_headers(ALICE))
     assert [item["id"] for item in found.json()["data"]] == [workflow["id"]]
     assert (await client.get("/v1/workflows", headers=_headers(BOB))).json()["data"] == []
 

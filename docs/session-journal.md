@@ -166,8 +166,8 @@ session's journal as the plan, and the entries written under it carry its ID in
 each run's journal keeps the plan it ran.
 
 - `GET /v1/workflows`: the caller's workflows by name, without their steps.
-  `limit` (1–200, default 50), `after` (the previous page's `last_id`), `name`
-  (an exact name) and `name_prefix`.
+  `limit` (1–200, default 50), `after` (the previous page's `last_id`) and
+  `name` (an exact name).
 - `POST /v1/workflows`: `name` (one line of at most 80 characters, unique among
   the caller's workflows; 409 otherwise), `description` (at most 2,000
   characters) and `steps`.

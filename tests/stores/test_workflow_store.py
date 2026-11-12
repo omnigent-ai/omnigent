@@ -56,7 +56,7 @@ def test_names_are_unique_per_owner(store: WorkflowStore) -> None:
     assert store.update(deploy.id, user_id=ALICE, name="deploy") is not None
 
 
-def test_pages_go_by_name_and_filter_by_name_or_prefix(store: WorkflowStore) -> None:
+def test_pages_go_by_name_and_filter_by_name(store: WorkflowStore) -> None:
     for name in ("deploy-prod", "build", "deploy-staging", "audit", "cleanup"):
         _save(store, name)
     _save(store, "deploy-bob", user_id=BOB)
@@ -72,8 +72,6 @@ def test_pages_go_by_name_and_filter_by_name_or_prefix(store: WorkflowStore) -> 
     assert names == ["audit", "build", "cleanup", "deploy-prod", "deploy-staging"]
     exact, _ = store.list_page(user_id=ALICE, limit=10, name="build")
     assert [workflow.name for workflow in exact] == ["build"]
-    prefixed, _ = store.list_page(user_id=ALICE, limit=10, name_prefix="deploy-")
-    assert [workflow.name for workflow in prefixed] == ["deploy-prod", "deploy-staging"]
     with pytest.raises(InvalidWorkflowError, match="one of your workflows"):
         store.list_page(user_id=BOB, limit=10, after=exact[0].id)
     with pytest.raises(InvalidWorkflowError, match="a workflow ID"):

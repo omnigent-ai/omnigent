@@ -66,15 +66,6 @@ def _plan_text(steps: list[dict[str, Any]]) -> str:
     return text
 
 
-def _prefix_end(prefix: str) -> str:
-    """The first string after every string that starts with ``prefix``, by code point."""
-    following = ord(prefix[-1]) + 1
-    if 0xD800 <= following <= 0xDFFF:
-        # Surrogates have no UTF-8 encoding.
-        following = 0xE000
-    return prefix[:-1] + chr(min(following, 0x10FFFF))
-
-
 def _to_workflow(row: Any, *, with_steps: bool) -> Workflow:
     return Workflow(
         id=row.id,
@@ -180,7 +171,6 @@ class WorkflowStore:
         limit: int,
         after: str | None = None,
         name: str | None = None,
-        name_prefix: str | None = None,
     ) -> tuple[list[Workflow], bool]:
         """Return one page of the owner's workflows by name, without their steps.
 
@@ -188,8 +178,6 @@ class WorkflowStore:
         :param limit: Page size, 1 to :data:`WORKFLOW_PAGE_MAX`.
         :param after: The previous page's last workflow ID.
         :param name: Only the workflow with this exact name.
-        :param name_prefix: Only names starting with this, compared by the
-            database's collation (case-insensitive on MySQL's default).
         :returns: ``(workflows, has_more)``.
         :raises InvalidWorkflowError: If ``after`` isn't one of the owner's workflows.
         """
@@ -202,10 +190,6 @@ class WorkflowStore:
             )
             if name is not None:
                 stmt = stmt.where(SqlWorkflow.name == name)
-            if name_prefix:
-                stmt = stmt.where(
-                    SqlWorkflow.name >= name_prefix, SqlWorkflow.name < _prefix_end(name_prefix)
-                )
             if after is not None:
                 try:
                     uuid_to_bytes(after)
