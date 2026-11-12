@@ -1886,7 +1886,10 @@ def prepare_claude_cli_path(
     validation_spec = spec
     # Named relative roots use the runner base; "." follows the selected session cwd.
     if spec.cwd and pathlib.Path(spec.cwd) != pathlib.Path("."):
-        validation_spec = replace(spec, cwd=str(_resolve_sandbox_cwd(spec.cwd)))
+        declared_cwd = _resolve_sandbox_cwd(spec.cwd)
+        if not pathlib.Path(spec.cwd).is_absolute() and resolved_cwd == _resolve_sandbox_cwd(None):
+            resolved_cwd = declared_cwd
+        validation_spec = replace(spec, cwd=str(declared_cwd))
     validate_harness_sandbox(
         validation_spec, "Claude SDK", cwd=resolved_cwd if cwd is not None else None
     )

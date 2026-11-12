@@ -743,19 +743,28 @@ def test_harness_policy_validation_rejects_unsupported_features(feature: str) ->
         validate_harness_sandbox(spec, "Example")
 
 
-@pytest.mark.parametrize("declared_cwd,conflicts", [(".", False), ("restricted", True)])
+@pytest.mark.parametrize(
+    "declaration,conflicts",
+    [(".", False), ("restricted", True), ("parent", False), ("outside", True), ("prefix", True)],
+)
 def test_harness_policy_validation_resolves_relative_cwd(
-    declared_cwd: str, conflicts: bool, tmp_path: pathlib.Path
+    declaration: str, conflicts: bool, tmp_path: pathlib.Path
 ) -> None:
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.inner.sandbox import validate_harness_sandbox
 
+    workspace = tmp_path / "workspace" / "project"
+    declared_cwd = {
+        "parent": str(workspace.parent),
+        "outside": str(tmp_path / "other"),
+        "prefix": str(workspace.parent / "pro"),
+    }.get(declaration, declaration)
     spec = OSEnvSpec(cwd=declared_cwd, sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
     if conflicts:
         with pytest.raises(ValueError, match=r"working directory conflicts with os_env\.cwd"):
-            validate_harness_sandbox(spec, "Example", cwd=tmp_path)
+            validate_harness_sandbox(spec, "Example", cwd=workspace)
     else:
-        validate_harness_sandbox(spec, "Example", cwd=tmp_path)
+        validate_harness_sandbox(spec, "Example", cwd=workspace)
 
 
 @pytest.mark.parametrize(

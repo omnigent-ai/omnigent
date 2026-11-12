@@ -541,7 +541,7 @@ def validate_harness_sandbox(
         cwd is not None
         and spec.cwd
         and sandbox.type != "none"
-        and _resolve_grant_root(cwd, spec.cwd) != cwd.resolve(strict=False)
+        and not cwd.resolve(strict=False).is_relative_to(_resolve_grant_root(cwd, spec.cwd))
     ):
         raise ValueError(f"{harness}: working directory conflicts with os_env.cwd")
     if sandbox.type == "windows_jobobject":
