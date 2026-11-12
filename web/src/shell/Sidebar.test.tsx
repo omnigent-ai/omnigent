@@ -2076,7 +2076,7 @@ describe("Sidebar sections", () => {
     expect(screen.queryByText("conv_only_mine")).toBeNull();
   });
 
-  it.each(["sessions", "project", "pinned", "pinned-shared"])(
+  it.each(["sessions", "project", "pinned", "pinned-shared", "source-off-page"])(
     "expands a collapsed family for its draft in %s, replaces it in place, and removes cancelled drafts",
     async (scope) => {
       const family = {
@@ -2105,7 +2105,7 @@ describe("Sidebar sections", () => {
       if (scope === "project")
         fireEvent.click(screen.getByRole("button", { name: /^Example project/ }));
       const source = {
-        id: "conv_parent",
+        id: scope === "source-off-page" ? "conv_peer" : "conv_parent",
         title: "conv_parent",
         createdAt: 1,
         labels,
@@ -2115,16 +2115,20 @@ describe("Sidebar sections", () => {
       act(() => addNestedSessionDraft(queryClient, "temp:nested", source));
       const placeholder = await screen.findByText("New nested agent");
       expect(placeholder.closest("li")).toHaveAttribute("data-sibling-session", "true");
-      expect(placeholder.closest("a")).toHaveAttribute("href", "/?sibling=conv_parent");
+      expect(placeholder.closest("a")).toHaveAttribute("href", `/?sibling=${source.id}`);
       expect(screen.getByText("conv_peer")).toBeInTheDocument();
       const rowNode = placeholder.closest("li");
       expect(rowNode).toHaveClass("ml-9");
       act(() => updateNestedSessionDraft(queryClient, "temp:nested", "created"));
-      load([...members, conv("created", "Codex", { family, labels, title: "New task" })]);
+      load([
+        ...members.filter((row) => scope !== "source-off-page" || row.id !== source.id),
+        conv("created", "Codex", { family, labels, title: "New task" }),
+      ]);
       refresh();
       await waitFor(() => expect(screen.queryByText("New nested agent")).toBeNull());
       expect(screen.getByText("New task").closest("li")).toBe(rowNode);
       await waitFor(() => expect(queryClient.getQueryData(["nested-session-drafts"])).toEqual([]));
+      if (scope === "source-off-page") expect(screen.queryByText("conv_peer")).toBeNull();
       if (scope === "pinned-shared") {
         load([...members, conv("created", "Codex", { family, title: "Renamed task" })]);
         refresh();
@@ -2140,6 +2144,31 @@ describe("Sidebar sections", () => {
       await waitFor(() => expect(screen.queryByText("New nested agent")).toBeNull());
     },
   );
+
+  it("retires a created draft deleted before a list refresh", async () => {
+    const parent = conv("conv_parent", "Codex", {
+      family: { id: "family", representative_id: "conv_parent", pinned: false },
+    });
+    mockConversations([parent]);
+    const fetch = vi
+      .spyOn(identity, "authenticatedFetch")
+      .mockResolvedValue(new Response(null, { status: 404 }));
+    onTestFinished(() => fetch.mockRestore());
+    const { queryClient } = renderSidebar();
+    act(() =>
+      addNestedSessionDraft(queryClient, "temp:deleted", {
+        id: parent.id,
+        createdAt: 1,
+        labels: {},
+        family: parent.family,
+      } as Session),
+    );
+    await screen.findByText("New nested agent");
+    act(() => updateNestedSessionDraft(queryClient, "temp:deleted", "deleted"));
+    await waitFor(() => expect(queryClient.getQueryData(["nested-session-drafts"])).toEqual([]));
+    expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/v1/sessions/deleted?"));
+    expect(screen.queryByText("New nested agent")).toBeNull();
+  });
 
   it.each([false, true])(
     "keeps legacy individual pins nested and pins the family as a unit (project: %s)",

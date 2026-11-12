@@ -196,6 +196,7 @@ import {
   useAutomationsEnabled,
 } from "@/hooks/useConversations";
 import { fetchConversationById, useOpenSessionRow } from "@/hooks/useOpenSessionRow";
+import { isOwnerLevel } from "@/lib/permissionsApi";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -2195,32 +2196,48 @@ function ConversationList({
     !pagedConversations.some((c) => c.id === activeRootSessionId) &&
     !pinnedConversations.some((c) => c.id === activeRootSessionId);
   const openSessionRow = useOpenSessionRow(openSessionMissing ? activeRootSessionId : null);
-  const missingRepresentatives = [
-    ...new Set(nestedDrafts.map((draft) => draft.source.family?.representative_id)),
+  const missingDraftRows = [
+    ...new Set(
+      nestedDrafts.flatMap((draft) => [
+        draft.source.family?.representative_id,
+        ...(draft.created ? [draft.id] : []),
+      ]),
+    ),
   ].filter(
     (id): id is string =>
       !!id &&
-      !pagedConversations.some((row) => row.id === id) &&
-      !pinnedConversations.some((row) => row.id === id),
+      ![...pagedConversations, ...pinnedConversations, ...loadedRows].some(
+        (row) => row.id === id && row.family,
+      ),
   );
-  const draftRepresentatives = useQueries({
-    queries: missingRepresentatives.map((id) => ({
+  const draftBackfills = useQueries({
+    queries: missingDraftRows.map((id) => ({
       queryKey: ["conversation-backfill", id],
       queryFn: () => fetchConversationById(id, draftQueryClient),
       staleTime: 30_000,
       retry: 2,
     })),
-    combine: (queries) => queries.flatMap((query) => (query.data ? [query.data] : [])),
+    combine: (queries) =>
+      queries.flatMap((query, index) =>
+        query.isSuccess ? [{ id: missingDraftRows[index], row: query.data }] : [],
+      ),
   });
+  const draftRows = useMemo(
+    () =>
+      draftBackfills.flatMap(({ id, row }) =>
+        row && row.id === id && (row.owner || isOwnerLevel(row.permission_level)) ? [row] : [],
+      ),
+    [draftBackfills],
+  );
   const authoritativeRows = useMemo(
     () =>
       dedupeConversationsById([
         ...pagedConversations,
         ...pinnedConversations,
         ...(openSessionRow ? [openSessionRow] : []),
-        ...draftRepresentatives,
+        ...draftRows,
       ]),
-    [pagedConversations, pinnedConversations, openSessionRow, draftRepresentatives],
+    [pagedConversations, pinnedConversations, openSessionRow, draftRows],
   );
   const allConversations = useMemo(
     () => withNestedSessionDrafts(authoritativeRows, nestedDrafts),
@@ -2231,13 +2248,13 @@ function ConversationList({
     for (const draft of nestedDrafts) {
       if (
         draft.created &&
-        knownRows.some((row) => row.id === draft.id && row.family) &&
-        knownRows.some((row) => row.id === draft.source.id && row.family)
+        (knownRows.some((row) => row.id === draft.id && row.family) ||
+          draftBackfills.some(({ id, row }) => id === draft.id && (!row || row.id === id)))
       ) {
         removeNestedSessionDraft(draftQueryClient, draft.key);
       }
     }
-  }, [nestedDrafts, authoritativeRows, loadedRows, draftQueryClient]);
+  }, [nestedDrafts, authoritativeRows, loadedRows, draftBackfills, draftQueryClient]);
   const groupOrder = useMemo<readonly string[]>(
     () =>
       view.grouping === "harness"

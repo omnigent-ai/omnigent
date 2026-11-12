@@ -15,7 +15,7 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
     error: null,
   })),
 }));
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
 vi.mock("@/hooks/useSidebarData", () => ({
@@ -787,6 +787,54 @@ describe("NewChatLandingScreen create flow", () => {
       }
     },
   );
+
+  it("keeps a created nested session and its prompt when local hydration fails", async () => {
+    const previousUrl = window.location.href;
+    onTestFinished(() => window.history.replaceState({}, "", previousUrl));
+    navigateMock.mockImplementation((to: string) => window.history.replaceState({}, "", to));
+    searchParams = new URLSearchParams("sibling=source");
+    vi.mocked(authenticatedFetch).mockImplementation(
+      async (url) =>
+        new Response(
+          JSON.stringify(
+            String(url).startsWith("/v1/sessions/source?")
+              ? {
+                  id: "source",
+                  host_id: "host_1",
+                  workspace: SEEDED_WORKSPACE,
+                  agent_id: "ag_hello",
+                  permission_level: 4,
+                  labels: {},
+                  items: [],
+                }
+              : { id: "created" },
+          ),
+        ),
+    );
+    const tempConvId = "temp:1234567890abcdef1234567890abcdef";
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId,
+      pendingMsgTempId: "pending",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+    hydrateLocalConversationMock.mockImplementationOnce(() => {
+      throw new Error("local setup failed");
+    });
+    const client = renderLanding([], { sibling_sessions: true });
+    await waitForWorkspaceSeed();
+    typeMessage("Keep this task");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(removeLocalConversationMock).toHaveBeenCalledWith(tempConvId));
+    expect(setPendingInitialPromptMock).toHaveBeenCalledWith("created", {
+      text: "Keep this task",
+      skill: null,
+      files: [],
+    });
+    expect(client.getQueryData(["nested-session-drafts"])).toEqual([
+      expect.objectContaining({ id: "created", created: true }),
+    ]);
+    expect(navigateMock).toHaveBeenLastCalledWith("/c/created");
+  });
 
   it("includes selected registry services in the sandbox creation request", async () => {
     vi.mocked(registryRequest).mockResolvedValue({

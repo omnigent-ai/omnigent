@@ -187,6 +187,7 @@ import {
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import {
+  type PendingInitialPrompt,
   beginLocalConversation,
   hasPendingLocalMessage,
   hydrateLocalConversation,
@@ -5945,6 +5946,7 @@ function NewChatLandingContent({
       createToken: string;
     } | null = null;
     let createdSessionId: string | undefined;
+    let undeliveredPrompt: PendingInitialPrompt | null = null;
     // Single teardown for EVERY create-failure exit (the `catch` and the
     // `"error" in created` early return): drop the client-only conversation and,
     // if the user is still on it, send them back to landing so the restored
@@ -6170,6 +6172,7 @@ function NewChatLandingContent({
         : matchSkillInvocation(initialPrompt, availableSkills);
       const serverOwnsInitialInput =
         sandboxSelected && info !== "loading" && info.durable_initial_input === true;
+      if (!serverOwnsInitialInput) undeliveredPrompt = { text: initialPrompt, skill, files };
       const initialInput =
         skill !== null
           ? {
@@ -6625,9 +6628,20 @@ function NewChatLandingContent({
       }
     } catch {
       if (siblingSource && createdSessionId) {
+        const stillViewing = localConv
+          ? stillViewingLocalSession(localConv.tempConvId)
+          : onScreenRef.current;
+        if (
+          undeliveredPrompt &&
+          (localConv === null || hasPendingLocalMessage(localConv.tempConvId))
+        ) {
+          setPendingInitialPrompt(createdSessionId, undeliveredPrompt);
+        }
+        if (localConv) removeLocalConversation(localConv.tempConvId);
         updateNestedSessionDraft(queryClient, nestedProvisional.id, createdSessionId);
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
-        if (localConv ? stillViewingLocalSession(localConv.tempConvId) : onScreenRef.current) {
+        showToast("Session created, but setup didn't finish. Open the session to continue.");
+        if (stillViewing) {
           navigate(sessionLocation(createdSessionId));
         }
         return;
