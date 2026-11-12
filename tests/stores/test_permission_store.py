@@ -10,14 +10,23 @@ SQLite file and tears it down automatically.
 
 from __future__ import annotations
 
-import pytest
-from sqlalchemy import event
+import contextlib
+import functools
+import logging
+from collections.abc import Callable, Sequence
+from typing import Any
 
+import pytest
+from sqlalchemy import event, insert, update
+from sqlalchemy.engine import Connection
+
+from omnigent.db.db_models import SqlSessionPermission, current_workspace_id, workspace_scope
 from omnigent.entities import SessionPermission
-from omnigent.server.auth import RESERVED_USER_PUBLIC
+from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
@@ -185,6 +194,556 @@ def test_grant_with_public_sentinel(store: SqlAlchemyPermissionStore, db_uri: st
         "The __public__ sentinel is not persisting as a normal user_id."
     )
     assert fetched.level == 1
+
+
+# ── grant_many ───────────────────────────────────────────────────────────────
+
+GrantMany = Callable[[str, Sequence[tuple[str, int]]], list[SessionPermission]]
+
+
+class _ReversedLevelOrderStore(SqlAlchemyPermissionStore):
+    """A store that ranks lower integers higher, to test the default's level hook."""
+
+    def level_outranks(self, level: int, other_level: int) -> bool:
+        """Rank a lower integer as the higher level."""
+        return level < other_level
+
+
+@pytest.fixture(params=["sql", "default"])
+def grant_many(request: pytest.FixtureRequest, store: SqlAlchemyPermissionStore) -> GrantMany:
+    """Run ``grant_many`` through the SQL override, or through the ABC default loop.
+
+    Each semantic test runs both ways, so the default stays equivalent to the override.
+    """
+    if request.param == "sql":
+        return store.grant_many
+    return functools.partial(PermissionStore.grant_many, store)
+
+
+def _seed_grant(
+    store: SqlAlchemyPermissionStore, user_id: str, conversation_id: str, level: int
+) -> None:
+    """Create the user row and a grant, as the share route does before granting.
+
+    :param store: The permission store to write to.
+    :param user_id: The grantee, e.g. ``"alice@test.com"``.
+    :param conversation_id: The session to grant on.
+    :param level: The level to store.
+    """
+    store.ensure_user(user_id)
+    store.grant(user_id, conversation_id, level)
+
+
+def test_grant_many_never_lowers_an_existing_grant(
+    grant_many: GrantMany, store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A request below the stored level leaves that level and returns nothing.
+
+    If this fails, grant_many wrote a level that does not outrank the stored one.
+    """
+    conv_id = _create_conversation(db_uri)
+    _seed_grant(store, "rita@test.com", conv_id, 3)
+
+    assert grant_many(conv_id, [("rita@test.com", 1)]) == []
+
+    fetched = store.get("rita@test.com", conv_id)
+    assert fetched is not None
+    assert fetched.level == 3, f"Expected the manage grant to stay at 3, got {fetched.level}."
+
+
+def test_grant_many_raises_a_lower_grant(
+    grant_many: GrantMany, store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A request above the stored level raises it and returns the raised grant."""
+    conv_id = _create_conversation(db_uri)
+    _seed_grant(store, "sam@test.com", conv_id, 1)
+
+    written = grant_many(conv_id, [("sam@test.com", 2)])
+
+    assert written == [SessionPermission("sam@test.com", conv_id, 2)]
+    fetched = store.get("sam@test.com", conv_id)
+    assert fetched is not None
+    assert fetched.level == 2, f"Expected the raised level 2, got {fetched.level}."
+
+
+def test_grant_many_creates_new_grants_and_user_rows(
+    grant_many: GrantMany, store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """Grantees with no grant or user row get both, and each new grant is returned."""
+    conv_id = _create_conversation(db_uri)
+
+    written = grant_many(conv_id, [("pia@test.com", 1), ("quinn@test.com", 2)])
+
+    assert written == [
+        SessionPermission("pia@test.com", conv_id, 1),
+        SessionPermission("quinn@test.com", conv_id, 2),
+    ]
+    assert store.user_exists("pia@test.com") and store.user_exists("quinn@test.com"), (
+        "grant_many must create the user rows that session_permissions references."
+    )
+    fetched = store.get("quinn@test.com", conv_id)
+    assert fetched is not None
+    assert fetched.level == 2
+
+
+def test_grant_many_leaves_the_owner_grant_untouched(
+    grant_many: GrantMany, store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """The owner keeps LEVEL_OWNER under any request, and an owner request writes nothing.
+
+    Owner requests are dropped before any write, so the requested user gets no row.
+    """
+    conv_id = _create_conversation(db_uri)
+    _seed_grant(store, "olga@test.com", conv_id, LEVEL_OWNER)
+
+    written = grant_many(
+        conv_id,
+        [("olga@test.com", 1), ("olga@test.com", 3), ("nora@test.com", LEVEL_OWNER)],
+    )
+
+    assert written == [], f"No grant should be written over the owner, got {written}."
+    owner = store.get("olga@test.com", conv_id)
+    assert owner is not None
+    assert owner.level == LEVEL_OWNER, f"Owner grant changed to {owner.level}."
+    assert store.get("nora@test.com", conv_id) is None
+
+
+def test_grant_many_returns_only_grants_it_wrote_or_raised(
+    grant_many: GrantMany, store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """The result omits skipped requests, keeps request order, and shows raised levels.
+
+    Skipped here: a higher stored grant, an equal stored grant, and the owner.
+    """
+    conv_id = _create_conversation(db_uri)
+    _seed_grant(store, "owner@test.com", conv_id, LEVEL_OWNER)
+    _seed_grant(store, "higher@test.com", conv_id, 3)
+    _seed_grant(store, "equal@test.com", conv_id, 2)
+    _seed_grant(store, "lower@test.com", conv_id, 1)
+
+    written = grant_many(
+        conv_id,
+        [
+            ("new@test.com", 1),
+            ("higher@test.com", 1),
+            ("lower@test.com", 2),
+            ("owner@test.com", 3),
+            ("equal@test.com", 2),
+        ],
+    )
+
+    assert written == [
+        SessionPermission("new@test.com", conv_id, 1),
+        SessionPermission("lower@test.com", conv_id, 2),
+    ]
+
+
+def test_grant_many_writes_a_repeated_user_once_at_the_highest_level(
+    grant_many: GrantMany, store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A user listed more than once is written once, at the highest requested level.
+
+    That level is compared with the stored grant like any other request, so a repeat
+    that does not outrank the stored grant writes nothing.
+    """
+    conv_id = _create_conversation(db_uri)
+    _seed_grant(store, "uma@test.com", conv_id, 2)
+
+    written = grant_many(
+        conv_id,
+        [
+            ("tina@test.com", 1),
+            ("tina@test.com", 3),
+            ("tina@test.com", 2),
+            ("uma@test.com", 1),
+            ("uma@test.com", 2),
+        ],
+    )
+
+    assert written == [SessionPermission("tina@test.com", conv_id, 3)]
+    tina = store.get("tina@test.com", conv_id)
+    assert tina is not None
+    assert tina.level == 3, f"Expected the highest requested level 3, got {tina.level}."
+    uma = store.get("uma@test.com", conv_id)
+    assert uma is not None
+    assert uma.level == 2, f"Expected the equal stored grant to stay at 2, got {uma.level}."
+
+
+def test_grant_many_with_no_grants_writes_nothing(
+    grant_many: GrantMany, store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """An empty request returns an empty list and creates no grant."""
+    conv_id = _create_conversation(db_uri)
+
+    assert grant_many(conv_id, []) == []
+    assert store.has_any_grants(conv_id) is False
+
+
+def test_grant_many_is_scoped_to_the_current_workspace(
+    grant_many: GrantMany, store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """Another workspace's grant neither blocks a request nor changes when it is raised.
+
+    The default-workspace grant is at 3. A request in workspace 42 writes its own row
+    there, and the default-workspace row stays at 3.
+    """
+    conv_id = _create_conversation(db_uri)
+    _seed_grant(store, "lena@test.com", conv_id, 3)
+
+    with workspace_scope(42):
+        written = grant_many(conv_id, [("lena@test.com", 1)])
+        scoped = store.get("lena@test.com", conv_id)
+
+    assert written == [SessionPermission("lena@test.com", conv_id, 1)]
+    assert scoped is not None
+    assert scoped.level == 1, f"Expected the workspace-42 grant at 1, got {scoped.level}."
+    default = store.get("lena@test.com", conv_id)
+    assert default is not None
+    assert default.level == 3, f"Default-workspace grant changed to {default.level}."
+
+
+def test_grant_many_skips_a_replaced_grantee_and_grants_the_rest(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A grantee replaced after the caller pinned it is skipped; the others are granted.
+
+    The pin holds the generation the caller saw, so the replacement fails the check.
+    The grantee is absent from the result and is never stored. Only the SQL override
+    isolates a pin per grantee; the ABC loop lets an ambient pin fail every write.
+    """
+    from omnigent.db.account_authority import target_account_scope
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    pinned = accounts.create_user_with_password("pinned-target", "pinned-hash")
+    other = accounts.create_user_with_password("other-target", "other-hash")
+    conv_id = _create_conversation(db_uri)
+    assert accounts.delete_user(pinned.id) is True
+    accounts.create_user_with_password(pinned.id, "replacement-hash")
+
+    with target_account_scope(pinned.id, pinned.account_generation):
+        written = store.grant_many(conv_id, [(other.id, 1), (pinned.id, 2)])
+
+    assert written == [SessionPermission(other.id, conv_id, 1)]
+    assert store.get(pinned.id, conv_id) is None, "A replaced grantee must not be granted."
+
+
+def test_grant_many_skips_a_deleted_grantee_and_grants_the_rest(
+    grant_many: GrantMany,
+    store: SqlAlchemyPermissionStore,
+    db_uri: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A deleted grantee is logged and skipped, and the other grantees are still granted."""
+    import logging
+
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    alice = accounts.create_user_with_password("alice-batch", "alice-hash")
+    bob = accounts.create_user_with_password("bob-batch", "bob-hash")
+    carol = accounts.create_user_with_password("carol-batch", "carol-hash")
+    assert accounts.delete_user(bob.id) is True
+    conv_id = _create_conversation(db_uri)
+
+    with caplog.at_level(logging.WARNING):
+        written = grant_many(conv_id, [(alice.id, 1), (bob.id, 1), (carol.id, 2)])
+
+    assert written == [
+        SessionPermission(alice.id, conv_id, 1),
+        SessionPermission(carol.id, conv_id, 2),
+    ]
+    assert store.get(bob.id, conv_id) is None
+    assert f"grant_many skipped grantee {bob.id!r}" in caplog.text, "The skip must be logged."
+
+
+def test_grant_many_skips_an_overlong_id_and_grants_the_rest(
+    grant_many: GrantMany, store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """An ID longer than the users table allows is skipped before the database sees it."""
+    conv_id = _create_conversation(db_uri)
+
+    written = grant_many(conv_id, [("x" * 129, 1), ("ivy@test.com", 1)])
+
+    assert written == [SessionPermission("ivy@test.com", conv_id, 1)]
+    assert store.get("ivy@test.com", conv_id) is not None
+
+
+@pytest.mark.parametrize(
+    "bad_entry",
+    [
+        pytest.param((None, 1), id="none-id"),
+        pytest.param((42, 1), id="int-id"),
+        pytest.param(("", 1), id="empty-id"),
+        pytest.param(("bad\x00id", 1), id="nul-id"),
+        pytest.param(("quinn@test.com", 5), id="level-5"),
+    ],
+)
+def test_grant_many_skips_an_entry_the_tables_cannot_store(
+    grant_many: GrantMany,
+    store: SqlAlchemyPermissionStore,
+    db_uri: str,
+    caplog: pytest.LogCaptureFixture,
+    bad_entry: tuple[Any, Any],
+) -> None:
+    """An entry the tables cannot store is logged and skipped; the others are granted.
+
+    The skip happens before any write, so the bad entry leaves no grant or user row.
+    """
+    owner = "owner-skip@test.com"
+    conv_id = _create_conversation(db_uri)
+    _seed_grant(store, owner, conv_id, LEVEL_OWNER)
+
+    with caplog.at_level(logging.WARNING):
+        written = grant_many(conv_id, [bad_entry, ("good-skip@test.com", 2)])
+
+    assert written == [SessionPermission("good-skip@test.com", conv_id, 2)]
+    assert "grant_many skipped an entry" in caplog.text, "The skip must be logged."
+    granted = {row.user_id for row in store.list_for_session(conv_id, limit=100)[0]}
+    assert granted == {owner, "good-skip@test.com"}, f"Unexpected grants: {granted}"
+
+
+def test_grant_many_ignores_a_pin_set_in_another_workspace(
+    grant_many: GrantMany, db_uri: str
+) -> None:
+    """A pin set in workspace 42 does not refuse a grantee in the default workspace."""
+    from omnigent.db.account_authority import target_account_scope
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    grantee = accounts.create_user_with_password("wes-pin", "wes-hash")
+    conv_id = _create_conversation(db_uri)
+    with contextlib.ExitStack() as stack:
+        with workspace_scope(42):
+            stack.enter_context(target_account_scope(grantee.id, "generation-from-workspace-42"))
+        written = grant_many(conv_id, [(grantee.id, 1)])
+
+    assert written == [SessionPermission(grantee.id, conv_id, 1)]
+
+
+def test_grant_many_locks_actor_grantees_and_pinned_targets_in_sorted_order(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """One call takes its account locks in one sorted pass, pinned non-grantees included.
+
+    Sorted order keeps overlapping calls from locking the same accounts in opposite
+    orders. Row locks are a server-database behaviour, so SQLite skips this test.
+    """
+    if store._engine.dialect.name == "sqlite":
+        pytest.skip("SQLite ignores FOR UPDATE, so the lock order is not observable")
+    from omnigent.db.account_authority import account_authority_scope, target_account_scope
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    actor = accounts.create_user_with_password("zed-lock", "zed-hash")
+    pinned = accounts.create_user_with_password("cy-lock", "cy-hash")
+    mona = accounts.create_user_with_password("mona-lock", "mona-hash")
+    bea = accounts.create_user_with_password("bea-lock", "bea-hash")
+    conv_id = _create_conversation(db_uri)
+    store.grant(actor.id, conv_id, LEVEL_OWNER)
+    expected = sorted([actor.id, pinned.id, mona.id, bea.id])
+    locked: list[str] = []
+
+    def record_user_lock(
+        connection: Connection,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: bool,
+    ) -> None:
+        """Record each account ID bound to a users row lock, in statement order."""
+        if "for update" in statement.lower() and "from users" in statement.lower():
+            values = parameters.values() if isinstance(parameters, dict) else parameters
+            locked.extend(value for value in values if value in expected)
+
+    event.listen(store._engine, "before_cursor_execute", record_user_lock)
+    try:
+        with (
+            account_authority_scope(actor.id, actor.account_generation),
+            target_account_scope(pinned.id, pinned.account_generation),
+        ):
+            written = store.grant_many(conv_id, [(mona.id, 1), (bea.id, 1)])
+    finally:
+        event.remove(store._engine, "before_cursor_execute", record_user_lock)
+
+    assert locked == expected, f"Account locks were taken as {locked}, not sorted."
+    assert sorted(grant.user_id for grant in written) == sorted([mona.id, bea.id])
+
+
+def test_grant_many_refuses_the_whole_call_when_the_actor_is_revoked(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """The acting owner's revoked authority refuses the whole call and writes nothing."""
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    actor = accounts.create_user_with_password("ada-actor", "ada-hash")
+    grantee = accounts.create_user_with_password("gia-grantee", "gia-hash")
+    conv_id = _create_conversation(db_uri)
+    assert accounts.delete_user(actor.id) is True
+    accounts.create_user_with_password(actor.id, "replacement-hash")
+
+    with account_authority_scope(actor.id, actor.account_generation):
+        with pytest.raises(OmnigentError) as caught:
+            store.grant_many(conv_id, [(grantee.id, 1)])
+
+    assert caught.value.code == ErrorCode.UNAUTHORIZED
+    assert store.get(grantee.id, conv_id) is None
+
+
+def test_grant_many_refreshes_a_cached_resolve_access(
+    grant_many: GrantMany, store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A positive resolve_access cached before grant_many reflects the raised grant."""
+    conv_id = _create_conversation(db_uri)
+    _seed_grant(store, "vic@test.com", conv_id, 1)
+    assert store.resolve_access("vic@test.com", conv_id).user_grant_level == 1
+
+    grant_many(conv_id, [("vic@test.com", 3)])
+
+    assert store.resolve_access("vic@test.com", conv_id).user_grant_level == 3, (
+        "The cached read must be evicted when grant_many raises the grant."
+    )
+
+
+def test_grant_many_on_a_store_that_reorders_levels_runs_the_default_loop(db_uri: str) -> None:
+    """A SQL subclass that overrides level_outranks does not use the integer SQL guard.
+
+    It falls back to the ABC loop, so level 1 raises a manage grant in the reversed order.
+    """
+    store = _ReversedLevelOrderStore(db_uri)
+    conv_id = _create_conversation(db_uri)
+    _seed_grant(store, "nia@test.com", conv_id, 3)
+
+    written = store.grant_many(conv_id, [("nia@test.com", 1)])
+
+    assert written == [SessionPermission("nia@test.com", conv_id, 1)]
+
+
+def test_grant_many_keeps_a_grant_raised_between_its_read_and_write(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A higher grant written after grant_many's read is not lowered by its upsert.
+
+    The raise runs in the same transaction, just before the upsert, so the read has
+    already seen level 1. Concurrent writers are serialized on SQLite and blocked by
+    row locks elsewhere, so this ordering is the deterministic way to reach that
+    window. Without the stored-level guard in the upsert, the grant would drop to 2.
+    """
+    conv_id = _create_conversation(db_uri)
+    _seed_grant(store, "kim@test.com", conv_id, 1)
+    raised = False
+
+    def _raise_before_upsert(
+        connection: Connection,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: bool,
+    ) -> None:
+        """Raise the grant to 3 on the same connection, just before the upsert runs."""
+        nonlocal raised
+        if raised or not statement.lstrip().upper().startswith("INSERT INTO SESSION_PERMISSIONS"):
+            return
+        raised = True
+        connection.execute(
+            update(SqlSessionPermission)
+            .where(
+                SqlSessionPermission.workspace_id == current_workspace_id(),
+                SqlSessionPermission.user_id == "kim@test.com",
+                SqlSessionPermission.conversation_id == conv_id,
+            )
+            .values(level=3)
+        )
+
+    event.listen(store._engine, "before_cursor_execute", _raise_before_upsert)
+    try:
+        written = store.grant_many(conv_id, [("kim@test.com", 2)])
+    finally:
+        event.remove(store._engine, "before_cursor_execute", _raise_before_upsert)
+
+    assert raised, "The upsert never ran, so the race was not exercised."
+    assert written == [], f"A grant that was not written must not be returned, got {written}."
+    fetched = store.get("kim@test.com", conv_id)
+    assert fetched is not None
+    assert fetched.level == 3, f"The raised grant was lowered to {fetched.level}."
+
+
+def test_grant_many_keeps_a_grant_inserted_into_a_missing_row_before_its_write(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A grant inserted after grant_many's read, for a grantee with no grant, is not lowered.
+
+    A missing row takes no lock, so the upsert's stored-level check is the only guard.
+    The insert runs in the same transaction, just before the upsert, as in the test
+    above. Without the guard, the grant would be overwritten with 2.
+    """
+    conv_id = _create_conversation(db_uri)
+    store.ensure_user("lou@test.com")
+    inserted = False
+
+    def _insert_before_upsert(
+        connection: Connection,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: bool,
+    ) -> None:
+        """Insert a level-3 grant on the same connection, just before the upsert runs."""
+        nonlocal inserted
+        if inserted or not statement.lstrip().upper().startswith(
+            "INSERT INTO SESSION_PERMISSIONS"
+        ):
+            return
+        inserted = True
+        connection.execute(
+            insert(SqlSessionPermission).values(
+                workspace_id=current_workspace_id(),
+                user_id="lou@test.com",
+                conversation_id=conv_id,
+                level=3,
+            )
+        )
+
+    event.listen(store._engine, "before_cursor_execute", _insert_before_upsert)
+    try:
+        written = store.grant_many(conv_id, [("lou@test.com", 2)])
+    finally:
+        event.remove(store._engine, "before_cursor_execute", _insert_before_upsert)
+
+    assert inserted, "The upsert never ran, so the race was not exercised."
+    assert written == [], f"A grant that was not written must not be returned, got {written}."
+    fetched = store.get("lou@test.com", conv_id)
+    assert fetched is not None
+    assert fetched.level == 3, (
+        f"The grant inserted before the upsert was lowered to {fetched.level}."
+    )
+
+
+def test_grant_many_default_orders_levels_through_level_outranks(db_uri: str) -> None:
+    """The ABC default compares levels only through ``level_outranks``.
+
+    In the reversed store, level 1 outranks manage, so the request raises the grant
+    even though 1 is numerically lower. The owner is still never written over.
+    """
+    store = _ReversedLevelOrderStore(db_uri)
+    conv_id = _create_conversation(db_uri)
+    _seed_grant(store, "mia@test.com", conv_id, 3)
+    _seed_grant(store, "owen@test.com", conv_id, LEVEL_OWNER)
+
+    written = PermissionStore.grant_many(
+        store, conv_id, [("mia@test.com", 1), ("owen@test.com", 1)]
+    )
+
+    assert written == [SessionPermission("mia@test.com", conv_id, 1)]
+    owner = store.get("owen@test.com", conv_id)
+    assert owner is not None
+    assert owner.level == LEVEL_OWNER, f"Owner grant changed to {owner.level}."
 
 
 # ── revoke ───────────────────────────────────────────────────────────────────

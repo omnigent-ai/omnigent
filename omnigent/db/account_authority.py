@@ -8,7 +8,7 @@ transaction on SQLite. Deletion uses the same ordering.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -142,6 +142,59 @@ class _GenerationDefault(Enum):
     CONTEXT = "context"
 
 
+def _pinned_expectations() -> tuple[dict[str, list[str | None]], set[str]]:
+    """Return the expected generations of the acting account and pinned targets.
+
+    The second value holds the pinned target IDs, so a caller can tell a stale
+    target from a revoked actor.
+    """
+    authority = _authority.get()
+    checks: dict[str, list[str | None]] = {}
+    if authority is not None and authority.workspace_id == current_workspace_id():
+        checks[authority.user_id] = [authority.generation]
+    target_ids: set[str] = set()
+    for target in _targets.get():
+        if target.workspace_id == current_workspace_id():
+            checks.setdefault(target.user_id, []).append(target.generation)
+            target_ids.add(target.user_id)
+    return checks, target_ids
+
+
+def lock_grantee_accounts(session: Session, user_ids: Iterable[str]) -> frozenset[str]:
+    """Lock the actor, *user_ids* and pinned targets once, in sorted order, then check them.
+
+    Returns the IDs in *user_ids* whose account was deleted, or replaced after a
+    pin, so the caller can skip them. Raises ``UNAUTHORIZED`` when the acting
+    account is revoked. Like :func:`require_active_account`, takes no lock when
+    account checks are off and nothing is pinned.
+    """
+    checks, _ = _pinned_expectations()
+    grantee_ids = list(user_ids)
+    for user_id in grantee_ids:
+        checks.setdefault(user_id, [])
+    if not _account_checks_enabled.get() and not any(
+        expected is not None for generations in checks.values() for expected in generations
+    ):
+        return frozenset()
+    rows = {checked_id: lock_account(session, checked_id) for checked_id in sorted(checks)}
+
+    def is_revoked(checked_id: str) -> bool:
+        row = rows[checked_id]
+        return (row is not None and row.deleted_at is not None) or any(
+            (row.account_generation if row else None) != expected
+            for expected in checks[checked_id]
+        )
+
+    authority = _authority.get()
+    if (
+        authority is not None
+        and authority.workspace_id == current_workspace_id()
+        and is_revoked(authority.user_id)
+    ):
+        raise OmnigentError("account authority has been revoked", code=ErrorCode.UNAUTHORIZED)
+    return frozenset(user_id for user_id in grantee_ids if is_revoked(user_id))
+
+
 def require_active_account(
     session: Session,
     user_id: str | None,
@@ -156,15 +209,7 @@ def require_active_account(
     Related resource owners join the same ordered lock set as actor and target.
     External auth skips account lookups unless a captured generation requires one.
     """
-    authority = _authority.get()
-    checks: dict[str, list[str | None]] = {}
-    if authority is not None and authority.workspace_id == current_workspace_id():
-        checks[authority.user_id] = [authority.generation]
-    target_ids: set[str] = set()
-    for target in _targets.get():
-        if target.workspace_id == current_workspace_id():
-            checks.setdefault(target.user_id, []).append(target.generation)
-            target_ids.add(target.user_id)
+    checks, target_ids = _pinned_expectations()
     for related_id, related_generation in (related_accounts or {}).items():
         checks.setdefault(related_id, []).append(related_generation)
     if user_id is not None:

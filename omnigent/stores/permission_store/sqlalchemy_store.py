@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import collections
+import logging
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import cast
 
-from sqlalchemy import delete, exists, literal, select, update
+from sqlalchemy import and_, case, delete, exists, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -17,7 +18,11 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Insert
 
-from omnigent.db.account_authority import account_generation, require_active_account
+from omnigent.db.account_authority import (
+    account_generation,
+    lock_grantee_accounts,
+    require_active_account,
+)
 from omnigent.db.db_models import SqlSessionPermission, SqlUser, current_workspace_id
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -33,6 +38,8 @@ from omnigent.server.auth import (
 )
 from omnigent.server.sharing_settings import effective_public_level
 from omnigent.stores.permission_store import PermissionStore
+
+logger = logging.getLogger(__name__)
 
 # Sentinel rows excluded from list_users() — never real, actionable
 # actors. Mirrors accounts_store._HIDDEN_LIST_USERS so the admin user
@@ -183,38 +190,9 @@ class SqlAlchemyPermissionStore(PermissionStore):
 
         def write(session: Session) -> None:
             require_active_account(session, user_id)
-            dialect = self._engine.dialect.name
-            values = {
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "level": level,
-            }
-            stmt: Insert
-            if dialect == "sqlite":
-                stmt = (
-                    sqlite_insert(SqlSessionPermission)
-                    .values(**values)
-                    .on_conflict_do_update(
-                        index_elements=["workspace_id", "user_id", "conversation_id"],
-                        set_={"level": level},
-                    )
-                )
-            elif dialect == "mysql":
-                stmt = (
-                    mysql_insert(SqlSessionPermission)
-                    .values(**values)
-                    .on_duplicate_key_update(level=level)
-                )
-            else:
-                stmt = (
-                    pg_insert(SqlSessionPermission)
-                    .values(**values)
-                    .on_conflict_do_update(
-                        index_elements=["workspace_id", "user_id", "conversation_id"],
-                        set_={"level": level},
-                    )
-                )
-            session.execute(stmt)
+            session.execute(
+                self._upsert_grants(conversation_id, {user_id: level}, only_raise=False)
+            )
             session.flush()
 
         run_write_transaction(
@@ -228,6 +206,168 @@ class SqlAlchemyPermissionStore(PermissionStore):
             user_id=user_id,
             conversation_id=conversation_id,
             level=level,
+        )
+
+    def grant_many(
+        self,
+        conversation_id: str,
+        grants: Sequence[tuple[str, int]],
+    ) -> list[SessionPermission]:
+        """Grant several users atomically, skipping any grantee that cannot be granted.
+
+        One transaction locks the actor, the grantees and any pinned targets in one
+        sorted pass, then checks them once over that locked set. A grantee whose
+        account was deleted, or replaced after a pin, is logged and skipped while
+        the rest are still granted. The acting account's own revoked authority
+        refuses the whole call, and nothing is written. Each remaining grantee's
+        grant is read under a row lock, missing user rows are created, and the
+        grants that need to change are written with one multi-row upsert. The
+        upsert repeats the stored-level check in SQL, so a grant raised after the
+        read is never lowered.
+
+        The result lists the grants now stored at the requested level that were
+        missing or lower when the call began. A concurrent writer that stored the
+        same level in that window may also appear, which is accepted.
+
+        Callers pin each grantee with ``target_account_scope``, as the share route
+        does, to refuse a replaced account. An unpinned grantee is only checked for
+        deletion. A pin on an account outside the batch is locked but not otherwise
+        checked, so it cannot refuse the call or skip a grantee.
+
+        The acting account is checked only when at least one entry passes
+        validation. An empty batch, or one where validation rejects every entry,
+        returns ``[]`` with no account check.
+
+        The SQL guard compares integer levels, so a subclass that overrides
+        :meth:`PermissionStore.level_outranks` runs the ABC default loop instead.
+        That loop is not atomic.
+        """
+        if type(self).level_outranks is not PermissionStore.level_outranks:
+            return super().grant_many(conversation_id, grants)
+        requested = self._collapse_grants(grants)
+        if not requested:
+            return []
+
+        def write(session: Session) -> tuple[list[SessionPermission], frozenset[str]]:
+            workspace_id = current_workspace_id()
+            refused = lock_grantee_accounts(session, list(requested))
+            grantable = {
+                user_id: level for user_id, level in requested.items() if user_id not in refused
+            }
+            if not grantable:
+                return [], refused
+            existing = {
+                row.user_id: row.level
+                for row in session.execute(
+                    select(SqlSessionPermission.user_id, SqlSessionPermission.level)
+                    .where(
+                        SqlSessionPermission.workspace_id == workspace_id,
+                        SqlSessionPermission.conversation_id == conversation_id,
+                        SqlSessionPermission.user_id.in_(list(grantable)),
+                    )
+                    .order_by(SqlSessionPermission.user_id)
+                    .with_for_update()
+                )
+            }
+            to_write = {
+                user_id: level
+                for user_id, level in grantable.items()
+                if self._should_write_grant(level, existing.get(user_id))
+            }
+            if not to_write:
+                return [], refused
+            session.execute(self._insert_missing_users(list(to_write)))
+            session.execute(self._upsert_grants(conversation_id, to_write, only_raise=True))
+            stored = {
+                row.user_id: row.level
+                for row in session.execute(
+                    select(SqlSessionPermission.user_id, SqlSessionPermission.level).where(
+                        SqlSessionPermission.workspace_id == workspace_id,
+                        SqlSessionPermission.conversation_id == conversation_id,
+                        SqlSessionPermission.user_id.in_(list(to_write)),
+                    )
+                )
+            }
+            written = [
+                SessionPermission(user_id=user_id, conversation_id=conversation_id, level=level)
+                for user_id, level in to_write.items()
+                if stored.get(user_id) == level
+            ]
+            return written, refused
+
+        written, refused = run_write_transaction(
+            self._session_immediate, "grant_permissions", write
+        )
+        for user_id in sorted(refused):
+            logger.warning("grant_many skipped grantee %r: account refused", user_id)
+        if written:
+            self._invalidate_resolve_cache_for_session(conversation_id)
+        return written
+
+    def _insert_missing_users(self, user_ids: Iterable[str], *, is_admin: bool = False) -> Insert:
+        """Build one multi-row insert that creates user rows and skips existing ones."""
+        workspace_id = current_workspace_id()
+        rows = [
+            {"workspace_id": workspace_id, "id": user_id, "is_admin": is_admin}
+            for user_id in sorted(user_ids)
+        ]
+        dialect = self._engine.dialect.name
+        if dialect == "mysql":
+            mysql_stmt = mysql_insert(SqlUser).values(rows)
+            # Re-assigning the key to itself makes a duplicate a no-op.
+            return mysql_stmt.on_duplicate_key_update(id=mysql_stmt.inserted.id)
+        insert = sqlite_insert if dialect == "sqlite" else pg_insert
+        return (
+            insert(SqlUser)
+            .values(rows)
+            .on_conflict_do_nothing(index_elements=["workspace_id", "id"])
+        )
+
+    def _upsert_grants(
+        self, conversation_id: str, grants: Mapping[str, int], *, only_raise: bool
+    ) -> Insert:
+        """Build one multi-row upsert of grants on one session.
+
+        With *only_raise*, a row takes the requested level only over a lower stored
+        level, and an owner row is never written. The stored level is compared in
+        SQL, so a grant raised after the caller's read is kept. Without it, every
+        row takes the requested level, which can lower a grant.
+        """
+        workspace_id = current_workspace_id()
+        rows = [
+            {
+                "workspace_id": workspace_id,
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "level": level,
+            }
+            for user_id, level in sorted(grants.items())
+        ]
+        dialect = self._engine.dialect.name
+        if dialect == "mysql":
+            mysql_stmt = mysql_insert(SqlSessionPermission).values(rows)
+            new_level = mysql_stmt.inserted.level
+            if not only_raise:
+                return mysql_stmt.on_duplicate_key_update(level=new_level)
+            stored_is_lower = and_(
+                SqlSessionPermission.level < new_level,
+                SqlSessionPermission.level != LEVEL_OWNER,
+            )
+            return mysql_stmt.on_duplicate_key_update(
+                level=case((stored_is_lower, new_level), else_=SqlSessionPermission.level)
+            )
+        insert = sqlite_insert if dialect == "sqlite" else pg_insert
+        stmt = insert(SqlSessionPermission).values(rows)
+        where = None
+        if only_raise:
+            where = and_(
+                SqlSessionPermission.level < stmt.excluded.level,
+                SqlSessionPermission.level != LEVEL_OWNER,
+            )
+        return stmt.on_conflict_do_update(
+            index_elements=["workspace_id", "user_id", "conversation_id"],
+            set_={"level": stmt.excluded.level},
+            where=where,
         )
 
     def revoke(self, user_id: str, conversation_id: str) -> bool:
@@ -432,29 +572,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
 
         def write(session: Session) -> None:
             require_active_account(session, user_id)
-            dialect = self._engine.dialect.name
-            values = {"id": user_id, "is_admin": is_admin}
-            stmt: Insert
-            if dialect == "sqlite":
-                stmt = (
-                    sqlite_insert(SqlUser)
-                    .values(**values)
-                    .on_conflict_do_nothing(index_elements=["workspace_id", "id"])
-                )
-            elif dialect == "mysql":
-                # ON DUPLICATE KEY UPDATE with a no-op to silently skip conflicts.
-                stmt = (
-                    mysql_insert(SqlUser)
-                    .values(**values)
-                    .on_duplicate_key_update(id=literal(user_id))
-                )
-            else:
-                stmt = (
-                    pg_insert(SqlUser)
-                    .values(**values)
-                    .on_conflict_do_nothing(index_elements=["workspace_id", "id"])
-                )
-            session.execute(stmt)
+            session.execute(self._insert_missing_users([user_id], is_admin=is_admin))
 
         run_write_transaction(self._session_immediate, "ensure_user", write)
 

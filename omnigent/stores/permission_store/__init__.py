@@ -5,9 +5,40 @@ level is an integer: 1=read, 2=edit, 3=manage. The ``"__public__"``
 sentinel user ID represents public link access, capped by the live server policy.
 """
 
+import logging
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 
 from omnigent.entities import Account, ResolvedAccess, SessionPermission
+from omnigent.errors import OmnigentError
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_OWNER, LEVEL_READ
+
+logger = logging.getLogger(__name__)
+
+# Matches the width of users.id and session_permissions.user_id.
+_USER_ID_MAX_LENGTH = 128
+# session_permissions accepts 1-4; owner (4) is dropped before this check.
+_GRANTABLE_LEVELS = (LEVEL_READ, LEVEL_EDIT, LEVEL_MANAGE)
+
+
+def _entry_problem(user_id: object, level: object) -> str | None:
+    """Describe why a grant entry cannot be stored, or return ``None`` if it can.
+
+    :param user_id: The grantee ID as passed by the caller.
+    :param level: The requested level as passed by the caller.
+    :returns: A short description for the log, or ``None``.
+    """
+    if not isinstance(user_id, str):
+        return f"grantee ID is a {type(user_id).__name__}, not a string"
+    if not user_id:
+        return "grantee ID is empty"
+    if len(user_id) > _USER_ID_MAX_LENGTH:
+        return f"grantee ID is {len(user_id)} characters, over {_USER_ID_MAX_LENGTH}"
+    if "\x00" in user_id:
+        return "grantee ID contains a NUL byte"
+    if not (isinstance(level, int) and not isinstance(level, bool) and level in _GRANTABLE_LEVELS):
+        return f"level {level!r} is not read, edit or manage"
+    return None
 
 
 class PermissionStore(ABC):
@@ -49,6 +80,101 @@ class PermissionStore(ABC):
         :returns: The resulting :class:`SessionPermission`.
         """
         ...
+
+    def level_outranks(self, level: int, other_level: int) -> bool:
+        """Return whether *level* grants strictly more access than *other_level*.
+
+        The default :meth:`grant_many` makes every level comparison through this
+        method, so a store whose levels are not ordered by integer value overrides
+        it here. The SQL override compares integers in SQL, so such a store also
+        overrides :meth:`grant_many`.
+
+        :param level: The candidate level, e.g. ``2``.
+        :param other_level: The level it is compared with, e.g. ``1``.
+        :returns: ``True`` if *level* outranks *other_level*.
+        """
+        return level > other_level
+
+    def grant_many(
+        self,
+        conversation_id: str,
+        grants: Sequence[tuple[str, int]],
+    ) -> list[SessionPermission]:
+        """Grant several users on one session without lowering any grant.
+
+        A user listed more than once keeps the highest requested level and is
+        written once. A request is skipped when an equal or higher grant already
+        exists, and the owner's grant is never written or changed. An entry that
+        cannot be stored is logged and skipped before any write: a grantee ID that
+        is not a non-empty string of at most 128 characters without a NUL byte, or
+        a level other than read, edit or manage. A grantee whose write raises an
+        :class:`~omnigent.errors.OmnigentError` is logged and skipped while the rest
+        are still granted.
+
+        This default is not atomic. It reads and writes each grantee in turn, so a
+        change made between one grantee's read and its write is not guarded. It
+        cannot tell a revoked acting account from a refused grantee, so it skips
+        both. A store with actor-level authority checks must override this method,
+        as the SQL store does. A pin set by ``target_account_scope`` applies to every
+        write in the loop, so a replaced pinned account fails each grantee rather
+        than only its own.
+
+        :param conversation_id: The session to grant on, e.g. ``"conv_abc123"``.
+        :param grants: ``(user_id, level)`` pairs, e.g.
+            ``[("alice@example.com", 1)]``. An empty list writes nothing.
+        :returns: The grants now stored at the requested level that were missing or
+            lower when the call began, in the first-appearance order of their user
+            IDs. A concurrent writer that stored the same level may also appear, which
+            is accepted.
+        """
+        written: list[SessionPermission] = []
+        for user_id, level in self._collapse_grants(grants).items():
+            try:
+                existing = self.get(user_id, conversation_id)
+                if not self._should_write_grant(level, existing.level if existing else None):
+                    continue
+                self.ensure_user(user_id)
+                written.append(self.grant(user_id, conversation_id, level))
+            except OmnigentError as error:
+                logger.warning("grant_many skipped grantee %r: %s", user_id, error)
+        return written
+
+    def _collapse_grants(self, grants: Sequence[tuple[str, int]]) -> dict[str, int]:
+        """Return one requested level per user, in first-appearance order.
+
+        A repeated user keeps the highest requested level. Owner requests are
+        dropped, because :meth:`grant_many` never writes an owner grant. An entry
+        that the tables cannot store is logged and dropped here, before any write.
+
+        :param grants: ``(user_id, level)`` pairs as passed to :meth:`grant_many`.
+        :returns: A mapping from each user ID to its level.
+        """
+        collapsed: dict[str, int] = {}
+        for user_id, level in grants:
+            if level == LEVEL_OWNER:
+                continue
+            problem = _entry_problem(user_id, level)
+            if problem is not None:
+                logger.warning("grant_many skipped an entry: %s", problem)
+                continue
+            current = collapsed.get(user_id)
+            if current is None or self.level_outranks(level, current):
+                collapsed[user_id] = level
+        return collapsed
+
+    def _should_write_grant(self, level: int, existing_level: int | None) -> bool:
+        """Return whether a grant at *level* should be written over *existing_level*.
+
+        A missing grant is always written. An owner grant is never written, and
+        any other grant is written only when *level* outranks it.
+
+        :param level: The requested level.
+        :param existing_level: The stored level, or ``None`` if there is no grant.
+        :returns: ``True`` if the grant should be written.
+        """
+        if existing_level is None:
+            return True
+        return existing_level != LEVEL_OWNER and self.level_outranks(level, existing_level)
 
     @abstractmethod
     def revoke(self, user_id: str, conversation_id: str) -> bool:
