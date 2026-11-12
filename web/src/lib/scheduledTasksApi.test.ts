@@ -160,41 +160,7 @@ describe("listScheduledTaskRuns", () => {
     });
   });
 
-  it("maps a run's session read state when the server sends it", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({
-        runs: [
-          {
-            id: "run_1",
-            scheduled_task_id: "st_1",
-            status: "succeeded",
-            scheduled_at: 1_700_000_000,
-            conversation_id: "conv_1",
-            fired_at: 1_700_000_005,
-            finished_at: 1_700_000_050,
-            error_code: null,
-            conversation_updated_at: 1_700_000_060,
-            conversation_status: "idle",
-            viewer_last_seen: 1_700_000_055,
-            viewer_unread: false,
-            session_cost_usd: 0,
-            conversation_pending_approvals: 2,
-          },
-        ],
-      }),
-    );
-    const [run] = await listScheduledTaskRuns("st_1");
-    expect(run).toMatchObject({
-      conversationUpdatedAt: 1_700_000_060,
-      conversationStatus: "idle",
-      viewerLastSeen: 1_700_000_055,
-      viewerUnread: false,
-      sessionCostUsd: 0,
-      conversationPendingApprovals: 2,
-    });
-  });
-
-  it("maps a failed run's error detail", async () => {
+  it("maps a run's failure detail and session read state when the server sends them", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         runs: [
@@ -208,12 +174,26 @@ describe("listScheduledTaskRuns", () => {
             finished_at: 1_700_000_050,
             error_code: "sandbox_registration_timeout",
             error_detail: "the sandbox did not register within 720 seconds",
+            conversation_updated_at: 1_700_000_060,
+            conversation_status: "idle",
+            viewer_last_seen: 1_700_000_055,
+            viewer_unread: false,
+            session_cost_usd: 0,
+            conversation_pending_approvals: 2,
           },
         ],
       }),
     );
     const [run] = await listScheduledTaskRuns("st_1");
-    expect(run.errorDetail).toBe("the sandbox did not register within 720 seconds");
+    expect(run).toMatchObject({
+      errorDetail: "the sandbox did not register within 720 seconds",
+      conversationUpdatedAt: 1_700_000_060,
+      conversationStatus: "idle",
+      viewerLastSeen: 1_700_000_055,
+      viewerUnread: false,
+      sessionCostUsd: 0,
+      conversationPendingApprovals: 2,
+    });
   });
 });
 
