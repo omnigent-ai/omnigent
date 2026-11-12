@@ -2953,12 +2953,8 @@ function ComposerImpl(
   // the input, which would delete the draft. Only save when the user
   // has actually changed the value since the last restore.
   const dirtyRef = useRef(false);
-  // The pending tab a typed `/side <question>` opened, reused if the same command repeats.
-  const slashSideChatRef = useRef<{
-    pendingId: string;
-    parentId: string;
-    question: string;
-  } | null>(null);
+  // Pending tabs typed `/side <question>` opened, by parent and question, reused if one repeats.
+  const slashSideChatsRef = useRef(new Map<string, string>());
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   // While dictation listens, Esc cancels the take instead of interrupting the turn.
@@ -4042,23 +4038,20 @@ function ComposerImpl(
       dirtyRef.current = true;
       setValue("");
       const store = useChatStore.getState();
-      const previous = slashSideChatRef.current;
-      const previousComposer = previous && store.sideChatComposers[previous.pendingId];
-      if (
-        question &&
-        previous?.parentId === sourceId &&
-        previous.question === question &&
-        previousComposer?.text === question
-      ) {
+      const slashKey = `${sourceId}\n${question}`;
+      const previousId = question ? slashSideChatsRef.current.get(slashKey) : undefined;
+      const previousComposer =
+        previousId === undefined ? undefined : store.sideChatComposers[previousId];
+      if (previousId !== undefined && previousComposer?.text === question) {
         // The same question's tab hasn't forked yet: reveal it (retrying a
         // failed start) instead of opening a duplicate.
         if (!previousComposer.starting) {
-          store.updateSideChatComposer(previous.pendingId, (current) => ({
+          store.updateSideChatComposer(previousId, (current) => ({
             ...current,
             autoStart: true,
           }));
         }
-        store.openSideChatWithDraft(previous.pendingId, "", sourceId);
+        store.openSideChatWithDraft(previousId, "", sourceId);
         return;
       }
       const pendingId = newPendingSideChatId();
@@ -4068,7 +4061,7 @@ function ComposerImpl(
           text: question,
           autoStart: true,
         }));
-        slashSideChatRef.current = { pendingId, parentId: sourceId, question };
+        slashSideChatsRef.current.set(slashKey, pendingId);
       } else {
         store.requestSideChatFocus(pendingId);
       }

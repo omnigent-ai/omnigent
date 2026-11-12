@@ -6551,13 +6551,15 @@ describe("Composer side-chat entry points", () => {
         ...patch,
       }));
     markComposer({ autoStart: false, starting: true });
+    const otherId = submitSide("/side how?");
+    expect(otherId).not.toBe(pendingId);
     expect(submitSide("/side why?")).toBe(pendingId);
     expect(composerFor(pendingId)?.autoStart).toBe(false);
     markComposer({ autoStart: false, starting: false });
+    expect(submitSide("/side how?")).toBe(otherId);
     expect(submitSide("/side why?")).toBe(pendingId);
     expect(composerFor(pendingId)?.autoStart).toBe(true);
 
-    expect(submitSide("/side how?")).not.toBe(pendingId);
     useChatStore.getState().clearSideChatComposer(pendingId);
     expect(submitSide("/side why?")).not.toBe(pendingId);
     const bareId = submitSide("/side ");
