@@ -1817,6 +1817,14 @@ def test_quoted_operator_characters_do_not_split_a_simple_command(
         ),
         pytest.param(
             "Bash",
+            {"command": "cd /work/repo >| /tmp/output && git pp"},
+            "/start",
+            {},
+            ["/work/repo"],
+            id="noclobber-redirect-keeps-the-cd",
+        ),
+        pytest.param(
+            "Bash",
             {"command": "cd /w/topic 2>&1 && git pp"},
             "/repo",
             {},

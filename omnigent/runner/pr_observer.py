@@ -393,15 +393,15 @@ def _shell_items(command: str) -> list[list[str] | str] | None:
                 chunk.append(command[index:end])
                 index = end
             else:
-                # The ``&`` of ``>&``, ``<&`` and ``&>`` is part of a redirection, not a separator.
-                redirect_ampersand = char == "&" and (
-                    command.startswith("&>", index)
-                    or (bool(chunk) and chunk[-1][-1:] in ("<", ">"))
-                )
+                # ``>&``, ``<&``, ``&>`` and ``>|`` are redirections, not separators.
+                previous = chunk[-1][-1:] if chunk else ""
+                part_of_redirect = (
+                    char == "&" and (command.startswith("&>", index) or previous in ("<", ">"))
+                ) or (char == "|" and previous == ">")
                 operator = next(
                     (op for op in _SHELL_OPERATORS if command.startswith(op, index)), None
                 )
-                if operator is None or redirect_ampersand:
+                if operator is None or part_of_redirect:
                     chunk.append(char)
                     index += 1
                     continue
