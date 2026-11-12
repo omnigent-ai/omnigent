@@ -159,6 +159,7 @@ function run(overrides: Partial<ScheduledTaskRun> = {}): ScheduledTaskRun {
     firedAt: 1_700_000_000,
     finishedAt: 1_700_000_102,
     errorCode: null,
+    errorDetail: null,
     conversationUpdatedAt: 1_700_000_500,
     conversationStatus: "idle",
     viewerLastSeen: null,
@@ -1023,6 +1024,28 @@ describe("run history", () => {
     expect(link).toHaveAccessibleName(/Runner · The agent didn't start\./);
     expect(within(row).getByTestId("run-failure")).toHaveTextContent(
       "Runner · The agent didn't start.",
+    );
+    // A run that recorded no failure detail shows no detail line.
+    expect(within(row).queryByTestId("run-failure-detail")).toBeNull();
+  });
+
+  it("shows a failed run's detail under its reason", () => {
+    setTask(task());
+    setRuns([
+      run({
+        status: "failed",
+        errorCode: "sandbox_registration_timeout",
+        errorDetail: "the sandbox did not register within 720 seconds — refresh your credentials",
+        conversationId: "c_7",
+      }),
+    ]);
+    renderPage();
+    const row = screen.getByTestId("task-detail-run");
+    expect(within(row).getByTestId("run-failure")).toHaveTextContent(
+      "Sandbox · The sandbox didn't connect in time.",
+    );
+    expect(within(row).getByTestId("run-failure-detail")).toHaveTextContent(
+      "the sandbox did not register within 720 seconds — refresh your credentials",
     );
   });
 

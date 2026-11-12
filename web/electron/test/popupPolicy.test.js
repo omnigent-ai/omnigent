@@ -157,6 +157,20 @@ describe("popupPolicy — everything else keeps leaving the shell", () => {
     assert.deepEqual(decision, { kind: "protocol-consent", scheme: "vscode:" });
   });
 
+  // Popups can come from untrusted frames in the window (e.g. HTML previews);
+  // chat routes its own session links in the renderer instead.
+  it("asks before opening an Omnigent session link, even to the window's own server", () => {
+    const decision = decideWindowOpen(
+      {
+        url: `omnigent://${new URL(PINNED).host}/c/abc`,
+        disposition: "foreground-tab",
+        features: "",
+      },
+      pinnedContext(),
+    );
+    assert.deepEqual(decision, { kind: "protocol-consent", scheme: "omnigent:" });
+  });
+
   it("ignores unparseable URLs (nothing safe to open)", () => {
     for (const url of ["", "not a url", "http://"]) {
       const decision = decideWindowOpen(

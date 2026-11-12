@@ -621,21 +621,42 @@ async def test_messages_queued_during_a_wait_that_ran_out_fail_with_it(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("take_over_at", [1, 2], ids=["before-refusal", "before-stream-end"])
+@pytest.mark.parametrize(
+    ("take_over_at", "new_epoch"),
+    [
+        pytest.param(0, True, id="turn-replaced-before-creation"),
+        pytest.param(1, False, id="response-replaced-before-refusal"),
+        pytest.param(1, True, id="turn-replaced-before-refusal"),
+        pytest.param(2, False, id="response-replaced-before-stream-end"),
+        pytest.param(2, True, id="turn-replaced-before-stream-end"),
+    ],
+)
+@pytest.mark.parametrize("stream_end", ["eof", "broken", "split"])
 async def test_refusal_on_a_stream_a_newer_turn_took_over_is_reported_not_held(
     take_over_at: int,
+    new_epoch: bool,
+    stream_end: str,
 ) -> None:
     """Only the stream that owns the live turn may hold; an older one reports its failure."""
-    script = _TakeoverScript(take_over_at)
-    app, harness, server = _build_app([script])
+    script = _TakeoverScript(3 if stream_end == "split" and take_over_at == 2 else take_over_at)
+    if stream_end == "split":
+        refusal = script[1]
+        midpoint = len(refusal) // 2
+        script[1:] = [refusal[:midpoint], refusal[midpoint:]]
+    broken = _BrokenStreamHarness([script]) if stream_end == "broken" else None
+    app, harness, server = _build_app([script], harness=broken)
     sid = uuid.uuid4().hex
     newer = asyncio.get_running_loop().create_task(asyncio.Event().wait())
     refused_turns: list[asyncio.Task[None]] = []
+    successor_error = {"code": "required_terminal_exited", "message": "newer terminal exited"}
 
     def take_over() -> None:
         refused_turns.append(app.state.active_turns[sid])
+        if new_epoch:
+            app.state.begin_turn_slot(sid)
         app.state.active_turns[sid] = newer
         app.state.live_response_id[sid] = "resp_newer"
+        app.state.required_terminal_exit_errors[sid] = successor_error
 
     script.take_over = take_over
     try:
@@ -646,7 +667,9 @@ async def test_refusal_on_a_stream_a_newer_turn_took_over_is_reported_not_held(
                 json={**_message("first"), "stable_id": _STABLE_ID},
             )
             await _until(lambda: bool(refused_turns) and refused_turns[0].done())
-            await asyncio.sleep(0.05)
+            assert app.state.active_turns[sid] is newer
+            assert app.state.live_response_id[sid] == "resp_newer"
+            assert app.state.required_terminal_exit_errors[sid] is successor_error
     finally:
         newer.cancel()
         with contextlib.suppress(asyncio.CancelledError):
