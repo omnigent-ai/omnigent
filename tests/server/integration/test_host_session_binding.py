@@ -4315,6 +4315,8 @@ async def test_runner_exited_after_connect_keeps_idle_session_idle(
     conv_store.set_session_live_status(conv.id, "idle")
     if connection_source == "replica":
         session_live_state.touch_runner_liveness(["runner_ran_idle"])
+        # Persist the setup heartbeat before the crash handler snapshots the session.
+        await asyncio.wrap_future(session_live_state.submit("drain_test_writes", lambda: None))
     else:
         assert session_live_state.last_liveness_stamp("runner_ran_idle") is None
 
@@ -4399,6 +4401,8 @@ async def test_runner_exited_after_connect_fails_mid_turn_session(
     conv_store.set_session_live_status(conv.id, "running")
     if connection_source == "replica":
         session_live_state.touch_runner_liveness(["runner_ran_mid_turn"])
+        # A heartbeat landing during the crash sweep looks like a runner reconnect.
+        await asyncio.wrap_future(session_live_state.submit("drain_test_writes", lambda: None))
     else:
         assert session_live_state.last_liveness_stamp("runner_ran_mid_turn") is None
 
