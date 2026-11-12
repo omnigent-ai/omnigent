@@ -314,6 +314,7 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_harness_settings: bool = True
     # Session creates accept ``permission_mode``; older servers ignore it.
     session_create_permission_modes: bool = True
+    scripted_sessions: bool = False
     # Scheduled tasks accept explicit modes that skip approval; servers that omit
     # this may reject them, so clients hide those modes.
     scheduled_task_approval_skipping_modes: bool = True
@@ -3793,6 +3794,7 @@ def create_app(
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
                 "session_list_scoped_archives": True,
+                "scripted_sessions": app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS),
                 "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
