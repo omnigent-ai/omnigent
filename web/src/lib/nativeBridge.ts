@@ -223,8 +223,6 @@ interface ElectronDesktopApi extends NativeShellApi {
   connectArcaHost?: () => Promise<ArcaConnectResult>;
   /** Connect a machine the user reaches over SSH; absent on Windows and older shells. */
   connectSshHost?: (destination: string) => Promise<ArcaConnectResult>;
-  /** Extend this machine's running Arca instance with an approved mode. */
-  extendArca?: (mode: ArcaExtendMode) => Promise<ArcaExtendResult>;
   /** Renew this machine's dbcert. */
   refreshDbcert?: (options?: DbcertRefreshOptions) => Promise<DbcertRefreshResult>;
   /** Check local credentials before an Arclet launch without starting sign-in. */
@@ -420,9 +418,6 @@ export interface ChromeCookieImportResult {
 /** A lifecycle action for the host daemon. */
 export type HostControlAction = "start" | "stop" | "restart";
 
-export type ArcaExtendMode = "overnight" | "workweek";
-export type ArcaExtendResult =
-  { ok: true; shutdownAt: number | null } | { ok: false; error: string };
 export type DbcertRefreshResult = { ok: true } | { ok: false; error: string };
 export interface DbcertRefreshOptions {
   skipArcaSync?: boolean;
@@ -461,8 +456,6 @@ export interface DesktopFeatures {
    * window's server is a managed server.
    */
   databricksInternalFeatures?: boolean;
-  /** This window may offer one-click Arca extension. */
-  canExtendArca?: boolean;
   /** This window may renew the laptop's dbcert. */
   canRefreshDbcert?: boolean;
   /** Shell can restore Arca preview identity after a desktop restart. */
@@ -1454,25 +1447,6 @@ export async function connectSshHost(destination: string): Promise<ArcaConnectRe
   } catch (err) {
     console.warn("[nativeBridge] electron connectSshHost failed:", err);
     return { ok: false, error: String(err) };
-  }
-}
-
-/** Present only in desktop shells that can extend a running Arca instance. */
-export function hasArcaExtendBridge(): boolean {
-  return typeof electronApi()?.extendArca === "function";
-}
-
-export async function extendArca(mode: ArcaExtendMode): Promise<ArcaExtendResult> {
-  const bridge = electronApi()?.extendArca;
-  if (!bridge) return { ok: false, error: "Arca extend is unavailable in this app." };
-  try {
-    return await bridge(mode);
-  } catch (error) {
-    console.warn("[nativeBridge] electron extendArca failed:", error);
-    return {
-      ok: false,
-      error: "Could not extend Arca from this app.",
-    };
   }
 }
 

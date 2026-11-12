@@ -5350,7 +5350,6 @@ function registerIpc() {
     const enabled = canExtendArca(event);
     return {
       databricksInternalFeatures: enabled,
-      canExtendArca: enabled,
       canRefreshDbcert: enabled,
       arcaPreviewRecovery: true,
       // Importing local Chrome cookies is wired for macOS only (Keychain-decrypted
@@ -5444,28 +5443,8 @@ function registerIpc() {
     return arcaConnectFlow.run(win, arcaServerUrl);
   });
 
-  let arcaExtendInFlight = false;
-  ipcMain.handle("omnigent:arca-extend", async (event, mode) => {
-    if (!isPinnedOriginSender(event)) {
-      throw new Error("arca-extend is only available to a connected server page");
-    }
-    if (!canExtendArca(event)) {
-      return { ok: false, error: "Arca support is not enabled for this server." };
-    }
-    if (!arca.ARCA_EXTEND_MODES.includes(mode)) {
-      return { ok: false, error: "Unsupported arca extend mode." };
-    }
-    if (arcaExtendInFlight) return { ok: false, error: "Arca extension is already in progress." };
-    arcaExtendInFlight = true;
-    try {
-      return await arca.runArcaExtend(mode);
-    } finally {
-      arcaExtendInFlight = false;
-    }
-  });
-
   // SPA → renew this machine's dbcert from the expired-dbcert banner. Same
-  // gates as arca-extend. Clicks from several windows share one sign-in.
+  // trusted-server gates. Clicks from several windows share one sign-in.
   let dbcertPreflight = null;
   let dbcertGeneration = 0;
   let dbcertRefresh = null;
