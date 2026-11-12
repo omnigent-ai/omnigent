@@ -230,6 +230,9 @@ describe("dropping an unpinned session onto a pinned row", () => {
     );
     renderSidebar();
 
+    const member = screen.getByText("conv_c").closest("li")!;
+    fireEvent.mouseEnter(member);
+    expect(member.querySelector('[data-testid="quick-pin-conversation"]')).toBeNull();
     await dropOnto("conv_c", "conv_b", {
       offsetY: ROW_HEIGHT / 4,
       expectTarget: false,

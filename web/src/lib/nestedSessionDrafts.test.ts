@@ -60,13 +60,29 @@ describe("nested draft sidebar rows", () => {
       ).map((item) => item.id),
     ).toEqual(["parent", "temp:nested"]);
     updateNestedSessionDraft(client, "temp:nested", "created");
-    const pushed = { ...row, id: "created", title: "Implement tests", family: before[1].family };
+    const pushed = {
+      ...row,
+      id: "created",
+      title: "Implement tests",
+      family: before[1].family,
+      created_at: 10,
+      updated_at: 20,
+      permission_level: 4,
+      project_id: null,
+    };
     const rows = withNestedSessionDrafts(
       [row, { ...row, id: "temp:nested" }, pushed],
       drafts(client),
     );
     expect(rows.map((item) => item.id)).toEqual(["parent", "created"]);
-    expect(rows[1]).toMatchObject({ title: "Implement tests", provisional: false });
+    expect(rows[1]).toMatchObject({
+      title: "Implement tests",
+      provisional: false,
+      created_at: 10,
+      updated_at: 20,
+      permission_level: 4,
+      project_id: null,
+    });
     expect(nestedSessionSidebarKey("created")).toBe("temp:nested");
     removeNestedSessionDraft(client, "temp:nested");
     expect(withNestedSessionDrafts([row, pushed], drafts(client))).toEqual([row, pushed]);

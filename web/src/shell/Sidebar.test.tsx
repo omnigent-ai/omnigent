@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import { conversationPage } from "@/test/sidebarMockHelpers";
 import * as automationInboxHook from "@/hooks/useAutomationInbox";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
@@ -2075,20 +2076,29 @@ describe("Sidebar sections", () => {
     expect(screen.queryByText("conv_only_mine")).toBeNull();
   });
 
-  it.each(["sessions", "project", "pinned"])(
+  it.each(["sessions", "project", "pinned", "pinned-shared"])(
     "expands a collapsed family for its draft in %s, replaces it in place, and removes cancelled drafts",
     async (scope) => {
-      const family = { id: "family", representative_id: "conv_parent", pinned: scope === "pinned" };
+      const family = {
+        id: "family",
+        representative_id: "conv_parent",
+        pinned: scope.startsWith("pinned"),
+      };
       const labels: Record<string, string> =
         scope === "project" ? { omni_project: "Example project" } : {};
       if (scope === "project") projectsMock.push("Example project");
-      if (scope === "pinned") seedPins(["conv_parent"]);
+      if (family.pinned) seedPins(["conv_parent", "conv_peer", "created"]);
       const members = [
         conv("conv_parent", "Claude Code", { family, labels }),
         conv("conv_peer", "Codex", { family, labels }),
       ];
-      mockConversations(members);
+      const load = (rows: Conversation[]) => {
+        mockConversations(rows);
+        if (scope === "pinned-shared") useConvMock.mockReturnValue(conversationPage([]));
+      };
+      load(members);
       const { queryClient, refresh } = renderSidebar();
+      if (scope === "pinned-shared") showSharedTab();
       if (scope === "project")
         fireEvent.click(screen.getByRole("button", { name: /^Example project/ }));
       fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
@@ -2110,13 +2120,20 @@ describe("Sidebar sections", () => {
       const rowNode = placeholder.closest("li");
       expect(rowNode).toHaveClass("ml-9");
       act(() => updateNestedSessionDraft(queryClient, "temp:nested", "created"));
-      mockConversations([
-        ...members,
-        conv("created", "Codex", { family, labels, title: "New task" }),
-      ]);
+      load([...members, conv("created", "Codex", { family, labels, title: "New task" })]);
       refresh();
       await waitFor(() => expect(screen.queryByText("New nested agent")).toBeNull());
       expect(screen.getByText("New task").closest("li")).toBe(rowNode);
+      await waitFor(() => expect(queryClient.getQueryData(["nested-session-drafts"])).toEqual([]));
+      if (scope === "pinned-shared") {
+        load([...members, conv("created", "Codex", { family, title: "Renamed task" })]);
+        refresh();
+        expect(screen.getByText("Renamed task")).toBeInTheDocument();
+        expect(screen.queryByText("New task")).toBeNull();
+        load(members);
+        refresh();
+        expect(screen.queryByText("Renamed task")).toBeNull();
+      }
       act(() => addNestedSessionDraft(queryClient, "temp:cancelled", source));
       expect(await screen.findByText("New nested agent")).toBeInTheDocument();
       act(() => removeNestedSessionDraft(queryClient, "temp:cancelled"));
@@ -2150,6 +2167,9 @@ describe("Sidebar sections", () => {
         within(screen.getByText("conv_nested").closest("li")!).queryByTestId(
           "quick-pin-conversation",
         ),
+      ).toBeNull();
+      expect(
+        screen.getByRole("button", { name: "Collapse session family" }).closest("a"),
       ).toBeNull();
       fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
       expect(screen.queryByText("conv_nested")).toBeNull();

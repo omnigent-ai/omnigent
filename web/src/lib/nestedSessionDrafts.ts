@@ -47,7 +47,7 @@ export function addNestedSessionDraft(client: QueryClient, id: string, source: S
         family: source.family ?? {
           id: source.id,
           representative_id: source.id,
-          pinned: source.labels?.[PINNED_LABEL_KEY] != null,
+          pinned: source.labels?.[PINNED_LABEL_KEY] !== undefined,
           pinned_at: source.labels?.[PINNED_LABEL_KEY],
         },
       },
@@ -104,17 +104,17 @@ export function withNestedSessionDrafts(
       id: draft.id,
       object: "conversation",
       title: existing?.title ?? (draft.created ? null : "New nested agent"),
-      created_at: draft.createdAt,
+      created_at: existing?.created_at ?? draft.createdAt,
       // Opening the composer must not move the family above unrelated sessions.
-      updated_at: source.updated_at,
+      updated_at: existing?.updated_at ?? source.updated_at,
       labels: {
         ...(source.labels[PROJECT_LABEL_KEY]
           ? { [PROJECT_LABEL_KEY]: source.labels[PROJECT_LABEL_KEY] }
           : {}),
         ...existing?.labels,
       },
-      permission_level: source.permission_level,
-      project_id: source.project_id,
+      permission_level: existing ? existing.permission_level : source.permission_level,
+      project_id: existing ? existing.project_id : source.project_id,
       family: existing?.family ?? family,
       provisional: !draft.created,
       nested_draft_source_id: draft.creating ? undefined : source.id,

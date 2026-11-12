@@ -2916,14 +2916,18 @@ function NewChatLandingContent({
   // `submittedRef` is flipped once the draft is sent to a create, so the
   // snapshot is dropped instead of resurrected.
   const submittedRef = useRef(false);
-  const [nestedProvisional] = useState(newTempConversation);
+  const [nestedProvisional, setNestedProvisional] = useState(newTempConversation);
+  const siblingSourceRef = useRef(siblingSource);
+  siblingSourceRef.current = siblingSource;
+  const siblingSourceKey = siblingSource?.id;
   useEffect(() => {
-    if (!siblingSource) return;
-    addNestedSessionDraft(queryClient, nestedProvisional.id, siblingSource);
+    const source = siblingSourceRef.current;
+    if (!source || submittedRef.current) return;
+    addNestedSessionDraft(queryClient, nestedProvisional.id, source);
     return () => {
       if (!submittedRef.current) removeNestedSessionDraft(queryClient, nestedProvisional.id);
     };
-  }, [queryClient, nestedProvisional, siblingSource]);
+  }, [queryClient, nestedProvisional, siblingSourceKey]);
   const submittedDraftRevisionRef = useRef<number | null>(null);
   // Whether this composer is still on screen. The create POST can outlive
   // it — the user opens another session while the session bootstraps — and
@@ -5880,10 +5884,9 @@ function NewChatLandingContent({
   function returnDraftToUser(temporaryConversationId?: string) {
     submittedRef.current = false;
     submittedDraftRevisionRef.current = null;
+    removeNestedSessionDraft(queryClient, nestedProvisional.id);
     if (siblingSource && onScreenRef.current) {
-      addNestedSessionDraft(queryClient, nestedProvisional.id, siblingSource);
-    } else {
-      removeNestedSessionDraft(queryClient, nestedProvisional.id);
+      setNestedProvisional(newTempConversation());
     }
     const originalDraft =
       temporaryConversationId && !hasPendingLocalMessage(temporaryConversationId)
@@ -5941,6 +5944,7 @@ function NewChatLandingContent({
       pendingMsgTempId: string;
       createToken: string;
     } | null = null;
+    let createdSessionId: string | undefined;
     // Single teardown for EVERY create-failure exit (the `catch` and the
     // `"error" in created` early return): drop the client-only conversation and,
     // if the user is still on it, send them back to landing so the restored
@@ -6245,6 +6249,7 @@ function NewChatLandingContent({
           serverOwnsInitialInput ? files : [],
         );
         data = { id: bundled.id };
+        createdSessionId = data.id;
         launchedAgentId = bundled.agentId ?? null;
         // Register create_session for the custom-agent (bundled) path too —
         // otherwise both sandbox and computer bundled creates emit nothing. Split
@@ -6466,6 +6471,7 @@ function NewChatLandingContent({
           return;
         }
         data = { id: created.id };
+        createdSessionId = data.id;
         // Register create_session (created → first AI activity), split by host.
         // New Chat is the only create path that can produce a managed sandbox;
         // interactionTelemetry completes/settles the span once the session runs.
@@ -6618,6 +6624,14 @@ function NewChatLandingContent({
         }
       }
     } catch {
+      if (siblingSource && createdSessionId) {
+        updateNestedSessionDraft(queryClient, nestedProvisional.id, createdSessionId);
+        void queryClient.refetchQueries({ queryKey: ["conversations"] });
+        if (localConv ? stillViewingLocalSession(localConv.tempConvId) : onScreenRef.current) {
+          navigate(sessionLocation(createdSessionId));
+        }
+        return;
+      }
       const msg = "Couldn't reach the server. Check your connection and try again.";
       returnDraftToUser(localConv?.tempConvId);
       tearDownLocalConversation();

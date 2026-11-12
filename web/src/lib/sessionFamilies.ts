@@ -5,7 +5,7 @@ import { PINNED_LABEL_KEY } from "./sessionListCache";
 export function isSessionPinned(row: Conversation, pinnedIds?: ReadonlySet<string>): boolean {
   return row.family
     ? row.family.pinned
-    : row.labels?.[PINNED_LABEL_KEY] != null || pinnedIds?.has(row.id) === true;
+    : row.labels?.[PINNED_LABEL_KEY] !== undefined || pinnedIds?.has(row.id) === true;
 }
 
 /** Display groups retain a surviving representative while deletion metadata refreshes. */

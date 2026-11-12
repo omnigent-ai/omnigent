@@ -238,18 +238,18 @@ export function sortConversations(
   sortBy: SessionSortBy = "updated_at",
   custom?: CustomSortOrder | null,
 ): Conversation[] {
+  const byId = new Map(conversations.map((row) => [row.id, row]));
   const effective = (c: Conversation): number => {
+    if (c.provisional && c.family?.representative_id && c.family.representative_id !== c.id) {
+      const source = byId.get(c.family.representative_id);
+      if (source) return effective(source);
+    }
     const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
     const updatedAt = frozenKeys?.get(c.id) ?? live;
     frozenKeys?.set(c.id, updatedAt);
-    if (c.provisional && c.family) {
-      const source = conversations.find((row) => row.id === c.family?.representative_id);
-      if (source) return sortBy === "created_at" ? source.created_at : source.updated_at;
-    }
     return sortBy === "created_at" ? c.created_at : updatedAt;
   };
   // Custom: saved rows by position, later-created sessions above, history (ties too) below.
-  const byId = custom ? new Map(conversations.map((row) => [row.id, row])) : null;
   const rank = (c: Conversation): number => {
     if (!custom) return 0;
     const representative = byId?.get(c.family?.representative_id ?? c.id) ?? c;

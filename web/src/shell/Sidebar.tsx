@@ -2203,44 +2203,41 @@ function ConversationList({
       !pagedConversations.some((row) => row.id === id) &&
       !pinnedConversations.some((row) => row.id === id),
   );
-  const representativeQueries = useQueries({
+  const draftRepresentatives = useQueries({
     queries: missingRepresentatives.map((id) => ({
       queryKey: ["conversation-backfill", id],
-      queryFn: () => fetchConversationById(id),
+      queryFn: () => fetchConversationById(id, draftQueryClient),
       staleTime: 30_000,
+      retry: 2,
     })),
+    combine: (queries) => queries.flatMap((query) => (query.data ? [query.data] : [])),
   });
-  const draftRepresentatives = representativeQueries.length
-    ? representativeQueries.map((query) => query.data).filter((row): row is Conversation => !!row)
-    : EMPTY_CONVERSATIONS;
-  const allConversations = useMemo(
+  const authoritativeRows = useMemo(
     () =>
-      withNestedSessionDrafts(
-        [
-          ...pagedConversations,
-          ...(openSessionRow ? [openSessionRow] : []),
-          ...draftRepresentatives,
-        ],
-        nestedDrafts,
-      ),
-    [pagedConversations, openSessionRow, nestedDrafts, draftRepresentatives],
+      dedupeConversationsById([
+        ...pagedConversations,
+        ...pinnedConversations,
+        ...(openSessionRow ? [openSessionRow] : []),
+        ...draftRepresentatives,
+      ]),
+    [pagedConversations, pinnedConversations, openSessionRow, draftRepresentatives],
+  );
+  const allConversations = useMemo(
+    () => withNestedSessionDrafts(authoritativeRows, nestedDrafts),
+    [authoritativeRows, nestedDrafts],
   );
   useEffect(() => {
+    const knownRows = [...authoritativeRows, ...loadedRows];
     for (const draft of nestedDrafts) {
       if (
         draft.created &&
-        pagedConversations.some((row) => row.id === draft.id && row.family) &&
-        pagedConversations.some((row) => row.id === draft.source.id && row.family)
+        knownRows.some((row) => row.id === draft.id && row.family) &&
+        knownRows.some((row) => row.id === draft.source.id && row.family)
       ) {
         removeNestedSessionDraft(draftQueryClient, draft.key);
       }
     }
-    setCollapsedFamilies((previous) => {
-      const expanded = new Set(nestedDrafts.map((draft) => draft.source.family!.id));
-      if (![...previous].some((id) => expanded.has(id))) return previous;
-      return new Set([...previous].filter((id) => !expanded.has(id)));
-    });
-  }, [nestedDrafts, pagedConversations, draftQueryClient]);
+  }, [nestedDrafts, authoritativeRows, loadedRows, draftQueryClient]);
   const groupOrder = useMemo<readonly string[]>(
     () =>
       view.grouping === "harness"
@@ -2679,22 +2676,31 @@ function ConversationList({
     });
   }, []);
 
+  const revealedDrafts = useRef(new Set<string>());
   useEffect(() => {
-    const source = nestedDrafts.find((draft) => !draft.creating)?.source;
-    if (!source) return;
-    const projectName =
-      projects.find((project) => project.id !== null && project.id === source.project_id)?.name ??
-      source.labels[PROJECT_LABEL_KEY];
-    if (!source.family?.pinned && !grouped && projectName) expandProject(projectName);
-    const section = source.family?.pinned
-      ? "Pinned"
-      : (loadedSections.groupTitles?.get(source.id) ?? "Sessions");
-    setCollapsedSections((previous) => {
-      if (!previous.includes(section)) return previous;
-      const next = previous.filter((title) => title !== section);
-      writeCollapsedSidebarSections(next);
-      return next;
-    });
+    if (nestedDrafts.length === 0) revealedDrafts.current.clear();
+    for (const draft of nestedDrafts) {
+      if (revealedDrafts.current.has(draft.key)) continue;
+      const source = draft.source;
+      const projectName =
+        projects.find((project) => project.id !== null && project.id === source.project_id)?.name ??
+        source.labels[PROJECT_LABEL_KEY];
+      if (source.project_id && !projectName) continue;
+      revealedDrafts.current.add(draft.key);
+      setCollapsedFamilies(
+        (previous) => new Set([...previous].filter((id) => id !== source.family?.id)),
+      );
+      if (!source.family?.pinned && !grouped && projectName) expandProject(projectName);
+      const section = source.family?.pinned
+        ? "Pinned"
+        : (loadedSections.groupTitles?.get(source.id) ?? "Sessions");
+      setCollapsedSections((previous) => {
+        if (!previous.includes(section)) return previous;
+        const next = previous.filter((title) => title !== section);
+        writeCollapsedSidebarSections(next);
+        return next;
+      });
+    }
   }, [nestedDrafts, projects, grouped, expandProject, loadedSections.groupTitles]);
 
   // ── Drag-and-drop: file sessions into / out of projects ────────────────────
@@ -6361,59 +6367,62 @@ function ConversationRowImpl({
             >
               {/* Archived rows omit the pin entirely: pinning is meaningless there
               (archive outranks pin), so there's no pin action even on hover. */}
-              {showQuickActions && !isArchived && !familyIndented && (
-                <Tooltip disableHoverableContent>
-                  <TooltipContent
-                    shortcut={
-                      sessionShortcuts.has("toggle-pin-session") ? PIN_SESSION_KEYS : undefined
-                    }
-                  >
-                    {pinTooltip}
-                  </TooltipContent>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
-                      data-testid="quick-pin-conversation"
-                      aria-disabled={pinSaving || (!isPinned && atPinCap)}
-                      className={cn(
-                        // Desktop-only quick affordance: hidden on mobile (the kebab's
-                        // Pin item below covers that), hover/focus-revealed from `md`
-                        // up. Pinned rows no longer keep a persistent pin marker, since
-                        // the "Pinned" section header (and pinned-first ordering inside
-                        // a project) already conveys the pinned state. Revealed glyph:
-                        // unpin if pinned, pin otherwise.
-                        //
-                        // `md:inline-flex` (not `md:block`): the Button base is
-                        // `inline-flex` and relies on it for `items-center
-                        // justify-center` to center the icon. `md:block` would override
-                        // that display and collapse the centering, leaving the glyph
-                        // pinned to the top-left of the button — so keep the flex
-                        // display when revealing it.
-                        "text-muted-foreground transition-opacity",
-                        "hidden md:inline-flex",
-                        "md:opacity-0 md:group-hover:opacity-100",
-                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-100",
-                      )}
-                      onClick={(e) => {
-                        // Keep the toggle click off the surrounding Link (no navigation).
-                        e.preventDefault();
-                        e.stopPropagation();
-                        if (pinSaving) return;
-                        onTogglePinned(conversation.id);
-                      }}
+              {showQuickActions &&
+                !isArchived &&
+                !familyIndented &&
+                !isIndentedSibling(conversation) && (
+                  <Tooltip disableHoverableContent>
+                    <TooltipContent
+                      shortcut={
+                        sessionShortcuts.has("toggle-pin-session") ? PIN_SESSION_KEYS : undefined
+                      }
                     >
-                      {isPinned ? (
-                        <PinOffIcon className="size-3.5" data-icon-size="14" />
-                      ) : (
-                        <PinIcon className="size-3.5" data-icon-size="14" />
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                </Tooltip>
-              )}
+                      {pinTooltip}
+                    </TooltipContent>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
+                        data-testid="quick-pin-conversation"
+                        aria-disabled={pinSaving || (!isPinned && atPinCap)}
+                        className={cn(
+                          // Desktop-only quick affordance: hidden on mobile (the kebab's
+                          // Pin item below covers that), hover/focus-revealed from `md`
+                          // up. Pinned rows no longer keep a persistent pin marker, since
+                          // the "Pinned" section header (and pinned-first ordering inside
+                          // a project) already conveys the pinned state. Revealed glyph:
+                          // unpin if pinned, pin otherwise.
+                          //
+                          // `md:inline-flex` (not `md:block`): the Button base is
+                          // `inline-flex` and relies on it for `items-center
+                          // justify-center` to center the icon. `md:block` would override
+                          // that display and collapse the centering, leaving the glyph
+                          // pinned to the top-left of the button — so keep the flex
+                          // display when revealing it.
+                          "text-muted-foreground transition-opacity",
+                          "hidden md:inline-flex",
+                          "md:opacity-0 md:group-hover:opacity-100",
+                          "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-100",
+                        )}
+                        onClick={(e) => {
+                          // Keep the toggle click off the surrounding Link (no navigation).
+                          e.preventDefault();
+                          e.stopPropagation();
+                          if (pinSaving) return;
+                          onTogglePinned(conversation.id);
+                        }}
+                      >
+                        {isPinned ? (
+                          <PinOffIcon className="size-3.5" data-icon-size="14" />
+                        ) : (
+                          <PinIcon className="size-3.5" data-icon-size="14" />
+                        )}
+                      </Button>
+                    </TooltipTrigger>
+                  </Tooltip>
+                )}
               {/* Archive is owner-only, same as the kebab's Archive item; non-owners
               don't get the quick affordance and instead see that item disabled
               with an explanation. */}

@@ -68,6 +68,16 @@ describe("unpinWithUndo", () => {
       }),
     );
     await screen.findByText("Unpinned session");
+    queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, {
+      conversations: [
+        {
+          id: "conv_a",
+          ...row("Group", "1"),
+          family: { id: "family", representative_id: "conv_a", pinned: false },
+        },
+      ],
+      filterHonored: true,
+    });
     act(() => fireEvent.click(screen.getByRole("button", { name: "Undo" })));
     expect(writePin).toHaveBeenLastCalledWith({ id: "conv_a", pinned: true, pinnedAt: 2000 });
   });

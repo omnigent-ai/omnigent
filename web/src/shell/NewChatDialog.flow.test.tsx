@@ -516,15 +516,7 @@ describe("NewChatLandingScreen create flow", () => {
             ),
           ),
       );
-      const client = renderLanding([], { sibling_sessions: true });
-      await waitFor(() =>
-        expect(client.getQueryData(["nested-session-drafts"])).toEqual([
-          expect.objectContaining({
-            source: expect.objectContaining({ id: "source" }),
-            creating: false,
-          }),
-        ]),
-      );
+      renderLanding([], { sibling_sessions: true });
       await screen.findByTestId("new-chat-landing-input");
       expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
         `Working directory: ${sourceDirectory}`,
@@ -607,11 +599,6 @@ describe("NewChatLandingScreen create flow", () => {
               }
             : undefined;
       expect(body.git).toEqual(expectedGit);
-      await waitFor(() =>
-        expect(client.getQueryData(["nested-session-drafts"])).toEqual([
-          expect.objectContaining({ id: "conv_new", creating: true, created: true }),
-        ]),
-      );
     },
   );
 
@@ -722,6 +709,7 @@ describe("NewChatLandingScreen create flow", () => {
       removeLocalConversationMock.mockReturnValue(true);
       let resolveCreate!: (response: Response) => void;
       let sourceUnavailable = false;
+      let sourceTitle = "Source";
       vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
         if (String(url).startsWith("/v1/sessions/source?")) {
           if (sourceUnavailable) {
@@ -730,7 +718,7 @@ describe("NewChatLandingScreen create flow", () => {
           return new Response(
             JSON.stringify({
               id: "source",
-              title: "Source",
+              title: sourceTitle,
               host_id: "host_1",
               workspace: SEEDED_WORKSPACE,
               agent_id: "ag_hello",
@@ -746,7 +734,7 @@ describe("NewChatLandingScreen create flow", () => {
       });
       const info = { features: { canvas: true }, sibling_sessions: true };
       try {
-        renderLanding([], info);
+        const client = renderLanding([], info);
         await waitForWorkspaceSeed();
         typeMessage("Keep this scoped draft");
         fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
@@ -754,6 +742,15 @@ describe("NewChatLandingScreen create flow", () => {
         });
         fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
         await waitFor(() => expect(resolveCreate).toBeDefined());
+        if (query.startsWith("sibling=")) {
+          sourceTitle = "Renamed source";
+          await act(async () => {
+            await client.invalidateQueries({ queryKey: ["sibling-source", "source"] });
+          });
+          expect(client.getQueryData(["nested-session-drafts"])).toEqual([
+            expect.objectContaining({ creating: true, created: false }),
+          ]);
+        }
         cleanup();
         sourceUnavailable = sourceDeleted;
         await act(async () => {
@@ -761,11 +758,14 @@ describe("NewChatLandingScreen create flow", () => {
             new Response(JSON.stringify({ detail: "Source unavailable" }), { status: 403 }),
           );
         });
+        if (query.startsWith("sibling=")) {
+          expect(client.getQueryData(["nested-session-drafts"])).toEqual([]);
+        }
         await waitFor(() =>
           expect(navigateMock).toHaveBeenLastCalledWith({ pathname: "/", search: `?${query}` }),
         );
         searchParams = new URLSearchParams(window.location.search);
-        renderLanding([], info);
+        const reopenedClient = renderLanding([], info);
         if (sourceDeleted) {
           expect(await screen.findByText("Source session is unavailable.")).toBeVisible();
           fireEvent.click(screen.getByRole("button", { name: "Continue in a new session" }));
@@ -778,6 +778,10 @@ describe("NewChatLandingScreen create flow", () => {
         expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this scoped draft");
         expect(screen.getByText("notes.txt")).toBeVisible();
         expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+        if (query.startsWith("sibling=") && !sourceDeleted) {
+          cleanup();
+          expect(reopenedClient.getQueryData(["nested-session-drafts"])).toEqual([]);
+        }
       } finally {
         window.history.replaceState({}, "", previousUrl);
       }

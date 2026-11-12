@@ -22,7 +22,7 @@ type WritePin = (vars: { id: string; pinned: boolean; pinnedAt?: number }) => Pr
 function isPinnedNow(queryClient: QueryClient, id: string): boolean {
   const pins = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
   return (
-    (pins?.conversations.some((c) => c.id === id) ?? false) ||
+    (pins?.conversations.some((c) => c.id === id && (c.family?.pinned ?? true)) ?? false) ||
     readPinnedConversationIds().includes(id)
   );
 }

@@ -3644,6 +3644,8 @@ def register_core_routes(
                 retained = active or members
                 if retained and retained[0].id == session_id:
                     family_pin_value = labels_to_set.pop(PINNED_LABEL_KEY)
+                    if not family_pin_value:
+                        labels_to_set[pinned_label_key(user_id)] = ""
         # Pins are per-user. The client writes the canonical ``omnigent.pinned``
         # key; rewrite it to the caller's per-user key so one user's pin doesn't
         # pin the session for everyone with access. Empty value (unpin) carries
