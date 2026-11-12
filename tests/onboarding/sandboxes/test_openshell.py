@@ -740,8 +740,10 @@ def test_client_create_sandbox_custom_workspace(sdk: _SDKState) -> None:
 
 
 @pytest.mark.parametrize("exec_path", ["execute", "run_foreground", "exec_background"])
-def test_client_execs_pin_sandbox_context(sdk: _SDKState, exec_path: str) -> None:
-    """Every exec path supplies the sandbox identity, home and environment explicitly."""
+def test_client_execs_address_the_sandbox_by_name_in_its_workspace(
+    sdk: _SDKState, exec_path: str
+) -> None:
+    """Every exec path reaches the sandbox by name in the client's workspace, with no lookup."""
     client = _OpenShellClient(workspace="team-beta")
 
     if exec_path == "execute":
@@ -756,8 +758,21 @@ def test_client_execs_pin_sandbox_context(sdk: _SDKState, exec_path: str) -> Non
     assert calls[-1][0] == "other-box"
     assert sdk.last_workspace == "team-beta"
     assert sdk.got == []
+
+
+def test_client_execute_pins_sandbox_home(sdk: _SDKState) -> None:
+    """
+    Execs run with cwd + ``$HOME`` set to the non-root sandbox user's home.
+
+    OpenShell runs as the ``sandbox`` user; without this the host image's
+    ``/root`` cwd/home is unreadable to it and ``omnigent host`` crashes.
+    """
+    client = _OpenShellClient()
+
+    client.execute("box", ["printf", "%s", "$HOME"])
+
     assert sdk.last_workdir == "/sandbox"
-    assert sdk.last_env == {"HOME": "/sandbox", "IS_SANDBOX": "1"}
+    assert sdk.last_env == {"HOME": "/sandbox"}
 
 
 def test_client_resume_waits_ready(sdk: _SDKState) -> None:

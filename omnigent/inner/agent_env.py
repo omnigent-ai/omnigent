@@ -11,7 +11,6 @@ harness added is filtered by construction rather than by remembering.
 The model is not "no credentials ever". It is:
 
     shared safe base  +  this harness's own config/provider families
-                      +  the Git credential-helper pair in managed sandboxes
                       +  exact names the host owner forwarded through
                          ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``
                       +  whatever the spec declared in
@@ -39,9 +38,6 @@ from omnigent.runner.identity import (
 DESKTOP_SESSION_ENV_VARS: frozenset[str] = frozenset(
     {"DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"}
 )
-
-# The managed host image's Git credential helper reads these exact names.
-SANDBOX_GIT_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset({"GIT_TOKEN", "GIT_USERNAME"})
 
 # Categories every POSIX CLI needs regardless of vendor: where the user's
 # config lives, how to reach the network, how to format output, where to put
@@ -122,9 +118,8 @@ def clean_agent_env(
         ``os_env.sandbox.env_passthrough``. This is the documented escape hatch
         for an agent that authenticates from a variable outside its own family.
     :param source: Environment to filter. Defaults to ``os.environ``; injectable
-        for tests. Its ``IS_SANDBOX`` marker controls the Git credential grant;
-        its ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` names are also allowed, subject
-        to the deny rules.
+        for tests. Its ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` names are also
+        allowed, subject to the deny rules.
     :returns: A filtered copy without runner-auth secrets that also keeps the
         variables the launching CLI forwarded for this session; desktop-session
         variables require ``extra_allowed``.
@@ -144,8 +139,6 @@ def clean_agent_env(
         | operator_names
         | forwarded_session_env_names(env_source)
     )
-    if (env_source.get("IS_SANDBOX") or "").strip() == "1":
-        exact |= SANDBOX_GIT_CREDENTIAL_ENV_VARS
     denied = set(deny_exact) | RUNNER_AUTH_SECRET_ENV_VARS | (DESKTOP_SESSION_ENV_VARS - extra)
     filtered = {
         key: value

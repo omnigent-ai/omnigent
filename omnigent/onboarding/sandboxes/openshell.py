@@ -46,7 +46,6 @@ from typing import TYPE_CHECKING, ClassVar, TypeVar, cast
 
 import click
 
-from omnigent.host.identity_env import MANAGED_SANDBOX_ENV_VAR
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     RemoteCommandResult,
@@ -258,8 +257,7 @@ class _OpenShellClient:
                 stdin=stdin,
                 timeout_seconds=timeout,
                 workdir=_SANDBOX_HOME,
-                # OpenShell execs rebuild the environment instead of inheriting image ENV.
-                env={"HOME": _SANDBOX_HOME, MANAGED_SANDBOX_ENV_VAR: "1"},
+                env={"HOME": _SANDBOX_HOME},
             ),
         )
 
@@ -276,7 +274,7 @@ class _OpenShellClient:
                 workspace=self._workspace,
                 timeout_seconds=timeout,
                 workdir=_SANDBOX_HOME,
-                env={"HOME": _SANDBOX_HOME, MANAGED_SANDBOX_ENV_VAR: "1"},
+                env={"HOME": _SANDBOX_HOME},
             ):
                 if isinstance(item, ExecResult):
                     exit_code = int(item.exit_code)
@@ -316,7 +314,7 @@ class _OpenShellClient:
                     workspace=ws,
                     timeout_seconds=timeout,
                     workdir=_SANDBOX_HOME,
-                    env={"HOME": _SANDBOX_HOME, MANAGED_SANDBOX_ENV_VAR: "1"},
+                    env={"HOME": _SANDBOX_HOME},
                 ):
                     pass
             except Exception:

@@ -2644,18 +2644,14 @@ def test_spawn_env_env_unset_strips_declared_names(monkeypatch: pytest.MonkeyPat
             command="agent stdio",
             name="Grok",
             env_passthrough=("XAI_API_KEY", "DEEPSEEK_API_KEY"),
-            env_unset=("XAI_API_KEY", "GIT_TOKEN", "GIT_USERNAME"),
+            env_unset=("XAI_API_KEY",),
         )
     )
     monkeypatch.setenv("XAI_API_KEY", "xai-secret")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "ds-secret")
-    monkeypatch.setenv("IS_SANDBOX", "1")
-    monkeypatch.setenv("GIT_TOKEN", "canary-git")
-    monkeypatch.setenv("GIT_USERNAME", "git-user")
     env = ex._build_spawn_env()
     assert env.get("DEEPSEEK_API_KEY") == "ds-secret"
     assert "XAI_API_KEY" not in env
-    assert {"GIT_TOKEN", "GIT_USERNAME"}.isdisjoint(env)
 
     monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "XAI_API_KEY")
     assert "XAI_API_KEY" not in ex._build_spawn_env()
