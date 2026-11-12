@@ -26,9 +26,10 @@ def statuses(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
 
 def _launch(tracker: ClaudeMcpSignInTracker, session_id: str) -> _Pane:
     """Start a pane the way the runner does: record, launch, hand the record over."""
-    tracker.note_launching(session_id)
+    launch = object()
+    tracker.note_launching(session_id, launch)
     pane = _Pane()
-    tracker.note_launched(session_id, pane)
+    tracker.note_launched(session_id, pane, launch=launch)
     return pane
 
 
@@ -82,8 +83,9 @@ def test_a_launch_that_finds_its_pane_running_keeps_the_pane_record(
     pane = _launch(tracker, "conv_a")
     statuses["linear"] = "connected"
 
-    tracker.note_launching("conv_a")
-    tracker.note_launched("conv_a", pane, previous=pane)
+    launch = object()
+    tracker.note_launching("conv_a", launch)
+    tracker.note_launched("conv_a", pane, launch=launch, previous=pane)
 
     assert tracker.signed_in_since_launch("conv_a", pane) == {"linear"}
 
@@ -93,8 +95,9 @@ def test_a_launch_without_a_pane_leaves_nothing_for_a_later_pane(
 ) -> None:
     tracker = ClaudeMcpSignInTracker()
     statuses["linear"] = "sign_in_required"
-    tracker.note_launching("conv_a")
-    tracker.note_launched("conv_a", None)
+    launch = object()
+    tracker.note_launching("conv_a", launch)
+    tracker.note_launched("conv_a", None, launch=launch)
     statuses["linear"] = "connected"
 
     assert tracker.signed_in_since_launch("conv_a", _Pane()) == frozenset()
@@ -112,3 +115,34 @@ def test_a_pane_the_runner_did_not_start_is_recorded_when_first_checked(
     assert tracker.signed_in_since_launch("conv_a", pane) == {"linear"}
     tracker.forget("conv_a")
     assert tracker.signed_in_since_launch("conv_a", pane) == frozenset()
+
+
+def test_a_launch_that_never_recorded_leaves_another_launch_record(
+    statuses: dict[str, str],
+) -> None:
+    """A caller cancelled while another launch held the lock can't discard that launch's record."""
+    tracker = ClaudeMcpSignInTracker()
+    statuses["linear"] = "sign_in_required"
+    launching, waiting = object(), object()
+    tracker.note_launching("conv_a", launching)
+    # The waiter is cancelled before it records anything, and finishes with its own token.
+    tracker.note_launched("conv_a", None, launch=waiting)
+    pane = _Pane()
+    tracker.note_launched("conv_a", pane, launch=launching)
+    statuses["linear"] = "connected"
+
+    assert tracker.signed_in_since_launch("conv_a", pane) == {"linear"}
+
+
+def test_a_late_check_for_a_replaced_pane_keeps_the_new_pane_record(
+    statuses: dict[str, str],
+) -> None:
+    """A check still reading for the old pane after a restart keeps the new pane's record."""
+    tracker = ClaudeMcpSignInTracker()
+    statuses["linear"] = "sign_in_required"
+    old_pane = _Pane()
+    new_pane = _launch(tracker, "conv_a")
+    statuses["linear"] = "connected"
+
+    assert tracker.signed_in_since_launch("conv_a", old_pane) == frozenset()
+    assert tracker.signed_in_since_launch("conv_a", new_pane) == {"linear"}

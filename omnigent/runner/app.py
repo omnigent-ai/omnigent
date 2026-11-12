@@ -246,6 +246,8 @@ _CLAUDE_RECONNECT_DEADLINE_S = 50.0
 # A message's automatic restart, which runs while that message holds the line;
 # past it the message is delivered without the restart.
 _CLAUDE_AUTO_RESTART_DEADLINE_S = 15.0
+# What Reconnect's answer after its deadline may spend listing the servers.
+_CLAUDE_TIMEOUT_ANSWER_S = 5.0
 _CLAUDE_START_IT = "Send a message to start it."
 # What /mcp shows for a server that signed in after a claude-native session's
 # Claude Code started.
@@ -3415,6 +3417,8 @@ def create_runner_app(
                 Callable[[], Awaitable[AgentSpec | ResolvedSpec | None]] | None
             ) = None
 
+            # This launch's own sign-in record, if it gets to start the pane.
+            claude_launch_token = object()
             if harness_name == "claude-native":
 
                 async def _claude_pre_launch(has_terminal: bool) -> PreLaunchResult:
@@ -3485,7 +3489,9 @@ def create_runner_app(
                     )
                     if bundle_dir is not None:
                         _ensure_orchestrator_skills_in_bundle(bundle_dir, spec)
-                    await asyncio.to_thread(_claude_mcp_sign_in.note_launching, session_id)
+                    await asyncio.to_thread(
+                        _claude_mcp_sign_in.note_launching, session_id, claude_launch_token
+                    )
                     return dataclasses.replace(
                         ctx,
                         bundle_dir=bundle_dir,
@@ -3633,6 +3639,7 @@ def create_runner_app(
                         _claude_terminals.get(session_id, "claude", "main")
                         if _claude_terminals is not None
                         else None,
+                        launch=claude_launch_token,
                         previous=_claude_pane_before,
                     )
             # Only claude reported terminal_ready in the create-session response.
@@ -9683,8 +9690,16 @@ def create_runner_app(
                 if pane is None:
                     late = f"Claude Code didn't start again in time. {_CLAUDE_START_IT}"
                     return {**_CLAUDE_NOT_RUNNING, "reconnect_error": late}
-                body = await asyncio.to_thread(_claude_live_mcp_body, conv_id, pane)
-                return {**body, "reconnect_error": "Reconnect took too long. Try again."}
+                too_long = "Reconnect took too long. Try again."
+                try:
+                    # Bounded too: host inventory discovery can be slow.
+                    body = await asyncio.wait_for(
+                        asyncio.to_thread(_claude_live_mcp_body, conv_id, pane),
+                        _CLAUDE_TIMEOUT_ANSWER_S,
+                    )
+                except TimeoutError:
+                    body = {"running": True, "partial": True, "servers": []}
+                return {**body, "reconnect_error": too_long}
             except asyncio.CancelledError:
                 current = asyncio.current_task()
                 # Cancelled by the session's deletion, not by this request going away.

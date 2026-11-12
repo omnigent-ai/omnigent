@@ -425,6 +425,8 @@ def register_resource_routes(
             _ensure_finalize: Callable[[SessionResourceView], JSONResponse] | None = None
             _ensure_conflict: str | None = None
 
+            # This request's own launch record, if it gets to start the pane.
+            claude_launch_token = object()
             if terminal_name == "claude":
 
                 async def _claude_ensure_build(
@@ -435,7 +437,9 @@ def register_resource_routes(
                     # carries its skills rather than the parent's.
                     claude_entry = await _resolve_session_spec_entry(session_id)
                     claude_agent_spec = _unwrap_resolved_spec(claude_entry)
-                    await asyncio.to_thread(claude_mcp_sign_in.note_launching, session_id)
+                    await asyncio.to_thread(
+                        claude_mcp_sign_in.note_launching, session_id, claude_launch_token
+                    )
                     return dataclasses.replace(
                         ctx,
                         agent_spec=claude_entry,
@@ -536,6 +540,7 @@ def register_resource_routes(
                     claude_mcp_sign_in.note_launched(
                         session_id,
                         terminal_registry.get(session_id, "claude", "main"),
+                        launch=claude_launch_token,
                         previous=claude_pane_before,
                     )
             if _ensure_result is not None:
@@ -627,9 +632,12 @@ def register_resource_routes(
             if claude_launch and terminal_registry is not None
             else None
         )
+        cli_launch_token = object()
         try:
             if claude_launch:
-                await asyncio.to_thread(claude_mcp_sign_in.note_launching, session_id)
+                await asyncio.to_thread(
+                    claude_mcp_sign_in.note_launching, session_id, cli_launch_token
+                )
             launch_method = (
                 resource_registry.launch_required_terminal
                 if bridge_inject
@@ -664,6 +672,7 @@ def register_resource_routes(
                     terminal_registry.get(session_id, "claude", "main")
                     if terminal_registry is not None
                     else None,
+                    launch=cli_launch_token,
                     previous=claude_pane_before,
                 )
 

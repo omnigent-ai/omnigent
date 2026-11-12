@@ -1522,38 +1522,60 @@ async def test_a_reconnect_past_its_deadline_frees_the_line_and_starts_nothing_l
 async def test_a_reconnect_waiting_in_line_is_bounded_by_its_deadline(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A Reconnect queued behind a stalled one answers in time, and the line frees up."""
+    """A Reconnect queued behind a slow one expires while it waits, and answers in time."""
+    import omnigent.runner.native.claude_mcp_sign_in as sign_in_module
+
     conv_id = "aeb2c3d4e5f60718293a4b5c6d7e8f90"
-    monkeypatch.setattr(runner_app, "_CLAUDE_RECONNECT_DEADLINE_S", 1.0)
+    monkeypatch.setattr(runner_app, "_CLAUDE_TIMEOUT_ANSWER_S", 0.2)
     checking, release = _hold_restart_attach_check(monkeypatch)
     harness = _ScriptedHarnessClient([])
     app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
         monkeypatch, tmp_path, conv_id, harness_client=harness
     )
     statuses["linear"] = "connected"
+    # Host inventory discovery that turns slow while the queued request answers.
+    slow = threading.Event()
+    discover = sign_in_module.harness_sign_in_by_live_name
+
+    def _sometimes_slow(harness_name: str) -> dict[str, str]:
+        if slow.is_set():
+            time.sleep(1.0)
+        return discover(harness_name)
+
+    monkeypatch.setattr(sign_in_module, "harness_sign_in_by_live_name", _sometimes_slow)
     url = f"/v1/sessions/{conv_id}/live-mcp-servers/reconnect"
 
     async with _runner_client(app) as client:
-        # The first stalls in its checks while holding the line; the second waits behind it.
+        # The head request, with a long budget, holds the line in its checks.
+        monkeypatch.setattr(runner_app, "_CLAUDE_RECONNECT_DEADLINE_S", 30.0)
         first = asyncio.create_task(client.post(url, json={"name": "linear"}))
         await poll_until_async(checking.is_set, timeout_s=5)
-        second = asyncio.create_task(client.post(url, json={"name": "linear"}))
-        # Within its own deadline of being sent, waiting in line included.
-        queued = await asyncio.wait_for(second, timeout=1.6)
-        answers = [await asyncio.wait_for(first, timeout=5), queued]
+        # The queued one, with a short budget, expires while still waiting behind it.
+        monkeypatch.setattr(runner_app, "_CLAUDE_RECONNECT_DEADLINE_S", 1.0)
+        slow.set()
+        queued = await asyncio.wait_for(
+            client.post(url, json={"name": "linear"}), timeout=1.0 + 0.2 + 0.5
+        )
+        slow.clear()
+        assert not first.done(), "the head request should still hold the line"
         release.set()
-        # The later message needs no restart of its own, so any restart came from Reconnect.
-        statuses["linear"] = "sign_in_required"
+        head = await asyncio.wait_for(first, timeout=5)
         message = await asyncio.wait_for(
             client.post(f"/v1/sessions/{conv_id}/events", json=_MESSAGE), timeout=5
         )
         assert message.status_code < 300, message.text
         await poll_until_async(lambda: bool(harness.posted_bodies), timeout_s=5)
 
-    assert [answer.json()["reconnect_error"] for answer in answers] == [
-        "Reconnect took too long. Try again."
-    ] * 2
-    assert (closes, relaunched) == ([], [])
+    # Answered without the slow inventory read, and it restarted nothing.
+    assert queued.json() == {
+        "running": True,
+        "partial": True,
+        "servers": [],
+        "reconnect_error": "Reconnect took too long. Try again.",
+    }
+    assert "reconnect_error" not in head.json(), head.text
+    # Only the head request restarted Claude Code.
+    assert (closes, relaunched) == ([conv_id], [conv_id])
 
 
 @pytest.mark.asyncio
@@ -1591,6 +1613,45 @@ async def test_a_message_is_admitted_when_its_restart_check_stalls(
     assert first.status_code < 300, first.text
     assert later.status_code < 300, later.text
     assert (closes, relaunched) == ([], [])
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_ensure_keeps_the_running_launch_sign_in_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An ensure cancelled while another launch holds the lock leaves that launch's record."""
+    conv_id = "b0b2c3d4e5f60718293a4b5c6d7e8f90"
+    gate = asyncio.Event()
+    app, _closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
+        monkeypatch, tmp_path, conv_id, relaunch_gate=gate
+    )
+    # linear makes the pane eligible; notion still needs sign-in as the relaunch starts.
+    statuses.update({"linear": "connected", "notion": "sign_in_required"})
+    ensure = {"terminal": "claude", "session_key": "main", "ensure_native_terminal": True}
+
+    async with _runner_client(app) as client:
+        reconnect = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{conv_id}/live-mcp-servers/reconnect", json={"name": "linear"}
+            )
+        )
+        await poll_until_async(lambda: relaunched == [conv_id], timeout_s=5)
+        waiting = asyncio.create_task(
+            client.post(f"/v1/sessions/{conv_id}/resources/terminals", json=ensure)
+        )
+        await asyncio.sleep(
+            0.3
+        )  # custom-lint: disable=sleep-then-assert -- let it wait on the lock
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        # Sign-in finishes before anything checks the new pane.
+        statuses["notion"] = "connected"
+        gate.set()
+        assert (await asyncio.wait_for(reconnect, timeout=5)).status_code == 200
+        status = await client.get(f"/v1/sessions/{conv_id}/live-mcp-servers")
+
+    assert [server["name"] for server in status.json()["servers"]] == ["notion"], status.text
 
 
 @pytest.mark.asyncio

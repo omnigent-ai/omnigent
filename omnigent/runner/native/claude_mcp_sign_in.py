@@ -28,38 +28,52 @@ class ClaudeMcpSignInTracker:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # A launch in progress: the servers that needed sign-in as it began.
-        self._launching: dict[str, frozenset[str]] = {}
+        # A launch in progress: its owner's token, and the servers that needed
+        # sign-in as it began.
+        self._launching: dict[str, tuple[object, frozenset[str]]] = {}
         # The session's pane and the servers that needed sign-in as it started.
         self._panes: dict[str, tuple[weakref.ref[object], frozenset[str]]] = {}
 
-    def note_launching(self, session_id: str) -> None:
+    def note_launching(self, session_id: str, launch: object) -> None:
         """Record which Claude servers need sign-in as the runner starts *session_id*'s pane.
 
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+        :param launch: A token the launching caller owns, e.g. ``object()``; only
+            :meth:`note_launched` with the same token finishes this record.
         """
         signed_out = _signed_out_claude_servers()
         with self._lock:
-            self._launching[session_id] = signed_out
+            self._launching[session_id] = (launch, signed_out)
 
     def note_launched(
-        self, session_id: str, pane: object | None, *, previous: object | None = None
+        self,
+        session_id: str,
+        pane: object | None,
+        *,
+        launch: object,
+        previous: object | None = None,
     ) -> None:
-        """Give the state recorded as the launch began to the pane it produced.
+        """Give the state *launch* recorded as it began to the pane it produced.
 
         Call it however the launch ends, so a failed or cancelled one leaves no
-        state behind for a later launch to hand out.
+        state behind for a later launch to hand out. A caller that never recorded
+        (e.g. one cancelled while another launch held the lock) leaves that other
+        launch's record alone.
 
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param pane: The session's terminal instance after the launch, or ``None``
-            when the launch produced none. A no-op when no launch was recorded.
+            when the launch produced none.
+        :param launch: The token given to :meth:`note_launching`.
         :param previous: The pane running before the launch; a launch that found
             it running leaves that pane its own record.
         """
         with self._lock:
-            signed_out = self._launching.pop(session_id, None)
-            if signed_out is not None and pane is not None and pane is not previous:
-                self._panes[session_id] = (weakref.ref(pane), signed_out)
+            recorded = self._launching.get(session_id)
+            if recorded is None or recorded[0] is not launch:
+                return
+            del self._launching[session_id]
+            if pane is not None and pane is not previous:
+                self._panes[session_id] = (weakref.ref(pane), recorded[1])
 
     def signed_in_since_launch(self, session_id: str, pane: object) -> frozenset[str]:
         """Name the Claude servers that needed sign-in when *pane* started and are signed in now.
@@ -76,7 +90,8 @@ class ClaudeMcpSignInTracker:
             signed_out = _signed_out_claude_servers()
             with self._lock:
                 recorded = self._panes.get(session_id)
-                if recorded is None or recorded[0]() is not pane:
+                # A late check for a replaced pane must not take a newer pane's record.
+                if recorded is None or recorded[0]() is None:
                     self._panes[session_id] = (weakref.ref(pane), signed_out)
         if not signed_out:
             return frozenset()
