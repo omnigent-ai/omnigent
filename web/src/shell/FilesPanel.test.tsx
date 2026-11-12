@@ -2091,3 +2091,89 @@ describe("FilesPanel double-click navigation", () => {
     expect(onFileSelect).toHaveBeenCalledWith("src/App.tsx");
   });
 });
+
+describe("FilesPanel beside an open file", () => {
+  const UNCONFINED = {
+    unconfined: true,
+    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+  };
+  beforeEach(() => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
+  });
+
+  it("opens a tree file in a tab by its absolute path at an outside browse location", () => {
+    const onFileSelect = vi.fn();
+    const onFileOpenInTab = vi.fn();
+    const view = renderPanel({
+      conversationId: "conv_tab_abs",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+    view.rerender(panelAt("conv_tab_abs", { onFileSelect, onFileOpenInTab }));
+    useAllFilesMock.mockImplementation((_id: unknown, _opts: unknown, location?: string) =>
+      location === "/etc" ? allFilesResult([file("hosts")]) : allFilesResult([]),
+    );
+    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    fireEvent.click(screen.getByTestId("stub-picker-confirm"));
+
+    fireEvent.click(screen.getByText("hosts"), { ctrlKey: true });
+    expect(onFileOpenInTab).toHaveBeenCalledWith("/etc/hosts");
+    expect(onFileSelect).not.toHaveBeenCalled();
+  });
+
+  it("puts a panel-wide header with Close file above the tree column and the file", () => {
+    const view = renderPanel({
+      conversationId: "conv_preview",
+      files: [file("a.md")],
+      workingDir: "/home/user/proj",
+    });
+    expect(screen.queryByRole("button", { name: "Close file" })).toBeNull();
+    const onClose = vi.fn();
+    const viewerRef = vi.fn();
+    view.rerender(
+      panelAt("conv_preview", {
+        compactTreeControls: true,
+        selectedFilePath: "a.md",
+        preview: {
+          treeWidth: 240,
+          rowRef: { current: null },
+          viewerRef,
+          separator: <div role="separator" aria-label="Resize file tree" />,
+          onClose,
+        },
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Close file" }));
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(viewerRef).toHaveBeenLastCalledWith(expect.any(HTMLDivElement));
+    expect(screen.getByText("a.md").closest("button")).toHaveAttribute("aria-current", "true");
+
+    const header = document.querySelector('[data-files-header="true"]')!;
+    const column = screen
+      .getByRole("searchbox", { name: "Search all files" })
+      .closest<HTMLElement>("[style]")!;
+    expect(column).toHaveStyle({ width: "240px" });
+    expect(header.contains(column)).toBe(false);
+    expect(column.parentElement!.parentElement).toBe(header.parentElement);
+    expect(column.nextElementSibling).toBe(screen.getByRole("separator"));
+  });
+
+  it("keeps Copy folder path and Refresh in Folder actions for narrow headers", async () => {
+    const view = renderPanel({
+      conversationId: "conv_actions",
+      files: [],
+      workingDir: "/home/user/proj",
+    });
+    expect(screen.queryByRole("button", { name: "Folder actions" })).toBeNull();
+    view.rerender(panelAt("conv_actions", { compactTreeControls: true }));
+    const actions = screen.getByRole("button", { name: "Folder actions" });
+    fireEvent.pointerDown(actions, { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Copy folder path" }));
+    expect(copyTextMock).toHaveBeenCalledWith("/home/user/proj");
+    fireEvent.pointerDown(actions, { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Refresh files" }));
+    await waitFor(() => expect(allFilesRefetchMock).toHaveBeenCalled());
+  });
+});

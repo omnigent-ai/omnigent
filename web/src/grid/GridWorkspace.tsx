@@ -186,9 +186,12 @@ function GridSidebarRow({
 export function RearrangeableGrid({
   grid,
   onOpenSidebar,
+  fileTreeSplitEnabled = false,
 }: {
   grid: SessionGrid;
   onOpenSidebar?: () => void;
+  /** Cells show a plainly clicked Files-tree file beside the tree, like the main rail. */
+  fileTreeSplitEnabled?: boolean;
 }) {
   const { layout } = grid;
   const sessionIds = gridSessionIds(layout);
@@ -245,6 +248,7 @@ export function RearrangeableGrid({
     open: workspace.open,
     width,
     maximized,
+    fileTreeSplitEnabled,
     onToggleMaximized: () => setMaximized((previous) => !previous),
     handleProps: {
       tabIndex: 0,
@@ -397,8 +401,9 @@ function preventLinkDrop(event: DragEvent<HTMLElement>) {
 export function GridWorkspace({
   children,
   onOpenSidebar,
+  fileTreeSplitEnabled,
   ...canvasProps
-}: ComponentProps<typeof CanvasWorkspace>) {
+}: ComponentProps<typeof CanvasWorkspace> & { fileTreeSplitEnabled?: boolean }) {
   const content = (
     <CanvasWorkspace {...canvasProps} onOpenSidebar={onOpenSidebar}>
       {children}
@@ -443,7 +448,12 @@ export function GridWorkspace({
       onDropCapture={preventLinkDrop}
     >
       {grids.activeGrid ? (
-        <RearrangeableGrid key={gridId} grid={grids.activeGrid} onOpenSidebar={onOpenSidebar} />
+        <RearrangeableGrid
+          key={gridId}
+          grid={grids.activeGrid}
+          onOpenSidebar={onOpenSidebar}
+          fileTreeSplitEnabled={fileTreeSplitEnabled}
+        />
       ) : (
         <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
           {onOpenSidebar && (

@@ -32,7 +32,7 @@ import {
 import { setEmbedRoot } from "@/lib/host";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { RoutingProvider, reactRouterRouting, type RoutingApi } from "@/lib/routing";
-import { FileViewerContext, useFileViewer } from "./FileViewerContext";
+import { FileViewerContext, useFileViewer, useOpenGithubTab } from "./FileViewerContext";
 import { ShellCommandContext, ShellCommandDraftContext } from "./ShellCommandContext";
 import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -164,10 +164,14 @@ vi.mock("./FilesPanel", () => ({
   // via the FileViewer mock below (data-testid="file-viewer-inline").
   FilesPanel: ({
     onFileSelect,
+    onFileOpenInTab,
+    preview,
     flatView,
     showHidden,
   }: {
     onFileSelect: (path: string) => void;
+    onFileOpenInTab?: (path: string) => void;
+    preview?: FilesPanelPreview;
     flatView: boolean;
     showHidden: boolean;
   }) => (
@@ -176,6 +180,19 @@ vi.mock("./FilesPanel", () => ({
       data-flat-view={String(flatView)}
       data-show-hidden={String(showHidden)}
     >
+      {onFileOpenInTab && (
+        <button type="button" onClick={() => onFileOpenInTab("AGENTS.md")}>
+          files: open AGENTS.md in new tab
+        </button>
+      )}
+      {preview && (
+        <>
+          <button type="button" onClick={preview.onClose}>
+            Close file
+          </button>
+          <div data-testid="preview-pane" ref={preview.viewerRef} />
+        </>
+      )}
       <button
         type="button"
         aria-label="files: select README.md"
@@ -219,6 +236,8 @@ vi.mock("./FileViewer", () => ({
       <button type="button" aria-label="file-viewer: close" onClick={onClose}>
         close
       </button>
+      {/* Uncontrolled, so the text is lost exactly when the viewer remounts. */}
+      <textarea aria-label="viewer draft" />
     </div>
   ),
 }));
@@ -328,6 +347,7 @@ const forkSessionMock = vi.mocked(forkSession);
 const getSessionSlimMock = vi.mocked(getSessionSlim);
 
 import { AppShell } from "./AppShell";
+import type { FilesPanelPreview } from "./FilesPanel";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
 import { useChatStore } from "@/store/chatStore";
@@ -6531,5 +6551,149 @@ describe("AppShell desktop Close", () => {
     expect(screen.queryByText("home")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
     expect(screen.getByText("home")).toBeInTheDocument();
+  });
+});
+
+describe("AppShell file tree split", () => {
+  const splitInfo = () => serverInfo({ features: { workspace_file_tree_split_ui: true } });
+  beforeEach(() => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    // Room for the tree beside a file; jsdom measures every other element as empty.
+    const rect = (width: number) =>
+      ({ x: 0, y: 0, top: 0, left: 0, width, height: 0, right: width, bottom: 0 }) as DOMRect;
+    const measure = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: HTMLElement) {
+        return rect(this.hasAttribute("data-workspace-panel-content") ? 900 : 0);
+      });
+    onTestFinished(() => measure.mockRestore());
+    const baseMatchMedia = window.matchMedia;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      ...baseMatchMedia(query),
+      matches: query === "(min-width: 768px)",
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
+  });
+  const urlParams = () => screen.getByTestId("url-params");
+  const previewedPath = () =>
+    within(screen.getByTestId("preview-pane"))
+      .getByTestId("file-viewer-inline")
+      .getAttribute("data-path");
+
+  it("shows a plain tree click beside the tree and opens a tab only on request", () => {
+    mockConversations([{ id: "conv_tree", permission_level: null }]);
+    renderShell("/c/conv_tree?line=4&column=2", splitInfo());
+    // Nothing selected yet: no file pane at all.
+    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
+    expect(previewedPath()).toBe("README.md");
+    expect(screen.queryByTitle("README.md")).toBeNull();
+    // A plain open drops the stale citation.
+    expect(urlParams()).toHaveTextContent(/^file=README\.md$/);
+    expect(readSessionWorkspaceState("conv_tree")).toMatchObject({
+      treePreviewPath: "README.md",
+      openFiles: [],
+      selectedFilePath: null,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "files: open AGENTS.md in new tab" }));
+    expect(screen.getByTitle("AGENTS.md")).toBeInTheDocument();
+    expect(screen.queryByTestId("preview-pane")).toBeNull();
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "AGENTS.md");
+    expect(urlParams()).toHaveTextContent(/^file=AGENTS\.md$/);
+
+    // Back on Files, the preview returns.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Files" }), { button: 0 });
+    expect(previewedPath()).toBe("README.md");
+    expect(screen.getByTitle("AGENTS.md")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close file" }));
+    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+    expect(urlParams()).not.toHaveTextContent("file=");
+    expect(readSessionWorkspaceState("conv_tree").treePreviewPath).toBeNull();
+  });
+
+  it("commits nothing until an unsaved file allows the tree click, then commits once", () => {
+    mockConversations([{ id: "conv_guard", permission_level: null }]);
+    renderShell("/c/conv_guard", splitInfo(), { dirtyFileViewer: true });
+    fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
+    expect(screen.queryByTestId("preview-pane")).toBeNull();
+    expect(urlParams()).not.toHaveTextContent("file=");
+    expect(readSessionWorkspaceState("conv_guard").treePreviewPath ?? null).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+    expect(previewedPath()).toBe("README.md");
+    expect(urlParams()).toHaveTextContent(/^file=README\.md$/);
+    expect(screen.queryByTitle("README.md")).toBeNull();
+
+    // Closing asks too, and keeps the file until allowed.
+    fireEvent.click(screen.getByRole("button", { name: "Close file" }));
+    expect(previewedPath()).toBe("README.md");
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+    expect(screen.queryByTestId("preview-pane")).toBeNull();
+  });
+
+  it.each(["?file=README.md", "?file=README.md&line=3&column=2"])(
+    "opens %s as a file tab even when it names the file beside the tree",
+    (search) => {
+      writeSessionWorkspaceState("conv_link", {
+        treePreviewPath: "README.md",
+        rightRailTab: "files",
+      });
+      mockConversations([{ id: "conv_link", permission_level: null }]);
+      renderShell(`/c/conv_link${search}`, splitInfo());
+      expect(screen.getByTitle("README.md")).toBeInTheDocument();
+      expect(screen.queryByTestId("preview-pane")).toBeNull();
+      const viewer = screen.getByTestId("file-viewer-inline");
+      expect(viewer).toHaveAttribute("data-path", "README.md");
+      expect(viewer.getAttribute("data-line")).toBe(search.includes("line") ? "3" : null);
+    },
+  );
+
+  it("keeps the previewed file's editor and draft behind a composer pull-request link", () => {
+    function OpenPullRequests() {
+      const openGithubTab = useOpenGithubTab();
+      return (
+        <button type="button" onClick={() => openGithubTab?.()}>
+          composer: open pull requests
+        </button>
+      );
+    }
+    mockConversations([{ id: "conv_pr", permission_level: null }]);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <CapabilitiesProvider info={splitInfo()}>
+        {sessionShellTree(qc, "/c/conv_pr", <OpenPullRequests />)}
+      </CapabilitiesProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
+    const viewer = within(screen.getByTestId("preview-pane")).getByTestId("file-viewer-inline");
+    fireEvent.change(within(viewer).getByLabelText("viewer draft"), {
+      target: { value: "Unsaved draft" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "composer: open pull requests" }));
+    expect(readSessionWorkspaceState("conv_pr").rightRailTab).toBe("github");
+    expect(screen.getByTestId("file-viewer-inline")).toBe(viewer);
+    expect(viewer.closest("[inert]")).not.toBeNull();
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Files" }), { button: 0 });
+    expect(within(screen.getByTestId("preview-pane")).getByTestId("file-viewer-inline")).toBe(
+      viewer,
+    );
+    expect(within(viewer).getByLabelText("viewer draft")).toHaveValue("Unsaved draft");
+  });
+
+  it("keeps tree clicks on tabs with the flag off", () => {
+    mockConversations([{ id: "conv_off", permission_level: null }]);
+    renderShell("/c/conv_off", serverInfo());
+    expect(screen.queryByRole("button", { name: "files: open AGENTS.md in new tab" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
+    expect(screen.getByTitle("README.md")).toBeInTheDocument();
+    expect(screen.queryByTestId("preview-pane")).toBeNull();
   });
 });

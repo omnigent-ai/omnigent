@@ -44,6 +44,7 @@ vi.mock("./CodeViewer", () => ({
     searchOpen,
     wrapLines,
     onDirtyChange,
+    panelOpen,
   }: {
     path: string;
     position?: { line: number };
@@ -52,11 +53,13 @@ vi.mock("./CodeViewer", () => ({
     searchOpen?: boolean;
     wrapLines?: boolean;
     onDirtyChange?: (dirty: boolean) => void;
+    panelOpen?: boolean;
   }) => {
     codeViewerRenders({ path, position });
     return (
       <div
         data-testid="code-viewer"
+        data-panel-open={String(panelOpen)}
         data-view-mode={viewMode}
         data-markdown-source={String(!!markdownSourceFallback)}
         data-search-open={String(!!searchOpen)}
@@ -1850,6 +1853,21 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     expect(screen.queryByRole("button", { name: /^View mode/ })).toBeNull();
   });
 
+  it("asks before a cleared citation turns edited HTML source back into a preview", () => {
+    const view = render(viewerTree({ open: true, path: "page.html", position: { line: 2 } }));
+    expect(viewModeOf()).toBe("source");
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+    view.rerender(viewerTree({ open: true, path: "page.html" }));
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(viewModeOf()).toBe("source");
+
+    view.rerender(viewerTree({ open: true, path: "page.html", position: { line: 5 } }));
+    view.rerender(viewerTree({ open: true, path: "page.html" }));
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
   it("keeps HTML's preview-default and preview ↔ source toggle intact", () => {
     renderViewer({ open: true, path: "page.html" });
     expect(viewModeOf()).toBe("preview");
@@ -2813,6 +2831,60 @@ describe("file position navigation", () => {
     expect(unregister).toHaveBeenCalled();
   });
 
+  it("drops a discarded draft from a viewer that keeps its file, then guards the next edit", () => {
+    let guard: FileNavigationGuard | undefined;
+    let activeGuards = 0;
+    const registerNavigationGuard = vi.fn((next: FileNavigationGuard) => {
+      guard = next;
+      activeGuards += 1;
+      return () => {
+        activeGuards -= 1;
+      };
+    });
+    function GuardedViewer() {
+      const contextValue = useMemo(
+        () => ({
+          openFile: vi.fn(),
+          registerNavigationGuard,
+          openGithubTab: vi.fn(),
+          isChangedPath: () => false,
+          conversationId: "conv_1",
+          workspaceRoot: null,
+          workspaceHome: null,
+        }),
+        [],
+      );
+      return (
+        <FileViewerContext.Provider value={contextValue}>
+          {viewerTree({ open: true, mediaActive: false, path: "docs/guide.md" })}
+        </FileViewerContext.Provider>
+      );
+    }
+    const { unmount } = render(<GuardedViewer />);
+    expect(activeGuards).toBe(1);
+    const leave = vi.fn();
+    fireEvent.change(screen.getByRole("textbox", { name: "Draft text" }), {
+      target: { value: "Unsaved draft" },
+    });
+    // A hidden viewer's dialog names the file, since the file may not be on screen.
+    act(() => guard!(null, undefined, leave));
+    expect(screen.getByText(/Your edits to guide\.md will be lost/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(leave).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("textbox", { name: "Draft text" })).toHaveValue("");
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Draft text" }), {
+      target: { value: "Second draft" },
+    });
+    act(() => guard!(null, undefined, leave));
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(leave).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("textbox", { name: "Draft text" })).toHaveValue("Second draft");
+    expect(activeGuards).toBe(1);
+    unmount();
+    expect(activeGuards).toBe(0);
+  });
+
   it("asks before a closing tab or a session exit drops unsaved edits", () => {
     let guard: FileNavigationGuard | undefined;
     const registerNavigationGuard = vi.fn((next: FileNavigationGuard) => {
@@ -3056,4 +3128,39 @@ it("keeps grid file viewers independent of shared URL parameters and copies a se
   expect(copied.pathname).toBe("/c/conv_1");
   expect(copied.searchParams.get("file")).toBe("file1.py");
   expect(copied.searchParams.has("comment")).toBe(false);
+});
+
+it("leaves Find to the page while the viewer is off screen", () => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux");
+  useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  const view = render(viewerTree({ open: true, mediaActive: false, path: "file1.py" }));
+  const codeViewer = screen.getByTestId("code-viewer");
+  expect(codeViewer).toHaveAttribute("data-panel-open", "false");
+  expect(fireEvent.keyDown(window, { key: "f", ctrlKey: true })).toBe(true);
+  expect(codeViewer).toHaveAttribute("data-search-open", "false");
+
+  view.rerender(viewerTree({ open: true, path: "file1.py" }));
+  expect(codeViewer).toHaveAttribute("data-panel-open", "true");
+  fireEvent.mouseDown(codeViewer);
+  expect(fireEvent.keyDown(window, { key: "f", ctrlKey: true })).toBe(false);
+  expect(codeViewer).toHaveAttribute("data-search-open", "true");
+});
+
+it("names its own file in a copied link when the page URL names another", () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  vi.stubGlobal("navigator", { clipboard: { writeText } });
+  window.history.replaceState(null, "", "/c/conv_1?file=other.md&line=4&column=2");
+  try {
+    renderViewer({ open: true, path: "docs/guide.md" });
+    fireEvent.click(screen.getByRole("button", { name: "Copy link to file" }));
+    const copied = new URL(writeText.mock.calls[0][0]);
+    expect(copied.pathname).toBe("/c/conv_1");
+    expect(copied.searchParams.get("file")).toBe("docs/guide.md");
+    expect(copied.searchParams.has("line")).toBe(false);
+    expect(copied.searchParams.has("column")).toBe(false);
+  } finally {
+    window.history.replaceState(null, "", "/");
+    vi.unstubAllGlobals();
+  }
 });

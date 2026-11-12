@@ -127,6 +127,18 @@ vi.mock("@/components/chat/SideChatPane", () => ({
         >
           Edit file
         </button>
+        {/* Like the real viewer holding guide.md: it asks only when another file replaces it. */}
+        <button
+          type="button"
+          onClick={() =>
+            context.registerNavigationGuard?.((path, _options, navigate) => {
+              if (path === "guide.md") navigate();
+              else fixture.discardEdits = navigate;
+            })
+          }
+        >
+          Edit guide.md
+        </button>
         <button type="button" onClick={() => context.openFolder?.("/workspace/experimental")}>
           Open folder
         </button>
@@ -147,6 +159,9 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         data-terminal={props.selectedTerminalKey ?? ""}
         data-tab={props.rightRailTab ?? ""}
         data-end-line={props.filePosition?.endLine}
+        data-split={String(props.fileTreeSplitEnabled ?? false)}
+        data-preview={props.treePreviewPath ?? ""}
+        data-can-browse={String(props.canBrowseWorkspace ?? true)}
       >
         <span>{props.selectedFilePath ?? "No file"}</span>
         <span>{props.filePosition?.line}</span>
@@ -165,6 +180,15 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         </button>
         <button type="button" onClick={props.onToggleMaximized}>
           Maximize
+        </button>
+        <button type="button" onClick={() => props.openFileInTree?.("guide.md")}>
+          Preview guide.md
+        </button>
+        <button type="button" onClick={() => props.onCloseTreePreview?.()}>
+          Close preview
+        </button>
+        <button type="button" onClick={() => props.onRightRailTabChange("subagents")}>
+          Show Agents
         </button>
       </aside>
     );
@@ -599,4 +623,59 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
     "data-width",
     "504",
   );
+});
+
+it("keeps each cell's tree preview apart and asks only when that cell's file would change", () => {
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "previews", layout: splitGrid("first", "first", "second", "right")! }}
+          fileTreeSplitEnabled
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  const first = within(screen.getByRole("region", { name: "first (active)" }));
+  const firstWorkspace = screen.getByTestId("workspace-first");
+  expect(firstWorkspace).toHaveAttribute("data-split", "true");
+  fireEvent.click(within(firstWorkspace).getByText("Preview guide.md"));
+  expect(firstWorkspace).toHaveAttribute("data-preview", "guide.md");
+  expect(firstWorkspace).toHaveAttribute("data-tab", "files");
+  expect(screen.getByTestId("workspace-second")).toHaveAttribute("data-preview", "");
+  expect(readSessionWorkspaceState("first")).toMatchObject({
+    treePreviewPath: "guide.md",
+    selectedFilePath: null,
+  });
+  expect(readSessionWorkspaceState("second").treePreviewPath).toBeNull();
+
+  // The preview stays loaded behind another tab, so switching asks nothing.
+  fireEvent.click(first.getByText("Edit guide.md"));
+  fireEvent.click(within(firstWorkspace).getByText("Show Agents"));
+  expect(fixture.discardEdits).toBeNull();
+  expect(firstWorkspace).toHaveAttribute("data-tab", "subagents");
+
+  // Closing it does ask, and waits for the answer.
+  fireEvent.click(within(firstWorkspace).getByText("Close preview"));
+  expect(firstWorkspace).toHaveAttribute("data-preview", "guide.md");
+  act(() => fixture.discardEdits?.());
+  expect(firstWorkspace).toHaveAttribute("data-preview", "");
+});
+
+it("keeps a cell's open file without file access, leaving the workspace to hide it", () => {
+  writeSessionWorkspaceState("first", { openFiles: ["guide.md"], selectedFilePath: "guide.md" });
+  fixture.permissionLevel = 1;
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "masked", layout: splitGrid("first", "first", "second", "right")! }}
+          fileTreeSplitEnabled
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  const workspace = screen.getByTestId("workspace-first");
+  expect(workspace).toHaveAttribute("data-can-browse", "false");
+  expect(workspace).toHaveTextContent("guide.md");
 });

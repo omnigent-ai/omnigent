@@ -127,6 +127,7 @@ import {
 } from "@/lib/identity";
 import { isAdminViewEnabled, setAdminViewEnabled } from "@/lib/adminView";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
@@ -228,11 +229,14 @@ import {
   writeSessionRowQuickActions,
 } from "@/lib/sessionRowQuickActionsPreferences";
 import {
+  ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY,
   DEFAULT_WORKSPACE_TAB,
   defaultWorkspaceTabs,
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
   readDefaultWorkspaceTab,
   readPinnedWorkspaceTabs,
+  useAlwaysOpenFilesInTab,
+  writeAlwaysOpenFilesInTab,
   writeDefaultWorkspaceTab,
   writePinnedWorkspaceTabs,
   type DefaultWorkspaceTab,
@@ -991,6 +995,29 @@ function FoldAssistantNarrationControl() {
   );
 }
 
+/** Opt-out of the Workspace file tree split: file clicks open standalone tabs instead. */
+function AlwaysOpenFilesInTabControl() {
+  const enabled = useAlwaysOpenFilesInTab();
+  const labelId = useId();
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Always open files in a new tab"
+        labelId={labelId}
+        description="Clicking a file in the Files tree opens it in its own tab instead of beside the tree."
+      />
+      <Switch
+        aria-labelledby={labelId}
+        checked={enabled}
+        onCheckedChange={writeAlwaysOpenFilesInTab}
+        data-testid="always-open-files-in-tab-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.appearance.always_open_files_in_tab"
+      />
+    </div>
+  );
+}
+
 /** On by default: expanded project folders list a page of sessions behind "Show more". */
 function ProjectFolderPaginationControl() {
   const collapse = useProjectFolderCollapse();
@@ -1074,6 +1101,7 @@ function SessionRowQuickActionsControl() {
 
 function AppearanceSection() {
   const { setTheme } = useTheme();
+  const info = useServerInfo();
   const [resetKey, setResetKey] = useState(0);
   const [isResetDialogOpen, setIsResetDialogOpen] = useState(false);
   const [isImportDialogOpen, setIsImportDialogOpen] = useState(false);
@@ -1097,6 +1125,7 @@ function AppearanceSection() {
 
     writeDefaultWorkspaceTab(DEFAULT_WORKSPACE_TAB);
     writePinnedWorkspaceTabs(defaultWorkspaceTabs);
+    writeAlwaysOpenFilesInTab(false);
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
     writeFoldAssistantNarration(DEFAULT_FOLD_ASSISTANT_NARRATION);
@@ -1129,6 +1158,7 @@ function AppearanceSection() {
           "omnigent:default-workspace-panel",
           "omnigent:default-workspace-tab",
           PINNED_WORKSPACE_TABS_STORAGE_KEY,
+          ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY,
           "omnigent:hide-unconfigured-harnesses",
           FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
           PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
@@ -1215,6 +1245,11 @@ function AppearanceSection() {
             <div className="mt-4 border-t border-border pt-4">
               <WorkspaceTabsControl />
             </div>
+            {isFeatureEnabled(info, "workspace_file_tree_split_ui") && (
+              <div className="mt-4 border-t border-border pt-4">
+                <AlwaysOpenFilesInTabControl />
+              </div>
+            )}
           </SettingsGroup>
 
           <SettingsGroup title="Sidebar" testId="settings-group-sidebar">

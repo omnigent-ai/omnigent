@@ -65,6 +65,7 @@ export type FeatureKey =
   | "custom_agents_settings_ui"
   | "sidebar_grouping_ui"
   | "workspace_content_search"
+  | "workspace_file_tree_split_ui"
   | "grid_sessions_display_ui"
   | "automations_v2"
   | "splittable_terminal_view_ui"

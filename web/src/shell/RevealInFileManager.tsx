@@ -2,7 +2,7 @@
 // shell, and only when the session's files are on this machine (its host is
 // this machine's host), so a browser tab or a remote session sees no change.
 
-import { FolderOpenIcon } from "lucide-react";
+import { FolderOpenIcon, SquareArrowOutUpRightIcon } from "lucide-react";
 import { createContext, useContext, useState, useSyncExternalStore, type MouseEvent } from "react";
 import { createPortal } from "react-dom";
 import { toast } from "sonner";
@@ -118,12 +118,12 @@ export function revealInFileManager(target: RevealTarget): void {
 
 /**
  * Right-click menu for a Files row. Spread ``onContextMenu`` on the row and
- * render ``menu`` inside it; both are inert when the reveal isn't available.
+ * render ``menu`` inside it; both are inert when the row offers no action.
  */
-export function useRevealMenu(path: string | null, directory = false) {
+export function useRevealMenu(path: string | null, directory = false, onOpenInTab?: () => void) {
   const target = useRevealTarget(path);
   const [point, setPoint] = useState<{ x: number; y: number } | null>(null);
-  if (!target) return { onContextMenu: undefined, menu: null };
+  if (!target && !onOpenInTab) return { onContextMenu: undefined, menu: null };
   const onContextMenu = (event: MouseEvent<HTMLElement>) => {
     event.preventDefault();
     // A keyboard-opened menu has no pointer position; anchor it to the row.
@@ -138,10 +138,18 @@ export function useRevealMenu(path: string | null, directory = false) {
           <span className="fixed" style={{ left: point.x, top: point.y }} />
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" onCloseAutoFocus={(event) => event.preventDefault()}>
-          <DropdownMenuItem onSelect={() => revealInFileManager(target)}>
-            <FolderOpenIcon className="size-4" />
-            {revealLabel(directory)}
-          </DropdownMenuItem>
+          {onOpenInTab && (
+            <DropdownMenuItem onSelect={onOpenInTab}>
+              <SquareArrowOutUpRightIcon className="size-4" />
+              Open in new tab
+            </DropdownMenuItem>
+          )}
+          {target && (
+            <DropdownMenuItem onSelect={() => revealInFileManager(target)}>
+              <FolderOpenIcon className="size-4" />
+              {revealLabel(directory)}
+            </DropdownMenuItem>
+          )}
         </DropdownMenuContent>
       </DropdownMenu>,
       document.body,

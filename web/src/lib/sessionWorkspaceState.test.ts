@@ -38,6 +38,24 @@ describe("sessionWorkspaceState", () => {
     });
   });
 
+  it("keeps each session's tree preview apart and drops a malformed one", () => {
+    writeSessionWorkspaceState("conv_a", { treePreviewPath: "docs/a.md", selectedFilePath: null });
+    writeSessionWorkspaceState("conv_b", { treePreviewPath: null });
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([
+        ...JSON.parse(localStorage.getItem(STORAGE_KEY)!),
+        { id: "conv_bad", state: { treePreviewPath: 7 } },
+      ]),
+    );
+    expect(readSessionWorkspaceState("conv_a")).toEqual({
+      treePreviewPath: "docs/a.md",
+      selectedFilePath: null,
+    });
+    expect(readSessionWorkspaceState("conv_b")).toEqual({ treePreviewPath: null });
+    expect(readSessionWorkspaceState("conv_bad")).toEqual({});
+  });
+
   it("remembers a selected GitHub tab", () => {
     writeSessionWorkspaceState("conv_github", { rightRailTab: "github" });
     expect(readSessionWorkspaceState("conv_github").rightRailTab).toBe("github");

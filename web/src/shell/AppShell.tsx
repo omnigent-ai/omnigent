@@ -354,6 +354,7 @@ function AppShellImpl() {
   const navigateTo = useNavigate();
   const rebasePath = useRebasePath();
   const serverInfo = useServerInfo();
+  const fileTreeSplitEnabled = isFeatureEnabled(serverInfo, "workspace_file_tree_split_ui");
   const canvasMode =
     extensionId === undefined &&
     isCanvasPathname(location.pathname, rebasePath("/canvas")) &&
@@ -509,6 +510,15 @@ function AppShellImpl() {
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).selectedFilePath ?? null) : null,
   );
+  // The file shown beside the Files tree. Separate from the file tabs: a ?file= deep link
+  // still opens a tab, even for this path.
+  const [treePreviewPath, setTreePreviewPath] = useState<string | null>(() =>
+    conversationId ? (readSessionWorkspaceState(conversationId).treePreviewPath ?? null) : null,
+  );
+  const previewPath = fileTreeSplitEnabled ? treePreviewPath : null;
+  // Read by guards that run after an await, when the preview may have changed.
+  const previewPathRef = useRef(previewPath);
+  previewPathRef.current = previewPath;
   // Explicit opens override the URL, including opens without a cited position.
   const [fileNavigation, setFileNavigation] = useState<{
     conversationId: string | undefined;
@@ -1329,6 +1339,7 @@ function AppShellImpl() {
       setRightRailTab(null);
       setOpenPanels([]);
       setSelectedFilePath(null);
+      setTreePreviewPath(null);
       setOpenFiles([]);
       setSelectedTerminalKey(null);
       setPanelInitialKeyState(null);
@@ -1388,6 +1399,7 @@ function AppShellImpl() {
       const nextSelected = showAgents ? null : (urlFile ?? persisted.selectedFilePath ?? null);
       setOpenFiles(nextOpenFiles);
       setSelectedFilePath(nextSelected);
+      setTreePreviewPath(persisted.treePreviewPath ?? null);
       // The tab strip derives from the live terminal list, so there's nothing to
       // restore for the tabs themselves — only which shell was focused. The prune
       // effect clears that selection if its terminal no longer exists once this
@@ -1526,14 +1538,39 @@ function AppShellImpl() {
       openPanels,
       openFiles,
       selectedFilePath,
+      treePreviewPath,
       selectedTerminalKey,
     });
-  }, [rightRailTab, openPanels, openFiles, selectedFilePath, selectedTerminalKey]);
+  }, [rightRailTab, openPanels, openFiles, selectedFilePath, treePreviewPath, selectedTerminalKey]);
 
   const handleFilesSortChange = useCallback((s: ChangedSort) => {
     setFilesPanelSort(s);
     writeFilesPanelPreferences({ ...readFilesPanelPreferences(), sort: s });
   }, []);
+
+  // Point ?file= at an opened file. Set in the open callback (not a useEffect) to avoid
+  // racing FileViewer's diff-sync effect, which can clobber it on mount.
+  const writeFileUrl = useCallback(
+    (path: string, position: FilePosition | undefined) =>
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.set("file", path);
+          next.delete("comment"); // stale comment belongs to the previous file
+          // A citation's cited line rides along so the viewer can land on it;
+          // a plain open clears any previous citation's line.
+          if (position?.line != null) next.set("line", String(position.line));
+          else next.delete("line");
+          if (position?.column != null) next.set("column", String(position.column));
+          else next.delete("column");
+          if (position?.endLine != null) next.set("endLine", String(position.endLine));
+          else next.delete("endLine");
+          return next;
+        },
+        { replace: true },
+      ),
+    [setSearchParams],
+  );
 
   const commitFileNavigation = useCallback(
     (path: string, options?: OpenFileOptions) => {
@@ -1576,27 +1613,9 @@ function AppShellImpl() {
       // visit (mirroring the header toggle's persistence).
       setRightPanelOpenAnimated(true);
       if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
-      // Set URL in the callback (not a useEffect) to avoid racing with
-      // FileViewer's diff-sync effect which can clobber it on mount.
-      setSearchParams(
-        (prev) => {
-          const next = new URLSearchParams(prev);
-          next.set("file", path);
-          next.delete("comment"); // stale comment belongs to the previous file
-          // A citation's cited line rides along so the viewer can land on it;
-          // a plain open clears any previous citation's line.
-          if (position?.line != null) next.set("line", String(position.line));
-          else next.delete("line");
-          if (position?.column != null) next.set("column", String(position.column));
-          else next.delete("column");
-          if (position?.endLine != null) next.set("endLine", String(position.endLine));
-          else next.delete("endLine");
-          return next;
-        },
-        { replace: true },
-      );
+      writeFileUrl(path, position);
     },
-    [setPanelInitialKey, terminalFirst, setSearchParams, conversationId, setRightPanelOpenAnimated],
+    [setPanelInitialKey, terminalFirst, writeFileUrl, conversationId, setRightPanelOpenAnimated],
   );
 
   const fileNavigationGuardsRef = useRef(new Set<FileNavigationGuard>());
@@ -1659,6 +1678,28 @@ function AppShellImpl() {
       { replace: true },
     );
   }, [setSearchParams]);
+  // A plain Files-tree click shows the file beside the tree, without a file tab.
+  const openFileInTree = useCallback(
+    (path: string) =>
+      guardFileNavigation(path, undefined, () => {
+        contentSearchFileRef.current = null;
+        setTreePreviewPath(path);
+        setSelectedFilePath(null);
+        setSelectedTerminalKey(null);
+        selectRightRailTab("files");
+        writeFileUrl(path, undefined);
+      }),
+    [guardFileNavigation, selectRightRailTab, writeFileUrl],
+  );
+  const closeTreePreview = useCallback(
+    () =>
+      guardFileNavigation(null, undefined, () => {
+        setTreePreviewPath(null);
+        setFileViewerCommentsOpen(false);
+        clearFileViewerUrl();
+      }),
+    [guardFileNavigation, clearFileViewerUrl],
+  );
   const restoreSelectedFileUrl = useCallback(() => {
     if (!selectedFilePath) return;
     setSearchParams(
@@ -2030,6 +2071,9 @@ function AppShellImpl() {
         setSelectedFilePath(null);
         setFileViewerCommentsOpen(false);
         clearFileViewerUrl();
+      } else if (next !== "files" && previewPath !== null && citationPath === previewPath) {
+        // The file beside the tree stays loaded behind the new tab, but no longer on screen.
+        clearFileViewerUrl();
       }
       // Clicking a static nav tab deselects any active shell tab (it stays in
       // the strip) so the picked tab's content shows in the single slot.
@@ -2037,7 +2081,14 @@ function AppShellImpl() {
         setSelectedTerminalKey(null);
       }
     },
-    [selectedFilePath, selectedTerminalKey, clearFileViewerUrl, selectRightRailTab],
+    [
+      selectedFilePath,
+      selectedTerminalKey,
+      clearFileViewerUrl,
+      selectRightRailTab,
+      previewPath,
+      citationPath,
+    ],
   );
   const closeWorkspacePanel = useCallback(
     (tab: DefaultWorkspaceTab) => {
@@ -2225,9 +2276,10 @@ function AppShellImpl() {
     openTerminalTab,
   ]);
   // A new shell replaces the file on screen, so its viewer confirms unsaved edits first.
+  // The file beside the tree stays loaded, so it is the viewer's destination.
   const launchShellFromShortcut = useCallback(
-    () => guardFileNavigation(null, undefined, launchDefaultShell),
-    [guardFileNavigation, launchDefaultShell],
+    () => guardFileNavigation(previewPath, undefined, launchDefaultShell),
+    [guardFileNavigation, launchDefaultShell, previewPath],
   );
   useNewShellHotkey(launchShellFromShortcut, shellLaunchable);
   useDesktopCommand("new-terminal", shellLaunchable ? launchShellFromShortcut : null);
@@ -2249,7 +2301,7 @@ function AppShellImpl() {
           (info) => {
             shellDrafts?.setDraft(`${conversationId}:${info.id}`, command);
             if (railSelectionRef.current.conversationId !== conversationId) return;
-            guardFileNavigation(null, undefined, () => {
+            guardFileNavigation(previewPathRef.current, undefined, () => {
               if (railSelectionRef.current.conversationId !== conversationId) return;
               const key = terminalTabKey(info);
               if (isMobileViewport()) openTerminalsPanel(key);
@@ -2476,7 +2528,7 @@ function AppShellImpl() {
   // A chat link to a folder browses the Files tree there (drawer on mobile).
   const openFolderInFiles = useCallback(
     (absolutePath: string) =>
-      guardFileNavigation(absolutePath, undefined, () => {
+      guardFileNavigation(previewPath ?? absolutePath, undefined, () => {
         if (!conversationId) return;
         revealFolderInFilesPanel(conversationId, absolutePath);
         if (isMobileViewport()) {
@@ -2495,6 +2547,7 @@ function AppShellImpl() {
       }),
     [
       guardFileNavigation,
+      previewPath,
       conversationId,
       openFilesDrawer,
       showScopeView,
@@ -2831,6 +2884,7 @@ function AppShellImpl() {
           as siblings. */}
             <GridWorkspace
               active={canvasMode}
+              fileTreeSplitEnabled={fileTreeSplitEnabled}
               conversationId={conversationId}
               minConversationWidth={workspacePanelVisible ? preferredConversationWidth : undefined}
               onCanvasWidthChange={setCanvasReservedWidth}
@@ -2990,6 +3044,10 @@ function AppShellImpl() {
                     openPanels={openPanels}
                     onClosePanel={closeWorkspacePanel}
                     showFilesPanel={showFilesPanel}
+                    fileTreeSplitEnabled={fileTreeSplitEnabled}
+                    treePreviewPath={previewPath}
+                    openFileInTree={openFileInTree}
+                    onCloseTreePreview={closeTreePreview}
                     showGithubTab={railTabsAvailable.github}
                     showContentSearch={railTabsAvailable["content-search"]}
                     showBrowserTab={railTabsAvailable.browser}

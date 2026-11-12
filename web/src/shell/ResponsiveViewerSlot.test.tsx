@@ -118,3 +118,48 @@ it.each(["hidden", "blurred", "elsewhere"] as const)(
     mobileTarget.remove();
   },
 );
+
+it("moves into a desktop target and back to a hidden holding place when it disappears", () => {
+  function Draft() {
+    const [draft, setDraft] = useState("");
+    return (
+      <textarea
+        aria-label="File draft"
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+      />
+    );
+  }
+  function Layout({ pane, hidden }: { pane: boolean; hidden: boolean }) {
+    const [target, setTarget] = useState<HTMLDivElement | null>(null);
+    return (
+      <div data-testid="rail">
+        {pane && <div data-testid="pane" ref={setTarget} />}
+        <ResponsiveViewerSlot
+          mobile={false}
+          mobileTarget={null}
+          target={pane ? target : null}
+          hidden={hidden}
+        >
+          <Draft />
+        </ResponsiveViewerSlot>
+      </div>
+    );
+  }
+  const { rerender } = render(<Layout pane hidden />);
+  const draft = screen.getByLabelText("File draft");
+  expect(screen.getByTestId("pane")).toContainElement(draft);
+  fireEvent.change(draft, { target: { value: "Unsaved" } });
+
+  // The pane goes (say, the tree loses access): the editor waits, hidden and inert.
+  rerender(<Layout pane={false} hidden />);
+  expect(screen.getByLabelText("File draft")).toBe(draft);
+  expect(draft.closest("[inert]")).not.toBeNull();
+  expect(draft).toHaveValue("Unsaved");
+
+  rerender(<Layout pane={false} hidden={false} />);
+  expect(draft.closest("[inert]")).toBeNull();
+  rerender(<Layout pane hidden />);
+  expect(screen.getByTestId("pane")).toContainElement(draft);
+  expect(draft).toHaveValue("Unsaved");
+});
