@@ -9,6 +9,7 @@ import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { PullRequestPanel } from "./PullRequestPanel";
 import { SubagentsPanel } from "./SubagentsPanel";
+import { TasksPanel } from "./TasksPanel";
 import { TerminalsPanel } from "./TerminalsPanel";
 
 export interface AppShellWorkspacePanelsProps {
@@ -38,8 +39,10 @@ export interface AppShellWorkspacePanelsProps {
   openTerminalsPanel: (key: string) => void;
   githubPanelOpen: boolean;
   setGithubPanelOpen: (open: boolean) => void;
+  tasksPanelOpen: boolean;
+  setTasksPanelOpen: (open: boolean) => void;
   mobileViewport: boolean;
-  railTabsAvailable: { readonly "content-search": boolean };
+  railTabsAvailable: { readonly "content-search": boolean; readonly tasks: boolean };
   contentSearchPanelOpen: boolean;
   setContentSearchPanelOpen: (open: boolean) => void;
   openContentSearchResult: (path: string, options?: OpenFileOptions) => void;
@@ -78,6 +81,8 @@ export function AppShellWorkspacePanels({
   openTerminalsPanel,
   githubPanelOpen,
   setGithubPanelOpen,
+  tasksPanelOpen,
+  setTasksPanelOpen,
   mobileViewport,
   railTabsAvailable,
   contentSearchPanelOpen,
@@ -163,6 +168,23 @@ export function AppShellWorkspacePanels({
         >
           <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
             <PullRequestPanel conversationId={conversationId} />
+          </RenderErrorBoundary>
+        </MobilePanelDrawer>
+      )}
+      {conversationId && mobileViewport && railTabsAvailable.tasks && (
+        <MobilePanelDrawer
+          open={tasksPanelOpen}
+          title="Tasks"
+          onClose={() => setTasksPanelOpen(false)}
+          testId="tasks-panel-drawer"
+        >
+          <RenderErrorBoundary name="tasks" resetKey={conversationId}>
+            <TasksPanel
+              conversationId={conversationId}
+              active={tasksPanelOpen}
+              // Close the drawer so the workflow dialog opens over the chat.
+              onStartWorkflow={() => setTasksPanelOpen(false)}
+            />
           </RenderErrorBoundary>
         </MobilePanelDrawer>
       )}

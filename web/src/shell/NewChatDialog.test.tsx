@@ -234,7 +234,7 @@ describe("ComposerAddMenu", () => {
     expect(onPlan).toHaveBeenCalledOnce();
   });
 
-  it.each(["goal", "side-chat"] as const)(
+  it.each(["goal", "side-chat", "workflow"] as const)(
     "lets the %s action keep focus after the menu closes",
     async (action) => {
       const user = userEvent.setup();
@@ -246,6 +246,7 @@ describe("ComposerAddMenu", () => {
             onAttach={vi.fn()}
             onGoal={action === "goal" ? openAction : undefined}
             onSideChat={action === "side-chat" ? openAction : undefined}
+            onWorkflow={action === "workflow" ? openAction : undefined}
             planActive={false}
           />
           <textarea data-testid="action-input" />

@@ -1,0 +1,483 @@
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseSessionJournalModule from "@/hooks/useSessionJournal";
+import type * as CapabilitiesModule from "@/lib/CapabilitiesContext";
+
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
+import { type SessionJournalView, useSessionJournal } from "@/hooks/useSessionJournal";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { formatMessageTimestamp } from "@/lib/relativeTime";
+import type { JournalEntry } from "@/lib/sessionJournal";
+import type { ConversationState } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
+import { registerStartWorkflow } from "@/store/sessionTasksActions";
+import { journalEntry, journalPlan } from "@/test/journalFixtures";
+import { TasksPanel } from "./TasksPanel";
+
+vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
+  useChildSessions: vi.fn(),
+}));
+vi.mock("@/hooks/useSessionJournal", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseSessionJournalModule>()),
+  useSessionJournal: vi.fn(),
+}));
+vi.mock("@/lib/CapabilitiesContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof CapabilitiesModule>()),
+  useServerInfo: vi.fn(),
+}));
+
+const RUN = "0b6c5f0d8a7e4c3b9a1d2e3f4a5b6c7d";
+
+function showJournal(entries: JournalEntry[], extra = {}) {
+  const view: SessionJournalView = {
+    entries,
+    isLoading: false,
+    error: null,
+    hasOlder: false,
+    loadingOlder: false,
+    loadOlder: vi.fn(),
+    ...extra,
+  };
+  vi.mocked(useSessionJournal).mockReturnValue(view);
+  return view;
+}
+
+function status(position: number, step: string, value: string, text?: string, run?: string) {
+  return journalEntry(position, {
+    kind: "status",
+    step,
+    scheduled_task_run_id: run ?? null,
+    payload: { status: value, text: text ?? null },
+  });
+}
+
+function renderPanel(onStartWorkflow?: () => void) {
+  return render(<TasksPanel conversationId="conv" active onStartWorkflow={onStartWorkflow} />);
+}
+
+/** The session's live state: whether it works, and the agent's own task list. */
+function setSession(state: Partial<ConversationState>) {
+  act(() => conversationRegistry.acquire("conv").setState(state));
+}
+
+beforeEach(() => {
+  vi.mocked(useChildSessions).mockReturnValue({ children: [] } as never);
+  vi.mocked(useServerInfo).mockReturnValue({ session_journal: true } as never);
+  conversationRegistry
+    .acquire("conv")
+    .setState({ sessionStatus: "idle", todos: [], backgroundTaskCount: 0 });
+});
+
+afterEach(() => {
+  cleanup();
+  conversationRegistry.clear();
+});
+
+describe("TasksPanel", () => {
+  it("says where tasks come from, and links to starting a workflow when the composer can", () => {
+    showJournal([]);
+    renderPanel();
+    expect(screen.getByText("No tasks yet")).toBeTruthy();
+    expect(screen.getByText("Tasks show up here when the agent makes a to-do list.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "run a workflow" })).toBeNull();
+    cleanup();
+
+    const start = vi.fn();
+    const closeDrawer = vi.fn();
+    const withdraw = registerStartWorkflow("conv", start);
+    try {
+      renderPanel(closeDrawer);
+      expect(screen.getByText(/to-do list or you/).textContent).toBe(
+        "Tasks show up here when the agent makes a to-do list or you run a workflow.",
+      );
+      fireEvent.click(screen.getByRole("button", { name: "run a workflow" }));
+      expect(closeDrawer).toHaveBeenCalled();
+      expect(start).toHaveBeenCalled();
+    } finally {
+      act(withdraw);
+    }
+  });
+
+  it("shows the agent's own task list when the session has no plan", () => {
+    showJournal([]);
+    setSession({
+      sessionStatus: "running",
+      todos: [
+        { content: "Add the flag", status: "completed", activeForm: "Adding the flag" },
+        { content: "Document it", status: "in_progress", activeForm: "Documenting it" },
+        { content: "Run the tests", status: "pending", activeForm: "Running the tests" },
+      ],
+    });
+    renderPanel();
+    const rows = screen.getAllByTestId("tasks-row");
+    expect(rows.map((row) => row.dataset.state)).toEqual(["done", "running", "waiting"]);
+    expect(rows[1].textContent).toContain("Documenting it");
+    // Their rows have no history to open, and nothing waits on another.
+    expect(within(rows[1]).queryByRole("button")).toBeNull();
+    // The list says nothing about what waits on what, so its strip's gaps mean nothing either.
+    expect(screen.getByTestId("tasks-progress").dataset.links).toBeUndefined();
+    expect(within(rows[2]).getByRole("img", { name: "Not started" }).textContent).toBe("3");
+    expect(screen.getByTestId("tasks-summary").textContent).toBe("1 of 3 finished");
+    expect(screen.queryByTestId("tasks-plan-name")).toBeNull();
+
+    setSession({ sessionStatus: "idle" });
+    expect(screen.getAllByTestId("tasks-row")[1].dataset.state).toBe("stopped");
+  });
+
+  it("shows the plan instead of the agent's own list once the session has one", () => {
+    showJournal([journalPlan(0, ["profile"], ["ship", ["profile"]])]);
+    setSession({ todos: [{ content: "Scratch item", status: "pending", activeForm: "" }] });
+    renderPanel();
+    expect(screen.getAllByTestId("tasks-row").map((row) => row.dataset.stepId)).toEqual([
+      "profile",
+      "ship",
+    ]);
+    expect(screen.queryByText("Scratch item")).toBeNull();
+  });
+
+  it("shows the agent's own list on a server that keeps no journal", () => {
+    vi.mocked(useServerInfo).mockReturnValue({ session_journal: false } as never);
+    showJournal([journalPlan(0, ["profile"])]);
+    setSession({ todos: [{ content: "Only item", status: "pending", activeForm: "" }] });
+    renderPanel();
+    expect(screen.getByTestId("tasks-row").textContent).toContain("Only item");
+    expect(vi.mocked(useSessionJournal)).toHaveBeenLastCalledWith("conv", false);
+  });
+
+  it("lists the plan's steps in order, each once, with where it stands", () => {
+    showJournal([
+      journalPlan(
+        0,
+        ["baseline"],
+        ["batch", ["baseline"]],
+        ["pool", ["batch"]],
+        ["tests", ["pool"]],
+        ["ship", ["tests"]],
+      ),
+      status(1, "baseline", "started"),
+      status(2, "baseline", "done", "p95 434 ms"),
+      status(3, "batch", "started"),
+      status(4, "batch", "done", "Kept: -9%"),
+      status(5, "pool", "failed", "Reverted"),
+      status(6, "tests", "needs_input", "The test database is down: wait, or skip it?"),
+    ]);
+    renderPanel();
+    const steps = screen.getAllByTestId("tasks-row");
+    expect(steps.map((step) => step.dataset.state)).toEqual([
+      "done",
+      "done",
+      "failed",
+      "needs_input",
+      "waiting",
+    ]);
+    expect(steps[0].textContent).toContain("p95 434 ms");
+    expect(steps[3].textContent).toContain("Waiting for you");
+    expect(steps[3].textContent).toContain("The test database is down: wait, or skip it?");
+    expect(within(steps[4]).getByRole("img", { name: "Not started" }).textContent).toBe("5");
+    // The failed try counts as finished; the count beside the summary names it.
+    expect(screen.getByTestId("tasks-summary").textContent).toBe("3 of 5 finished");
+    expect(screen.getByText("1 failed")).toBeTruthy();
+  });
+
+  it("marks every step that can start as ready, and shows on the strip what waits on what", () => {
+    showJournal([
+      journalPlan(
+        0,
+        ["profile"],
+        ["batch", ["profile"]],
+        ["pool", ["profile"]],
+        ["ship", ["batch", "pool"]],
+      ),
+      status(1, "profile", "done"),
+    ]);
+    renderPanel();
+    const steps = screen.getAllByTestId("tasks-row");
+    expect(steps.map((step) => step.dataset.state)).toEqual(["done", "ready", "ready", "waiting"]);
+    expect(within(steps[1]).getByRole("img", { name: "Ready" }).textContent).toBe("2");
+    expect(within(steps[1]).getByText("Ready")).toBeTruthy();
+    // batch and pool can run at the same time, so a gap separates them.
+    expect(screen.getByTestId("tasks-progress").dataset.links).toBe("true");
+    const segments = screen.getAllByTestId("tasks-progress-segment");
+    expect(segments.map((segment) => segment.dataset.linked === "true")).toEqual([
+      false,
+      true,
+      false,
+      true,
+    ]);
+    // Hovering batch arcs it to profile, which it waits on, and ship, which waits on it.
+    fireEvent.pointerEnter(segments[1]);
+    expect(screen.getAllByTestId("tasks-progress-arc")).toHaveLength(2);
+    expect(segments.map((segment) => segment.dataset.dimmed === "true")).toEqual([
+      false,
+      false,
+      true,
+      false,
+    ]);
+    fireEvent.pointerLeave(screen.getByTestId("tasks-progress"));
+    expect(screen.queryAllByTestId("tasks-progress-arc")).toHaveLength(0);
+    expect(segments.some((segment) => segment.dataset.dimmed)).toBe(false);
+  });
+
+  it("says on hover which task a progress segment is and where it stands", async () => {
+    showJournal([
+      journalPlan(0, ["profile"], ["cache", ["profile"]], ["ship", ["cache"]]),
+      status(1, "profile", "done"),
+    ]);
+    renderPanel();
+    const segments = screen.getAllByTestId("tasks-progress-segment");
+    fireEvent.focus(segments[1]);
+    const ready = await screen.findByRole("tooltip");
+    expect(ready).toHaveTextContent("Task 2 of 3");
+    expect(ready).toHaveTextContent("cache");
+    expect(ready).toHaveTextContent("Ready to start");
+    fireEvent.blur(segments[1]);
+    fireEvent.focus(segments[2]);
+    await waitFor(() => expect(screen.getByRole("tooltip")).toHaveTextContent("Waiting on cache"));
+  });
+
+  it("jumps to a task when its progress segment is clicked", () => {
+    const scrollIntoView = vi.fn();
+    Element.prototype.scrollIntoView = scrollIntoView;
+    try {
+      showJournal([journalPlan(0, ["a"], ["b"], ["c"])]);
+      renderPanel();
+      fireEvent.click(screen.getAllByTestId("tasks-progress-segment")[2]);
+      const row = screen.getAllByTestId("tasks-row")[2];
+      expect(scrollIntoView.mock.contexts[0]).toBe(row);
+      expect(row.dataset.flash).toBe("true");
+    } finally {
+      delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+    }
+  });
+
+  it("heads the list with the plan's name", () => {
+    const named = journalPlan(0, ["baseline"]);
+    named.payload.name = "Cut GET /orders p95 by 20%";
+    showJournal([named]);
+    renderPanel();
+    expect(screen.getByTestId("tasks-plan-name").textContent).toBe("Cut GET /orders p95 by 20%");
+    // The name is the heading, level with "Updated …"; the tab already says Tasks.
+    expect(screen.getByRole("heading", { name: "Cut GET /orders p95 by 20%" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Tasks" })).toBeNull();
+  });
+
+  it("says every task finished when the last one failed", () => {
+    showJournal([journalPlan(0, ["a"], ["b"]), status(1, "a", "done"), status(2, "b", "failed")]);
+    renderPanel();
+    expect(screen.getByTestId("tasks-summary").textContent).toBe("All 2 tasks finished");
+    expect(screen.getByText("1 failed")).toBeTruthy();
+  });
+
+  it("shows a started task as running only while the session works", () => {
+    showJournal([journalPlan(0, ["baseline"]), status(1, "baseline", "started")]);
+    renderPanel();
+    const step = () => screen.getByTestId("tasks-row");
+    expect(step().dataset.state).toBe("stopped");
+    expect(step().textContent).toMatch(/Started .+ ago/);
+
+    setSession({ sessionStatus: "running" });
+    expect(step().dataset.state).toBe("running");
+    expect(within(step()).getByRole("img", { name: "Running" })).toBeTruthy();
+  });
+
+  it("counts a running task's time up every second", () => {
+    vi.useFakeTimers();
+    try {
+      const start = status(1, "build", "started");
+      vi.setSystemTime((start.created_at + 10) * 1000);
+      showJournal([journalPlan(0, ["build"]), start]);
+      setSession({ sessionStatus: "running" });
+      renderPanel();
+      const elapsed = () => within(screen.getByTestId("tasks-row")).getByTitle(/^Started/);
+      expect(elapsed().textContent).toBe("10s");
+      act(() => vi.advanceTimersByTime(1000));
+      expect(elapsed().textContent).toBe("11s");
+      act(() => vi.advanceTimersByTime(1000));
+      expect(elapsed().textContent).toBe("12s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a started task running while a background task it started runs on", () => {
+    showJournal([journalPlan(0, ["deploy"]), status(1, "deploy", "started")]);
+    renderPanel();
+    const step = () => screen.getByTestId("tasks-row");
+    expect(step().dataset.state).toBe("stopped");
+    // The agent's turn ended, but the deploy it left running is still going.
+    setSession({ backgroundTaskCount: 1 });
+    expect(step().dataset.state).toBe("running");
+    setSession({ backgroundTaskCount: 0 });
+    expect(step().dataset.state).toBe("stopped");
+  });
+
+  it("shows a task waiting for you in pink, and counts it in the summary", () => {
+    showJournal([
+      journalPlan(0, ["build"], ["approve", ["build"]], ["ship", ["approve"]]),
+      status(1, "build", "done", "Image built"),
+      status(2, "approve", "needs_input", "Approve the deploy to prod?"),
+    ]);
+    setSession({ sessionStatus: "running" });
+    renderPanel();
+    const [, approve, ship] = screen.getAllByTestId("tasks-row");
+    expect(approve.dataset.state).toBe("needs_input");
+    expect(approve.textContent).toContain("Waiting for you · Approve the deploy to prod?");
+    expect(within(approve).getByRole("img", { name: "Waiting for you" })).toBeTruthy();
+    expect(within(approve).getByText("Waiting for you")).toHaveClass("text-brand-accent");
+    expect(ship.dataset.state).toBe("waiting");
+    expect(screen.getByText("1 waiting for you")).toHaveClass("text-brand-accent");
+  });
+
+  it("shows a running task waiting for you while a prompt in the chat waits", () => {
+    showJournal([journalPlan(0, ["tests"]), status(1, "tests", "started")]);
+    setSession({ sessionStatus: "running" });
+    renderPanel();
+    const row = () => screen.getByTestId("tasks-row");
+    expect(row().dataset.state).toBe("running");
+    const prompt = { type: "elicitation", elicitationId: "e1", status: "pending" };
+    setSession({ blocks: [prompt] as unknown as ConversationState["blocks"] });
+    expect(row().dataset.state).toBe("needs_input");
+    expect(row().textContent).toContain("Waiting for you · Respond in the chat");
+    setSession({
+      blocks: [{ ...prompt, status: "responded" }] as unknown as ConversationState["blocks"],
+    });
+    expect(row().dataset.state).toBe("running");
+  });
+
+  it("says an idle list stopped while a task could run, or that an automation's run ended", () => {
+    showJournal([journalPlan(0, ["a"], ["b", ["a"]]), status(1, "a", "done", "ok")]);
+    const { unmount } = renderPanel();
+    expect(screen.getByTestId("tasks-paused").textContent).toBe("· Stopped");
+    setSession({ sessionStatus: "running" });
+    expect(screen.queryByTestId("tasks-paused")).toBeNull();
+    unmount();
+    setSession({ sessionStatus: "idle" });
+    showJournal([journalPlan(0, ["a"], ["b", ["a"]]), status(1, "a", "done", "ok", RUN)]);
+    renderPanel();
+    expect(screen.getByTestId("tasks-paused").textContent).toBe("· Run ended");
+  });
+
+  it("counts a busy sub-agent as work, but not a side chat", () => {
+    showJournal([journalPlan(0, ["deploy"]), status(1, "deploy", "started")]);
+    const busy = (labels: Record<string, string>) =>
+      vi.mocked(useChildSessions).mockReturnValue({
+        children: [{ id: "child", busy: true, labels }] as ChildSessionInfo[],
+      } as never);
+    busy({ "omnigent.side_chat": "1", "omnigent.fork.source_id": "conv" });
+    const { unmount } = renderPanel();
+    expect(screen.getByTestId("tasks-row").dataset.state).toBe("stopped");
+    unmount();
+    busy({});
+    renderPanel();
+    expect(screen.getByTestId("tasks-row").dataset.state).toBe("running");
+  });
+
+  it("marks where a task restarted in its history", () => {
+    showJournal([
+      journalPlan(0, ["deploy"]),
+      status(1, "deploy", "started"),
+      status(2, "deploy", "failed", "Stopped during the build"),
+      status(3, "deploy", "started", "Redeploying"),
+    ]);
+    renderPanel();
+    fireEvent.click(within(screen.getByTestId("tasks-row")).getAllByRole("button")[0]);
+    const history = screen.getByRole("list", { name: "deploy history" });
+    expect(
+      within(history)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual([
+      expect.stringMatching(/^Started/),
+      expect.stringMatching(/^Failed · Stopped during the build/),
+      "Restarted",
+      expect.stringMatching(/^Started · Redeploying/),
+    ]);
+  });
+
+  it("opens a task's history: what it waits on, then its entries, oldest first", () => {
+    showJournal([
+      journalPlan(0, ["profile"], ["batch"], ["pool", ["profile", "batch"]]),
+      status(1, "pool", "started"),
+      status(2, "pool", "failed", "Reverted"),
+    ]);
+    renderPanel();
+    const pool = screen.getAllByTestId("tasks-row")[2];
+    fireEvent.click(within(pool).getAllByRole("button")[0]);
+    expect(within(pool).getByText(/^After/).textContent).toBe("After profile and batch");
+    const history = screen.getByRole("list", { name: "pool history" });
+    expect(
+      within(history)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual([expect.stringMatching(/^Started/), expect.stringMatching(/^Failed · Reverted/)]);
+  });
+
+  it("shows when a finished task ended, stamped the way chat messages are", async () => {
+    const done = status(2, "build", "done");
+    const failed = status(4, "deploy", "failed", "Reverted");
+    const doneWithoutStart = status(5, "docs", "done");
+    showJournal([
+      journalPlan(0, ["build"], ["deploy", ["build"]], ["docs"]),
+      status(1, "build", "started"),
+      done,
+      status(3, "deploy", "started"),
+      failed,
+      doneWithoutStart,
+    ]);
+    renderPanel();
+    // ICU may put a narrow no-break space before AM/PM; queries collapse it.
+    const ended = (entry: JournalEntry) =>
+      formatMessageTimestamp(entry.created_at).replace(/\s/g, " ");
+    const [build, deploy, docs] = screen.getAllByTestId("tasks-row");
+    // The end time replaces how long the task ran, a minute here.
+    expect(within(build).getByText(ended(done)).tagName).toBe("TIME");
+    expect(within(build).queryByText("1m")).toBeNull();
+    expect(within(deploy).getByText(ended(failed))).toBeTruthy();
+    expect(within(docs).getByText(ended(doneWithoutStart))).toBeTruthy();
+    fireEvent.focus(screen.getAllByTestId("tasks-progress-segment")[0]);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(`Done · ${ended(done)}`);
+  });
+
+  it("leaves out the agent's notes, under a task, in its history and on their own", () => {
+    showJournal([
+      journalPlan(0, ["pool"]),
+      status(1, "pool", "started"),
+      journalEntry(2, { step: "pool", payload: { body: "Cold connects are the slowest" } }),
+      journalEntry(3, { payload: { body: "Measure first" } }),
+    ]);
+    renderPanel();
+    fireEvent.click(within(screen.getByTestId("tasks-row")).getAllByRole("button")[0]);
+    const history = screen.getByRole("list", { name: "pool history" });
+    expect(
+      within(history)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual([expect.stringMatching(/^Started/)]);
+    expect(screen.queryByText(/Cold connects|Measure first/)).toBeNull();
+    expect(screen.queryByRole("region", { name: "Notes" })).toBeNull();
+  });
+
+  it("has no tasks yet when the agent wrote only notes, and no Runs section", () => {
+    showJournal([
+      journalEntry(0, { payload: { body: "Measure first" } }),
+      journalEntry(1, { scheduled_task_run_id: RUN, payload: { body: "Stopped at the try cap" } }),
+    ]);
+    renderPanel();
+    expect(screen.getByText("No tasks yet")).toBeTruthy();
+    expect(screen.queryByText(/Measure first|try cap/)).toBeNull();
+    expect(screen.queryByRole("region", { name: "Runs" })).toBeNull();
+  });
+
+  it("offers no older entries, and names no workers", () => {
+    // Busy sub-agents show in the Agents tab; the Tasks tab lists only tasks.
+    vi.mocked(useChildSessions).mockReturnValue({
+      children: [{ id: "c1", busy: true, task_summary: "fix-3", title: "codex:fix-3" }],
+    } as never);
+    showJournal([journalPlan(0, ["a"])], { hasOlder: true });
+    renderPanel();
+    expect(screen.queryByText(/workers? running/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /older/ })).toBeNull();
+  });
+});

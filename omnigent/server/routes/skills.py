@@ -17,6 +17,7 @@ from omnigent.server.routes._auth_helpers import require_access_and_level, requi
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._session_create_validation import validate_session_agent
 from omnigent.server.schemas import SkillSummary
+from omnigent.spec.skill_sources import framework_skills
 from omnigent.spec.types import AgentSpec
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore
@@ -170,6 +171,13 @@ def create_skills_router(
                 for skill in spec.skills
                 if skill.user_invocable
             ] + [skill for skill in skills if skill.name not in reserved]
+            # Framework skills come last, as in resolve_session_skills.
+            listed = reserved | {skill.name for skill in skills}
+            skills += [
+                SkillSummary(name=skill.name, description=skill.description)
+                for skill in framework_skills(spec)
+                if skill.name not in listed
+            ]
         return SkillsResponse(skills=skills, warnings=result.warnings)
 
     return router

@@ -6714,6 +6714,11 @@
             "title": "Session Fork Workspaces",
             "type": "boolean"
           },
+          "session_journal": {
+            "default": false,
+            "title": "Session Journal",
+            "type": "boolean"
+          },
           "session_list_scoped_archives": {
             "default": true,
             "title": "Session List Scoped Archives",
@@ -6849,6 +6854,7 @@
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
+            "session.journal.appended": "#/components/schemas/SessionJournalAppendedEvent",
             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
@@ -6945,6 +6951,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionChildSessionUpdatedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionJournalAppendedEvent"
           },
           {
             "$ref": "#/components/schemas/SessionChangedFilesInvalidatedEvent"
@@ -8404,6 +8413,238 @@
           }
         },
         "title": "SessionItemList",
+        "type": "object"
+      },
+      "SessionJournalAppendRequest": {
+        "additionalProperties": false,
+        "description": "Body of `POST /v1/sessions/{id}/journal`, sent by the session's runner.",
+        "properties": {
+          "idempotency_key": {
+            "description": "Names the write, e.g. `\"tool:<tool call ID>\"`; a retry with the same key returns the first attempt's entry.",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "kind": {
+            "description": "The kind the agent writes.",
+            "enum": [
+              "status",
+              "note",
+              "plan"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "description": "The kind's fields, e.g. `{\"status\": \"done\", \"text\": \"PR merged\"}`.",
+            "title": "Payload",
+            "type": "object"
+          },
+          "step": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The plan step the entry is about.",
+            "title": "Step"
+          }
+        },
+        "required": [
+          "kind",
+          "payload",
+          "idempotency_key"
+        ],
+        "title": "SessionJournalAppendRequest",
+        "type": "object"
+      },
+      "SessionJournalAppendedEvent": {
+        "description": "An entry was appended to the session's journal.\n\nTransient: the journal itself is the source of truth, and a client that\nreconnects catches up with `GET \u2026/journal?order=asc&after=<last entry ID>`.",
+        "properties": {
+          "conversation_id": {
+            "description": "The session whose journal grew.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "entry": {
+            "$ref": "#/components/schemas/SessionJournalEntry",
+            "description": "The new entry."
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.journal.appended",
+            "description": "Always `\"session.journal.appended\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "entry"
+        ],
+        "title": "SessionJournalAppendedEvent",
+        "type": "object"
+      },
+      "SessionJournalAuthor": {
+        "description": "Who wrote a journal entry, derived from its kind and, for plans, its source.",
+        "properties": {
+          "type": {
+            "description": "`\"agent\"` for the session's agent, `\"omnigent\"` for entries Omnigent writes.",
+            "enum": [
+              "agent",
+              "omnigent"
+            ],
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "SessionJournalAuthor",
+        "type": "object"
+      },
+      "SessionJournalEntry": {
+        "description": "One entry of a session's journal.",
+        "properties": {
+          "author": {
+            "$ref": "#/components/schemas/SessionJournalAuthor"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds when it was appended.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "id": {
+            "description": "Entry ID, a bare 32-character hex UUID.",
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "description": "The entry kind; `payload` holds its fields.",
+            "enum": [
+              "status",
+              "note",
+              "dispatch",
+              "dispatch_result",
+              "plan",
+              "plan_status"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "description": "e.g. `{\"status\": \"done\", \"text\": \"PR merged\"}` for a status, `{\"body\": \"\u2026\"}` for a note, or `{\"version\": 2, \"source\": \"agent\", \"steps\": [...]}` for a plan.",
+            "title": "Payload",
+            "type": "object"
+          },
+          "position": {
+            "description": "The entry's place in the journal: 0, 1, 2, \u2026",
+            "format": "int64",
+            "title": "Position",
+            "type": "integer"
+          },
+          "scheduled_task_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The automation run the session was serving, or `None`.",
+            "title": "Scheduled Task Run Id"
+          },
+          "step": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The plan step it is about, e.g. `\"propose\"`, or `None`.",
+            "title": "Step"
+          }
+        },
+        "required": [
+          "id",
+          "position",
+          "created_at",
+          "author",
+          "kind",
+          "payload"
+        ],
+        "title": "SessionJournalEntry",
+        "type": "object"
+      },
+      "SessionJournalPage": {
+        "description": "One page of a session's journal, for `GET /v1/sessions/{id}/journal`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SessionJournalEntry"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "SessionJournalPage",
         "type": "object"
       },
       "SessionLabelsResponse": {
@@ -18889,6 +19130,198 @@
         "summary": "List Session Items",
         "tags": [
           "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/journal": {
+      "get": {
+        "description": "One page of the session's journal by position; requires read access.\n\n`after` continues in the sort order and `before` goes against it,\nboth taking entry IDs, as for conversation items.",
+        "operationId": "list_session_journal_v1_sessions__session_id__journal_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "default": "asc",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "title": "Order",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "status",
+                    "note",
+                    "dispatch",
+                    "dispatch_result",
+                    "plan",
+                    "plan_status"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "step",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Step"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionJournalPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Journal",
+        "tags": [
+          "session_journal"
+        ]
+      },
+      "post": {
+        "description": "Append an entry written by the session's agent; only its runner calls this.",
+        "operationId": "append_session_journal_entry_v1_sessions__session_id__journal_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionJournalAppendRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionJournalEntry"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Append Session Journal Entry",
+        "tags": [
+          "session_journal"
         ]
       }
     },

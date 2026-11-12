@@ -43,7 +43,7 @@ it("round-trips workspace pins and default without restoring stale selections", 
   writeDefaultWorkspaceTab("changes");
   const exported = collectSettings()!;
   applyImportedSettings({ version: 1, settings: {} });
-  expect(readPinnedWorkspaceTabs()).toHaveLength(4);
+  expect(readPinnedWorkspaceTabs()).toHaveLength(5);
   expect(readInitialWorkspaceTab()).toBe("files");
 
   writeSessionWorkspaceState("conv", { open: true, rightRailTab: "files" });

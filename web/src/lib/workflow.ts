@@ -1,0 +1,34 @@
+// The message that runs Omnigent's `workflow` skill from the "Run a workflow"
+// dialog, in the session composer and on the new-session page.
+
+/** The framework skill that plans and runs a workflow (`/workflow <description>`). */
+export const WORKFLOW_SKILL = "workflow";
+
+/**
+ * Added to the workflow message when the user reviews the plan before work starts. The
+ * workflow skill says how: the review comes right after the exploration every plan starts with.
+ */
+export const REVIEW_PLAN_FIRST = "Let me review the plan before you start the work.";
+
+/** Whether a skill list offers the workflow skill, so the composer can offer "Run a workflow". */
+export function offersWorkflow(skills: readonly { name: string }[]): boolean {
+  return skills.some((skill) => skill.name === WORKFLOW_SKILL);
+}
+
+/**
+ * The message that runs the workflow skill for *description*.
+ *
+ * @param skillPrefix The harness's skill prefix, `"/"` or `"$"` for Codex's own CLI.
+ * @param description What the user wants done, e.g. `"Add a --json flag"`.
+ * @param reviewPlanFirst Whether the user reviews the plan before the work starts.
+ * @returns e.g. `"/workflow Add a --json flag"`, plus {@link REVIEW_PLAN_FIRST} as its own
+ *   paragraph when *reviewPlanFirst* is set.
+ */
+export function workflowMessage(
+  skillPrefix: string,
+  description: string,
+  reviewPlanFirst: boolean,
+): string {
+  const command = `${skillPrefix}${WORKFLOW_SKILL} ${description.trim()}`;
+  return reviewPlanFirst ? `${command}\n\n${REVIEW_PLAN_FIRST}` : command;
+}

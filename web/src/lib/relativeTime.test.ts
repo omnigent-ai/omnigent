@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { absoluteTime, relativeTime } from "./relativeTime";
+import { absoluteTime, formatMessageTimestamp, relativeTime } from "./relativeTime";
 
 const NOW = new Date("2026-05-28T12:00:00Z").getTime();
 const MIN = 60_000;
@@ -71,5 +71,19 @@ describe("relativeTime", () => {
     expect(relativeTime(NOW - DAY, NOW)).toBe("1d");
     expect(relativeTime(NOW - (WEEK - 1), NOW)).toBe("6d");
     expect(relativeTime(NOW - WEEK, NOW)).toBe("1w");
+  });
+});
+
+describe("formatMessageTimestamp", () => {
+  // Local times, so the stamps don't depend on the machine's time zone.
+  const now = new Date(2026, 10, 12, 9, 30);
+  // ICU may put a narrow no-break space before AM/PM.
+  const stamp = (date: Date) =>
+    formatMessageTimestamp(date.getTime() / 1000, now).replace(/\s/g, " ");
+
+  it("is the time today, adds the day before today, and the year before this year", () => {
+    expect(stamp(new Date(2026, 10, 12, 8, 5))).toBe("8:05 AM");
+    expect(stamp(new Date(2026, 10, 11, 20, 56))).toBe("Nov 11, 8:56 PM");
+    expect(stamp(new Date(2025, 10, 11, 20, 56))).toBe("Nov 11, 2025, 8:56 PM");
   });
 });
