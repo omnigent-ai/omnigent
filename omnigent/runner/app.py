@@ -1480,6 +1480,8 @@ def create_runner_app(
     _recovery_turn_ids: dict[str, set[str]] = {}
     # session_id → claude-native MCP Reconnects in flight, which delete cancels first.
     _claude_reconnect_tasks: dict[str, set[asyncio.Task[_JsonObject]]] = {}
+    # session_id → deletes in progress; no new Reconnect is admitted meanwhile.
+    _deleting_sessions: dict[str, int] = {}
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     # session_id → canonical reasoning effort, seeded from the session-init
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
@@ -4075,6 +4077,17 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
+        # Reconnects stay out while teardown runs, so none can relaunch Claude Code
+        # after the cleanup that would have removed it.
+        _deleting_sessions[session_id] = _deleting_sessions.get(session_id, 0) + 1
+        try:
+            return await _delete_session(session_id)
+        finally:
+            remaining = _deleting_sessions.pop(session_id, 1) - 1
+            if remaining:
+                _deleting_sessions[session_id] = remaining
+
+    async def _delete_session(session_id: str) -> JSONResponse:
         resource_registry.note_terminal_control_request(session_id, "delete_session")
         _cancel_claude_prompt_waiter(session_id)
         _session_message_buffers.pop(session_id, None)
@@ -9628,6 +9641,9 @@ def create_runner_app(
                 and _session_harness_name(conv_id) != "claude-native"
             ):
                 return None
+            # Checked with no await before registering, so delete either refuses it or cancels it.
+            if conv_id in _deleting_sessions:
+                return {**_CLAUDE_NOT_RUNNING, "reconnect_error": "This session was deleted."}
             task = asyncio.create_task(
                 _reconnect_claude_in_line(conv_id, name), name=f"claude-mcp-reconnect-{conv_id}"
             )
