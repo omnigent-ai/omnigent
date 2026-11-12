@@ -74,6 +74,7 @@ export DAYTONA_API_KEY=dtn_…
 # Optional: a non-default API endpoint or target region
 # export DAYTONA_API_URL=https://app.daytona.io/api
 # export DAYTONA_TARGET=us
+# export DAYTONA_OUTBOUND_PROXY_URL=https://user:pass@proxy.example.com:28431
 ```
 
 ## CLI-launched sandboxes
@@ -315,5 +316,6 @@ it.
 | `DAYTONA_API_KEY` | CLI machine / server | Daytona API credentials (required) |
 | `DAYTONA_API_URL` | CLI machine / server | Non-default Daytona API endpoint |
 | `DAYTONA_TARGET` | CLI machine / server | Target region for new sandboxes |
+| `DAYTONA_OUTBOUND_PROXY_URL` | CLI machine / server | Proxy URL new sandboxes route HTTP(S) traffic through (may embed credentials) |
 | `OMNIGENT_DAYTONA_HOST_IMAGE` | CLI machine / server | Override the host image ref (`sandbox.daytona.image` takes precedence) |
 | `OMNIGENT_DAYTONA_SANDBOX_ENV` | CLI machine / server | Comma-separated launcher-side env var names to inject (`sandbox.daytona.env` takes precedence for managed) |

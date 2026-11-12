@@ -177,7 +177,7 @@ modal = ["modal>=1.0,<2"]
 # Daytona sandbox launcher (`omnigent sandbox --provider daytona` and
 # server-managed `sandbox.provider: daytona`).
 # Same lazy-import posture as the modal extra. Pre-1.0 SDK: pin minor.
-daytona = ["daytona>=0.180,<1"]
+daytona = ["daytona>=0.204,<1"]
 # Blaxel sandbox launcher (`omnigent sandbox --provider blaxel` and
 # server-managed `sandbox.provider: blaxel`).
 blaxel = ["blaxel>=0.4.1,<0.5"]
