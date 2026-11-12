@@ -15,6 +15,7 @@ import {
   clearSessionTombstones,
   useArchiveConversation,
   useConversations,
+  useMoveToProject,
   type Conversation,
   type ConversationsPage,
 } from "@/hooks/useConversations";
@@ -665,6 +666,281 @@ describe("SessionUpdatesProvider archive tombstone", () => {
   });
 });
 
+describe("SessionUpdatesProvider move-to-project in flight", () => {
+  it("does not let a stale changed frame move a moving row back to its old project", async () => {
+    let resolvePatch: (value: unknown) => void = () => {};
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            object: "list",
+            data: [
+              { id: "p_old", name: "Old" },
+              { id: "p_new", name: "New" },
+            ],
+          }),
+        })
+        .mockReturnValueOnce(
+          new Promise((resolve) => {
+            resolvePatch = resolve;
+          }),
+        ),
+    );
+    const client = new QueryClient();
+    client.setQueryData(
+      ["projects"],
+      [
+        { id: "p_old", name: "Old" },
+        { id: "p_new", name: "New" },
+      ],
+    );
+    const moving = { ...conv("conv_a"), project_id: "p_old" };
+    client.setQueryData<ConversationsInfiniteData>(["conversations", "", false], {
+      pages: [{ data: [moving], first_id: "conv_a", last_id: "conv_a", has_more: false }],
+      pageParams: [undefined],
+    });
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const move = renderHook(() => useMoveToProject(), { wrapper });
+    const row = () =>
+      client
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+        .pages[0].data.find((c) => c.id === "conv_a");
+
+    move.result.current.mutate({ id: "conv_a", project: "New" });
+    await waitFor(() => expect(row()?.project_id).toBe("p_new"));
+
+    // Built from a read that predates the PATCH commit.
+    act(() => handler({ type: "changed", items: [{ ...moving, title: "Late edit" }] }));
+    expect(row()).toMatchObject({ project_id: "p_new", title: "Late edit" });
+
+    resolvePatch({
+      ok: true,
+      status: 200,
+      json: async () => ({ ...moving, project_id: "p_new", updated_at: 10 }),
+    });
+    await waitFor(() => expect(move.result.current.isSuccess).toBe(true));
+  });
+});
+
+describe("SessionUpdatesProvider open-session row", () => {
+  it.each([true, false])(
+    "applies a remote archive change (archived: %s) to the fetched row, keeping its owner",
+    (archived) => {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      const key = ["conversation-backfill", "conv_old"];
+      client.setQueryData<Conversation>(key, {
+        ...conv("conv_old"),
+        owner: "teammate",
+        archived: !archived,
+      });
+      renderProvider(client, ["/c/conv_old"]);
+
+      act(() =>
+        frameHandler()({
+          type: "changed",
+          items: [{ ...conv("conv_old"), owner: null, archived }],
+        }),
+      );
+
+      expect(client.getQueryData<Conversation>(key)).toMatchObject({ archived, owner: "teammate" });
+    },
+  );
+
+  it("applies a remote rename to the fetched row, keeping its owner", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const key = ["conversation-backfill", "conv_old"];
+    client.setQueryData<Conversation>(key, {
+      ...conv("conv_old"),
+      archived: true,
+      owner: "teammate",
+    });
+    renderProvider(client, ["/c/conv_old"]);
+
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [
+          { ...conv("conv_old"), archived: true, owner: null, title: "Renamed", updated_at: 99 },
+        ],
+      }),
+    );
+
+    expect(client.getQueryData<Conversation>(key)).toMatchObject({
+      title: "Renamed",
+      updated_at: 99,
+      archived: true,
+      owner: "teammate",
+    });
+  });
+
+  it.each([
+    [0, 1],
+    [1, 0],
+  ])(
+    "applies a remote approval count change (%i → %i) to a fetched shared row",
+    (before, after) => {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      const key = ["conversation-backfill", "conv_old"];
+      const row: Conversation = {
+        ...conv("conv_old"),
+        owner: "teammate",
+        permission_level: 1,
+        pending_elicitations_count: before,
+      };
+      client.setQueryData<Conversation>(key, row);
+      renderProvider(client, ["/c/conv_old"]);
+
+      act(() =>
+        frameHandler()({
+          type: "changed",
+          items: [
+            {
+              ...conv("conv_old"),
+              owner: null,
+              permission_level: null,
+              pending_elicitations_count: after,
+            },
+          ],
+        }),
+      );
+
+      expect(client.getQueryData<Conversation>(key)).toMatchObject({
+        owner: "teammate",
+        permission_level: 1,
+        pending_elicitations_count: after,
+      });
+    },
+  );
+
+  it("leaves an unchanged fetched row as it is", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const key = ["conversation-backfill", "conv_old"];
+    const row: Conversation = { ...conv("conv_old"), archived: true };
+    client.setQueryData<Conversation>(key, row);
+    renderProvider(client, ["/c/conv_old"]);
+    const writes = vi.fn();
+    const unsubscribe = client.getQueryCache().subscribe((event) => {
+      if (event.type === "updated" && event.query.queryKey[0] === "conversation-backfill") writes();
+    });
+
+    act(() =>
+      frameHandler()({ type: "changed", items: [{ ...conv("conv_old"), archived: true }] }),
+    );
+
+    expect(client.getQueryData<Conversation>(key)).toBe(row);
+    expect(writes).not.toHaveBeenCalled();
+    unsubscribe();
+  });
+
+  it("drops a remotely removed session's fetched row", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const key = ["conversation-backfill", "conv_old"];
+    client.setQueryData<Conversation>(key, { ...conv("conv_old"), archived: true });
+    renderProvider(client, ["/c/conv_old"]);
+
+    act(() => frameHandler()({ type: "removed", ids: ["conv_old"] }));
+
+    expect(client.getQueryData(key)).toBeNull();
+  });
+
+  it("keeps a removed session's row gone when its outstanding fetch answers late", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const key = ["conversation-backfill", "conv_old"];
+    let answer: (row: Conversation) => void = () => undefined;
+    const fetching = client.fetchQuery<Conversation | null>({
+      queryKey: key,
+      queryFn: () =>
+        new Promise<Conversation>((resolve) => {
+          answer = resolve;
+        }),
+    });
+    renderProvider(client, ["/c/conv_old"]);
+
+    act(() => frameHandler()({ type: "removed", ids: ["conv_old"] }));
+    answer({ ...conv("conv_old"), archived: true });
+    await fetching.catch(() => undefined);
+
+    expect(client.getQueryData(key)).toBeNull();
+  });
+
+  it.each([true, false].flatMap((archived) => [true, false].map((changed) => [archived, changed])))(
+    "keeps a streamed archive flag (archived: %s, changed: %s) and the owner over a late refetch",
+    async (archived, changed) => {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      const key = ["conversation-backfill", "conv_old"];
+      client.setQueryData<Conversation>(key, {
+        ...conv("conv_old"),
+        owner: "teammate",
+        archived: changed ? !archived : archived,
+      });
+      let answer: (row: Conversation) => void = () => undefined;
+      // Served before the frame: it carries the opposite flag, even when the
+      // frame matches the row (an archive and its undo between two rescans).
+      const refetching = client.fetchQuery<Conversation | null>({
+        queryKey: key,
+        queryFn: () =>
+          new Promise<Conversation>((resolve) => {
+            answer = resolve;
+          }),
+      });
+      renderProvider(client, ["/c/conv_old"]);
+
+      act(() =>
+        frameHandler()({
+          type: "changed",
+          items: [{ ...conv("conv_old"), owner: null, archived }],
+        }),
+      );
+      answer({ ...conv("conv_old"), archived: !archived });
+      await refetching.catch(() => undefined);
+
+      expect(client.getQueryData<Conversation>(key)).toMatchObject({ archived, owner: "teammate" });
+    },
+  );
+
+  it("restarts a first fetch that a streamed archive change may postdate", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const key = ["conversation-backfill", "conv_old"];
+    const answers: ((row: Conversation) => void)[] = [];
+    // The sidebar's open-session query, still on its first fetch.
+    const observer = new QueryObserver<Conversation | null>(client, {
+      queryKey: key,
+      queryFn: () =>
+        new Promise<Conversation>((resolve) => {
+          answers.push(resolve);
+        }),
+    });
+    const unsubscribe = observer.subscribe(() => undefined);
+    renderProvider(client, ["/c/conv_old"]);
+
+    act(() =>
+      frameHandler()({ type: "changed", items: [{ ...conv("conv_old"), archived: true }] }),
+    );
+    await waitFor(() => expect(answers).toHaveLength(2));
+    answers[0]({ ...conv("conv_old"), archived: false });
+    answers[1]({ ...conv("conv_old"), archived: true });
+
+    await waitFor(() => expect(client.getQueryData<Conversation>(key)?.archived).toBe(true));
+    unsubscribe();
+  });
+});
+
 describe("SessionUpdatesProvider list invalidation", () => {
   it("invalidates the archived-project-names scan on a remote removal", () => {
     // Another client archiving/relabeling/deleting must refresh the Archived
@@ -944,28 +1220,66 @@ describe("SessionUpdatesProvider projects_changed frames", () => {
   });
 });
 
-it("updates pending counts on a pinned row outside the scope windows", () => {
-  const client = new QueryClient();
-  client.setQueryData(["pinned-conversations"], {
-    conversations: [
-      { ...conv("old-pin"), labels: { "omnigent.pinned": "123" }, pending_elicitations_count: 0 },
-    ],
-    filterHonored: true,
-  });
-  renderProvider(client, ["/"]);
-  act(() =>
-    frameHandler()({
-      type: "changed",
-      items: [{ ...wireItem("old-pin", 2, 100), pending_elicitations_count: 3 }],
-    }),
-  );
-  const data = client.getQueryData<{ conversations: Conversation[] }>(["pinned-conversations"]);
-  expect(data?.conversations[0]).toMatchObject({
-    pending_elicitations_count: 3,
-    comments_count: 2,
-    labels: { "omnigent.pinned": "123" },
-  });
-});
+it.each(["pin", "family"])(
+  "reconciles streamed updates and removals for an off-window %s row",
+  (kind) => {
+    const client = new QueryClient();
+    const family = { id: "family", representative_id: "older", pinned: true };
+    const original = {
+      conversations: [
+        {
+          ...conv("old-pin"),
+          family: kind === "family" ? family : undefined,
+          labels: kind === "family" ? {} : { "omnigent.pinned": "123" },
+          pending_elicitations_count: 0,
+        },
+      ],
+      filterHonored: true,
+    };
+    client.setQueryData(["pinned-conversations"], original);
+    renderProvider(client, ["/"]);
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [
+          {
+            ...wireItem("old-pin", 2, 100),
+            pending_elicitations_count: 3,
+            ...(kind === "family"
+              ? {
+                  family: { ...family, representative_id: "old-pin" },
+                  labels: { "omnigent.pinned": "456" },
+                }
+              : {}),
+          },
+        ],
+      }),
+    );
+    const data = client.getQueryData<{ conversations: Conversation[] }>(["pinned-conversations"]);
+    expect(data?.conversations[0]).toMatchObject({
+      pending_elicitations_count: 3,
+      comments_count: 2,
+      labels: { "omnigent.pinned": kind === "family" ? "456" : "123" },
+    });
+    if (kind === "family") expect(data?.conversations[0].family?.representative_id).toBe("old-pin");
+    act(() => frameHandler()({ type: "removed", ids: ["old-pin"] }));
+    expect(
+      client.getQueryData<{ conversations: Conversation[] }>(["pinned-conversations"])
+        ?.conversations,
+    ).toEqual([]);
+    client.setQueryData(["pinned-conversations"], original);
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [{ ...wireItem("old-pin", 2, 100), archived: true }],
+      }),
+    );
+    expect(
+      client.getQueryData<{ conversations: Conversation[] }>(["pinned-conversations"])
+        ?.conversations,
+    ).toEqual([]);
+  },
+);
 
 it("keeps a directly opened shared session watched and permission-aware with the Shared list inactive", async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });

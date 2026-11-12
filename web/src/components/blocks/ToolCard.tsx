@@ -588,7 +588,7 @@ function ShellCommandLine({ command }: { command: string }) {
   const { env, rest } = splitEnvPrefix(firstLine);
   return (
     // Only the command truncates, so the line count stays visible.
-    <span className="inline-flex max-w-full items-baseline font-mono text-sm">
+    <span className="literal-code inline-flex max-w-full items-baseline font-mono text-sm">
       <span className="min-w-0 truncate">
         {env.length > 0 && <span className="opacity-60">{env}</span>}
         <span>{rest}</span>

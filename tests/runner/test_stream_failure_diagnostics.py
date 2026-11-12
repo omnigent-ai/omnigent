@@ -37,7 +37,12 @@ from omnigent.runner.resource_registry import TerminalExitEvent, TerminalLifecyc
 from omnigent.server.schemas import CancelledEvent
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals.registry import TerminalRegistry
-from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient, _sse
+from tests.runner.conftest import (
+    _drain_session_event_queue,
+    _FakeProcessManager,
+    _ScriptedHarnessClient,
+    _sse,
+)
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 _CONV_ID = "ac1dbeef245985f541fd686eb2a32b73"
@@ -53,10 +58,14 @@ class _StreamErrorHarnessClient(_ScriptedHarnessClient):
         *,
         cause: str,
         before_drop: Callable[[], None] | None = None,
+        drop_at_exit: bool = False,
+        error_type: type[Exception] | None = httpx.ReadError,
     ) -> None:
         super().__init__(sse_frames)
         self._cause = cause
         self._before_drop = before_drop
+        self._drop_at_exit = drop_at_exit
+        self._error_type = error_type
 
     def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
         """Return a context manager whose stream errors after the frames."""
@@ -65,15 +74,23 @@ class _StreamErrorHarnessClient(_ScriptedHarnessClient):
         frames = self._sse_frames
         cause = self._cause
         before_drop = self._before_drop
+        drop_at_exit = self._drop_at_exit
+        error_type = self._error_type
 
         class _ErrCtx:
             status_code = 200
 
             async def __aenter__(self) -> _StreamErrorHarnessClient._ErrHandle:
-                return _StreamErrorHarnessClient._ErrHandle(frames, cause, before_drop)
+                return _StreamErrorHarnessClient._ErrHandle(
+                    frames, cause, before_drop, drop_at_exit, error_type
+                )
 
             async def __aexit__(self, *_: Any) -> None:
-                return None
+                if drop_at_exit:
+                    if before_drop is not None:
+                        before_drop()
+                    if error_type is not None:
+                        raise error_type(cause)
 
         return _ErrCtx()
 
@@ -83,50 +100,71 @@ class _StreamErrorHarnessClient(_ScriptedHarnessClient):
         status_code = 200
 
         def __init__(
-            self, frames: list[str], cause: str, before_drop: Callable[[], None] | None
+            self,
+            frames: list[str],
+            cause: str,
+            before_drop: Callable[[], None] | None,
+            drop_at_exit: bool,
+            error_type: type[Exception] | None,
         ) -> None:
             self._frames = frames
             self._cause = cause
             self._before_drop = before_drop
+            self._drop_at_exit = drop_at_exit
+            self._error_type = error_type
 
         async def aiter_text(self) -> AsyncIterator[str]:
             for frame in self._frames:
                 yield frame
+            if self._drop_at_exit:
+                return
             # What severs the channel (e.g. the runner releasing the harness)
             # happens while the runner is parked on this read.
             if self._before_drop is not None:
                 self._before_drop()
-            raise httpx.ReadError(self._cause)
+            if self._error_type is not None:
+                raise self._error_type(self._cause)
 
 
 def _make_app(
     *,
-    cause: str,
+    cause: str = "",
     terminal_registry: TerminalRegistry | None = None,
     frames: list[str] | None = None,
     before_drop: Callable[[], None] | None = None,
+    harness_client: _ScriptedHarnessClient | None = None,
+    process_manager: _FakeProcessManager | None = None,
+    drop_at_exit: bool = False,
+    error_type: type[Exception] | None = httpx.ReadError,
 ) -> Any:
-    """Build a runner app whose harness stream drops with *cause* mid-turn."""
-    harness_client = _StreamErrorHarnessClient(
-        frames
-        if frames is not None
-        else [
-            _sse(
-                {
-                    "type": "response.created",
-                    "response": {
-                        "id": "resp_drop",
-                        "model": "plain-agent",
-                        "created_at": 1,
-                        "status": "in_progress",
-                    },
-                }
-            )
-        ],
-        cause=cause,
-        before_drop=before_drop,
-    )
-    pm = _FakeProcessManager(harness_client)
+    """Build a runner app whose harness stream drops with *cause* mid-turn.
+
+    :param harness_client: A scripted client to use instead of the dropping one.
+    :param process_manager: A fake manager to wrap *harness_client* instead of a new one.
+    """
+    if harness_client is None:
+        harness_client = _StreamErrorHarnessClient(
+            frames
+            if frames is not None
+            else [
+                _sse(
+                    {
+                        "type": "response.created",
+                        "response": {
+                            "id": "resp_drop",
+                            "model": "plain-agent",
+                            "created_at": 1,
+                            "status": "in_progress",
+                        },
+                    }
+                )
+            ],
+            cause=cause,
+            before_drop=before_drop,
+            drop_at_exit=drop_at_exit,
+            error_type=error_type,
+        )
+    pm = process_manager or _FakeProcessManager(harness_client)
     spec = AgentSpec(spec_version=1, name="plain-agent")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
@@ -220,6 +258,185 @@ async def test_stream_failure_logs_harness_and_response(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
+@pytest.mark.parametrize("shape", ["owned", "foreign", "missing_id", "wrong_status", "wrong_kind"])
+@pytest.mark.parametrize("drop_at_exit", [False, True], ids=["read", "close"])
+async def test_terminal_outcome_survives_a_later_stream_read_error(
+    outcome: str, shape: str, drop_at_exit: bool
+) -> None:
+    response = {
+        "id": "resp_drop",
+        "model": "plain-agent",
+        "created_at": 1,
+        "status": "in_progress",
+    }
+    terminal = {
+        "type": f"response.{outcome}",
+        "response": {
+            **response,
+            "id": "resp_other" if shape == "foreign" else "resp_drop",
+            "status": outcome,
+        },
+    }
+    if shape == "missing_id":
+        terminal["response"].pop("id")
+    elif shape == "wrong_status":
+        terminal["response"]["status"] = "in_progress"
+    elif shape == "wrong_kind":
+        terminal["type"] = "response.in_progress"
+    if outcome == "failed":
+        terminal["error"] = {"code": "harness_error", "message": "Explicit harness failure"}
+    app = _make_app(
+        frames=[_sse({"type": "response.created", "response": response}), _sse(terminal)],
+        cause="connection closed after terminal response",
+        drop_at_exit=drop_at_exit,
+    )
+    _drain_session_event_queue(app.state.session_event_queues.get(_CONV_ID))
+
+    events = await _streamed_events(app, _CONV_ID)
+    failures = [event for event in events if event.get("type") == "response.failed"]
+    queued = _drain_session_event_queue(app.state.session_event_queues.get(_CONV_ID))
+    statuses = [event for event in queued if event.get("type") == "session.status"]
+    failed_statuses = [event for event in statuses if event.get("status") == "failed"]
+    if shape != "owned":
+        assert failures[-1]["error"]["code"] == "connection_error"
+        assert failed_statuses[-1]["error"]["code"] == "connection_error"
+    elif outcome == "failed":
+        assert [event["error"]["code"] for event in failures] == ["harness_error"]
+        assert [status["error"]["code"] for status in failed_statuses] == ["harness_error"]
+    else:
+        assert failures == []
+        assert failed_statuses == []
+        assert len([event for event in statuses if event["status"] == "idle"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drop_at_exit", [False, True], ids=["read", "close"])
+@pytest.mark.parametrize("scenario", ["local_error", "newer_turn", "required_exit", "clean_exit"])
+async def test_completed_stream_preserves_lifecycle_and_newer_turn_ownership(
+    drop_at_exit: bool, scenario: str
+) -> None:
+    response = {"id": "resp_drop", "model": "plain-agent", "created_at": 1}
+
+    def before_drop() -> None:
+        if scenario == "newer_turn":
+            app.state.live_response_id[_CONV_ID] = "resp_newer"
+        elif scenario in {"required_exit", "clean_exit"}:
+            exit_event = _required_terminal_exit(session_was_idle=False)
+            if scenario == "clean_exit":
+                exit_event = replace(
+                    exit_event,
+                    exit_status=0,
+                    last_output="Resume this session with:\nclaude --resume synthetic-session",
+                )
+            app.state.session_resource_registry._terminal_exit_publisher(exit_event)
+
+    app = _make_app(
+        frames=[
+            _sse({"type": "response.created", "response": {**response, "status": "in_progress"}}),
+            _sse({"type": "response.completed", "response": {**response, "status": "completed"}}),
+        ],
+        cause="synthetic teardown error",
+        before_drop=before_drop,
+        drop_at_exit=drop_at_exit,
+        error_type=RuntimeError if scenario == "local_error" else httpx.ReadError,
+    )
+    _drain_session_event_queue(app.state.session_event_queues.get(_CONV_ID))
+    events = await _streamed_events(app, _CONV_ID)
+    failures = [event for event in events if event.get("type") == "response.failed"]
+    if scenario == "local_error":
+        assert len(failures) == 1
+        assert failures[0]["error"]["type"] == "RuntimeError"
+    elif scenario == "required_exit":
+        assert len(failures) == 1
+        assert failures[0]["error"]["code"] == "required_terminal_exited"
+    elif scenario == "clean_exit":
+        assert failures == []
+        assert len([event for event in events if event.get("type") == "response.cancelled"]) == 1
+    else:
+        assert failures == []
+        assert app.state.live_response_id[_CONV_ID] == "resp_newer"
+        queued = _drain_session_event_queue(app.state.session_event_queues.get(_CONV_ID))
+        assert not any(
+            event.get("type") == "session.status" and event.get("status") in {"idle", "failed"}
+            for event in queued
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_phase", ["close", "dispatch_drain"])
+@pytest.mark.parametrize("newer_owner", [False, True])
+@pytest.mark.parametrize("clean_exit", [False, True])
+@pytest.mark.parametrize("outcome", ["completed", "failed"])
+async def test_normal_stream_close_preserves_terminal_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    exit_phase: str,
+    newer_owner: bool,
+    clean_exit: bool,
+    outcome: str,
+) -> None:
+    response = {"id": "resp_drop", "model": "plain-agent", "created_at": 1}
+    frames = [
+        _sse({"type": "response.created", "response": {**response, "status": "in_progress"}})
+    ]
+    stream_closed = asyncio.Event()
+
+    def terminal_exited() -> None:
+        if newer_owner:
+            app.state.live_response_id[_CONV_ID] = "resp_newer"
+        exit_event = _required_terminal_exit(session_was_idle=False)
+        if clean_exit:
+            exit_event = replace(
+                exit_event,
+                exit_status=0,
+                last_output="Resume this session with:\nclaude --resume synthetic-session",
+            )
+        app.state.session_resource_registry._terminal_exit_publisher(exit_event)
+
+    if exit_phase == "dispatch_drain":
+
+        async def complete_dispatch(**kwargs: object) -> None:
+            await stream_closed.wait()
+            terminal_exited()
+
+        monkeypatch.setattr("omnigent.runner.app._evaluate_policy_via_omnigent", complete_dispatch)
+        frames.append(_sse({"type": "policy_evaluation.requested", "evaluation_id": "test-eval"}))
+    frames.append(
+        _sse(
+            {
+                "type": f"response.{outcome}",
+                "response": {**response, "status": outcome},
+                **(
+                    {"error": {"code": "harness_error", "message": "Explicit harness failure"}}
+                    if outcome == "failed"
+                    else {}
+                ),
+            }
+        )
+    )
+    app = _make_app(
+        frames=frames,
+        before_drop=stream_closed.set if exit_phase == "dispatch_drain" else terminal_exited,
+        drop_at_exit=True,
+        error_type=None,
+    )
+    _drain_session_event_queue(app.state.session_event_queues.get(_CONV_ID))
+
+    await _streamed_events(app, _CONV_ID)
+    queued = _drain_session_event_queue(app.state.session_event_queues.get(_CONV_ID))
+    statuses = [event for event in queued if event.get("type") == "session.status"]
+    assert statuses[-1]["status"] == ("idle" if clean_exit else "failed")
+    if not clean_exit:
+        assert statuses[-1]["error"]["code"] == "required_terminal_exited"
+        assert (_CONV_ID in app.state.required_terminal_exit_errors) is newer_owner
+    if newer_owner:
+        assert app.state.live_response_id[_CONV_ID] == "resp_newer"
+    else:
+        assert _CONV_ID not in app.state.live_response_id
+        assert _CONV_ID not in app.state.active_turns
+
+
+@pytest.mark.asyncio
 async def test_causeless_failure_names_the_exception_type_and_attaches_pane(
     tmp_path: Path,
 ) -> None:
@@ -303,7 +520,10 @@ async def test_oversized_pane_snapshot_is_bounded(tmp_path: Path) -> None:
 
 
 def _required_terminal_exit(
-    session_was_idle: bool, expected_close: bool = False, closed_outside_omnigent: bool = False
+    session_was_idle: bool,
+    expected_close: bool = False,
+    closed_outside_omnigent: bool = False,
+    session_was_waiting: bool = False,
 ) -> TerminalExitEvent:
     """Build the exit the registry publishes when the session's Claude pane dies."""
     return TerminalExitEvent(
@@ -317,9 +537,23 @@ def _required_terminal_exit(
         cwd="/work",
         last_output="Waiting for the API key helper...\n",
         session_was_idle=session_was_idle,
+        session_was_waiting=session_was_waiting,
         expected_close=expected_close,
         closed_outside_omnigent=closed_outside_omnigent,
     )
+
+
+def _session_statuses(conv_id: str) -> list[dict[str, Any]]:
+    """Drain and return every ``session.status`` event published for *conv_id*."""
+    from omnigent.runner.app import _session_event_queues_ref
+
+    queue = _session_event_queues_ref.get(conv_id)
+    statuses: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        item = queue.get_nowait()
+        if isinstance(item, dict) and item.get("type") == "session.status":
+            statuses.append(item)
+    return statuses
 
 
 def _failed_statuses(conv_id: str) -> list[dict[str, Any]]:
@@ -435,6 +669,44 @@ async def test_stream_drop_after_required_terminal_exit_reports_the_exit(
 
 
 @pytest.mark.asyncio
+async def test_stream_drop_after_required_terminal_exit_during_a_background_agent_hold(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A pane that dies while its finished turn waits on a background agent settles idle.
+
+    The server keeps ``waiting`` and the agent list until a status edge ends them,
+    and once the pane is gone the exit handler is the only thing left to send one.
+    The release that follows may still sever a stream, which must not turn this
+    clean exit into a failure.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+
+    _session_event_queues_ref.pop(_CONV_ID, None)
+    publish: dict[str, Callable[[TerminalExitEvent], None]] = {}
+    app = _make_app(
+        cause="ReadError(ClosedResourceError())",
+        before_drop=lambda: publish["exit"](
+            _required_terminal_exit(session_was_idle=True, session_was_waiting=True)
+        ),
+    )
+    publish["exit"] = app.state.session_resource_registry._terminal_exit_publisher
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            events = await _streamed_events(app, _CONV_ID)
+        statuses = [s["status"] for s in _session_statuses(_CONV_ID)]
+    finally:
+        _session_event_queues_ref.pop(_CONV_ID, None)
+
+    assert [e for e in events if e.get("type") == "response.failed"] == [], events
+    assert "idle" in statuses, statuses
+    assert "failed" not in statuses, statuses
+    assert _CONV_ID not in app.state.required_terminal_exit_errors
+    assert [
+        r for r in caplog.records if getattr(r, "event_name", None) == "harness_stream_failed"
+    ] == []
+
+
+@pytest.mark.asyncio
 async def test_stream_drop_after_an_expected_close_reports_the_delivery_timeout(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -470,6 +742,8 @@ async def test_stream_drop_after_an_expected_close_reports_the_delivery_timeout(
     ), message
     assert "Last captured terminal output:\nWaiting for the API key helper" in message, message
     assert "Harness stream connection error" not in message, message
+    # Nothing reached the pane, so the server keeps the queued message.
+    assert failed["error"]["undelivered"] is True, failed
     assert [
         r for r in caplog.records if getattr(r, "event_name", None) == "harness_stream_failed"
     ] == []
@@ -553,17 +827,7 @@ async def test_expected_close_release_waits_for_the_turns_own_error(
         return await original_release(conversation_id, *args, **kwargs)
 
     pm.release = _release  # type: ignore[method-assign]
-    spec = AgentSpec(spec_version=1, name="plain-agent")
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return spec
-
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app = _make_app(harness_client=client, process_manager=pm)
     publish["exit"] = app.state.session_resource_registry._terminal_exit_publisher
     try:
         events = await _streamed_events(app, _CONV_ID)
@@ -577,6 +841,85 @@ async def test_expected_close_release_waits_for_the_turns_own_error(
     failed = [e for e in events if e.get("type") == "response.failed"]
     assert [e["error"]["message"] for e in failed] == ["inner executor error: late"], events
     assert order == ["failure_frame", "release"], order
+
+
+class _StalledHarnessClient(_ScriptedHarnessClient):
+    """Harness client that never reports its failure; the stream ends only when released."""
+
+    def __init__(self, on_exit: Callable[[], None]) -> None:
+        super().__init__([])
+        self._on_exit = on_exit
+        self.released = asyncio.Event()
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        del method, url, timeout
+        self.posted_bodies.append(json)
+        on_exit, released = self._on_exit, self.released
+
+        class _Ctx:
+            status_code = 200
+
+            async def __aenter__(self) -> _StalledHarnessClient._Handle:
+                return _StalledHarnessClient._Handle(on_exit, released)
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        return _Ctx()
+
+    class _Handle:
+        status_code = 200
+
+        def __init__(self, on_exit: Callable[[], None], released: asyncio.Event) -> None:
+            self._on_exit, self._released = on_exit, released
+
+        async def aiter_text(self) -> AsyncIterator[str]:
+            yield _sse({"type": "response.created", "response": {"id": "resp_stalled"}})
+            self._on_exit()
+            # The executor never composes its error; only the release ends the read.
+            await self._released.wait()
+            raise httpx.ReadError("")
+
+
+@pytest.mark.asyncio
+async def test_expected_close_release_is_bounded_when_the_executor_never_reports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stalled executor does not hold the harness past the expected-close grace.
+
+    When no failure frame ever arrives, the grace expires, the release severs
+    the stream, and the drop reports the closed pane as undelivered.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+
+    monkeypatch.setattr(runner_app, "_EXPECTED_CLOSE_RELEASE_GRACE_S", 0.2)
+    _session_event_queues_ref.pop(_CONV_ID, None)
+    publish: dict[str, Callable[[TerminalExitEvent], None]] = {}
+    client = _StalledHarnessClient(
+        on_exit=lambda: publish["exit"](
+            _required_terminal_exit(session_was_idle=False, expected_close=True)
+        )
+    )
+    pm = _FakeProcessManager(client)
+    original_release = pm.release
+
+    async def _release(conversation_id: str, *args: Any, **kwargs: Any) -> Any:
+        await original_release(conversation_id, *args, **kwargs)
+        client.released.set()
+
+    pm.release = _release  # type: ignore[method-assign]
+    app = _make_app(harness_client=client, process_manager=pm)
+    publish["exit"] = app.state.session_resource_registry._terminal_exit_publisher
+    try:
+        failed, message = await asyncio.wait_for(_failed_event_message(app, _CONV_ID), 10.0)
+    finally:
+        _session_event_queues_ref.pop(_CONV_ID, None)
+
+    assert pm.released == [_CONV_ID], pm.release_calls
+    assert failed["error"]["code"] == "RuntimeError", failed
+    assert failed["error"]["undelivered"] is True, failed
+    assert "did not become ready before the message delivery timed out" in message, message
 
 
 @pytest.mark.asyncio

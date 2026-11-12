@@ -1,0 +1,236 @@
+# Privileged half of dependabot-regen.yml: push the lockfiles that workflow
+# regenerated back to the Dependabot PR.
+#
+# It runs on `workflow_run`, from main, on a fresh runner, so it can hold the
+# App token. It never checks out or runs PR code: the PR is resolved from the
+# API (still open, Dependabot-authored, same repo, head unchanged); the artifact
+# is untrusted input, of which only `uv.lock` and `pnpm-lock.yaml` are accepted;
+# the checkout holds only those two files; and git runs with hooks disabled.
+# https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
+#
+# What the lockfiles say is not trusted either: they land on the PR like any
+# Dependabot change, and the auto-merge policy (.github/scripts/
+# dependabot_policy.py) still checks every changed package against its
+# registry before anything merges without review.
+#
+# The App-token push re-fires the PR's checks (a GITHUB_TOKEN push would not),
+# including dependabot-regen.yml, which then finds the lockfiles consistent.
+#
+# NOTE: `workflow_run` only triggers from the copy of this file on the DEFAULT
+# branch, so it activates once merged to main -- it does not fire on its own PR.
+name: Dependabot lockfile regen publish
+
+on:
+  workflow_run:
+    workflows: ["Dependabot lockfile regen"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+# One push per PR branch at a time.
+concurrency:
+  group: dependabot-regen-publish-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Push regenerated lockfiles
+    # A cheap pre-filter; the PR itself is verified from the API below.
+    if: >-
+      github.repository == 'omnigent-ai/omnigent'
+      && github.event.workflow_run.event == 'pull_request'
+      && github.event.workflow_run.head_repository.full_name == github.repository
+      && startsWith(github.event.workflow_run.head_branch, 'dependabot/')
+      && (github.event.workflow_run.conclusion == 'success'
+          || github.event.workflow_run.conclusion == 'failure')
+    permissions:
+      actions: read        # list and download the regen run's artifact
+      contents: write      # GITHUB_TOKEN fallback push
+      pull-requests: write # comment the result
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # A result for a commit that is no longer the head is stale: the newer
+      # push runs its own regen.
+      - name: Resolve the Dependabot PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          pr=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" | jq -c --arg sha "$HEAD_SHA" --arg repo "$REPO" '
+            [.[] | select(.state == "open"
+                          and .user.login == "dependabot[bot]"
+                          and .head.sha == $sha
+                          and .head.repo.full_name == $repo
+                          and .base.repo.full_name == $repo
+                          and .base.ref == "main")]
+            | first // empty')
+          if [ -z "$pr" ]; then
+            echo "No open same-repo Dependabot PR has $HEAD_SHA as its head; nothing to do."
+            exit 0
+          fi
+          echo "number=$(jq -r .number <<<"$pr")" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$(jq -r .head.ref <<<"$pr")" >> "$GITHUB_OUTPUT"
+
+      # The artifact was written by a job that ran dependency code, so its
+      # contents are untrusted: exact names, regular files, bounded size, and
+      # well-formed lockfiles, read with the stdlib and never extracted as-is.
+      - name: Fetch and validate the regenerated lockfiles
+        id: lockfiles
+        if: steps.pr.outputs.number != '' && github.event.workflow_run.conclusion == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          id=$(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" --jq '
+            [.artifacts[] | select(.name == "dependabot-regen-lockfiles" and (.expired | not))]
+            | first | .id // empty')
+          if [ -z "$id" ]; then
+            echo "changed=" >> "$GITHUB_OUTPUT"
+            echo "The regen run uploaded no lockfiles; the PR is already consistent."
+            exit 0
+          fi
+          gh api "repos/$REPO/actions/artifacts/$id/zip" > "$RUNNER_TEMP/lockfiles.zip"
+          changed=$(python3 -I - "$RUNNER_TEMP/lockfiles.zip" "$RUNNER_TEMP/lockfiles" <<'PY'
+          import sys
+          import tomllib
+          import zipfile
+          from pathlib import Path
+
+          ALLOWED = {"uv.lock", "pnpm-lock.yaml"}
+          MAX_BYTES = 32 * 1024 * 1024
+          archive, out = Path(sys.argv[1]), Path(sys.argv[2])
+          with zipfile.ZipFile(archive) as zf:
+              entries = zf.infolist()
+              names = [entry.filename for entry in entries]
+              if not names or len(set(names)) != len(names) or not set(names) <= ALLOWED:
+                  sys.exit(f"unexpected artifact entries: {names}")
+              out.mkdir()
+              for entry in entries:
+                  if entry.is_dir() or entry.file_size > MAX_BYTES:
+                      sys.exit(f"{entry.filename}: not a regular lockfile within {MAX_BYTES} bytes")
+                  with zf.open(entry) as handle:
+                      data = handle.read(MAX_BYTES + 1)
+                  if len(data) > MAX_BYTES:
+                      sys.exit(f"{entry.filename}: larger than {MAX_BYTES} bytes")
+                  text = data.decode("utf-8")
+                  if entry.filename == "uv.lock":
+                      tomllib.loads(text)
+                  elif not text.startswith("lockfileVersion:"):
+                      sys.exit("pnpm-lock.yaml does not start with lockfileVersion")
+                  (out / entry.filename).write_bytes(data)
+          print(" ".join(sorted(names)))
+          PY
+          )
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+      # PR files land on disk but nothing from them runs; the sparse checkout
+      # keeps even that to the two lockfiles.
+      - name: Check out the PR head (lockfiles only)
+        if: steps.lockfiles.outputs.changed != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            uv.lock
+            pnpm-lock.yaml
+          sparse-checkout-cone-mode: false
+
+      # Minted only in this no-PR-code job, for this repository and contents
+      # only. Skipped when the App isn't configured (the push then falls back to
+      # GITHUB_TOKEN, which won't re-run CI).
+      - name: Mint App token
+        id: app-token
+        if: steps.lockfiles.outputs.changed != '' && vars.OMNIGENT_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
+      # ${{ }} values pass via env: as "$VAR" to avoid injection; CHANGED holds
+      # only names the validation step allow-listed. The push token
+      # authenticates inline (never in .git/config). The new commit's parent is
+      # the resolved head, so the push only fast-forwards; if the branch moved
+      # meanwhile, the newer push has its own regen run.
+      - name: Commit and push to the PR branch
+        id: push
+        if: steps.lockfiles.outputs.changed != ''
+        env:
+          CHANGED: ${{ steps.lockfiles.outputs.changed }}
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          LOCKFILES: ${{ runner.temp }}/lockfiles
+          PR: ${{ steps.pr.outputs.number }}
+          PUSH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          read -ra lockfiles <<<"$CHANGED"
+          for lockfile in "${lockfiles[@]}"; do
+            cp "$LOCKFILES/$lockfile" "$lockfile"
+          done
+          if [ -z "$(git status --porcelain -- uv.lock pnpm-lock.yaml)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Lockfiles already match the PR head — nothing to commit."
+            exit 0
+          fi
+          git_safe() {
+            git -c core.hooksPath=/dev/null \
+              -c user.name="omnigent-ci[bot]" \
+              -c user.email="294685417+omnigent-ci[bot]@users.noreply.github.com" "$@"
+          }
+          git_safe add -- "${lockfiles[@]}"
+          git_safe commit -s -m "chore(deps): regenerate $CHANGED for this Dependabot update"
+          if ! git_safe push "https://x-access-token:${PUSH_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/$HEAD_REF"; then
+            current=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+            if [ "$current" != "$HEAD_SHA" ]; then
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "The PR moved to $current; its own regen run handles it."
+              exit 0
+            fi
+            exit 1
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Comment the result
+        if: steps.push.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          REPO: ${{ github.repository }}
+          CHANGED: ${{ steps.lockfiles.outputs.changed }}
+          APP_USED: ${{ steps.app-token.conclusion == 'success' }}
+        run: |
+          body="✅ Regenerated \`$CHANGED\` for this update and pushed it to the PR."
+          if [ "$APP_USED" = "true" ]; then
+            body="$body CI will re-run on the new commit."
+          else
+            body="$body ⚠️ No regen App configured, so this push won't re-trigger CI."
+          fi
+          gh pr comment "$PR" --repo "$REPO" --body "$body"
+
+      - name: Comment on failure
+        if: >-
+          always() && steps.pr.outputs.number != ''
+          && (failure() || github.event.workflow_run.conclusion == 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          REPO: ${{ github.repository }}
+          RUN_URL: >-
+            ${{ github.event.workflow_run.conclusion == 'failure'
+                && github.event.workflow_run.html_url
+                || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+        run: |
+          gh pr comment "$PR" --repo "$REPO" \
+            --body "❌ Automatic lockfile regeneration failed — see the [workflow run]($RUN_URL). Lockfiles were not changed; a maintainer can retry with \`/regen\`."

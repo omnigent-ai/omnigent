@@ -16,7 +16,7 @@ Process split (native Codex runs across processes; each helper lives where its
 inputs do):
 
 * The **executor** (which injects turns via a bridge-state app-server client)
-  detects ``/side`` and opens the fork: :func:`side_chat_question` +
+  detects ``/side`` and opens the fork: :func:`side_chat_question_from_content` +
   :func:`open_side_chat_on_client`.
 * The **forwarder** (which watches the app-server event stream and holds the
   ``_CodexForwarderState`` + Omnigent HTTP client) auto-surfaces the fork as a
@@ -40,6 +40,8 @@ import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
+
+from omnigent.errors import ErrorCode, OmnigentError
 
 if TYPE_CHECKING:  # runtime imports are lazy to avoid a forwarder<->side_chat cycle
     import httpx
@@ -95,6 +97,57 @@ def side_chat_question_from_text(text: str) -> str | None:
     return question or None
 
 
+def side_chat_text_from_content(content: object) -> str:
+    """
+    Join the text the user typed into a message, ignoring attachments.
+
+    :param content: A message's content: a string, or a list of blocks, e.g.
+        ``[{"type": "input_text", "text": "and why?"}]``.
+    :returns: The concatenated text with leading indentation preserved, or
+        ``""`` when there is none.
+    """
+    if isinstance(content, str):
+        return content.rstrip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") in {"text", "input_text"}:
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "\n".join(parts).rstrip()
+
+
+def side_chat_question_from_content(content: object) -> str | None:
+    """
+    Return the question when a message's content is a ``/side`` command.
+
+    Only typed text counts, never an attachment's contents. The server's owner
+    check, the runner and the executor all decide with this one function, so
+    none of them acts on a command the others don't see.
+
+    :param content: A message body's ``content`` list, e.g.
+        ``[{"type": "input_text", "text": "/side why?"}]``.
+    :returns: The question, or ``None`` when the message is not a ``/side`` command.
+    :raises OmnigentError: A ``/side`` command includes unsupported attachments.
+    """
+    question = side_chat_question_from_text(side_chat_text_from_content(content).lstrip())
+    if (
+        question is not None
+        and isinstance(content, list)
+        and any(
+            not isinstance(block, dict) or block.get("type") not in {"text", "input_text"}
+            for block in content
+        )
+    ):
+        raise OmnigentError(
+            "Codex /side doesn't support attachments. Remove the attachments and try again.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return question
+
+
 def is_side_chat_child(labels: Mapping[str, str] | None) -> bool:
     """Whether a child conversation's labels mark it as a ``/side`` fork, not a sub-agent."""
     return (labels or {}).get(_NICKNAME_LABEL_KEY) == SIDE_CHAT_DISPLAY_NAME
@@ -109,26 +162,6 @@ def is_side_chat_command(text: str) -> bool:
         main thread.
     """
     return side_chat_question_from_text(text) is not None
-
-
-def side_chat_question(input_items: list[_JsonObject]) -> str | None:
-    """
-    Return the question when normalized turn input is a ``/side`` command.
-
-    :param input_items: Codex ``turn/start`` input items, e.g.
-        ``[{"type": "text", "text": "/side why?"}]``.
-    :returns: The question with leading indentation preserved, or ``None`` when
-        the input is not a single ``/side <question>`` text item.
-    """
-    if len(input_items) != 1:
-        return None
-    item = input_items[0]
-    if item.get("type") != "text":
-        return None
-    text = item.get("text")
-    if not isinstance(text, str):
-        return None
-    return side_chat_question_from_text(text)
 
 
 async def fork_ephemeral_side_thread(

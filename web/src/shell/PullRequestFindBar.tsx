@@ -115,8 +115,9 @@ export function PullRequestFindBar({
   };
 
   if (!open) {
+    // Flex, so the inline-flex button centres in the toolbar rather than on a text line box.
     return (
-      <span ref={trigger}>
+      <span ref={trigger} className="flex shrink-0">
         <IconButton
           label="Find in changes"
           onClick={onOpen}
