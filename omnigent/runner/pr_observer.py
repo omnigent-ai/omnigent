@@ -275,46 +275,86 @@ def _prepare_shell_text(command: str, *, model_syntax: bool = True) -> tuple[str
     return "".join(result), redirected
 
 
+# Operator runs as shlex returns them: ``&&``, ``||``, a parenthesis, or one separator character.
+_SHELL_OPERATOR = re.compile(r"&&|\|\||[();&|\n]")
+
+
+def _shell_steps(
+    command: str, depth: int = 0, *, or_lists: bool = False
+) -> list[ShellSegment | str] | None:
+    """Split a command into simple commands and operators, unwrapping nested shell strings.
+
+    Operators are ``"&&"``, ``"||"``, ``"("``, ``")"``, and ``";"`` for any other
+    separator. A nested shell runs in a child process, so its steps sit between
+    ``"("`` and ``")"``, except for ``eval``, which runs in this shell.
+
+    Without *or_lists*, a command with ``||`` or one that cannot be lexed returns
+    None, since which of its commands ran is unknown.
+    """
+    if depth > MAX_SHELL_NESTING:
+        return None
+    joined, redirected = _prepare_shell_text(command)
+    lexer = shlex.shlex(joined, posix=True, punctuation_chars=";&|\n()")
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    items: list[list[str] | str] = []
+    words: list[str] = []
+    output_eligible = not redirected
+    try:
+        for token in lexer:
+            if token and all(char in ";&|\n()" for char in token):
+                for operator in _SHELL_OPERATOR.findall(token):
+                    if operator == "||" and not or_lists:
+                        return None
+                    if operator in {"&", "|"}:
+                        output_eligible = False
+                    items.append(words)
+                    words = []
+                    items.append(";" if operator in {"&", "|", ";", "\n"} else operator)
+            else:
+                words.append(token)
+    except ValueError:
+        return None
+    items.append(words)
+    steps: list[ShellSegment | str] = []
+    for item in items:
+        if isinstance(item, str):
+            steps.append(item)
+            continue
+        tokens = real_invocation_tokens(item)
+        if not tokens:
+            continue
+        inner = unwrap_shell_command(tokens)
+        if inner is None:
+            steps.append(ShellSegment(raw_tokens=tuple(item), invocation_tokens=tuple(tokens)))
+            continue
+        nested = _shell_steps(inner, depth + 1, or_lists=or_lists)
+        if nested is None or not any(isinstance(step, ShellSegment) for step in nested):
+            output_eligible = False
+        if nested is None:
+            continue
+        if tokens[0].rsplit("/", 1)[-1] == "eval":
+            steps.extend(nested)
+        else:
+            steps.extend(["(", *nested, ")"])
+    if output_eligible:
+        return steps
+    return [
+        replace(step, output_eligible=False) if isinstance(step, ShellSegment) else step
+        for step in steps
+    ]
+
+
 def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
     """Split a command into simple commands, unwrapping nested shell strings in place.
 
     A command with ``||`` or one that cannot be lexed has no segments, since
     which of its commands ran is unknown.
     """
-    if depth > MAX_SHELL_NESTING:
+    steps = _shell_steps(command, depth)
+    if steps is None:
         return []
-    found: list[ShellSegment] = []
-    joined, redirected = _prepare_shell_text(command)
-    lexer = shlex.shlex(joined, posix=True, punctuation_chars=";&|\n")
-    lexer.whitespace = " \t\r"
-    lexer.whitespace_split = True
-    segments: list[list[str]] = [[]]
-    output_eligible = not redirected
-    try:
-        for token in lexer:
-            if token == "||":
-                return []
-            if token and all(char in ";&|\n" for char in token):
-                if token.strip(";\n") not in {"", "&&"}:
-                    output_eligible = False
-                segments.append([])
-            else:
-                segments[-1].append(token)
-    except ValueError:
-        return []
-    for segment in segments:
-        tokens = real_invocation_tokens(segment)
-        if not tokens:
-            continue
-        inner = unwrap_shell_command(tokens)
-        if inner is not None:
-            nested = _shell_segments(inner, depth + 1)
-            if not nested:
-                output_eligible = False
-            found.extend(nested)
-        else:
-            found.append(ShellSegment(raw_tokens=tuple(segment), invocation_tokens=tuple(tokens)))
-    return found if output_eligible else [replace(item, output_eligible=False) for item in found]
+    return [step for step in steps if isinstance(step, ShellSegment)]
 
 
 def _log_provider_failure(provider_id: str, step: str) -> None:
@@ -550,6 +590,11 @@ def _resolve_directory(current: str | None, argument: str) -> str | None:
     return os.path.normpath(path)
 
 
+def _merge_directories(*groups: tuple[str | None, ...]) -> tuple[str | None, ...]:
+    """Return the distinct directories in *groups*, in first-seen order."""
+    return tuple(dict.fromkeys(directory for group in groups for directory in group))
+
+
 def _git_checkouts(
     tool_name: str, arguments: dict[str, object], result: object, cwd: str | None
 ) -> list[str]:
@@ -558,30 +603,76 @@ def _git_checkouts(
     *cwd* is where the call started, when the caller knows it. ``sys_os_shell``
     may run under a sandbox that hides other directories, so only the directory
     it reports running in counts.
+
+    Each step has a set of possible directories, because ``a || b`` runs ``b``
+    whether or not ``a`` changed directory. A subshell's ``cd`` ends with it.
     """
     if tool_name not in SHELL_TOOLS and tool_name not in {"exec_command", "run_command"}:
         return []
     command = arguments.get("command", arguments.get("cmd"))
     if not isinstance(command, str) or len(command) > 100_000:
         return []
-    segments = _shell_segments(command)
+    steps = _shell_steps(command, or_lists=True)
+    if steps is None:
+        return []
     if tool_name == "sys_os_shell":
         reported = result.get("cwd") if isinstance(result, dict) else None
-        runs_git = any(os.path.basename(s.invocation_tokens[0]) == "git" for s in segments)
+        runs_git = any(
+            isinstance(step, ShellSegment) and os.path.basename(step.invocation_tokens[0]) == "git"
+            for step in steps
+        )
         return [reported] if runs_git and isinstance(reported, str) and reported else []
     workdir = arguments.get("workdir")
-    current = _resolve_directory(cwd, workdir) if isinstance(workdir, str) and workdir else cwd
+    start = _resolve_directory(cwd, workdir) if isinstance(workdir, str) and workdir else cwd
     found: dict[str, None] = {}
-    for segment in segments:
-        tokens = segment.invocation_tokens
+    # Directories the next step may run in, and those the previous step may have run in.
+    here: tuple[str | None, ...] = (start,)
+    before: tuple[str | None, ...] = (start,)
+    # Directories from which an ``||`` left side succeeded, skipping the rest of its chain.
+    skipped: tuple[str | None, ...] = ()
+    after_or = False
+    # Per open subshell: the directories it was entered in, and ``skipped`` outside it.
+    subshells: list[tuple[tuple[str | None, ...], tuple[str | None, ...]]] = []
+    for step in steps:
+        if isinstance(step, str):
+            if step == "(":
+                entry = _merge_directories(before, here) if after_or else here
+                after_or = False
+                subshells.append((entry, skipped))
+                here = before = entry
+                skipped = ()
+            elif step == ")":
+                if subshells:
+                    entry, skipped = subshells.pop()
+                    here = before = entry
+            elif step == "||":
+                skipped = _merge_directories(skipped, here)
+                after_or = True
+            elif step == ";":
+                here = _merge_directories(here, skipped)
+                skipped = ()
+                after_or = False
+            continue
+        tokens = step.invocation_tokens
+        pre = _merge_directories(before, here) if after_or else here
+        after_or = False
         if tokens[0] in {"cd", "pushd"}:
-            current = _resolve_directory(current, tokens[1] if len(tokens) > 1 else "~")
-        elif os.path.basename(tokens[0]) == "git":
-            directory = current
-            if len(tokens) > 2 and tokens[1] == "-C":
-                directory = _resolve_directory(current, tokens[2])
-            if directory is not None:
-                found[directory] = None
+            target = tokens[1] if len(tokens) > 1 else "~"
+            post = _merge_directories(
+                *((_resolve_directory(directory, target),) for directory in pre)
+            )
+        elif tokens[0] in {"exit", "return"}:
+            post = ()
+        else:
+            post = pre
+            if os.path.basename(tokens[0]) == "git":
+                for directory in pre:
+                    git_directory = directory
+                    if len(tokens) > 2 and tokens[1] == "-C":
+                        git_directory = _resolve_directory(directory, tokens[2])
+                    if git_directory is not None:
+                        found[git_directory] = None
+        before, here = pre, post
     return list(found)[:4]
 
 
