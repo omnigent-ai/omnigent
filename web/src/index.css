@@ -588,7 +588,9 @@
         padding var(--composer-morph-duration) var(--composer-morph-easing);
     }
 
-    > [data-composer-input-area] > textarea {
+    /* The live Markdown field wraps the textarea; it stands in for it here. */
+    > [data-composer-input-area] > textarea,
+    > [data-composer-input-area] > [data-composer-field] > textarea {
       display: block;
       min-height: 1lh;
     }
@@ -640,7 +642,11 @@
       display: none;
     }
 
-    &[data-composer-hint-placeholder] > [data-composer-input-area] > textarea::placeholder {
+    &[data-composer-hint-placeholder] > [data-composer-input-area] > textarea::placeholder,
+    &[data-composer-hint-placeholder]
+      > [data-composer-input-area]
+      > [data-composer-field]
+      > textarea::placeholder {
       color: transparent;
     }
 
@@ -662,7 +668,8 @@
         pointer-events: none;
       }
 
-      > [data-composer-input-area] > textarea {
+      > [data-composer-input-area] > textarea,
+      > [data-composer-input-area] > [data-composer-field] > textarea {
         min-height: 1lh;
         height: 1lh !important;
         overflow: hidden;
@@ -670,11 +677,12 @@
         pointer-events: auto;
       }
 
-      > [data-composer-input-area] > :not(textarea) {
+      > [data-composer-input-area] > :not(textarea, [data-composer-field]) {
         visibility: hidden;
       }
 
-      > [data-composer-input-area] > textarea::placeholder {
+      > [data-composer-input-area] > textarea::placeholder,
+      > [data-composer-input-area] > [data-composer-field] > textarea::placeholder {
         color: var(--muted-foreground);
       }
 

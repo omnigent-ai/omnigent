@@ -746,6 +746,7 @@ export const ComposerTextarea = forwardRef<HTMLTextAreaElement, ComposerTextarea
     return (
       <div
         className="composer-input-text relative text-ui"
+        data-composer-field=""
         data-compact={compacted ? "" : undefined}
         // The textarea below the preview adds no height or scroll (nor its
         // line box's strut); a quote's bar still reaches into the left gutter.
