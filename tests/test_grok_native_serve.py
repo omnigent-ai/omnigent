@@ -35,5 +35,3 @@ def test_build_endpoint_allocates_distinct_ports_and_secrets() -> None:
     assert a.secret != b.secret
     assert a.ws_url.endswith(f"server-key={a.secret}")
     assert a.ws_url.startswith(f"ws://127.0.0.1:{a.port}/")
-
-
