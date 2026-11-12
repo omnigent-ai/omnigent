@@ -163,6 +163,7 @@ import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDi
 import { resolveDefaultShell } from "./preferredShell";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
+import { TasksTabOnOpen } from "./TasksTabOnOpen";
 import type { RightRailTab } from "./railTabs";
 
 /**
@@ -231,16 +232,21 @@ function restoredRailOpen(
   canvasMode: boolean,
   searchParams: URLSearchParams,
 ): boolean {
-  const file = searchParams.get("file");
-  const comment = searchParams.get("comment");
-  const hasWorkspaceUrlSignal =
-    searchParams.get("panel") === "agents" ||
-    (file !== null && file !== "") ||
-    (comment !== null && comment !== "");
   return (
     (readSessionWorkspaceState(conversationId).open ??
       (canvasMode ? false : readDefaultWorkspacePanelOpen())) ||
-    hasWorkspaceUrlSignal
+    hasWorkspaceUrlSignal(searchParams)
+  );
+}
+
+/** Whether the URL asks the rail for a file, a comment or the Agents tab. */
+function hasWorkspaceUrlSignal(searchParams: URLSearchParams): boolean {
+  const file = searchParams.get("file");
+  const comment = searchParams.get("comment");
+  return (
+    searchParams.get("panel") === "agents" ||
+    (file !== null && file !== "") ||
+    (comment !== null && comment !== "")
   );
 }
 
@@ -2811,6 +2817,10 @@ function AppShellImpl() {
             data-ios-native={isIOSShell() ? "true" : undefined}
             data-android-native={isAndroidShell() ? "true" : undefined}
           >
+            <TasksTabOnOpen
+              conversationId={serverConversationId}
+              skip={canvasMode || hasWorkspaceUrlSignal(searchParams)}
+            />
             {/* Frameless-window titlebar stand-in (macOS Electron only): the
           sidebar's electron top margin (see index.css) frees this strip of
           canvas for the traffic lights, and the strip is the window's one

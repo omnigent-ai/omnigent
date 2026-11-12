@@ -112,7 +112,7 @@ import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { applyJournalEntry } from "@/hooks/useSessionJournal";
 import { isFirstPlan } from "@/lib/sessionJournal";
-import { showTasksTabForNewPlan } from "@/store/sessionTasksActions";
+import { showTasksTabBesideChat } from "@/store/sessionTasksActions";
 import { noteSessionStreamClosed, noteSessionStreamOpen } from "@/lib/sessionStreamSignals";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
@@ -9580,7 +9580,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         isFirstPlan(event.entry) &&
         event.conversationId === useChatStore.getState().conversationId
       ) {
-        showTasksTabForNewPlan(event.conversationId);
+        showTasksTabBesideChat(event.conversationId);
       }
       return;
     case "session_changed_files_invalidated":

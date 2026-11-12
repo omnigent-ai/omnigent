@@ -97,8 +97,11 @@ export function openTasksTab(conversationId: string, stepId?: string): void {
   });
 }
 
-/** The agent made the session's first plan: show its Tasks tab beside the chat, not over it on a phone. */
-export function showTasksTabForNewPlan(conversationId: string): void {
+/**
+ * Show a session's Tasks tab beside the chat, not over it on a phone: when the
+ * agent makes the session's first plan, or a session with tasks opens.
+ */
+export function showTasksTabBesideChat(conversationId: string): void {
   useSessionTasksActions.setState({
     tasksTabToOpen: conversationId,
     taskToShow: null,
