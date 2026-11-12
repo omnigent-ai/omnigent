@@ -148,14 +148,14 @@ def test_requested_sandbox_never_falls_back_to_bare_worker(
         resolve.assert_called_once()
 
 
-# Goose/Qwen's executor scenarios already cover absent and explicit-none policies.
+# Goose/Kimi/Qwen's executor scenarios cover absent and explicit-none policies.
 # Codex's worker scenario covers explicit none and preserves the caller's executable.
 @pytest.mark.parametrize(
     ("harness", "declared"),
     [
         (harness, declared)
         for harness in _HARNESSES
-        if harness not in ("goose", "qwen")
+        if harness not in ("goose", "kimi", "qwen")
         for declared in (False, True)
         if not (harness == "codex" and declared)
     ],
