@@ -10625,10 +10625,10 @@ async def _auto_create_grok_terminal(
     from omnigent.harnesses.grok_native.client import GrokAcpClient, GrokAcpError
     from omnigent.harnesses.grok_native.credentials import resolve_grok_executable
     from omnigent.harnesses.grok_native.forwarder import start_updates_follower
+    from omnigent.harnesses.grok_native.probe import wait_for_grok_serve
     from omnigent.harnesses.grok_native.serve import (
         build_grok_serve_endpoint,
         grok_serve_argv,
-        wait_for_grok_serve,
     )
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 

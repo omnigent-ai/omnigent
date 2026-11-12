@@ -8,7 +8,6 @@ resource a ``native-server`` harness manages. See docs/GROK_NATIVE_DESIGN.md.
 
 from __future__ import annotations
 
-import asyncio
 import secrets
 import socket
 from dataclasses import dataclass
@@ -80,33 +79,6 @@ def grok_serve_argv(
     return argv
 
 
-async def wait_for_grok_serve(
-    port: int,
-    *,
-    timeout_s: float = 30.0,
-    poll_s: float = 0.1,
-) -> None:
-    """Wait until the serve port accepts a TCP connection.
-
-    The server prints its WS URL once bound; a connectable port is the cheap
-    readiness signal (the ACP ``initialize`` handshake happens on the client
-    side of the WS connect, not at bind time).
-
-    :raises TimeoutError: when the port never comes up (e.g. crashed spawn).
-    """
-    deadline = asyncio.get_event_loop().time() + timeout_s
-    while asyncio.get_event_loop().time() < deadline:
-        try:
-            _reader, writer = await asyncio.open_connection(_DEFAULT_BIND_HOST, port)
-        except OSError:
-            await asyncio.sleep(poll_s)
-            continue
-        writer.close()
-        await writer.wait_closed()
-        return
-    raise TimeoutError(f"grok agent serve did not bind {port} within {timeout_s}s")
-
-
 def build_grok_serve_endpoint(
     *,
     port: int | None = None,
@@ -130,5 +102,4 @@ __all__ = [
     "grok_serve_argv",
     "grok_ws_url",
     "mint_grok_secret",
-    "wait_for_grok_serve",
 ]
