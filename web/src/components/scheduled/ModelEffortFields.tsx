@@ -12,6 +12,8 @@ import type { useScheduledHarnessSettings } from "./useScheduledHarnessSettings"
  * Distinct from Claude's real `default` (Manual) mode so leaving the control
  * alone keeps the agent's configured mode rather than forcing Manual. */
 const PERMISSION_SELECT_DEFAULT = "__agent_default__";
+/** Sentinel for an empty mode that inherits another session's, shown beside Default. */
+const PERMISSION_SELECT_INHERITED = "__inherited__";
 
 export function ModelEffortFields({
   model,
@@ -24,6 +26,7 @@ export function ModelEffortFields({
   onPermissionModeChange,
   onSelectOpenChange,
   idPrefix = "task",
+  inheritedPermissionLabel,
 }: {
   /** Selected model id/alias, or "" = agent default (nothing overridden). */
   model: string;
@@ -41,6 +44,8 @@ export function ModelEffortFields({
   onSelectOpenChange?: (open: boolean) => void;
   /** Prefix for element ids and test ids, so two groups can share a form. */
   idPrefix?: string;
+  /** Label for an empty mode that inherits another session's instead of the default. */
+  inheritedPermissionLabel?: string;
 }) {
   const modelOptions = settings.models.map((option) => ({
     id: option.id,
@@ -56,6 +61,7 @@ export function ModelEffortFields({
   const permissionOptions = settings.permissions.filter(
     (option) => settings.harness === "claude-native" || option.value !== "default",
   );
+  const inheritsPermission = Boolean(inheritedPermissionLabel) && permissionMode === "";
 
   return (
     <div className="flex flex-col gap-3 sm:gap-4">
@@ -153,14 +159,19 @@ export function ModelEffortFields({
           <Select
             disabled={disabled}
             value={
-              permissionMode === "" ||
-              (settings.harness !== "claude-native" && permissionMode === "default")
-                ? PERMISSION_SELECT_DEFAULT
-                : permissionMode
+              inheritsPermission
+                ? PERMISSION_SELECT_INHERITED
+                : permissionMode === "" ||
+                    (settings.harness !== "claude-native" && permissionMode === "default")
+                  ? PERMISSION_SELECT_DEFAULT
+                  : permissionMode
             }
             componentId="tasks.scheduled.permission_mode"
             valueHasNoPii
-            onValueChange={(v) => onPermissionModeChange(v === PERMISSION_SELECT_DEFAULT ? "" : v)}
+            onValueChange={(v) => {
+              if (v !== PERMISSION_SELECT_INHERITED)
+                onPermissionModeChange(v === PERMISSION_SELECT_DEFAULT ? "" : v);
+            }}
             onOpenChange={onSelectOpenChange}
           >
             <SelectTrigger
@@ -178,6 +189,11 @@ export function ModelEffortFields({
               align="end"
               className="w-[min(20rem,calc(100vw-2rem))]"
             >
+              {inheritsPermission && (
+                <SelectItem value={PERMISSION_SELECT_INHERITED}>
+                  {inheritedPermissionLabel}
+                </SelectItem>
+              )}
               <SelectItem value={PERMISSION_SELECT_DEFAULT}>Default</SelectItem>
               {permissionOptions.map((m) => (
                 <SelectItem key={m.value} value={m.value}>

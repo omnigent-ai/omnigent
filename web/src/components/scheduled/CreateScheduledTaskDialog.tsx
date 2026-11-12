@@ -961,7 +961,7 @@ export function CreateScheduledTaskDialog({
             schedule.preset === "custom" && schedule.customFreq === "minutely"
               ? schedule.interval
               : 60,
-          // A switched edit keeps the saved workers' harness, model, effort, and mode.
+          // Workers carry their own harness, model, effort, and mode.
           agentId: workerSettings?.agentId,
           model: workerSettings?.model || undefined,
           effort: workerSettings?.effort || undefined,
@@ -2032,6 +2032,7 @@ export function CreateScheduledTaskDialog({
                                 value={workerSettings}
                                 settings={workerHarnessSettings}
                                 permissionModesSupported={sessionPermissionModesSupported}
+                                pollingPermissionMode={effectivePermission}
                                 taskSession={sendsToTaskSession}
                                 disabled={curationPending}
                                 onSelectOpenChange={handleSelectOpenChange}
@@ -2135,6 +2136,7 @@ export function CreateScheduledTaskDialog({
                                 value={workerSettings}
                                 settings={workerHarnessSettings}
                                 permissionModesSupported={sessionPermissionModesSupported}
+                                pollingPermissionMode={effectivePermission}
                                 taskSession={sendsToTaskSession}
                                 creating
                                 followsPolling={newTriggerWorkerSettings === null}

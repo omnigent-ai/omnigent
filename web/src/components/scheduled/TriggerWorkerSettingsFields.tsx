@@ -75,6 +75,7 @@ export function TriggerWorkerSettingsFields({
   taskSession = false,
   creating = false,
   followsPolling = false,
+  pollingPermissionMode = "",
   disabled,
   onChange,
   onSelectOpenChange,
@@ -89,6 +90,8 @@ export function TriggerWorkerSettingsFields({
   creating?: boolean;
   /** The values still mirror the polling session's settings. */
   followsPolling?: boolean;
+  /** The polling session's mode, which workers without their own mode run in. */
+  pollingPermissionMode?: string;
   disabled: boolean;
   onChange: (value: TriggerWorkerSettings) => void;
   onSelectOpenChange: (open: boolean) => void;
@@ -108,6 +111,10 @@ export function TriggerWorkerSettingsFields({
   const chosenDefault = permissions.some((option) => option.value === defaultMode)
     ? (defaultMode ?? "")
     : "";
+  const inheritsPolling =
+    permissions.length > 0 &&
+    value.permissionMode === "" &&
+    settings.permissions.some((option) => option.value === pollingPermissionMode);
   const unappliedLabel =
     settings.permissions.find((option) => option.value === unappliedMode)?.label ?? unappliedMode;
   return (
@@ -119,6 +126,7 @@ export function TriggerWorkerSettingsFields({
         settings={{ ...settings, permissions }}
         disabled={disabled}
         idPrefix="task-worker"
+        inheritedPermissionLabel={inheritsPolling ? "Same as polling session" : undefined}
         onModelChange={(model) =>
           onChange({
             ...value,
@@ -172,7 +180,8 @@ export function TriggerWorkerSettingsFields({
             : "Applies to new sessions started for matching items. Existing sessions, including the polling session, keep their settings. ")}
         {followsPolling && "They match the polling session until you change them. "}
         Default uses the selected harness&apos;s configuration.
-        {permissions.length > 0 && " Modes that skip approval aren't available here."}
+        {permissions.length > 0 &&
+          " Default permissions start the harness's own default mode. Modes that skip approval aren't available here."}
       </p>
     </div>
   );
