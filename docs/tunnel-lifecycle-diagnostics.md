@@ -86,7 +86,8 @@ session impact or changes KPI eligibility.
   rejection, cancellation) raises out of the reconnect loop and is logged by
   the caller instead. `disconnect_reason` (the bounded classifier shared with
   the OTel counter; `local_shutdown` when the process is stopping, even if the
-  close handshake broke), `close_code`, `close_reason`, `close_rcvd_code` and
+  close handshake broke; `scheduled_renewal` for a planned renewal),
+  `close_code`, `close_reason`, `close_rcvd_code` and
   `close_sent_code` (which side sent a close frame; a 1006 has neither),
   `error_type`, `connected`, `connection_age_s`, `recycle`, `backoff_reset`,
   `delay_s`, `retry_in_s`. A clean 1000/1001 close ends the read loop without
@@ -512,7 +513,9 @@ in its worker thread.
 
 A successful preparation closes the transport with code `1001` and reason
 `scheduled tunnel renewal`. The next handshake uses the prepared credential
-without another credential lookup in the disconnected interval. The runner
+without another credential lookup in the disconnected interval. Its
+`runner_tunnel_disconnected` row reports `disconnect_reason = scheduled_renewal`
+and reconnects at the base delay, not as a server recycle. The runner
 and harness stay alive, and the usual session-stream recovery runs. Renewal
 does not run the idle-shutdown drain or mark sessions intentionally stopped.
 It still depends on working session recovery, including across replicas;
