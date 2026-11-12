@@ -1657,7 +1657,7 @@ class TestProviderManagedProfiles:
             )
             assert env.catalog.get_session_snapshot(source_id) == snapshot
             return
-        assert cleared.is_success, cleared.text
+        assert cleared.status_code == (202 if command == "clear" else 200), cleared.text
         continuation_id = cleared.json()["session_id"]
         continuation = env.conversations.get_conversation(continuation_id)
         assert continuation is not None

@@ -11106,6 +11106,12 @@
             "title": "Attachments",
             "type": "array"
           },
+          "attachments_incomplete": {
+            "default": false,
+            "description": "Some attachments could not be restored; warn the user to attach them again before sending.",
+            "title": "Attachments Incomplete",
+            "type": "boolean"
+          },
           "prompt": {
             "description": "Text of the chosen prompt, for the client to put back in the composer, e.g. `\"Add a test for the parser\"`.",
             "title": "Prompt",

@@ -3199,11 +3199,14 @@ class SessionRewindResponse(BaseModel):
         the composer, e.g. ``"Add a test for the parser"``.
     :param attachments: The prompt's attachments, in prompt order, for the
         client to put back in the composer; empty when it had none.
+    :param attachments_incomplete: Some attachments could not be restored;
+        warn the user to attach them again before sending.
     """
 
     session_id: str
     prompt: str
     attachments: list[SessionRewindAttachment] = Field(default_factory=list)
+    attachments_incomplete: bool = False
 
 
 class ReadStatePutRequest(BaseModel):

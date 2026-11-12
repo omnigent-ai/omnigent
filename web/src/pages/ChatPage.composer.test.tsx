@@ -1352,6 +1352,7 @@ describe("Composer slash-command menu", () => {
         respond({
           sessionId: "conv_new",
           prompt: "Write the parser",
+          attachmentsIncomplete: false,
           attachments: [{ type: "input_image", fileId: "file_new", filename: "diagram.png" }],
         }),
       );

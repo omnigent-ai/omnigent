@@ -3753,6 +3753,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const { conversationId } = get();
     if (!conversationId) return;
     const rewound = await rewindSession(conversationId, itemId);
+    if (rewound.attachmentsIncomplete) {
+      toast.warning("Some attachments couldn't be restored. Attach them again before sending.");
+    }
     const target = rewound.sessionId;
     // A draft the user has edited, cleared or sent in the new session since
     // it opened, here or offscreen, wins over the prompt.

@@ -367,6 +367,7 @@ async def test_rewind_returns_the_prompt_attachments_as_the_fork_holds_them(
     # The fork's copies come from the map the fork made, not a listing of its files.
     assert new_id not in listed_files
     assert resp.json()["prompt"] == ""
+    assert resp.json()["attachments_incomplete"] is True
     assert [(a["type"], a["filename"]) for a in attachments] == [
         ("input_image", "diagram.png"),
         ("input_file", "notes.txt"),
@@ -442,6 +443,7 @@ async def test_rewind_returns_an_inline_attachment_from_the_prompt(
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["prompt"] == (text or "")
+    assert resp.json()["attachments_incomplete"] is False
     assert resp.json()["attachments"] == [
         {"file_id": None, "image_url": None, "file_data": None, **expected}
     ]
@@ -494,6 +496,7 @@ async def test_rewind_still_returns_the_new_session_when_its_attachments_fail(
     assert resp.status_code == 200, resp.text
     new_id = resp.json()["session_id"]
     assert (resp.json()["prompt"], resp.json()["attachments"]) == ("Q3", [])
+    assert resp.json()["attachments_incomplete"] is True
     assert message_texts(store, new_id) == ["Q1", "A1", "Q2", "A2"]
     assert live_runner.superseded == [(source_id, new_id, "rewind")]
 

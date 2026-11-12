@@ -7768,24 +7768,40 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       return () => sent;
     }
 
-    it("opens the rewound session with the prompt in its composer", async () => {
-      onTestFinished(() => clearSessionDrafts());
-      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
-      const sent = answerRewind(
-        Response.json({ session_id: "conv_new", prompt: "Add parser tests" }),
-      );
+    it.each([false, true])(
+      "restores the rewound prompt and warns if incomplete: %s",
+      async (incomplete) => {
+        onTestFinished(() => clearSessionDrafts());
+        useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+        const sent = answerRewind(
+          Response.json({
+            session_id: "conv_new",
+            prompt: "Add parser tests",
+            attachments_incomplete: incomplete,
+          }),
+        );
+        const warning = vi.spyOn(toast, "warning");
+        onTestFinished(() => warning.mockRestore());
 
-      await useChatStore.getState().rewindToPrompt("msg_second");
+        await useChatStore.getState().rewindToPrompt("msg_second");
 
-      expect(JSON.parse(String(sent()?.body))).toEqual({ item_id: "msg_second" });
-      expect(getSessionDraft("conv_new")?.text).toBe("Add parser tests");
-      expect(useChatStore.getState().redirectToConversationId).toBe("conv_new");
-      expect(useChatStore.getState().rewindPrefill).toEqual({
-        conversationId: "conv_new",
-        text: "Add parser tests",
-        files: [],
-      });
-    });
+        if (incomplete) {
+          expect(warning).toHaveBeenCalledExactlyOnceWith(
+            "Some attachments couldn't be restored. Attach them again before sending.",
+          );
+        } else {
+          expect(warning).not.toHaveBeenCalled();
+        }
+        expect(JSON.parse(String(sent()?.body))).toEqual({ item_id: "msg_second" });
+        expect(getSessionDraft("conv_new")?.text).toBe("Add parser tests");
+        expect(useChatStore.getState().redirectToConversationId).toBe("conv_new");
+        expect(useChatStore.getState().rewindPrefill).toEqual({
+          conversationId: "conv_new",
+          text: "Add parser tests",
+          files: [],
+        });
+      },
+    );
 
     it("stays put when the user switched away before the rewind was acknowledged", async () => {
       onTestFinished(() => {

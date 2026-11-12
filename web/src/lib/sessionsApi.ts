@@ -1121,7 +1121,12 @@ export interface RewindAttachment {
 export async function rewindSession(
   sessionId: string,
   itemId: string,
-): Promise<{ sessionId: string; prompt: string; attachments: RewindAttachment[] }> {
+): Promise<{
+  sessionId: string;
+  prompt: string;
+  attachments: RewindAttachment[];
+  attachmentsIncomplete: boolean;
+}> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/rewind`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1130,6 +1135,7 @@ export async function rewindSession(
   const body = await readJsonOrThrow<{
     session_id: string;
     prompt: string;
+    attachments_incomplete?: boolean;
     attachments?: {
       type: RewindAttachment["type"];
       file_id?: string | null;
@@ -1141,6 +1147,7 @@ export async function rewindSession(
   return {
     sessionId: body.session_id,
     prompt: body.prompt,
+    attachmentsIncomplete: body.attachments_incomplete === true,
     attachments: (body.attachments ?? []).map((attachment) => ({
       type: attachment.type,
       ...(attachment.file_id ? { fileId: attachment.file_id } : {}),

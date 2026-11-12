@@ -6221,6 +6221,8 @@ def register_core_routes(
                 if part.get("type") == "input_text" and isinstance(part.get("text"), str)
             ),
             attachments=attachments,
+            attachments_incomplete=len(attachments)
+            < sum(part.get("type") in ("input_file", "input_image") for part in prompt.content),
         )
 
     def _user_prompt_in_history(session_id: str, prompt: str) -> bool:

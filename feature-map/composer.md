@@ -160,9 +160,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   while a turn runs or with neither a usable runner nor a saved host binding
   (error under the composer), prompt arriving after the new session opened
   (filled unless the user has typed, cleared or sent a draft there), an
-  attachment that could not be downloaded into the composer (a warning names
-  it; one whose file is gone, or that the server could not look up, is left
-  out without a warning).
+  attachment that could not be restored (a warning asks the user to attach it
+  again, including missing files and failed server lookups; failed downloads
+  name the affected files).
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
