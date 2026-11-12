@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -14,18 +15,19 @@ import pytest
 
 from omnigent import mcp_disabled_servers
 from omnigent.config import global_config_path
-from omnigent.mcp_disabled_servers import ServerKey, plan_codex_launch, set_disabled
-from tests._helpers.mcp_disabled_servers import write_mcp_inheritance
+from omnigent.mcp_disabled_servers import (
+    McpStrictModeError,
+    ServerKey,
+    plan_codex_launch,
+    set_disabled,
+)
+from tests._helpers.mcp_disabled_servers import isolate_codex_system_layers, write_mcp_inheritance
 
 
 @pytest.fixture
 def launch(tmp_path, monkeypatch):
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "omnigent"))
-    system = tmp_path / "etc-codex"
-    monkeypatch.setattr(mcp_disabled_servers, "CODEX_SYSTEM_CONFIG_PATH", system / "config.toml")
-    monkeypatch.setattr(
-        mcp_disabled_servers, "CODEX_MANAGED_CONFIG_PATH", system / "managed_config.toml"
-    )
+    isolate_codex_system_layers(monkeypatch, tmp_path / "etc-codex")
     home = tmp_path / "private-home"
     home.mkdir()
     repo = tmp_path / "repo"
@@ -38,6 +40,29 @@ def launch(tmp_path, monkeypatch):
 def _write(path, content):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
+
+
+# Codex accepts this multiline inline table; tomllib does not.
+_TOML_1_1_CONFIG = (
+    'mcp_servers.user = {\n  command = "true",\n}\n[mcp_servers.kept]\ncommand="true"\n'
+)
+
+
+def _codex_mcp_list(home, repo, overrides):
+    """Return the real Codex CLI's ``mcp list --json`` rows for *overrides*."""
+    argv = ["codex"]
+    for override in overrides:
+        argv.extend(["-c", override])
+    result = subprocess.run(
+        [*argv, "mcp", "list", "--json"],
+        env={**os.environ, "CODEX_HOME": str(home)},
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    return json.loads(result.stdout)
 
 
 def _plan(home, cwd, overrides=(), *, active=("codex",), executor="codex"):
@@ -349,6 +374,7 @@ def test_plan_is_synchronous_and_never_spawns(launch):
 
 @pytest.mark.parametrize("executor", ["codex", "codex-native"])
 def test_strict_disables_every_layer_except_allowlist_without_retry(launch, executor, caplog):
+    caplog.set_level(logging.INFO, logger=mcp_disabled_servers.__name__)
     home, repo = launch
     write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
     _write(mcp_disabled_servers.CODEX_SYSTEM_CONFIG_PATH, '[mcp_servers.system]\ncommand="true"\n')
@@ -363,20 +389,53 @@ def test_strict_disables_every_layer_except_allowlist_without_retry(launch, exec
     )
     _write(repo / ".codex/config.toml", '[mcp_servers.repo]\ncommand="true"\n')
     plan = _plan(home, repo, ['mcp_servers.cli.command="true"'], active=None, executor=executor)
+    # Codex reads its /etc layers only on POSIX hosts.
+    names = (
+        ["cli", "managed", "repo", "system", "user"]
+        if os.name == "posix"
+        else ["cli", "repo", "user"]
+    )
     expected = (
         'mcp_servers.cli.command="true"',
-        *(
-            f"mcp_servers.{name}.enabled=false"
-            for name in ["cli", "managed", "repo", "system", "user"]
-        ),
+        *(f"mcp_servers.{name}.enabled=false" for name in names),
     )
     assert plan.config_overrides == plan.fallback_config_overrides == expected
     assert plan.outcome == "none"
     assert plan.overrides_after_early_exit() is None
     assert (
         f"mcp_strict_mode_applied executor={executor} "
-        "disabled=('cli', 'managed', 'repo', 'system', 'user') allowed=('omnigent', 'kept')"
+        f"disabled={tuple(names)} allowed=('omnigent', 'kept')"
     ) in caplog.text
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Codex reads /etc layers only on POSIX")
+@pytest.mark.parametrize("strict", [False, True])
+def test_strict_refuses_launch_when_a_layer_is_unreadable(launch, caplog, strict):
+    home, repo = launch
+    if strict:
+        write_mcp_inheritance({"inherit": False})
+    else:
+        set_disabled(ServerKey("codex", "user"), True)
+    managed = mcp_disabled_servers.CODEX_MANAGED_CONFIG_PATH
+    _write(managed, "[mcp_servers.managed\n")
+    _write(home / "config.toml", '[mcp_servers.user]\ncommand="true"\n')
+    if not strict:
+        plan = _plan(home, repo, executor="codex-native")
+        assert plan.config_overrides == ("mcp_servers.user.enabled=false",)
+        assert "mcp_strict_launch_refused" not in caplog.text
+        return
+    with pytest.raises(McpStrictModeError, match="codex-native launch") as refused:
+        _plan(home, repo, executor="codex-native")
+    assert refused.value.path == managed
+    assert "harness.codex-native.mcp.inherit: true" in str(refused.value)
+    assert f"mcp_strict_launch_refused executor=codex-native path={managed}" in caplog.text
+
+
+def test_toml_1_1_layer_is_read(launch):
+    home, repo = launch
+    write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
+    _write(home / "config.toml", _TOML_1_1_CONFIG)
+    assert _plan(home, repo, active=None).config_overrides == ("mcp_servers.user.enabled=false",)
 
 
 def test_strict_with_switch_retry_keeps_strict_overrides(launch):
@@ -429,23 +488,12 @@ def test_real_codex_enables_only_allowlisted_servers_in_strict_mode(launch):
     write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
     _write(
         home / "config.toml",
-        '[mcp_servers.user]\ncommand="true"\n[mcp_servers.kept]\ncommand="true"\n'
-        '[mcp_servers.omnigent]\ncommand="true"\n[mcp_servers."quoted.name"]\ncommand="true"\n',
+        _TOML_1_1_CONFIG
+        + '[mcp_servers.omnigent]\ncommand="true"\n[mcp_servers."quoted.name"]\ncommand="true"\n',
     )
     overrides = ['mcp_servers.cli.command="true"']
-    argv = ["codex"]
-    for override in _plan(home, repo, overrides, active=None).config_overrides:
-        argv.extend(["-c", override])
-    result = subprocess.run(
-        [*argv, "mcp", "list", "--json"],
-        env={**os.environ, "CODEX_HOME": str(home)},
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=10,
-    )
-    assert {row["name"]: row["enabled"] for row in json.loads(result.stdout)} == {
+    rows = _codex_mcp_list(home, repo, _plan(home, repo, overrides, active=None).config_overrides)
+    assert {row["name"]: row["enabled"] for row in rows} == {
         "cli": False,
         "kept": True,
         "omnigent": True,
@@ -477,39 +525,15 @@ def test_real_codex_config_names_match_in_process_plan(launch):
     for name in ["user", "repo", "cli", "cli.dotted", "missing", *quoted_names]:
         set_disabled(ServerKey("codex", name), True)
     plan = _plan(home, repo, overrides)
-    argv = ["codex"]
-    for override in overrides:
-        argv.extend(["-c", override])
-    result = subprocess.run(
-        [*argv, "mcp", "list", "--json"],
-        env={**os.environ, "CODEX_HOME": str(home)},
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=10,
-    )
-    cli_names = {row["name"] for row in json.loads(result.stdout)}
+    baseline = _codex_mcp_list(home, repo, overrides)
     expected_names = {"user", "repo", "cli", "cli.dotted", "keep", *quoted_names}
-    assert cli_names == expected_names
+    assert {row["name"] for row in baseline} == expected_names
     assert plan.dropped == ("missing",)
-    argv = ["codex"]
-    for override in plan.config_overrides:
-        argv.extend(["-c", override])
-    disabled = subprocess.run(
-        [*argv, "mcp", "list", "--json"],
-        env={**os.environ, "CODEX_HOME": str(home)},
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=10,
-    )
-    rows = json.loads(disabled.stdout)
+    rows = _codex_mcp_list(home, repo, plan.config_overrides)
     assert {row["name"] for row in rows} == expected_names
     assert {row["name"]: row["enabled"] for row in rows} == {
         name: name == "keep" for name in expected_names
     }
     assert {row["name"]: row["transport"] for row in rows} == {
-        row["name"]: row["transport"] for row in json.loads(result.stdout)
+        row["name"]: row["transport"] for row in baseline
     }

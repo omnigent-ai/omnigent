@@ -339,9 +339,14 @@ unchanged. Saved preferences remain available when the flags are re-enabled.
 `~/.omnigent/config.yaml`, optionally overridden under `harness.<id>.mcp`, makes
 Claude and Codex launches load only the `omnigent` server plus the allowlist.
 It needs no server flag and has no UI. Project config cannot change it. Claude
-gets `allowedMcpServers` through `--settings`; Codex gets an `enabled=false`
-override for every other discovered server and no relaunch without them.
-Malformed values warn once and inherit. Claude 2.1.283 matches allowlisted
+gets `allowedMcpServers` through `--settings`, and because Claude unions
+allowlists across settings sources, every other inherited user, project, local
+or managed `allowedMcpServers` entry is mirrored into `deniedMcpServers`. Codex
+gets an `enabled=false` override for every other discovered server (TOML 1.1
+layers are read with `tomlkit`) and no relaunch without them. A strict launch
+whose Claude settings or Codex config layer exists but is unreadable raises
+`McpStrictModeError` naming the file. Malformed Omnigent values warn once and
+inherit. Claude 2.1.283 matches allowlisted
 names against configured servers only, so strict mode always blocks Claude
 plugin MCP servers. Codex plugin MCPs and macOS-managed preferences are not
 discovered.

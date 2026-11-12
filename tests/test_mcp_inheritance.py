@@ -94,7 +94,19 @@ def test_reads_user_config_and_ignores_project_config(config_home, tmp_path, mon
     assert resolve_mcp_inheritance("codex") == McpInheritance(False, frozenset({"docs"}))
 
 
-def test_unreadable_user_config_warns_and_inherits(config_home, caplog):
-    (config_home / "config.yaml").write_text("mcp: [unclosed\n")
-    assert resolve_mcp_inheritance("claude-sdk").inherit
-    assert "cannot read MCP inheritance" in caplog.text
+@pytest.mark.parametrize("failure", ["malformed", "permission"])
+def test_unreadable_user_config_warns_once_and_inherits(config_home, caplog, monkeypatch, failure):
+    path = config_home / "config.yaml"
+    path.write_text("mcp: [unclosed\n" if failure == "malformed" else "mcp: {inherit: false}\n")
+    if failure == "permission":
+        # Raised directly so the case also holds when tests run as root.
+        def load_global_config():
+            raise PermissionError(13, "Permission denied", str(path))
+
+        monkeypatch.setattr("omnigent.config.load_global_config", load_global_config)
+    for _ in range(2):
+        assert resolve_mcp_inheritance("claude-sdk").inherit
+    warnings = [
+        record for record in caplog.records if "cannot read MCP inheritance" in record.getMessage()
+    ]
+    assert len(warnings) == 1

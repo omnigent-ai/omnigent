@@ -78,6 +78,12 @@ def test_disabled_server_absent_from_real_native_session(
     config = {name: {"command": sys.executable, "args": [str(fixture)]} for name in names}
     if harness == "claude":
         (home / ".claude.json").write_text(json.dumps({"mcpServers": config}))
+        if control == "strict":
+            # Claude unions allowlists across settings sources; strict mode must still win.
+            (home / ".claude").mkdir()
+            (home / ".claude/settings.json").write_text(
+                json.dumps({"allowedMcpServers": [{"serverName": "off_fixture"}]})
+            )
     else:
         codex = home / ".codex"
         codex.mkdir()

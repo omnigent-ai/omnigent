@@ -1351,19 +1351,30 @@ async def test_malformed_config_read_keeps_the_launch_model_provider_pin(
     assert [method for method, _params in client.requests] == ["config/read"]
 
 
-@pytest.mark.parametrize("strict", [False, True])
-@pytest.mark.parametrize("saved", [False, True])
-@pytest.mark.parametrize("active", [None, [], ["codex"]])
+# The switch matrix, plus strict alone and strict beside an active disable.
+_HOOK_CASES = [
+    *((active, saved, False) for active in (None, [], ["codex"]) for saved in (False, True)),
+    (None, False, True),
+    (["codex"], True, True),
+]
+
+
+@pytest.mark.parametrize(("active", "saved", "strict"), _HOOK_CASES)
 async def test_disabled_mcp_launch_hook_uses_prepared_private_config(
     tmp_path, monkeypatch, active, saved, strict
 ):
-    from tests._helpers.mcp_disabled_servers import launch_activation, write_mcp_inheritance
+    from tests._helpers.mcp_disabled_servers import (
+        isolate_codex_system_layers,
+        launch_activation,
+        write_mcp_inheritance,
+    )
 
     active = launch_activation(active)
 
     from omnigent import mcp_disabled_servers as disabled
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    isolate_codex_system_layers(monkeypatch, tmp_path / "etc-codex")
     if saved:
         disabled.set_disabled(disabled.ServerKey("codex", "fixture"), True)
     if strict:

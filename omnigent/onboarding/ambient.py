@@ -570,6 +570,19 @@ def read_claude_managed_settings(
     return None
 
 
+def claude_user_settings_path(cwd: str | Path | None = None) -> Path:
+    """Return the user ``settings.json`` path Claude Code reads from *cwd*.
+
+    :param cwd: The CLI's working directory, e.g. ``"/home/user/repo"``;
+        ``None`` means this process's working directory.
+    :returns: ``$CLAUDE_CONFIG_DIR/settings.json`` when set, else
+        ``~/.claude/settings.json``.
+    """
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    config_dir = Path(configured) if configured else Path.home() / ".claude"
+    return Path(cwd or "") / config_dir / "settings.json"
+
+
 def read_claude_user_settings(cwd: str | None = None) -> dict[str, object] | None:
     """Return Claude Code's user ``settings.json``, parsed.
 
@@ -583,11 +596,8 @@ def read_claude_user_settings(cwd: str | None = None) -> dict[str, object] | Non
     :returns: The settings object, or ``None`` when the file is missing,
         unreadable, or not an object.
     """
-    configured = os.environ.get("CLAUDE_CONFIG_DIR")
-    config_dir = Path(configured) if configured else Path.home() / ".claude"
-    settings_path = Path(cwd or "") / config_dir / "settings.json"
     try:
-        payload = json.loads(settings_path.read_text(encoding="utf-8"))
+        payload = json.loads(claude_user_settings_path(cwd).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return payload if isinstance(payload, dict) else None
@@ -672,8 +682,8 @@ def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -
     return urlsplit(base_url).hostname or "Claude Code gateway"
 
 
-def claude_code_managed_mcp_paths() -> tuple[Path, ...]:
-    """Claude Code's enterprise MCP config, which sits beside its managed settings.
+def claude_code_platform_managed_settings_paths() -> tuple[Path, ...]:
+    """The managed ``settings.json`` files Claude Code reads on this platform.
 
     Claude Code reads only its own platform's directory, so this skips the other POSIX
     one, and Windows paths on POSIX, which would resolve against the working directory.
@@ -684,9 +694,17 @@ def claude_code_managed_mcp_paths() -> tuple[Path, ...]:
         else _CLAUDE_CODE_MACOS_MANAGED_DIR
     )
     return tuple(
-        path.with_name("managed-mcp.json")
+        path
         for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS
         if path.is_absolute() and path.parent != other_platform_dir
+    )
+
+
+def claude_code_managed_mcp_paths() -> tuple[Path, ...]:
+    """Claude Code's enterprise MCP config, which sits beside its managed settings."""
+    return tuple(
+        path.with_name("managed-mcp.json")
+        for path in claude_code_platform_managed_settings_paths()
     )
 
 

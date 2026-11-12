@@ -3533,6 +3533,7 @@ class ClaudeSDKExecutor(Executor):
             ),
             executor="claude-sdk",
             active_harnesses=self._mcp_active_harnesses,
+            cwd=self._cwd,
         )
         if hermetic:
             # Claude Code builds older than that setting honor only this knob.

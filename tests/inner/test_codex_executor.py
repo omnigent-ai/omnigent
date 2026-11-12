@@ -6951,9 +6951,10 @@ def test_completed_turn_clears_certificate_evidence(turn: dict):
 @pytest.fixture
 def disabled_mcp_session(tmp_path, monkeypatch):
     from omnigent import mcp_disabled_servers as disabled
-    from tests._helpers.mcp_disabled_servers import launch_activation
+    from tests._helpers.mcp_disabled_servers import isolate_codex_system_layers, launch_activation
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    isolate_codex_system_layers(monkeypatch, tmp_path / "etc-codex")
     source_home = tmp_path / "source-codex-home"
     source_home.mkdir()
     monkeypatch.setenv("CODEX_HOME", str(source_home))
@@ -7139,6 +7140,20 @@ async def test_disabled_mcp_not_applied_early_exit_does_not_retry(disabled_mcp_s
         await harness.session.start()
     assert harness.spawns == [("/bin/echo", "app-server", "-c", "base=true")]
     assert RELAUNCH_WITHOUT_OVERRIDES_EVENT not in caplog.text
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Codex reads /etc layers only on POSIX")
+async def test_strict_mcp_refuses_launch_before_spawn(disabled_mcp_session):
+    from omnigent import mcp_disabled_servers as disabled
+    from tests._helpers.mcp_disabled_servers import write_mcp_inheritance
+
+    harness = disabled_mcp_session
+    write_mcp_inheritance({"inherit": False})
+    disabled.CODEX_SYSTEM_CONFIG_PATH.parent.mkdir(parents=True)
+    disabled.CODEX_SYSTEM_CONFIG_PATH.write_text("[mcp_servers.system\n")
+    with pytest.raises(disabled.McpStrictModeError, match="codex launch"):
+        await harness.session.start()
+    assert harness.spawns == []
 
 
 async def test_strict_mcp_early_exit_keeps_disables(disabled_mcp_session, caplog):

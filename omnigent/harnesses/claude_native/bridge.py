@@ -3196,7 +3196,10 @@ def augment_claude_args(
     from omnigent.mcp_disabled_servers import apply_claude_settings
 
     hook_settings = apply_claude_settings(
-        hook_settings, executor="claude-native", active_harnesses=active_harnesses
+        hook_settings,
+        executor="claude-native",
+        active_harnesses=active_harnesses,
+        cwd=workspace,
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)

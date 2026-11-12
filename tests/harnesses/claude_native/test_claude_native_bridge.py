@@ -18019,11 +18019,21 @@ def test_read_tmux_target_rejects_invalid_payloads(tmp_path: Path) -> None:
     assert claude_native_bridge.read_tmux_target(bridge_dir) is None
 
 
-@pytest.mark.parametrize("strict", [False, True])
-@pytest.mark.parametrize("saved", [False, True])
-@pytest.mark.parametrize("active", [None, [], ["claude"]])
+# The switch matrix, plus strict alone and strict beside an active disable.
+_HOOK_CASES = [
+    *((active, saved, False) for active in (None, [], ["claude"]) for saved in (False, True)),
+    (None, False, True),
+    (["claude"], True, True),
+]
+
+
+@pytest.mark.parametrize(("active", "saved", "strict"), _HOOK_CASES)
 def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved, strict):
-    from tests._helpers.mcp_disabled_servers import launch_activation, write_mcp_inheritance
+    from tests._helpers.mcp_disabled_servers import (
+        isolate_claude_settings,
+        launch_activation,
+        write_mcp_inheritance,
+    )
 
     active = launch_activation(active)
 
@@ -18032,9 +18042,16 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved,
     from omnigent.mcp_disabled_servers import ServerKey, apply_claude_settings, set_disabled
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    workspace = isolate_claude_settings(monkeypatch, tmp_path / "claude")
+    (workspace / ".claude").mkdir()
+    (workspace / ".claude/settings.json").write_text(
+        json.dumps({"allowedMcpServers": [{"serverName": "inherited"}]})
+    )
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    original_args = augment_claude_args(("--model", "test-model"), bridge_dir=bridge_dir)
+    original_args = augment_claude_args(
+        ("--model", "test-model"), bridge_dir=bridge_dir, workspace=workspace
+    )
     settings_path = Path(original_args[original_args.index("--settings") + 1])
     original = settings_path.read_bytes()
     if saved:
@@ -18045,14 +18062,24 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved,
         "omnigent.mcp_disabled_servers.apply_claude_settings", wraps=apply_claude_settings
     ) as hook:
         args = augment_claude_args(
-            ("--model", "test-model"), bridge_dir=bridge_dir, active_harnesses=active
+            ("--model", "test-model"),
+            bridge_dir=bridge_dir,
+            active_harnesses=active,
+            workspace=workspace,
         )
     hook.assert_called_once()
-    assert hook.call_args.kwargs == {"executor": "claude-native", "active_harnesses": active}
+    assert hook.call_args.kwargs == {
+        "executor": "claude-native",
+        "active_harnesses": active,
+        "cwd": workspace,
+    }
     assert args == original_args
     expected = json.loads(original)
-    if active and saved:
-        expected["deniedMcpServers"] = [{"serverName": "fixture"}]
+    denied = [{"serverName": "fixture"}] if active and saved else []
+    if strict:
+        denied.append({"serverName": "inherited"})
+    if denied:
+        expected["deniedMcpServers"] = denied
     if strict:
         expected["allowedMcpServers"] = [{"serverName": "omnigent"}]
     if (active and saved) or strict:
