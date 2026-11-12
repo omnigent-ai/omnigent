@@ -9,7 +9,7 @@ this single function.
 from __future__ import annotations
 
 from omnigent.entities import Conversation, ResolvedAccess
-from omnigent.server.auth import LEVEL_MANAGE, LEVEL_OWNER
+from omnigent.server.auth import LEVEL_MANAGE, LEVEL_OWNER, effective_admin
 from omnigent.server.sharing_settings import effective_public_level
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
@@ -49,7 +49,7 @@ def check_session_access(
     if conversation is not None and conversation.id != conversation_id:
         return False
 
-    if user_id is not None and permission_store.is_admin(user_id):
+    if user_id is not None and effective_admin(permission_store.is_admin(user_id)):
         return True
 
     conv = conversation or conversation_store.get_conversation(conversation_id)
@@ -83,7 +83,7 @@ def resolved_allows(access: ResolvedAccess, required_level: int) -> bool:
         3=manage, 4=owner).
     :returns: ``True`` if access is allowed, ``False`` otherwise.
     """
-    if access.is_admin:
+    if effective_admin(access.is_admin):
         return True
     if access.user_grant_level is not None and access.user_grant_level >= required_level:
         return True
@@ -104,7 +104,7 @@ def resolved_level(access: ResolvedAccess) -> int | None:
     :returns: Numeric level (1/2/3/4), or ``None`` when the user has no
         access.
     """
-    if access.is_admin:
+    if effective_admin(access.is_admin):
         return LEVEL_OWNER
     levels = [
         level

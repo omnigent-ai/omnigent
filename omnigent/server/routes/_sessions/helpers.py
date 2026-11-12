@@ -71,6 +71,7 @@ from omnigent.errors import (
     ErrorImpact,
     ErrorPhase,
     OmnigentError,
+    WrongReplicaError,
     category_for_code,
     restart_on_stale_cursor,
 )
@@ -124,6 +125,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
+    effective_admin,
 )
 from omnigent.server.host_registry import (
     HostConnection,
@@ -1302,7 +1304,7 @@ def _permission_level_from_grants(
     """
     if user_id is None:
         return None
-    if is_admin:
+    if effective_admin(is_admin):
         return LEVEL_OWNER
     user_grant = next((g for g in grants if g.user_id == user_id), None)
     if user_grant is not None:
@@ -2041,6 +2043,7 @@ def _resolve_harness_impl(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     agents_by_id: Mapping[str, Agent] | None = None,
+    agent: Agent | None = None,
 ) -> str | None:
     """
     Resolve the canonical harness for a conversation's bound agent.
@@ -2058,6 +2061,8 @@ def _resolve_harness_impl(
     :param agent_store: Optional store for resolving the bound agent.
     :param agent_cache: Optional cache for loading the bound agent spec.
     :param agents_by_id: Optional preloaded agents, avoiding per-session store reads.
+    :param agent: The bound agent row when the caller already holds it, so
+        the store is not read again. Ignored unless it is ``conv``'s agent.
     :returns: The canonical harness (e.g. ``"openai-agents"`` or
         ``"claude-sdk"``), or ``None`` when unavailable.
     """
@@ -2076,7 +2081,7 @@ def _resolve_harness_impl(
 
         if agents_by_id is not None:
             agent = agents_by_id.get(conv.agent_id)
-        else:
+        elif agent is None or agent.id != conv.agent_id:
             if agent_store is None:
                 from omnigent.runtime._globals import _agent_store
 
@@ -6498,6 +6503,8 @@ async def _launch_runner_on_host_impl(
     conversation_store: ConversationStore,
     host_registry: HostRegistry,
     host_conn: HostConnection,
+    *,
+    replace_move_claim: bool = False,
 ) -> _HostLaunchAttempt:
     """
     Ask a host to spawn a runner for a session and capture the result.
@@ -6523,6 +6530,8 @@ async def _launch_runner_on_host_impl(
     :param conversation_store: Store for updating ``runner_id``.
     :param host_registry: In-memory ``HostRegistry``.
     :param host_conn: The live ``HostConnection`` for the host.
+    :param replace_move_claim: Whether this launch may replace a move's claim
+        on the runner; only the move's own sandbox launch may.
     :returns: The :class:`_HostLaunchAttempt` — the new runner id plus any
         structured refusal from the host.
     """
@@ -6544,6 +6553,14 @@ async def _launch_runner_on_host_impl(
                 error_code="session_not_found",
                 error="session was deleted while its relaunch was in flight",
             )
+        from omnigent.server.managed_hosts import is_move_claim
+
+        if is_move_claim(fresh.runner_id) and not replace_move_claim:
+            # A move holds the session, perhaps claimed since the caller's read:
+            # there's no runner to ride, and its sandbox's launch starts one.
+            # Not recorded as a launch, so the move's own launch, which may be
+            # waiting on this lock, doesn't take it for its result.
+            return _move_in_progress_attempt(fresh.runner_id or "")
         last = _relaunch_last_attempt.get(conv.id)
         # A waiter may already have read the active flight's replacement binding.
         if last is not None and last is not previous_attempt and last.runner_id == fresh.runner_id:
@@ -6553,7 +6570,11 @@ async def _launch_runner_on_host_impl(
                 return last
             return _HostLaunchAttempt(runner_id=fresh.runner_id)
         attempt = await _launch_runner_on_host_locked(
-            fresh, conversation_store, host_registry, host_conn
+            fresh,
+            conversation_store,
+            host_registry,
+            host_conn,
+            replace_move_claim=replace_move_claim,
         )
         # Re-insert so the plain dict's insertion order is newest-last, then
         # evict from the front once past the cap.
@@ -6564,28 +6585,59 @@ async def _launch_runner_on_host_impl(
         return attempt
 
 
+def _move_in_progress_attempt(claim: str) -> _HostLaunchAttempt:
+    """
+    The refusal for a launch that finds a move's claim on the session.
+
+    :param claim: The move's claim, e.g. ``"runner_token_move_…"``; callers
+        recognize the refusal by it (:func:`~omnigent.server.managed_hosts.is_move_claim`).
+    """
+    return _HostLaunchAttempt(
+        runner_id=claim,
+        error_code="session_binding_changed",
+        error="the session is moving to a new sandbox",
+    )
+
+
 async def _launch_runner_on_host_locked(
     conv: Conversation,
     conversation_store: ConversationStore,
     host_registry: HostRegistry,
     host_conn: HostConnection,
+    *,
+    replace_move_claim: bool = False,
 ) -> _HostLaunchAttempt:
     """The launch round-trip proper; runs under the conversation's lock."""
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
     from omnigent.scheduled_context import current_scheduled_run
+    from omnigent.server.managed_hosts import is_move_claim
 
+    if is_move_claim(conv.runner_id) and not replace_move_claim:
+        # The session is moving onto a new sandbox; that launch starts its runner.
+        return _move_in_progress_attempt(conv.runner_id or "")
     await host_registry.admit_launch(host_conn, conv.id)
     superseded_runner_id = conv.runner_id
     reap_superseded = await _owns_host_runner(conv, conversation_store)
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
 
-    bound_conv = await asyncio.to_thread(
-        conversation_store.replace_runner_id,
-        conv.id,
-        new_runner_id,
-    )
+    try:
+        # Only while the runner is still the one this launch read, so a claim a
+        # move took meanwhile isn't overwritten. The host may have changed: an
+        # admitted launch still goes ahead after its host is revoked.
+        bound_conv = await asyncio.to_thread(
+            conversation_store.replace_runner_id,
+            conv.id,
+            new_runner_id,
+            expected_runner=conv,
+        )
+    except ValueError:
+        return _HostLaunchAttempt(
+            runner_id=conv.runner_id or "",
+            error_code="session_binding_changed",
+            error="the session's host or runner changed before the runner could start",
+        )
     if bound_conv.runner_last_seen is not None:
         # The new token has not reached the host, so this stamp can only
         # belong to the previous runner. Clear it before launching.
@@ -6755,6 +6807,7 @@ def _start_managed_launch_task(
     conversation_store: ConversationStore,
     tracker: ManagedLaunchTracker,
     startup: ManagedStartupInputs | None,
+    held_runner_id: str | None = None,
 ) -> asyncio.Task[None]:
     """
     Run a managed launch in the background, failing saved inputs it can't deliver.
@@ -6770,8 +6823,108 @@ def _start_managed_launch_task(
     :param tracker: The app's launch tracker; a settled failure is read here.
     :param startup: The server's saved-input service, or ``None`` when the
         server has none.
+    :param held_runner_id: The claim a move holds on the session's runner
+        while this launch provisions, released if shutdown abandons it.
     :returns: The launch task.
     """
+    # Read before the launch settles, which forgets a superseded entry.
+    entry = tracker.get(session_id)
+    superseded_note = (
+        "The message wasn't sent: the session's move to a new sandbox was cancelled "
+        "before the sandbox was ready. Send it again."
+    )
+
+    async def hold_to_settle(*, unbound_only: bool = False) -> str:
+        """
+        Hold the session under the move's claim while this launch settles it.
+
+        Only the move releases its claim, so until it does nothing else can bind
+        the session: a host that takes it afterwards isn't settled with this
+        launch's outcome. A claim handed over to the sandbox's replica, or one
+        its runner replaced, is taken back first, from the binding just read.
+
+        :param unbound_only: Leave a session bound to this launch's sandbox to
+            that sandbox's replica, which finishes the launch.
+        :returns: ``"held"``; ``"bound"`` when left to the sandbox's replica; or
+            ``"taken"`` when another host has the session.
+        """
+        if held_runner_id is None:
+            return "held"
+        for _ in range(3):
+            current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if current is None or current.runner_id == held_runner_id:
+                return "held"
+            on_sandbox = (
+                current.host_id is not None
+                and entry is not None
+                and entry.host_id == current.host_id
+            )
+            if not on_sandbox and (current.host_id is not None or current.runner_id is not None):
+                return "taken"
+            if on_sandbox and unbound_only:
+                return "bound"
+            try:
+                await asyncio.to_thread(
+                    conversation_store.replace_runner_id,
+                    session_id,
+                    held_runner_id,
+                    expected_binding=current,
+                )
+            except ConversationNotFoundError:
+                return "held"
+            except ValueError:
+                continue  # Changed since the read; classify it again.
+            return "held"
+        # Still contended after repeated reads: don't settle the session.
+        return "taken"
+
+    async def release_claim() -> None:
+        """Drop the move's claim, keeping any host its sandbox bound."""
+        if held_runner_id is None:
+            return
+        for _ in range(3):
+            current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if current is None or current.runner_id != held_runner_id:
+                return
+            # Compare-and-clear on the exact binding read, so the host stays.
+            try:
+                await asyncio.to_thread(
+                    conversation_store.clear_runner_id, session_id, expected_binding=current
+                )
+            except ConversationNotFoundError:
+                return
+            except ValueError:
+                continue
+            return
+
+    async def settle_superseded() -> None:
+        # Another host runs the session: nothing failed there, but what was
+        # held for this sandbox will never reach it.
+        tracker.finish(session_id)
+        _publish_sandbox_status(session_id, "ready")
+        if startup is not None:
+            await startup.release_held_inputs(
+                session_id, superseded_note, move_claim=held_runner_id
+            )
+
+    async def settle(held: str, record: Callable[[], Awaitable[object]] | None) -> None:
+        """Record the launch's outcome while the session is held, then release the claim."""
+        if held == "taken":
+            await settle_superseded()
+            return
+        try:
+            if held == "held" and record is not None:
+                await record()
+        finally:
+            await release_claim()
+
+    # Only a move's failure carries its claim; a create's launch has none.
+    move_kwargs = {"move_claim": held_runner_id} if held_runner_id is not None else {}
+
+    def record_failure(reason: str) -> Callable[[], Awaitable[object]] | None:
+        if startup is None:
+            return None
+        return lambda: startup.record_launch_failure(session_id, reason, **move_kwargs)
 
     async def record_unbound_launch_failure() -> None:
         # Shutdown gave up on the launch. Bound, the host's replica finishes
@@ -6781,29 +6934,41 @@ def _start_managed_launch_task(
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is not None and conv.host_id is None:
             await startup.record_launch_failure(
-                session_id, "the server shut down before the sandbox finished launching"
+                session_id,
+                "the server shut down before the sandbox finished launching",
+                **move_kwargs,
             )
+
+    async def settle_cancelled() -> None:
+        await settle(
+            await hold_to_settle(unbound_only=True),
+            record_unbound_launch_failure if startup is not None else None,
+        )
 
     async def launch_and_record_failure() -> None:
         try:
             await launch
         except asyncio.CancelledError:
-            if startup is not None:
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(
-                        record_unbound_launch_failure(),
-                        timeout=_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S,
-                    )
-            raise
-        except Exception as exc:
-            if startup is not None:
-                await startup.record_launch_failure(
-                    session_id, f"managed sandbox failed to launch: {exc}"
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    settle_cancelled(), timeout=_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S
                 )
             raise
+        except Exception as exc:
+            await settle(
+                await hold_to_settle(),
+                record_failure(f"managed sandbox failed to launch: {exc}"),
+            )
+            raise
+        if entry is not None and entry.superseded:
+            if startup is not None:
+                await startup.release_held_inputs(
+                    session_id, superseded_note, move_claim=held_runner_id
+                )
+            return
         failed = tracker.get(session_id)
-        if startup is not None and failed is not None and failed.error is not None:
-            await startup.record_launch_failure(session_id, failed.error)
+        if failed is not None and failed.error is not None:
+            await settle(await hold_to_settle(), record_failure(failed.error))
 
     launch_task = asyncio.create_task(launch_and_record_failure())
     _managed_launch_tasks.add(launch_task)
@@ -9336,6 +9501,7 @@ def _filesystem_attachment_in_history(
     file_store: FileStore | None,
     *,
     up_to_response_id: str | None = None,
+    before_item_id: str | None = None,
     content: Sequence[dict[str, Any]] = (),
 ) -> str | None:
     """Find a retained attachment requiring filesystem tools, using its stored name.
@@ -9344,6 +9510,8 @@ def _filesystem_attachment_in_history(
     :param conversation_store: Store containing the ordered source history.
     :param file_store: Store containing authoritative attachment filenames.
     :param up_to_response_id: Inclusive fork cutoff, or all history when absent.
+    :param before_item_id: Exclusive cutoff: only the items before this one
+        are retained, e.g. ``"msg_abc"``.
     :param content: Additional incoming message blocks to check before stored history.
     :returns: A referenced filesystem attachment's name, or ``None``.
     """
@@ -9371,7 +9539,7 @@ def _filesystem_attachment_in_history(
 
     # Descending order finds the last item of the cutoff response first,
     # matching the fork store's inclusive position cutoff.
-    retained = up_to_response_id is None
+    retained = up_to_response_id is None and before_item_id is None
     items_after: str | None = None
     while True:
         page = conversation_store.list_items(
@@ -9380,6 +9548,9 @@ def _filesystem_attachment_in_history(
         for item in page.data:
             if item.response_id == up_to_response_id:
                 retained = True
+            if before_item_id is not None and item.id == before_item_id:
+                retained = True
+                continue
             if not retained or not isinstance(item.data, MessageData):
                 continue
             for block in item.data.content:
@@ -9444,14 +9615,15 @@ def _load_agent_spec_for_session(*args: Any, **kwargs: Any) -> AgentSpec | None:
 def _load_agent_spec_for_session_impl(
     conv: Conversation,
     agent_store: AgentStore,
+    agent: Agent | None = None,
 ) -> AgentSpec | None:
-    # Split from _build_policy_engine_from_spec so the caller can run the
-    # cheap guardrails/default-policy skip check between the two and avoid
-    # paying for engine construction when no policy could fire. Both halves
-    # are blocking DB/IO, so each is run under asyncio.to_thread.
+    # Split from _build_policy_engine_from_spec so callers can skip engine
+    # construction when no policy could fire; both halves run in to_thread.
+    # A caller already holding conv's agent row passes it to skip the store read.
     if conv.agent_id is None:
         return None
-    agent = agent_store.get(conv.agent_id)
+    if agent is None or agent.id != conv.agent_id:
+        agent = agent_store.get(conv.agent_id)
     if agent is None:
         return None
     agent_cache = cast(AgentCache, get_agent_cache())
@@ -9621,7 +9793,8 @@ def _build_evaluation_context(
 
     - ``TOOL_CALL``: ``content = {"name": name, "arguments": args}``,
       ``tool_name = name``.
-    - ``TOOL_RESULT``: ``content = {"result": result_str}``,
+    - ``TOOL_RESULT``: ``content = {"result": result_str}``, plus
+      ``"is_error": True`` when the producer reported the call failed,
       ``tool_name`` from ``request_data.name``,
       ``request_data`` from the event's ``request_data`` field.
     - ``REQUEST`` / ``RESPONSE``: ``content = str(data)``.
@@ -9673,11 +9846,14 @@ def _build_evaluation_context(
         if request_data is not None:
             raw_tool_name = request_data.get("name")
             result_tool_name = raw_tool_name if isinstance(raw_tool_name, str) else None
+        result_content: dict[str, Any] = {
+            "result": tool_result if isinstance(tool_result, str) else json.dumps(tool_result),
+        }
+        if structured_data.get("is_error") is True:
+            result_content["is_error"] = True
         return EvaluationContext(
             phase=phase,
-            content={
-                "result": tool_result if isinstance(tool_result, str) else json.dumps(tool_result),
-            },
+            content=result_content,
             tool_name=result_tool_name,
             request_data=request_data,
             actor=actor,
@@ -12194,9 +12370,9 @@ def require_filesystem_attachment_runtime(
     if host is not None or runner is not None:
         return
     if host_id and runner_router is not None and runner_router.host_is_on_another_replica(host_id):
-        raise OmnigentError(
+        raise WrongReplicaError(
             "Attachment support must be checked on the host's server replica",
-            code=ErrorCode.WRONG_REPLICA,
+            host_id=host_id,
         )
     raise OmnigentError(
         "Connect an updated Omnigent host before attaching archives, Office documents, "

@@ -906,6 +906,47 @@ it("orders equal-updated_at rows by id whether or not the order is frozen", () =
   expect(sortConversations([c, a, b], null).map((row) => row.id)).toEqual(["c", "b", "a"]);
 });
 
+it("keeps nested drafts at the representative's active or frozen sort position", () => {
+  const parent = { ...conversation("parent", "Parent", new Date(1000)), updated_at: 300 };
+  const other = { ...parent, id: "other", updated_at: 200 };
+  const draft = {
+    ...parent,
+    id: "temp:draft",
+    provisional: true,
+    family: { id: "family", representative_id: parent.id, pinned: false },
+  };
+  for (const frozen of [null, new Map([[parent.id, 100]])]) {
+    const rows = sortConversations(
+      [parent, other, draft],
+      { id: parent.id, updatedAt: 100 },
+      frozen,
+    );
+    expect(rows[0].id).toBe(other.id);
+  }
+  const tiedParent = { ...parent, id: "conv_a", created_at: 150, updated_at: 200 };
+  const tiedOther = { ...tiedParent, id: "conv_b", created_at: 160 };
+  const tiedDraft = {
+    ...draft,
+    created_at: 300,
+    family: { ...draft.family, representative_id: tiedParent.id },
+  };
+  const rows = [tiedParent, tiedOther, tiedDraft];
+  expect(sortConversations(rows, null).map((row) => row.id)).toEqual([
+    "conv_b",
+    "conv_a",
+    "temp:draft",
+  ]);
+  expect(
+    sortConversations(
+      rows,
+      null,
+      null,
+      "updated_at",
+      customSortOrder({ base: "updated", since: 100, ids: [] }),
+    ).map((row) => row.id),
+  ).toEqual(["conv_b", "conv_a", "temp:draft"]);
+});
+
 describe("Custom order", () => {
   // Whole-second server timestamps, as the API returns them.
   const row = (id: string, createdAt: number, updatedAt = createdAt): Conversation => ({

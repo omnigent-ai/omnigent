@@ -252,6 +252,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.host_starts: list[HostStartInvocation] = []
         self.terminated: list[str] = []
         self.resumed: list[str] = []
+        self.stopped: list[str] = []
 
     @property
     def capabilities(self) -> SandboxCapabilities:
@@ -323,6 +324,10 @@ class FakeSandboxLauncher(SandboxLauncher):
     def terminate(self, sandbox_id: str) -> None:
         """Record the termination."""
         self.terminated.append(sandbox_id)
+
+    def stop(self, sandbox_id: str) -> None:
+        """Record the stop."""
+        self.stopped.append(sandbox_id)
 
     def resume(self, sandbox_id: str) -> None:
         """Record the resume."""
