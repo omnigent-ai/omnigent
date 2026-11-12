@@ -296,11 +296,16 @@ export function useSessionAgents(enabled = true) {
   return { ...mine, data };
 }
 
-/** The harness of the agent a session runs, from `GET /v1/sessions/{id}/agent`. */
-async function fetchSessionAgentHarness(sessionId: string): Promise<string | null> {
+/**
+ * The harness of the agent a session runs, from `GET /v1/sessions/{id}/agent`.
+ * Rejects when the server couldn't read it, so the lookup is retried later.
+ */
+async function fetchSessionAgentHarness(sessionId: string): Promise<string> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/agent`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return ((await res.json()) as AgentObjectWire).harness ?? null;
+  const harness = ((await res.json()) as AgentObjectWire).harness;
+  if (!harness) throw new Error("the session's agent has no readable harness");
+  return harness;
 }
 
 /** Wire shape of `GET /v1/sessions/{id}/agent` (AgentObject). */

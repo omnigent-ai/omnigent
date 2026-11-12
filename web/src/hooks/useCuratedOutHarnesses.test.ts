@@ -18,6 +18,16 @@ describe("curatedOutHarnesses", () => {
     );
   });
 
+  it("leaves everything in while an agent's harness is unknown", () => {
+    // The server lists an agent whose bundle it couldn't read without a harness.
+    expect(
+      curatedOutHarnesses(new Set(["codex-native-ui"]), [
+        { harness: "claude-native" },
+        { harness: null },
+      ]),
+    ).toEqual(new Set());
+  });
+
   it("leaves everything in when the server hides nothing", () => {
     expect(curatedOutHarnesses(new Set(), [])).toEqual(new Set());
   });

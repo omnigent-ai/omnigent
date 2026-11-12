@@ -1242,10 +1242,8 @@ def _ensure_default_agents(
     extras = _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
     if allowlist is None:
         return frozenset()
-    # A built-in an earlier version seeded is still packaged roster, so the
-    # allowlist hides it too; its row stays for the sessions bound to it.
-    # Configured ACP agents and listed extras share built-in ids but are the
-    # operator's roster, even when an extra fails to seed this boot.
+    # Configured ACP agents and listed extras use built-in IDs but remain
+    # operator-owned, even when an extra fails to seed.
     operator_owned = frozenset(agent.slug for agent in _configured_acp_agents()[0])
     operator_owned |= _listed_extra_builtin_agent_names()
     retired = _retired_builtin_agent_names(agent_store, packaged | extras | operator_owned)

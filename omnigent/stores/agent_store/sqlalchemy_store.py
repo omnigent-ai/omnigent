@@ -5,7 +5,7 @@ from __future__ import annotations
 import builtins
 from typing import cast
 
-from sqlalchemy import CursorResult, and_, asc, case, desc, or_, select, tuple_, update
+from sqlalchemy import CursorResult, and_, asc, case, desc, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -16,6 +16,7 @@ from omnigent.db.db_models import (
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import encode_agent_kind
+from omnigent.db.keyset import keyset_after
 from omnigent.db.utils import (
     get_or_create_conversation_engine,
     get_or_create_engine,
@@ -252,7 +253,7 @@ class SqlAlchemyAgentStore(AgentStore):
             stmt = select(SqlAgent).where(in_workspace, is_template)
             # Seeking on the whole (created_at, id) key keeps a page's scan at
             # O(limit) even when many rows share the cursor's created_at.
-            sort_key = tuple_(SqlAgent.created_at, SqlAgent.id)
+            sort_key = (SqlAgent.created_at, SqlAgent.id)
             for cursor_id, newer in ((after, not is_desc), (before, is_desc)):
                 if not cursor_id:
                     continue
@@ -263,8 +264,14 @@ class SqlAlchemyAgentStore(AgentStore):
                 ).scalar_one_or_none()
                 if cursor_at is None:
                     return PagedList(data=[], first_id=None, last_id=None, has_more=False)
-                cursor = (cursor_at, cursor_id)
-                stmt = stmt.where(sort_key > cursor if newer else sort_key < cursor)
+                stmt = stmt.where(
+                    keyset_after(
+                        self._engine.dialect.name,
+                        sort_key,
+                        (cursor_at, cursor_id),
+                        descending=not newer,
+                    )
+                )
             stmt = stmt.order_by(sort_fn(SqlAgent.created_at), sort_fn(SqlAgent.id)).limit(
                 limit + 1
             )

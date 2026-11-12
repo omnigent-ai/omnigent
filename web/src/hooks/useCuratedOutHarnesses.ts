@@ -16,6 +16,8 @@ export function curatedOutHarnesses(
   agents: readonly Pick<AvailableAgent, "harness">[],
 ): ReadonlySet<string> {
   if (suppressedNames.size === 0) return NONE;
+  // A harness the server couldn't read (e.g. a broken bundle) may be one it hides.
+  if (agents.some((agent) => !agent.harness)) return NONE;
   const inUse = new Set(agents.map((agent) => nativeCodingAgentForHarness(agent.harness)?.harness));
   return new Set(
     NATIVE_CODING_AGENTS.filter(
