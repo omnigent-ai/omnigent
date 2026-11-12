@@ -6885,6 +6885,11 @@
             "title": "Scheduled Task Worktrees",
             "type": "boolean"
           },
+          "scripted_sessions": {
+            "default": false,
+            "title": "Scripted Sessions",
+            "type": "boolean"
+          },
           "server_version": {
             "title": "Server Version",
             "type": "string"
