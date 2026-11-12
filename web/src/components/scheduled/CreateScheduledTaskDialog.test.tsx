@@ -1464,6 +1464,10 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Pick a host");
     expect(screen.getByTestId("task-no-host-online")).toHaveTextContent(/^No host is connected\.$/);
     expect(screen.queryByText(/omni host/)).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Morning review" } });
+    fireEvent.change(screen.getByLabelText("Instructions"), {
+      target: { value: "Summarize open PRs" },
+    });
 
     vi.mocked(hostsHook.useHosts).mockReturnValue({
       data: [{ ...offline[0], status: "online" }],
@@ -1472,6 +1476,9 @@ describe("CreateScheduledTaskDialog submit", () => {
 
     expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("laptop");
     expect(screen.queryByTestId("task-no-host-online")).not.toBeInTheDocument();
+    // Connecting a host keeps the draft.
+    expect(screen.getByLabelText("Name")).toHaveValue("Morning review");
+    expect(screen.getByLabelText("Instructions")).toHaveValue("Summarize open PRs");
   });
 
   it("says no host is connected when the host list is empty", () => {
