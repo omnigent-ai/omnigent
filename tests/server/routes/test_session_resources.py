@@ -9012,18 +9012,44 @@ async def test_relay_records_queued_native_messages_reported_after_a_long_prompt
             if item.type == "error" and item.response_id in failure_ids
         ]
         assert [e.data.code for e in errors] == ["native_prompt_wait_expired"] * 2
-        live = [event for event in published if event.get("type") == "response.failed"]
-        assert [event["response"]["id"] for event in live] == failure_ids
+        # Live clients get both pairs as conversation items, like a skipped native
+        # input, never as a response terminal they would apply to the active turn.
         consumed = [event for event in published if event.get("type") == "session.input.consumed"]
         assert [event["data"]["cleared_pending_id"] for event in consumed] == [
             body["pending_id"] for body in bodies
         ]
-        # The parked turn is untouched: still running, never failed.
-        assert not [
+        assert [
+            "".join(block["text"] for block in event["data"]["data"]["content"])
+            for event in consumed
+        ] == texts
+        live_errors = [
+            event["item"]
+            for event in published
+            if event.get("type") == "response.output_item.done"
+            and event["item"].get("type") == "error"
+        ]
+        assert [(item["response_id"], item["code"]) for item in live_errors] == [
+            (failure_id, "native_prompt_wait_expired") for failure_id in failure_ids
+        ]
+        # The parked turn is untouched: no response terminal or status edge from
+        # the failures, so no client closes its turn or flips to idle.
+        terminals = [
             event
             for event in published
-            if event.get("type") == "session.status" and event.get("status") == "failed"
+            if event.get("type")
+            in {
+                "response.completed",
+                "response.failed",
+                "response.cancelled",
+                "response.incomplete",
+            }
         ]
+        assert [event["response"]["id"] for event in terminals] == (
+            [parked_response_id] if parked_response_id is not None else []
+        )
+        assert [
+            event.get("status") for event in published if event.get("type") == "session.status"
+        ] == ["running"]
         if parked_response_id is None:
             assert sessions_module._session_status_cache.get(session_id) == "running"
         else:
@@ -9035,6 +9061,22 @@ async def test_relay_records_queued_native_messages_reported_after_a_long_prompt
             ] == [parked_response_id]
     finally:
         pending_inputs.reset_for_tests()
+
+
+def test_undelivered_input_content_is_bounded_and_well_formed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner-sent content is used only as a list of blocks within the event size limit."""
+    from omnigent.server.routes._sessions import orchestration
+
+    block = {"type": "input_text", "text": "hi"}
+    encoded_bytes = len(json.dumps([block], separators=(",", ":")).encode())
+    monkeypatch.setattr(orchestration, "MAX_SESSION_EVENT_REQUEST_BYTES", encoded_bytes)
+    assert orchestration._undelivered_input_content({"input_content": [block]}) == [block]
+    monkeypatch.setattr(orchestration, "MAX_SESSION_EVENT_REQUEST_BYTES", encoded_bytes - 1)
+    assert orchestration._undelivered_input_content({"input_content": [block]}) is None
+    for malformed in (None, [], "hi", [block, "hi"], [{"type": "input_text", "text": object()}]):
+        assert orchestration._undelivered_input_content({"input_content": malformed}) is None
 
 
 @pytest.mark.asyncio

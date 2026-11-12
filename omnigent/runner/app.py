@@ -476,10 +476,7 @@ _server_version: str | None = None
 # session stream request, that it accepts pane-inferred status edges. A
 # reconnect clears it.
 _server_accepts_inferred_status = False
-# Whether that server records an ``input_only`` failure for one queued message
-# without ending the session's tracked turn. Until it says so, the runner keeps
-# a prompt waiter (and its queued messages) past the human-wait hold. A
-# reconnect clears it.
+# Whether the current server supports input-only settlement; cleared on reconnect.
 _server_accepts_input_only_failures = False
 
 

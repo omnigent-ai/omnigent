@@ -9006,6 +9006,8 @@ async def _relay_persist_error_once(
     conversation_store: ConversationStore | None,
     session_id: str,
     item: NewConversationItem,
+    *,
+    on_persisted: Callable[[ConversationItem], None] | None = None,
 ) -> Literal["persisted", "duplicate", "skipped", "failed"]:
     """
     Persist a runner error item unless the same error already exists.
@@ -9020,6 +9022,8 @@ async def _relay_persist_error_once(
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
     :param item: The candidate ``type="error"`` item.
+    :param on_persisted: Called with the stored item when this call appended it,
+        e.g. to publish it.
     :returns: ``"persisted"`` if this call appended the item,
         ``"duplicate"`` if a matching recent error already exists,
         ``"skipped"`` if no store or non-error item was provided, or
@@ -9070,6 +9074,8 @@ async def _relay_persist_error_once(
                 response_id=persisted_items[0].response_id,
             ),
         )
+        if on_persisted is not None:
+            on_persisted(persisted_items[0])
         return "persisted"
     except Exception:  # noqa: BLE001
         _logger.exception(

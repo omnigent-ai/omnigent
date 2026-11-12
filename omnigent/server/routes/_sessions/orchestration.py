@@ -3611,7 +3611,10 @@ async def _settle_input_only_failure(
 
     Commits the message (from the server's queued copy, else the content the
     runner sent) and its error item, both under the failure's own response id,
-    so neither borrows the session's tracked turn.
+    so neither borrows the session's tracked turn. Both reach live clients as
+    conversation items (``session.input.consumed`` and
+    ``response.output_item.done``), like a skipped native input, never as a
+    ``response.failed`` that a client would apply to its active turn.
 
     :param conversation_store: Store to append to; ``None`` skips persistence.
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
@@ -3633,7 +3636,14 @@ async def _settle_input_only_failure(
     )
     error_item = _error_item_from_sse(event, response_id=response_id)
     if error_item is not None:
-        await _relay_persist_error_once(conversation_store, session_id, error_item)
+        await _relay_persist_error_once(
+            conversation_store,
+            session_id,
+            error_item,
+            on_persisted=lambda persisted: _publish_external_conversation_item(
+                session_id, persisted
+            ),
+        )
 
 
 _NATIVE_INPUT_LIFECYCLE_STAGES: dict[str, pending_inputs.NativeInputDeliveryStage] = {
@@ -9811,7 +9821,6 @@ async def _relay_runner_stream_once(
                         await _settle_input_only_failure(
                             conversation_store, session_id, event, input_only_response_id
                         )
-                        session_stream.publish(session_id, event)
                         continue
 
                     # A pane-inferred reason only annotates a running turn. Publishing it

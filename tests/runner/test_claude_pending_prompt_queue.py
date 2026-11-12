@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import json
 import logging
 import re
 import threading
@@ -622,3 +623,20 @@ async def test_prompt_waiter_outlives_the_hold_until_the_server_takes_input_only
                 waiter.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await waiter
+
+
+def test_prompt_wait_expired_failure_carries_content_only_within_the_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure carries a message's content only when it fits the event size limit."""
+    content = [{"type": "input_text", "text": "hi"}]
+    encoded_bytes = len(json.dumps(content, separators=(",", ":")).encode())
+    body = {**_message("hi"), "content": content}
+    monkeypatch.setattr(runner_app, "MAX_SESSION_EVENT_REQUEST_BYTES", encoded_bytes)
+    assert runner_app._prompt_wait_expired_failure(body)["input_content"] == content
+    monkeypatch.setattr(runner_app, "MAX_SESSION_EVENT_REQUEST_BYTES", encoded_bytes - 1)
+    assert "input_content" not in runner_app._prompt_wait_expired_failure(body)
+    for malformed in ("hi", [], [{"type": "input_text", "text": object()}]):
+        failure = runner_app._prompt_wait_expired_failure({**body, "content": malformed})
+        assert "input_content" not in failure
+        assert failure["input_only"] is True
