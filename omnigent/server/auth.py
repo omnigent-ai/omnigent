@@ -154,6 +154,37 @@ LEVEL_EDIT = 2
 LEVEL_MANAGE = 3
 LEVEL_OWNER = 4
 
+# Privilege order of the stored levels. Compare levels through
+# :func:`level_rank` / :func:`level_satisfies` rather than as integers, so a
+# level added later can rank between existing ones.
+LEVEL_RANKS: dict[int, int] = {
+    LEVEL_READ: 1,
+    LEVEL_EDIT: 2,
+    LEVEL_MANAGE: 3,
+    LEVEL_OWNER: 4,
+}
+
+
+def level_rank(level: int | None) -> int:
+    """Order permission levels by privilege; ``None`` or unknown ranks lowest.
+
+    :param level: Stored numeric level, e.g. ``LEVEL_EDIT``.
+    :returns: Privilege rank, ``0`` for no access or an unrecognized level.
+    """
+    return LEVEL_RANKS.get(level, 0) if level is not None else 0
+
+
+def level_satisfies(granted: int | None, required: int) -> bool:
+    """Whether a *granted* level meets a *required* level.
+
+    :param granted: The caller's grant level, or ``None`` for no grant.
+    :param required: Minimum level the action needs, e.g. ``LEVEL_EDIT``.
+    :returns: ``True`` if *granted* ranks at or above *required*; ``False`` for
+        an unknown *required* level, so a typo can never open access.
+    """
+    required_rank = level_rank(required)
+    return required_rank > 0 and level_rank(granted) >= required_rank
+
 
 class SharingMode(str, Enum):
     """Server policy for creating new session permission grants.
@@ -163,8 +194,9 @@ class SharingMode(str, Enum):
       rejected; workspace/public read still allowed.
     - ``RESTRICTED_READ_ONLY``: like ``READ_ONLY`` (grants capped at read), but
       sessions whose working directory is a user home directory or the
-      filesystem root (see :func:`workspace_sharing_blocked`) cannot be shared
-      at all — not even read — because that cwd exposes an entire home/filesystem.
+      filesystem root (see :func:`workspace_sharing_blocked`) never share their
+      workspace files, because that cwd exposes an entire home/filesystem. The
+      conversation itself can still be shared at read.
     - ``OFF``: no new grants at all.
 
     Value is the lowercase name so ``GET /v1/info`` and the
@@ -204,9 +236,9 @@ _BLOCKED_WORKSPACE_ROOTS = ("/", "/root")
 
 
 def workspace_sharing_blocked(workspace: str | None) -> bool:
-    """True when a session's working directory is too broad to share under
-    :attr:`SharingMode.RESTRICTED_READ_ONLY` — the filesystem root or a user
-    home directory, whose whole contents a grant would expose.
+    """True when a session's working directory is too broad to share files from
+    under :attr:`SharingMode.RESTRICTED_READ_ONLY` — the filesystem root or a
+    user home directory, whose whole contents file sharing would expose.
 
     Recognizes the filesystem root (``/``), root's home (``/root``), and any
     direct child of a common home parent (see :data:`_HOME_PARENT_DIRS` — e.g.
@@ -225,6 +257,20 @@ def workspace_sharing_blocked(workspace: str | None) -> bool:
         return True
     parent, _, leaf = path.rpartition("/")
     return bool(leaf) and parent in _HOME_PARENT_DIRS
+
+
+def workspace_files_withheld(sharing_mode: SharingMode, workspace: str | None) -> bool:
+    """True when only the owner may see a session's workspace files.
+
+    Such a session can still be shared, but only at read.
+
+    :param sharing_mode: The server's current sharing mode.
+    :param workspace: The session's recorded working directory, if any.
+    :returns: ``True`` for a home or root cwd under ``RESTRICTED_READ_ONLY``.
+    """
+    return sharing_mode == SharingMode.RESTRICTED_READ_ONLY and workspace_sharing_blocked(
+        workspace
+    )
 
 
 def env_var_is_truthy(name: str, *, default: bool = False) -> bool:

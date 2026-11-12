@@ -55,6 +55,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
+    SharingMode,
     UnifiedAuthProvider,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
@@ -80,6 +81,7 @@ class _StubConversationStore:
         *,
         share_workspace_files: bool = False,
         parent: str | None = None,
+        workspace: str | None = None,
     ) -> None:
         self._conversations[conversation_id] = Conversation(
             id=conversation_id,
@@ -89,6 +91,7 @@ class _StubConversationStore:
             parent_conversation_id=parent,
             agent_id="ag_test",
             share_workspace_files=share_workspace_files,
+            workspace=workspace,
         )
 
 
@@ -286,6 +289,8 @@ def app(runner_globals_reset: None, runner_client: _RecordingRunnerClient) -> Fa
     # A second session whose owner opted into sharing workspace files with
     # view-level collaborators — same grant shape, share flag on.
     conv_store.add("conv_open", share_workspace_files=True)
+    # Shared files from a home directory: withheld from viewers in restricted mode.
+    conv_store.add("conv_home", share_workspace_files=True, workspace="/home/alice")
     # A sub-agent of conv_share: nobody holds a direct grant on it, so every
     # caller's access is inherited through the parent.
     conv_store.add("conv_child", parent="conv_share")
@@ -297,6 +302,9 @@ def app(runner_globals_reset: None, runner_client: _RecordingRunnerClient) -> Fa
     perm_store.add_grant("owner@example.com", "conv_open", LEVEL_EDIT)
     perm_store.add_grant("viewer@example.com", "conv_open", LEVEL_READ)
     perm_store.add_grant("real-owner@example.com", "conv_open", LEVEL_OWNER)
+    perm_store.add_grant("owner@example.com", "conv_home", LEVEL_EDIT)
+    perm_store.add_grant("viewer@example.com", "conv_home", LEVEL_READ)
+    perm_store.add_grant("real-owner@example.com", "conv_home", LEVEL_OWNER)
     perm_store.add_admin("admin@example.com")
     set_runner_router(_FakeRunnerRouter(runner_client))  # type: ignore[arg-type]
 
@@ -715,6 +723,29 @@ async def test_workspace_reads_allow_view_only_when_shared(
 
     assert resp.status_code == 200, resp.text
     assert len(runner_client.gets) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "shared_status"),
+    [(SharingMode.RESTRICTED_READ_ONLY, 403), (SharingMode.READ_ONLY, 200)],
+)
+async def test_restricted_mode_withholds_home_directory_files_from_non_owners(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    mode: SharingMode,
+    shared_status: int,
+) -> None:
+    """In restricted mode only the owner sees a home-directory session's files, even
+    with the share flag on and for an edit grant; other modes are unaffected."""
+    app.state.sharing_mode = lambda: mode
+    url = "/v1/sessions/conv_home/resources/environments/default/filesystem/src/app.py"
+    # owner@example.com holds an edit grant on conv_home.
+    for email in ("viewer@example.com", "owner@example.com"):
+        shared = await client.get(url, headers={"X-Forwarded-Email": email})
+        assert shared.status_code == shared_status, (email, shared.text)
+    owner = await client.get(url, headers={"X-Forwarded-Email": "real-owner@example.com"})
+    assert owner.status_code == 200, owner.text
 
 
 @pytest.mark.asyncio

@@ -80,6 +80,8 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
+    SharingMode,
+    workspace_files_withheld,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -289,6 +291,31 @@ ClearSessionIntoFreshSession = Callable[
     [Request, Conversation, Callable[[], Awaitable[None]]], Awaitable[str]
 ]
 _SESSION_LIST_BATCH_SIZE = 1000
+
+
+async def _reject_blocked_workspace_file_sharing(
+    request: Request, session_id: str, conversation_store: ConversationStore
+) -> None:
+    """Refuse to share workspace files from a home or root cwd in restricted mode.
+
+    That workspace is too broad to expose; the file gate also withholds it from
+    Read viewers. Turning sharing off stays allowed so owners can revoke it.
+
+    :param request: The incoming request; its app state carries the sharing mode.
+    :param session_id: Session being updated, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store used to read the session's workspace.
+    :raises OmnigentError: 403 when the workspace cannot be shared.
+    """
+    sharing_mode = getattr(request.app.state, "sharing_mode", lambda: SharingMode.ON)()
+    if sharing_mode != SharingMode.RESTRICTED_READ_ONLY:
+        return
+    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if conv is not None and workspace_files_withheld(sharing_mode, conv.workspace):
+        raise OmnigentError(
+            "This session runs in a home or root directory, so this Omnigent "
+            "server never shares its workspace files.",
+            code=ErrorCode.FORBIDDEN,
+        )
 
 
 def _require_attachment_compatible_history(
@@ -3472,6 +3499,8 @@ def register_core_routes(
             )
         if body.archived is True:
             await _require_archive_teardown_replica(request, session_id, conversation_store)
+        if set_share_workspace and body.share_workspace_files:
+            await _reject_blocked_workspace_file_sharing(request, session_id, conversation_store)
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store

@@ -45,7 +45,8 @@ const TIERS: { id: SharingMode; label: string; description: string }[] = [
   {
     id: "restricted_read_only",
     label: "Read only (restricted)",
-    description: "Read-only. Sessions in a home directory or the filesystem root cannot be shared.",
+    description:
+      "Read-only. Sessions in a home directory or the filesystem root never share workspace files.",
   },
   {
     id: "off",

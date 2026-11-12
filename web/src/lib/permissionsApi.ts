@@ -8,11 +8,16 @@ import type { Session } from "@/lib/types";
 import { authenticatedFetch } from "./identity";
 
 /**
- * Numeric permission level of the session owner. Mirrors
- * ``LEVEL_OWNER`` in ``omnigent/server/auth.py`` (READ=1, EDIT=2,
- * MANAGE=3, OWNER=4).
+ * Numeric permission levels. Mirror the ``LEVEL_*`` constants in
+ * ``omnigent/server/auth.py``. COMMENT ranks between READ and EDIT but is
+ * numerically 5, so order levels with ``roleRank`` in ``shareRoles.ts``.
  */
+export const LEVEL_READ = 1;
+/** Legacy; the web UI never grants it but still shows existing grants. */
+export const LEVEL_MANAGE = 3;
 export const LEVEL_OWNER = 4;
+/** Offered only when the server reports ``comment_sharing_enabled``. */
+export const LEVEL_COMMENT = 5;
 
 export function workspaceSharingBlocked(workspace: string | null | undefined): boolean {
   if (!workspace?.startsWith("/")) return false;

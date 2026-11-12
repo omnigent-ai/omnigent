@@ -3,13 +3,14 @@
 Drives the real SPA on a dedicated multi-user server: enabling defaults to
 managed hosts only, then the admin picks "All sessions". Both survive a reload. A
 session created afterwards opens its Share dialog with General access set to
-Read (backed by a ``__public__`` read grant). The session seeded before the
+"Anyone with the link" (backed by a ``__public__`` read grant). The session seeded before the
 change stays private. The data dir is isolated so the admin override file never
 lands in the runner's ``~/.omnigent``.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 
 import httpx
@@ -65,8 +66,8 @@ def _share_dialog_general_access(page: Page, url: str) -> Locator:
     expect(share).to_be_enabled(timeout=60_000)
     share.click()
     dialog = page.get_by_role("dialog")
-    expect(dialog.get_by_text("Share this session")).to_be_visible()
-    return dialog.get_by_role("combobox", name="General access")
+    expect(dialog.get_by_role("heading", name=re.compile(r"^Share "))).to_be_visible()
+    return dialog.get_by_role("button", name="General access")
 
 
 def test_admin_default_public_all_makes_new_sessions_public(
@@ -113,7 +114,7 @@ def test_admin_default_public_all_makes_new_sessions_public(
 
         expect(
             _share_dialog_general_access(page, f"{server.public_url}/c/{new_session}")
-        ).to_have_text("Read")
+        ).to_have_text("Anyone with the link")
         expect(
             _share_dialog_general_access(page, f"{server.public_url}/c/{server.session_id}")
-        ).to_have_text("No access")
+        ).to_have_text("Restricted")

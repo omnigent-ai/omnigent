@@ -5531,11 +5531,11 @@ describe("AppShell share action", () => {
       mockConversations([{ id: "conv_home", permission_level: 4, workspace: "/home/alice" }]);
       renderShell("/c/conv_home", serverInfo({ sharing_mode: "restricted_read_only" }));
       fireEvent.click(screen.getByRole("button", { name: /share session/i }));
-      expect(
-        screen.getByText(/This session's working directory \(a home or root directory\)/),
-      ).toBeInTheDocument();
-      expect(screen.getByText(/Please be careful when sharing/)).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: /^grant$/i })).toBeInTheDocument();
+      // A home directory on a restricted server shares at Read only, so typing an
+      // address shows a fixed Read instead of a role menu.
+      fireEvent.change(screen.getByLabelText("User ID"), { target: { value: "bob" } });
+      expect(screen.getByRole("button", { name: /^add$/i })).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "New user permission" })).not.toBeInTheDocument();
     });
   });
 
