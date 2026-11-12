@@ -1,3 +1,5 @@
+import { cn } from "@/lib/utils";
+import { pickerTriggerClass } from "./pickerStyles";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { Label } from "./Label";
 import { ModelEffortFields } from "./ModelEffortFields";
@@ -6,12 +8,11 @@ import type { useScheduledHarnessSettings } from "./useScheduledHarnessSettings"
 import { ScheduleSelect as Select } from "./ScheduleSelect";
 import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
-export function TriggerWorkerSettingsFields({
+export function TriggerWorkerHarnessField({
   value,
   pollingAgentId,
   agents,
   selectedAgent,
-  settings,
   disabled,
   onChange,
   onSelectOpenChange,
@@ -20,42 +21,64 @@ export function TriggerWorkerSettingsFields({
   pollingAgentId: string;
   agents: AvailableAgent[];
   selectedAgent: AvailableAgent | undefined;
-  settings: ReturnType<typeof useScheduledHarnessSettings>;
   disabled: boolean;
   onChange: (value: TriggerWorkerSettings) => void;
   onSelectOpenChange: (open: boolean) => void;
 }) {
   const agentId = value.agentId ?? pollingAgentId;
   return (
-    <div className="space-y-3" data-testid="task-worker-settings">
-      <div className="flex flex-col gap-1.5">
-        <Label htmlFor="task-worker-agent">Harness for matching sessions</Label>
-        <Select
-          value={agentId}
-          disabled={disabled}
-          onValueChange={(nextAgentId) => onChange({ agentId: nextAgentId, model: "", effort: "" })}
-          componentId="tasks.scheduled.worker_harness"
-          onOpenChange={onSelectOpenChange}
+    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-4">
+      <Label htmlFor="task-worker-agent">Harness for matching sessions</Label>
+      <Select
+        value={agentId}
+        disabled={disabled}
+        onValueChange={(nextAgentId) => onChange({ agentId: nextAgentId, model: "", effort: "" })}
+        componentId="tasks.scheduled.worker_harness"
+        onOpenChange={onSelectOpenChange}
+      >
+        <SelectTrigger
+          id="task-worker-agent"
+          data-testid="task-worker-agent-trigger"
+          className={cn(
+            "w-auto max-w-40 border-0 shadow-none text-muted-foreground",
+            pickerTriggerClass,
+          )}
         >
-          <SelectTrigger
-            id="task-worker-agent"
-            data-testid="task-worker-agent-trigger"
-            className="w-full"
-          >
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent position="popper" align="start">
-            {!agents.some((agent) => agent.id === agentId) && (
-              <SelectItem value={agentId}>{selectedAgent?.display_name ?? agentId}</SelectItem>
-            )}
-            {agents.map((agent) => (
-              <SelectItem key={agent.id} value={agent.id}>
-                {agent.display_name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent position="popper" align="end">
+          {!agents.some((agent) => agent.id === agentId) && (
+            <SelectItem value={agentId}>{selectedAgent?.display_name ?? agentId}</SelectItem>
+          )}
+          {agents.map((agent) => (
+            <SelectItem key={agent.id} value={agent.id}>
+              {agent.display_name}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+export function TriggerWorkerSettingsFields({
+  value,
+  settings,
+  taskSession = false,
+  disabled,
+  onChange,
+  onSelectOpenChange,
+}: {
+  value: TriggerWorkerSettings;
+  settings: ReturnType<typeof useScheduledHarnessSettings>;
+  /** Every match goes to one task session, so changes wait for the next one. */
+  taskSession?: boolean;
+  disabled: boolean;
+  onChange: (value: TriggerWorkerSettings) => void;
+  onSelectOpenChange: (open: boolean) => void;
+}) {
+  return (
+    <div className="space-y-3" data-testid="task-worker-settings">
       <ModelEffortFields
         model={value.model}
         effort={value.effort}
@@ -81,8 +104,10 @@ export function TriggerWorkerSettingsFields({
         </p>
       )}
       <p className="text-sm text-muted-foreground">
-        Applies to new sessions started for matching items. Existing sessions, including the polling
-        session, keep their settings. Default uses the selected harness&apos;s configuration.
+        {taskSession
+          ? "Applies to the next task session. The current task session and the polling session keep their settings; archive the task session so the next match starts one with these. "
+          : "Applies to new sessions started for matching items. Existing sessions, including the polling session, keep their settings. "}
+        Default uses the selected harness&apos;s configuration.
       </p>
     </div>
   );

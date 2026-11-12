@@ -1077,6 +1077,32 @@ def test_session_metadata_managed_accepts_repo_url_workspace(workspace: str) -> 
     assert meta.workspace == workspace
 
 
+def test_session_metadata_managed_accepts_multiple_repo_workspaces() -> None:
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    workspaces = ["https://github.com/org/one", "git@github.com:org/two.git#release"]
+    meta = SessionCreateMetadata(host_type="managed", workspaces=workspaces)
+    assert meta.managed_repo_workspaces() == workspaces
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"host_type": "managed", "workspace": "https://github.com/org/one", "workspaces": []},
+        {"host_type": "managed", "workspaces": ["https://github.com/org/one"] * 11},
+        {"host_type": "managed", "workspaces": ["/tmp/local"]},
+        {"host_type": "external", "workspaces": ["https://github.com/org/one"]},
+        {"host_type": "managed", "git": {"branch_name": "new"}},
+        {"git": {"branch_name": "new"}},
+    ],
+)
+def test_bundled_workspace_metadata_rejects_incompatible_options(metadata) -> None:
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError):
+        SessionCreateMetadata.model_validate(metadata)
+
+
 def test_session_metadata_managed_accepts_sandbox_provider() -> None:
     """
     ``sandbox_provider`` is accepted with ``host_type="managed"`` (chooses
@@ -1253,6 +1279,40 @@ def test_session_fork_external_rejects_any_workspace(workspace: str) -> None:
 
     with pytest.raises(ValidationError, match="workspace only applies"):
         SessionForkRequest(workspace=workspace)
+
+
+@pytest.mark.parametrize(
+    ("fields", "error"),
+    [
+        ({}, None),
+        (
+            {
+                "sandbox_provider": "modal",
+                "host_id": "0123456789abcdef0123456789abcdef",
+                "workspace": "https://github.com/org/repo#main",
+            },
+            None,
+        ),
+        ({"host_id": "host_abc"}, "32 lowercase hex characters"),
+        ({"workspace": "/Users/alice/repo"}, "takes a git repository URL"),
+        ({"host_type": "managed"}, "Extra inputs are not permitted"),
+    ],
+)
+def test_session_managed_host_request_takes_a_managed_forks_sandbox_fields(
+    fields: dict[str, str], error: str | None
+) -> None:
+    """
+    Moving a session onto a sandbox names the new sandbox as a managed fork
+    does: a provider, an optional host id of the minted shape, and a repository
+    URL rather than a path, since the sandbox's filesystem doesn't exist yet.
+    """
+    from omnigent.server.schemas import SessionManagedHostRequest
+
+    if error is None:
+        assert SessionManagedHostRequest(**fields).model_dump(exclude_unset=True) == fields
+        return
+    with pytest.raises(ValidationError, match=error):
+        SessionManagedHostRequest(**fields)
 
 
 @pytest.mark.parametrize("status", ["idle", "running", "waiting", "failed"])
