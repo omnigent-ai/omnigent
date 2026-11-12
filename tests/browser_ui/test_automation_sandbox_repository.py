@@ -146,7 +146,7 @@ def test_automation_sandbox_repository(
             expect(page.get_by_role("option", name=entry["name"], exact=True)).to_be_visible()
         page.get_by_role("option", name="runtime", exact=True).click()
         expect(repository).to_have_text("runtime")
-        expect(page.get_by_test_id("task-workspace-browse")).to_have_count(0)
+        expect(page.get_by_test_id("task-workspace-trigger")).to_have_count(0)
         page.get_by_test_id("create-scheduled-task-submit").click()
         expect(page.get_by_role("dialog")).to_have_count(0)
         page.get_by_role("tab", name="Your automations", exact=True).click()
@@ -206,7 +206,7 @@ def test_automation_sandbox_repository(
         expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible()
         contract.json(f"/v1/hosts/{chat.host_id}/filesystem", list_payload([]))
         for _ in range(2):
-            page.get_by_test_id("task-workspace-browse").click()
+            page.get_by_test_id("task-workspace-trigger").click()
             expect(page.get_by_test_id("workspace-picker-dialog")).to_be_visible()
             page.keyboard.press("Escape")
             expect(page.get_by_test_id("workspace-picker-dialog")).to_have_count(0)
@@ -348,14 +348,8 @@ def test_reused_automation_settings(
         expect(note).to_contain_text("This automation continues in an existing session")
         expect(page.get_by_test_id("new-chat-landing-agent-select")).to_be_visible()
         expect(page.get_by_test_id("task-permission-trigger")).to_be_disabled()
-        if prompt_kind == "custom-trigger":
-            expect(
-                page.get_by_text(
-                    "Worker controls are unavailable for these customized instructions. "
-                    "Edit the prompt or system prompt above to configure matching sessions.",
-                    exact=True,
-                )
-            ).to_be_visible()
+        if trigger:
+            expect(note).to_contain_text("each match starts a new worker")
             expect(page.get_by_test_id("task-worker-settings")).to_have_count(0)
 
 
