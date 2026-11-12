@@ -57,6 +57,7 @@ import {
 import { cn } from "@/lib/utils";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
+import { useLocalReviewNavigation } from "@/lib/localReviewContext";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -1036,6 +1037,11 @@ export function PullRequestPanel({
     [updateView],
   );
   const setActiveTab = (value: PullRequestSubtab) => updateView({ subtab: value });
+  const localReviewTarget = useLocalReviewNavigation(conversationId);
+  useEffect(() => {
+    const prUrl = localReviewTarget?.anchor_metadata?.pr_url;
+    if (prUrl) updateView({ selected: prUrl, showingDetails: true, subtab: "changes" });
+  }, [localReviewTarget, updateView]);
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
   const info = usePullRequestInfo(conversationId, {
@@ -1900,7 +1906,7 @@ function PullRequestPanelDetails({
           pr={pr}
           prUrl={prUrl}
           canEdit={canEdit}
-          selected={activeTab === "changes"}
+          selected={active && activeTab === "changes"}
           changes={changes}
           prDiff={prDiff}
           reviews={reviews}

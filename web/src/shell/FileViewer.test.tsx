@@ -1087,6 +1087,18 @@ describe("FileViewer Address All", () => {
   const otherDraft = { ...makeComment("c2"), path: "other.py" };
   const otherSent = { ...makeComment("c3", "addressed"), path: "other.py" };
   const sentHere = makeComment("c4", "addressed");
+  const localReview: Comment = {
+    ...makeComment("pr-comment"),
+    path: "review.py",
+    anchor_metadata: {
+      pr_url: "https://github.com/acme/app/pull/1",
+      side: "RIGHT",
+      line: 1,
+      start_line: null,
+      head_sha: "head",
+      base_sha: "base",
+    },
+  };
 
   it.each([
     ["the open file and others", [makeComment("c1"), sentHere], ["c1", "c2"], 2],
@@ -1101,6 +1113,7 @@ describe("FileViewer Address All", () => {
       makeComment("c5"),
       otherDraft,
       otherSent,
+      localReview,
     ];
     useCommentsMock.mockImplementation((_sessionId, path) =>
       makeCommentsQuery(path ? fileComments : staleSessionComments),
@@ -1115,6 +1128,24 @@ describe("FileViewer Address All", () => {
     const panel = screen.getByTestId("comments-panel");
     expect(panel).toHaveAttribute("data-address-count", String(expectedIds.length));
     expect(panel).toHaveAttribute("data-address-file-count", String(fileCount));
+  });
+
+  it("does not send or count local review comments on any path", () => {
+    const mutate = vi.fn();
+    useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+    const localHere = { ...localReview, id: "pr-here", path: "file1.py" };
+    useCommentsMock.mockImplementation((_sessionId, path) =>
+      makeCommentsQuery(path ? [localHere] : [localHere, localReview]),
+    );
+
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
+
+    expect(mutate).not.toHaveBeenCalled();
+    const panel = screen.getByTestId("comments-panel");
+    expect(panel).toHaveAttribute("data-address-count", "0");
+    expect(panel).toHaveAttribute("data-address-file-count", "0");
   });
 
   it.each([

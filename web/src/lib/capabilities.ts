@@ -307,6 +307,8 @@ export interface ServerInfo {
    * and ``Conversation.pull_request``); absent on older servers (off).
    */
   session_pull_requests?: boolean;
+  /** Session comments preserve PR revision and line anchors; absent on older servers. */
+  comment_anchor_metadata?: boolean;
   /**
    * True when the server stores each user's session title instructions
    * (``/v1/settings/session-title-instructions``); absent on older servers (off).
@@ -470,6 +472,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   request_managed_sandbox_host_id: false,
   session_fork_workspaces: false,
   move_to_managed_sandbox: false,
+  comment_anchor_metadata: false,
   branding: null,
   picker: UNRESTRICTED_PICKER,
 };
@@ -656,6 +659,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_pull_requests: data.session_pull_requests === true,
           session_title_instructions: data.session_title_instructions === true,
           admin_view: data.admin_view === true,
+          comment_anchor_metadata: data.comment_anchor_metadata === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
