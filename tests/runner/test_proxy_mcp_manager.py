@@ -95,6 +95,32 @@ def _json_resp(data: dict[str, Any], status: int = 200) -> httpx.Response:
     )
 
 
+def _input_required(elicitation_id: str, request_state: str, rpc_id: int) -> httpx.Response:
+    return _json_resp(
+        {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "result": {
+                "resultType": "input_required",
+                "inputRequests": {
+                    elicitation_id: {
+                        "method": "elicitation/create",
+                        "params": {
+                            "message": "Approve shell command?",
+                            "requestedSchema": {
+                                "type": "object",
+                                "properties": {"approved": {"type": "boolean"}},
+                                "required": ["approved"],
+                            },
+                        },
+                    }
+                },
+                "requestState": request_state,
+            },
+        }
+    )
+
+
 def _make_spec(*names: str) -> AgentSpec:
     """Build an AgentSpec with one HTTP MCPServerConfig per name.
 
@@ -380,31 +406,6 @@ async def test_call_tool_recreates_approval_after_server_reconnect() -> None:
     old_elicitation = "elicit_old_server"
     new_elicitation = "elicit_new_server"
 
-    def _input_required(elicitation_id: str, request_state: str, rpc_id: int) -> httpx.Response:
-        return _json_resp(
-            {
-                "jsonrpc": "2.0",
-                "id": rpc_id,
-                "result": {
-                    "resultType": "input_required",
-                    "inputRequests": {
-                        elicitation_id: {
-                            "method": "elicitation/create",
-                            "params": {
-                                "message": "Approve shell command?",
-                                "requestedSchema": {
-                                    "type": "object",
-                                    "properties": {"approved": {"type": "boolean"}},
-                                    "required": ["approved"],
-                                },
-                            },
-                        }
-                    },
-                    "requestState": request_state,
-                },
-            }
-        )
-
     transport = _StubTransport(
         [
             _input_required(old_elicitation, "old-state", 1),
@@ -620,13 +621,17 @@ async def test_call_tool_reattaches_after_gateway_severs_held_request(
         ]
     )
     monkeypatch.setattr(proxy_mcp_manager, "monotonic", lambda: transport.now)
-    async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
-        manager = ProxyMcpManager(
-            session_id="conv_test", ap_client=client, execution_registry=registry
-        )
-        assert await manager.call_tool(None, "sys_os_shell", {"command": "sleep 600"}) == "done"
-    await asyncio.gather(*severed_handlers)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
+            manager = ProxyMcpManager(
+                session_id="conv_test", ap_client=client, execution_registry=registry
+            )
+            result = await manager.call_tool(None, "sys_os_shell", {"command": "sleep 600"})
+    finally:
+        work_released.set()
+        await asyncio.gather(*severed_handlers)
 
+    assert result == "done"
     assert external_invocations == 1
     assert [call.body["id"] for call in transport.calls] == [1, 2]
     first_params, retry_params = [call.body["params"] for call in transport.calls]
@@ -719,6 +724,47 @@ async def test_call_tool_bounds_reattach_by_remaining_call_budget(
 
 
 @pytest.mark.asyncio
+async def test_call_tool_bounds_whole_reattach_by_remaining_call_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reattach that stalls without exceeding a single read timeout still ends on time."""
+    from omnigent.runner import proxy_mcp_manager
+
+    class _StallingReattachTransport(_HeldResponseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            response = await super().handle_async_request(request)
+            if len(self.calls) > 1:
+                await asyncio.sleep(5.0)
+            return response
+
+    transport = _StallingReattachTransport(
+        [
+            (299.9, httpx.Response(504)),
+            (
+                0.0,
+                _json_resp(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {"content": [{"type": "text", "text": "done"}]},
+                    }
+                ),
+            ),
+        ]
+    )
+    monkeypatch.setattr(proxy_mcp_manager, "monotonic", lambda: transport.now)
+    monkeypatch.setattr(proxy_mcp_manager, "MCP_PROXY_CALL_TIMEOUT_S", 300.0)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
+        manager = ProxyMcpManager(
+            session_id="conv_test", ap_client=client, execution_registry=McpExecutionRegistry()
+        )
+        with pytest.raises(RuntimeError, match="did not finish within 300s"):
+            await manager.call_tool(None, "sys_os_shell", {})
+
+    assert transport.read_timeouts == [300.0, pytest.approx(0.1)]
+
+
+@pytest.mark.asyncio
 async def test_call_tool_does_not_resend_approved_reply_after_gateway_sever(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -726,23 +772,12 @@ async def test_call_tool_does_not_resend_approved_reply_after_gateway_sever(
     from omnigent.runner import proxy_mcp_manager
 
     elicitation_id = "elicit_shell"
-    input_required = _json_resp(
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "resultType": "input_required",
-                "inputRequests": {
-                    elicitation_id: {
-                        "method": "elicitation/create",
-                        "params": {"message": "Approve shell command?"},
-                    }
-                },
-                "requestState": "approval-state",
-            },
-        }
+    transport = _HeldResponseTransport(
+        [
+            (0.0, _input_required(elicitation_id, "approval-state", 1)),
+            (300.0, httpx.Response(504)),
+        ]
     )
-    transport = _HeldResponseTransport([(0.0, input_required), (300.0, httpx.Response(504))])
     monkeypatch.setattr(proxy_mcp_manager, "monotonic", lambda: transport.now)
     pending_approvals.reset_for_tests()
     async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
@@ -762,6 +797,58 @@ async def test_call_tool_does_not_resend_approved_reply_after_gateway_sever(
 
     assert [call.body["id"] for call in transport.calls] == [1, 2]
     assert transport.calls[1].body["params"]["requestState"] == "approval-state"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("next_request", ["approval-reply", "server-reconnect-rerun"])
+async def test_call_tool_excludes_approval_wait_from_reattach_budget(
+    monkeypatch: pytest.MonkeyPatch, next_request: str
+) -> None:
+    """An approval wait after a reattach does not spend the reattach budget."""
+    from omnigent.runner import proxy_mcp_manager
+
+    elicitation_id = "elicit_after_reattach"
+    transport = _HeldResponseTransport(
+        [
+            (200.0, httpx.Response(504)),
+            (0.0, _input_required(elicitation_id, "approval-state", 2)),
+            (
+                1.0,
+                _json_resp(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "result": {"content": [{"type": "text", "text": "done"}]},
+                    }
+                ),
+            ),
+        ]
+    )
+    monkeypatch.setattr(proxy_mcp_manager, "monotonic", lambda: transport.now)
+    monkeypatch.setattr(proxy_mcp_manager, "MCP_PROXY_CALL_TIMEOUT_S", 300.0)
+    pending_approvals.reset_for_tests()
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
+        manager = ProxyMcpManager(
+            session_id="conv_test", ap_client=client, execution_registry=McpExecutionRegistry()
+        )
+        task = asyncio.create_task(manager.call_tool(None, "sys_os_shell", {}))
+        try:
+            await poll_until_async(lambda: elicitation_id in pending_approvals._pending)
+            transport.now += 200.0
+            if next_request == "approval-reply":
+                assert pending_approvals.resolve(elicitation_id, approved=True)
+            else:
+                assert pending_approvals.notify_server_reconnect() == 1
+            assert await task == "done"
+        finally:
+            if not task.done():
+                task.cancel()
+            pending_approvals.reset_for_tests()
+
+    assert transport.read_timeouts == [300.0, 100.0, 100.0]
+    assert ("requestState" in transport.calls[2].body["params"]) == (
+        next_request == "approval-reply"
+    )
 
 
 @pytest.mark.asyncio

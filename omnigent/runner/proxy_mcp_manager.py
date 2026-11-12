@@ -22,6 +22,7 @@ When to use each implementation:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -484,36 +485,42 @@ class ProxyMcpManager:
 
         payload = _initial_payload()
         approval_retries = 0
-        call_deadline = monotonic() + MCP_PROXY_CALL_TIMEOUT_S
-        severed = False
+        # Requests that reattach after a gateway sever share the severed request's budget.
+        reattach_deadline: float | None = None
 
         while True:
             request_generation = pending_approvals.current_server_generation()
             started = monotonic()
             failure_phase = "transport"
             resp: httpx.Response | None = None
-            # Reattached requests share the severed call's budget.
-            read_timeout = call_deadline - started if severed else MCP_PROXY_CALL_TIMEOUT_S
-            if read_timeout <= 0:
-                raise _call_budget_spent(
-                    None, request_generation=request_generation, started=started
-                )
+            request_deadline = started + MCP_PROXY_CALL_TIMEOUT_S
+            read_timeout = MCP_PROXY_CALL_TIMEOUT_S
+            # The read timeout bounds each read; a reattach must also finish in time.
+            total_timeout: float | None = None
+            if reattach_deadline is not None:
+                request_deadline = reattach_deadline
+                read_timeout = total_timeout = reattach_deadline - started
+                if read_timeout <= 0:
+                    raise _call_budget_spent(
+                        None, request_generation=request_generation, started=started
+                    )
             try:
-                resp = await self._omnigent_client.post(
-                    url,
-                    json=payload,
-                    headers={"X-Omnigent-Session-Id": self._session_id} if managed else {},
-                    # Short connect timeout still fails fast on an unreachable
-                    # server; the read timeout covers ordinary proxy request
-                    # hangs. Sub-agent dispatch returns an async handle
-                    # immediately and no longer holds this call for a child turn.
-                    timeout=httpx.Timeout(
-                        connect=10.0,
-                        read=read_timeout,
-                        write=10.0,
-                        pool=10.0,
-                    ),
-                )
+                async with asyncio.timeout(total_timeout):
+                    resp = await self._omnigent_client.post(
+                        url,
+                        json=payload,
+                        headers={"X-Omnigent-Session-Id": self._session_id} if managed else {},
+                        # Short connect timeout still fails fast on an unreachable
+                        # server; the read timeout covers ordinary proxy request
+                        # hangs. Sub-agent dispatch returns an async handle
+                        # immediately and no longer holds this call for a child turn.
+                        timeout=httpx.Timeout(
+                            connect=10.0,
+                            read=read_timeout,
+                            write=10.0,
+                            pool=10.0,
+                        ),
+                    )
                 failure_phase = "http_status"
                 resp.raise_for_status()
                 failure_phase = "response_decode"
@@ -530,13 +537,11 @@ class ProxyMcpManager:
                         "MCP gateway transport failed; completion is unknown. "
                         "Call was not retried."
                     ) from exc
-                if severed and monotonic() >= call_deadline:
+                if reattach_deadline is not None and monotonic() >= reattach_deadline:
                     raise _call_budget_spent(
                         exc, request_generation=request_generation, started=started
                     ) from exc
-                await _wait_to_reattach(
-                    request_generation, exc, deadline=call_deadline if severed else None
-                )
+                await _wait_to_reattach(request_generation, exc, deadline=reattach_deadline)
                 # Reattach the new server generation to the same runner-owned
                 # operation. A fresh JSON-RPC id distinguishes this transport
                 # attempt; the operation id prevents external work from replaying.
@@ -544,6 +549,10 @@ class ProxyMcpManager:
                 payload = cast("_JsonObject", {**payload, "id": request_id})
                 continue
             except Exception as exc:
+                if isinstance(exc, TimeoutError) and reattach_deadline is not None:
+                    raise _call_budget_spent(
+                        exc, request_generation=request_generation, started=started
+                    ) from exc
                 held_s = monotonic() - started
                 registry = self._execution_registry
                 # The runner keeps executing a severed call, so re-POSTing the same
@@ -555,7 +564,7 @@ class ProxyMcpManager:
                     and held_s >= _HELD_REQUEST_SEVER_FLOOR_S
                     and not managed
                     and approval_retries == 0
-                    and monotonic() < call_deadline
+                    and monotonic() < request_deadline
                     and registry is not None
                     and registry.has_operation(self._session_id, operation_id)
                 ):
@@ -566,7 +575,7 @@ class ProxyMcpManager:
                         exc.response.status_code,
                         held_s,
                     )
-                    severed = True
+                    reattach_deadline = request_deadline
                     request_id += 1
                     payload = cast("_JsonObject", {**payload, "id": request_id})
                     continue
@@ -592,9 +601,7 @@ class ProxyMcpManager:
                 msg = err.get("message", "")
                 if code == RUNNER_MCP_EXECUTION_DETACHED_CODE:
                     await _wait_to_reattach(
-                        request_generation,
-                        response=resp,
-                        deadline=call_deadline if severed else None,
+                        request_generation, response=resp, deadline=reattach_deadline
                     )
                     request_id += 1
                     payload = cast("_JsonObject", {**payload, "id": request_id})
@@ -641,6 +648,7 @@ class ProxyMcpManager:
                     if self._publish_event is not None
                     else (lambda _s, _e: None)
                 )
+                approval_started = monotonic()
                 try:
                     verdict = await pending_approvals.wait_for_user_verdict(
                         elicitation_id=elicitation_id,
@@ -655,6 +663,10 @@ class ProxyMcpManager:
                     request_id += 1
                     payload = _initial_payload()
                     continue
+                finally:
+                    # Approval waits do not spend a reattached execution's budget.
+                    if reattach_deadline is not None:
+                        reattach_deadline += monotonic() - approval_started
 
                 request_id += 1
                 payload = {
