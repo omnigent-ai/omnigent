@@ -43,7 +43,7 @@ export function WorkflowsPage() {
         <div className="flex flex-col gap-1">
           <h1 className="text-2xl font-semibold">Workflows</h1>
           <p className="text-ui text-muted-foreground">
-            Run multi-step work again from a saved plan.
+            Reusable step-by-step plans an agent can run for you.
           </p>
         </div>
         <Button
