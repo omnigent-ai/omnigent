@@ -1319,7 +1319,7 @@ export async function getHostIdentity(): Promise<HostIdentity | null> {
   }
 }
 
-/** Where desktop onboarding connected a runner: this machine, or a remote host like Arca. */
+/** Host selected by desktop onboarding; older shells may hand over a remote host. */
 export type OnboardingRunner = "local" | "remote";
 
 /** Features that each take the onboarding runner once per page load. */

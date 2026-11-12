@@ -32,7 +32,6 @@ interface OmnigentSetup {
   getServerNames?: () => Promise<Record<string, string>>;
   getRecentServers: () => Promise<string[]>;
   forgetRecentServer?: (url: string) => Promise<string[]>;
-  getRunnerOptions?: (url: string) => Promise<{ remote?: boolean; bundledCli?: boolean } | null>;
   connectRunner?: (url: string, runner: Runner) => Promise<Partial<SetupResult>>;
   onRunnerConnectLog?: (cb: (line: string) => void) => () => void;
   checkServer?: (url: string) => Promise<{ status: "ok" | "reachable" | "unreachable" }>;
@@ -296,12 +295,6 @@ export function BridgeSetupApp() {
       ? (cb) => setupBridge()?.onCliInstallLog?.(cb) ?? (() => {})
       : undefined,
     // Older shells omit it → the runner step offers this laptop only.
-    getRunnerOptions: setupBridge()?.getRunnerOptions
-      ? async (url) => {
-          const options = await setupBridge()?.getRunnerOptions?.(url);
-          return { remote: options?.remote === true, bundledCli: options?.bundledCli === true };
-        }
-      : undefined,
     onConnectRunner: setupBridge()?.connectRunner
       ? async (url, runner) => {
           try {
