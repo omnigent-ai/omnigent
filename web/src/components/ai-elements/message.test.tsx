@@ -184,6 +184,52 @@ describe("MessageResponse", () => {
       expect(await screen.findByText("[Image blocked: shot]")).toBeTruthy();
     });
 
+    it.each([
+      ["its own paragraph", `Demo:\n\n${asset}\n\nAfter`],
+      ["its own line", `Demo:\n${asset}\nAfter`],
+    ])("plays a bare GitHub attachment URL on %s as a video", async (_case, markdown) => {
+      render(<MessageResponse allowGitHubAttachmentImages>{markdown}</MessageResponse>);
+
+      await screen.findByText(/Demo:/);
+      const video = document.querySelector("video");
+      expect(video).toHaveAttribute("src", asset);
+      expect(video).toHaveAttribute("controls");
+      expect(video).toHaveAttribute("preload", "metadata");
+      expect(screen.queryByRole("link")).toBeNull();
+    });
+
+    it.each([
+      ["a titled link", `[clip](${asset})`],
+      ["a URL inside a sentence", `See ${asset} for the clip`],
+      ["another host", "https://attacker.example/clip.mp4"],
+      ["a query string", `${asset}?q=secret`],
+    ])("leaves %s a link", async (_case, markdown) => {
+      render(<MessageResponse allowGitHubAttachmentImages>{markdown}</MessageResponse>);
+
+      expect(await screen.findByRole("link")).toBeTruthy();
+      expect(document.querySelector("video")).toBeNull();
+    });
+
+    it("doesn't treat a raw parked-video tag as a GitHub video", async () => {
+      render(
+        <MessageResponse allowGitHubAttachmentImages>
+          {
+            'before <omnigent-github-video src="https://evil.example/x.mp4"></omnigent-github-video>'
+          }
+        </MessageResponse>,
+      );
+
+      await screen.findByText(/before/);
+      expect(document.querySelector("video")).toBeNull();
+    });
+
+    it("leaves a bare GitHub attachment URL a link without the option", async () => {
+      render(<MessageResponse>{asset}</MessageResponse>);
+
+      expect(await screen.findByRole("link", { name: asset })).toHaveAttribute("href", asset);
+      expect(document.querySelector("video")).toBeNull();
+    });
+
     it("leaves links as the default renderer treats them", async () => {
       render(
         <MessageResponse allowGitHubAttachmentImages>
