@@ -38,7 +38,9 @@ from typing import Any
 import httpx
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import debug_event
+from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task, close_subprocess_transport
@@ -487,6 +489,7 @@ class _SubprocessEntry:
         :data:`_LIVE_MODEL_CONFIG_HARNESSES` and explicitly curated ACP agents
         apply it in-process.
     :param acp_config: ACP startup options, excluding the live model selection.
+    :param os_env_config: Serialized OS policy installed when this worker started.
     """
 
     def __init__(
@@ -497,6 +500,7 @@ class _SubprocessEntry:
         harness: str,
         model: str | None = None,
         acp_config: dict[str, str] | None = None,
+        os_env_config: str | None = None,
     ) -> None:
         self.process = process
         self.client = client
@@ -504,6 +508,7 @@ class _SubprocessEntry:
         self.harness = harness
         self.model = model
         self.acp_config = acp_config or {}
+        self.os_env_config = os_env_config
         self.last_used_at: float = 0.0
 
 
@@ -533,6 +538,17 @@ def _acp_startup_config(env: dict[str, str] | None) -> dict[str, str]:
         for key, value in (env or {}).items()
         if key.startswith("HARNESS_ACP_") and key != "HARNESS_ACP_MODEL"
     }
+
+
+def _os_env_key(harness: str) -> str:
+    """Return the worker policy variable, including the shared ACP adapter prefix."""
+    harness = canonicalize_harness(harness) or harness
+    prefix = (
+        "ACP"
+        if harness in ACP_CLI_HARNESSES or harness.startswith("acp:")
+        else harness.upper().replace("-", "_")
+    )
+    return f"HARNESS_{prefix}_OS_ENV"
 
 
 def _build_harness_spawn_env(env: dict[str, str] | None) -> dict[str, str]:
@@ -738,7 +754,7 @@ class HarnessProcessManager:
         Unix socket to appear, and constructs an
         :class:`httpx.AsyncClient` over it. Subsequent calls
         return the cached client. Model changes restart harnesses without live
-        switching support; changes to ACP startup options also require a restart.
+        switching support; changes to OS policies or ACP startup options also restart them.
 
         Crash detection: if the previously-spawned subprocess has
         exited (``returncode is not None``), or its Unix socket has
@@ -761,7 +777,9 @@ class HarnessProcessManager:
             "HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE": "<your-profile>"}``.
             Caller-supplied keys win on conflicts. ``None`` inherits
             ``os.environ`` minus the runner-auth secrets stripped by
-            ``_build_harness_spawn_env``. Used by AP's
+            ``_build_harness_spawn_env``. For a retained worker, ``None``
+            preserves its OS policy; an explicit mapping (including ``{}``)
+            compares the merged policy and replaces the worker if changed. Used by AP's
             workflow dispatch to thread per-spec executor config
             into the subprocess without polluting AP's own
             ``os.environ`` (which would race across concurrent
@@ -792,8 +810,34 @@ class HarnessProcessManager:
         # the hook must not fire. Carried into the hook so the runner can
         # identity-match the turn it is about to cancel.
         replaced_response_id: str | None = None
+
+        async def notify_replaced_turn() -> None:
+            # Notify only the displaced response after releasing the spawn lock;
+            # recovery may re-enter get_client to deliver its interrupt.
+            if (
+                respawn_reason is not None
+                and replaced_response_id is not None
+                and self._on_harness_respawn is not None
+            ):
+                # Recovery failures must preserve the original startup result
+                # and allow handing off a healthy replacement.
+                try:
+                    await self._on_harness_respawn(
+                        conversation_id, respawn_reason, replaced_response_id
+                    )
+                except Exception:  # best-effort recovery signal — never fail handoff
+                    _logger.error(
+                        "respawn resync hook failed for conversation %s (reason %s); "
+                        "harness acquisition proceeds, orphan backstop remains",
+                        conversation_id,
+                        respawn_reason,
+                        exc_info=True,
+                    )
+
         spawn_lock = await self._get_spawn_lock(conversation_id)
-        async with spawn_lock:
+        async with contextlib.AsyncExitStack() as cleanup:
+            cleanup.push_async_callback(notify_replaced_turn)
+            await cleanup.enter_async_context(spawn_lock)
             # ``release`` / ``shutdown`` take this same lock, so a teardown
             # that started while we were waiting cannot race the spawn below.
             if self._shutting_down:
@@ -866,6 +910,7 @@ class HarnessProcessManager:
                 # The retired process cannot emit its terminal stream edge.
                 self._in_flight_response_ids.pop(conversation_id, None)
                 entry = None
+            policy_key = _os_env_key(harness)
             if entry is not None and harness != "any" and entry.harness != harness:
                 # The harness is fixed at spawn time (it selects which runner
                 # module the subprocess loads), but the socket is keyed by
@@ -886,12 +931,19 @@ class HarnessProcessManager:
                     entry.harness,
                     harness,
                 )
-                replaced_response_id = self._in_flight_response_ids.get(conversation_id)
-                await self._close_entry(entry)
-                self._in_flight_response_ids.pop(conversation_id, None)
-                entry = None
                 respawn_reason = "harness_respawn_agent_switch"
-            if (
+            elif (
+                entry is not None
+                and harness != "any"
+                and env is not None
+                and entry.os_env_config != env.get(policy_key, os.environ.get(policy_key))
+            ):
+                _logger.info(
+                    "OS environment policy changed for conversation %s; respawning",
+                    conversation_id,
+                )
+                respawn_reason = "harness_respawn_policy_change"
+            elif (
                 entry is not None
                 and harness == "acp"
                 and env is not None
@@ -901,12 +953,8 @@ class HarnessProcessManager:
                     "ACP startup config changed for conversation %s; respawning",
                     conversation_id,
                 )
-                replaced_response_id = self._in_flight_response_ids.get(conversation_id)
-                await self._close_entry(entry)
-                self._in_flight_response_ids.pop(conversation_id, None)
-                entry = None
                 respawn_reason = "harness_respawn_agent_switch"
-            if entry is not None and not (
+            elif entry is not None and not (
                 harness in _LIVE_MODEL_CONFIG_HARNESSES
                 or (harness == "acp" and entry.acp_config.get("HARNESS_ACP_MODEL_LIST"))
             ):
@@ -922,11 +970,13 @@ class HarnessProcessManager:
                         entry.model,
                         requested_model,
                     )
-                    replaced_response_id = self._in_flight_response_ids.get(conversation_id)
-                    await self._close_entry(entry)
-                    self._in_flight_response_ids.pop(conversation_id, None)
-                    entry = None
                     respawn_reason = "harness_respawn_model_switch"
+            if entry is not None and respawn_reason is not None:
+                replaced_response_id = self._in_flight_response_ids.get(conversation_id)
+                self._entries.pop(conversation_id, None)
+                self._in_flight_response_ids.pop(conversation_id, None)
+                await self._close_entry(entry)
+                entry = None
             if entry is None:
                 if harness == "any":
                     raise NoLiveHarnessError(
@@ -959,40 +1009,7 @@ class HarnessProcessManager:
             # ``time.monotonic()`` is a single process-wide source
             # both code paths agree on.
             entry.last_used_at = time.monotonic()
-            client = entry.client
-        # Signal the runner OUTSIDE the spawn lock (the hook re-enters
-        # ``get_client(conv, "any")`` to forward the interrupt). Fire ONLY when
-        # the replaced process was actually mid-response — a respawn with no
-        # in-flight response strands no turn (the common between-turns ``/model``
-        # case, and the new-turn's-own-setup case where the caller has not marked
-        # in-flight yet), so firing there would cancel the very turn being
-        # started. The replaced response id is carried so the runner can
-        # identity-match the turn it cancels.
-        if (
-            respawn_reason is not None
-            and replaced_response_id is not None
-            and self._on_harness_respawn is not None
-        ):
-            # Best-effort: the respawn→resync signal is a recovery hint, not part
-            # of the client-handoff contract. A hook that raises (e.g. the
-            # runner's ``_resync_turn_state`` adapter throwing) must NOT fail the
-            # acquisition — a turn would then lose its client purely because a
-            # recovery signal errored. Catch broadly, log, and still return the
-            # freshly-spawned client. Logged (not swallowed silently) so the
-            # backstop watchdog path stays observable.
-            try:
-                await self._on_harness_respawn(
-                    conversation_id, respawn_reason, replaced_response_id
-                )
-            except Exception:  # best-effort recovery signal — never fail handoff
-                _logger.error(
-                    "respawn resync hook failed for conversation %s (reason %s); "
-                    "harness acquisition proceeds, orphan backstop remains",
-                    conversation_id,
-                    respawn_reason,
-                    exc_info=True,
-                )
-        return client
+            return entry.client
 
     async def forward_cancel(
         self,
@@ -1444,6 +1461,7 @@ class HarnessProcessManager:
                 # process env var, not re-read per turn.
                 model=(env or {}).get(_model_env_key(harness)),
                 acp_config=_acp_startup_config(env) if harness == "acp" else None,
+                os_env_config=effective_env.get(_os_env_key(harness)),
             )
         except BaseException:
             # From spawn onward the process must have exactly one owner:

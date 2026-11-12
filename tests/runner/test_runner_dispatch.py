@@ -1622,12 +1622,12 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
 
 
 @pytest.mark.asyncio
-async def test_runner_corrected_policy_retries_after_runtime_reset(
+async def test_runner_policy_changes_replace_retained_worker(
     started_manager: HarnessProcessManager,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A corrected spec reaches a fresh child after a rejected worker is reset."""
+    """Corrected and tightened policies reach fresh children in the same session."""
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     isolate_provider_resolution(monkeypatch, tmp_path / "config")
@@ -1675,22 +1675,29 @@ async def test_runner_corrected_policy_retries_after_runtime_reset(
 
         spec.os_env = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))
         body["agent_revision"] = "corrected"
-        retained = await http.post(url, json=body)
-        assert retained.status_code == 200
-        assert _parse_sse(retained.content)[-1][0] == "response.failed"
-        assert started_manager.registered_client(session_id) is client
-        assert session_id not in app.state.active_turns
-
-        reset = await http.post(f"/v1/sessions/{session_id}/reset-state")
-        assert reset.status_code == 200
-        assert started_manager.registered_client(session_id) is None
-        assert process.returncode is not None
         completed = await http.post(url, json=body)
         assert completed.status_code == 200
         events = _parse_sse(completed.content)
         assert events[-1][0] == "response.completed"
         assert "policy retry completed" in completed.text
-        assert started_manager.registered_client(session_id) is not client
+        corrected_client = started_manager.registered_client(session_id)
+        assert corrected_client is not None and corrected_client is not client
+        assert process.returncode is not None
+        assert session_id not in app.state.active_turns
+        assert not app.state.session_message_buffers.get(session_id)
+
+        unchanged = await http.post(url, json=body)
+        assert unchanged.status_code == 200
+        assert _parse_sse(unchanged.content)[-1][0] == "response.completed"
+        assert started_manager.registered_client(session_id) is corrected_client
+        spec.os_env = OSEnvSpec(fork=True, sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
+        body["agent_revision"] = "tightened"
+        tightened = await http.post(url, json=body)
+        assert tightened.status_code == 200
+        tightened_events = _parse_sse(tightened.content)
+        assert tightened_events[-1][0] == "response.failed"
+        assert "os_env.fork" in tightened_events[-1][1]["response"]["error"]["message"]
+        assert started_manager.registered_client(session_id) is not corrected_client
         assert session_id not in app.state.active_turns
         assert not app.state.session_message_buffers.get(session_id)
 

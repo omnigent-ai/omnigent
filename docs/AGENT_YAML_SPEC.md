@@ -651,8 +651,8 @@ ACP, Claude SDK, Codex, Goose, Kimi, Pi, and Qwen worker containment supports
 `os_env.type: caller_process` and rejects `fork`, `start_in_scratch`, and
 `sandbox.git_ssh`. Worker `egress_rules` are supported only by Codex, and worker
 `credential_proxy` requires Codex's supported brokered gateway configuration.
-After changing an already spawned worker's OS policy, reset the session runtime
-before retrying; an agent revision alone does not replace its process environment.
+When a later turn supplies a changed OS policy, the runtime replaces its retained
+worker before running that turn so the new policy reaches a fresh process.
 
 Sandbox launchers also grant read access to the installed `omnigent` Python
 package. With an editable installation, this includes that package's source
