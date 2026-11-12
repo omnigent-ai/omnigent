@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import {
   REVIEW_PLAN_FIRST,
-  continueTaskMessage,
   createWorkflowPrompt,
   runSavedWorkflowPrompt,
   offersSaveWorkflow,
@@ -10,12 +9,18 @@ import {
   parseSavedWorkflowMessage,
   savedWorkflowMessage,
   saveWorkflowMessage,
+  taskActionMessage,
   workflowMessage,
 } from "./workflow";
 
-describe("continueTaskMessage", () => {
-  it("names the task to pick back up", () => {
-    expect(continueTaskMessage("Review #6109")).toBe('Continue the task "Review #6109".');
+describe("taskActionMessage", () => {
+  it("asks to run or continue the task by name, then the rest of the plan", () => {
+    expect(taskActionMessage("run", "Share the files")).toBe(
+      'Run the task "Share the files", then go on with the rest of the plan.',
+    );
+    expect(taskActionMessage("continue", "Review #6109")).toBe(
+      'Continue the task "Review #6109", then go on with the rest of the plan.',
+    );
   });
 });
 

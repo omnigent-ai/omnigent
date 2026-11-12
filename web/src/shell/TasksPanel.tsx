@@ -10,6 +10,7 @@ import {
   Loader2Icon,
   MessageCircleQuestionMarkIcon,
   PlayIcon,
+  SquareIcon,
   WorkflowIcon,
   XIcon,
 } from "lucide-react";
@@ -54,6 +55,7 @@ import { messageDeepLinkParams } from "@/lib/messageDeepLink";
 import { Link, useSearchParams } from "@/lib/routing";
 import { taskMarkerTarget } from "@/lib/taskActivity";
 import { cn } from "@/lib/utils";
+import type { TaskAction } from "@/lib/workflow";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
 
 const NO_ENTRIES: JournalEntry[] = [];
@@ -334,6 +336,32 @@ function StepHistory({
   );
 }
 
+// What a task's ⋯ menu offers: Run while it's ready, Continue once it's stopped, Stop while it runs.
+type RowAction = TaskAction | "stop";
+const ROW_ACTION_LABELS: Record<RowAction, string> = {
+  run: "Run",
+  continue: "Continue",
+  stop: "Stop",
+};
+
+interface RowMenuAction {
+  action: RowAction;
+  onSelect: () => void;
+}
+
+/** A task's menu action for its state, when this viewer's composer offers it. */
+function rowMenuAction(
+  item: StepProgress,
+  onTaskAction: ((action: TaskAction, taskName: string) => void) | undefined,
+  onStop: (() => void) | undefined,
+): RowMenuAction | undefined {
+  if (item.state === "running") return onStop && { action: "stop", onSelect: onStop };
+  const action: TaskAction | null =
+    item.state === "ready" ? "run" : item.state === "stopped" ? "continue" : null;
+  if (action === null || !onTaskAction) return undefined;
+  return { action, onSelect: () => onTaskAction(action, item.step.name) };
+}
+
 // A task row's small icon buttons: its ⋯ menu and the chevron that opens its history.
 const ROW_ICON_BUTTON =
   "mt-1.5 shrink-0 cursor-pointer rounded-md p-1 text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50";
@@ -346,7 +374,7 @@ function StepRow({
   names,
   flash,
   onShowInChat,
-  onContinue,
+  menuAction,
 }: {
   item: StepProgress;
   number: number;
@@ -357,8 +385,8 @@ function StepRow({
   flash: boolean;
   /** Scroll the chat to a marker, e.g. ``journal-<entry id>``. */
   onShowInChat: (markerId: string) => void;
-  /** Asks the agent to pick the task back up; offered while it's stopped. */
-  onContinue?: () => void;
+  /** What its ⋯ menu offers: Run, Continue or Stop; absent for none. */
+  menuAction?: RowMenuAction;
 }) {
   const [open, setOpen] = useState(false);
   const detail = stepDetail(item);
@@ -435,7 +463,7 @@ function StepRow({
         ) : (
           <div className={rowClassName}>{content}</div>
         )}
-        {onContinue && (
+        {menuAction && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button
@@ -448,9 +476,16 @@ function StepRow({
               </button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              <DropdownMenuItem data-testid="tasks-row-continue" onSelect={onContinue}>
-                <PlayIcon className="size-4" />
-                Continue
+              <DropdownMenuItem
+                data-testid={`tasks-row-${menuAction.action}`}
+                onSelect={() => menuAction.onSelect()}
+              >
+                {menuAction.action === "stop" ? (
+                  <SquareIcon className="size-3.5 fill-current" />
+                ) : (
+                  <PlayIcon className="size-4" />
+                )}
+                {ROW_ACTION_LABELS[menuAction.action]}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -865,15 +900,18 @@ function TaskList({
   names,
   flashStep,
   onShowInChat,
-  onContinueTask,
+  onTaskAction,
+  onStop,
 }: {
   progress: readonly StepProgress[];
   entries: readonly JournalEntry[];
   names: ReadonlyMap<string, string>;
   flashStep: string | null;
   onShowInChat: (markerId: string) => void;
-  /** The composer's Continue, given a task's name; absent when this viewer can't send. */
-  onContinueTask?: (taskName: string) => void;
+  /** The composer's Run or Continue, given a task's name; absent when this viewer can't send. */
+  onTaskAction?: (action: TaskAction, taskName: string) => void;
+  /** The composer's Stop; present only while the agent works. */
+  onStop?: () => void;
 }) {
   return (
     <section aria-label="Tasks">
@@ -888,11 +926,7 @@ function TaskList({
             names={names}
             flash={flashStep === item.step.id}
             onShowInChat={onShowInChat}
-            onContinue={
-              onContinueTask && item.state === "stopped"
-                ? () => onContinueTask(item.step.name)
-                : undefined
-            }
+            menuAction={rowMenuAction(item, onTaskAction, onStop)}
           />
         ))}
       </ol>
@@ -923,7 +957,8 @@ export function TasksPanel({
   const { journal, plan, progress } = tasks;
   const startWorkflow = useSessionTasksActions((state) => state.startWorkflow[conversationId]);
   const saveWorkflow = useSessionTasksActions((state) => state.saveWorkflow[conversationId]);
-  const continueTask = useSessionTasksActions((state) => state.continueTask[conversationId]);
+  const taskAction = useSessionTasksActions((state) => state.taskAction[conversationId]);
+  const stopWork = useSessionTasksActions((state) => state.stopWork[conversationId]);
   const entries = tasks.journalSupported ? journal.entries : NO_ENTRIES;
   const names = new Map(progress.map((item) => [item.step.id, item.step.name]));
   const empty = progress.length === 0;
@@ -1033,7 +1068,8 @@ export function TasksPanel({
               names={names}
               flashStep={flashStep}
               onShowInChat={showInChat}
-              onContinueTask={continueTask}
+              onTaskAction={taskAction}
+              onStop={stopWork}
             />
           </>
         )}

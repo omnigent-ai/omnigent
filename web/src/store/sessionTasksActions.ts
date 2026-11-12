@@ -1,12 +1,16 @@
 import { create } from "zustand";
 
+import type { TaskAction } from "@/lib/workflow";
+
 interface SessionTasksActionsState {
   /** Per session: how its composer starts a workflow, when it offers one. */
   startWorkflow: Readonly<Record<string, () => void>>;
   /** Per session: how its composer saves the plan as a workflow, given the plan's name. */
   saveWorkflow: Readonly<Partial<Record<string, (planName: string) => void>>>;
-  /** Per session: how its composer asks the agent to continue a stopped task, given its name. */
-  continueTask: Readonly<Partial<Record<string, (taskName: string) => void>>>;
+  /** Per session: how its composer stops the agent, offered only while it works. */
+  stopWork: Readonly<Partial<Record<string, () => void>>>;
+  /** Per session: how its composer asks the agent to run or continue a task, given its name. */
+  taskAction: Readonly<Partial<Record<string, (action: TaskAction, taskName: string) => void>>>;
   /** A session whose Tasks tab should open; the shell clears it once open. */
   tasksTabToOpen: string | null;
   /** The task the Tasks tab should scroll to and highlight; the tab clears it once shown. */
@@ -17,14 +21,15 @@ interface SessionTasksActionsState {
 
 /**
  * Actions that cross surfaces for a session's tasks: the composer registers
- * how to start a workflow, save one and continue a stopped task, so the Tasks
- * tab can offer them, and the chat's task preview asks the shell to open the
- * Tasks tab.
+ * how to start a workflow, save one, run or continue a task, and stop the agent,
+ * so the Tasks tab can offer them, and the chat's task preview asks the shell to
+ * open the Tasks tab.
  */
 export const useSessionTasksActions = create<SessionTasksActionsState>(() => ({
   startWorkflow: {},
   saveWorkflow: {},
-  continueTask: {},
+  taskAction: {},
+  stopWork: {},
   tasksTabToOpen: null,
   taskToShow: null,
   tasksTabAutoOpen: false,
@@ -52,18 +57,27 @@ export function registerSaveWorkflow(
 }
 
 /**
- * Offer a session's "continue a stopped task" action to its Tasks tab.
+ * Offer a session's "run or continue a task" action to its Tasks tab.
  *
  * @returns A function that withdraws the action, unless another took its place.
  */
-export function registerContinueTask(
+export function registerTaskAction(
   conversationId: string,
-  continueTask: (taskName: string) => void,
+  taskAction: (action: TaskAction, taskName: string) => void,
 ): () => void {
-  return registerSessionAction("continueTask", conversationId, continueTask);
+  return registerSessionAction("taskAction", conversationId, taskAction);
 }
 
-type SessionActionKey = "startWorkflow" | "saveWorkflow" | "continueTask";
+/**
+ * Offer a session's "stop the agent" action to its Tasks tab while the agent works.
+ *
+ * @returns A function that withdraws the action, unless another took its place.
+ */
+export function registerStopWork(conversationId: string, stop: () => void): () => void {
+  return registerSessionAction("stopWork", conversationId, stop);
+}
+
+type SessionActionKey = "startWorkflow" | "saveWorkflow" | "taskAction" | "stopWork";
 
 function registerSessionAction<Key extends SessionActionKey>(
   key: Key,
