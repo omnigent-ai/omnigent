@@ -98,6 +98,7 @@ def _prepared_launch(
 def test_requested_sandbox_never_falls_back_to_bare_worker(
     harness: str, fault: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.delenv("OMNIGENT_CLAUDE_SDK_NO_SANDBOX", raising=False)
     executable = tmp_path / "bin" / "agent"
     executable.parent.mkdir()
     executable.touch()
@@ -267,9 +268,9 @@ def test_harness_without_egress_broker_rejects_egress_rules(harness: str, tmp_pa
 
 
 @pytest.mark.parametrize("harness", ["copilot", "cursor", "hermes"])
-@pytest.mark.parametrize("sandbox_type", ["linux_bwrap", "none"])
+@pytest.mark.parametrize("sandbox_type", [None, "linux_bwrap", "none"])
 def test_harness_without_process_sandbox_rejects_requested_confinement(
-    harness: str, sandbox_type: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    harness: str, sandbox_type: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from omnigent.inner.copilot_executor import CopilotExecutor
     from omnigent.inner.cursor_executor import CursorExecutor
@@ -283,7 +284,10 @@ def test_harness_without_process_sandbox_rejects_requested_confinement(
         "cursor": CursorExecutor,
         "hermes": HermesExecutor,
     }
-    spec = OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type=sandbox_type))
+    spec = OSEnvSpec(
+        cwd=str(tmp_path),
+        sandbox=OSEnvSandboxSpec(type=sandbox_type) if sandbox_type is not None else None,
+    )
     if sandbox_type == "none":
         assert constructors[harness](os_env=spec, cwd=str(tmp_path))._cwd == str(tmp_path)
         return
