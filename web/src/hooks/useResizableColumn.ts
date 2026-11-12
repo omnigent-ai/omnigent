@@ -30,10 +30,7 @@ function writeStoredWidth(storageKey: string | undefined, width: number): void {
 
 /**
  * Resizable left-column width, dragged from its right edge or stepped with the arrow keys.
- *
- * The user's preferred width is kept apart from the rendered width (the preference
- * clamped to [minWidth, maxWidth]), so a shrinking container clamps the rendered width
- * without erasing the preference. Pass `storageKey` to persist the preference.
+ * The preferred width is kept apart, so container clamps never overwrite it.
  */
 export function useResizableColumn(
   defaultWidth = 176,

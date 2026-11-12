@@ -168,6 +168,10 @@ it.each([
     applyImportedSettings({ version: 1, settings: { [key]: "true" } });
   });
   expect(result.current).toBe(true);
+  act(() => {
+    applyImportedSettings({ version: 1, settings: {} });
+  });
+  expect(result.current).toBe(false);
 });
 
 it("carries hidden picker entries through export and import and tells an open picker", () => {

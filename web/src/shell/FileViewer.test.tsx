@@ -278,6 +278,7 @@ interface RenderProps {
   onNavigateTo?: (path: string) => void;
   /** Esc closes through `onClose` too, as a workspace file tab or the narrow-screen overlay does. */
   escapeCloses?: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 /**
@@ -303,6 +304,7 @@ function viewerTree({
   sort,
   onNavigateTo,
   escapeCloses = false,
+  onDirtyChange,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -324,6 +326,7 @@ function viewerTree({
           onCloseTab={onCloseTab ?? (escapeCloses ? onClose : undefined)}
           sort={sort}
           onNavigateTo={onNavigateTo}
+          onDirtyChange={onDirtyChange}
         />
       </MemoryRouter>
     </QueryClientProvider>
@@ -2523,7 +2526,7 @@ describe("FileViewer Escape closes the active tab", () => {
   // wasn't already consumed (in-file search or an overlay) and focus isn't in
   // a text field — so dismissing a dialog or hitting Escape while typing never
   // collapses the tab out from under the user.
-  function renderWithCloseTab(onCloseTab: () => void) {
+  function renderWithCloseTab(onCloseTab: () => void, mediaActive = true) {
     useCommentsMock.mockReturnValue(makeCommentsQuery(undefined));
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     return render(
@@ -2531,6 +2534,7 @@ describe("FileViewer Escape closes the active tab", () => {
         <MemoryRouter initialEntries={["/"]}>
           <FileViewer
             open
+            mediaActive={mediaActive}
             conversationId="conv_1"
             path="file1.py"
             onClose={vi.fn()}
@@ -2546,6 +2550,14 @@ describe("FileViewer Escape closes the active tab", () => {
     renderWithCloseTab(onCloseTab);
     fireEvent.keyDown(window, { key: "Escape" });
     expect(onCloseTab).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores Escape while the viewer is off screen, e.g. in a collapsed rail", () => {
+    const onCloseTab = vi.fn();
+    renderWithCloseTab(onCloseTab, false);
+    expect(screen.getByTestId("file-viewer")).not.toHaveAttribute("data-escape-owner");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onCloseTab).not.toHaveBeenCalled();
   });
 
   it("ignores Escape while focus is in a text field", () => {
@@ -2832,6 +2844,7 @@ describe("file position navigation", () => {
   });
 
   it("drops a discarded draft from a viewer that keeps its file, then guards the next edit", () => {
+    const onDirtyChange = vi.fn();
     let guard: FileNavigationGuard | undefined;
     let activeGuards = 0;
     const registerNavigationGuard = vi.fn((next: FileNavigationGuard) => {
@@ -2856,7 +2869,7 @@ describe("file position navigation", () => {
       );
       return (
         <FileViewerContext.Provider value={contextValue}>
-          {viewerTree({ open: true, mediaActive: false, path: "docs/guide.md" })}
+          {viewerTree({ open: true, mediaActive: false, path: "docs/guide.md", onDirtyChange })}
         </FileViewerContext.Provider>
       );
     }
@@ -2866,10 +2879,13 @@ describe("file position navigation", () => {
     fireEvent.change(screen.getByRole("textbox", { name: "Draft text" }), {
       target: { value: "Unsaved draft" },
     });
+    // The rail keeps an edited file loaded, so it hears about the edits.
+    expect(onDirtyChange).toHaveBeenLastCalledWith(true);
     // A hidden viewer's dialog names the file, since the file may not be on screen.
     act(() => guard!(null, undefined, leave));
     expect(screen.getByText(/Your edits to guide\.md will be lost/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false);
     expect(leave).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("textbox", { name: "Draft text" })).toHaveValue("");
 

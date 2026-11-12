@@ -49,8 +49,6 @@ import type { FilesPanelPreview } from "./FilesPanel";
 // Each stub renders a testid (plus, for FileViewer, the path it was asked to
 // show) so we can prove which child mounted without dragging in Monaco / hook
 // stacks / xterm.
-// Counts viewer mounts, so a test can tell a kept editor from a remounted one.
-const viewerMounts = vi.hoisted(() => ({ count: 0 }));
 vi.mock("./FileViewer", async () => {
   const { useState } = await import("react");
   return {
@@ -64,6 +62,7 @@ vi.mock("./FileViewer", async () => {
       onCloseTab,
       position,
       onCommentsOpenChange,
+      onDirtyChange,
     }: {
       path: string;
       open: boolean;
@@ -73,15 +72,14 @@ vi.mock("./FileViewer", async () => {
       onCloseTab?: () => void;
       position?: { line: number };
       onCommentsOpenChange?: (open: boolean) => void;
+      onDirtyChange?: (dirty: boolean) => void;
     }) {
-      const [mount] = useState(() => ++viewerMounts.count);
       const [draft, setDraft] = useState("");
       return (
         <div
           data-testid="file-viewer-stub"
           data-open={open}
           data-media-active={mediaActive}
-          data-mount={mount}
           data-permission-level={String(permissionLevel)}
           data-sync-url={String(syncUrl)}
           data-closable={String(onCloseTab !== undefined)}
@@ -91,7 +89,10 @@ vi.mock("./FileViewer", async () => {
           <textarea
             aria-label="Unsaved draft"
             value={draft}
-            onChange={(event) => setDraft(event.target.value)}
+            onChange={(event) => {
+              setDraft(event.target.value);
+              onDirtyChange?.(event.target.value !== "");
+            }}
           />
           <button type="button" onClick={() => onCommentsOpenChange?.(true)}>
             open comments
@@ -2489,6 +2490,118 @@ describe("WorkspacePanel file tree split", () => {
     rerender({ selectedFilePath: null, rightRailTab: "browser" });
     expect(viewer()).toBe(editor);
     expect(draftIn(editor)).toHaveValue("Keep this draft");
+  });
+
+  // Changes that skip the viewer's guard, e.g. a background arrival or a missed call site.
+  it.each([
+    { change: "the Files tree shows", props: { selectedFilePath: null }, then: "docs/a.md" },
+    {
+      change: "another tab shows",
+      props: { selectedFilePath: null, rightRailTab: "changes" as const },
+      then: null,
+    },
+    {
+      change: "a shell shows",
+      props: { selectedFilePath: null, selectedTerminalKey: "terminal:zsh" },
+      then: null,
+    },
+    {
+      change: "its tab closes",
+      props: { selectedFilePath: null, openFiles: [] },
+      then: "docs/a.md",
+    },
+    {
+      change: "another file goes beside the tree",
+      props: { selectedFilePath: null, treePreviewPath: "docs/c.md" },
+      then: "docs/c.md",
+    },
+  ])(
+    "keeps an edited file loaded when $change unasked, until its edits are gone",
+    ({ props, then }) => {
+      measureRail(800);
+      const fileGuard = vi.fn<FileNavigationGuard>();
+      const { rerender } = renderWorkspace({
+        ...split,
+        treePreviewPath: "docs/a.md",
+        openFiles: ["docs/b.md"],
+        selectedFilePath: "docs/b.md",
+        openTerminals: ["terminal:zsh"],
+        fileGuard,
+      });
+      const editor = viewer();
+      typeDraft("Keep this draft");
+
+      rerender(props);
+      expect(viewer()).toBe(editor);
+      expect(editor).toHaveTextContent("docs/b.md");
+      expect(editor.closest("[inert]")).not.toBeNull();
+      expect(draftIn(editor)).toHaveValue("Keep this draft");
+      // The tree gets no pane for a file the editor can't take yet.
+      expect(screen.queryByTestId("preview-pane")).toBeNull();
+      expect(fileGuard).not.toHaveBeenCalled();
+
+      // Saved or discarded edits let the editor follow the rail.
+      typeDraft("");
+      if (then === null) expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+      else expect(viewer()).toHaveTextContent(then);
+    },
+  );
+
+  it.each([
+    {
+      gesture: "the Files tab",
+      pick: () => fireEvent.mouseDown(screen.getByRole("tab", { name: "Files" }), { button: 0 }),
+    },
+    {
+      gesture: "the Changes tab",
+      pick: () => fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }), { button: 0 }),
+    },
+    { gesture: "a tab number", pick: () => pressTabNumber(1) },
+    { gesture: "a shell tab", pick: () => fireEvent.click(screen.getByTitle("zsh")) },
+    {
+      gesture: "a browser tab",
+      pick: () => fireEvent.click(screen.getByRole("tab", { name: "Browser 1" })),
+    },
+    {
+      gesture: "a side-chat tab",
+      pick: () => fireEvent.click(screen.getByRole("tab", { name: "Side chat 1" })),
+    },
+    {
+      gesture: "the panel menu",
+      pick: () => {
+        fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+        fireEvent.click(screen.getByRole("menuitem", { name: "Changes" }));
+      },
+    },
+  ])("asks the viewer before $gesture leaves a file tab, then switches once", ({ pick }) => {
+    measureRail(800);
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["browser-one"],
+      openSideChats: ["pending:one"],
+    });
+    const allow: (() => void)[] = [];
+    const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
+      allow.push(commit);
+    });
+    const { onRightRailTabChange, openTerminalTab } = renderWorkspace({
+      ...split,
+      keyboardTarget: true,
+      showBrowserTab: true,
+      treePreviewPath: "docs/a.md",
+      openFiles: ["docs/b.md"],
+      selectedFilePath: "docs/b.md",
+      openTerminals: ["terminal:zsh"],
+      fileGuard,
+    });
+    pick();
+    // The file beside the tree would replace the tab's file, so the viewer decides first.
+    expect(fileGuard).toHaveBeenLastCalledWith("docs/a.md", undefined, expect.any(Function));
+    expect(onRightRailTabChange).not.toHaveBeenCalled();
+    expect(openTerminalTab).not.toHaveBeenCalled();
+
+    // A Radix tab asks on focus and on mouse-down; the viewer keeps only the latest request.
+    act(() => allow.at(-1)!());
+    expect(onRightRailTabChange.mock.calls.length + openTerminalTab.mock.calls.length).toBe(1);
   });
 
   it("keeps a tab's citation while its file stays beside the tree, until opened there again", async () => {

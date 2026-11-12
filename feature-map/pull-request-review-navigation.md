@@ -65,7 +65,8 @@ and a changed file is flagged.
 - `canvas`: Open a conversation beside Canvas, click its composer PR link, then
   open Changes.
 
-The Changes tab is the same on every entry. Its toolbar holds the find button,
+The Changes tab is the same on every entry. Drag the divider beside the file list,
+or focus it and use the arrow keys, to resize the list. Its toolbar holds the find button,
 the thread navigation buttons, the filter button when the file list is hidden,
 and the progress row. The toolbar appears once the list has files or an unresolved
 conversation exists. The viewed controls need a pinned list and a fetched diff that

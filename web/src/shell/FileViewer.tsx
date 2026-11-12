@@ -366,6 +366,8 @@ interface FileViewerProps {
   onCloseTab?: () => void;
   /** Called when the comments panel opens or closes inside the viewer. */
   onCommentsOpenChange?: (open: boolean) => void;
+  /** Called when the editor gains or loses edits that aren't saved yet. */
+  onDirtyChange?: (dirty: boolean) => void;
   /**
    * Sort order for the prev/next navigation. Must match the order the
    * Changes list (`FilesPanel` → `FlatFileList`) is sorted by, or the
@@ -411,6 +413,7 @@ function FileViewerBody({
   mobileOverlay = false,
   viewport,
   onCommentsOpenChange,
+  onDirtyChange,
   sort = "recent",
 }: FileViewerProps) {
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
@@ -510,9 +513,13 @@ function FileViewerBody({
   const [isEditorDirty, setIsEditorDirty] = useState(false);
   // Acceptance clears this synchronously before entering another navigation guard.
   const isEditorDirtyRef = useRef(false);
+  // A ref, so a new callback doesn't re-run the effects that reset the dirty state.
+  const onDirtyChangeRef = useRef(onDirtyChange);
+  onDirtyChangeRef.current = onDirtyChange;
   const handleDirtyChange = useCallback((dirty: boolean) => {
     isEditorDirtyRef.current = dirty;
     setIsEditorDirty(dirty);
+    onDirtyChangeRef.current?.(dirty);
   }, []);
   // Auto-save lifecycle reported up from the Monaco editor, shown as a status
   // chip in the toolbar (the editor itself no longer has a Save button).
@@ -780,9 +787,9 @@ function FileViewerBody({
     return () => window.removeEventListener("keydown", handler);
   }, [syncUrl, open, onNavigateTo, currentNavIdx, prevPath, nextPath, guardDirty]);
 
-  // Escape closes the active file tab (when search is not open).
+  // Escape closes the active file tab (when search is not open) while it is on screen.
   useEffect(() => {
-    if (!open || !onCloseTab) return;
+    if (!onScreen || !onCloseTab) return;
     const handler = (e: KeyboardEvent) => {
       if (!syncUrl && !viewerIsActiveSurfaceRef.current) return;
       if (e.key !== "Escape" || e.defaultPrevented) return;
@@ -799,7 +806,7 @@ function FileViewerBody({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [syncUrl, open, onCloseTab, searchOpen, guardDirty]);
+  }, [syncUrl, onScreen, onCloseTab, searchOpen, guardDirty]);
 
   // View mode toggle — markdown defaults to the rich-text editor, HTML and
   // notebooks to their rendered preview, and everything else to source.
@@ -2100,7 +2107,7 @@ function FileViewerBody({
 
   // While the viewer is the surface last used, Escape closes its Find bar, or else its
   // tab (see above), so page-wide Escape shortcuts leave it alone.
-  const ownsEscape = open && viewerIsActiveSurface && (searchOpen || onCloseTab !== undefined);
+  const ownsEscape = onScreen && viewerIsActiveSurface && (searchOpen || onCloseTab !== undefined);
 
   if (frameless) {
     return (

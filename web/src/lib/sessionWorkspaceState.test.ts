@@ -38,24 +38,6 @@ describe("sessionWorkspaceState", () => {
     });
   });
 
-  it("keeps each session's tree preview apart and drops a malformed one", () => {
-    writeSessionWorkspaceState("conv_a", { treePreviewPath: "docs/a.md", selectedFilePath: null });
-    writeSessionWorkspaceState("conv_b", { treePreviewPath: null });
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify([
-        ...JSON.parse(localStorage.getItem(STORAGE_KEY)!),
-        { id: "conv_bad", state: { treePreviewPath: 7 } },
-      ]),
-    );
-    expect(readSessionWorkspaceState("conv_a")).toEqual({
-      treePreviewPath: "docs/a.md",
-      selectedFilePath: null,
-    });
-    expect(readSessionWorkspaceState("conv_b")).toEqual({ treePreviewPath: null });
-    expect(readSessionWorkspaceState("conv_bad")).toEqual({});
-  });
-
   it("remembers a selected GitHub tab", () => {
     writeSessionWorkspaceState("conv_github", { rightRailTab: "github" });
     expect(readSessionWorkspaceState("conv_github").rightRailTab).toBe("github");
@@ -235,9 +217,20 @@ describe("sessionWorkspaceState", () => {
     // proving one bad field can't poison the whole entry.
     localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify([{ id: "conv_b", state: { open: true, widthPx: -5, rightRailTab: "bogus" } }]),
+      JSON.stringify([
+        { id: "conv_b", state: { open: true, widthPx: -5, rightRailTab: "bogus" } },
+        { id: "conv_preview", state: { treePreviewPath: "docs/a.md", selectedFilePath: null } },
+        { id: "conv_no_preview", state: { treePreviewPath: null } },
+        { id: "conv_bad_preview", state: { treePreviewPath: 7 } },
+      ]),
     );
     expect(readSessionWorkspaceState("conv_b")).toEqual({ open: true });
+    expect(readSessionWorkspaceState("conv_preview")).toEqual({
+      treePreviewPath: "docs/a.md",
+      selectedFilePath: null,
+    });
+    expect(readSessionWorkspaceState("conv_no_preview")).toEqual({ treePreviewPath: null });
+    expect(readSessionWorkspaceState("conv_bad_preview")).toEqual({});
 
     // Tab id lists keep each non-empty string once, in order.
     localStorage.setItem(

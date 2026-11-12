@@ -6637,6 +6637,33 @@ describe("AppShell file tree split", () => {
     expect(screen.queryByTestId("preview-pane")).toBeNull();
   });
 
+  it("asks before the Files tab swaps an edited tab for the file beside the tree", () => {
+    mockConversations([{ id: "conv_return", permission_level: null }]);
+    renderShell("/c/conv_return", splitInfo(), { dirtyFileViewer: true });
+    fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+    fireEvent.click(screen.getByRole("button", { name: "files: open AGENTS.md in new tab" }));
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+    const viewer = screen.getByTestId("file-viewer-inline");
+    expect(viewer).toHaveAttribute("data-path", "AGENTS.md");
+    fireEvent.change(within(viewer).getByLabelText("viewer draft"), {
+      target: { value: "Unsaved draft" },
+    });
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Files" }), { button: 0 });
+    // Until the viewer allows it, the tab keeps its file, draft and URL.
+    expect(screen.getByTestId("file-viewer-inline")).toBe(viewer);
+    expect(viewer).toHaveAttribute("data-path", "AGENTS.md");
+    expect(within(viewer).getByLabelText("viewer draft")).toHaveValue("Unsaved draft");
+    expect(screen.queryByTestId("preview-pane")).toBeNull();
+    expect(urlParams()).toHaveTextContent(/^file=AGENTS\.md$/);
+
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+    expect(previewedPath()).toBe("README.md");
+    expect(urlParams()).not.toHaveTextContent("AGENTS.md");
+    expect(screen.getByTitle("AGENTS.md")).toBeInTheDocument();
+  });
+
   it.each(["?file=README.md", "?file=README.md&line=3&column=2"])(
     "opens %s as a file tab even when it names the file beside the tree",
     (search) => {

@@ -14,7 +14,9 @@ folder header spans both columns, and the shown file stays highlighted.
 - `resize`: drag the divider or use its arrow keys; the preferred width survives reloads.
 - `fallback`: Files narrower than 524px keeps a full-width tree and opens clicked files in tabs.
 - `close`: while a file is shown, the folder's Open-in action becomes **Close file**.
-- `drafts`: replacing or closing an unsaved file asks first; hiding it keeps the draft.
+- `drafts`: picking another rail tab, replacing, or closing an unsaved file asks first.
+  Anything else that hides it, such as an agent opening a browser tab, keeps its draft
+  loaded until the edits are saved or the user returns to the file.
 - `access`: losing file access hides the tree, but an open file keeps its editor and draft.
 - `preference`: **Always open files in a new tab** applies immediately and supports Reset and settings import/export.
 - `states`: loading, empty, unavailable and filename-search states keep the existing Files behavior.

@@ -101,6 +101,14 @@ describe("useResizableColumn storage", () => {
 describe("useResizableColumn keyboard", () => {
   it("steps 16px per arrow key and persists each change", () => {
     const { result, unmount } = renderHook(() => useResizableColumn(200, 100, 480, STORAGE_KEY));
+    expect(result.current.handleProps).toMatchObject({
+      role: "separator",
+      "aria-orientation": "vertical",
+      "aria-label": "Resize terminal list",
+      tabIndex: 0,
+      "aria-valuemin": 100,
+      "aria-valuemax": 480,
+    });
 
     expect(pressKey(result, "ArrowRight")).toHaveBeenCalledOnce();
     expect(result.current.width).toBe(216);
@@ -174,18 +182,6 @@ describe("useResizableColumn dynamic max", () => {
   it("gives the minimum precedence when max is below min", () => {
     const { result } = renderHook(() => useResizableColumn(200, 150, 120));
     expect(result.current.width).toBe(150);
-  });
-
-  it("exposes separator semantics with the default label", () => {
-    const { result } = renderHook(() => useResizableColumn(200, 100, 480));
-    expect(result.current.handleProps).toMatchObject({
-      role: "separator",
-      "aria-orientation": "vertical",
-      "aria-label": "Resize terminal list",
-      tabIndex: 0,
-      "aria-valuemin": 100,
-      "aria-valuemax": 480,
-    });
   });
 });
 
