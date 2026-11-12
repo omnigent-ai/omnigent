@@ -21,7 +21,7 @@ from omnigent.inner.codex_worker import prepare_codex_worker
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.goose_executor import GooseExecutor
 from omnigent.inner.kimi_executor import KimiExecutor
-from omnigent.inner.pi_executor import _try_sandbox_pi
+from omnigent.inner.pi_executor import PiExecutor, _try_sandbox_pi
 from omnigent.inner.qwen_executor import QwenExecutor
 
 _HARNESSES = ["acp", "claude-sdk", "codex", "goose", "kimi", "pi", "qwen"]
@@ -455,3 +455,52 @@ def test_installed_codex_native_commands_remain_inside_outer_sandbox(
                 assert not output.exists()
             finally:
                 terminate_process(process)
+
+
+def test_pi_version_probe_runs_inside_requested_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, active_sandbox_type: str
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    executable = tmp_path / "install" / "bin" / "pi"
+    executable.parent.mkdir(parents=True)
+    secret = tmp_path / "private.txt"
+    secret.write_text("private canary")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("FAKE_HOST_SECRET", "private value")
+    script = f"""
+import os, pathlib, sys
+assert sys.argv[1:] == ['--version']
+assert pathlib.Path.cwd() == pathlib.Path({str(workspace.resolve())!r})
+assert 'FAKE_HOST_SECRET' not in os.environ
+try:
+    pathlib.Path({str(secret)!r}).read_text()
+except OSError:
+    pass
+else:
+    raise AssertionError('version probe read outside its sandbox')
+print('0.80.4')
+"""
+    executable.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(script)} "$@"\n'
+    )
+    executable.chmod(0o755)
+    executor = PiExecutor(
+        pi_path=str(executable),
+        cwd=str(workspace),
+        os_env=OSEnvSpec(
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(
+                type=active_sandbox_type,
+                read_paths=[str(workspace)],
+                write_paths=[],
+                allow_network=False,
+            ),
+        ),
+    )
+    try:
+        assert executor._pi_version == (0, 80, 4)
+    finally:
+        Path(executor._pi_launch_path).unlink(missing_ok=True)

@@ -6288,6 +6288,11 @@ def create_runner_app(
                         "detail": SESSION_AGENT_MISSING_MESSAGE,
                     },
                 )
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": {"code": "invalid_input", "message": str(exc)}},
+                )
             except (httpx.HTTPError, RuntimeError) as exc:
                 return JSONResponse(
                     status_code=503,

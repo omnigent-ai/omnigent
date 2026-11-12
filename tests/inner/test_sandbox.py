@@ -716,14 +716,16 @@ def test_run_launcher_rejects_noop_spawn_wrap(
     assert not scratch.exists()
 
 
-@pytest.mark.parametrize("feature", ["fork", "start_in_scratch", "git_ssh"])
+@pytest.mark.parametrize("feature", ["type", "fork", "start_in_scratch", "git_ssh"])
 def test_harness_policy_validation_rejects_unsupported_features(feature: str) -> None:
     from omnigent.inner.datamodel import GitSshBinding, OSEnvSandboxSpec, OSEnvSpec
     from omnigent.inner.sandbox import validate_harness_sandbox
 
     policy = OSEnvSandboxSpec(type="linux_bwrap")
     spec = OSEnvSpec(sandbox=policy)
-    if feature == "git_ssh":
+    if feature == "type":
+        spec.type = "container"
+    elif feature == "git_ssh":
         policy.git_ssh = [
             GitSshBinding(
                 host="git.example.test",

@@ -1514,51 +1514,70 @@ def test_spec_resolve_error_detail_names_structured_cause(
 
 
 @pytest.mark.asyncio
-async def test_runner_post_returns_503_when_spec_resolver_fails(
+@pytest.mark.parametrize("policy_rejection", [False, True])
+async def test_runner_post_releases_turn_when_spec_resolution_fails(
     caplog: pytest.LogCaptureFixture,
     pinned_runner_log: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    policy_rejection: bool,
 ) -> None:
-    """Spec resolver failures are surfaced as structured 503 errors.
+    """Resolver outages and policy rejection must release the turn before retry."""
 
-    :param caplog: Pytest log capture, used to confirm the raw cause is
-        logged server-side (the other half of the log-and-genericize
-        contract).
-    :param pinned_runner_log: The log path the detail must name.
-    :returns: None.
-    """
+    from unittest.mock import AsyncMock
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     async def _failing_spec_resolver(
         agent_id: str, session_id: str | None = None
     ) -> AgentSpec | None:
-        """
-        Raise the resolver failure under test.
-
-        :param agent_id: Agent id requested by the runner.
-        :returns: Never returns.
-        :raises RuntimeError: Always.
-        """
+        """Return an unsupported policy or raise a resolver outage."""
+        if policy_rejection:
+            return AgentSpec(
+                spec_version=1,
+                name="restricted-agent",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity"}),
+                os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+            )
         raise RuntimeError(f"spec resolver unavailable for {agent_id}")
 
+    manager = _FakeProcessManager()
+    get_client = AsyncMock(side_effect=AssertionError("must not launch a harness"))
+    monkeypatch.setattr(manager, "get_client", get_client)
     app = create_runner_app(
-        process_manager=cast(HarnessProcessManager, _FakeProcessManager()),
+        process_manager=cast(HarnessProcessManager, manager),
         spec_resolver=_failing_spec_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
     async with _runner_test_client(app) as http:
         with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
-            response = await http.post(
-                "/v1/sessions/conv_spec_resolver_failed/events?stream=true",
-                json={
-                    "type": "message",
-                    "role": "user",
-                    "agent_id": "ag_missing",
-                    "model": "x",
-                    "content": [],
-                },
-            )
+            for _ in range(2):
+                response = await http.post(
+                    "/v1/sessions/conv_spec_resolver_failed/events?stream=true",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "ag_missing",
+                        "model": "x",
+                        "content": [],
+                    },
+                )
+                assert response.status_code == (400 if policy_rejection else 503)
+                assert "conv_spec_resolver_failed" not in app.state.active_turns
+                assert not app.state.session_message_buffers.get("conv_spec_resolver_failed")
+                statuses = await _drain_published_statuses(
+                    app.state.session_event_queues,
+                    "conv_spec_resolver_failed",
+                    until="failed",
+                    timeout=2.0,
+                )
+                assert statuses == ["running", "failed"]
 
-    assert response.status_code == 503
+    get_client.assert_not_called()
     body = response.json()
+    if policy_rejection:
+        assert body["error"]["code"] == "invalid_input"
+        assert "Antigravity cannot enforce" in body["error"]["message"]
+        return
     # The structured error slug is preserved for the caller; the detail names
     # the runner log holding the cause. The raw resolver exception text must
     # not leak into the HTTP body (it is logged on the runner instead).
