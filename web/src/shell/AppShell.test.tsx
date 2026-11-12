@@ -8,6 +8,7 @@ vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas board</div> }));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type { TerminalInfo } from "@/lib/terminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
@@ -32,6 +33,7 @@ import { setEmbedRoot } from "@/lib/host";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { RoutingProvider, reactRouterRouting, type RoutingApi } from "@/lib/routing";
 import { FileViewerContext, useFileViewer } from "./FileViewerContext";
+import { ShellCommandContext, ShellCommandDraftContext } from "./ShellCommandContext";
 import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -6285,6 +6287,100 @@ describe("AppShell design-mode submission", () => {
       undefined,
     );
   });
+});
+
+describe("shell command drafts", () => {
+  const command = "printf 'hello\\n'\npwd";
+
+  function CommandProbe() {
+    const action = useContext(ShellCommandContext);
+    const drafts = useContext(ShellCommandDraftContext);
+    return (
+      <>
+        {action && (
+          <button
+            type="button"
+            disabled={action.disabled}
+            onClick={() => action.open(command, "bash")}
+          >
+            Open command
+          </button>
+        )}
+        <output data-testid="command-drafts">{JSON.stringify(drafts?.drafts)}</output>
+      </>
+    );
+  }
+
+  it.each([
+    { mobile: false, permission: 4, terminal: "bash" },
+    { mobile: true, permission: 4, terminal: "bash" },
+    { mobile: false, permission: 2, terminal: "bash" },
+    { mobile: false, permission: 4, terminal: "shell" },
+  ])(
+    "opens fresh shells for owners (mobile=$mobile, permission=$permission, terminal=$terminal)",
+    async ({ mobile, permission, terminal }) => {
+      const matchMedia = window.matchMedia;
+      const viewport = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+        ...matchMedia(query),
+        matches: query === "(min-width: 768px)" ? !mobile : matchMedia(query).matches,
+      }));
+      onTestFinished(() => viewport.mockRestore());
+      const terminals: TerminalInfo[] = [];
+      const createShell = vi.fn(async () => {
+        const session = `u-${terminals.length}`;
+        const info = {
+          id: `terminal_${terminal}_${session}`,
+          name: terminal,
+          session,
+          running: true,
+        };
+        terminals.push(info);
+        useTerminalsMock.mockReturnValue({
+          terminals: [...terminals],
+          isLoading: false,
+          error: null,
+        });
+        return info;
+      });
+      vi.mocked(useCreateTerminal).mockReturnValue({
+        mutateAsync: createShell,
+        isPending: false,
+      } as unknown as ReturnType<typeof useCreateTerminal>);
+      useTerminalsMock.mockReturnValue({ terminals, isLoading: false, error: null });
+      useSessionAgentMock.mockReturnValue({
+        data: { id: "agent", name: "test", terminals: [terminal] },
+      } as ReturnType<typeof useSessionAgent>);
+      mockConversations([{ id: "conv_command", permission_level: permission }]);
+      render(sessionShellTree(new QueryClient(), "/c/conv_command", <CommandProbe />));
+      const button = screen.queryByRole("button", { name: "Open command" });
+      if (permission < 4) {
+        expect(button).toBeNull();
+        expect(createShell).not.toHaveBeenCalled();
+        return;
+      }
+      fireEvent.click(button!);
+      await waitFor(() =>
+        expect(screen.getByTestId("command-drafts")).toHaveTextContent(`terminal_${terminal}_u-0`),
+      );
+      expect(createShell).toHaveBeenCalledWith(terminal);
+      expect(JSON.parse(screen.getByTestId("command-drafts").textContent!)).toEqual({
+        [`conv_command:terminal_${terminal}_u-0`]: command,
+      });
+      if (mobile)
+        expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open");
+      else
+        await waitFor(() =>
+          expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent(
+            `terminal_${terminal}_u-0`,
+          ),
+        );
+      fireEvent.click(button!);
+      await waitFor(() =>
+        expect(screen.getByTestId("command-drafts")).toHaveTextContent(`terminal_${terminal}_u-1`),
+      );
+      expect(createShell).toHaveBeenCalledTimes(2);
+    },
+  );
 });
 
 describe("new-session browser shortcut", () => {

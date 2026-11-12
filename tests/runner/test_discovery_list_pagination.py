@@ -461,6 +461,7 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
     ]
     received_afters: list[str | None] = []
     received_visibilities: list[str | None] = []
+    received_limits: list[str | None] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/sessions/conv_caller/child_sessions":
@@ -470,12 +471,21 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
         if request.url.path == "/v1/sessions":
             received_afters.append(request.url.params.get("after"))
             received_visibilities.append(request.url.params.get("visibility"))
+            received_limits.append(request.url.params.get("limit"))
             return _server_page(request, rows)
         raise AssertionError(f"unexpected path {request.url.path}")
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://server"
     ) as client:
+        default = json.loads(
+            await execute_tool(
+                tool_name="sys_session_list",
+                arguments="{}",
+                server_client=client,
+                conversation_id="conv_caller",
+            )
+        )
         first = json.loads(
             await execute_tool(
                 tool_name="sys_session_list",
@@ -493,11 +503,19 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
             )
         )
 
+    # Without a limit, a large catalog returns the newest 50 and a cursor.
+    assert [row["session_id"] for row in default["sessions"]] == [
+        f"conv_{index:04d}" for index in range(50)
+    ]
+    assert default["page"]["limit"] == 50
+    assert default["page"]["has_more"] == {"sessions": True}
+    assert "next_cursor" in default["page"]
     assert first["sessions"][0]["session_id"] == "conv_0000"
     assert second["sessions"][0]["session_id"] == "conv_0100"
-    assert received_afters == [None, "conv_0099"]
+    assert received_afters == [None, None, "conv_0099"]
+    assert received_limits == ["50", "100", "100"]
     # Own sessions only by default, like the UI sidebar.
-    assert received_visibilities == ["mine", "mine"]
+    assert received_visibilities == ["mine", "mine", "mine"]
 
 
 _VIEWER = "alice@example.com"
@@ -642,7 +660,7 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
     # Everything not owned is shared, including the ownerless session.
     assert [(row["session_id"], row["owner"]) for row in shared["sessions"]] == [
         (row["id"], row["owner"]) for row in rows if row["owner"] != _VIEWER
-    ]
+    ][: tool_dispatch._SESSION_LIST_DEFAULT_LIMIT]
     assert shared["sessions"][0]["session_id"] == "conv_orphan"
     listing = "mine" if scoped_archives else "all"
     shared_listing = "shared" if scoped_archives else "all"
@@ -827,9 +845,9 @@ async def test_sys_session_list_checks_runner_status_only_for_returned_rows() ->
     """
     Runner status is resolved for the rows the tool returns, with bounded concurrency.
 
-    The default call fetches 1,000 sessions (each on its own runner) and the
-    output budget keeps 100. Resolving before paging used to fire 1,000
-    concurrent status calls, which bursts the caller's per-user rate limit.
+    The server holds 1,000 sessions, each on its own runner, and the default
+    call returns 50. Resolving before paging used to fire one status call per
+    fetched row, which bursts the caller's per-user rate limit.
     """
     rows = [
         {
@@ -879,7 +897,7 @@ async def test_sys_session_list_checks_runner_status_only_for_returned_rows() ->
     result = json.loads(raw)
     returned_runners = [row["runner_id"] for row in result["sessions"]]
     assert result["page"]["has_more"] == {"sessions": True}
-    assert len(returned_runners) == 100
+    assert len(returned_runners) == tool_dispatch._SESSION_LIST_DEFAULT_LIMIT
     assert sorted(status_calls) == sorted(returned_runners)
     assert max_in_flight <= tool_dispatch._RUNNER_STATUS_CONCURRENCY
     assert all(row["runner_online"] is True for row in result["sessions"])

@@ -1144,12 +1144,13 @@ def _skip_httpx_cli_import() -> None:
 def _main_evaluate_policy(argv: list[str]) -> int:
     """
     Evaluate a Claude Code ``PreToolUse`` / ``PostToolUse`` /
-    ``UserPromptSubmit`` hook against Omnigent policies.
+    ``PostToolUseFailure`` / ``UserPromptSubmit`` hook against Omnigent
+    policies.
 
     Reads the hook JSON payload from stdin, converts it into the
     proto-compatible ``EvaluationRequest`` schema (``PHASE_TOOL_CALL``
-    for PreToolUse, ``PHASE_TOOL_RESULT`` for PostToolUse,
-    ``PHASE_REQUEST`` for UserPromptSubmit), POSTs to
+    for PreToolUse, ``PHASE_TOOL_RESULT`` for PostToolUse and
+    PostToolUseFailure, ``PHASE_REQUEST`` for UserPromptSubmit), POSTs to
     ``/v1/sessions/{id}/policies/evaluate``, and converts the
     ``EvaluationResponse`` back into Claude Code's hook output format.
 
@@ -1168,9 +1169,9 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     drops the prompt before the model sees it; ASK is resolved
     server-side; ALLOW proceeds with no output.
 
-    For ``PostToolUse``, policy denials are surfaced as
-    ``additionalContext`` (Claude sees the warning but the tool result
-    is already committed — PostToolUse hooks are observational).
+    For ``PostToolUse`` and ``PostToolUseFailure``, policy denials are
+    surfaced as ``additionalContext`` (Claude sees the warning but the
+    tool result is already committed — these hooks are observational).
 
     Failure handling is phase-aware (mirroring the runner-side default
     from PR #163). Once the session is known to be governed (an active
@@ -1180,7 +1181,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     a ``PreToolUse`` (``PHASE_TOOL_CALL``) call fails CLOSED with a
     ``deny`` (this hook is the sole enforcement point for native tools, so
     a transient outage must not silently let a gated call through), while
-    ``UserPromptSubmit`` and ``PostToolUse`` fail OPEN. Pre-evaluation
+    ``UserPromptSubmit`` blocks and the tool-result hooks fail OPEN. Pre-evaluation
     conditions that mean the session simply is not governed — no active
     session, no ``ap_server_url``, an unparseable hook payload, or an
     ``mcp__omnigent__*`` tool already gated on the relay path — still

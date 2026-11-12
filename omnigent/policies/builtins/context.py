@@ -319,6 +319,9 @@ _ERROR_PREFIXES: tuple[str, ...] = (
 
 _ERROR_JSON_RE = re.compile(r'^\s*\{[^}]*"error"\s*:', re.DOTALL)
 
+# Claude Code's rendering of a non-zero shell exit: "Exit code 1\n<stderr>".
+_EXIT_CODE_RE = re.compile(r"exit code [1-9]")
+
 
 def _looks_like_error(result: str) -> bool:
     """Heuristically detect whether a tool result is an error.
@@ -338,6 +341,8 @@ def _looks_like_error(result: str) -> bool:
         return False
     lower = result[:500].lower().lstrip()
     if any(lower.startswith(p) for p in _ERROR_PREFIXES):
+        return True
+    if _EXIT_CODE_RE.match(lower):
         return True
     if _ERROR_JSON_RE.match(result[:500]):
         return True
@@ -368,7 +373,10 @@ def detect_thrashing(
     intervenes or the agent recovers naturally (successful results
     push old errors out of the window).
 
-    Error detection is heuristic — see :func:`_looks_like_error`.
+    A result whose ``data["is_error"]`` is ``True`` counts as an error:
+    the harness reported the failure itself. Any other result falls back
+    to the text heuristic in :func:`_looks_like_error`, because many
+    producers only have the output text.
 
     :param consecutive_threshold: Number of consecutive errors before
         the policy fires.  ``0`` disables the consecutive check.
@@ -408,7 +416,11 @@ def detect_thrashing(
         if not isinstance(result_str, str):
             result_str = str(result_str)
 
-        is_error = 1 if _looks_like_error(result_str) else 0
+        # A reported failure always counts, and everything else still goes
+        # through the heuristic, so the flag can only add errors the text
+        # check misses, never hide one it catches.
+        reported_failure = data.get("is_error") is True
+        is_error = 1 if reported_failure or _looks_like_error(result_str) else 0
 
         state = event.get("session_state") or {}
         raw_history = state.get(_THRASHING_HISTORY_KEY)
@@ -533,8 +545,9 @@ POLICY_REGISTRY: list[dict[str, object]] = [
             "Detects when an agent is failing repeatedly by tracking tool-result "
             "outcomes in a rolling window. Fires when consecutive errors exceed a "
             "threshold or when the error rate within the window is too high. "
-            "Error detection is heuristic (common error prefixes and JSON error "
-            "payloads). No server LLM required."
+            "A failure the harness reports counts as an error. Otherwise "
+            "detection is heuristic (common error prefixes, a non-zero exit "
+            "code, and JSON error payloads). No server LLM required."
         ),
         "params_schema": {
             "type": "object",

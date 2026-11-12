@@ -185,7 +185,8 @@ def _in_sandbox() -> bool:
 def _gh(
     argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
 ) -> tuple[int | None, str, str]:
-    # ``timeout`` raises the per-call limit for a slow call, such as a video upload.
+    # ``timeout`` replaces the per-call limit: higher for a slow call such as a video
+    # upload, lower for a best-effort one.
     timeout = timeout or _gh_timeout_seconds()
     if (deadline := _gh_deadline.get()) is not None:
         timeout = min(timeout, deadline - time.monotonic())
@@ -1628,13 +1629,80 @@ def _pr_commits(root: str, reference: PullRequestRef, *, head_sha: str) -> dict[
         pr = _check_pr_revision(root, reference, head_sha=head_sha)
         commits = _pr_commit_entries(root, reference)
         _check_pr_revision(root, reference, head_sha=head_sha)
-    shown = commits[:_MAX_PR_COMMITS]
+        shown = commits[:_MAX_PR_COMMITS]
+        heads = _other_pr_heads(root, reference, pr, [commit["sha"] for commit in shown])
+    for commit in shown:
+        if commit["sha"] in heads:
+            commit["head_of"] = heads[commit["sha"]]
     total = pr.get("commits")
     return {
         "object": "list",
         "data": shown,
         "has_more": isinstance(total, int) and total > len(shown),
     }
+
+
+# How many of the author's recently updated PRs one lookup reads for stack parents.
+_AUTHOR_PR_LOOKUPS = 100
+# The lookup only adds hints, so a slow search must not cost the commit list its deadline.
+_AUTHOR_PR_LOOKUP_SECONDS = 4.0
+_AUTHOR_PRS_QUERY = """query($search: String!, $first: Int!) {
+  search(query: $search, type: ISSUE, first: $first) {
+    nodes { ... on PullRequest { number url state headRefOid } }
+  }
+}"""
+
+
+def _other_pr_heads(
+    root: str, reference: PullRequestRef, pr: dict[str, Any], shas: list[str]
+) -> dict[str, list[dict[str, Any]]]:
+    """Map each commit that is the head of another PR by the same author, best effort.
+
+    Marks a stacked PR's parents in its commit list with one search over the author's
+    recently updated PRs in the repository; a per-commit lookup is too slow on large
+    repositories. Any failure leaves the commits unmarked.
+    """
+    user = pr.get("user") if isinstance(pr.get("user"), dict) else {}
+    author = user.get("login")
+    if not isinstance(author, str) or not author or not shas:
+        return {}
+    search = f"repo:{reference.repository} is:pr author:{author} sort:updated-desc"
+    try:
+        rc, out, _ = _gh(
+            [
+                "api",
+                *_host_args(root, reference),
+                "graphql",
+                "-f",
+                f"query={_AUTHOR_PRS_QUERY}",
+                "-f",
+                f"search={search}",
+                "-F",
+                f"first={_AUTHOR_PR_LOOKUPS}",
+            ],
+            cwd=root,
+            token=_pr_token(root, reference),
+            timeout=_AUTHOR_PR_LOOKUP_SECONDS,
+        )
+    except ValueError:
+        return {}
+    if rc != 0:
+        return {}
+    try:
+        nodes = json.loads(out)["data"]["search"]["nodes"]
+    except (ValueError, KeyError, TypeError):
+        return {}
+    wanted = set(shas)
+    heads: dict[str, list[dict[str, Any]]] = {}
+    for node in nodes if isinstance(nodes, list) else []:
+        if not isinstance(node, dict) or node.get("number") == reference.number:
+            continue
+        sha = node.get("headRefOid")
+        if isinstance(sha, str) and sha in wanted:
+            heads.setdefault(sha, []).append(
+                {"number": node.get("number"), "url": node.get("url"), "state": node.get("state")}
+            )
+    return heads
 
 
 def _pr_commit_patch(root: str, reference: PullRequestRef, *, commit_sha: str) -> dict[str, Any]:
@@ -1660,6 +1728,41 @@ def _pr_commit_patch(root: str, reference: PullRequestRef, *, commit_sha: str) -
         )
     if rc != 0:
         raise ValueError("GitHub could not load the commit's diff. Refresh or open it on GitHub.")
+    return {"object": PR_DIFF_OBJECT, "patch": out}
+
+
+_COMPARE_FAILED = "GitHub could not load the changes since that commit. Refresh to retry."
+
+
+def _pr_compare(
+    root: str, reference: PullRequestRef, *, head_sha: str, from_sha: str
+) -> dict[str, Any]:
+    """Return the PR's changes after ``from_sha``, up to its head.
+
+    ``from_sha`` must be one of the PR's own commits, so only the PR's history is
+    served, and the head is checked before and after the reads so the patch describes
+    the revision the panel shows.
+    """
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        host = _host_args(root, reference)
+        token = _pr_token(root, reference)
+        _check_pr_revision(root, reference, head_sha=head_sha)
+        if from_sha not in {entry["sha"] for entry in _pr_commit_entries(root, reference)}:
+            raise ValueError("That commit is not part of the selected pull request.")
+        rc, out, _ = _gh(
+            [
+                "api",
+                *host,
+                "-H",
+                "Accept: application/vnd.github.diff",
+                f"repos/{reference.repository}/compare/{from_sha}...{head_sha}",
+            ],
+            cwd=root,
+            token=token,
+        )
+        if rc != 0:
+            raise ValueError(_COMPARE_FAILED)
+        _check_pr_revision(root, reference, head_sha=head_sha)
     return {"object": PR_DIFF_OBJECT, "patch": out}
 
 
@@ -1921,7 +2024,13 @@ def _merge_error(stderr: str, *, action: str) -> str:
             "The pull request's branch changed since the panel loaded. "
             "Review the new commits, then merge again."
         )
-    if re.search(r"\(HTTP 40[13]\)|Resource not accessible|must have (?:write|push)", stderr):
+    # An Enterprise Managed User can read public repositories outside its
+    # enterprise but not write to them; GitHub says so in a GraphQL error, not a 403.
+    if re.search(
+        r"\(HTTP 40[13]\)|Resource not accessible|must have (?:write|push)"
+        r"|As an Enterprise Managed User",
+        stderr,
+    ):
         return f"The GitHub account on the host cannot {action}."
     detail = next((line.strip() for line in stderr.splitlines() if line.strip()), "")
     # gh prefixes GraphQL errors and its failure marks; neither helps the reader.
@@ -1931,27 +2040,59 @@ def _merge_error(stderr: str, *, action: str) -> str:
     return f"GitHub could not {action}: {detail}"
 
 
-def _run_pr_merge(
-    root: str, reference: PullRequestRef, flags: list[str], *, action: str, timed_out: str
-) -> None:
-    """Run ``gh pr merge <flags>`` on the PR as its selected account.
+def _active_login(root: str, host: str) -> str | None:
+    """``gh``'s active account on ``host``, or ``None`` when there is none."""
+    _, accounts = _list_accounts(root)
+    return next(
+        (a.get("login") for a in accounts if a.get("host") == host and a.get("active")), None
+    )
 
-    Every ``gh`` call shares :data:`_PR_EDIT_REQUEST_SECONDS`. Without a saved
-    account, ``gh``'s active account runs it; a saved one without a token refuses.
+
+def _run_pr_merge(
+    root: str,
+    reference: PullRequestRef,
+    flags: list[str],
+    *,
+    action: str,
+    timed_out: str,
+    account: str | None = None,
+) -> None:
+    """Run ``gh pr merge <flags>`` on the PR as ``account`` or its selected account.
+
+    Every ``gh`` call shares :data:`_PR_EDIT_REQUEST_SECONDS`. ``account`` binds
+    this call alone; it is never read back from the saved preference, which a
+    concurrent request can change. Without either, ``gh``'s active account runs
+    it; a named account without a token refuses. A sandbox keeps its single
+    broker identity, so it refuses any other ``account``.
 
     :param action: What the command does, for error messages.
     :param timed_out: Message when the deadline leaves the outcome unknown.
+    :param account: The account the user confirmed for this command.
     :raises ValueError: With a user-facing message when GitHub refuses.
     """
     with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
         _host_args(root, reference)
-        token = _pr_token(root, reference)
+        sandbox_login: str | None = None
+        if account is None:
+            token = _pr_token(root, reference)
+            login = (
+                None
+                if _in_sandbox()
+                else _config.github_account_preference(_repo_argument(reference))
+            )
+        elif _in_sandbox():
+            token, login = None, None
+            sandbox_login = _active_login(root, reference.host)
+        else:
+            token, login = _gh_auth_token(root, account, reference.host), account
         # Without the selected account's token gh would run as another account.
         if _gh_timed_out.get():
             raise ValueError(timed_out)
-        login = (
-            None if _in_sandbox() else _config.github_account_preference(_repo_argument(reference))
-        )
+        if account is not None and _in_sandbox() and sandbox_login != account:
+            raise ValueError(
+                "This sandbox can only use its own GitHub account"
+                + (f", {sandbox_login}." if sandbox_login else ".")
+            )
         if login and token is None:
             raise ValueError(
                 f"The selected GitHub account {login} isn't signed in on the host. "
@@ -1969,13 +2110,19 @@ def _run_pr_merge(
 
 
 def _merge_pr(
-    root: str, reference: PullRequestRef, *, merge_method: str, expected_head: str
+    root: str,
+    reference: PullRequestRef,
+    *,
+    merge_method: str,
+    expected_head: str,
+    account: str | None = None,
 ) -> dict[str, Any]:
     """Merge the PR with ``gh pr merge``, only while its head is ``expected_head``.
 
     ``--match-head-commit`` makes GitHub refuse the merge when the branch moved
     since the panel showed it.
 
+    :param account: Run as this account instead of the PR's saved one.
     :raises ValueError: With a user-facing message when GitHub refuses the merge.
     """
     _run_pr_merge(
@@ -1984,6 +2131,7 @@ def _merge_pr(
         [f"--{merge_method}", "--match-head-commit", expected_head],
         action="merge this pull request",
         timed_out=_MERGE_TIMED_OUT,
+        account=account,
     )
     return {"object": PR_MERGE_OBJECT, "pr_url": reference.url}
 
