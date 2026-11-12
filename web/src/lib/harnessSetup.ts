@@ -60,11 +60,11 @@ export interface HarnessReadinessExplanation {
   description: string;
 }
 
-export type HarnessCredentialKind = "isaac" | "personal";
+export type HarnessCredentialKind = "gateway" | "personal";
 
 export const HARNESS_CREDENTIAL_COPY: Record<HarnessCredentialKind, HarnessReadinessExplanation> = {
-  isaac: {
-    label: "Isaac",
+  gateway: {
+    label: "Unity Gateway",
     description: "Databricks-managed credential via the Unity Gateway",
   },
   personal: {

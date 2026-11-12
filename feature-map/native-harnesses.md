@@ -83,7 +83,7 @@ implements them separately, so a fix for one harness does not reach the others.
   metadata and these routes are available only while harness repair is enabled
   and the connected host advertises support; older hosts receive no probe, and
   older servers or flag-off servers never cause a new host to spawn one.
-- `isaac-credential-detection`: harness setup offers Isaac when host-side
+- `gateway-credential-detection`: harness setup offers Unity Gateway when host-side
   Databricks detection finds a matching credential, and fails open for older
   hosts or servers that cannot report detection results.
 - `picker-entry-visibility`: the user hides individual harnesses and agents from

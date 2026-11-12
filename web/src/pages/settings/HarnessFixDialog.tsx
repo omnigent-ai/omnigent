@@ -72,7 +72,7 @@ type Phase =
   | "choose"
   | "confirm"
   | "progress"
-  | "isaac"
+  | "gateway"
   | "personal"
   | "device-error"
   | "credentials"
@@ -82,7 +82,7 @@ type Phase =
 
 // Phases that each work on the harness's credentials; moving between them on
 // Check again would discard the sign-in the user is in the middle of.
-const AUTH_PHASES: ReadonlySet<Phase> = new Set(["choose", "personal", "isaac", "credentials"]);
+const AUTH_PHASES: ReadonlySet<Phase> = new Set(["choose", "personal", "gateway", "credentials"]);
 
 // A sign-in on a host without a usable tmux succeeds but leaves tmux as the
 // blocker, so it continues to the tmux step instead of announcing "ready".
@@ -122,7 +122,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
     if (accountKey === "claude") return configuredCommand ?? "claude auth login --claudeai";
     return configuredCommand ?? null;
   }, [accountKey, canonicalHarness, setupSteps]);
-  const isaacSupported =
+  const gatewaySupported =
     credentialFamily !== null &&
     (host.harness_accounts_supported !== true ||
       detectedCredentials.isError ||
@@ -130,7 +130,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   const credentialDecisionPending = credentialFamily !== null && detectedCredentials.isPending;
   const personalSupported =
     loginCommand !== null && (accountKey === "codex" || accountKey === "claude");
-  const hasCredentialCards = isaacSupported || personalSupported;
+  const hasCredentialCards = gatewaySupported || personalSupported;
   const canUseCredentialForm = harnessAuthableOnHost(info, harness, host);
   const credentialChoicePhase: Phase =
     credentialDecisionPending || hasCredentialCards
@@ -370,13 +370,13 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
       return;
     }
     credentialDefaultSettled.current = true;
-    setChoice(isaacSupported ? "isaac" : "personal");
+    setChoice(gatewaySupported ? "gateway" : "personal");
     if (!hasCredentialCards) setPhase(canUseCredentialForm ? "credentials" : "setup");
   }, [
     canUseCredentialForm,
     credentialDecisionPending,
     hasCredentialCards,
-    isaacSupported,
+    gatewaySupported,
     open,
     phase,
   ]);
@@ -441,7 +441,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
         const credentialKind: HarnessCredentialKind | undefined = result.gateway_inference?.[
           harness
         ]
-          ? "isaac"
+          ? "gateway"
           : phase === "personal"
             ? "personal"
             : undefined;
@@ -636,7 +636,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               onChoice={setChoice}
               hostName={hostName}
               harnessLabel={harnessLabel}
-              isaacSupported={isaacSupported}
+              gatewaySupported={gatewaySupported}
               personalSupported={personalSupported}
               canUseCredentialForm={mode !== "install" && canUseCredentialForm}
               onUseCredentialForm={() => setPhase("credentials")}
@@ -660,8 +660,8 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               hostName={hostName}
               stillNotReady={stillNotReady}
             />
-          ) : phase === "isaac" ? (
-            <IsaacCommand
+          ) : phase === "gateway" ? (
+            <GatewayCommand
               harnessLabel={harnessLabel}
               hostName={hostName}
               stillNotReady={stillNotReady}
@@ -760,7 +760,10 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               </Button>
               <Button onClick={() => void startDeviceLogin()}>Try again</Button>
             </>
-          ) : phase === "personal" || phase === "isaac" || phase === "setup" || phase === "tmux" ? (
+          ) : phase === "personal" ||
+            phase === "gateway" ||
+            phase === "setup" ||
+            phase === "tmux" ? (
             <>
               <Button variant="outline" onClick={() => setOpen(false)}>
                 Close
@@ -957,7 +960,7 @@ function ChooseCredential({
   onChoice,
   hostName,
   harnessLabel,
-  isaacSupported,
+  gatewaySupported,
   personalSupported,
   canUseCredentialForm,
   onUseCredentialForm,
@@ -966,7 +969,7 @@ function ChooseCredential({
   onChoice: (choice: HarnessCredentialKind) => void;
   hostName: string;
   harnessLabel: string;
-  isaacSupported: boolean;
+  gatewaySupported: boolean;
   personalSupported: boolean;
   canUseCredentialForm: boolean;
   onUseCredentialForm: () => void;
@@ -977,12 +980,12 @@ function ChooseCredential({
         Choose the credential {harnessLabel} will use to authenticate on {hostName}.
       </DialogDescription>
       <div role="radiogroup" aria-label="Credential" className="flex flex-col gap-2">
-        {isaacSupported && (
+        {gatewaySupported && (
           <CredentialCard
-            selected={choice === "isaac"}
-            title={HARNESS_CREDENTIAL_COPY.isaac.label}
-            description={HARNESS_CREDENTIAL_COPY.isaac.description}
-            onClick={() => onChoice("isaac")}
+            selected={choice === "gateway"}
+            title={HARNESS_CREDENTIAL_COPY.gateway.label}
+            description={HARNESS_CREDENTIAL_COPY.gateway.description}
+            onClick={() => onChoice("gateway")}
           />
         )}
         {personalSupported && (
@@ -1123,7 +1126,7 @@ function PersonalCommand({
   );
 }
 
-function IsaacCommand({
+function GatewayCommand({
   harnessLabel,
   hostName,
   stillNotReady,
@@ -1308,7 +1311,7 @@ function dialogTitle(
     return `Sign in to ${harnessLabel} on ${hostName}`;
   }
   if (phase === "personal") return `Sign in to ${harnessLabel} on ${hostName}`;
-  if (phase === "isaac") return `Set up Isaac for ${harnessLabel} on ${hostName}`;
+  if (phase === "gateway") return `Set up Unity Gateway for ${harnessLabel} on ${hostName}`;
   if (phase === "setup") return `Set up ${harnessLabel} on ${hostName}`;
   if (phase === "tmux") return `Set up tmux on ${hostName}`;
   if (phase === "error") {
