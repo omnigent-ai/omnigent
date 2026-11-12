@@ -58,35 +58,6 @@ def _active_policy(workspace: Path) -> SandboxPolicy:
     )
 
 
-def test_active_sandbox_wrap_failure_is_not_downgraded(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    codex = tmp_path / "bin" / "codex"
-    codex.parent.mkdir()
-    codex.touch()
-    codex_home = tmp_path / "codex-home"
-    codex_home.mkdir()
-
-    monkeypatch.setattr(
-        "omnigent.inner.codex_worker.resolve_sandbox",
-        Mock(return_value=_active_policy(tmp_path)),
-    )
-    monkeypatch.setattr(
-        "omnigent.inner.codex_worker.get_backend",
-        Mock(side_effect=OSError("seatbelt unavailable")),
-    )
-
-    with pytest.raises(OSError, match="seatbelt unavailable"):
-        prepare_codex_worker(
-            codex_path=str(codex),
-            cwd=tmp_path,
-            codex_home=codex_home,
-            os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
-            spawn_env_names=["PATH", "CODEX_HOME"],
-        )
-
-
 def test_active_sandbox_preflights_before_creating_launcher(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

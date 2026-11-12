@@ -85,8 +85,15 @@ def _prepared_launch(
             Path(launch_path).unlink(missing_ok=True)
 
 
-@pytest.mark.parametrize("harness", _HARNESSES)
-@pytest.mark.parametrize("fault", ["resolve", "unsupported", "backend", "launcher", "inactive"])
+@pytest.mark.parametrize(
+    ("harness", "fault"),
+    [
+        pytest.param(harness, fault, id=f"{fault}-{harness}")
+        for fault in ("resolve", "unsupported", "backend", "launcher", "inactive")
+        for harness in _HARNESSES
+    ]
+    + [pytest.param("codex", "backend-oserror", id="backend-oserror-codex")],
+)
 def test_requested_sandbox_never_falls_back_to_bare_worker(
     harness: str, fault: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -121,6 +128,8 @@ def test_requested_sandbox_never_falls_back_to_bare_worker(
     backend = Mock(return_value=implementation)
     if fault == "backend":
         backend.side_effect = NotImplementedError("backend unavailable")
+    elif fault == "backend-oserror":
+        backend.side_effect = OSError("backend unavailable")
     if fault == "resolve":
         resolve.side_effect = OSError("sandbox unavailable")
     elif fault == "unsupported":
@@ -141,7 +150,7 @@ def test_requested_sandbox_never_falls_back_to_bare_worker(
             pytest.fail(f"{harness} accepted an unavailable requested sandbox")
     if fault == "launcher":
         launcher.assert_called_once()
-    elif fault == "backend":
+    elif fault in ("backend", "backend-oserror"):
         backend.assert_called_once()
     else:
         launcher.assert_not_called()

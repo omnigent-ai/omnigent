@@ -1622,6 +1622,80 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
 
 
 @pytest.mark.asyncio
+async def test_runner_corrected_policy_retries_after_runtime_reset(
+    started_manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A corrected spec reaches a fresh child after a rejected worker is reset."""
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    monkeypatch.setitem(
+        _HARNESS_MODULES,
+        "claude-sdk",
+        "tests.runtime.harnesses._test_executor_adapter_harness",
+    )
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "sandbox_policy")
+    spec = AgentSpec(
+        spec_version=1,
+        name="policy-retry-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        os_env=OSEnvSpec(fork=True, sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+
+    async def resolve_spec(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    session_id = "conv_policy_retry"
+    app = create_runner_app(
+        process_manager=started_manager,
+        spec_resolver=resolve_spec,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    body = {
+        "type": "message",
+        "role": "user",
+        "agent_id": "ag_policy_retry",
+        "agent_revision": "initial",
+        "model": "x",
+        "content": [],
+    }
+    url = f"/v1/sessions/{session_id}/events?stream=true"
+    async with _runner_test_client(app) as http, asyncio.timeout(30):
+        rejected = await http.post(url, json=body)
+        assert rejected.status_code == 200
+        failed = _parse_sse(rejected.content)
+        assert failed[-1][0] == "response.failed"
+        assert "os_env.fork" in failed[-1][1]["response"]["error"]["message"]
+        assert session_id not in app.state.active_turns
+        client = started_manager.registered_client(session_id)
+        assert client is not None
+        process = started_manager._entries[session_id].process
+
+        spec.os_env = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))
+        body["agent_revision"] = "corrected"
+        retained = await http.post(url, json=body)
+        assert retained.status_code == 200
+        assert _parse_sse(retained.content)[-1][0] == "response.failed"
+        assert started_manager.registered_client(session_id) is client
+        assert session_id not in app.state.active_turns
+
+        reset = await http.post(f"/v1/sessions/{session_id}/reset-state")
+        assert reset.status_code == 200
+        assert started_manager.registered_client(session_id) is None
+        assert process.returncode is not None
+        completed = await http.post(url, json=body)
+        assert completed.status_code == 200
+        events = _parse_sse(completed.content)
+        assert events[-1][0] == "response.completed"
+        assert "policy retry completed" in completed.text
+        assert started_manager.registered_client(session_id) is not client
+        assert session_id not in app.state.active_turns
+        assert not app.state.session_message_buffers.get(session_id)
+
+
+@pytest.mark.asyncio
 async def test_runner_stream_emits_failed_when_tool_spec_resolver_fails() -> None:
     """Streaming spec resolver failures emit ``response.failed`` SSE.
 
