@@ -6,9 +6,10 @@ export function updateOverlayToastOffset(height: number): string {
 
 /** Toaster offsets: top clears the native status bar / Dynamic Island, bottom the update overlay. */
 export function toasterOffsets(updateOverlayHeight: number) {
+  const top = "calc(1rem + var(--omnigent-safe-top))";
   const bottom = updateOverlayToastOffset(updateOverlayHeight);
   return {
-    offset: { top: "calc(24px + var(--omnigent-inset-top))", right: "1rem", bottom },
-    mobileOffset: { top: "calc(16px + var(--omnigent-inset-top))", right: "1rem", bottom },
+    offset: { top, right: "1rem", bottom },
+    mobileOffset: { top, right: "1rem", bottom },
   };
 }

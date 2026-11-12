@@ -145,6 +145,40 @@ describe("resolveServerInfo sandbox_providers", () => {
     });
   });
 
+  it("keeps each provider's automation notice", async () => {
+    const result = await probe({
+      sandbox_provider_automation_notices: { agent_sandbox: "Keep your laptop signed in." },
+    });
+    expect(result.sandbox_provider_automation_notices).toEqual({
+      agent_sandbox: "Keep your laptop signed in.",
+    });
+  });
+
+  it.each([undefined, null, "invalid", ["note"]])(
+    "reads a missing or malformed notice map as no notices (%j)",
+    async (value) => {
+      expect(
+        (await probe({ sandbox_provider_automation_notices: value }))
+          .sandbox_provider_automation_notices,
+      ).toEqual({});
+    },
+  );
+
+  it("drops notices that aren't non-blank text", async () => {
+    const result = await probe({
+      sandbox_provider_automation_notices: {
+        kept: "Keep your laptop signed in.",
+        empty: "",
+        blank: "   ",
+        number: 42,
+        missing: null,
+      },
+    });
+    expect(result.sandbox_provider_automation_notices).toEqual({
+      kept: "Keep your laptop signed in.",
+    });
+  });
+
   it.each([undefined, false, "true", true])(
     "requires an explicit durable-input capability (%s)",
     async (value) => {
@@ -386,6 +420,17 @@ describe("resolveServerInfo session_event_types", () => {
   });
 });
 
+describe("resolveServerInfo move_to_managed_sandbox", () => {
+  it.each([
+    [true, true],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ move_to_managed_sandbox: advertised });
+    expect(parsed.move_to_managed_sandbox).toBe(expected);
+  });
+});
+
 describe("resolveServerInfo smart_routing_sources", () => {
   it("reads an explicit field verbatim", async () => {
     const parsed = await probe({
@@ -483,6 +528,15 @@ describe("custom agents settings capability", () => {
     async (stored) => {
       const parsed = await probe({ session_title_instructions: stored });
       expect(parsed.session_title_instructions).toBe(stored === true);
+    },
+  );
+
+  it.each([undefined, false, "true", true])(
+    "requires explicit support for PR comment anchors: %s",
+    async (supported) => {
+      expect((await probe({ comment_anchor_metadata: supported })).comment_anchor_metadata).toBe(
+        supported === true,
+      );
     },
   );
 

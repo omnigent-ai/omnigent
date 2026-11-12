@@ -19,10 +19,10 @@ describe("updateOverlayToastOffset", () => {
 });
 
 describe("toasterOffsets", () => {
-  it("keeps top toasts below the native status bar inset", () => {
+  it("keeps top toasts below the native status bar safe area", () => {
     const { offset, mobileOffset } = toasterOffsets(180.4);
-    expect(offset.top).toBe("calc(24px + var(--omnigent-inset-top))");
-    expect(mobileOffset.top).toBe("calc(16px + var(--omnigent-inset-top))");
+    expect(offset.top).toBe("calc(1rem + var(--omnigent-safe-top))");
+    expect(mobileOffset.top).toBe("calc(1rem + var(--omnigent-safe-top))");
     expect(offset.bottom).toBe(updateOverlayToastOffset(180.4));
     expect(mobileOffset.bottom).toBe(updateOverlayToastOffset(180.4));
   });
