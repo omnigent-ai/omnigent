@@ -163,7 +163,7 @@ Firing is fire-and-forget: the guard steps run synchronously so a dead fire cost
 
 The transcript hides only the exact tagged unattended-run note appended by the scheduler. The agent still receives it, and stored messages retain it. Modified notes, other text inside the tags, and older untagged messages remain visible and copyable.
 
-## Run history
+## Runs
 
 `GET /v1/scheduled-tasks/{id}/runs` returns history in descending `scheduled_at` order as `{"runs": [...], "next_cursor": ...}`. The `limit` query parameter defaults to 100 and accepts 1–1,000. Pass the returned `next_cursor` as `after` to fetch the next page; a null cursor marks the end. For example, request `/runs?limit=1`, then `/runs?limit=1&after=<next_cursor>`.
 
@@ -178,11 +178,13 @@ Each run carries `status`, `scheduled_at`, `fired_at`, `finished_at`, `conversat
 
 `ScheduledTaskRun` also declares `scheduled` and `starting` statuses. The default scheduler creates runs at dispatch with status `running`. With `automations_v2` enabled, Run now records `scheduled` until a server claims the request. The persistent scheduler then records `starting` while it prepares a run, and `running` once the prompt is sent, or saved with its sandbox's host bound. A continued session's run goes straight to `succeeded` once its prompt is delivered.
 
-Run history shows **Session needs approval · Open to review** when the linked session has a pending permission request or question and its runner is reachable. Stale counts from disconnected runners are hidden using the same liveness rules as the session sidebar. Sessions without a bound runner use their live approval requests rather than a persisted count. Open the run to review it. This is current session state, including when several runs reuse that session; it is not a historical per-run outcome. Permission enforcement and approval timeouts are unchanged.
+The Runs list shows **Session needs approval · Open to review** when the linked session has a pending permission request or question and its runner is reachable. Stale counts from disconnected runners are hidden using the same liveness rules as the session sidebar. Sessions without a bound runner use their live approval requests rather than a persisted count. Open the run to review it. This is current session state, including when several runs reuse that session; it is not a historical per-run outcome. Permission enforcement and approval timeouts are unchanged.
 
 ### What each run did
 
 `status` says whether a run finished, not whether it did what the prompt asked. The agent records that in its session's [journal](session-journal.md): the plan it follows and each step's status. Before each run's prompt is sent, the session is labeled `omnigent.scheduled_task_run` with the run's ID, so every entry the agent writes during the run carries it. If a continued run fails before its prompt goes in, the label goes back to the previous run, which may still be working in the session. Clients can't set the label, and forks drop it.
+
+When the automation runs a saved workflow, each of its runs shows the plan it started with: the Tasks tab's timeline of its tasks, and a button that shows the run on the workflow's graph. `GET /v1/scheduled-tasks/{id}/run-steps` supplies them. It pages like `/runs`, and lists, for each run that wrote a plan, that plan's steps and each step's newest status.
 
 ## Lifecycle
 
@@ -203,6 +205,7 @@ Switching to `execution_target: "managed_sandbox"` clears both stored pins. Omit
 | `DELETE` | `/v1/scheduled-tasks/{id}` | Delete a task. |
 | `POST` | `/v1/scheduled-tasks/{id}/run` | Run now (202). |
 | `GET` | `/v1/scheduled-tasks/{id}/runs` | Run history. |
+| `GET` | `/v1/scheduled-tasks/{id}/run-steps` | The plan each run started with, for its timeline. |
 
 A task response carries `id`, `name`, `prompt`, `rrule`, `owner_user_id`, `agent_id`, `timezone`, `created_at`, `model_override`, `reasoning_effort`, `permission_mode`, `max_cost_usd`, `session_mode`, `session_id`, `source_session_id`, `workspace`, `host_id`, `execution_target`, `project_id`, `state`, `last_run_at`, `last_run_status`, `last_run_conversation_id`, `next_run_at`, and `updated_at`.
 
@@ -221,7 +224,7 @@ The scheduler is the timing engine only, and its behavior is deliberately simple
 
 After upgrading, an existing automation with an unresolved harness or an incompatible
 saved permission override fails before creating a session; older schedulers could
-silently omit the override. Run history identifies the permission failure. Restore
+silently omit the override. The Runs list identifies the permission failure. Restore
 access to the agent if its harness cannot be resolved, or edit the automation to
 clear or correct an incompatible permission setting. Review the resulting permissions
 before running the automation again.
