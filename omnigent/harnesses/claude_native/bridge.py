@@ -3008,16 +3008,31 @@ def build_hook_settings(
     # blocking statusLine path — the forwarder normalizes it into
     # ``context.json``) and chains to whatever the user had globally so
     # claude-hud / their bar still renders.
+    settings["statusLine"] = {
+        "type": "command",
+        "command": _status_line_command(bridge_dir, read_user_status_line_command()),
+    }
+    return settings
+
+
+def _status_line_command(bridge_dir: Path, chain_command: str | None) -> str:
+    """
+    Build the statusLine shell command that captures Claude's payload.
+
+    :param bridge_dir: Bridge directory receiving ``CONTEXT_RAW_FILE``.
+    :param chain_command: Status-line command to pipe the same payload to
+        afterwards so its bar still renders, e.g. ``"claude-hud"``; ``None``
+        captures only.
+    :returns: The ``/bin/sh`` command for ``statusLine.command``.
+    """
     raw_quoted = shlex.quote(str(bridge_dir / CONTEXT_RAW_FILE))
-    status_command = (
+    command = (
         f"p=$(cat); printf '%s' \"$p\" > {raw_quoted}.$$.tmp"
         f" && mv -f {raw_quoted}.$$.tmp {raw_quoted}"
     )
-    chain_command = read_user_status_line_command()
     if chain_command is not None:
-        status_command += f"; printf '%s' \"$p\" | ( {chain_command} )"
-    settings["statusLine"] = {"type": "command", "command": status_command}
-    return settings
+        command += f"; printf '%s' \"$p\" | ( {chain_command} )"
+    return command
 
 
 def _claude_read_rule(directory: PurePath) -> str | None:
@@ -3200,6 +3215,9 @@ def augment_claude_args(
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
+    args, caller_settings = _pop_caller_settings(args)
+    if caller_settings:
+        hook_settings = _merge_caller_settings(hook_settings, caller_settings, bridge_dir)
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
     _write_json_file(settings_path, hook_settings)
     from omnigent.onboarding.ambient import claude_code_managed_mcp_present
@@ -3348,6 +3366,93 @@ def _merge_append_system_prompt(
     existing = args[value_idx][offset:]
     args[value_idx] = args[value_idx][:offset] + (f"{extra}\n\n{existing}" if existing else extra)
     return args
+
+
+def _pop_caller_settings(args: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
+    """
+    Remove caller ``--settings`` flags from ``args`` and return their parsed values.
+
+    Claude Code honours only the LAST ``--settings`` flag, so a caller's flag would
+    be silently replaced by the invocation settings Omnigent appends. Each value
+    is a JSON object or a path to one; unreadable values stay in ``args`` untouched.
+
+    :param args: Claude CLI argument list.
+    :returns: ``(args without the merged flags, parsed settings in flag order)``.
+    """
+    kept: list[str] = []
+    found: list[dict[str, Any]] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--settings" and i + 1 < len(args):
+            value, step = args[i + 1], 2
+        elif arg.startswith("--settings="):
+            value, step = arg.partition("=")[2], 1
+        else:
+            kept.append(arg)
+            i += 1
+            continue
+        parsed: object = None
+        try:
+            inline = value.lstrip().startswith("{")
+            parsed = json.loads(value if inline else Path(value).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            found.append(parsed)
+        else:
+            kept.extend(args[i : i + step])
+        i += step
+    return kept, found
+
+
+def _merge_caller_settings(
+    settings: dict[str, Any], callers: list[dict[str, Any]], bridge_dir: Path
+) -> dict[str, Any]:
+    """
+    Merge caller ``--settings`` objects into Omnigent's invocation settings.
+
+    Caller hooks run before Omnigent's for the same event, ``env`` merges,
+    ``permissions`` lists merge, a caller ``statusLine`` command is chained after
+    Omnigent's context capture (in place of the user's global one), and any other
+    key Omnigent does not set is taken from the caller. Omnigent's own values win
+    on conflict so its bridge keeps working.
+
+    :param settings: Omnigent's invocation settings.
+    :param callers: Parsed caller settings, in flag order.
+    :param bridge_dir: Bridge directory the statusLine capture writes into.
+    :returns: The merged settings.
+    """
+    merged = dict(settings)
+    for caller in callers:
+        for key, value in caller.items():
+            if key == "hooks" and isinstance(value, dict):
+                hooks = {k: list(v) for k, v in (merged.get("hooks") or {}).items()}
+                for event, entries in value.items():
+                    if isinstance(entries, list):
+                        hooks[event] = [*entries, *hooks.get(event, [])]
+                merged["hooks"] = hooks
+            elif key == "env" and isinstance(value, dict):
+                merged["env"] = {**value, **(merged.get("env") or {})}
+            elif key == "permissions" and isinstance(value, dict):
+                perms = dict(merged.get("permissions") or {})
+                for pkey, pval in value.items():
+                    if isinstance(pval, list) and isinstance(perms.get(pkey), list):
+                        perms[pkey] = list(dict.fromkeys([*perms[pkey], *pval]))
+                    else:
+                        perms.setdefault(pkey, pval)
+                merged["permissions"] = perms
+            elif key == "statusLine" and isinstance(value, dict):
+                command = value.get("command")
+                if isinstance(command, str) and command.strip():
+                    merged["statusLine"] = {
+                        **value,
+                        "type": "command",
+                        "command": _status_line_command(bridge_dir, command),
+                    }
+            else:
+                merged.setdefault(key, value)
+    return merged
 
 
 def _merge_disallowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:

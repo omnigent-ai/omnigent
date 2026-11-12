@@ -5018,6 +5018,71 @@ def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> Non
     assert disallowed == ["Bash", "Edit"]
 
 
+def test_augment_claude_args_merges_caller_settings(tmp_path: Path) -> None:
+    """
+    A caller ``--settings`` is merged into the invocation settings, not dropped.
+
+    Claude Code honours only the last ``--settings`` flag, so before the merge a
+    caller's env, hooks and statusLine silently lost to the bridge's own file.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    caller_hook = {"hooks": [{"type": "command", "command": "echo caller"}]}
+    caller_file = tmp_path / "caller-settings.json"
+    caller_file.write_text(
+        json.dumps(
+            {
+                "env": {"SEAT_KEY": "seat-1"},
+                "hooks": {"UserPromptSubmit": [caller_hook]},
+                "statusLine": {"type": "command", "command": "seat-status --key seat-1"},
+                "enabledPlugins": {"extra@market": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+    baseline = _load_invocation_settings(augment_claude_args((), bridge_dir=bridge_dir))
+
+    args = augment_claude_args(
+        ("--name", "seat-1", "--settings", str(caller_file), '--settings={"env":{"B":"2"}}'),
+        bridge_dir=bridge_dir,
+    )
+
+    assert args.count("--settings") == 1
+    assert not any(arg.startswith("--settings=") for arg in args)
+    assert args[:2] == ["--name", "seat-1"]
+    settings = _load_invocation_settings(args)
+    assert settings["env"]["SEAT_KEY"] == "seat-1"
+    assert settings["env"]["B"] == "2"
+    assert settings["enabledPlugins"] == {"extra@market": False}
+    assert settings["hooks"]["UserPromptSubmit"][0] == caller_hook
+    assert settings["hooks"]["UserPromptSubmit"][1:] == baseline["hooks"]["UserPromptSubmit"]
+    assert settings["statusLine"]["command"] == claude_native_bridge._status_line_command(
+        bridge_dir, "seat-status --key seat-1"
+    )
+    for event, entries in baseline["hooks"].items():
+        assert all(entry in settings["hooks"][event] for entry in entries)
+
+
+def test_augment_claude_args_keeps_its_own_settings_on_conflict(tmp_path: Path) -> None:
+    """The bridge's own keys win a conflict, so its consent gates stay in force."""
+    args = augment_claude_args(
+        ("--settings", json.dumps({"enableAllProjectMcpServers": False})),
+        bridge_dir=tmp_path,
+    )
+
+    assert _load_invocation_settings(args)["enableAllProjectMcpServers"] is True
+
+
+def test_augment_claude_args_passes_unreadable_caller_settings_through(tmp_path: Path) -> None:
+    """A ``--settings`` value that is not a readable JSON object is left to Claude."""
+    missing = str(tmp_path / "missing.json")
+
+    args = augment_claude_args(("--settings", missing), bridge_dir=tmp_path)
+
+    assert args[:2] == ["--settings", missing]
+    assert args.count("--settings") == 2
+
+
 def test_augment_claude_args_injects_plugin_dir_for_bundle_with_skills(
     tmp_path: Path,
 ) -> None:
