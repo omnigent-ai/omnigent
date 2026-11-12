@@ -504,6 +504,7 @@ function SubagentRow({
   const primary = childPrimaryLabel(child);
   const isActive = conversationId === child.id;
   const openInPanel = useOpenSubagentInPanel();
+  const destination = { pathname: `/c/${child.id}`, search };
   // De-emphasize settled rows (done/idle) so working/failed agents dominate
   // — but never the row the user is currently viewing.
   const dim = !isActive && SETTLED_STATE[status.activity];
@@ -567,11 +568,11 @@ function SubagentRow({
           // See MainRow: drop session-scoped params on rail navigation
           // (preserving global ones like ``?debug=1``) so a sticky
           // ``?file=`` from the previous session doesn't carry over.
-          to={{ pathname: `/c/${child.id}`, search }}
+          to={destination}
           data-testid="subagent-row"
           data-child-session-id={child.id}
           onClick={(event) => {
-            openInPanel(child.id, event);
+            openInPanel(child.id, event, destination);
           }}
           data-depth={depth}
           // Left gutter (depth-stepped) + connector glyph nests this row

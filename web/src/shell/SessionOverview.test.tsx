@@ -1,4 +1,5 @@
 import type { ComponentProps, ReactNode } from "react";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
@@ -12,7 +13,8 @@ import { SessionOverview } from "./SessionOverview";
 const mobile = vi.hoisted(() => ({ value: false }));
 const useChildSessionsMock = vi.hoisted(() => vi.fn());
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => mobile.value }));
-vi.mock("@/hooks/useChildSessions", () => ({
+vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: useChildSessionsMock,
 }));
 
@@ -141,7 +143,16 @@ describe("Session overview", () => {
       children:
         id === "session"
           ? children
-          : [{ id: "grandchild", task_summary: "Nested agent", own_cost_usd: 0.5, busy: false }],
+          : id === "child-1"
+            ? [{ id: "grandchild", task_summary: "Nested agent", own_cost_usd: 0.5, busy: false }]
+            : [
+                {
+                  id: "great-grandchild",
+                  task_summary: "Deepest agent",
+                  own_cost_usd: 0.25,
+                  busy: false,
+                },
+              ],
       isLoading: false,
       error: null,
     }));
@@ -162,6 +173,17 @@ describe("Session overview", () => {
     expect(
       within(screen.getByRole("link", { name: /^Agent 1(?!\d)/ })).getByText("$1.00"),
     ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show nested costs for Nested agent" }));
+    expect(useChildSessionsMock).toHaveBeenCalledWith("grandchild", 10_000);
+    expect(screen.getByRole("link", { name: /Deepest agent/ })).toHaveAttribute(
+      "href",
+      "/c/great-grandchild",
+    );
+    expect(
+      screen.queryByRole("button", { name: "Show nested costs for Deepest agent" }),
+    ).toBeNull();
+    expect(useChildSessionsMock.mock.calls.map(([id]) => id)).not.toContain("great-grandchild");
 
     fireEvent.click(screen.getByRole("button", { name: "Hide nested costs for Agent 1" }));
     useChildSessionsMock.mockClear();

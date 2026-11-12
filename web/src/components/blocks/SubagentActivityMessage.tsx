@@ -35,7 +35,7 @@ export function SubagentActivityMessage({ data }: { data: Record<string, unknown
           <Link
             to={to}
             onClick={(event) => {
-              openInPanel(activity.sessionId, event);
+              openInPanel(activity.sessionId, event, to);
             }}
             className="rounded-sm font-normal text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >

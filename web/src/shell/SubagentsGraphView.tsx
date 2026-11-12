@@ -239,14 +239,15 @@ export function SubagentsGraphView({
   const handleNodeClick = useCallback(
     (event: React.MouseEvent, node: Node<AgentNodeData>) => {
       const childSessionId = node.data.sessionId;
-      if (openInPanel(childSessionId, event)) return;
       const params = new URLSearchParams(location.search);
       for (const key of ["file", "diff", "comment", "view", "message"]) params.delete(key);
       const search = params.toString();
-      navigate({
-        pathname: `/c/${node.data.sessionId}`,
+      const destination = {
+        pathname: `/c/${childSessionId}`,
         search: search ? `?${search}` : "",
-      });
+      };
+      if (openInPanel(childSessionId, event, destination)) return;
+      navigate(destination);
     },
     [navigate, location.search, openInPanel],
   );

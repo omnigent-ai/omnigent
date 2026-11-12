@@ -7,7 +7,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { ModelUsageBreakdown } from "@/components/ModelUsageBreakdown";
 import { RunningDot } from "@/components/RunningDot";
-import { useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import type { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { formatSessionCostUsd, formatTokenCount } from "@/lib/formatCost";
@@ -37,37 +37,46 @@ function UsageValue({
 
 function OverviewSubagent({
   child,
+  depth,
   onNavigate,
 }: {
   child: ChildSessionInfo;
+  depth: number;
   onNavigate?: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const openInPanel = useOpenSubagentInPanel();
   const location = useLocation();
+  const destination = {
+    pathname: `/c/${child.id}`,
+    search: sessionNavigationSearch(location.search),
+  };
+  const canExpand = depth < MAX_TREE_DEPTH;
   const label = childPrimaryLabel(child);
   const status = childStatus(child);
   return (
     <li>
       <div className="flex items-center gap-1">
-        <Button
-          variant="ghost"
-          size="icon-xs"
-          className="shrink-0 max-md:size-11"
-          aria-expanded={expanded}
-          aria-label={`${expanded ? "Hide" : "Show"} nested costs for ${label}`}
-          onClick={() => setExpanded(!expanded)}
-        >
-          {expanded ? (
-            <ChevronDownIcon className="size-3.5" />
-          ) : (
-            <ChevronRightIcon className="size-3.5" />
-          )}
-        </Button>
+        {canExpand && (
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            className="shrink-0 max-md:size-11"
+            aria-expanded={expanded}
+            aria-label={`${expanded ? "Hide" : "Show"} nested costs for ${label}`}
+            onClick={() => setExpanded(!expanded)}
+          >
+            {expanded ? (
+              <ChevronDownIcon className="size-3.5" />
+            ) : (
+              <ChevronRightIcon className="size-3.5" />
+            )}
+          </Button>
+        )}
         <Link
-          to={{ pathname: `/c/${child.id}`, search: sessionNavigationSearch(location.search) }}
+          to={destination}
           onClick={(event) => {
-            openInPanel(child.id, event);
+            openInPanel(child.id, event, destination);
             onNavigate?.();
           }}
           className="flex min-w-0 flex-1 items-center gap-2 rounded-md p-1 hover:bg-accent focus-visible:outline-ring"
@@ -88,9 +97,9 @@ function OverviewSubagent({
           <SubagentCost costUsd={child.own_cost_usd} />
         </Link>
       </div>
-      {expanded && (
+      {canExpand && expanded && (
         <div className="ml-2 border-l border-border/50 pl-2 pt-2">
-          <OverviewSubagents sessionId={child.id} onNavigate={onNavigate} />
+          <OverviewSubagents sessionId={child.id} depth={depth} onNavigate={onNavigate} />
         </div>
       )}
     </li>
@@ -99,9 +108,11 @@ function OverviewSubagent({
 
 function OverviewSubagents({
   sessionId,
+  depth = 0,
   onNavigate,
 }: {
   sessionId: string;
+  depth?: number;
   onNavigate?: () => void;
 }) {
   const [showAll, setShowAll] = useState(false);
@@ -114,7 +125,12 @@ function OverviewSubagents({
       {!error && children.length === 0 && <p className="text-muted-foreground">No subagents yet</p>}
       <ul className="space-y-2">
         {(showAll ? children : children.slice(0, 5)).map((child) => (
-          <OverviewSubagent key={child.id} child={child} onNavigate={onNavigate} />
+          <OverviewSubagent
+            key={child.id}
+            child={child}
+            depth={depth + 1}
+            onNavigate={onNavigate}
+          />
         ))}
       </ul>
       {children.length > 5 && (

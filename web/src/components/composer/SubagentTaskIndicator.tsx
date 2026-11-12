@@ -109,6 +109,7 @@ function SubagentNavigationRow({
 }) {
   const search = sessionNavigationSearch(useLocation().search);
   const openInPanel = useOpenSubagentInPanel();
+  const destination = { pathname: `/c/${child.id}`, search };
   const label = subagentLabel(child);
   const tool = child.tool?.trim();
   const showTool = !!tool && tool !== label;
@@ -116,10 +117,10 @@ function SubagentNavigationRow({
   return (
     <li>
       <Link
-        to={{ pathname: `/c/${child.id}`, search }}
+        to={destination}
         componentId="composer-subagent-indicator-row"
         onClick={(event) => {
-          openInPanel(child.id, event);
+          openInPanel(child.id, event, destination);
           onNavigate(event);
         }}
         className="flex items-start gap-2 rounded-lg px-1 py-2 hover:bg-accent/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"

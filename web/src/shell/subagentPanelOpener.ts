@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext } from "react";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { useLocation, useNavigate } from "@/lib/routing";
-import { sessionNavigationSearch } from "@/lib/sessionNavigation";
+import type { To } from "react-router-dom";
+import { useNavigate } from "@/lib/routing";
 import { FileViewerContext } from "./FileViewerContext";
 import { readOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
 
@@ -30,14 +30,14 @@ interface SubagentLinkClick {
 export function useOpenSubagentInPanel(): (
   childSessionId: string,
   event: SubagentLinkClick,
+  destination: To,
 ) => boolean {
   const opener = useContext(SubagentPanelOpenerContext);
   const isMobile = useIsMobileViewport();
   const guardFileNavigation = useContext(FileViewerContext)?.guardFileNavigation;
   const navigate = useNavigate();
-  const location = useLocation();
   return useCallback(
-    (childSessionId, event) => {
+    (childSessionId, event, destination) => {
       if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
         return false;
       }
@@ -46,12 +46,7 @@ export function useOpenSubagentInPanel(): (
       if (guardFileNavigation) {
         event.preventDefault();
         guardFileNavigation(null, undefined, () => {
-          if (!openInPanel()) {
-            navigate({
-              pathname: `/c/${childSessionId}`,
-              search: sessionNavigationSearch(location.search),
-            });
-          }
+          if (!openInPanel()) navigate(destination);
         });
         return true;
       }
@@ -59,6 +54,6 @@ export function useOpenSubagentInPanel(): (
       event.preventDefault();
       return true;
     },
-    [opener, isMobile, guardFileNavigation, navigate, location.search],
+    [opener, isMobile, guardFileNavigation, navigate],
   );
 }

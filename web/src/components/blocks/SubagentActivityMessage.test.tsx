@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { writeOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
+import { FileViewerContext } from "@/shell/FileViewerContext";
 import { SubagentPanelOpenerContext } from "@/shell/subagentPanelOpener";
 import { BubbleView } from "@/pages/ChatPage";
 import { useChatStore } from "@/store/chatStore";
@@ -10,6 +11,16 @@ import type { Bubble } from "@/lib/renderItems";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { parseEvent } from "@/lib/sse";
+
+const fileViewer = {
+  openFile: vi.fn(),
+  openGithubTab: vi.fn(),
+  isChangedPath: () => false,
+  conversationId: "parent",
+  workspaceRoot: null,
+  workspaceHome: null,
+  guardFileNavigation: (_path: unknown, _options: unknown, commit: () => void) => commit(),
+};
 
 afterEach(() => {
   cleanup();
@@ -113,7 +124,7 @@ describe("sub-agent activity", () => {
 
   it.each([
     [true, "/c/parent"],
-    [false, "/c/conv_child"],
+    [false, "/c/conv_child?panel=agents"],
   ])("with the panel setting %s, a click lands on %s", (enabled, pathname) => {
     writeOpenSubagentsInPanel(enabled);
     const opener = vi.fn(() => true);
@@ -129,12 +140,15 @@ describe("sub-agent activity", () => {
     };
     const [bubble] = buildBubbles(itemsToBlocks([item]), null);
     function CurrentPath() {
-      return <output data-testid="current-path">{useLocation().pathname}</output>;
+      const location = useLocation();
+      return <output data-testid="current-path">{location.pathname + location.search}</output>;
     }
     render(
       <MemoryRouter initialEntries={["/c/parent"]}>
         <SubagentPanelOpenerContext.Provider value={opener}>
-          <BubbleView bubble={bubble!} />
+          <FileViewerContext.Provider value={fileViewer}>
+            <BubbleView bubble={bubble!} />
+          </FileViewerContext.Provider>
         </SubagentPanelOpenerContext.Provider>
         <CurrentPath />
       </MemoryRouter>,
@@ -142,7 +156,7 @@ describe("sub-agent activity", () => {
 
     fireEvent.click(screen.getByRole("link"));
 
-    expect(screen.getByTestId("current-path")).toHaveTextContent(pathname);
+    expect(screen.getByTestId("current-path").textContent).toBe(pathname);
     if (enabled) expect(opener).toHaveBeenCalledWith("conv_child");
     else expect(opener).not.toHaveBeenCalled();
   });
