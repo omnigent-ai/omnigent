@@ -1,9 +1,11 @@
 // Chat markers for a session's tasks, as the server writes them into the
 // transcript: where a task started, finished, failed or began waiting for the
 // user, and each change to the plan. They render like sub-agent markers and link
-// to the Tasks tab.
+// to the Tasks tab, and stand in for the journal writes that made them.
 
 import { WAITING_FOR_YOU, type StepProgress, type StepStatus } from "@/lib/sessionJournal";
+import { splitToolName } from "@/lib/toolTitle";
+import { parseToolOutput, toolErrorMessage } from "@/lib/toolValue";
 
 /** A plan-change line's kind: the first plan, a new one, a new name, or any other change. */
 export type PlanChange = "made" | "replaced" | "renamed" | "updated";
@@ -148,4 +150,27 @@ export function taskMarkerTarget(item: StepProgress): string | null {
     return todoMarkerId(item.step.id, "started");
   }
   return null;
+}
+
+// The journal writes whose accepted calls the chat marks: a task's status, or the plan.
+const MARKED_JOURNAL_WRITES: ReadonlySet<string> = new Set([
+  "sys_journal_write_status",
+  "sys_journal_write_plan",
+]);
+
+/**
+ * Whether a tool call's row would repeat a task marker or plan line, so the chat
+ * leaves it out: a status or plan write the journal accepted, or one still
+ * running, whose marker lands once it's accepted. A rejected write gets no
+ * marker, so its row stays and shows the error.
+ *
+ * @param name - The tool as the harness names it, e.g. `mcp__omnigent__sys_journal_write_status`.
+ * @param output - What the call returned; null while it runs or when nothing came back.
+ * @param running - Whether the call is still running.
+ */
+export function repeatsTaskMarker(name: string, output: string | null, running: boolean): boolean {
+  const { server, tool } = splitToolName(name);
+  if (server !== undefined || !MARKED_JOURNAL_WRITES.has(tool)) return false;
+  if (output === null) return running;
+  return toolErrorMessage(parseToolOutput(output)) === null;
 }

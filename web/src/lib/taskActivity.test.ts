@@ -4,6 +4,7 @@ import { nativeTaskProgress, planSteps, stepProgress } from "./sessionJournal";
 import {
   planChangeText,
   readTaskActivity,
+  repeatsTaskMarker,
   taskMarkerId,
   taskMarkerLabel,
   taskMarkerTarget,
@@ -140,5 +141,34 @@ describe("taskMarkerTarget", () => {
       null,
       todoMarkerId("task-3", "done"),
     ]);
+  });
+});
+
+describe("repeatsTaskMarker", () => {
+  const accepted = '{"id": "e7", "position": 7}';
+
+  it("covers a status or plan write the journal accepted, by any harness's name", () => {
+    expect(repeatsTaskMarker("sys_journal_write_status", accepted, false)).toBe(true);
+    expect(repeatsTaskMarker("mcp__omnigent__sys_journal_write_plan", accepted, false)).toBe(true);
+    // Claude keeps an MCP tool's result as content blocks.
+    const blocks = JSON.stringify([{ type: "text", text: accepted }]);
+    expect(repeatsTaskMarker("mcp__omnigent__sys_journal_write_status", blocks, false)).toBe(true);
+  });
+
+  it("covers a write still running, whose marker lands once it's accepted", () => {
+    expect(repeatsTaskMarker("sys_journal_write_status", null, true)).toBe(true);
+    // A write that ended with no result made no marker.
+    expect(repeatsTaskMarker("sys_journal_write_status", null, false)).toBe(false);
+  });
+
+  it("leaves a rejected write, which gets no marker, and every other tool", () => {
+    const rejected = '{"error": "invalid_entry: step ship is not in the plan"}';
+    expect(repeatsTaskMarker("sys_journal_write_status", rejected, false)).toBe(false);
+    expect(repeatsTaskMarker("sys_journal_write_note", accepted, false)).toBe(false);
+    expect(repeatsTaskMarker("sys_journal_read", "{}", false)).toBe(false);
+    // Another MCP server's tool of the same name isn't the journal's.
+    expect(repeatsTaskMarker("mcp__tracker__sys_journal_write_status", accepted, false)).toBe(
+      false,
+    );
   });
 });

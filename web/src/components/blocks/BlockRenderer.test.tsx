@@ -1572,9 +1572,9 @@ describe("BlockRenderer dispatch", () => {
           <MemoryRouter>
             <BlockRenderer
               items={[
-                tool(1, "sys_journal_write_status"),
+                tool(1, "Agent"),
                 marker("e1", "started", "Say hello"),
-                tool(2, "sys_journal_write_status"),
+                tool(2, "Agent"),
                 marker("e2", "done", "Say hello"),
                 { kind: "text", itemId: "m1", text: "Said hello.", final: true },
               ]}
@@ -1588,7 +1588,7 @@ describe("BlockRenderer dispatch", () => {
           "Started Say hello",
           "Completed Say hello",
         ]);
-        // The tool calls behind each marker stay in their own group.
+        // The tool calls on either side of a marker stay in their own group.
         expect(screen.getAllByText("Called 1 tool")).toHaveLength(2);
         expect(screen.getByText("Said hello.")).toBeDefined();
       });

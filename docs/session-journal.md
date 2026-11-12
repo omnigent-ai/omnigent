@@ -157,6 +157,11 @@ the journal accepts a status or a plan, or when the agent's own list changes.
 A retried write adds no second marker, and sessions from before markers have
 none.
 
+A marker stands in for the journal write behind it, so the chat shows no tool
+row for a `sys_journal_write_status` or `sys_journal_write_plan` call the
+journal accepted, or one still running. A rejected write gets no marker, so its
+row stays and shows the error. Reads and notes show as tool calls.
+
 When the agent writes the session's first plan while you're watching, the
 Tasks tab opens beside the chat; on phones the drawer stays closed so the chat
 stays in view.
