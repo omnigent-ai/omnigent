@@ -280,7 +280,8 @@ def _prepare_shell_text(command: str, *, model_syntax: bool = True) -> tuple[str
 # quoting. A command containing any of it keeps the flat parse the observer had before.
 _UNMODELED_SHELL = re.compile(
     r"\b(?:case|esac|function|eval|if|then|else|elif|fi|do|done|while|until|for|select)\b"
-    r"|[{}]|\(\s*\)|\(\s*\(|=\s*\(|\[\[|[@?*+!<>]\(|\|&|\$\[|(?:^|[\s;&|()])!(?=\s)"
+    r"|[{}]|\(\s*\)|\(\s*\(|=\s*\(|\[\[|[@?*+!<>]\(|\|&|\$\[|\$\(|`"
+    r"|(?:^|[\s;&|()])!(?=\s)"
 )
 
 
@@ -291,6 +292,30 @@ def _has_unmodeled_shell(command: str) -> bool:
     )
 
 
+# Words that start unmodeled syntax, checked on the decoded invocation.
+_UNMODELED_WORDS = frozenset(
+    {
+        "case",
+        "esac",
+        "function",
+        "eval",
+        "if",
+        "then",
+        "else",
+        "elif",
+        "fi",
+        "do",
+        "done",
+        "while",
+        "until",
+        "for",
+        "select",
+        "{",
+        "}",
+        "[[",
+        "!",
+    }
+)
 # Operators, longest first. Quoted and backslash-escaped characters are never operators.
 _SHELL_OPERATORS = ("&&", "||", "(", ")", ";", "&", "|", "\n")
 
@@ -329,15 +354,14 @@ def _shell_items(command: str) -> list[list[str] | str] | None:
                     (op for op in _SHELL_OPERATORS if command.startswith(op, index)), None
                 )
                 if operator is None:
+                    if char in " \t\r" and not chunk and items and items[-1] in {"&&", "||", "|"}:
+                        # Leading whitespace after a connective is not part of a word.
+                        index += 1
+                        continue
                     chunk.append(char)
                     index += 1
                     continue
-                if (
-                    operator == "\n"
-                    and items
-                    and items[-1] in {"&&", "||", "|"}
-                    and not "".join(chunk).strip()
-                ):
+                if operator == "\n" and items and items[-1] in {"&&", "||", "|"} and not chunk:
                     # A newline after an operator continues the command.
                     index += 1
                     continue
@@ -392,6 +416,8 @@ def _shell_steps(
         tokens = real_invocation_tokens(item)
         if not tokens:
             continue
+        if tokens[0] in _UNMODELED_WORDS:
+            return None
         inner = unwrap_shell_command(tokens)
         if inner is None:
             steps.append(ShellSegment(raw_tokens=tuple(item), invocation_tokens=tuple(tokens)))

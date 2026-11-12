@@ -1659,6 +1659,16 @@ def test_a_process_substitution_keeps_the_explicit_repository() -> None:
     assert was_created is False
 
 
+def test_a_nested_substitution_quote_is_not_a_command_for_pr_attribution() -> None:
+    refs, was_created = extract_prs(
+        "Bash",
+        {"command": "printf '%s\\n' \"$(printf '\"(gh pr create)\"')\""},
+        "https://github.com/example/one/pull/41\n",
+    )
+    assert refs == []
+    assert was_created is False
+
+
 def test_a_pattern_with_parentheses_is_not_a_command_for_pr_attribution() -> None:
     # An extended glob is a pattern for printf, not a command that runs.
     refs, was_created = extract_prs(
@@ -1679,6 +1689,11 @@ def test_a_long_operator_free_command_lexes_in_bounded_time() -> None:
     start = time.perf_counter()
     items = pr_observer._shell_items(command)
     assert items is not None and len(items) == 1
+    assert time.perf_counter() - start < 5
+    # Continuation whitespace after an operator must not rescan the chunk.
+    continued = "true && " + " \n" * 49_990 + "true"
+    start = time.perf_counter()
+    assert pr_observer._shell_items(continued) is not None
     assert time.perf_counter() - start < 5
 
 
@@ -1988,6 +2003,30 @@ def test_quoted_operator_characters_do_not_split_a_simple_command(
             {},
             [],
             id="negated-cd-is-not-tracked",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "printf '%s\\n' \"$(printf '\"(git -C /wrong status)\"')\""},
+            "/start",
+            {},
+            [],
+            id="nested-substitution-quotes-are-not-a-git-call",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "e'v'al \"cd /w/topic\"; git pp"},
+            "/start",
+            {},
+            ["/w/topic"],
+            id="quoted-eval-stays-in-this-shell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "e\\val 'cd /w/topic'; git pp"},
+            "/start",
+            {},
+            ["/w/topic"],
+            id="escaped-eval-stays-in-this-shell",
         ),
         pytest.param(
             "Bash",
