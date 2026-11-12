@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import socket
 
 import pytest
@@ -115,6 +116,58 @@ async def test_fork_harness_nonzero_exit(zygote: ZygoteManager, tmp_path) -> Non
         _harness_env(5, tmp_path / "h.log"),
     )
     assert await asyncio.wait_for(proc.wait(), timeout=10) == 5
+
+
+async def test_wait_timeout_preserves_exit_polling(zygote: ZygoteManager, tmp_path) -> None:
+    """A graceful-stop timeout must leave the real exit available after escalation."""
+    client = _client_on(zygote)
+    proc = await client.fork_harness(
+        ["--harness", "x"],
+        {
+            "PATH": os.environ.get("PATH", ""),
+            "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_SLEEP": "30",
+            "OMNIGENT_PROCESS_LOG_FILE": str(tmp_path / "h.log"),
+        },
+    )
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(proc.wait(), timeout=0.05)
+        assert proc.returncode is None
+        proc.kill()
+        assert await asyncio.wait_for(proc.wait(), timeout=10) == -signal.SIGKILL
+    finally:
+        proc.kill()
+        await asyncio.wait_for(proc.wait(), timeout=10)
+
+
+async def test_cancelling_one_waiter_preserves_other_waiters(
+    zygote: ZygoteManager, tmp_path
+) -> None:
+    """One cancelled caller must not manufacture an exit for every other caller."""
+    client = _client_on(zygote)
+    proc = await client.fork_harness(
+        ["--harness", "x"],
+        {
+            "PATH": os.environ.get("PATH", ""),
+            "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_SLEEP": "30",
+            "OMNIGENT_PROCESS_LOG_FILE": str(tmp_path / "h.log"),
+        },
+    )
+    cancelled_waiter = asyncio.create_task(proc.wait())
+    surviving_waiter = asyncio.create_task(proc.wait())
+    try:
+        await asyncio.sleep(0)
+        cancelled_waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_waiter
+        assert not surviving_waiter.done()
+        assert proc.returncode is None
+        proc.kill()
+        assert await asyncio.wait_for(surviving_waiter, timeout=10) == -signal.SIGKILL
+        assert await proc.wait() == -signal.SIGKILL
+    finally:
+        proc.kill()
+        await asyncio.gather(cancelled_waiter, surviving_waiter, return_exceptions=True)
 
 
 async def test_fork_harness_raises_when_channel_closed(zygote: ZygoteManager, tmp_path) -> None:

@@ -67,7 +67,7 @@ class HostCertCache:
         """Generate a cert + key for *hostname*, signed by the CA."""
         key = rsa.generate_private_key(public_exponent=65537, key_size=_HOST_KEY_SIZE)
 
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
 
         builder = (
             x509.CertificateBuilder()

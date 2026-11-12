@@ -1,13 +1,14 @@
 """Tests for the batch path in POST /v1/sessions/{id}/events.
 
 When a batch contains consecutive batchable external_conversation_item entries
-(other than user messages, slash_command items, and entries with created_by or
-tools), the route authorizes once and calls conversation_store.append once per
-run instead of once per item.
+(other than user messages, slash_command items, shell-command inputs, and
+entries with created_by or tools), the route authorizes once and calls
+conversation_store.append once per run instead of once per item.
 """
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import uuid as _uuid_mod
 from itertools import count
@@ -23,6 +24,11 @@ import omnigent.server.routes.sessions.routes_events as routes_events_mod
 from omnigent.entities import NewConversationItem
 from omnigent.entities.conversation import Conversation, ConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runtime import pending_inputs
+from omnigent.server._elicitation_registry import (
+    _harness_parked_elicitations,
+    _ParkedHarnessElicitation,
+)
 from omnigent.server.routes.sessions import create_sessions_router
 
 _SESSION_ID = "conv_test"
@@ -274,6 +280,25 @@ def _slash_command_event(
     }
 
 
+def _terminal_command_event(
+    kind: str,
+    *,
+    source_id: str,
+    response_id: str = "resp_shell",
+    **fields: Any,
+) -> dict:
+    """One half of a mirrored ``!cmd`` shell command (``kind`` is ``input`` or ``output``)."""
+    return {
+        "type": "external_conversation_item",
+        "data": {
+            "item_type": "terminal_command",
+            "item_data": {"kind": kind, **fields},
+            "response_id": response_id,
+            "source_id": source_id,
+        },
+    }
+
+
 # ── tests: one append + one auth ─────────────────────────────────────────────
 
 
@@ -406,6 +431,96 @@ def test_dedup_items_not_elicitation_driven() -> None:
     assert resp.status_code == 202
     assert len(recorder.driven) == 2
     assert _stable_id(src_b) not in recorder.driven
+
+
+def test_dedup_tool_result_skips_mirrored_call_lookup() -> None:
+    """A deduplicated tool result does not look its call up in the store."""
+    _park_prompt_for_session()
+    src_new, src_dup = "src_out_new", "src_out_dup"
+    store = _FailingCallLookupStore(_make_conv(), dedup_item_ids={_stable_id(src_dup)})
+    recorder = _SideEffectRecorder()
+
+    with recorder.patch():
+        resp, _ = _post(
+            [
+                _tool_output_event("toolu_new", source_id=src_new),
+                _tool_output_event("toolu_dup", source_id=src_dup),  # dedup
+            ],
+            store=store,
+        )
+
+    assert resp.status_code == 202, resp.text
+    # Only the new result looked its call up; the duplicate was not re-driven.
+    assert store.list_calls == 1
+
+
+def _tool_output_event(
+    call_id: str, *, response_id: str = "resp_1", source_id: str | None = None
+) -> dict:
+    data: dict[str, Any] = {
+        "item_type": "function_call_output",
+        "item_data": {"call_id": call_id, "output": "ok"},
+        "response_id": response_id,
+    }
+    if source_id is not None:
+        data["source_id"] = source_id
+    return {"type": "external_conversation_item", "data": data}
+
+
+class _FailingCallLookupStore(_RecordingStore):
+    """Store whose item listing fails, as a database outage would."""
+
+    def __init__(self, conv: Conversation, *, dedup_item_ids: set[str] | None = None) -> None:
+        super().__init__(conv, dedup_item_ids=dedup_item_ids)
+        self.list_calls = 0
+
+    def list_items(self, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            self.list_calls += 1
+        raise RuntimeError("test-induced list_items failure")
+
+
+def _park_prompt_for_session() -> None:
+    """Park a prompt here, so each uncached tool result looks its call up."""
+    _harness_parked_elicitations["e_parked"] = _ParkedHarnessElicitation(
+        session_id=_SESSION_ID,
+        tool_name="bash",
+        tool_input={},
+        resolved_elsewhere=asyncio.Event(),
+    )
+
+
+def test_failed_mirrored_call_lookup_does_not_stop_single_item_delivery() -> None:
+    """A single-event POST still publishes its tool result when the lookup fails."""
+    _park_prompt_for_session()
+    store = _FailingCallLookupStore(_make_conv())
+    recorder = _SideEffectRecorder()
+
+    with recorder.patch():
+        resp, _ = _post(_tool_output_event("toolu_single"), store=store)
+
+    assert resp.status_code == 202, resp.text
+    assert store.list_calls == 1
+    assert len(recorder.published) == 1
+
+
+def test_failed_mirrored_call_lookup_does_not_stop_batch_delivery() -> None:
+    """A failed store lookup for a tool result's call leaves later items published."""
+    _park_prompt_for_session()
+    store = _FailingCallLookupStore(_make_conv())
+    recorder = _SideEffectRecorder()
+
+    with recorder.patch():
+        resp, _ = _post(
+            [_tool_output_event("toolu_a"), _tool_output_event("toolu_b"), _assistant_event()],
+            store=store,
+        )
+
+    assert resp.status_code == 202, resp.text
+    assert store.list_calls == 2
+    assert len(resp.json()) == 3
+    # Every committed item reached live subscribers despite both failed lookups.
+    assert len(recorder.published) == 3
 
 
 # ── tests: invalid source_id ──────────────────────────────────────────────────
@@ -660,6 +775,39 @@ def test_skill_slash_command_item_uses_per_entry_path() -> None:
     assert len(store.append_calls[0]) == 1
     assert store.append_calls[1][0].type == "slash_command"
     assert len(store.append_calls[2]) == 1
+
+
+# ── tests: shell command input stays on the per-entry path ────────────────────
+
+
+def test_shell_command_input_uses_per_entry_path() -> None:
+    """The input half of a ``!cmd`` drains a pending entry, so it leaves the coalesced run.
+
+    Its output half and the items around it stay batchable: only the input
+    needs the pending-input drain the per-entry path performs.
+    """
+    batch = [
+        _assistant_event(source_id="shell_pre"),
+        _terminal_command_event("input", source_id="shell_in", input="pwd"),
+        _terminal_command_event("output", source_id="shell_out", stdout="/tmp", stderr=""),
+        _assistant_event(source_id="shell_post"),
+    ]
+    pending_inputs.reset_for_tests()
+    pending_inputs.record(_SESSION_ID, [{"type": "input_text", "text": "!pwd"}])
+    try:
+        resp, store = _post(batch)
+
+        assert resp.status_code == 202, resp.text
+        assert len(resp.json()) == 4
+        assert [[item.type for item in call] for call in store.append_calls] == [
+            ["message"],
+            ["terminal_command"],
+            ["terminal_command", "message"],
+        ]
+        # Only the per-entry path drains, so the queued ``!pwd`` entry is gone.
+        assert pending_inputs.snapshot_for(_SESSION_ID) == []
+    finally:
+        pending_inputs.reset_for_tests()
 
 
 # ── tests: stable_id only when source_id is present ──────────────────────────

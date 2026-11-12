@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal, overload
 
 import httpx
+from pydantic import ValidationError
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.server.schemas import UsageReport
 
-from ._errors import OmnigentError
+from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
 from ._files import FilesNamespace
-from ._http import is_loopback_url
+from ._http import is_loopback_url, session_url
 from ._query import QueryResult, QueryStream
 from ._responses import ResponsesNamespace
 from ._session import Session
@@ -78,15 +80,15 @@ class OmnigentClient:
 
         async with OmnigentClient(base_url="http://localhost:8080") as client:
             result = await client.query(model="archer", input="hello")
-            print(result.text)        # the assistant's reply
-            print(result.files)       # any files the agent produced
+            print(result.text)  # the assistant's reply
+            print(result.files)  # any files the agent produced
 
     Streaming::
 
         stream = await client.query(model="archer", input="hi", stream=True)
         async for chunk in stream:
             print(chunk, end="", flush=True)
-        print(stream.files)            # populated after the stream ends
+        print(stream.files)  # populated after the stream ends
 
     Multi-turn conversation::
 
@@ -96,7 +98,9 @@ class OmnigentClient:
 
     For access to raw events or semantic blocks (tool-call display,
     reasoning, lifecycle), drop to :attr:`responses` or
-    :class:`BlockStream`.
+    :class:`BlockStream`. Server-level reads that are not tied to one
+    session — :meth:`info`, :meth:`usage` and :meth:`list_hosts` — live
+    on the client itself.
 
     :param base_url: Server base URL, e.g. ``"http://localhost:8080"``.
     :param headers: Extra headers sent on every request (e.g. auth).
@@ -104,9 +108,12 @@ class OmnigentClient:
         authentication. When set, the auth handler runs on every
         request, allowing transparent token refresh for OAuth
         flows. ``None`` (default) relies on static ``headers``.
+    :param request_hooks: Async HTTP request hooks, run after authentication.
     :param timeout: Default timeout for non-streaming HTTP requests in
         seconds. SSE streams use a 600-second read timeout so server-side
-        tool execution can pause the stream for several minutes.
+        tool execution can pause the stream for several minutes. Session
+        creation with ``host_id`` allows at least 3660 seconds for the
+        server's host-launch acknowledgement.
 
     The client follows 3xx redirects on the configured origin (including
     http→https upgrades on the same host) and refuses cross-origin hops
@@ -121,6 +128,7 @@ class OmnigentClient:
         headers: dict[str, str] | None = None,
         auth: httpx.Auth | None = None,
         timeout: float = 30.0,
+        request_hooks: list[Callable[[httpx.Request], Awaitable[None]]] | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         # Announce this as a first-party non-browser client via the sentinel
@@ -142,7 +150,10 @@ class OmnigentClient:
             # the host the caller configured. httpx raises TooManyRedirects
             # on loops.
             follow_redirects=True,
-            event_hooks={"response": [_refuse_cross_origin_redirects]},
+            event_hooks={
+                "request": request_hooks or [],
+                "response": [_refuse_cross_origin_redirects],
+            },
             # A proxy cannot reach our loopback server, so bypass the
             # environment for local targets. Loopback is plain HTTP with
             # explicit headers, so losing netrc/CA env with it costs nothing.
@@ -240,13 +251,17 @@ class OmnigentClient:
 
             from omnigent_client import tool
 
+
             @tool
             def get_time() -> str:
                 '''Return the current time.'''
                 return datetime.now().isoformat()
 
+
             result = await client.query(
-                model="archer", input="what time?", tools=[get_time],
+                model="archer",
+                input="what time?",
+                tools=[get_time],
             )
 
         Creates a single-turn session internally. For multi-turn
@@ -323,6 +338,75 @@ class OmnigentClient:
             hooks=hooks,
         )
 
+    async def info(self) -> dict[str, Any]:
+        """
+        Fetch the server's version and capability report.
+
+        Calls ``GET /v1/info`` (served without authentication) and
+        returns the raw ``ServerInfoResponse`` JSON, e.g.
+        ``info["server_version"]`` for a version check or
+        ``info["accounts_enabled"]`` to learn whether login is required.
+        Kept as a dict because the report is the server's own feature
+        inventory: a version probe must not fail against a server whose
+        inventory differs from this client's release.
+
+        :returns: The ``/v1/info`` body.
+        :raises OmnigentError: On non-2xx status or a non-JSON body.
+        """
+        resp = await self._http.get(f"{self._base_url}/v1/info")
+        raise_for_status(resp.status_code, response_body(resp))
+        return require_json_object(resp, "GET /v1/info")
+
+    async def usage(self) -> UsageReport:
+        """
+        Fetch the calling user's aggregated LLM spend.
+
+        Calls ``GET /v1/usage`` and validates the body into
+        :class:`omnigent.server.schemas.UsageReport`: UTC calendar-day
+        windows (``cost_today``, ``cost_last_7d``, ``cost_last_30d``),
+        the all-time ``total_cost_usd``, the ``daily_costs`` timeline
+        and per-session ``sessions`` detail.
+
+        :returns: The typed usage report.
+        :raises OmnigentError: On non-2xx status (401 when the server
+            requires authentication and the client sent none), or when
+            a 2xx body does not match the ``UsageReport`` schema.
+        """
+        resp = await self._http.get(f"{self._base_url}/v1/usage")
+        raise_for_status(resp.status_code, response_body(resp))
+        body = require_json_object(resp, "GET /v1/usage")
+        try:
+            return UsageReport.model_validate(body)
+        except ValidationError as exc:
+            raise OmnigentError(
+                f"GET /v1/usage returned an unexpected body "
+                f"({exc.error_count()} validation error(s))",
+                resp.status_code,
+            ) from exc
+
+    async def list_hosts(self) -> list[dict[str, Any]]:
+        """
+        List the hosts owned by the calling user.
+
+        Calls ``GET /v1/hosts`` and returns its ``hosts`` array: one
+        dict per host with ``host_id``, ``name``, ``owner``, ``status``
+        (``"online"`` or ``"offline"``), ``sandbox_provider``,
+        ``configured_harnesses`` and ``gateway_inference``, so a client
+        can choose a launch target through the public API.
+
+        :returns: Host dicts, empty when the user owns no hosts.
+        :raises OmnigentError: On non-2xx status, or when a 2xx body
+            lacks a well-formed ``hosts`` array.
+        """
+        resp = await self._http.get(f"{self._base_url}/v1/hosts")
+        raise_for_status(resp.status_code, response_body(resp))
+        hosts = require_json_object(resp, "GET /v1/hosts").get("hosts")
+        if not isinstance(hosts, list) or not all(isinstance(host, dict) for host in hosts):
+            raise OmnigentError(
+                "GET /v1/hosts returned a malformed 'hosts' array", resp.status_code
+            )
+        return hosts
+
     async def _fetch_agent_tools(
         self, agent_id: str, session_id: str | None = None
     ) -> list[dict[str, Any]]:
@@ -357,8 +441,7 @@ class OmnigentClient:
         """
         if session_id is None:
             return []  # No session context — cannot resolve agent tools
-        path = f"{self._base_url}/v1/sessions/{session_id}/agent"
-        resp = await self._http.get(path)
+        resp = await self._http.get(session_url(self._base_url, session_id, "agent"))
         if resp.status_code != 200:
             return []
         agent_data = resp.json()

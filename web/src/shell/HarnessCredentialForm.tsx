@@ -25,9 +25,10 @@ import {
   useStoreCredential,
   type DetectedCredential,
   type Host,
+  type StoreCredentialResult,
   type StoreCredentialInput,
 } from "@/hooks/useHosts";
-import { harnessCredentialAdoptFamilies } from "@/lib/harnessSetup";
+import { harnessCredentialAdoptFamilies, MIN_TMUX_VERSION } from "@/lib/harnessSetup";
 
 export function HarnessCredentialForm({
   harness,
@@ -45,7 +46,7 @@ export function HarnessCredentialForm({
   /** The server's subscription-login command (e.g. `codex login`), shown as a
    *  copy signpost — the UI can't drive browser OAuth. `null` for Pi. */
   command: string | null;
-  onDone: () => void;
+  onDone: (result: StoreCredentialResult) => void;
 }) {
   // What the user sees in toasts — the friendly name, not the canonical id.
   const display = label ?? harness;
@@ -57,7 +58,12 @@ export function HarnessCredentialForm({
   // (and persist) a cross-family key, e.g. an Anthropic key for Codex. Pi
   // consumes both families, so it can adopt an openai OR an anthropic key.
   const adoptFamilies = harnessCredentialAdoptFamilies(harness);
-  const adoptable = (detected ?? []).find((d) => d.env_var && adoptFamilies.includes(d.family));
+  const adoptable = (detected ?? []).find(
+    (credential) =>
+      credential.family !== "databricks" &&
+      credential.env_var &&
+      adoptFamilies.includes(credential.family),
+  );
 
   const [apiKey, setApiKey] = useState("");
   const [gatewayUrl, setGatewayUrl] = useState("");
@@ -78,7 +84,12 @@ export function HarnessCredentialForm({
         // "ready" then would contradict the still-yellow dot. Only close the
         // form when the harness actually turned ready, so a not-ready result
         // keeps the options visible to try another.
-        const ready = result.configured_harnesses[harness] === true;
+        const availability = result.configured_harnesses[harness];
+        const ready = availability === true;
+        // The host reports "tmux-unavailable" only for an otherwise ready native
+        // harness, so the credential worked and tmux is what's left. Close the
+        // form and let the parent show the tmux step.
+        const onlyTmuxMissing = availability === "tmux-unavailable";
         // Clear the secret fields so a saved value doesn't linger in the input
         // (the form stays open on a not-ready result to try another option).
         setApiKey("");
@@ -86,7 +97,12 @@ export function HarnessCredentialForm({
         setGatewayKey("");
         if (ready) {
           showToast(`${display} is ready on ${host.name}.`);
-          onDone();
+          onDone(result);
+        } else if (onlyTmuxMissing) {
+          showToast(
+            `Saved. ${display} still needs tmux ${MIN_TMUX_VERSION} or newer on ${host.name}.`,
+          );
+          onDone(result);
         } else {
           showToast(
             `Saved, but ${display} still needs setup on ${host.name}. Try another option.`,

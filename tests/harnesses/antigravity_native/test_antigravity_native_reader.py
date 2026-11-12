@@ -3863,9 +3863,10 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
 ) -> None:
     """``_rotate_session_for_cascade`` runs claude's exact session-rotation sequence.
 
-    Asserts: GET old snapshot → POST /v1/sessions (agent_id + inherited labels) →
-    PATCH runner_id → POST terminal transfer → PATCH old runner_id="" — and that
-    bridge state is rewritten with the new session id + new cascade id. Crucially,
+    Asserts: GET old snapshot → POST /v1/sessions (agent_id, title, project + labels) →
+    PATCH runner_id → POST terminal transfer → PATCH old runner_id="" → the
+    ``/clear`` notice to the OLD session — and that bridge state is rewritten with
+    the new session id + new cascade id. Crucially,
     NO ``external_session_id`` PATCH is made: agy is one long-lived process hosting
     many cascades, so the new cascade is already live (reached via the rewritten
     bridge state, not a later ``--resume``), exactly as claude's
@@ -3883,6 +3884,8 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
         "agent_id": "agent_xyz",
         "runner_id": "runner_abc",
         "labels": {ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: "bridge-123"},
+        "title": "Fix login flow",
+        "project_id": "proj_alpha",
     }
     calls: list[tuple[str, str, dict[str, object]]] = []
     async with _rotation_client(monkeypatch, calls=calls, snapshot=snapshot) as client:
@@ -3906,18 +3909,34 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
             f"/v1/sessions/{_SESSION_ID}/resources/terminals/terminal_antigravity_main/transfer",
         ),
         ("PATCH", f"/v1/sessions/{_SESSION_ID}"),  # release old runner
+        # The shared /clear notice to the OLD conversation.
+        ("POST", f"/v1/sessions/{_SESSION_ID}/events"),
+        ("POST", f"/v1/sessions/{_SESSION_ID}/events"),
+        ("POST", f"/v1/sessions/{_SESSION_ID}/events"),
     ]
+    event_bodies = [b for (_m, p, b) in calls if p == f"/v1/sessions/{_SESSION_ID}/events"]
+    assert [b.get("type") for b in event_bodies] == [
+        "external_session_status",
+        "external_conversation_item",
+        "external_session_superseded",
+    ]
+    assert event_bodies[1]["data"]["item_data"]["agent"] == "antigravity-native-ui"
+    assert event_bodies[2].get("data") == {"target_conversation_id": "conv_new"}
     # No external_session_id PATCH is made anywhere (the loop-bug source): every
     # PATCH body is a runner_id bind/release, never an external_session_id write.
     assert all("external_session_id" not in body for (_m, _p, body) in calls), (
         f"rotation must not PATCH external_session_id (claude parity); calls={calls!r}"
     )
-    # The create POST inherited the old agent_id + bridge-id label (so the new
-    # session resolves to the same bridge_dir).
+    # The create POST inherited the old agent_id, title, project + bridge-id label
+    # (so the new session resolves to the same bridge_dir).
     create_body = calls[1][2]
     assert create_body["agent_id"] == "agent_xyz"
     assert isinstance(create_body["labels"], dict)
     assert create_body["labels"][ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY] == "bridge-123"
+    assert create_body.get("title") == "Fix login flow"
+    assert create_body.get("project_id") == "proj_alpha"
+    assert create_body.get("workspace", "missing") is None
+    assert create_body.get("git", "missing") is None
     # The runner_id bind carried the old runner; the new session is owned by it.
     assert calls[2][2] == {"runner_id": "runner_abc"}
     # The terminal transfer targeted the new session (the SAME agy moves over).

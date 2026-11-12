@@ -300,6 +300,27 @@ describe("itemsToBlocks — flat shape", () => {
     expect(td?.interrupted).toBe(true);
   });
 
+  it.each([
+    ["commentary", "commentary"],
+    ["summary", undefined],
+  ] as const)("assistant phase %s reaches TextDone as %s", (stored, expected) => {
+    // The server stores phases this client may not know yet; only known ones apply.
+    const items: ConversationItem[] = [
+      {
+        id: "msg_commentary",
+        response_id: "codex_turn_123",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        model: "codex-native-ui",
+        phase: stored,
+        content: [{ type: "output_text", text: "Checking the tests." }],
+      },
+    ];
+    const td = itemsToBlocks(items).find((b): b is TextDone => b.type === "text_done");
+    expect(td?.phase).toBe(expected);
+  });
+
   it("error items carry an info level through to the block only when set", () => {
     const base = {
       response_id: "resp_notice",

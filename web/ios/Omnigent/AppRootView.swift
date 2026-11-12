@@ -78,7 +78,9 @@ struct AppRootView: View {
       }
     }
     .environmentObject(theme)
+    .background(Color(uiColor: DesignTokens.nativeBackground).ignoresSafeArea())
     .preferredColorScheme(theme.source.colorScheme)
+    .onAppear { theme.apply(theme.source) }
     .task {
       guard shouldAutoOpenSavedServer else { return }
       // A deep link that arrived before this task ran already moved us off the

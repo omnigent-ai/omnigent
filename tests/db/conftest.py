@@ -18,10 +18,12 @@ non-DDL ``tests/db`` unit tests stay fully parallel).
 from __future__ import annotations
 
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
+from sqlalchemy import Engine
 
 # One lock file per runner; all workers on the host contend on it.
 _CRDB_SCHEMA_LOCK = Path(tempfile.gettempdir()) / "omnigent-crdb-schema-ddl.lock"
@@ -44,3 +46,27 @@ def _serialize_crdb_schema_ddl(
 
     with FileLock(str(_CRDB_SCHEMA_LOCK)):
         yield
+
+
+@pytest.fixture()
+def record_terminators(monkeypatch: pytest.MonkeyPatch) -> Callable[[Engine], list[str]]:
+    """Record every COMMIT/ROLLBACK an engine sends, including pool resets."""
+
+    def _record(engine: Engine) -> list[str]:
+        terminators: list[str] = []
+        dialect = engine.dialect
+        real_commit, real_rollback = dialect.do_commit, dialect.do_rollback
+
+        def _commit(dbapi_connection: Any) -> None:
+            terminators.append("COMMIT")
+            real_commit(dbapi_connection)
+
+        def _rollback(dbapi_connection: Any) -> None:
+            terminators.append("ROLLBACK")
+            real_rollback(dbapi_connection)
+
+        monkeypatch.setattr(dialect, "do_commit", _commit)
+        monkeypatch.setattr(dialect, "do_rollback", _rollback)
+        return terminators
+
+    return _record

@@ -426,7 +426,10 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     dead.wait()
     dead_dir = root / "deadowner"
     dead_dir.mkdir()
-    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+    marker = dead_dir / "owner.pid"
+    marker.write_text(str(dead.pid), encoding="utf-8")
+    expired = pi_native_bridge.time.time() - pi_native_bridge._ORPHAN_RETENTION_SECONDS - 1
+    os.utime(marker, (expired, expired))
 
     live_dir = root / "liveowner"
     live_dir.mkdir()
@@ -441,3 +444,82 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("recent_marker", "recent_session", "expected_pruned"),
+    [(True, False, 0), (False, True, 0), (False, False, 1), (None, True, 0), (None, False, 1)],
+)
+def test_prune_uses_latest_pi_session_activity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recent_marker: bool | None,
+    recent_session: bool,
+    expected_pruned: int,
+) -> None:
+    import os
+
+    root = tmp_path / "pi-native"
+    bridge = root / "session"
+    sessions = bridge / "sessions"
+    sessions.mkdir(parents=True)
+    marker = bridge / "owner.pid"
+    if recent_marker is not None:
+        marker.write_text("999999")
+    native_session = sessions / "session.jsonl"
+    native_session.write_text('{"type":"message","message":{"usage":{"totalTokens":800000}}}\n')
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    now = 2_000_000_000.0
+    monkeypatch.setattr(pi_native_bridge.time, "time", lambda: now)
+    expired = now - pi_native_bridge._ORPHAN_RETENTION_SECONDS
+    for path, recent in ((marker, recent_marker), (native_session, recent_session)):
+        if recent is None:
+            continue
+        stamp = now - 60 if recent else expired
+        os.utime(path, (stamp, stamp))
+    if recent_marker is None:
+        for path in (bridge, sessions):
+            os.utime(path, (expired, expired))
+
+    assert pi_native_bridge.prune_orphaned_bridge_dirs() == expected_pruned
+    assert native_session.exists() is (expected_pruned == 0)
+
+
+def test_prune_retains_pi_session_on_scan_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "pi-native"
+    bridge = root / "session"
+    bridge.mkdir(parents=True)
+    marker = bridge / "owner.pid"
+    marker.write_text("999999")
+    # An unreadable or malformed sessions directory must not cost native history.
+    (bridge / "sessions").write_text("not a directory")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    monkeypatch.setattr(pi_native_bridge.time, "time", lambda: 3_000_000_000.0)
+
+    assert pi_native_bridge.prune_orphaned_bridge_dirs() == 0
+    assert marker.exists()
+
+
+def test_write_agent_instructions_replaces_symlink_and_clears_stale_text(tmp_path: Path) -> None:
+    target = tmp_path / "unrelated.md"
+    target.write_text("unchanged")
+    path = tmp_path / "agent_instructions.md"
+    path.symlink_to(target)
+    instructions = "  Authored role. π\nKeep whitespace.  "
+
+    assert pi_native_bridge.write_agent_instructions(tmp_path, instructions) == path
+    assert not path.is_symlink()
+    assert target.read_text() == "unchanged"
+    assert path.read_text() == instructions
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert not list(tmp_path.glob(".*.tmp"))
+
+    assert pi_native_bridge.write_agent_instructions(tmp_path, "Updated role") == path
+    assert path.read_text() == "Updated role"
+    assert pi_native_bridge.write_agent_instructions(tmp_path, None) is None
+    assert not path.exists()
+    assert pi_native_bridge.write_agent_instructions(tmp_path, None) is None

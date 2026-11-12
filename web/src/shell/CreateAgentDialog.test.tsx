@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import userEvent from "@testing-library/user-event";
 
 import { CreateAgentDialog } from "./CreateAgentDialog";
 
@@ -45,10 +46,40 @@ describe("CreateAgentDialog", () => {
     );
     expect(screen.getByTestId("create-agent-submit")).toBeDisabled();
 
-    fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "agent-1" } });
+    fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: " agent-1 " } });
     expect(screen.queryByTestId("create-agent-name-error")).toBeNull();
     fireEvent.click(screen.getByTestId("create-agent-submit"));
     expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({ name: "agent-1" }));
+    expect(screen.getByTestId("create-agent-name")).toHaveValue("");
+    expect(screen.getByTestId("create-agent-model")).toHaveValue("");
+  });
+
+  it("only creates on an explicit click, not Enter in a field", async () => {
+    const user = userEvent.setup();
+    const onCreate = vi.fn();
+    renderDialog({ onCreate });
+    await user.type(screen.getByTestId("create-agent-name"), "agent-1");
+    await user.type(screen.getByTestId("create-agent-model"), "test-model{Enter}");
+    expect(onCreate).not.toHaveBeenCalled();
+    await user.click(screen.getByTestId("create-agent-submit"));
+    expect(onCreate).toHaveBeenCalledOnce();
+  });
+
+  it.each(["Cancel", "Close"])("resets the draft on %s without relying on unmount", (action) => {
+    const onOpenChange = vi.fn();
+    renderDialog({ onOpenChange });
+    for (const field of ["name", "model", "description", "instructions"]) {
+      fireEvent.change(screen.getByTestId(`create-agent-${field}`), {
+        target: { value: "draft" },
+      });
+    }
+    fireEvent.click(screen.getByTestId("create-agent-add-mcp"));
+    fireEvent.click(screen.getByRole("button", { name: action }));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    for (const field of ["name", "model", "description", "instructions"]) {
+      expect(screen.getByTestId(`create-agent-${field}`)).toHaveValue("");
+    }
+    expect(screen.queryByTestId("create-agent-mcp-entry")).toBeNull();
   });
 
   it("hides Import bundle without an import handler", () => {
@@ -85,7 +116,7 @@ describe("CreateAgentDialog", () => {
     expect(screen.getByTestId("create-agent-import")).not.toBeDisabled();
   });
 
-  it("locks Cancel and Create while an import is in flight", async () => {
+  it("locks dismissal and Create while an import is in flight", async () => {
     let finish: () => void = () => {};
     const onImport = vi.fn(
       () =>
@@ -93,7 +124,8 @@ describe("CreateAgentDialog", () => {
           finish = resolve;
         }),
     );
-    renderDialog({ onImport });
+    const onOpenChange = vi.fn();
+    renderDialog({ onImport, onOpenChange });
 
     fireEvent.change(screen.getByTestId("create-agent-import-input"), {
       target: { files: [bundle] },
@@ -101,7 +133,15 @@ describe("CreateAgentDialog", () => {
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled());
     expect(screen.getByTestId("create-agent-submit")).toBeDisabled();
+    expect(screen.getByTestId("create-agent-name")).toBeEnabled();
+    expect(screen.getByTestId("create-agent-add-mcp")).toBeEnabled();
+    fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "draft" } });
+    expect(screen.getByTestId("create-agent-name")).toHaveValue("draft");
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(onOpenChange).not.toHaveBeenCalled();
     finish();
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
     await waitFor(() => expect(screen.getByTestId("create-agent-import")).not.toBeDisabled());
+    expect(screen.getByTestId("create-agent-name")).toHaveValue("");
   });
 });

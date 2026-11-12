@@ -7,18 +7,26 @@ import {
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 import type { SessionFilter } from "@/lib/sessionFilterPreferences";
-import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import {
+  clearRecentlyCreated,
+  markRecentlyCreated,
+  PINNED_LABEL_KEY,
+} from "@/lib/sessionListCache";
 import { sessionRowsPage, type ScopeCacheData } from "@/lib/sidebarData";
 import type { Session } from "@/lib/types";
 import type * as IdentityModule from "@/lib/identity";
 import {
   PINNED_CONVERSATIONS_KEY,
   useTogglePinnedConversation,
+  useProjectSessions,
   type Conversation,
 } from "./useConversations";
 import { SidebarDataProvider, useSidebarData, useSidebarView } from "./useSidebarData";
+import { useArchivedSessions } from "./useScopeCache";
 import { useDirectorySessions } from "./useDirectorySessions";
 
 const identity = vi.hoisted(() => ({
@@ -47,6 +55,7 @@ let client: QueryClient;
 let config: SidebarConfig;
 let view: SessionFilter;
 let mounted: boolean;
+let groupingUi = false;
 function View() {
   useSidebarView(view);
   return null;
@@ -54,10 +63,14 @@ function View() {
 function wrapper({ children }: { children: ReactNode }) {
   return (
     <QueryClientProvider client={client}>
-      <SidebarDataProvider config={config}>
-        {mounted && <View />}
-        {children}
-      </SidebarDataProvider>
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { sidebar_grouping_ui: groupingUi } }}
+      >
+        <SidebarDataProvider config={config}>
+          {mounted && <View />}
+          {children}
+        </SidebarDataProvider>
+      </CapabilitiesProvider>
     </QueryClientProvider>
   );
 }
@@ -71,12 +84,16 @@ const response = (rows: Conversation[], more = false) => ({
   json: async () => sessionRowsPage(rows, more),
 });
 beforeEach(() => {
+  groupingUi = false;
+  localStorage.clear();
   identity.viewerId = null;
   identity.resolution = Promise.resolve(null);
   view = "mine";
   mounted = true;
   config = { ...sidebarConfig, inboxIncludesShared: false, pinsIncludeShared: false };
-  client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
+  client = new QueryClient({
+    defaultOptions: { queries: { retry: false, retryDelay: 0, gcTime: Infinity } },
+  });
   fetchMock.mockReset().mockImplementation(async (url: string) => {
     const p = params(url);
     const shared = p.get("visibility") === "shared";
@@ -97,6 +114,9 @@ beforeEach(() => {
   vi.stubGlobal("fetch", fetchMock);
 });
 afterEach(() => {
+  localStorage.clear();
+  clearRecentlyCreated();
+  vi.restoreAllMocks();
   cleanup();
   client.clear();
   vi.useRealTimers();
@@ -468,3 +488,200 @@ it.each([true, false])(
     expect(fetchMock.mock.calls).toHaveLength(requestsBeforeIdentity);
   },
 );
+
+it("gates Created ordering and separates its pagination from Updated caches", async () => {
+  localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "created" }));
+  view = "all";
+  const { result, rerender } = renderHook(useSidebarData, { wrapper });
+  await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
+  expect(
+    [...listCalls("mine"), ...listCalls("shared")].every(
+      ([url]) => params(url).get("sort_by") === "updated_at",
+    ),
+  ).toBe(true);
+  groupingUi = true;
+  fetchMock.mockClear();
+  rerender();
+  await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
+  expect(result.current.sortBy).toBe("created_at");
+  expect(listCalls("mine")).toHaveLength(1);
+  expect(listCalls("shared")).toHaveLength(1);
+  await act(async () => {
+    await result.current.all.fetchNextPage();
+  });
+  await act(async () => {
+    await result.current.all.refetch?.();
+  });
+  expect(
+    [...listCalls("mine"), ...listCalls("shared")].every(
+      ([url]) => params(url).get("sort_by") === "created_at",
+    ),
+  ).toBe(true);
+  expect(listCalls("mine").some(([url]) => params(url).has("after"))).toBe(true);
+  expect(
+    client.getQueryData(["conversations", "", false, null, "mine", "created_at"]),
+  ).toBeDefined();
+  expect(client.getQueryData(["conversations", "", false, null, "mine"])).toBeDefined();
+  await act(async () => {
+    result.current.updateView({ ordering: "updated" });
+  });
+  expect(result.current.sortBy).toBe("updated_at");
+  expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).ordering).toBe("updated");
+});
+
+it.each([false, true])(
+  "clears destination sort snapshots while folders, pins and Archived reload (archived folder: %s)",
+  async (archivedFolder) => {
+    groupingUi = true;
+    view = "all";
+    client.setQueryDefaults(["project-sessions"], { staleTime: 30_000 });
+    let updatedAt = 100;
+    let release!: () => void;
+    let pending = Promise.resolve();
+    fetchMock.mockImplementation(async (url: string) => {
+      await pending;
+      const p = params(url);
+      const next: Conversation = {
+        ...row(p.get("visibility") ?? "mine", p.get("visibility") === "shared"),
+        updated_at: updatedAt,
+        archived: p.get("visibility") === "archived" || p.get("include_archived") === "true",
+        labels: p.has("pinned") ? { [PINNED_LABEL_KEY]: "1" } : {},
+      };
+      return response([next]);
+    });
+    const { result } = renderHook(
+      () => {
+        const sidebar = useSidebarData();
+        const folder = useProjectSessions("folder", true, sidebar.sortBy, archivedFolder);
+        const archived = useArchivedSessions(true, sidebar.sortBy);
+        return { ...sidebar, folder, archived };
+      },
+      { wrapper },
+    );
+    const timestamps = () => [
+      ...[
+        result.current.mine,
+        result.current.shared,
+        result.current.folder,
+        result.current.archived,
+      ].map((query) => query.data?.pages[0].data[0]?.updated_at),
+      result.current.pinned.data?.conversations[0]?.updated_at,
+    ];
+    await waitFor(() => expect(timestamps()).toEqual([100, 100, 100, 100, 100]));
+    act(() => result.current.updateView({ ordering: "created" }));
+    await waitFor(() => expect(timestamps()).toEqual([100, 100, 100, 100, 100]));
+    updatedAt = 200;
+    await act(async () => {
+      await result.current.all.refetch?.();
+    });
+    await waitFor(() => expect(result.current.mine.data?.pages[0].data[0].updated_at).toBe(200));
+    expect(
+      client.getQueryData<ScopeCacheData>(["conversations", "", false, null, "mine"])?.pages[0]
+        .data[0].updated_at,
+    ).toBe(100);
+
+    const unrelatedKey = ["conversations", "search", false];
+    const unrelatedData = {
+      pages: [sessionRowsPage([row("search-result")])],
+      pageParams: [undefined],
+    };
+    client.setQueryData(unrelatedKey, unrelatedData);
+    pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    fetchMock.mockClear();
+    act(() => result.current.updateView({ ordering: "updated" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
+    expect(timestamps()).toEqual([undefined, undefined, undefined, undefined, undefined]);
+    expect(
+      [
+        result.current.mine,
+        result.current.shared,
+        result.current.folder,
+        result.current.archived,
+        result.current.pinned,
+      ].every((query) => query.isLoading),
+    ).toBe(true);
+    expect(client.getQueryData(unrelatedKey)).toBe(unrelatedData);
+    await act(async () => {
+      release();
+    });
+    await waitFor(() => expect(timestamps()).toEqual([200, 200, 200, 200, 200]));
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock.mock.calls.every(([url]) => params(url).get("sort_by") === "updated_at")).toBe(
+      true,
+    );
+    expect(
+      client.getQueryState(["conversations", "", false, null, "mine", "created_at"])?.isInvalidated,
+    ).toBe(true);
+    expect(
+      client.getQueryState(["project-sessions", "folder", "created_at", archivedFolder])
+        ?.isInvalidated,
+    ).toBe(true);
+
+    updatedAt = 300;
+    pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    fetchMock.mockClear();
+    act(() => result.current.updateView({ ordering: "created" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
+    expect(timestamps()).toEqual([undefined, undefined, undefined, undefined, undefined]);
+    await act(async () => {
+      release();
+    });
+    await waitFor(() => expect(timestamps()).toEqual([300, 300, 300, 300, 300]));
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    fetchMock.mockClear();
+    act(() => result.current.updateView({ ordering: "created", grouping: "status" }));
+    expect(fetchMock).not.toHaveBeenCalled();
+  },
+);
+
+it("keeps Custom on its base's caches and saves cutoff-second arrivals through storage failures", async () => {
+  groupingUi = true;
+  const { result } = renderHook(useSidebarData, { wrapper });
+  await waitFor(() => expect(result.current.mine.isSuccess).toBe(true));
+  fetchMock.mockClear();
+  const custom = { base: "updated", since: 100, ids: ["mine"] } as const;
+  act(() => result.current.updateView({ ordering: "custom", custom }));
+  expect(result.current.sortBy).toBe("updated_at");
+  expect(result.current.customOrder?.positions.get("mine")).toBe(0);
+  expect(fetchMock).not.toHaveBeenCalled();
+
+  // Same-second history stays below; a session this tab saw created then is new.
+  const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new DOMException("Quota exceeded", "QuotaExceededError");
+  });
+  const arrival = { ...row("arrival"), created_at: 100 };
+  markRecentlyCreated(arrival);
+  act(() =>
+    client.setQueryData<ScopeCacheData>(["conversations", "", false, null, "mine"], (data) => ({
+      ...data!,
+      pages: [sessionRowsPage([arrival, { ...row("history"), created_at: 100 }, row("mine")])],
+    })),
+  );
+  await waitFor(() => expect(result.current.view.custom?.ids).toEqual(["arrival", "mine"]));
+  expect(result.current.loadedRows.map((r) => r.id)).toContain("history");
+  expect(setItem).toHaveBeenCalled();
+  setItem.mockRestore();
+  // Loading more history, including the cutoff second, never writes the preference.
+  const writes = vi.spyOn(Storage.prototype, "setItem");
+  act(() =>
+    client.setQueryData<ScopeCacheData>(["conversations", "", false, null, "mine"], (data) => ({
+      ...data!,
+      pages: [...data!.pages, sessionRowsPage([row("older"), { ...row("tie"), created_at: 100 }])],
+    })),
+  );
+  await waitFor(() => expect(result.current.loadedRows.map((r) => r.id)).toContain("tie"));
+  expect(writes).not.toHaveBeenCalled();
+  expect(result.current.view.custom?.ids).toEqual(["arrival", "mine"]);
+  act(() => result.current.updateView({ ordering: "created" }));
+  expect(result.current.sortBy).toBe("created_at");
+  act(() => result.current.updateView({ ordering: "custom" }));
+  expect(result.current.sortBy).toBe("updated_at");
+  expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).custom.ids).toEqual([
+    "arrival",
+    "mine",
+  ]);
+});

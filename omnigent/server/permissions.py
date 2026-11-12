@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from omnigent.entities import Conversation, ResolvedAccess
 from omnigent.server.auth import LEVEL_MANAGE, LEVEL_OWNER
+from omnigent.server.sharing_settings import effective_public_level
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
@@ -86,7 +87,8 @@ def resolved_allows(access: ResolvedAccess, required_level: int) -> bool:
         return True
     if access.user_grant_level is not None and access.user_grant_level >= required_level:
         return True
-    if access.public_grant_level is not None and access.public_grant_level >= required_level:
+    public_level = effective_public_level(access.public_grant_level)
+    if public_level is not None and public_level >= required_level:
         return True
     return False
 
@@ -95,11 +97,8 @@ def resolved_level(access: ResolvedAccess) -> int | None:
     """The effective level for UI display from a resolved-access snapshot.
 
     The in-memory equivalent of :meth:`PermissionStore.get_permission_level`:
-    admin → ``LEVEL_OWNER``; otherwise the user's own grant, falling back to
-    the ``"__public__"`` grant, else ``None``. Note this deliberately prefers
-    the user's own grant over a (possibly higher) public grant, matching the
-    store — so it can differ from :func:`resolved_allows`, which is satisfied
-    by either.
+    admin → ``LEVEL_OWNER``; otherwise the maximum of the direct grant and
+    the capped public grant, or ``None`` if neither grants access.
 
     :param access: The resolved-access snapshot for one ``(user, conv)``.
     :returns: Numeric level (1/2/3/4), or ``None`` when the user has no
@@ -107,9 +106,12 @@ def resolved_level(access: ResolvedAccess) -> int | None:
     """
     if access.is_admin:
         return LEVEL_OWNER
-    if access.user_grant_level is not None:
-        return access.user_grant_level
-    return access.public_grant_level
+    levels = [
+        level
+        for level in (access.user_grant_level, effective_public_level(access.public_grant_level))
+        if level is not None
+    ]
+    return max(levels) if levels else None
 
 
 def check_is_manager(

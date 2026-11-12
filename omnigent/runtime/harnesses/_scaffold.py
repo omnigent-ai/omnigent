@@ -52,6 +52,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.errors import ErrorCode, HarnessTransportClosedError, OmnigentError
+from omnigent.inner.executor import (
+    LiveMcpHarnessNotRunning,
+    LiveMcpReconnectRefused,
+    LiveMcpServerStatus,
+    LiveMcpServerUnknown,
+)
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.tool_output import cap_tool_output
@@ -61,6 +67,7 @@ from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestEvent,
     ElicitationRequestParams,
+    ElicitationResolvedEvent,
     ElicitationResult,
     FailedEvent,
     HarnessStreamEvent,
@@ -102,6 +109,12 @@ _SHUTDOWN_GRACE_S = 4.5
 # (now rare) expiry the fallback below is phase-aware — TOOL_CALL fails CLOSED
 # (DENY), advisory LLM/TOOL_RESULT phases fail OPEN (ALLOW).
 _POLICY_EVAL_TIMEOUT_S = 86400.0
+
+# Only these phases can park server-side on a human ASK (see the
+# ``policies/evaluate`` route). The others answer in seconds, so a verdict
+# lost in delivery must not stall the turn for the full human-wait budget.
+_HUMAN_GATED_POLICY_PHASES = frozenset({"PHASE_TOOL_CALL", "PHASE_LLM_REQUEST", "PHASE_REQUEST"})
+_UNGATED_POLICY_EVAL_TIMEOUT_S = 120.0
 
 # Stable, client-visible error code for a turn-context desync (the inner SDK
 # generation outlived its turn — an orphaned tool/policy callback, or a turn
@@ -617,6 +630,8 @@ class TurnContext:
         resolves the parked Future when upstream sends the reply.
         See §Elicitation in the design doc.
 
+        Always emits ``response.elicitation_resolved`` on exit; idempotent.
+
         :param elicitation_id: Unique correlation id for this
             elicitation, e.g. ``"elicit_abc123"``. Must appear
             in the URL of the upstream reply.
@@ -636,11 +651,21 @@ class TurnContext:
                 params=params,
             )
         )
+        result: ElicitationResult | None = None
         try:
-            return await future
+            result = await future
+            return result
         finally:
             self._pending_elicitations.pop(elicitation_id, None)
             self._pending_human_waits -= 1
+            self.emit(
+                ElicitationResolvedEvent(
+                    type="response.elicitation_resolved",
+                    elicitation_id=elicitation_id,
+                    action=result.action if result is not None else None,
+                    reason="unanswered" if result is None else None,
+                )
+            )
 
     async def next_injection(self, timeout: float | None = None) -> CreateResponseRequest | None:
         """
@@ -665,7 +690,7 @@ class TurnContext:
             if timeout is None:
                 return await self._injection_queue.get()
             return await asyncio.wait_for(self._injection_queue.get(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
 
     def _complete_tool(self, call_id: str, output: str) -> bool:
@@ -727,9 +752,18 @@ class TurnContext:
         """
         future: asyncio.Future[PolicyVerdictPayload] = asyncio.get_running_loop().create_future()
         self._pending_policy_evaluations[evaluation_id] = future
+        human_gated = phase in _HUMAN_GATED_POLICY_PHASES
+        timeout_s = (
+            _POLICY_EVAL_TIMEOUT_S
+            if human_gated
+            else min(_POLICY_EVAL_TIMEOUT_S, _UNGATED_POLICY_EVAL_TIMEOUT_S)
+        )
         # Unlike elicit's unbounded park, this wait is already bounded by
-        # the wait_for below; the counter only holds the idle window open.
-        self._pending_human_waits += 1
+        # the wait_for below; the counter only holds the idle window open,
+        # and only for phases that can actually wait on a human.
+        if human_gated:
+            self._pending_human_waits += 1
+        _logger.info("Policy evaluation %s requested (phase=%s)", evaluation_id, phase)
         self.emit(
             PolicyEvaluationRequestEvent(
                 type="policy_evaluation.requested",
@@ -739,8 +773,10 @@ class TurnContext:
             )
         )
         try:
-            return await asyncio.wait_for(future, timeout=_POLICY_EVAL_TIMEOUT_S)
-        except asyncio.TimeoutError:
+            verdict = await asyncio.wait_for(future, timeout=timeout_s)
+            _logger.info("Policy evaluation %s resolved: %s", evaluation_id, verdict.action)
+            return verdict
+        except TimeoutError:
             # Phase-aware default: advisory LLM phases and TOOL_RESULT (the
             # tool already ran) fail OPEN so a missing verdict never hangs the
             # turn, but TOOL_CALL is the authoritative gate for
@@ -750,7 +786,7 @@ class TurnContext:
             _logger.warning(
                 "Policy evaluation %s timed out after %ds; defaulting to %s",
                 evaluation_id,
-                _POLICY_EVAL_TIMEOUT_S,
+                timeout_s,
                 _action,
             )
             return PolicyVerdictPayload(
@@ -763,7 +799,8 @@ class TurnContext:
             )
         finally:
             self._pending_policy_evaluations.pop(evaluation_id, None)
-            self._pending_human_waits -= 1
+            if human_gated:
+                self._pending_human_waits -= 1
 
     def _complete_policy_evaluation(
         self, evaluation_id: str, verdict: PolicyVerdictPayload
@@ -811,6 +848,48 @@ class TurnContext:
                 policy_future.cancel()
 
 
+# Long enough for a harness's reason, short enough for one row of the /mcp panel.
+_LIVE_MCP_DETAIL_MAX_CHARS = 300
+
+
+def _live_mcp_body(statuses: list[LiveMcpServerStatus] | None) -> dict[str, Any]:
+    """The wire body for a harness's MCP connections; ``None`` means none are running."""
+    return {
+        "running": statuses is not None,
+        "servers": [
+            {
+                key: value
+                for key, value in (
+                    ("name", entry.name),
+                    ("status", entry.status),
+                    ("error", entry.error),
+                    ("scope", entry.scope),
+                )
+                if value is not None
+            }
+            for entry in statuses or []
+        ],
+    }
+
+
+async def _live_mcp_server_name(request: Request) -> str | None:
+    """The non-empty ``name`` string in a JSON request body, else ``None``."""
+    try:
+        body = await request.json()
+    except ValueError:
+        return None
+    name = body.get("name") if isinstance(body, dict) else None
+    return name if isinstance(name, str) and name.strip() else None
+
+
+def _live_mcp_detail(exc: BaseException) -> str:
+    return str(exc).strip()[:_LIVE_MCP_DETAIL_MAX_CHARS]
+
+
+def _live_mcp_failure(status_code: int, error: str) -> JSONResponse:
+    return JSONResponse({"error": error}, status_code=status_code)
+
+
 class HarnessApp:
     """
     Base class for harness wraps. Subclasses implement
@@ -822,12 +901,9 @@ class HarnessApp:
     .. code-block:: python
 
         class MyHarnessApp(HarnessApp):
-            async def run_turn(
-                self, request: CreateResponseRequest, ctx: TurnContext
-            ) -> None:
-                ctx.emit(OutputTextDeltaEvent(
-                    type="response.output_text.delta", delta="hi"
-                ))
+            async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+                ctx.emit(OutputTextDeltaEvent(type="response.output_text.delta", delta="hi"))
+
 
         def create_app() -> FastAPI:
             return MyHarnessApp().build()
@@ -889,6 +965,28 @@ class HarnessApp:
 
         The base implementation is a no-op.
         """
+
+    def supports_live_mcp_control(self) -> bool:
+        """Whether this harness reports and reconnects its own MCP connections."""
+        return False
+
+    async def live_mcp_statuses(self) -> list[LiveMcpServerStatus] | None:
+        """The harness's MCP connections, or ``None`` while it has none running.
+
+        Only called when :meth:`supports_live_mcp_control` is true.
+        """
+        raise NotImplementedError
+
+    async def reconnect_live_mcp_server(self, name: str) -> None:
+        """Reconnect one of the harness's MCP servers.
+
+        Only called when :meth:`supports_live_mcp_control` is true.
+
+        :raises LiveMcpHarnessNotRunning: The harness has no MCP connections running.
+        :raises LiveMcpServerUnknown: The harness reports no server named *name*.
+        :raises LiveMcpReconnectRefused: The harness tried and gave its reason.
+        """
+        raise NotImplementedError
 
     async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         """
@@ -1116,7 +1214,84 @@ class HarnessApp:
             # heterogeneous return type.
             response_model=None,
         )
+        router.add_api_route(
+            "/sessions/{conversation_id}/mcp-status",
+            self._get_live_mcp_status,
+            methods=["GET"],
+            response_model=None,
+        )
+        router.add_api_route(
+            "/sessions/{conversation_id}/mcp-reconnect",
+            self._post_live_mcp_reconnect,
+            methods=["POST"],
+            response_model=None,
+        )
         return router
+
+    def _live_mcp_request_error(self, request: Request, conversation_id: str) -> Response | None:
+        """Authorize a live-MCP request; refuse one this harness cannot answer."""
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        if not self.supports_live_mcp_control():
+            return JSONResponse(
+                {"error": "unsupported", "detail": "This harness does not report MCP status."},
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        return None
+
+    async def _get_live_mcp_status(self, conversation_id: str, request: Request) -> Response:
+        """Handle ``GET /v1/sessions/{conversation_id}/mcp-status``."""
+        refused = self._live_mcp_request_error(request, conversation_id)
+        if refused is not None:
+            return refused
+        try:
+            statuses = await self.live_mcp_statuses()
+        except TimeoutError:
+            return _live_mcp_failure(status.HTTP_504_GATEWAY_TIMEOUT, "mcp_status_timeout")
+        except Exception:
+            _logger.warning("Reading live MCP status failed", exc_info=True)
+            return _live_mcp_failure(status.HTTP_502_BAD_GATEWAY, "mcp_status_failed")
+        return JSONResponse(_live_mcp_body(statuses))
+
+    async def _post_live_mcp_reconnect(self, conversation_id: str, request: Request) -> Response:
+        """Handle ``POST /v1/sessions/{conversation_id}/mcp-reconnect`` with ``{"name": ...}``.
+
+        Answers with the connections as they stand after the reconnect.
+        """
+        refused = self._live_mcp_request_error(request, conversation_id)
+        if refused is not None:
+            return refused
+        server_name = await _live_mcp_server_name(request)
+        if server_name is None:
+            return _live_mcp_failure(status.HTTP_400_BAD_REQUEST, "invalid_request")
+        reconnect_error: str | None = None
+        try:
+            await self.reconnect_live_mcp_server(server_name)
+        except LiveMcpHarnessNotRunning:
+            return _live_mcp_failure(status.HTTP_409_CONFLICT, "harness_not_running")
+        except LiveMcpServerUnknown:
+            return _live_mcp_failure(status.HTTP_404_NOT_FOUND, "mcp_server_unknown")
+        except TimeoutError:
+            return _live_mcp_failure(status.HTTP_504_GATEWAY_TIMEOUT, "mcp_reconnect_timeout")
+        except LiveMcpReconnectRefused as exc:
+            _logger.info("The harness refused to reconnect MCP server %r: %s", server_name, exc)
+            reconnect_error = _live_mcp_detail(exc) or "Reconnect failed."
+        except Exception:
+            # Other failures can carry internal detail, so only the log gets it.
+            _logger.warning("Reconnecting MCP server %r failed", server_name, exc_info=True)
+            return _live_mcp_failure(status.HTTP_502_BAD_GATEWAY, "mcp_reconnect_failed")
+        body: dict[str, Any]
+        try:
+            body = _live_mcp_body(await self.live_mcp_statuses())
+        except Exception:
+            _logger.warning("Reading live MCP status after reconnect failed", exc_info=True)
+            # The harness is still running; only its status could not be read.
+            body = {"running": True, "servers": [], "status_unavailable": True}
+        if reconnect_error is not None:
+            body["reconnect_error"] = reconnect_error
+        return JSONResponse(body)
 
     def _check_conversation_id(self, request: Request, conversation_id: str) -> None:
         """
@@ -1303,6 +1478,13 @@ class HarnessApp:
         for ctx in self._in_flight.values():
             if ctx._complete_policy_evaluation(body.evaluation_id, verdict):
                 break
+        else:
+            # A dropped verdict leaves its turn parked until the eval timeout.
+            _logger.warning(
+                "Policy verdict %s matched no pending evaluation (%d in-flight turns)",
+                body.evaluation_id,
+                len(self._in_flight),
+            )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     async def _start_or_inject_turn(
@@ -1317,8 +1499,11 @@ class HarnessApp:
         1. ``previous_response_id`` matches an in-flight turn →
            in-band injection: enqueue the request body on that
            turn's injection queue, return 204.
-        2. Scaffold is shutting down → refuse with 503.
-        3. Otherwise → start a new turn: allocate ``response_id``,
+        2. A runner steer (``injection_id`` set) with no live turn to
+           inject into → refuse with 409; the runner replays it as its
+           continuation turn.
+        3. Scaffold is shutting down → refuse with 503.
+        4. Otherwise → start a new turn: allocate ``response_id``,
            build a :class:`TurnContext`, register it in
            ``_in_flight``, and return a streaming SSE response
            that runs ``run_turn`` to completion.
@@ -1327,7 +1512,8 @@ class HarnessApp:
         :returns: Either a :class:`StreamingResponse` for the new
             turn or a 204 :class:`Response` for an in-band
             injection.
-        :raises OmnigentError: 503 on shutdown.
+        :raises OmnigentError: 409 for a steer with no live turn; 503 on
+            shutdown.
         """
         if (
             request.previous_response_id is not None
@@ -1351,6 +1537,15 @@ class HarnessApp:
             ):
                 self._active_turn_ctx._push_injection(request)
                 return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+            if request.injection_id is not None:
+                # The steered turn already ended or was interrupted. The runner
+                # keeps the message buffered for its continuation turn, so a turn
+                # started here would run unseen and make that continuation a 204.
+                raise OmnigentError(
+                    "no active turn to inject into",
+                    code=ErrorCode.CONFLICT,
+                )
 
             if self._shutting_down.is_set():
                 raise OmnigentError(
@@ -1406,29 +1601,33 @@ class HarnessApp:
             HTTP response.
         """
         sequence = 0
-        for initial_event in self._initial_envelope_events(ctx, model=model, start_seq=sequence):
-            yield _format_sse_event(initial_event)
-            sequence += 1
-
-        run_task = asyncio.create_task(
-            self._guarded_run_turn(request, ctx),
-            name=f"harness-run-turn:{ctx.response_id}",
-        )
-        heartbeat_task = asyncio.create_task(
-            self._heartbeat_loop(ctx),
-            name=f"harness-heartbeat:{ctx.response_id}",
-        )
-        # Track the sequence_number of the last non-heartbeat
-        # event emitted on this stream so we can stamp the
-        # heartbeat's ``last_event_seq`` field at yield time.
-        # Per the contract (§Heartbeats), heartbeats carry the
-        # *previous* user-visible event's sequence number so
-        # consumers can detect dropped events. ``None`` until
-        # the first non-heartbeat event lands; the initial
-        # response.created / response.in_progress envelope
-        # events count, so this populates immediately.
-        last_event_seq: int | None = sequence - 1 if sequence > 0 else None
+        run_task: asyncio.Task[None] | None = None
+        heartbeat_task: asyncio.Task[None] | None = None
         try:
+            for initial_event in self._initial_envelope_events(
+                ctx, model=model, start_seq=sequence
+            ):
+                yield _format_sse_event(initial_event)
+                sequence += 1
+
+            run_task = asyncio.create_task(
+                self._guarded_run_turn(request, ctx),
+                name=f"harness-run-turn:{ctx.response_id}",
+            )
+            heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(ctx),
+                name=f"harness-heartbeat:{ctx.response_id}",
+            )
+            # Track the sequence_number of the last non-heartbeat
+            # event emitted on this stream so we can stamp the
+            # heartbeat's ``last_event_seq`` field at yield time.
+            # Per the contract (§Heartbeats), heartbeats carry the
+            # *previous* user-visible event's sequence number so
+            # consumers can detect dropped events. ``None`` until
+            # the first non-heartbeat event lands; the initial
+            # response.created / response.in_progress envelope
+            # events count, so this populates immediately.
+            last_event_seq: int | None = sequence - 1 if sequence > 0 else None
             while True:
                 event = await ctx._event_queue.get()
                 if event is None:
@@ -1462,7 +1661,8 @@ class HarnessApp:
             yield _format_sse_event(terminal)
         finally:
             await self._teardown_turn(ctx, run_task, heartbeat_task)
-            _freeze_gc_if_armed(run_task, ctx)
+            if run_task is not None:
+                _freeze_gc_if_armed(run_task, ctx)
 
     def _initial_envelope_events(
         self, ctx: TurnContext, model: str, start_seq: int
@@ -1511,8 +1711,8 @@ class HarnessApp:
     async def _teardown_turn(
         self,
         ctx: TurnContext,
-        run_task: asyncio.Task[None],
-        heartbeat_task: asyncio.Task[None],
+        run_task: asyncio.Task[None] | None,
+        heartbeat_task: asyncio.Task[None] | None,
     ) -> None:
         """
         Cancel the heartbeat + (defensively) the run task, then
@@ -1524,16 +1724,15 @@ class HarnessApp:
 
         :param ctx: The per-turn context (used for the response_id
             registry key).
-        :param run_task: The completed (or to-be-cancelled)
-            run_turn task.
-        :param heartbeat_task: The heartbeat emitter task; always
-            still running at this point (it loops forever) and
-            needs explicit cancellation.
+        :param run_task: The completed (or to-be-cancelled) run_turn task,
+            or ``None`` if the stream closed during its initial envelope.
+        :param heartbeat_task: The heartbeat emitter task, if started.
         """
-        heartbeat_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat_task
-        if not run_task.done():
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
+        if run_task is not None and not run_task.done():
             # Defensive: run_turn might still be parked on a
             # Future the cleanup didn't release. Cancel here as a
             # last resort so the task doesn't leak.
@@ -1996,7 +2195,7 @@ def _utc_now_iso() -> str:
     """
     import datetime
 
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # Note: ``HarnessApp._build_error_detail`` is the canonical

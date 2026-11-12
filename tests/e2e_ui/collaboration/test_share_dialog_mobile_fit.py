@@ -20,6 +20,7 @@ from collections.abc import Iterator
 import pytest
 from playwright.sync_api import Browser, Locator, Page, ViewportSize, expect
 
+from tests._helpers.browser import user_page
 from tests.e2e_ui.collaboration._multi_user_server import (
     ADMIN_EMAIL,
     MultiUserServer,
@@ -45,23 +46,6 @@ def multi_user_server(
     """A dedicated NON-single-user server (Share chrome enabled)."""
     server_tmp = tmp_path_factory.mktemp("e2e_ui_share_dialog_mobile")
     yield from spawn_multi_user_server(mock_llm_server_url, server_tmp)
-
-
-def _mobile_admin_page(browser: Browser) -> Page:
-    """An iPhone-profile page whose requests carry the admin identity."""
-    # The conftest's OMNIGENT_E2E_RECORD_DIR hook only covers the async API,
-    # so honor it here for this sync, manually-created context.
-    record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
-    context = browser.new_context(
-        viewport=_IPHONE_VIEWPORT,
-        device_scale_factor=3,
-        is_mobile=True,
-        has_touch=True,
-        user_agent=_IOS_SAFARI_UA,
-        extra_http_headers={"X-Forwarded-Email": ADMIN_EMAIL},
-        record_video_dir=record_dir,
-    )
-    return context.new_page()
 
 
 def _open_share_dialog(page: Page) -> Locator:
@@ -94,8 +78,15 @@ def test_share_dialog_grant_controls_fit_on_phone_viewport(
     multi_user_server: MultiUserServer,
 ) -> None:
     """The add-grant row's controls stay inside the dialog on a phone."""
-    page = _mobile_admin_page(browser)
-    try:
+    with user_page(
+        browser,
+        headers={"X-Forwarded-Email": ADMIN_EMAIL},
+        viewport=_IPHONE_VIEWPORT,
+        device_scale_factor=3,
+        is_mobile=True,
+        has_touch=True,
+        user_agent=_IOS_SAFARI_UA,
+    ) as page:
         page.goto(f"{multi_user_server.public_url}/c/{multi_user_server.session_id}")
         dialog = _open_share_dialog(page)
         # Grants have loaded (the owner's own row renders) — the dialog is at
@@ -113,7 +104,7 @@ def test_share_dialog_grant_controls_fit_on_phone_viewport(
         content_right = dialog_right - padding_right
 
         grant_button = dialog.get_by_role("button", name="Grant")
-        level_select = dialog.get_by_role("combobox").filter(has_text="Read")
+        level_select = dialog.get_by_role("combobox", name="New user permission")
         user_field = dialog.get_by_placeholder("alice@example.com")
         expect(grant_button).to_be_visible()
         expect(level_select).to_be_visible()
@@ -136,5 +127,3 @@ def test_share_dialog_grant_controls_fit_on_phone_viewport(
                 f" {control_right:.1f} vs dialog content right edge"
                 f" {content_right:.1f} (dialog right {dialog_right:.1f})"
             )
-    finally:
-        page.context.close()

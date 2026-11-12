@@ -1,5 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { SharingMode } from "@/lib/capabilities";
+import {
+  parseSiblingSessionDestinations,
+  type SharingMode,
+  type SiblingSessionDestinations,
+} from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 
 /** Server-wide sharing settings from ``GET /v1/sharing`` (admin). */
@@ -14,11 +18,19 @@ export interface SharingState {
   public_sharing_enabled: boolean;
   /** False when the deployment manages public access itself (not file-backed). */
   public_sharing_editable: boolean;
+  public_sharing_max_level?: "read" | "edit";
+  public_sharing_max_level_editable?: boolean;
+  public_sharing_max_level_options?: ("read" | "edit")[];
   /** Which new sessions start with a public read grant. */
   default_public_sessions: DefaultPublicSessions;
   /** False when the deployment manages this default itself (not file-backed). */
   default_public_sessions_editable: boolean;
   default_public_sessions_options: DefaultPublicSessions[];
+  peer_session_messaging_enabled?: boolean;
+  peer_session_messaging_editable?: boolean;
+  sibling_session_destinations: SiblingSessionDestinations;
+  sibling_session_destinations_editable: boolean;
+  sibling_session_destinations_options: SiblingSessionDestinations[];
 }
 
 /** ``off`` = all private, ``sandbox`` = cloud sandbox sessions public, ``all`` = every session. */
@@ -28,10 +40,48 @@ export type DefaultPublicSessions = "off" | "sandbox" | "all";
 export interface SharingUpdate {
   sharing_mode?: SharingMode;
   public_sharing?: boolean;
+  public_sharing_max_level?: "read" | "edit";
   default_public_sessions?: DefaultPublicSessions;
+  peer_session_messaging?: boolean;
+  sibling_session_destinations?: SiblingSessionDestinations;
 }
 
 const QUERY_KEY = ["sharing"];
+const PUBLIC_MAX_LEVEL_QUERY_KEY = ["sharing", "public-max-level"];
+
+const DESTINATIONS_QUERY_KEY = ["sharing", "sibling-destinations"];
+
+export function useSiblingSessionDestinations(enabled: boolean) {
+  return useQuery({
+    queryKey: DESTINATIONS_QUERY_KEY,
+    enabled,
+    staleTime: 0,
+    queryFn: async (): Promise<SiblingSessionDestinations> => {
+      const response = await authenticatedFetch("/v1/info");
+      if (!response.ok) throw new Error("Could not load agent destinations");
+      const info = await response.json();
+      return parseSiblingSessionDestinations(info.sibling_session_destinations);
+    },
+  });
+}
+
+export function usePublicSharingMaxLevel(enabled: boolean) {
+  return useQuery({
+    queryKey: PUBLIC_MAX_LEVEL_QUERY_KEY,
+    enabled,
+    staleTime: 0,
+    queryFn: async (): Promise<"read" | "edit"> => {
+      try {
+        const response = await authenticatedFetch("/v1/info");
+        if (!response.ok) return "read";
+        const info = await response.json();
+        return info.public_sharing_max_level === "edit" ? "edit" : "read";
+      } catch {
+        return "read";
+      }
+    },
+  });
+}
 
 async function fetchSharing(): Promise<SharingState> {
   const res = await authenticatedFetch("/v1/sharing");
@@ -66,6 +116,11 @@ export function useSetSharing() {
     onSuccess: (data) => {
       // Reflect the new value immediately, then revalidate.
       queryClient.setQueryData(QUERY_KEY, data);
+      queryClient.setQueryData(
+        DESTINATIONS_QUERY_KEY,
+        parseSiblingSessionDestinations(data.sibling_session_destinations),
+      );
+      queryClient.setQueryData(PUBLIC_MAX_LEVEL_QUERY_KEY, data.public_sharing_max_level ?? "read");
       void queryClient.invalidateQueries({ queryKey: QUERY_KEY });
     },
   });

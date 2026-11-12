@@ -91,6 +91,7 @@ from omnigent._wrapper_labels import (
 )
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.errors import OmnigentError
 from omnigent.harnesses.antigravity_native.bridge import (
     AGY_PLACEHOLDER_CONVERSATION_PREFIX,
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -258,10 +259,11 @@ def run_antigravity_native(
     if not resolved_command:
         raise click.ClickException("Antigravity command must not be empty.")
     _preflight_local_tools()
-    # Resolve auth/model config once up front so a missing credential warns
-    # before any server work. agy is OAuth-only (subscription), inherited
-    # from ~/.gemini — nothing is seeded.
-    launch = resolve_native_antigravity_launch(model=model)
+    # Fail early on an invalid selected provider before starting the server.
+    try:
+        launch = resolve_native_antigravity_launch(model=model)
+    except OmnigentError as exc:
+        raise click.ClickException(exc.message) from exc
     # Detect headless ONCE here (a controlling TTY on stdin+stdout means an
     # interactive client will attach to drive agy's request-review prompt; a
     # non-TTY launch must auto-bypass or the unattended turn hangs forever).
@@ -988,7 +990,8 @@ async def _launch_and_record(
     # ``seed_isolated_agy_home`` — in the isolated dir agy actually reads under
     # ``--gemini_dir``. Seeding the real ``~/.gemini`` marker as well would write
     # the user's tree for a file this launch never reads.
-    argv, env_overrides = build_agy_launch(
+    argv, env_overrides = await asyncio.to_thread(
+        build_agy_launch,
         conversation_id=conversation_id if resume else None,
         model=model,
         resume=resume,
@@ -1017,16 +1020,23 @@ async def _launch_and_record(
     # marker, so a web turn injected into this CLI-launched session while the survey
     # is up would be silently lost (#1494). Disable it in the isolated dir agy reads
     # under --gemini_dir, never the user's real ~/.gemini.
-    await asyncio.to_thread(ensure_agy_feedback_survey_disabled, agy_home_dir(bridge_dir))
+    await asyncio.to_thread(
+        ensure_agy_feedback_survey_disabled,
+        agy_home_dir(bridge_dir),
+        launch_env={**os.environ, **env_overrides},
+    )
     # Lead the args so the flag is never swallowed by a later positional.
     argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
+    from omnigent.harnesses.antigravity_native.gateway import wrap_agy_gateway_launch
+
+    argv = wrap_agy_gateway_launch([command, *argv[1:]], env_overrides)
     _update_progress(startup_progress, "Starting Antigravity terminal...")
     launched = await _launch_antigravity_terminal(
         client,
         session_id,
         argv=argv,
         env=env_overrides,
-        command=command,
+        command=argv[0],
     )
     # Advertise the tmux pane so a web turn to this CLI-launched session can be
     # bootstrapped into the idle agy TUI by the executor (agy mints its

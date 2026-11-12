@@ -23,6 +23,9 @@ Env vars read at startup:
 - ``HARNESS_CLAUDE_SDK_MODEL``: model identifier, e.g.
   ``"databricks-claude-opus-4-6"``. ``None`` falls back to
   Claude SDK's own default.
+- ``HARNESS_CLAUDE_SDK_CONTEXT_WINDOW``: the spec's declared
+  ``executor.context_window`` in tokens, e.g. ``"1000000"``. Sizes the
+  history a restarted client replays; unset resolves it from the model.
 - ``HARNESS_CLAUDE_SDK_GATEWAY``: ``"1"`` / ``"true"`` to route
   through a vendor-neutral gateway (base URL + bearer-token
   command + model). The Databricks Unity Gateway is one producer of
@@ -41,6 +44,8 @@ Env vars read at startup:
   ``"plan"``, ``"dontAsk"``, ``"default"``). Defaults to
   ``"auto"`` so the agent runs autonomously with background
   safety checks.
+- ``HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET``: ``claude_code`` appends
+  agent instructions to Claude Code's prompt. Unset keeps the custom prompt.
 - ``HARNESS_CLAUDE_SDK_OS_ENV``: JSON-encoded :class:`OSEnvSpec`
   (from :func:`dataclasses.asdict`) controlling the SDK's
   native OS-tool exposure. When set, the inner executor builds
@@ -96,6 +101,7 @@ from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
 from omnigent.inner.os_env_serialization import decode_sandbox_spec
+from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.spec.types import RetryPolicy
 
@@ -105,11 +111,13 @@ _logger = logging.getLogger(__name__)
 # the module docstring for semantics. Centralizing as constants
 # so misconfigurations surface as a single grep target.
 _ENV_MODEL = "HARNESS_CLAUDE_SDK_MODEL"
+_ENV_CONTEXT_WINDOW = "HARNESS_CLAUDE_SDK_CONTEXT_WINDOW"
 _ENV_GATEWAY = "HARNESS_CLAUDE_SDK_GATEWAY"
 _ENV_DATABRICKS_PROFILE = "HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE"
 _ENV_GATEWAY_HOST = "HARNESS_CLAUDE_SDK_GATEWAY_HOST"
 _ENV_CWD = "HARNESS_CLAUDE_SDK_CWD"
 _ENV_PERMISSION_MODE = "HARNESS_CLAUDE_SDK_PERMISSION_MODE"
+_ENV_SYSTEM_PROMPT_PRESET = "HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET"
 _ENV_OS_ENV = "HARNESS_CLAUDE_SDK_OS_ENV"
 _ENV_RETRY_POLICY = "HARNESS_CLAUDE_SDK_RETRY_POLICY"
 _ENV_SKILLS_FILTER = "HARNESS_CLAUDE_SDK_SKILLS_FILTER"
@@ -251,6 +259,24 @@ def _resolve_skills_filter() -> str | list[str]:
     return "all"
 
 
+def _resolve_context_window() -> int | None:
+    """
+    Resolve the spec-declared context window from env config.
+
+    :returns: The positive window in tokens, or ``None`` when unset or
+        malformed so the executor resolves the window from the model.
+    """
+    raw = os.environ.get(_ENV_CONTEXT_WINDOW, "").strip()
+    if not raw:
+        return None
+    try:
+        window = int(raw)
+    except ValueError:
+        _logger.warning("%s is not an integer (%r); ignoring it", _ENV_CONTEXT_WINDOW, raw)
+        return None
+    return window if window > 0 else None
+
+
 def _build_claude_sdk_executor() -> Executor:
     """
     Construct a :class:`ClaudeSDKExecutor` from env-var config.
@@ -273,6 +299,7 @@ def _build_claude_sdk_executor() -> Executor:
     agent_name_raw = os.environ.get(_ENV_AGENT_NAME, "").strip()
     agent_name = agent_name_raw or None
     return ClaudeSDKExecutor(
+        active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
         # Run the CLI in the session workspace: an explicit
         # HARNESS_CLAUDE_SDK_CWD wins, else the runner's
         # OMNIGENT_RUNNER_WORKSPACE (the folder the user launched in, and
@@ -284,7 +311,9 @@ def _build_claude_sdk_executor() -> Executor:
         cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None,
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),
+        context_window=_resolve_context_window(),
         permission_mode=os.environ.get(_ENV_PERMISSION_MODE, _DEFAULT_PERMISSION_MODE),
+        system_prompt_preset=os.environ.get(_ENV_SYSTEM_PROMPT_PRESET) or None,
         gateway=gateway,
         databricks_profile=os.environ.get(_ENV_DATABRICKS_PROFILE),
         gateway_host=os.environ.get(_ENV_GATEWAY_HOST) or None,

@@ -2,6 +2,7 @@ import {
   forwardRef,
   useLayoutEffect,
   useRef,
+  useState,
   type ComponentPropsWithRef,
   type ComponentPropsWithoutRef,
   type KeyboardEvent,
@@ -10,8 +11,11 @@ import {
 } from "react";
 import { ArrowUpIcon, Loader2Icon, SquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import { cn } from "@/lib/utils";
+import { insertComposerText } from "@/lib/composerText";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
   isComposerAltNewlineKey,
   isComposerSendKey,
@@ -68,6 +72,9 @@ export interface ComposerKeyIntent {
 }
 
 interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "children"> {
+  appearance?: "default" | "glass";
+  /** Attachments, mentions, or feedback that need the expanded mobile layout. */
+  hasContent?: boolean;
   keyboard: {
     submitWithModEnter: boolean;
     preventsKeyboardSubmit: boolean;
@@ -95,35 +102,89 @@ interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "child
 }
 
 export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(function ChatComposer(
-  { className, input, keyboard, slots, actions, ...props },
+  {
+    appearance = "default",
+    hasContent = false,
+    className,
+    input,
+    keyboard,
+    slots,
+    actions,
+    onFocusCapture,
+    onBlurCapture,
+    ...props
+  },
   ref,
 ) {
+  const isMobile = useIsMobileViewport();
+  const [focusWithin, setFocusWithin] = useState(false);
+  const [uncontrolledValue, setUncontrolledValue] = useState(input.defaultValue ?? "");
+  const expanded =
+    focusWithin ||
+    hasContent ||
+    Boolean(slots?.inputPrefix) ||
+    String(input.value ?? uncontrolledValue).length > 0;
+  const needsHintPlaceholder = input.placeholder === "" && Boolean(slots?.inputHint);
   const actionRowRef = useRef<HTMLDivElement>(null);
   const actionWidthRef = useRef<HTMLDivElement>(null);
   const leadingRef = useRef<HTMLDivElement>(null);
   const trailingRef = useRef<HTMLDivElement>(null);
-  useCollapsedComposerLabels(actionRowRef, actionWidthRef, leadingRef, trailingRef);
+  useCollapsedComposerLabels(actionRowRef, actionWidthRef, leadingRef, trailingRef, isMobile);
   return (
     <div
       ref={ref}
       data-composer-card
+      data-mobile-composer={isMobile ? (expanded ? "expanded" : "collapsed") : undefined}
+      data-composer-hint-placeholder={needsHintPlaceholder || undefined}
       className={cn(
-        "composer-reference-surface relative flex w-full flex-col rounded-2xl border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)] md:min-h-[105px]",
+        "relative flex w-full flex-col rounded-2xl md:min-h-[105px]",
+        appearance === "glass"
+          ? "isolate rounded-[20px] border-0 bg-transparent"
+          : "composer-reference-surface border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
         className,
       )}
       {...props}
+      onFocusCapture={(event) => {
+        // Header controls bubble through React portals outside this card.
+        if (
+          event.currentTarget.contains(event.target) &&
+          !event.target.closest('[data-composer-action="add"]')
+        ) {
+          setFocusWithin(true);
+        }
+        onFocusCapture?.(event);
+      }}
+      onBlurCapture={(event) => {
+        if (event.currentTarget.contains(event.target)) {
+          setFocusWithin(event.currentTarget.contains(event.relatedTarget));
+        }
+        onBlurCapture?.(event);
+      }}
     >
+      {appearance === "glass" && <OmniGlassSurface borderRadius={20} className="-z-10" />}
       {slots?.beforeInput}
       <ComposerInputArea
+        data-composer-input-area
         className={slots?.inputPrefix ? "max-h-[320px] overflow-y-auto" : undefined}
       >
         {slots?.inputPrefix}
         {slots?.inputBackdrop}
-        <ComposerTextInput input={input} keyboard={keyboard} />
+        <ComposerTextInput
+          input={{
+            ...input,
+            rows: input.rows ?? (isMobile ? 1 : undefined),
+            placeholder: isMobile && needsHintPlaceholder ? input["aria-label"] : input.placeholder,
+            onChange: (event) => {
+              if (input.value === undefined) setUncontrolledValue(event.currentTarget.value);
+              input.onChange?.(event);
+            },
+          }}
+          keyboard={keyboard}
+        />
         {slots?.inputHint}
       </ComposerInputArea>
       {slots?.attachments}
-      <ComposerActionRow ref={actionRowRef} data-testid={actions.testId}>
+      <ComposerActionRow ref={actionRowRef} data-composer-actions data-testid={actions.testId}>
         {/* Zero-height width probe: resize-observed instead of the row itself,
             whose height the collapse verdict can change. */}
         <div ref={actionWidthRef} className="absolute inset-x-0 top-0 h-0" />
@@ -156,6 +217,7 @@ function useCollapsedComposerLabels(
   widthRef: RefObject<HTMLDivElement | null>,
   leadingRef: RefObject<HTMLDivElement | null>,
   trailingRef: RefObject<HTMLDivElement | null>,
+  isMobile: boolean,
 ) {
   useLayoutEffect(() => {
     const row = rowRef.current;
@@ -170,21 +232,33 @@ function useCollapsedComposerLabels(
       // Not laid out yet (hidden, or jsdom): keep the current verdict.
       if (!(available > 0)) return;
       delete row.dataset.labels;
+      const previousWrap = leading.style.flexWrap;
+      leading.style.flexWrap = "nowrap";
       const gap = Math.max(parseFloat(style.columnGap) || 0, COMPOSER_LABELS_MIN_GAP_PX);
       if (leading.scrollWidth + trailing.scrollWidth + gap > available)
         row.dataset.labels = "collapsed";
+      leading.style.flexWrap = previousWrap;
     };
     measure();
     if (typeof ResizeObserver === "undefined") return;
     const resizeObserver = new ResizeObserver(measure);
     resizeObserver.observe(width);
+    resizeObserver.observe(leading);
+    resizeObserver.observe(trailing);
     const mutationObserver = new MutationObserver(measure);
-    mutationObserver.observe(row, { childList: true, characterData: true, subtree: true });
+    // Portaled controls can change appearance without resizing their collapsed groups.
+    mutationObserver.observe(row, {
+      childList: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["class"],
+      subtree: true,
+    });
     return () => {
       resizeObserver.disconnect();
       mutationObserver.disconnect();
     };
-  }, [rowRef, widthRef, leadingRef, trailingRef]);
+  }, [rowRef, widthRef, leadingRef, trailingRef, isMobile]);
 }
 
 /**
@@ -231,19 +305,6 @@ export function useCollapsedWorkspaceLabels(barRef: RefObject<HTMLElement | null
   }, [barRef]);
 }
 
-/**
- * Insert a line break at the caret as typed input, so onChange sees it. The
- * ``insertText`` command also keeps it on the undo stack; the fallback covers
- * environments without it.
- */
-function insertLineBreak(textarea: HTMLTextAreaElement) {
-  const inserted =
-    typeof document.execCommand === "function" && document.execCommand("insertText", false, "\n");
-  if (inserted) return;
-  textarea.setRangeText("\n", textarea.selectionStart, textarea.selectionEnd, "end");
-  textarea.dispatchEvent(new Event("input", { bubbles: true }));
-}
-
 export function ComposerTextInput({
   input,
   keyboard,
@@ -255,10 +316,21 @@ export function ComposerTextInput({
         // A newline in every mode and on touch devices; completion menus never see it.
         if (isComposerAltNewlineKey({ ...event, isComposing: event.nativeEvent.isComposing })) {
           event.preventDefault();
-          insertLineBreak(event.currentTarget);
+          insertComposerText(event.currentTarget, "\n");
           return;
         }
         if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
+        const insertNewline =
+          event.key === "Enter" &&
+          (event.shiftKey || keyboard.submitWithModEnter) &&
+          !event.altKey &&
+          !event.metaKey &&
+          !event.ctrlKey;
+        const listEdit = insertNewline ? composerListEdit(event.currentTarget) : null;
+        const listStartEdit =
+          event.key === " " && !event.altKey && !event.shiftKey && !event.metaKey && !event.ctrlKey
+            ? composerListStartEdit(event.currentTarget)
+            : null;
         const shouldSubmitFromKeyboard = isComposerSendKey(
           { ...event, isComposing: event.nativeEvent.isComposing },
           keyboard.submitWithModEnter,
@@ -274,9 +346,50 @@ export function ComposerTextInput({
           shouldPreferSendOverCompletion: keyboard.submitWithModEnter && shouldSubmitFromKeyboard,
           shouldSteerAllFromKeyboard,
         });
+        if (event.defaultPrevented) return;
+        const edit = listStartEdit ?? listEdit;
+        if (edit) {
+          event.preventDefault();
+          insertComposerText(event.currentTarget, edit.text, edit.start, edit.end);
+        }
       }}
     />
   );
+}
+
+function composerListStartEdit(textarea: HTMLTextAreaElement) {
+  const { value, selectionStart, selectionEnd } = textarea;
+  if (selectionStart !== selectionEnd) return null;
+  const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
+  const prefix = value.slice(lineStart, selectionStart);
+  const match = prefix.match(/^([ \t]*)([-*]|\d+[.)])$/);
+  if (!match) return null;
+  const [, indent, marker] = match;
+  return {
+    start: lineStart,
+    end: selectionStart,
+    text: `${indent || "  "}${marker} `,
+  };
+}
+
+function composerListEdit(textarea: HTMLTextAreaElement) {
+  const { value, selectionStart, selectionEnd } = textarea;
+  const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
+  const lineEndIndex = value.indexOf("\n", selectionEnd);
+  const lineEnd = lineEndIndex < 0 ? value.length : lineEndIndex;
+  const prefix = value.slice(lineStart, selectionStart);
+  const match = prefix.match(/^([ \t]*)([-*•]|\d+[.)])([ \t]+)(.*)$/);
+  if (!match) return null;
+  const [, indent, marker, spacing, content] = match;
+  const suffix = value.slice(selectionEnd, lineEnd);
+  if (selectionStart === selectionEnd && !content.trim() && !suffix.trim()) {
+    return { start: lineStart, end: lineEnd, text: "" };
+  }
+  // Keep the typed bullet so the draft stays valid Markdown.
+  const nextMarker = /^\d/.test(marker)
+    ? `${Number.parseInt(marker, 10) + 1}${marker.at(-1)}`
+    : marker;
+  return { start: selectionStart, end: selectionEnd, text: `\n${indent}${nextMarker}${spacing}` };
 }
 
 export function ComposerInputArea({ className, ...props }: ComponentPropsWithoutRef<"div">) {
@@ -296,12 +409,14 @@ export function ComposerInputArea({ className, ...props }: ComponentPropsWithout
  * One wrapping row of chips (attachment tiles, mention chips) on the shared
  * inset line. Chips are measured through their own boxes, so the row pads
  * rather than margins; the chip type picks its gap via ``className``.
+ * Past three tile rows the row scrolls, so many chips cannot push the input
+ * and Send off screen; ``-mt-1 pt-1`` keeps corner remove buttons unclipped.
  */
 export function ComposerChipRow({ className, ...props }: ComponentPropsWithoutRef<"div">) {
   return (
     <div
       className={cn(
-        "flex flex-wrap items-start gap-2 pb-2",
+        "-mt-1 flex max-h-[208px] flex-wrap items-start gap-2 overflow-y-auto pt-1 pb-2",
         COMPOSER_CONTENT_INSET_CLASS,
         className,
       )}
@@ -370,7 +485,7 @@ export const ComposerActionRow = forwardRef<HTMLDivElement, ComponentPropsWithou
       <div
         ref={ref}
         className={cn(
-          "group/composer-actions @container/composer-actions relative flex min-w-0 flex-nowrap items-center justify-between gap-2 pt-1 pb-2",
+          "group/composer-actions relative flex min-w-0 flex-nowrap mobile-app:flex-wrap items-center justify-between gap-2 pt-1 pb-2",
           COMPOSER_CONTENT_INSET_CLASS,
           className,
         )}
@@ -387,9 +502,12 @@ export const ComposerActionGroup = forwardRef<
   return (
     <div
       ref={ref}
+      data-composer-action-group={side}
       className={cn(
-        "flex min-w-0 items-center gap-1",
-        side === "left" ? "flex-none overflow-visible" : "ml-auto max-w-full shrink-0",
+        "flex min-w-0 items-center gap-1 mobile-app:max-w-full",
+        side === "left"
+          ? "flex-none overflow-visible mobile-app:flex-wrap mobile-app:shrink"
+          : "ml-auto max-w-full shrink",
         className,
       )}
       {...props}
@@ -415,13 +533,14 @@ export const ComposerSendButton = forwardRef<
       size="icon"
       variant={interrupt ? "destructive" : "default"}
       className={cn(
-        "size-8 shrink-0 rounded-lg transition-opacity md:size-7",
+        "size-8 mobile-touch-target shrink-0 rounded-lg transition-opacity md:size-7",
         !interrupt &&
           "hover:opacity-80 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
         className,
       )}
       aria-label={label}
       aria-busy={busy}
+      data-composer-action="send"
       {...props}
     >
       {busy ? (

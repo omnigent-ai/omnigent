@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, renderHook } from "@testing-library/react";
 import { serializeReplyDraft, type StoredReplyDraft } from "./replyDraft";
 
 const key = "omnigent.sessionDrafts";
@@ -9,6 +10,7 @@ describe("session drafts", () => {
     sessionStorage.clear();
   });
   afterEach(() => sessionStorage.clear());
+  afterEach(cleanup);
 
   it("loads legacy string drafts as plain text without inferring cards", async () => {
     const text = "\nintro\n> quote\nlazy continuation\n\n";
@@ -37,6 +39,26 @@ describe("session drafts", () => {
     expect(reloaded.getSessionDraft("conversation")).toEqual({ text, replyDraft, files: [] });
     expect(reloaded.hasSessionDraft("conversation")).toBe(true);
     expect(reloaded.getSessionDraft("another")).toBeUndefined();
+  });
+
+  it("persists @-tagged files and sessions across a reload, dropping invalid entries", async () => {
+    const text = "Ask @Alpha planning about @src/a.ts";
+    const mentions = {
+      files: [{ path: "src/a.ts", isDir: false, token: "@src/a.ts" }],
+      sessions: [
+        { id: "s_alpha", title: "Alpha planning", isSubagent: false, token: "@Alpha planning" },
+      ],
+    };
+    const { setSessionDraft } = await import("./sessionDrafts");
+    setSessionDraft("conversation", { text, files: [], mentions });
+    const stored = JSON.parse(sessionStorage.getItem(key)!);
+    expect(stored).toEqual({ conversation: { text, mentions } });
+
+    stored.conversation.mentions.sessions.push({ id: 7 });
+    sessionStorage.setItem(key, JSON.stringify(stored));
+    vi.resetModules();
+    const reloaded = await import("./sessionDrafts");
+    expect(reloaded.getSessionDraft("conversation")).toEqual({ text, files: [], mentions });
   });
 
   it("preserves fallback text when stored metadata is invalid or unsupported", async () => {
@@ -100,5 +122,70 @@ describe("session drafts", () => {
     setSessionDraft("temp:failed", temporaryDraft);
     expect(getSessionDraft("temp:failed")).toBeUndefined();
     expect(sessionStorage.getItem(key)).toBeNull();
+  });
+
+  it("keeps each recovered tag on its own target when both drafts used the same token", async () => {
+    const { recoverFailedSessionDraft, setSessionDraft } = await import("./sessionDrafts");
+    const { composerInlineMentions, expandMentionTokens } = await import("./composerMentions");
+    // Two different sessions titled "Plan", tagged in the launcher and in the
+    // temporary session; each composer gave its tag the plain "@Plan" token.
+    const planA = { id: "s_aaaaaaaa", title: "Plan", isSubagent: false, token: "@Plan" };
+    const planB = { id: "s_bbbbbbbb", title: "Plan", isSubagent: false, token: "@Plan" };
+    setSessionDraft("temp:clash", {
+      text: "and also @Plan",
+      files: [],
+      mentions: { files: [], sessions: [planB] },
+    });
+
+    const recovered = recoverFailedSessionDraft(
+      { message: "read @Plan", files: [], mentions: { files: [], sessions: [planA] } },
+      "temp:clash",
+    );
+
+    const inline = composerInlineMentions(
+      recovered.mentions!.files,
+      recovered.mentions!.sessions,
+      "claude-native",
+    );
+    const sent = expandMentionTokens(recovered.message, inline);
+    expect(sent).toBe(
+      'read [Session: "Plan" id=s_aaaaaaaa subagent=no]\n\n' +
+        'and also [Session: "Plan" id=s_bbbbbbbb subagent=no]',
+    );
+  });
+
+  it("re-renders useSessionDraftIds only when the set of draft ids changes", async () => {
+    const { setSessionDraft, useSessionDraftIds } = await import("./sessionDrafts");
+    let renders = 0;
+    const { result } = renderHook(() => {
+      renders += 1;
+      return useSessionDraftIds();
+    });
+    expect(result.current).toBe("");
+
+    act(() => setSessionDraft("a", { text: "hi", files: [] }));
+    expect(result.current).toBe("a");
+    const afterAdd = renders;
+
+    // Editing an existing draft's text leaves the id set unchanged, so no re-render.
+    act(() => setSessionDraft("a", { text: "hello again", files: [] }));
+    expect(renders).toBe(afterAdd);
+
+    act(() => setSessionDraft("a", { text: "", files: [] }));
+    expect(result.current).toBe("");
+  });
+
+  it("returns an empty snapshot without subscribing when disabled", async () => {
+    const { setSessionDraft, useSessionDraftIds } = await import("./sessionDrafts");
+    let renders = 0;
+    const { result } = renderHook(() => {
+      renders += 1;
+      return useSessionDraftIds(false);
+    });
+    const before = renders;
+
+    act(() => setSessionDraft("a", { text: "hi", files: [] }));
+    expect(result.current).toBe("");
+    expect(renders).toBe(before);
   });
 });

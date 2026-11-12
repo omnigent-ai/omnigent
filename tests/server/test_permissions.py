@@ -940,21 +940,13 @@ def test_resolved_allows_public_grant_satisfies_access() -> None:
     assert resolved_allows(access, LEVEL_EDIT) is False
 
 
-def test_resolved_level_prefers_user_grant_over_public() -> None:
-    """The displayed level is the user's own grant, NOT a higher public one.
-
-    This is the asymmetry between access and displayed level: with a low
-    user grant and a higher public grant, ``resolved_allows`` is satisfied
-    by the public grant, but ``resolved_level`` reports the user's own
-    grant — exactly matching ``get_permission_level`` so the combined
-    helper does not change the displayed level.
-    """
+def test_resolved_level_caps_corrupt_public_grant() -> None:
+    """A malformed public Manage grant cannot bypass the default Read ceiling."""
     access = ResolvedAccess(
         is_admin=False, user_grant_level=LEVEL_READ, public_grant_level=LEVEL_MANAGE
     )
-    # Access at EDIT is granted via the public (manage) grant ...
-    assert resolved_allows(access, LEVEL_EDIT) is True
-    # ... but the level shown to the UI is the user's own read grant.
+    assert resolved_allows(access, LEVEL_EDIT) is False
+    assert resolved_allows(access, LEVEL_MANAGE) is False
     assert resolved_level(access) == LEVEL_READ
 
 

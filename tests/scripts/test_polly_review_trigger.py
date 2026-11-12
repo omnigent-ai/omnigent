@@ -105,3 +105,63 @@ def test_force_review_bypasses_duplicate_check(
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert ("duplicate=true" in output.read_text()) is skipped
+
+
+def test_automatic_review_runs_base_workflow_and_excludes_fork_prs():
+    workflow = yaml.safe_load(_WORKFLOW.read_text())
+    triggers = workflow.get("on", workflow.get(True))
+    assert "pull_request" not in triggers
+    assert triggers["pull_request_target"]["types"] == ["opened", "reopened", "ready_for_review"]
+    jobs = workflow["jobs"]
+    for name in ("gate", "review"):
+        assert (
+            "github.event.pull_request.head.repo.full_name == github.repository"
+            in jobs[name]["if"]
+        )
+    assert "!github.event.pull_request.draft" in jobs["review"]["if"]
+    steps = jobs["review"]["steps"]
+    checkout = next(s for s in steps if s.get("name") == "Check out repo")
+    assert checkout["with"]["ref"] == (
+        "${{ github.event_name == 'workflow_dispatch' && github.sha || "
+        "github.event.repository.default_branch }}"
+    )
+    receipt = next(s for s in steps if s.get("name") == "Upload Polly completion receipt")
+    assert receipt["if"] == "steps.publish.outcome == 'success'"
+    assert "steps.ctx.outputs.head_sha" in receipt["with"]["name"]
+    assert not any("pull_request.head" in s.get("with", {}).get("ref", "") for s in steps)
+
+
+@pytest.mark.parametrize(
+    "expected_head,passes", [("old-head", False), ("new-head", True), ("", True)]
+)
+def test_requested_head_cannot_change_before_polly_reads_the_diff(tmp_path, expected_head, passes):
+    workflow = yaml.safe_load(_WORKFLOW.read_text())
+    step = next(s for s in workflow["jobs"]["review"]["steps"] if s.get("id") == "ctx")
+    script = step["run"]
+    marker = 'gh api "repos/${REPO}/compare/'
+    assert marker in script, "diff-fetch command not found in ctx step"
+    script = script[: script.index(marker)].replace("/tmp/", str(tmp_path) + "/")
+    assert step["env"]["EXPECTED_HEAD"] == "${{ inputs.expected_head }}"
+    jq = tmp_path / "jq"
+    jq.write_text(
+        '#!/bin/sh\ncase "$2" in .baseRefOid) echo base;; .headRefOid) echo new-head;; esac\n'
+    )
+    jq.chmod(0o755)
+    gh = tmp_path / "gh"
+    gh.write_text('#!/bin/sh\necho \'{"baseRefOid":"base","headRefOid":"new-head"}\'\n')
+    gh.chmod(0o755)
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", script],
+        env={
+            **os.environ,
+            "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+            "EXPECTED_HEAD": expected_head,
+            "PR_NUMBER": "7",
+            "REPO": "o/r",
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert (result.returncode == 0) is passes
+    assert ("PR moved" in result.stdout) is not passes

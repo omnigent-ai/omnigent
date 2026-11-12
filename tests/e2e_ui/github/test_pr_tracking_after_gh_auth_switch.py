@@ -35,7 +35,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests._helpers.session import post_session_bundle
+from tests._helpers.operator_agents import post_operator_session
 from tests.e2e_ui.conftest import (
     _ensure_runner_online,
     configure_mock_llm,
@@ -170,7 +170,7 @@ def pr_probe_session(
 
     name = f"pr_track_probe_{uuid.uuid4().hex[:8]}"
     model = f"pr-track-probe-{uuid.uuid4().hex[:8]}"
-    create_resp = post_session_bundle(
+    create_resp = post_operator_session(
         httpx.post, f"{live_server}/v1/sessions", _agent_bundle(name, model, str(ws)), timeout=30.0
     )
     create_resp.raise_for_status()
@@ -232,8 +232,8 @@ def test_created_pr_is_tracked(
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name="Pull Requests").click()
-    # The created PR must be associated with the session: the Pull Requests tab's
-    # session-PR picker names it, and the composer status line links it.
-    picker = rail.get_by_role("combobox", name="Session pull request")
-    expect(picker).to_have_text("example/project #42", timeout=30_000)
+    # The created PR remains linked even when its details cannot load.
+    expect(rail.get_by_role("link", name="Open the PR on GitHub")).to_have_attribute(
+        "href", _PR_URL, timeout=30_000
+    )
     expect(page.get_by_test_id("composer-pr-link")).to_have_accessible_name("#42")

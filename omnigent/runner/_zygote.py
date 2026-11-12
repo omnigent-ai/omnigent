@@ -14,6 +14,10 @@ multithreaded async process would deadlock the child). It is single-threaded,
 holds no event loop and no network sockets, and blocks on one ``AF_UNIX``
 control socket handed to it by the daemon.
 
+If optional deferred preload starts a thread, the zygote refuses new forks
+while preserving existing children's parent and poll/reap service. New
+launches use the callers' direct-exec fallback.
+
 Protocol (newline-delimited JSON, one request → one response):
 
   {"cmd": "ping"}                          -> {"pong": true}
@@ -306,6 +310,9 @@ def _run_child(request: dict[str, Any], harness_fd: int) -> None:
     :param harness_fd: fd of this runner's own control socket back to the
         zygote, exported so the runner can request harness forks.
     """
+    # Wire stdio first so a failure in the setup below lands in the runner's
+    # own log, which the host's exit report reads, not in the zygote's.
+    _wire_child_stdio(request.get("log_path"))
     _apply_child_env(request)
     workspace = request.get("cwd")
     if not isinstance(workspace, str):
@@ -314,8 +321,6 @@ def _run_child(request: dict[str, Any], harness_fd: int) -> None:
     # Tell the runner its harness-fork channel fd (set after the env replace so
     # it survives the clear).
     os.environ[ZYGOTE_HARNESS_FD_ENV_VAR] = str(harness_fd)
-
-    _wire_child_stdio(request.get("log_path"))
 
     # Test seam: exercise fork/reap/poll without booting a real runner. Honored
     # only when set in the fork payload's env (never in production launches).
@@ -476,6 +481,7 @@ class _ZygoteServer:
         self._control_socks: set[socket.socket] = {control_sock}
         self._buffers: dict[int, bytearray] = {}
         self._deferred_imported = False
+        self._forking_disabled = False
         self._sel.register(control_sock, selectors.EVENT_READ, "daemon")
         self._buffers[control_sock.fileno()] = bytearray()
 
@@ -504,7 +510,14 @@ class _ZygoteServer:
         self._deferred_imported = True
         _import_deferred_graph()
         gc.freeze()
-        _exit_unless_single_threaded()
+        try:
+            _exit_unless_single_threaded()
+        except SystemExit as exc:
+            if exc.code != 2:
+                raise
+            # Children may already depend on this parent. Keep their status
+            # service alive and send new launches through the exec fallback.
+            self._forking_disabled = True
 
     def _reap(self) -> None:
         """Non-blocking reap of any exited children into ``exit_codes``.
@@ -685,6 +698,9 @@ class _ZygoteServer:
         :param conn: The daemon socket to answer on.
         :param request: The ``fork`` request (``env`` + optional ``log_path``).
         """
+        if self._forking_disabled:
+            _send(conn, {"error": "zygote is not single-threaded; refusing to fork a runner"})
+            return
         if self._refuse_if_upgraded(conn, "runner"):
             return
         try:
@@ -722,6 +738,9 @@ class _ZygoteServer:
         :param conn: The runner socket to answer on.
         :param request: The ``fork_harness`` request (``argv`` + ``env``).
         """
+        if self._forking_disabled:
+            _send(conn, {"error": "zygote is not single-threaded; refusing to fork a harness"})
+            return
         if self._refuse_if_upgraded(conn, "harness"):
             return
         try:
@@ -796,7 +815,7 @@ class _ZygoteServer:
             if harness_pid in self._live:
                 self._orphaned.add(harness_pid)
                 # Signal the pid, never the group: everything the zygote forks
-                # shares the daemon's group, so a killpg would take it down too.
+                # shares the zygote's group, so a killpg would take it down too.
                 with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
                     os.kill(harness_pid, signal.SIGTERM)
         with contextlib.suppress(OSError):

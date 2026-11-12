@@ -5,7 +5,7 @@
 
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { TICK_MS, useNow } from "./useNow";
+import { TICK_MS, useNow, useNowSelector } from "./useNow";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -81,5 +81,53 @@ describe("useNow", () => {
     b.unmount();
     expect(clearSpy).toHaveBeenCalledTimes(1);
     clearSpy.mockRestore();
+  });
+});
+
+describe("useNowSelector", () => {
+  it("does not subscribe or re-render while disabled", () => {
+    const interval = vi.spyOn(globalThis, "setInterval");
+    let renders = 0;
+    const view = renderHook(() => {
+      renders += 1;
+      return useNowSelector((now) => now.getHours() >= 17, { enabled: false });
+    });
+
+    act(() => vi.advanceTimersByTime(TICK_MS * 2));
+    expect(renders).toBe(1);
+    expect(interval).not.toHaveBeenCalled();
+    view.unmount();
+    interval.mockRestore();
+  });
+
+  it("does not re-render on a tick with the same selected value", () => {
+    vi.setSystemTime(new Date(2026, 9, 5, 17, 0));
+    let renders = 0;
+    const view = renderHook(() => {
+      renders += 1;
+      return useNowSelector((now) => now.getHours() >= 17, { enabled: true });
+    });
+    expect(view.result.current).toBe(true);
+    const rendersAfterMount = renders;
+
+    act(() => vi.advanceTimersByTime(TICK_MS * 2));
+    expect(renders).toBe(rendersAfterMount);
+    view.unmount();
+  });
+
+  it("re-renders when the selected warning window opens", () => {
+    vi.setSystemTime(new Date(2026, 9, 5, 16, 59, 30));
+    let renders = 0;
+    const view = renderHook(() => {
+      renders += 1;
+      return useNowSelector((now) => now.getHours() >= 17, { enabled: true });
+    });
+    expect(view.result.current).toBe(false);
+    const rendersAfterMount = renders;
+
+    act(() => vi.advanceTimersByTime(TICK_MS));
+    expect(view.result.current).toBe(true);
+    expect(renders).toBe(rendersAfterMount + 1);
+    view.unmount();
   });
 });

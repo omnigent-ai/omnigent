@@ -10,6 +10,11 @@ Two families: **HTTP/API journeys** (server + DB, no runner/LLM — fast and
 low-noise) and **full-turn journeys** (a real agent turn through the runner +
 a zero-latency mock LLM). See *Journeys* below.
 
+The companion [OSS UI benchmark](../ui/README.md) drives the production SPA in
+Chromium against the same isolated server lifecycle. It measures populated
+session opening, composer key-to-frame latency, and per-keystroke style/layout
+work, with a same-runner base-versus-PR gate and nightly JSON artifacts.
+
 By default the server boots a fresh, empty SQLite DB, which gives best-case
 numbers that don't move with load. For meaningful results, point it at a
 **pre-seeded corpus** (`seed.py`) and, ideally, at **Postgres** — production
@@ -386,8 +391,12 @@ baseline's schema. Dispatch it with `baseline_ref` == `candidate_ref` for an A/A
 noise check.
 
 `compare.py` (used by the release and PR gates) flags a regression on run-median
-P50 or P95. Journeys with fewer than 20 samples per run (the capped full-turn and
-`cli_startup` journeys) gate on P50 only, since their P95 is the slowest sample.
+P50 or P95 (`--threshold`, and optionally a separate `--threshold-p95`). Journeys
+with fewer than 20 samples per run gate on P50 only, since their P95 is the slowest
+sample. A journey whose candidate ops all failed is `failed` and fails the gate.
+The release gate uses 30% on P50 and 50% on P95, about twice the worst
+per-journey noise seen in same-runner A/A runs; the PR benchmark's comparison
+against the nightly (a different VM) stays at 100%.
 
 Schema changes need no manual step: the seed always targets the current
 migrated schema (migrations run when the store is constructed), the reuse

@@ -184,7 +184,9 @@ async def test_successful_update_mirrors_unchanged_native_effort_without_notific
 
 
 @pytest.mark.parametrize("runner_ignores_combined_effort", [False, True])
-@pytest.mark.parametrize(("requested", "expected"), [("default", "low"), ("max", "max")])
+@pytest.mark.parametrize(
+    ("requested", "expected"), [("default", "low"), ("max", "max"), ("xhigh", "xhigh")]
+)
 async def test_combined_model_and_effort_uses_target_model_capabilities(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
@@ -228,6 +230,34 @@ async def test_combined_model_and_effort_uses_target_model_capabilities(
     else:
         assert len(forwarded) == 1
         assert updates == [{"threadId": "thread_codex", "model": "gpt-6-sol", "effort": expected}]
+
+
+async def test_model_reset_forwards_unchanged_effort(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = native_session
+    session.codex.failure = None
+    original_post = session.runner.post
+    forwarded: list[dict[str, Any]] = []
+
+    async def forward(url: str, **kwargs: Any) -> httpx.Response:
+        forwarded.append(dict(kwargs["json"]))
+        return await original_post(url, **kwargs)
+
+    monkeypatch.setattr(session.runner, "post", forward)
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}",
+        json={"model_override": "default", "reasoning_effort": "xhigh"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["model_override"] is None
+    assert response.json()["reasoning_effort"] == "xhigh"
+    assert [event["type"] for event in forwarded] == ["effort_change", "model_change"]
+    assert forwarded[0]["effort"] == "xhigh"
+    assert bridge.read_codex_config_effort(session.bridge_dir) == "xhigh"
 
 
 async def test_legacy_server_split_reset_uses_the_previous_model_default(
@@ -486,7 +516,7 @@ async def test_rejected_change_restores_an_effort_the_terminal_reported_before_s
     """A report that precedes the refused write confirms the old effort, so it is restored."""
     session = native_session
     session.codex.failure = "update_refused"
-    real_update = SqlAlchemyConversationStore.update_conversation
+    real_update = SqlAlchemyConversationStore.update_conversation_with_changes
     saving = threading.Event()
     resume = threading.Event()
 
@@ -496,7 +526,9 @@ async def test_rejected_change_restores_an_effort_the_terminal_reported_before_s
             resume.wait(timeout=5.0)
         return real_update(store, *args, **kwargs)
 
-    monkeypatch.setattr(SqlAlchemyConversationStore, "update_conversation", pause_before_saving)
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore, "update_conversation_with_changes", pause_before_saving
+    )
     url = f"/v1/sessions/{session.session_id}"
     pending = asyncio.create_task(client.patch(url, json={"reasoning_effort": "high"}))
     try:
