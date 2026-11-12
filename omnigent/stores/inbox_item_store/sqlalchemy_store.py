@@ -65,7 +65,6 @@ def _to_entity(row: SqlInboxItem) -> InboxItem:
         user_id=row.user_id,
         source_session_id=row.source_session_id,
         agent_id=row.agent_id,
-        prompt_version=row.prompt_version,
         kind=content["kind"],
         title=content["title"],
         body_md=content["body_md"],
@@ -213,7 +212,6 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
                 user_id=item.user_id,
                 source_session_id=item.source_session_id,
                 agent_id=item.agent_id,
-                prompt_version=item.prompt_version,
                 dedupe_key=item.dedupe_key,
                 status=encode_inbox_item_status("unread"),
                 content={

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+    from omnigent.inner.terminal import TerminalInstance
     from omnigent.terminals.registry import TerminalListEntry, TerminalRegistry
 
 import httpx
@@ -59,6 +60,7 @@ from omnigent.runner.native import (
     _is_runner_owned_codex_terminal,
     _log_terminal_lookup_miss,
     _publish_tmux_target_for_bridge,
+    _readvertise_live_claude_tmux_target,
     _resolved_spec_workdir,
     _unwrap_resolved_spec,
 )
@@ -645,6 +647,44 @@ def register_resource_routes(
             content=session_resource_view_to_dict(resource_view),
         )
 
+    async def _readvertise_live_claude_pane(
+        conv_id: str, instance: TerminalInstance, terminal_registry: TerminalRegistry
+    ) -> None:
+        """Restore a live Claude pane's missing or stale ``tmux.json`` before a turn.
+
+        The relay binding already knows the bridge dir; the session labels
+        (a server round trip) are the fallback. Best-effort.
+        """
+        from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
+
+        binding = _session_comment_relays.get(conv_id)
+        if binding is not None:
+            bridge_dir = binding.bridge_dir
+        else:
+            try:
+                bridge_id = await _claude_native_bridge_id_for_session(
+                    server_client=server_client,
+                    session_id=conv_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _logger.warning(
+                    "could not resolve the claude bridge dir for conv=%s; skipping re-advertise",
+                    conv_id,
+                    exc_info=True,
+                    extra={"session_id": conv_id},
+                )
+                return
+            bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await asyncio.to_thread(
+            _readvertise_live_claude_tmux_target,
+            bridge_dir,
+            instance,
+            terminal_registry=terminal_registry,
+            session_id=conv_id,
+        )
+
     async def _ensure_native_terminal_for_turn(conv_id: str, harness_name: str | None) -> None:
         """Re-create a reaped native pane before forwarding a turn (self-heal).
 
@@ -676,6 +716,9 @@ def register_resource_routes(
             return
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None and await instance.is_alive():
+            if terminal_name == "claude":
+                # A live pane still needs its advertisement for message delivery.
+                await _readvertise_live_claude_pane(conv_id, instance, terminal_registry)
             if terminal_name != "codex":
                 return
             terminal_id = terminal_resource_id("codex", "main")
@@ -1519,6 +1562,25 @@ def register_resource_routes(
             default_pr_url=default_pr_url,
         )
 
+    @app.get("/v1/sessions/{session_id}/resources/github/compare-diff")
+    async def read_github_compare_diff(
+        session_id: str,
+        pr_url: str | None = None,
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+        head_sha: str | None = None,
+        from_sha: str | None = None,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_compare_diff",
+            head_sha=head_sha,
+            from_sha=from_sha,
+            pr_url=pr_url,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
+
     @app.get("/v1/sessions/{session_id}/resources/github/diff/{relative_path:path}")
     async def read_github_file_diff(
         session_id: str,
@@ -1615,6 +1677,21 @@ def register_resource_routes(
             **_server_tracking_fields(body),
             merge_method=body.get("merge_method"),
             expected_head=body.get("expected_head"),
+        )
+
+    @app.post("/v1/sessions/{session_id}/resources/github/merge-as")
+    async def merge_github_pr_as_route(session_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id,
+            "merge_pr_as",
+            pr_url=body["pr_url"],
+            **_server_tracking_fields(body),
+            merge_method=body.get("merge_method"),
+            expected_head=body.get("expected_head"),
+            account=body.get("account"),
         )
 
     @app.post("/v1/sessions/{session_id}/resources/github/disable-auto-merge")

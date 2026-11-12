@@ -150,7 +150,6 @@ async def test_post_creates_an_item(client: httpx.AsyncClient, stores: SimpleNam
     assert payload["duplicate"] is False
     item = payload["item"]
     assert (item["source_session_id"], item["agent_id"]) == (session_id, _INBOX_AGENT)
-    assert item["prompt_version"] == _BUNDLE_HASH
     assert (item["primary_link"], item["topic"]) == ("github.com/acme/app/pull/7", "rampup-flag")
     assert item["actions"] == _body()["actions"]
     assert (item["status"], item["resolution"]) == ("unread", "none")

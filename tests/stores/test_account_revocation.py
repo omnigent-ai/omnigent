@@ -951,7 +951,6 @@ def _inbox_item(user_id: str) -> NewInboxItem:
         user_id=user_id,
         source_session_id=uuid.uuid4().hex,
         agent_id=uuid.uuid4().hex,
-        prompt_version=None,
         kind="info",
         title="A private suggestion",
         body_md="Only the account that got it may read it.",

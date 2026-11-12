@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  SANDBOX_WORKSPACE_LENGTH_MESSAGE,
   isValidSandboxBranch,
   isValidSandboxRepoUrl,
   isValidSandboxWorkspaceLength,
+  sandboxRepoProblem,
 } from "./sandboxRepositories";
 
 describe("isValidSandboxRepoUrl repository names", () => {
@@ -69,5 +71,17 @@ describe("isValidSandboxBranch", () => {
     "feature\\next",
   ])("rejects branches the managed workspace parser refuses: %j", (branch) => {
     expect(isValidSandboxBranch(branch)).toBe(false);
+  });
+});
+
+describe("sandboxRepoProblem", () => {
+  const url = "https://github.com/org/repo";
+
+  it("reports an over-long repository and branch under the repository", () => {
+    expect(sandboxRepoProblem(url, "b".repeat(256 - url.length))).toEqual({
+      field: "repository",
+      message: SANDBOX_WORKSPACE_LENGTH_MESSAGE,
+    });
+    expect(sandboxRepoProblem(url, "b".repeat(255 - url.length))).toBeNull();
   });
 });

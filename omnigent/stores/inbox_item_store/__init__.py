@@ -31,7 +31,6 @@ class NewInboxItem:
     :param user_id: Owner of the item.
     :param source_session_id: Session whose agent posted it.
     :param agent_id: Agent of that session.
-    :param prompt_version: Content hash of the agent bundle, or ``None``.
     :param kind: ``"followup"``, ``"info"``, or ``"reminder"``.
     :param title: One-line summary.
     :param body_md: Markdown body.
@@ -47,7 +46,6 @@ class NewInboxItem:
     user_id: str
     source_session_id: str
     agent_id: str
-    prompt_version: str | None
     kind: str
     title: str
     body_md: str

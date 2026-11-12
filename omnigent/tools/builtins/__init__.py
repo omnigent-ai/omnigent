@@ -58,6 +58,7 @@ from omnigent.tools.builtins.scheduled_tasks import (
 from omnigent.tools.builtins.session_projects import (
     SysProjectListTool,
     SysProjectUpdateTool,
+    SysSessionLinkPrTool,
     SysSessionUpdateTool,
 )
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
@@ -105,6 +106,7 @@ __all__ = [
     "SysSessionCreateTool",
     "SysSessionGetHistoryTool",
     "SysSessionGetInfoTool",
+    "SysSessionLinkPrTool",
     "SysSessionListTool",
     "SysSessionRenameTool",
     "SysSessionSendTool",
