@@ -674,7 +674,10 @@ def _runner_error_detail(response: httpx.Response) -> str | None:
 
 
 def _live_mcp_servers_from_runner(response: httpx.Response) -> SessionLiveMCPServers:
-    """Translate the runner's ``{running, servers, status_unavailable?, reconnect_error?}``."""
+    """Translate the runner's live MCP answer.
+
+    The runner sends ``{running, servers, partial?, status_unavailable?, reconnect_error?}``.
+    """
     payload = _runner_error_payload(response)
     reconnect_error = payload.get("reconnect_error")
     reconnect_error = reconnect_error if isinstance(reconnect_error, str) else None
@@ -697,7 +700,12 @@ def _live_mcp_servers_from_runner(response: httpx.Response) -> SessionLiveMCPSer
             servers.append(LiveMCPServerStatus.model_validate(entry))
         except ValueError:
             _logger.debug("skipping malformed live MCP entry %r", entry)
-    return SessionLiveMCPServers(live=True, servers=servers, reconnect_error=reconnect_error)
+    return SessionLiveMCPServers(
+        live=True,
+        servers=servers,
+        partial=payload.get("partial") is True,
+        reconnect_error=reconnect_error,
+    )
 
 
 def _publish_agent_changed(session_id: str, agent: Agent) -> None:

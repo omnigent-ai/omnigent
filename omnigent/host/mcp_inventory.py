@@ -356,6 +356,46 @@ def _auth_status_overlay() -> AuthStatusOverlay:
         return {}
 
 
+def harness_auth_statuses(harness: str) -> dict[str, str]:
+    """The sign-in manager's account state for each of *harness*'s MCP servers, by name.
+
+    :param harness: The harness the servers belong to, e.g. ``"claude"``.
+    :returns: Each server's state, e.g. ``{"linear": "connected"}``; empty when the
+        report is missing or unreadable.
+    """
+    return {
+        name: fields["auth_status"]
+        for (entry_harness, name), fields in _auth_status_overlay().items()
+        if entry_harness == harness
+    }
+
+
+def harness_sign_in_by_live_name(harness: str) -> dict[str, str]:
+    """Account state of each enabled *harness* server, by the name the harness reports it under.
+
+    A plugin's server reads ``plugin:<plugin>:<server>``, as Claude Code and ``/mcp``
+    name it. Servers the host did not discover, or that a preference disables, and
+    servers with no reported state are left out.
+
+    :param harness: The harness the servers belong to, e.g. ``"claude"``.
+    :returns: Each server's state, e.g. ``{"plugin:notes:notes": "connected"}``; empty
+        when the configs or the report cannot be read.
+    """
+    try:
+        servers = apply_enabled_status(discover_mcp_servers())
+    except Exception:
+        _logger.exception("Reading the %s MCP servers failed", harness)
+        return {}
+    statuses: dict[str, str] = {}
+    for server in apply_auth_status(servers, _auth_status_overlay()):
+        status = server.get("auth_status")
+        if server["harness"] != harness or server.get("enabled") == "false" or status is None:
+            continue
+        plugin = server.get("plugin")
+        statuses[f"plugin:{plugin}:{server['name']}" if plugin else server["name"]] = status
+    return statuses
+
+
 def apply_auth_status(
     servers: list[McpServerSummary], overlay: AuthStatusOverlay
 ) -> list[McpServerSummary]:

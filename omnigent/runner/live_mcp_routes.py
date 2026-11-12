@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 
 import httpx
 from fastapi import FastAPI, Request
@@ -12,6 +12,10 @@ from fastapi.responses import JSONResponse, Response
 from omnigent.runner.app_support import _client_safe_error_detail
 from omnigent.runner.native import _forward_harness_response
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
+from omnigent.util.json_types import JsonObject as _JsonObject
+
+# Answers a live-MCP request for a claude-native session; ``None`` for any other.
+_ClaudeNativeLiveMcp = Callable[[str], Awaitable[_JsonObject | None]]
 
 _logger = logging.getLogger("omnigent.runner.app")
 
@@ -22,15 +26,29 @@ _LIVE_MCP_RECONNECT_TIMEOUT_S = 60.0
 
 
 def register_live_mcp_routes(
-    app: FastAPI, *, process_manager: HarnessProcessManager | None
+    app: FastAPI,
+    *,
+    process_manager: HarnessProcessManager | None,
+    claude_native_live_mcp: _ClaudeNativeLiveMcp | None = None,
+    reconnect_claude_native_mcp: _ClaudeNativeLiveMcp | None = None,
 ) -> None:
     """Register ``/v1/sessions/{session_id}/live-mcp-servers[/reconnect]`` on *app*.
 
     Both routes reach only a harness that is already running; they never start one.
+    A claude-native session's Claude Code runs in a pane the runner owns, so the
+    runner answers for it: it lists the servers signed in since the pane started,
+    and reconnects by restarting the pane.
+
+    :param claude_native_live_mcp: Live status for a claude-native session.
+    :param reconnect_claude_native_mcp: Reconnect for a claude-native session.
     """
 
     @app.get("/v1/sessions/{session_id}/live-mcp-servers")
     async def get_live_mcp_servers(session_id: str) -> Response:
+        if claude_native_live_mcp is not None and (
+            native := await claude_native_live_mcp(session_id)
+        ):
+            return JSONResponse(native)
         client = await _running_harness_client(process_manager, session_id)
         if client is None:
             return JSONResponse({"running": False, "servers": []})
@@ -52,6 +70,10 @@ def register_live_mcp_routes(
             return JSONResponse(
                 {"error": "invalid_request", "detail": "name is required"}, status_code=400
             )
+        if reconnect_claude_native_mcp is not None and (
+            native := await reconnect_claude_native_mcp(session_id)
+        ):
+            return JSONResponse(native)
         client = await _running_harness_client(process_manager, session_id)
         if client is None:
             return JSONResponse({"error": "harness_not_running"}, status_code=409)

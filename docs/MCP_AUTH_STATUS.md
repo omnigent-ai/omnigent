@@ -49,6 +49,19 @@ If the reconnects take longer than 30 seconds, the session restarts Claude Code 
 turn with the conversation so far; the new process connects every server as it starts,
 without holding the turn.
 
+A claude-native session's Claude Code runs in a terminal with no way to reconnect one
+server, so the runner restarts it instead, resuming the same conversation, which connects
+every server as it starts. It does this only while Claude Code is idle: not during a turn
+(including one typed in the terminal), while background agents or shells are running,
+while a question or dialog waits for an answer or its launcher waits for a sign-in,
+within two minutes of activity in the terminal, or while someone has it open in a terminal
+on the host. When a `claude` server
+that read `sign_in_required` as the terminal started reads `connected`, the next message
+restarts Claude Code before it is delivered, if it is idle; otherwise a later message does.
+`/mcp` lists such a server as failed with **Reconnect**, which restarts Claude Code at once
+when it is idle and otherwise says why it waits. Anything typed but not sent in the
+terminal is lost by a restart.
+
 ## Rules the reader enforces
 
 - An entry naming a server the host did not discover is ignored. Report servers under
