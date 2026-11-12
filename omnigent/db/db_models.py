@@ -1813,9 +1813,6 @@ class SqlInboxItem(OmnigentBase):
     # The session whose agent posted the item, and that agent.
     source_session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
     agent_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
-    # Content hash of the agent bundle that posted the item, so acceptance can be
-    # compared across prompt revisions.
-    prompt_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Versioned duplicate key: a hash of the kind, primary link, and topic.
     dedupe_key: Mapped[str] = mapped_column(String(128), nullable=False)
     # INBOX_ITEM_STATUS code: unread, read, done, or dismissed.
@@ -1840,10 +1837,6 @@ class SqlInboxItem(OmnigentBase):
         CheckConstraint(
             "user_id IS NULL OR length(CAST(user_id AS BLOB)) <= 512",
             name="ck_inbox_items_user_id_bytes",
-        ).ddl_if(callable_=_on_sqlite_family),
-        CheckConstraint(
-            "prompt_version IS NULL OR length(CAST(prompt_version AS BLOB)) <= 256",
-            name="ck_inbox_items_prompt_version_bytes",
         ).ddl_if(callable_=_on_sqlite_family),
         CheckConstraint(
             "dedupe_key IS NULL OR length(CAST(dedupe_key AS BLOB)) <= 512",
