@@ -86,6 +86,8 @@ export function parseSiblingSessionDestinations(value: unknown): SiblingSessionD
 export interface ServerInfo {
   /** The server enforces the browser's Admin view cookie; absent on older servers. */
   admin_view?: boolean;
+  /** Server validates project repositories and clones them on hosts. */
+  project_repository_creation?: boolean;
   sibling_sessions?: boolean;
   session_bundle_workspaces?: boolean;
   sibling_session_destinations?: SiblingSessionDestinations;
@@ -444,6 +446,7 @@ function parseBranding(raw: unknown): Branding | null {
 export const FALLBACK_SERVER_INFO: ServerInfo = {
   sibling_session_destinations: "any_host",
   session_bundle_workspaces: false,
+  project_repository_creation: false,
   accounts_enabled: false,
   // Fail to multi-user: a failed probe must not hide account/sharing chrome.
   single_user: false,
@@ -611,6 +614,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             data.sibling_session_destinations,
           ),
           session_bundle_workspaces: data.session_bundle_workspaces === true,
+          project_repository_creation: data.project_repository_creation === true,
           accounts_enabled: data.accounts_enabled === true,
           single_user: data.single_user === true,
           login_url: typeof data.login_url === "string" ? data.login_url : null,

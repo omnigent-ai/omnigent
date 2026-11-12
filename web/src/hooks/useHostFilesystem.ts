@@ -340,22 +340,26 @@ export async function createHostDirectory(hostId: string, path: string): Promise
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path }),
   });
-  if (!res.ok) {
-    // Surface the server's detail (e.g. "directory already exists") so
-    // the user sees why creation failed rather than a bare status code.
-    let detail: string | null;
-    try {
-      const body = (await res.json()) as { detail?: string };
-      detail = typeof body.detail === "string" ? body.detail : null;
-    } catch {
-      detail = null;
-    }
-    const err: FetchError = new Error(detail ?? `create directory failed: HTTP ${res.status}`);
-    err.status = res.status;
-    throw err;
-  }
+  if (!res.ok) throw await hostRequestError(res, "create directory failed");
   const body = (await res.json()) as CreateHostDirectoryResponse;
   return body.path;
+}
+
+/**
+ * Surface the server's detail (e.g. "directory already exists") so the
+ * user sees why a host write failed rather than a bare status code.
+ */
+async function hostRequestError(res: Response, fallback: string): Promise<FetchError> {
+  let detail: string | null;
+  try {
+    const body = (await res.json()) as { detail?: string };
+    detail = typeof body.detail === "string" ? body.detail : null;
+  } catch {
+    detail = null;
+  }
+  const err: FetchError = new Error(detail ?? `${fallback}: HTTP ${res.status}`);
+  err.status = res.status;
+  return err;
 }
 
 /**
@@ -378,4 +382,27 @@ export function useCreateHostDirectory() {
       void queryClient.invalidateQueries({ queryKey: ["host-filesystem", hostId] });
     },
   });
+}
+
+/**
+ * Clone a repository into a new directory on a host.
+ *
+ * @returns The checkout's absolute path.
+ * @throws FetchError with the server's detail. A lost response may mean the
+ *   clone is still running, so callers must not retry automatically.
+ */
+export async function cloneHostRepository(
+  hostId: string,
+  repository: { url: string; branch?: string; path: string },
+): Promise<string> {
+  const res = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/repositories/clone`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(repository),
+    },
+  );
+  if (!res.ok) throw await hostRequestError(res, "clone failed");
+  return ((await res.json()) as { path: string }).path;
 }

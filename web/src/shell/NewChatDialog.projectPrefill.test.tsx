@@ -628,6 +628,38 @@ describe("NewChatLandingScreen project prefill", () => {
     expect("agent_id" in body).toBe(false);
   });
 
+  it("starts a sandbox project's session with its saved repository", async () => {
+    // The project's repository wins over the globally remembered one.
+    localStorage.setItem(
+      "omnigent:last-sandbox-repos",
+      JSON.stringify([{ url: "https://git.example.com/team/remembered.git", branch: "" }]),
+    );
+    vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+      profiles: [{ id: "large", name: "Large", provider: "modal", revision: "1", description: "" }],
+      managed_providers: ["modal"],
+      next_cursor: null,
+    });
+    vi.mocked(useProjectConfig).mockReturnValue({
+      data: {
+        host_id: "__sandbox__",
+        sandbox_provider: "modal",
+        repository: { url: "https://git.example.com/team/sample.git", branch: "release" },
+      },
+      isLoading: false,
+    } as ReturnType<typeof useProjectConfig>);
+    renderSandboxLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("sample"),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }));
+    fireEvent.click(screen.getByRole("option", { name: "Large" }));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    const body = await submitAndReadBody();
+    expect(body.host_type).toBe("managed");
+    expect(body.workspaces).toEqual(["https://git.example.com/team/sample.git#release"]);
+  });
+
   it("clears the sandbox repository and profile on an in-place project switch", async () => {
     // Mounted mirror of the unmount/remount sandbox-leak case: clicking
     // another project's pencil only changes `?project=` — the screen never

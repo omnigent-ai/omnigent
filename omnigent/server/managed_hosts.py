@@ -1239,6 +1239,28 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
     return RepoWorkspace(url=url, branch=branch, repo_name=_derive_repo_name(url))
 
 
+def parse_project_repository(repository: object) -> RepoWorkspace:
+    """
+    Validate a project's saved repository, e.g. ``{"url": "https://git.example.com/a/b.git"}``.
+
+    :param repository: The ``repository`` config value: a ``url`` and an optional ``branch``.
+    :returns: The parsed, validated :class:`RepoWorkspace`.
+    :raises ValueError: When the shape, URL or branch is invalid.
+    """
+    if (
+        not isinstance(repository, dict)
+        or set(repository) - {"url", "branch"}
+        or not isinstance(repository.get("url"), str)
+        or not isinstance(repository.get("branch", ""), str)
+    ):
+        raise ValueError("repository must be an object with a url and an optional branch")
+    url = repository["url"].strip()
+    branch = repository.get("branch", "").strip()
+    if "#" in url:
+        raise ValueError("pass the branch separately from the repository URL")
+    return parse_repo_workspace(f"{url}#{branch}" if branch else url)
+
+
 def _modal_launcher_factory(
     image: str | None,
     secrets: list[str] | None,

@@ -1,6 +1,7 @@
 import type { Host } from "@/hooks/useHosts";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
 import type { ProjectLaunchDefaults } from "@/lib/projectLaunchPreferences";
+import type { LastSandboxRepo } from "@/lib/repoPreferences";
 
 type ProjectPrefillPhase = "location" | "settled";
 
@@ -19,6 +20,10 @@ type ProjectPrefillPhase = "location" | "settled";
  */
 export interface ProjectPrefillConfig {
   hostId?: string;
+  /** Repository the project was created with; seeds a sandbox session's repo. */
+  repository?: { url: string; branch?: string };
+  /** Sandbox provider saved with a sandbox project. */
+  sandboxProvider?: string;
   workspace?: string;
   agentId?: string;
   /** Opt-in worktree default; only `true` is meaningful (absent = no worktree). */
@@ -39,7 +44,8 @@ export interface ProjectPrefillConfig {
  * Overlay how a project's last session started on its stored defaults. The
  * started agent becomes `launchAgentId`; when it is the stored agent and the
  * start recorded its own harness options, those replace the stored model and
- * effort. A started host replaces the stored host and its working directory.
+ * effort. A started host replaces the stored host and its working directory,
+ * except for a repository project, whose saved placement and repository pair.
  */
 export function withProjectLaunchDefaults(
   config: ProjectPrefillConfig,
@@ -54,7 +60,7 @@ export function withProjectLaunchDefaults(
       merged.effort = undefined;
     }
   }
-  if (launch.hostId !== undefined) {
+  if (launch.hostId !== undefined && config.repository === undefined) {
     merged.hostId = launch.hostId;
     merged.workspace = launch.workspace;
   }
@@ -111,6 +117,9 @@ interface ProjectPrefillWrites {
   /** Select the managed sandbox as the target (config.hostId was the sandbox
    *  sentinel). Distinct from `hostId` — the sandbox is not a real host id. */
   selectSandbox?: boolean;
+  /** With selectSandbox: the project's saved provider and repository. */
+  sandboxProvider?: string;
+  sandboxRepos?: LastSandboxRepo[];
 }
 
 /**
@@ -189,6 +198,12 @@ function locationStep(
   if (config?.hostId === SANDBOX_HOST_CHOICE) {
     if (inputs.managedSandboxesEnabled && !inputs.sandboxSelected && selectedHostId === null) {
       writes.selectSandbox = true;
+      writes.sandboxProvider = config.sandboxProvider;
+      if (config.repository) {
+        writes.sandboxRepos = [
+          { url: config.repository.url, branch: config.repository.branch ?? "" },
+        ];
+      }
     }
     return settled(state);
   }

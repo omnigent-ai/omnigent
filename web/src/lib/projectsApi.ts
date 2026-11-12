@@ -22,6 +22,10 @@ import { apiErrorFromResponse } from "./sessionsApi";
 export interface ProjectConfig {
   /** Default host id, or the sandbox sentinel. */
   host_id?: string;
+  /** Repository linked at creation; the server validates it. */
+  repository?: { url: string; branch?: string };
+  /** Sandbox provider for a sandbox project's sessions. */
+  sandbox_provider?: string;
   /** Default working directory / repo path on that host. */
   workspace?: string;
   /** Default agent id for new sessions. */

@@ -2353,6 +2353,8 @@ function NewChatLandingContent({
     const stored: ProjectPrefillConfig = c
       ? {
           hostId: c.host_id,
+          repository: c.repository,
+          sandboxProvider: c.sandbox_provider,
           workspace: c.workspace,
           agentId: c.agent_id,
           useWorktree: c.use_worktree,
@@ -5047,7 +5049,12 @@ function NewChatLandingContent({
     const { writes } = step;
     if (writes.selectSandbox) {
       setSandboxSelected(true);
-      setSandboxProvider(defaultSandboxProvider());
+      setSandboxProvider(
+        writes.sandboxProvider !== undefined && sandboxProviderRows.includes(writes.sandboxProvider)
+          ? writes.sandboxProvider
+          : defaultSandboxProvider(),
+      );
+      if (writes.sandboxRepos) setSandboxRepoSelections(writes.sandboxRepos);
     }
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
     if (writes.agentId !== undefined) {
@@ -5089,6 +5096,7 @@ function NewChatLandingContent({
     prefillConfig,
     projectLaunch,
     defaultSandboxProvider,
+    sandboxProviderRows,
   ]);
 
   // Nested agents reuse their source checkout unless a new worktree is explicitly chosen.

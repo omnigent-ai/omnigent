@@ -42,11 +42,13 @@ from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness, harness_account_key
 from omnigent.host.frames import (
+    CAP_CLONE_REPOSITORY,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
     CAP_REFRESH_HARNESSES,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
     HostCreateDirFrame,
     HostDetectCredentialsFrame,
     HostHarnessLoginCancelFrame,
@@ -84,6 +86,7 @@ from omnigent.server.host_registry import (
     HostRegistry,
     update_harness_accounts,
 )
+from omnigent.server.managed_hosts import parse_project_repository
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import (
     LAUNCH_TIMEOUT_ENV_VAR,
@@ -139,6 +142,8 @@ _LIST_DIR_MAX_LIMIT = 1000
 # fast syscall on the host side; 5s matches list_dir and is generous
 # for transient network slowness without making the picker feel hung.
 _CREATE_DIR_TIMEOUT_S = 5.0
+# Above the host's own 360s clone deadline, so the host reports its timeout first.
+_CLONE_REPOSITORY_TIMEOUT_S = 420.0
 _MODEL_OPTIONS_TIMEOUT_S = 15.0
 # Per-call timeout for host.install_harness round-trips. The host runs
 # `npm install -g <pkg>` — install_harness_cli caps that subprocess at 300s —
@@ -667,6 +672,19 @@ async def _proxy_detect_credentials(
             ) from exc
     finally:
         host_conn.pending_credential_detects.pop(request_id, None)
+
+
+class CloneRepositoryRequest(BaseModel):
+    """Request body for ``POST /v1/hosts/{host_id}/repositories/clone``.
+
+    :param url: Credential-free HTTPS or SSH clone URL.
+    :param branch: Branch to check out, or ``None`` for the default branch.
+    :param path: New checkout directory, absolute or tilde-prefixed.
+    """
+
+    url: str
+    branch: str | None = None
+    path: str
 
 
 class CreateDirectoryRequest(BaseModel):
@@ -1750,6 +1768,74 @@ def create_hosts_router(
             "data": result.get("entries", []),
             "has_more": bool(result.get("has_more", False)),
         }
+
+    @router.post("/hosts/{host_id}/repositories/clone")
+    async def clone_host_repository(
+        request: Request,
+        host_id: str,
+        body: CloneRepositoryRequest,
+    ) -> dict[str, Any]:
+        """
+        Clone a repository into a new directory on an owned host.
+
+        :returns: ``{"object": "repository", "path": "<checkout abs path>"}``.
+        :raises HTTPException: 404/403 for a missing or foreign host, 400 on
+            invalid input, 409 if the host is offline, too old, or the
+            destination exists, 502 on clone failure, 504 on timeout.
+        """
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        try:
+            repository = parse_project_repository(
+                {"url": body.url, **({"branch": body.branch} if body.branch else {})}
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        if "\x00" in body.path or not (
+            body.path.startswith(("/", "~", "\\\\")) or _is_windows_absolute_path(body.path)
+        ):
+            raise HTTPException(status_code=400, detail="path must be absolute or tilde-prefixed")
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise _host_absent_error(host)
+        if CAP_CLONE_REPOSITORY not in conn.hello.capabilities:
+            raise HTTPException(status_code=409, detail="Update this host to clone repositories")
+
+        request_id = secrets.token_hex(8)
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        conn.pending_clones[request_id] = future
+        frame = HostCloneRepositoryFrame(
+            request_id=request_id,
+            url=repository.url,
+            branch=repository.branch,
+            path=body.path,
+        )
+        try:
+            host_registry.send_text(conn, encode_host_frame(frame))
+            result = await asyncio.wait_for(future, timeout=_CLONE_REPOSITORY_TIMEOUT_S)
+        except (ConnectionError, TimeoutError) as exc:
+            # The clone may still be running or complete; never retry it blindly.
+            raise HTTPException(
+                status_code=504 if isinstance(exc, TimeoutError) else 502,
+                detail=(
+                    "Lost contact with the host during the clone, which may still finish. "
+                    "Check the destination before retrying."
+                ),
+            ) from exc
+        finally:
+            conn.pending_clones.pop(request_id, None)
+        if result.get("status") != "ok":
+            status = {
+                "invalid_input": 400,
+                "clone_destination_conflict": 409,
+                "clone_timeout": 504,
+            }.get(result.get("error_code") or "", 502)
+            raise HTTPException(status_code=status, detail=result.get("error") or "clone failed")
+        return {"object": "repository", "path": result.get("path")}
 
     @router.post("/hosts/{host_id}/directories")
     async def create_host_directory(

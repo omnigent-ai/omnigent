@@ -23,6 +23,7 @@ from fastapi import APIRouter, Query, Request
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import AuthProvider
+from omnigent.server.managed_hosts import parse_project_repository
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.sessions import announce_projects_changed
 from omnigent.server.schemas import (
@@ -38,6 +39,24 @@ from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore, 
 
 _DEFAULT_PROJECT_PAGE = 50
 _MAX_PROJECT_PAGE = 200
+
+
+def _validated_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the saved repository; other config keys stay opaque."""
+    if "repository" not in config:
+        return config
+    config = dict(config)
+    if config["repository"] is None:
+        del config["repository"]
+        return config
+    try:
+        repository = parse_project_repository(config["repository"])
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from None
+    config["repository"] = {"url": repository.url}
+    if repository.branch:
+        config["repository"]["branch"] = repository.branch
+    return config
 
 
 def _to_response(project: Project) -> dict[str, Any]:
@@ -104,7 +123,7 @@ def create_projects_router(
             uuid.uuid4().hex,
             body.name,
             user_id,
-            body.config,
+            _validated_config(body.config),
         )
         # Push the change to the owner's other connected clients so their
         # sidebars pick up the new folder without a reload.
@@ -222,7 +241,7 @@ def create_projects_router(
             project_id,
             user_id=user_id,
             name=body.name,
-            config=body.config,
+            config=_validated_config(body.config) if body.config is not None else None,
         )
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)

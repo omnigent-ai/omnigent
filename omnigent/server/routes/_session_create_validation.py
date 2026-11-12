@@ -19,6 +19,7 @@ from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.models.model_override import validate_model_override
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_LOCAL, local_single_user_enabled
+from omnigent.server.managed_hosts import parse_project_repository
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.host_store import host_is_live
@@ -66,9 +67,20 @@ async def resolve_project_session_create(
     # Nested agents inherit filing, while the composer or MCP chooses their placement.
     config = {} if getattr(body, "sibling_source_id", None) else project.config
     updates: dict[str, Any] = {}
-    for field in ("agent_id", "workspace", "git"):
+    managed = getattr(body, "host_type", None) == "managed"
+    # A managed session clones the project's repository; a host-local path does not apply.
+    repository = config.get("repository") if managed else None
+    for field in ("agent_id",) if repository else ("agent_id", "workspace", "git"):
         if field not in fields_set and field in config and field in body.__class__.model_fields:
             updates[field] = config[field]
+    if managed and "sandbox_provider" not in fields_set and "sandbox_provider" in config:
+        updates["sandbox_provider"] = config["sandbox_provider"]
+    if repository and not {"workspace", "workspaces"} & fields_set:
+        try:
+            parsed = parse_project_repository(repository)
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from None
+        updates["workspaces"] = [f"{parsed.url}#{parsed.branch}" if parsed.branch else parsed.url]
     resolved_data = body.model_dump()
     resolved_data.update(updates)
     # Re-validate project hints because config is intentionally stored as

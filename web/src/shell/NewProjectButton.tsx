@@ -14,10 +14,26 @@ import {
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
-import { useCreateProject } from "@/hooks/useConversations";
-import { useCreateHostDirectory } from "@/hooks/useHostFilesystem";
+import { useCreateProject, useProjects } from "@/hooks/useConversations";
+import { cloneHostRepository, useCreateHostDirectory } from "@/hooks/useHostFilesystem";
+import { useHosts } from "@/hooks/useHosts";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import {
+  SANDBOX_HOST_CHOICE,
+  sandboxHostChoice,
+  sandboxHostChoiceProvider,
+} from "@/lib/hostPreferences";
 import type { ProjectConfig } from "@/lib/projectsApi";
+import type { LastSandboxRepo } from "@/lib/repoPreferences";
+import {
+  deriveRepoName,
+  isValidSandboxBranch,
+  isValidSandboxRepoUrl,
+  isValidSandboxWorkspaceLength,
+} from "@/lib/sandboxRepositories";
+import { SandboxRepositoryPicker } from "./SandboxRepositoryPicker";
 import { joinPath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 
@@ -65,6 +81,17 @@ function friendlyDirectoryError(error: unknown): string {
   return "The folder couldn’t be created. Check the host and try again.";
 }
 
+/** Why a chosen repository can't be used, or null when it can. */
+function repositoryError(repository: LastSandboxRepo): string | null {
+  if (!isValidSandboxRepoUrl(repository.url))
+    return "Enter an HTTPS or SSH URL ending in a repository name.";
+  if (!isValidSandboxBranch(repository.branch))
+    return "Enter a valid branch name, or leave it blank for the default branch.";
+  if (!isValidSandboxWorkspaceLength(repository.url, repository.branch))
+    return "The repository URL and branch are too long.";
+  return null;
+}
+
 function friendlyProjectError(error: unknown): string {
   const message = error instanceof Error ? error.message.toLowerCase() : "";
   if (message.includes("already exists")) {
@@ -105,7 +132,33 @@ export function NewProjectButton({
   const [name, setName] = useState("");
   const [icon, setIcon] = useState<string | undefined>(undefined);
   const [emojiOpen, setEmojiOpen] = useState(false);
-  const [dialogHostId, setDialogHostId] = useState<string | null>(null);
+  const info = useServerInfo();
+  const repositoryCreation = info !== "loading" && info.project_repository_creation === true;
+  const { data: hosts = [] } = useHosts({ enabled: open && repositoryCreation });
+  const { data: projects = [] } = useProjects({ enabled: open });
+  const sandboxProviders =
+    repositoryCreation && info.managed_sandboxes_enabled ? sandboxProviderOptions(info) : [];
+  // A connected host id, or a sandboxHostChoice() value.
+  const [runOn, setRunOn] = useState<string | null>(null);
+  const sandboxProvider = runOn === null ? undefined : sandboxHostChoiceProvider(runOn);
+  const sandboxSelected = sandboxProvider !== undefined;
+  const dialogHostId = sandboxSelected ? null : runOn;
+  const [mode, setMode] = useState<"folder" | "repository">("folder");
+  const repositoryMode = repositoryCreation && (sandboxSelected || mode === "repository");
+  const [repositories, setRepositories] = useState<LastSandboxRepo[]>([]);
+  const [pendingUrl, setPendingUrl] = useState("");
+  // A typed URL counts without pressing Add.
+  const repository =
+    repositories[0] ?? (pendingUrl.trim() !== "" ? { url: pendingUrl.trim(), branch: "" } : null);
+  const repositoryName = (repository && deriveRepoName(repository.url)) ?? "repository";
+  // The destination follows the repository name until the user edits it.
+  const [cloneParent, setCloneParent] = useState("~");
+  const [cloneDestination, setCloneDestination] = useState<string | null>(null);
+  const destination = cloneDestination ?? joinPath(cloneParent, repositoryName);
+  const [parentPickerOpen, setParentPickerOpen] = useState(false);
+  // Reused when only the project name changes, so a failed save never clones twice.
+  const [checkout, setCheckout] = useState<{ key: string; path: string } | null>(null);
+  const [cloning, setCloning] = useState(false);
   const [workspace, setWorkspace] = useState<WorkspaceSelection | null>(null);
   const [createdWorkspace, setCreatedWorkspace] = useState<
     | (WorkspaceSelection & {
@@ -122,23 +175,77 @@ export function NewProjectButton({
   const isComposingRef = useRef(false);
   const createProject = useCreateProject();
   const createDirectory = useCreateHostDirectory();
-  const isPending = createProject.isPending || createDirectory.isPending;
+  const isPending = cloning || createProject.isPending || createDirectory.isPending;
   const folderCreationDisabled = isPending || (!hostsLoading && dialogHostId === null);
 
   useEffect(() => {
-    if (open && dialogHostId === null && hostId !== null) {
-      setDialogHostId(hostId);
+    if (open && runOn === null && hostId !== null) {
+      setRunOn(hostId);
     }
-  }, [dialogHostId, hostId, open]);
+  }, [runOn, hostId, open]);
+
+  const reset = () => {
+    setName("");
+    setIcon(undefined);
+    setRunOn(hostId);
+    setMode("folder");
+    setRepositories([]);
+    setPendingUrl("");
+    setCloneParent("~");
+    setCloneDestination(null);
+    setParentPickerOpen(false);
+    setCheckout(null);
+    setWorkspace(null);
+    setCreatedWorkspace(null);
+    setWorkspacePickerOpen(false);
+    setCreateWorkspaceFolder(false);
+    setSubmitError(null);
+  };
 
   const submit = async () => {
     const trimmed = name.trim();
     if (trimmed === "" || isPending) return;
+    if (repositoryCreation && projects.some((project) => project.name === trimmed)) {
+      setSubmitError("A project with this name already exists. Use a different name.");
+      return;
+    }
+    const repositoryProblem = repositoryMode && repository ? repositoryError(repository) : null;
+    if (repositoryProblem) {
+      setSubmitError(repositoryProblem);
+      return;
+    }
     const submission = ++submissionGeneration.current;
     setSubmitError(null);
 
     let selectedWorkspace = workspace;
-    if (createWorkspaceFolder) {
+    if (repositoryMode && repository && dialogHostId !== null) {
+      const request = { url: repository.url, branch: repository.branch, path: destination };
+      const key = JSON.stringify([dialogHostId, request]);
+      if (checkout?.key === key) {
+        selectedWorkspace = { hostId: dialogHostId, path: checkout.path };
+      } else {
+        setCloning(true);
+        try {
+          const path = await cloneHostRepository(dialogHostId, {
+            ...request,
+            branch: request.branch || undefined,
+          });
+          if (submission !== submissionGeneration.current) return;
+          selectedWorkspace = { hostId: dialogHostId, path };
+          setCheckout({ key, path });
+        } catch (error) {
+          if (submission !== submissionGeneration.current) return;
+          setSubmitError(
+            error instanceof Error ? error.message : "The repository couldn’t be cloned.",
+          );
+          return;
+        } finally {
+          setCloning(false);
+        }
+      }
+    } else if (repositoryMode) {
+      selectedWorkspace = null;
+    } else if (createWorkspaceFolder) {
       if (!isSinglePathComponent(trimmed)) {
         setSubmitError("Use a project name without slashes or dot segments to create a folder.");
         return;
@@ -173,6 +280,14 @@ export function NewProjectButton({
       config.host_id = selectedWorkspace.hostId;
       config.workspace = selectedWorkspace.path;
     }
+    if (repositoryMode && sandboxSelected) {
+      config.host_id = SANDBOX_HOST_CHOICE;
+      if (sandboxProvider) config.sandbox_provider = sandboxProvider;
+    }
+    if (repositoryMode && repository) {
+      config.repository = { url: repository.url };
+      if (repository.branch.trim()) config.repository.branch = repository.branch.trim();
+    }
     createProject.mutate(
       { name: trimmed, config: Object.keys(config).length > 0 ? config : undefined },
       {
@@ -180,14 +295,8 @@ export function NewProjectButton({
           if (submission !== submissionGeneration.current) return;
           submissionGeneration.current += 1;
           setOpen(false);
-          setName("");
-          setIcon(undefined);
-          setDialogHostId(null);
-          setWorkspace(null);
-          setCreatedWorkspace(null);
-          setWorkspacePickerOpen(false);
-          setCreateWorkspaceFolder(false);
-          setSubmitError(null);
+          reset();
+          setRunOn(null);
           onCreated(project.name);
         },
       },
@@ -198,6 +307,8 @@ export function NewProjectButton({
     <Dialog
       open={open}
       onOpenChange={(next) => {
+        // Clone and save keep the modal open; a lost result needs the user's attention.
+        if (!next && isPending) return;
         if (!next) {
           submissionGeneration.current += 1;
         }
@@ -205,6 +316,7 @@ export function NewProjectButton({
         if (!next) {
           setEmojiOpen(false);
           setWorkspacePickerOpen(false);
+          setParentPickerOpen(false);
         }
       }}
     >
@@ -232,141 +344,269 @@ export function NewProjectButton({
             Create a project, then file sessions into it from a session's menu.
           </DialogDescription>
         </DialogHeader>
-        {/* One combined control: emoji tile (left) + name (right) share a
+        <fieldset disabled={isPending} aria-busy={isPending} className="contents">
+          {/* One combined control: emoji tile (left) + name (right) share a
             single border, so it reads as a single input. */}
-        <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
-          <Popover open={emojiOpen} onOpenChange={setEmojiOpen}>
-            <PopoverTrigger asChild>
-              <button
-                type="button"
-                aria-label="Choose project icon"
-                data-testid="new-project-icon"
-                className="flex w-[38px] shrink-0 cursor-pointer items-center justify-center self-stretch bg-primary/10 outline-none transition-colors"
+          <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
+            <Popover open={emojiOpen} onOpenChange={setEmojiOpen}>
+              <PopoverTrigger asChild>
+                <button
+                  type="button"
+                  aria-label="Choose project icon"
+                  data-testid="new-project-icon"
+                  className="flex w-[38px] shrink-0 cursor-pointer items-center justify-center self-stretch bg-primary/10 outline-none transition-colors"
+                >
+                  {icon ? (
+                    <span className="text-xl leading-none">{icon}</span>
+                  ) : (
+                    <SmilePlusIcon className="size-4 text-primary" />
+                  )}
+                </button>
+              </PopoverTrigger>
+              <PopoverContent
+                align="start"
+                // Publish the collision-aware available viewport height (Radix
+                // exposes it as a CSS var), capped at the picker's natural size,
+                // so the .emoji-picker-popover rule in index.css shrinks
+                // emoji-mart to fit — it then scrolls its grid internally
+                // instead of clipping on short screens.
+                collisionPadding={8}
+                style={
+                  {
+                    "--emoji-picker-height":
+                      "min(420px, var(--radix-popover-content-available-height))",
+                  } as CSSProperties
+                }
+                className="emoji-picker-popover flex max-h-[var(--radix-popover-content-available-height)] w-auto flex-col overflow-hidden p-0"
+                // The Dialog's scroll lock (react-remove-scroll) preventDefaults
+                // wheel events over the picker — it can't see emoji-mart's scroll
+                // region inside shadow DOM. Stop the wheel from reaching the
+                // document-level lock so the grid scrolls.
+                onWheel={(e) => e.stopPropagation()}
+                onInteractOutside={() => setEmojiOpen(false)}
               >
-                {icon ? (
-                  <span className="text-xl leading-none">{icon}</span>
-                ) : (
-                  <SmilePlusIcon className="size-4 text-primary" />
-                )}
-              </button>
-            </PopoverTrigger>
-            <PopoverContent
-              align="start"
-              // Publish the collision-aware available viewport height (Radix
-              // exposes it as a CSS var), capped at the picker's natural size,
-              // so the .emoji-picker-popover rule in index.css shrinks
-              // emoji-mart to fit — it then scrolls its grid internally
-              // instead of clipping on short screens.
-              collisionPadding={8}
-              style={
-                {
-                  "--emoji-picker-height":
-                    "min(420px, var(--radix-popover-content-available-height))",
-                } as CSSProperties
-              }
-              className="emoji-picker-popover flex max-h-[var(--radix-popover-content-available-height)] w-auto flex-col overflow-hidden p-0"
-              // The Dialog's scroll lock (react-remove-scroll) preventDefaults
-              // wheel events over the picker — it can't see emoji-mart's scroll
-              // region inside shadow DOM. Stop the wheel from reaching the
-              // document-level lock so the grid scrolls.
-              onWheel={(e) => e.stopPropagation()}
-              onInteractOutside={() => setEmojiOpen(false)}
-            >
-              <EmojiPicker
-                onSelect={(native) => {
-                  setIcon(native);
-                  setEmojiOpen(false);
-                }}
-              />
-            </PopoverContent>
-          </Popover>
-          <input
-            autoFocus
-            className="w-full bg-transparent px-3 py-2 text-ui outline-none"
-            placeholder="Project name…"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            onCompositionStart={() => {
-              isComposingRef.current = true;
-            }}
-            onCompositionEnd={() => {
-              isComposingRef.current = false;
-            }}
-            onKeyDown={(e) => {
-              if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
-              if (e.key === "Enter") {
-                e.preventDefault();
-                void submit();
-              }
-            }}
-          />
-        </div>
-        <Collapsible>
-          <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-1 rounded-sm text-left outline-none focus-visible:ring-3 focus-visible:ring-ring/50">
-            <span className="font-medium text-ui">
-              Working directory{" "}
-              <span className="font-normal text-muted-foreground">(optional)</span>
-            </span>
-            <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-out group-data-[state=open]:rotate-90" />
-          </CollapsibleTrigger>
-          <CollapsibleContent className="new-project-working-directory-content mt-2 flex flex-col gap-1.5">
-            <label
-              htmlFor="new-project-create-workspace"
-              className={`flex h-10 items-center gap-2 rounded-lg border border-input bg-transparent px-3 text-ui ${
-                folderCreationDisabled ? "cursor-not-allowed opacity-50" : "cursor-pointer"
-              }`}
-            >
-              <Checkbox
-                id="new-project-create-workspace"
-                checked={createWorkspaceFolder}
-                onCheckedChange={(checked) => {
-                  setCreateWorkspaceFolder(checked === true);
-                  setSubmitError(null);
-                }}
-                disabled={folderCreationDisabled}
-              />
-              <span>Create a folder using the project name</span>
-            </label>
-            <button
-              id="new-project-workspace"
-              type="button"
-              data-testid="new-project-workspace"
-              aria-label={`Working directory: ${
-                createWorkspaceFolder
-                  ? joinPath("~", name.trim() || "Project name")
-                  : workspace?.path || "Not selected"
-              }`}
-              onClick={() => setWorkspacePickerOpen(true)}
-              disabled={createWorkspaceFolder || dialogHostId === null || isPending}
-              className="flex h-10 w-full items-center justify-between gap-3 rounded-lg border border-input bg-transparent px-3 text-ui outline-none transition-colors hover:bg-muted/50 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <span className="flex min-w-0 items-center gap-2">
-                <FolderOpenIcon className="size-4 shrink-0 text-muted-foreground" />
-                <span className="truncate">
-                  {createWorkspaceFolder
-                    ? joinPath("~", name.trim() || "Project name")
-                    : workspace?.path || (hostsLoading ? "Loading hosts…" : "Choose a folder…")}
-                </span>
-              </span>
-              <span className="shrink-0 text-muted-foreground text-sm">Browse</span>
-            </button>
-            <WorkspacePickerDialog
-              open={workspacePickerOpen}
-              onOpenChange={setWorkspacePickerOpen}
-              hostId={dialogHostId}
-              initialPath={workspace?.path}
-              onConfirm={(path) => {
-                if (dialogHostId !== null) {
-                  setWorkspace({ hostId: dialogHostId, path });
+                <EmojiPicker
+                  onSelect={(native) => {
+                    setIcon(native);
+                    setEmojiOpen(false);
+                  }}
+                />
+              </PopoverContent>
+            </Popover>
+            <input
+              autoFocus
+              className="w-full bg-transparent px-3 py-2 text-ui outline-none"
+              placeholder="Project name…"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onCompositionStart={() => {
+                isComposingRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                isComposingRef.current = false;
+              }}
+              onKeyDown={(e) => {
+                if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void submit();
                 }
               }}
-              description="Choose a default working directory for sessions in this project."
             />
-          </CollapsibleContent>
-        </Collapsible>
+          </div>
+          <Collapsible>
+            <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-1 rounded-sm text-left outline-none focus-visible:ring-3 focus-visible:ring-ring/50">
+              <span className="font-medium text-ui">
+                Working directory{" "}
+                <span className="font-normal text-muted-foreground">(optional)</span>
+              </span>
+              <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-out group-data-[state=open]:rotate-90" />
+            </CollapsibleTrigger>
+            <CollapsibleContent className="new-project-working-directory-content mt-2 flex flex-col gap-1.5">
+              {repositoryCreation && (
+                <>
+                  <label className="flex flex-col gap-1 text-ui">
+                    <span className="font-medium">Run on</span>
+                    <select
+                      value={runOn ?? ""}
+                      onChange={(event) => {
+                        setRunOn(event.target.value || null);
+                        setCloneParent("~");
+                        setCloneDestination(null);
+                        setWorkspace(null);
+                        setSubmitError(null);
+                      }}
+                      className="h-10 rounded-lg border border-input bg-transparent px-3 text-ui"
+                    >
+                      {runOn === null && <option value="">Choose a target…</option>}
+                      {hosts
+                        .filter((host) => host.status === "online" || host.host_id === runOn)
+                        .map((host) => (
+                          <option key={host.host_id} value={host.host_id}>
+                            {host.name}
+                          </option>
+                        ))}
+                      {sandboxProviders.map((provider) => (
+                        <option key={provider ?? ""} value={sandboxHostChoice(provider)}>
+                          {sandboxOptionLabel(provider)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {!sandboxSelected && (
+                    <div
+                      role="radiogroup"
+                      aria-label="Workspace source"
+                      className="flex gap-4 text-ui"
+                    >
+                      {(["folder", "repository"] as const).map((option) => (
+                        <label key={option} className="flex items-center gap-1.5">
+                          <input
+                            type="radio"
+                            name="new-project-workspace-source"
+                            checked={mode === option}
+                            onChange={() => {
+                              setMode(option);
+                              setSubmitError(null);
+                            }}
+                          />
+                          {option === "folder" ? "Folder" : "Repository"}
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+              {repositoryMode ? (
+                <>
+                  <span className="font-medium text-ui">Repository (optional)</span>
+                  <SandboxRepositoryPicker
+                    selections={repositories}
+                    onChange={(next) => {
+                      setRepositories(next);
+                      setSubmitError(null);
+                    }}
+                    maxRepos={1}
+                    enabled={open}
+                    testIdPrefix="new-project-repo"
+                    pendingUrl={pendingUrl}
+                    onPendingUrlChange={(url) => {
+                      setPendingUrl(url);
+                      setSubmitError(null);
+                    }}
+                  />
+                  {sandboxSelected ? (
+                    <p className="text-sm text-muted-foreground">
+                      Saved with this project. The repository will be prepared when you start a
+                      session.
+                    </p>
+                  ) : (
+                    <>
+                      <label htmlFor="new-project-clone-into" className="font-medium text-ui">
+                        Clone into
+                      </label>
+                      <div className="flex gap-2">
+                        <input
+                          id="new-project-clone-into"
+                          value={destination}
+                          onChange={(event) => setCloneDestination(event.target.value)}
+                          className="h-10 min-w-0 flex-1 rounded-lg border border-input bg-transparent px-3 text-ui"
+                        />
+                        <Button
+                          type="button"
+                          variant="outline"
+                          onClick={() => setParentPickerOpen(true)}
+                          disabled={dialogHostId === null}
+                        >
+                          Browse
+                        </Button>
+                      </div>
+                      <p className="text-sm text-muted-foreground">
+                        The repository will be cloned before the project is created.
+                      </p>
+                      <WorkspacePickerDialog
+                        open={parentPickerOpen}
+                        onOpenChange={setParentPickerOpen}
+                        hostId={dialogHostId}
+                        title="Choose parent folder"
+                        description="The repository is cloned into a new folder here."
+                        onConfirm={(parent) => {
+                          setCloneParent(parent);
+                          setCloneDestination(null);
+                        }}
+                      />
+                    </>
+                  )}
+                </>
+              ) : (
+                <>
+                  <label
+                    htmlFor="new-project-create-workspace"
+                    className={`flex h-10 items-center gap-2 rounded-lg border border-input bg-transparent px-3 text-ui ${
+                      folderCreationDisabled ? "cursor-not-allowed opacity-50" : "cursor-pointer"
+                    }`}
+                  >
+                    <Checkbox
+                      id="new-project-create-workspace"
+                      checked={createWorkspaceFolder}
+                      onCheckedChange={(checked) => {
+                        setCreateWorkspaceFolder(checked === true);
+                        setSubmitError(null);
+                      }}
+                      disabled={folderCreationDisabled}
+                    />
+                    <span>Create a folder using the project name</span>
+                  </label>
+                  <button
+                    id="new-project-workspace"
+                    type="button"
+                    data-testid="new-project-workspace"
+                    aria-label={`Working directory: ${
+                      createWorkspaceFolder
+                        ? joinPath("~", name.trim() || "Project name")
+                        : workspace?.path || "Not selected"
+                    }`}
+                    onClick={() => setWorkspacePickerOpen(true)}
+                    disabled={createWorkspaceFolder || dialogHostId === null || isPending}
+                    className="flex h-10 w-full items-center justify-between gap-3 rounded-lg border border-input bg-transparent px-3 text-ui outline-none transition-colors hover:bg-muted/50 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <span className="flex min-w-0 items-center gap-2">
+                      <FolderOpenIcon className="size-4 shrink-0 text-muted-foreground" />
+                      <span className="truncate">
+                        {createWorkspaceFolder
+                          ? joinPath("~", name.trim() || "Project name")
+                          : workspace?.path ||
+                            (hostsLoading ? "Loading hosts…" : "Choose a folder…")}
+                      </span>
+                    </span>
+                    <span className="shrink-0 text-muted-foreground text-sm">Browse</span>
+                  </button>
+                  <WorkspacePickerDialog
+                    open={workspacePickerOpen}
+                    onOpenChange={setWorkspacePickerOpen}
+                    hostId={dialogHostId}
+                    initialPath={workspace?.path}
+                    onConfirm={(path) => {
+                      if (dialogHostId !== null) {
+                        setWorkspace({ hostId: dialogHostId, path });
+                      }
+                    }}
+                    description="Choose a default working directory for sessions in this project."
+                  />
+                </>
+              )}
+            </CollapsibleContent>
+          </Collapsible>
+        </fieldset>
+        {isPending && repositoryMode && (
+          <p className="text-ui text-muted-foreground" role="status">
+            {cloning ? "Cloning…" : "Creating project…"}
+          </p>
+        )}
         {(submitError || createProject.isError) && (
           <p className="text-ui text-destructive" role="alert">
             {submitError ?? friendlyProjectError(createProject.error)}
+            {!submitError && checkout && ` The repository is already cloned to ${checkout.path}.`}
           </p>
         )}
         <DialogFooter className="border-t-0 bg-transparent">
@@ -401,14 +641,7 @@ export function NewProjectButton({
             onClick={(e) => {
               e.stopPropagation();
               submissionGeneration.current += 1;
-              setName("");
-              setIcon(undefined);
-              setDialogHostId(hostId);
-              setWorkspace(null);
-              setCreatedWorkspace(null);
-              setWorkspacePickerOpen(false);
-              setCreateWorkspaceFolder(false);
-              setSubmitError(null);
+              reset();
               setOpen(true);
             }}
           >

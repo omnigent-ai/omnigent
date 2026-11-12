@@ -128,6 +128,24 @@ describe("projectPrefill config seeding", () => {
     expect(state.phase).toBe("settled");
   });
 
+  it("seeds a sandbox project's provider and repository with the sandbox", () => {
+    const { writes } = runToDone(
+      inputs({
+        config: {
+          hostId: SANDBOX_HOST_CHOICE,
+          sandboxProvider: "provider",
+          repository: { url: "https://git.example.com/team/sample.git", branch: "release" },
+        },
+        managedSandboxesEnabled: true,
+      }),
+    );
+    expect(writes.selectSandbox).toBe(true);
+    expect(writes.sandboxProvider).toBe("provider");
+    expect(writes.sandboxRepos).toEqual([
+      { url: "https://git.example.com/team/sample.git", branch: "release" },
+    ]);
+  });
+
   it("drops a stored sandbox default when the server no longer offers sandboxes", () => {
     const { writes } = runToDone(
       inputs({ config: { hostId: SANDBOX_HOST_CHOICE }, managedSandboxesEnabled: false }),
@@ -136,15 +154,20 @@ describe("projectPrefill config seeding", () => {
     expect(writes.hostId).toBeUndefined();
   });
 
-  it("does not re-select the sandbox once it is already selected", () => {
+  it("does not re-select the sandbox or its repository once it is already selected", () => {
+    // A restored draft keeps its own repository choice.
     const { writes } = runToDone(
       inputs({
-        config: { hostId: SANDBOX_HOST_CHOICE },
+        config: {
+          hostId: SANDBOX_HOST_CHOICE,
+          repository: { url: "https://git.example.com/team/sample.git", branch: "release" },
+        },
         managedSandboxesEnabled: true,
         sandboxSelected: true,
       }),
     );
     expect(writes.selectSandbox).toBeUndefined();
+    expect(writes.sandboxRepos).toBeUndefined();
   });
 
   it("does not select the sandbox when the user already picked a host", () => {
@@ -311,5 +334,15 @@ describe("withProjectLaunchDefaults", () => {
     expect(
       withProjectLaunchDefaults({}, { hostId: "host_2", workspace: "/repos/working-dir-b" }),
     ).toEqual({ hostId: "host_2", workspace: "/repos/working-dir-b" });
+  });
+
+  it("keeps a repository project's saved placement", () => {
+    const repositoryProject = {
+      hostId: SANDBOX_HOST_CHOICE,
+      repository: { url: "https://git.example.com/team/sample.git", branch: "release" },
+    };
+    expect(
+      withProjectLaunchDefaults(repositoryProject, { hostId: "host_2", workspace: "/elsewhere" }),
+    ).toEqual(repositoryProject);
   });
 });

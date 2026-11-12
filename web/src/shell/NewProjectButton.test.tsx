@@ -1,12 +1,28 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type { ServerInfo } from "@/lib/capabilities";
 import { NewProjectButton } from "./NewProjectButton";
 
 const mocks = vi.hoisted(() => ({
   createProject: vi.fn(),
   createDirectory: vi.fn(),
   projectError: null as Error | null,
+  cloneRepository: vi.fn(),
+  info: { project_repository_creation: false } as ServerInfo,
+  projects: [] as { name: string }[],
+}));
+
+vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => mocks.info }));
+
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: () => ({
+    data: [
+      { host_id: "host_1", name: "Laptop", owner: "me", status: "online" },
+      { host_id: "host_2", name: "Desktop", owner: "me", status: "online" },
+    ],
+  }),
 }));
 
 vi.mock("@/hooks/useConversations", () => ({
@@ -16,6 +32,7 @@ vi.mock("@/hooks/useConversations", () => ({
     isError: mocks.projectError !== null,
     error: mocks.projectError,
   }),
+  useProjects: () => ({ data: mocks.projects }),
 }));
 
 vi.mock("@/hooks/useHostFilesystem", () => ({
@@ -23,6 +40,7 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
     mutateAsync: mocks.createDirectory,
     isPending: false,
   }),
+  cloneHostRepository: mocks.cloneRepository,
 }));
 
 vi.mock("@/components/ProjectIconPicker", () => ({
@@ -44,11 +62,15 @@ vi.mock("./WorkspacePickerDialog", () => ({
     ) : null,
 }));
 
+const queryClient = new QueryClient();
+
 function projectButton(hostId: string | null) {
   return (
-    <TooltipProvider>
-      <NewProjectButton onCreated={vi.fn()} hostId={hostId} hostsLoading={false} />
-    </TooltipProvider>
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        <NewProjectButton onCreated={vi.fn()} hostId={hostId} hostsLoading={false} />
+      </TooltipProvider>
+    </QueryClientProvider>
   );
 }
 
@@ -64,6 +86,10 @@ beforeEach(() => {
   mocks.createProject.mockReset();
   mocks.createDirectory.mockReset();
   mocks.projectError = null;
+  mocks.cloneRepository.mockReset();
+  mocks.cloneRepository.mockResolvedValue("/Users/me/sample");
+  mocks.info = { project_repository_creation: false } as ServerInfo;
+  mocks.projects = [];
   mocks.createProject.mockImplementation(
     (input: { name: string }, options?: { onSuccess?: (project: { name: string }) => void }) => {
       options?.onSuccess?.({ name: input.name });
@@ -275,5 +301,159 @@ describe("NewProjectButton", () => {
     expect(screen.getByRole("alert")).toHaveTextContent(
       "A project with this name already exists. Use a different name.",
     );
+  });
+
+  describe("with repository creation", () => {
+    const url = "https://git.example.com/team/sample.git";
+
+    beforeEach(() => {
+      mocks.info = {
+        project_repository_creation: true,
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "provider",
+        sandbox_providers: ["provider"],
+      } as ServerInfo;
+    });
+
+    function chooseRepository(project = "Sample") {
+      renderButton();
+      fireEvent.change(screen.getByPlaceholderText("Project name…"), {
+        target: { value: project },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
+      fireEvent.click(screen.getByRole("radio", { name: "Repository" }));
+      fireEvent.change(screen.getByLabelText("Repository URL"), { target: { value: url } });
+    }
+
+    it("clones a typed URL on the host before saving the project", async () => {
+      chooseRepository();
+      expect(screen.getByLabelText("Clone into")).toHaveValue("~/sample");
+      fireEvent.change(screen.getByLabelText("Repository URL"), { target: { value: "" } });
+      fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+      fireEvent.click(screen.getByRole("button", { name: "Select test folder" }));
+      // A browsed parent keeps following the repository typed afterwards.
+      fireEvent.change(screen.getByLabelText("Repository URL"), { target: { value: url } });
+      expect(screen.getByLabelText("Clone into")).toHaveValue("/work/repo/sample");
+      fireEvent.click(screen.getByTestId("new-project-confirm"));
+
+      await waitFor(() =>
+        expect(mocks.createProject).toHaveBeenCalledWith(
+          {
+            name: "Sample",
+            config: {
+              host_id: "host_1",
+              workspace: "/Users/me/sample",
+              repository: { url },
+            },
+          },
+          expect.any(Object),
+        ),
+      );
+      expect(mocks.cloneRepository).toHaveBeenCalledWith("host_1", {
+        url,
+        branch: undefined,
+        path: "/work/repo/sample",
+      });
+    });
+
+    it("keeps the modal locked while cloning and keeps inputs after a failure", async () => {
+      let rejectClone: (error: Error) => void = () => {};
+      mocks.cloneRepository.mockReturnValue(
+        new Promise((_resolve, reject) => {
+          rejectClone = reject;
+        }),
+      );
+      chooseRepository();
+      fireEvent.click(screen.getByTestId("new-project-confirm"));
+
+      await screen.findByText("Cloning…");
+      fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+      expect(screen.getByRole("dialog")).toBeInTheDocument();
+      expect(screen.getByLabelText("Repository URL")).toBeDisabled();
+      expect(screen.getByTestId("new-project-confirm")).toBeDisabled();
+
+      await act(async () => rejectClone(new Error("The clone destination already exists")));
+      expect(screen.getByRole("alert")).toHaveTextContent("already exists");
+      expect(screen.getByLabelText("Repository URL")).toHaveValue(url);
+      expect(screen.getByLabelText("Repository URL")).toBeEnabled();
+      expect(mocks.createProject).not.toHaveBeenCalled();
+    });
+
+    it("reuses the checkout when only the project name changes after a failed save", async () => {
+      mocks.createProject.mockImplementation(() => {});
+      chooseRepository();
+      fireEvent.click(screen.getByTestId("new-project-confirm"));
+      await waitFor(() => expect(mocks.createProject).toHaveBeenCalledTimes(1));
+      fireEvent.change(screen.getByPlaceholderText("Project name…"), {
+        target: { value: "Renamed" },
+      });
+      fireEvent.click(screen.getByTestId("new-project-confirm"));
+      await waitFor(() => expect(mocks.createProject).toHaveBeenCalledTimes(2));
+      expect(mocks.cloneRepository).toHaveBeenCalledTimes(1);
+
+      fireEvent.change(screen.getByLabelText("Clone into"), { target: { value: "~/other" } });
+      fireEvent.click(screen.getByTestId("new-project-confirm"));
+      await waitFor(() => expect(mocks.cloneRepository).toHaveBeenCalledTimes(2));
+    });
+
+    it("refuses a known duplicate name before cloning", () => {
+      mocks.projects = [{ name: "Sample" }];
+      chooseRepository();
+      fireEvent.click(screen.getByTestId("new-project-confirm"));
+      expect(screen.getByRole("alert")).toHaveTextContent("already exists");
+      expect(mocks.cloneRepository).not.toHaveBeenCalled();
+    });
+
+    it("saves a sandbox repository without cloning", async () => {
+      renderButton();
+      fireEvent.change(screen.getByPlaceholderText("Project name…"), {
+        target: { value: "Sample" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
+      fireEvent.change(screen.getByRole("combobox", { name: "Run on" }), {
+        target: { value: "__sandbox__:provider" },
+      });
+      expect(screen.queryByLabelText("Clone into")).toBeNull();
+      fireEvent.change(screen.getByLabelText("Repository URL"), { target: { value: url } });
+      fireEvent.click(screen.getByTestId("new-project-confirm"));
+
+      await waitFor(() =>
+        expect(mocks.createProject).toHaveBeenCalledWith(
+          {
+            name: "Sample",
+            config: {
+              host_id: "__sandbox__",
+              sandbox_provider: "provider",
+              repository: { url },
+            },
+          },
+          expect.any(Object),
+        ),
+      );
+      expect(mocks.cloneRepository).not.toHaveBeenCalled();
+    });
+
+    it("rejects an invalid URL without side effects", () => {
+      renderButton();
+      fireEvent.change(screen.getByPlaceholderText("Project name…"), {
+        target: { value: "Sample" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
+      fireEvent.click(screen.getByRole("radio", { name: "Repository" }));
+      fireEvent.change(screen.getByLabelText("Repository URL"), {
+        target: { value: "not a url" },
+      });
+      fireEvent.click(screen.getByTestId("new-project-confirm"));
+      expect(screen.getByRole("alert")).toHaveTextContent("HTTPS or SSH URL");
+      expect(mocks.cloneRepository).not.toHaveBeenCalled();
+      expect(mocks.createProject).not.toHaveBeenCalled();
+    });
+  });
+
+  it("keeps the folder-only form for servers without repository creation", () => {
+    renderButton();
+    fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
+    expect(screen.queryByRole("combobox", { name: "Run on" })).toBeNull();
+    expect(screen.queryByRole("radio", { name: "Repository" })).toBeNull();
   });
 });
