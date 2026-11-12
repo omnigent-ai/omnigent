@@ -9,6 +9,8 @@ folder header spans both columns, and the shown file stays highlighted.
 - `gate`: `workspace_file_tree_split_ui` enables the split and its setting; it defaults off.
 - `preview`: Files starts as a full-width tree and adds the file pane only after a click.
 - `standalone`: Cmd/Ctrl-click, middle-click and **Open in new tab** open full-width file tabs.
+  With **Always open files in a new tab** on, every click opens a tab as before, and
+  middle-click and **Open in new tab** are not offered.
 - `resize`: drag the divider or use its arrow keys; the preferred width survives reloads.
 - `fallback`: Files narrower than 524px keeps a full-width tree and opens clicked files in tabs.
 - `close`: while a file is shown, the folder's Open-in action becomes **Close file**.
@@ -28,8 +30,9 @@ folder header spans both columns, and the shown file stays highlighted.
   on macOS, Ctrl-click elsewhere, or middle-click. Choose **Files** again to
   return to the expanded tree and the file beside it.
 - Close the file beside the tree with the header's **Close file** button, with
-  Escape after working in the file (not while Find is open or focus is in a
-  text field), or with the desktop app's Cmd/Ctrl+W while the Workspace has focus.
+  Escape (not while Find is open or focus is in a text field; in a Grid cell, only
+  after working in the file), or with the desktop app's Cmd/Ctrl+W while the
+  Workspace has focus.
 - At narrow widths, the header's **Folder actions** menu holds **Copy folder path**
   and **Refresh files**.
 - Settings → Appearance → Workspace → **Always open files in a new tab** opts

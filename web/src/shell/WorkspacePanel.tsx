@@ -1878,6 +1878,12 @@ function WorkspacePanelImpl({
   useDesktopCommand("previous-tab", tabCommandsActive ? () => showAdjacentTab(-1) : null);
   useDesktopCommand("next-tab", tabCommandsActive ? () => showAdjacentTab(1) : null);
   useDesktopCommand("reopen-closed-tab", tabCommandsActive ? reopenClosedTab : null);
+  // The rail widens for an open comments panel only while its viewer is on screen.
+  const [viewerCommentsOpen, setViewerCommentsOpen] = useState(false);
+  useEffect(
+    () => onCommentsOpenChange(viewerShown && viewerCommentsOpen),
+    [viewerShown, viewerCommentsOpen, onCommentsOpenChange],
+  );
   // A phone's full-screen viewer closes back to its drawer; the file beside the tree just closes.
   const mobileFileClose = isMobile ? onMobileFileClose : undefined;
   const viewerClose = standaloneShown ? (mobileFileClose ?? onShowScopeView) : closeTreePreview;
@@ -2358,7 +2364,7 @@ function WorkspacePanelImpl({
                 onCloseTab={viewerShown ? viewerCloseTab : undefined}
                 onNavigateTo={viewerShown ? openFileViewer : undefined}
                 permissionLevel={permissionLevel}
-                onCommentsOpenChange={onCommentsOpenChange}
+                onCommentsOpenChange={setViewerCommentsOpen}
                 sort={filesPanelSort}
               />
             </ResponsiveViewerSlot>

@@ -63,6 +63,7 @@ vi.mock("./FileViewer", async () => {
       syncUrl,
       onCloseTab,
       position,
+      onCommentsOpenChange,
     }: {
       path: string;
       open: boolean;
@@ -71,6 +72,7 @@ vi.mock("./FileViewer", async () => {
       syncUrl?: boolean;
       onCloseTab?: () => void;
       position?: { line: number };
+      onCommentsOpenChange?: (open: boolean) => void;
     }) {
       const [mount] = useState(() => ++viewerMounts.count);
       const [draft, setDraft] = useState("");
@@ -91,6 +93,9 @@ vi.mock("./FileViewer", async () => {
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
           />
+          <button type="button" onClick={() => onCommentsOpenChange?.(true)}>
+            open comments
+          </button>
         </div>
       );
     },
@@ -367,6 +372,7 @@ function renderWorkspace(
   const openFileViewer = vi.fn();
   const openFileInTree = vi.fn();
   const onCloseTreePreview = vi.fn();
+  const onCommentsOpenChange = vi.fn();
   const onCloseFile = vi.fn();
   const onRightRailTabChange = vi.fn();
   const onClosePanel = vi.fn();
@@ -422,7 +428,7 @@ function renderWorkspace(
         openFileViewer={openFileViewer}
         onCloseFile={onCloseFile}
         onShowScopeView={vi.fn()}
-        onCommentsOpenChange={vi.fn()}
+        onCommentsOpenChange={onCommentsOpenChange}
         openTerminalTab={openTerminalTab}
         openTerminals={overrides.openTerminals ?? []}
         selectedTerminalKey={overrides.selectedTerminalKey ?? null}
@@ -467,6 +473,7 @@ function renderWorkspace(
     openFileViewer,
     openFileInTree,
     onCloseTreePreview,
+    onCommentsOpenChange,
     onCloseFile,
     onRightRailTabChange,
     onClosePanel,
@@ -2548,6 +2555,20 @@ describe("WorkspacePanel file tree split", () => {
     expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
     rerender({ canBrowseWorkspace: true, showFilesPanel: true });
     expect(viewer()).toHaveTextContent("docs/guide.md");
+  });
+
+  it("widens the rail for the preview's comments only while the preview is on screen", () => {
+    measureRail(800);
+    const { rerender, onCommentsOpenChange } = renderWorkspace({
+      ...split,
+      treePreviewPath: "docs/a.md",
+    });
+    fireEvent.click(within(viewer()).getByRole("button", { name: "open comments" }));
+    expect(onCommentsOpenChange).toHaveBeenLastCalledWith(true);
+    rerender({ rightRailTab: "changes" });
+    expect(onCommentsOpenChange).toHaveBeenLastCalledWith(false);
+    rerender({ rightRailTab: "files" });
+    expect(onCommentsOpenChange).toHaveBeenLastCalledWith(true);
   });
 
   it("loads a saved preview only once it is shown", () => {

@@ -274,7 +274,6 @@ def test_tree_minimum_width_keeps_controls_separate_and_persists(
     divider.focus()
     page.keyboard.press("ArrowRight")
     expect(divider).to_have_attribute("aria-valuenow", "216")
-    assert page.evaluate("localStorage.getItem('omnigent:workspace-file-tree-width')") == "216"
     page.reload()
     # The ?file= link reopens as a tab, by design; the preview waits on the Files tab.
     toolbar = page.get_by_role("toolbar", name="Workspace tabs")

@@ -1274,24 +1274,9 @@ describe("SettingsPage", () => {
     );
   });
 
-  it("resets the always-open-files choice to off", () => {
-    mocks.features = { workspace_file_tree_split_ui: true };
-    renderPage("/settings/appearance");
-    fireEvent.click(screen.getByTestId("always-open-files-in-tab-toggle"));
-    expect(localStorage.getItem("omnigent:always-open-files-in-tab")).toBe("true");
-
-    fireEvent.click(screen.getByTestId("reset-appearance-button"));
-    fireEvent.click(screen.getByTestId("reset-appearance-confirm"));
-
-    expect(localStorage.getItem("omnigent:always-open-files-in-tab")).toBeNull();
-    expect(screen.getByTestId("always-open-files-in-tab-toggle")).toHaveAttribute(
-      "aria-checked",
-      "false",
-    );
-  });
-
   it("resets every appearance preference back to product defaults", () => {
     localStorage.clear();
+    mocks.features = { workspace_file_tree_split_ui: true };
     renderPage("/settings/appearance");
 
     // Tweak a representative set of appearance preferences.
@@ -1312,6 +1297,7 @@ describe("SettingsPage", () => {
     });
     fireEvent.click(screen.getByTestId("project-folder-collapse-toggle"));
     fireEvent.click(screen.getByTestId("session-row-quick-actions-toggle"));
+    fireEvent.click(screen.getByTestId("always-open-files-in-tab-toggle"));
     const folderPagination = renderHook(() => [
       useProjectFolderCollapse(),
       useProjectFolderPageSize(),
@@ -1349,6 +1335,7 @@ describe("SettingsPage", () => {
       "aria-checked",
       "false",
     );
+    expect(localStorage.getItem("omnigent:always-open-files-in-tab")).toBe("true");
 
     // Open the confirmation dialog and confirm the reset.
     fireEvent.click(screen.getByTestId("reset-appearance-button"));
@@ -1367,6 +1354,13 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
     expect(localStorage.getItem("omnigent:code-font-size")).toBeNull();
     expect(localStorage.getItem("omnigent:code-font-weight")).toBeNull();
+
+    // Files open beside the tree again.
+    expect(localStorage.getItem("omnigent:always-open-files-in-tab")).toBeNull();
+    expect(screen.getByTestId("always-open-files-in-tab-toggle")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
 
     // Color theme is back to Omnigent.
     expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
