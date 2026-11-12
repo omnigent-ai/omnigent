@@ -519,3 +519,67 @@ async def test_a_retried_workflow_question_reuses_its_status_and_question(
     # Only the session's own runner asks.
     refused = await client.post(url, json=body, headers=_headers())
     assert refused.status_code == 403, refused.text
+
+
+async def test_the_workflow_tools_save_and_load_through_the_real_routes(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """The workflow tools reach ``/v1/workflows`` as the owner: save, load and list."""
+    import json
+
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.runner.journal_tools import execute_journal_tool
+
+    session_id = _session(db_uri)
+    # The runner's own credentials: its tunnel token, bound to the calling session.
+    token = "workflow-tools-runner"
+    conversations = SqlAlchemyConversationStore(db_uri)
+    assert conversations.set_runner_id(session_id, token_bound_runner_id(token)) is True
+    client.headers.update({**_headers(), RUNNER_TUNNEL_TOKEN_HEADER: token})
+
+    async def run(tool: str, args: dict[str, object]) -> dict:
+        output = await execute_journal_tool(
+            tool, json.dumps(args), server_client=client, conversation_id=session_id
+        )
+        return json.loads(output)
+
+    workflow = {
+        "name": "Triage flaky tests",
+        "description": "Finds and fixes flaky tests. Give it: the test suite.",
+        "steps": [
+            {"id": "explore", "name": "Explore the failing tests", "depends_on": []},
+            {"id": "fix", "name": "Fix the failing tests", "depends_on": ["explore"]},
+        ],
+    }
+    saved = await run("sys_workflow_save", workflow)
+    assert set(saved) == {"id", "name"}, saved
+    assert saved["name"] == "Triage flaky tests"
+    assert (await run("sys_workflow_save", workflow))["error"] == "name_taken"
+
+    by_name = await run("sys_workflow_load", {"workflow": "triage flaky tests"})
+    assert by_name["id"] == saved["id"]
+    assert [step["id"] for step in by_name["steps"]] == ["explore", "fix"]
+    assert await run("sys_workflow_load", {"workflow": saved["id"]}) == by_name
+    listed = (await client.get("/v1/workflows")).json()["data"]
+    assert [item["name"] for item in listed] == ["Triage flaky tests"]
+
+    missing = await run("sys_workflow_load", {"workflow": "Triage flaky test runs"})
+    assert missing["error"] == "workflow_not_found"
+    assert missing["similar"] == ["Triage flaky tests"]
+
+    notes = {**workflow, "name": "Release notes", "description": "Drafts the notes. " * 100}
+    assert (await run("sys_workflow_save", notes))["name"] == "Release notes"
+    page = await run("sys_workflow_list", {"limit": 1})
+    assert [item["name"] for item in page["workflows"]] == ["Release notes"]
+    assert page["workflows"][0]["description"].endswith("…")
+    rest = await run("sys_workflow_list", {"cursor": page["next_cursor"]})
+    assert rest == {
+        "workflows": [
+            {
+                "id": saved["id"],
+                "name": "Triage flaky tests",
+                "description": workflow["description"],
+            }
+        ],
+        "next_cursor": None,
+    }

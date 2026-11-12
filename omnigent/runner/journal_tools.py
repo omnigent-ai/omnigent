@@ -7,6 +7,9 @@ its retries reuse, and once the server accepts it the runner publishes
 child-session updates. Reads come back as compact lines the model can scan.
 ``sys_workflow_request_input`` has the server mark a task waiting and raise its
 questions, then waits for the answer like any other elicitation.
+``sys_workflow_save``, ``sys_workflow_load`` and ``sys_workflow_list`` call
+``/v1/workflows`` as the session's owner, naming the session so the server can
+refuse a shared one's save.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import difflib
 import hashlib
 import itertools
 import json
@@ -36,10 +40,15 @@ from omnigent.entities.session_journal import (
     normalize_status,
     normalize_step_id,
 )
+from omnigent.entities.workflow import InvalidWorkflowError, normalize_workflow
 from omnigent.entities.workflow_questions import answers_from_content, normalize_questions
 from omnigent.runner import pending_approvals
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
-from omnigent.tools.builtins.journal import JOURNAL_READ_PAGE_MAX, JOURNAL_TOOLS
+from omnigent.tools.builtins.journal import (
+    JOURNAL_READ_PAGE_MAX,
+    JOURNAL_TOOLS,
+    WORKFLOW_LIST_PAGE_MAX,
+)
 
 JOURNAL_TOOL_NAMES: frozenset[str] = frozenset(tool.name() for tool in JOURNAL_TOOLS)
 
@@ -469,6 +478,163 @@ async def _read(
     )
 
 
+# ── Saved workflows ───────────────────────────────────
+
+_WORKFLOWS_URL = "/v1/workflows"
+_NO_WORKFLOWS = "this Omnigent server has no saved workflows"
+# Workflow IDs are bare hex UUIDs, like session IDs.
+_WORKFLOW_ID = re.compile(r"[0-9a-f]{32}")
+# A name with no exact match is compared with this many of the user's workflows.
+_SIMILAR_SCAN = 100
+_SIMILAR_MAX = 5
+# A list page's default size, and how much of each description it shows.
+_LIST_PAGE_DEFAULT = 20
+_DESCRIPTION_PREVIEW_CHARS = 200
+
+
+async def _save_workflow(
+    args: dict[str, Any], *, server_client: httpx.AsyncClient, conversation_id: str
+) -> str:
+    """Save a workflow for the session's owner with ``POST /v1/workflows``."""
+    try:
+        name, description, steps = normalize_workflow(
+            name=args.get("name"), description=args.get("description"), steps=args.get("steps")
+        )
+    except InvalidWorkflowError as exc:
+        return _error(f"invalid_workflow: {exc}")
+    try:
+        response = await server_client.post(
+            _WORKFLOWS_URL,
+            json={"name": name, "description": description, "steps": steps},
+            headers={ORCHESTRATION_SOURCE_HEADER: conversation_id},
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        # Not retried: a save that did reach the server would come back name_taken.
+        return _error(
+            f"sys_workflow_save failed: {exc}. Check with sys_workflow_load before saving again."
+        )
+    if _is_unrouted(response):
+        return _error(f"sys_workflow_save: {_NO_WORKFLOWS}")
+    if response.status_code == 409:
+        return _error("name_taken", name=name)
+    if response.status_code >= 400:
+        return _error(_server_message(response))
+    workflow = response.json()
+    return json.dumps({"id": workflow["id"], "name": workflow["name"]}, ensure_ascii=False)
+
+
+async def _get_workflows(
+    server_client: httpx.AsyncClient, path: str, conversation_id: str, **params: Any
+) -> httpx.Response:
+    return await server_client.get(
+        f"{_WORKFLOWS_URL}{path}",
+        params=params or None,
+        headers={ORCHESTRATION_SOURCE_HEADER: conversation_id},
+        timeout=30.0,
+    )
+
+
+async def _load_workflow(
+    args: dict[str, Any], *, server_client: httpx.AsyncClient, conversation_id: str
+) -> str:
+    """Load one of the session owner's workflows by ID or name, with its steps."""
+    wanted = args.get("workflow")
+    if not isinstance(wanted, str) or not wanted.strip():
+        return _error("invalid_input: workflow must be a saved workflow's ID or name")
+    wanted = " ".join(wanted.split())
+    try:
+        if _WORKFLOW_ID.fullmatch(wanted):
+            response = await _get_workflows(server_client, f"/{wanted}", conversation_id)
+            if response.status_code == 200:
+                return _workflow_result(response.json())
+            if _is_unrouted(response):
+                return _error(f"sys_workflow_load: {_NO_WORKFLOWS}")
+        response = await _get_workflows(
+            server_client, "", conversation_id, name=wanted, limit=_SIMILAR_SCAN
+        )
+        if _is_unrouted(response):
+            return _error(f"sys_workflow_load: {_NO_WORKFLOWS}")
+        if response.status_code >= 400:
+            return _error(_server_message(response))
+        found = response.json().get("data") or []
+        if not found:
+            # No exact name: a case-only difference still counts; otherwise suggest names.
+            response = await _get_workflows(
+                server_client, "", conversation_id, limit=_SIMILAR_SCAN
+            )
+            if response.status_code >= 400:
+                return _error(_server_message(response))
+            names = {item["name"]: item["id"] for item in response.json().get("data") or []}
+            same = [name for name in names if name.casefold() == wanted.casefold()]
+            if not same:
+                folded = {name.casefold(): name for name in names}
+                matches = difflib.get_close_matches(
+                    wanted.casefold(), list(folded), n=_SIMILAR_MAX
+                )
+                similar = [folded[match] for match in matches]
+                return _error("workflow_not_found", workflow=wanted, similar=similar)
+            found = [{"id": names[same[0]]}]
+        response = await _get_workflows(server_client, f"/{found[0]['id']}", conversation_id)
+    except httpx.HTTPError as exc:
+        return _error(f"sys_workflow_load failed: {exc}")
+    if response.status_code >= 400:
+        return _error(_server_message(response))
+    return _workflow_result(response.json())
+
+
+def _description_preview(description: object) -> str:
+    """The start of *description* on one line, cut to fit a list entry."""
+    text = " ".join(str(description or "").split())
+    if len(text) <= _DESCRIPTION_PREVIEW_CHARS:
+        return text
+    return text[: _DESCRIPTION_PREVIEW_CHARS - 1].rstrip() + "…"
+
+
+async def _list_workflows(
+    args: dict[str, Any], *, server_client: httpx.AsyncClient, conversation_id: str
+) -> str:
+    """List one page of the session owner's workflows by name, without their steps."""
+    limit = args.get("limit", _LIST_PAGE_DEFAULT)
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        return _error(f"invalid_input: limit must be 1 to {WORKFLOW_LIST_PAGE_MAX}")
+    if not 1 <= limit <= WORKFLOW_LIST_PAGE_MAX:
+        return _error(f"invalid_input: limit must be 1 to {WORKFLOW_LIST_PAGE_MAX}")
+    cursor = args.get("cursor")
+    if cursor is not None and not (isinstance(cursor, str) and _WORKFLOW_ID.fullmatch(cursor)):
+        return _error("invalid_input: cursor must be a next_cursor from sys_workflow_list")
+    params: dict[str, Any] = {"limit": limit}
+    if cursor is not None:
+        # The server pages after the previous page's last workflow.
+        params["after"] = cursor
+    try:
+        response = await _get_workflows(server_client, "", conversation_id, **params)
+    except httpx.HTTPError as exc:
+        return _error(f"sys_workflow_list failed: {exc}")
+    if _is_unrouted(response):
+        return _error(f"sys_workflow_list: {_NO_WORKFLOWS}")
+    if response.status_code >= 400:
+        return _error(_server_message(response))
+    body = response.json()
+    workflows = [
+        {
+            "id": item["id"],
+            "name": item["name"],
+            "description": _description_preview(item.get("description")),
+        }
+        for item in body.get("data") or []
+    ]
+    next_cursor = body.get("last_id") if body.get("has_more") else None
+    return json.dumps({"workflows": workflows, "next_cursor": next_cursor}, ensure_ascii=False)
+
+
+def _workflow_result(workflow: dict[str, Any]) -> str:
+    return json.dumps(
+        {key: workflow.get(key) for key in ("id", "name", "description", "steps")},
+        ensure_ascii=False,
+    )
+
+
 async def execute_journal_tool(
     tool_name: str,
     arguments: str,
@@ -478,7 +644,7 @@ async def execute_journal_tool(
     call_id: str | None = None,
     publish_event: _Publisher | None = None,
 ) -> str:
-    """Run one journal tool call (``sys_journal_*``, ``sys_workflow_request_input``).
+    """Run one journal tool call (``sys_journal_*`` or ``sys_workflow_*``).
 
     :param tool_name: One of :data:`JOURNAL_TOOL_NAMES`.
     :param arguments: The call's JSON arguments.
@@ -500,6 +666,18 @@ async def execute_journal_tool(
         return _error(f"{tool_name}: arguments must be an object")
     if tool_name == "sys_journal_read":
         return await _read(args, server_client=server_client, conversation_id=conversation_id)
+    if tool_name == "sys_workflow_save":
+        return await _save_workflow(
+            args, server_client=server_client, conversation_id=conversation_id
+        )
+    if tool_name == "sys_workflow_load":
+        return await _load_workflow(
+            args, server_client=server_client, conversation_id=conversation_id
+        )
+    if tool_name == "sys_workflow_list":
+        return await _list_workflows(
+            args, server_client=server_client, conversation_id=conversation_id
+        )
     if tool_name == "sys_workflow_request_input":
         return await _request_input(
             args,

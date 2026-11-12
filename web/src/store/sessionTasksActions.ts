@@ -1,8 +1,16 @@
 import { create } from "zustand";
 
+import type { TaskAction } from "@/lib/workflow";
+
 interface SessionTasksActionsState {
   /** Per session: how its composer starts a workflow, when it offers one. */
   startWorkflow: Readonly<Record<string, () => void>>;
+  /** Per session: how its composer saves the plan as a workflow, given the plan's name. */
+  saveWorkflow: Readonly<Partial<Record<string, (planName: string) => void>>>;
+  /** Per session: how its composer stops the agent, offered only while it works. */
+  stopWork: Readonly<Partial<Record<string, () => void>>>;
+  /** Per session: how its composer asks the agent to run or continue a task, given its name. */
+  taskAction: Readonly<Partial<Record<string, (action: TaskAction, taskName: string) => void>>>;
   /** A session whose Tasks tab should open; the shell clears it once open. */
   tasksTabToOpen: string | null;
   /** The task the Tasks tab should scroll to and highlight; the tab clears it once shown. */
@@ -13,11 +21,15 @@ interface SessionTasksActionsState {
 
 /**
  * Actions that cross surfaces for a session's tasks: the composer registers
- * how to start a workflow, so the Tasks tab's empty state can link to it, and
- * the chat's task preview asks the shell to open the Tasks tab.
+ * how to start a workflow, save one, run or continue a task, and stop the agent,
+ * so the Tasks tab can offer them, and the chat's task preview asks the shell to
+ * open the Tasks tab.
  */
 export const useSessionTasksActions = create<SessionTasksActionsState>(() => ({
   startWorkflow: {},
+  saveWorkflow: {},
+  taskAction: {},
+  stopWork: {},
   tasksTabToOpen: null,
   taskToShow: null,
   tasksTabAutoOpen: false,
@@ -29,17 +41,60 @@ export const useSessionTasksActions = create<SessionTasksActionsState>(() => ({
  * @returns A function that withdraws the action, unless another took its place.
  */
 export function registerStartWorkflow(conversationId: string, start: () => void): () => void {
-  useSessionTasksActions.setState((state) => ({
-    startWorkflow: { ...state.startWorkflow, [conversationId]: start },
-  }));
+  return registerSessionAction("startWorkflow", conversationId, start);
+}
+
+/**
+ * Offer a session's "save the plan as a workflow" action to its Tasks tab.
+ *
+ * @returns A function that withdraws the action, unless another took its place.
+ */
+export function registerSaveWorkflow(
+  conversationId: string,
+  save: (planName: string) => void,
+): () => void {
+  return registerSessionAction("saveWorkflow", conversationId, save);
+}
+
+/**
+ * Offer a session's "run or continue a task" action to its Tasks tab.
+ *
+ * @returns A function that withdraws the action, unless another took its place.
+ */
+export function registerTaskAction(
+  conversationId: string,
+  taskAction: (action: TaskAction, taskName: string) => void,
+): () => void {
+  return registerSessionAction("taskAction", conversationId, taskAction);
+}
+
+/**
+ * Offer a session's "stop the agent" action to its Tasks tab while the agent works.
+ *
+ * @returns A function that withdraws the action, unless another took its place.
+ */
+export function registerStopWork(conversationId: string, stop: () => void): () => void {
+  return registerSessionAction("stopWork", conversationId, stop);
+}
+
+type SessionActionKey = "startWorkflow" | "saveWorkflow" | "taskAction" | "stopWork";
+
+function registerSessionAction<Key extends SessionActionKey>(
+  key: Key,
+  conversationId: string,
+  action: NonNullable<SessionTasksActionsState[Key][string]>,
+): () => void {
+  useSessionTasksActions.setState(
+    (state) =>
+      ({ [key]: { ...state[key], [conversationId]: action } }) as Partial<SessionTasksActionsState>,
+  );
   return () =>
     useSessionTasksActions.setState((state) => {
-      if (state.startWorkflow[conversationId] !== start) return state;
-      return {
-        startWorkflow: Object.fromEntries(
-          Object.entries(state.startWorkflow).filter(([id]) => id !== conversationId),
-        ),
-      };
+      if (state[key][conversationId] !== action) return state;
+      const rest = Object.fromEntries(
+        Object.entries(state[key]).filter(([id]) => id !== conversationId),
+      );
+      return { [key]: rest } as Partial<SessionTasksActionsState>;
     });
 }
 

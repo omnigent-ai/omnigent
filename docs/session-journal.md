@@ -51,7 +51,7 @@ stored entry is at most 16,383 bytes after compression.
 
 ## Agent tools
 
-The five tools make up the `journal` tool group, which every agent has. An agent
+The eight tools make up the `journal` tool group, which every agent has. An agent
 spec can drop it with `tool_groups.journal: false` (see
 [Tool groups](AGENT_YAML_SPEC.md#tool-groups)).
 
@@ -62,6 +62,9 @@ spec can drop it with `tool_groups.journal: false` (see
 | `sys_journal_write_status(status, step?, text?)`                    | Records a step's status. `step` may be left out when the plan has one step. `started` and `done` need every step it depends on to be done first; otherwise the write fails with `step_not_ready`, naming them.                                                                  |
 | `sys_journal_write_note(body, step?)`                               | Adds a note.                                                                                                                                                                                                                                                                    |
 | `sys_workflow_request_input(step, questions)`                      | Asks the user about a task in the current plan and waits for the answer. It marks the task `needs_input` with the first question, raises the questions as an elicitation in the Inbox with the options as buttons, and returns `{answered, answers}`.                           |
+| `sys_workflow_save(name, description, steps)` | Saves a reusable workflow for the session's owner through `POST /v1/workflows`, and returns `{id, name}`, or `name_taken`. The `save-workflow` skill says how to make the steps generic. A save from a session shared with edit access is refused. |
+| `sys_workflow_load(workflow)` | Loads one of the owner's saved workflows by ID or name, with its steps. A name with no exact match returns `workflow_not_found` with the closest names. |
+| `sys_workflow_list(cursor?, limit?)` | Lists the owner's saved workflows by name, 20 at a time unless `limit` says otherwise (at most 50): each one's ID, name and the start of its description, without steps. `next_cursor` pages to the rest. |
 
 Errors come back as `{"error": …}`: `invalid_entry` (a field failed
 validation), `invalid_input` (a question or its task failed validation; a
@@ -105,6 +108,37 @@ also checks on it periodically with a background timer of its own. With the
 `sibling_sessions` feature on, these sessions are grouped with the session that
 started them.
 
+## Saving and reusing a workflow
+
+To keep a workflow that worked, open the **⋯** menu at the right of the plan's
+name in the Tasks tab and choose **Save as workflow…**. Pick a name, which
+starts as the plan's, and choose **Save workflow**. The request goes to the
+agent through the `/save-workflow` skill. The agent keeps the steps worth
+repeating, writes them generically, leaving out the details that change from
+run to run, and saves the workflow with a description that says what a run
+needs ("Give it: the test suite"). You can also ask in chat, "save this as a
+workflow"; with no name given, the agent suggests one first. Describe a new
+workflow in chat ("make a workflow that triages flaky tests") and the agent
+writes the draft as the session's plan, so its steps show in the Tasks tab,
+then waits: save it now, or try it once first on the details you give it.
+
+Once you have saved workflows, **Run a workflow** lists them, with a search
+field and **New workflow** below them. Pick one, add this run's
+details, and choose **Run workflow**: the agent loads the saved workflow with
+`sys_workflow_load` and uses its steps as the plan, filling in the details.
+For a saved workflow, **Review the plan before work starts** is off by
+default; check it to approve the plan first.
+The saved steps are a starting point, so the agent can still replan. You can
+also ask for a saved workflow by name in chat ("run my flaky-test triage
+workflow").
+
+To run a saved workflow on a schedule or a trigger, pick it in New
+automation's **Workflow (optional)** field. Each run follows the workflow
+without a plan review, and the automation's **Additional instructions**
+customize it. No one is watching the run, so the agent doesn't stop to ask:
+it takes the option it would recommend when that's easy to undo, or leaves
+the step **Waiting for you** and goes on with the rest.
+
 ## Automations
 
 An automation's prompt asks the agent to read its journal first, write a plan if
@@ -136,7 +170,10 @@ result, and how long it has run while it runs. A done or failed task shows when
 it finished, stamped the way chat messages are ("8:56 PM" today, "Nov 11,
 8:56 PM" earlier). A started task is running while the session's turn, a
 background task it left running or a sub-agent is still going, and stopped once
-nothing is. It waits for you while a question or permission prompt in the chat
+nothing is. A ready task's **⋯** menu has **Run**, and a stopped task's has
+**Continue**: each sends the agent a message asking it to do that, then go on
+with the rest of the plan. While the agent works, a running task's menu has
+**Stop**, which stops the agent as the composer's Stop does. It waits for you while a question or permission prompt in the chat
 waits for your answer. A task's history marks a restart after the task was done
 or failed. Tasks waiting for you are pink, and an idle list
 with tasks the agent could still run says "Stopped" ("Run ended" after an

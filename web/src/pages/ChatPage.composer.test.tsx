@@ -84,6 +84,10 @@ vi.mock("@/lib/mcpRegistry", () => ({
 vi.mock("@/hooks/usePullRequests", () => ({
   usePullRequestInfo: () => ({ data: undefined }),
 }));
+// Run a workflow lists saved workflows from a TanStack query; none here.
+vi.mock("@/hooks/useSavedWorkflows", () => ({
+  useSavedWorkflows: () => ({ workflows: [], refresh: () => {} }),
+}));
 // The workspace bar's git-status hook uses TanStack Query; stub it so the
 // composer renders in isolation (no QueryClient) with a neutral empty status.
 // The hoisted spy records the args so a test can assert the page passes the
@@ -6439,6 +6443,51 @@ describe("Composer workflow entry point", () => {
     ).toBeInTheDocument();
     expect(screen.getByTestId("workflow-dialog-run")).toBeDisabled();
     expect(onSendSlashCommand).not.toHaveBeenCalled();
+  });
+
+  it("runs or continues a task for the Tasks tab, or says why it can't", () => {
+    setComposerState({ conversationId: "conv_test", sessionHarness: "openai-agents", skills: [] });
+    const onSend = vi.fn();
+    const error = vi.spyOn(toast, "error");
+    const { rerender } = renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+
+    const taskAction = (action: "run" | "continue", name: string) =>
+      act(() => useSessionTasksActions.getState().taskAction.conv_test?.(action, name));
+    taskAction("continue", "Run the tests");
+    expect(onSend).toHaveBeenLastCalledWith(
+      'Continue the task "Run the tests", then go on with the rest of the plan.',
+    );
+    taskAction("run", "Ship it");
+    expect(onSend).toHaveBeenLastCalledWith(
+      'Run the task "Ship it", then go on with the rest of the plan.',
+    );
+
+    rerender(
+      <TooltipProvider>
+        <Composer {...composerProps({ onSend, unreachable: true })} />
+      </TooltipProvider>,
+    );
+    taskAction("run", "Ship it");
+    expect(error).toHaveBeenCalledWith("The session is offline. Reconnect it to run the task.");
+    expect(onSend).toHaveBeenCalledTimes(2);
+    error.mockRestore();
+  });
+
+  it("lets the Tasks tab stop the agent only while it works", () => {
+    setComposerState({ conversationId: "conv_test", sessionHarness: "openai-agents", skills: [] });
+    const onStop = vi.fn();
+    const { rerender } = renderWithTooltips(
+      <Composer {...composerProps({ onStop, isWorking: true })} />,
+    );
+    act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
+    expect(onStop).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <TooltipProvider>
+        <Composer {...composerProps({ onStop, isWorking: false })} />
+      </TooltipProvider>,
+    );
+    expect(useSessionTasksActions.getState().stopWork.conv_test).toBeUndefined();
   });
 
   it("opens the dialog for the Tasks tab's empty state", async () => {

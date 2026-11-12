@@ -14,7 +14,10 @@ import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import {
   openTasksTab,
+  registerSaveWorkflow,
   registerStartWorkflow,
+  registerStopWork,
+  registerTaskAction,
   useSessionTasksActions,
 } from "@/store/sessionTasksActions";
 import { journalEntry, journalPlan } from "@/test/journalFixtures";
@@ -314,6 +317,77 @@ describe("TasksPanel", () => {
       expect(useSessionTasksActions.getState().taskToShow).toBeNull();
     } finally {
       delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+    }
+  });
+
+  it("offers Save as workflow in the plan's menu once the composer can save", async () => {
+    const named = journalPlan(0, ["baseline"]);
+    named.payload.name = "Cut GET /orders p95 by 20%";
+    showJournal([named]);
+    renderPanel();
+    expect(screen.queryByTestId("tasks-plan-menu")).toBeNull();
+    cleanup();
+
+    const save = vi.fn();
+    const withdraw = registerSaveWorkflow("conv", save);
+    try {
+      renderPanel();
+      fireEvent.pointerDown(screen.getByTestId("tasks-plan-menu"), { button: 0 });
+      fireEvent.click(screen.getByTestId("tasks-save-workflow"));
+      await waitFor(() => expect(save).toHaveBeenCalledWith("Cut GET /orders p95 by 20%"));
+    } finally {
+      act(withdraw);
+    }
+  });
+
+  it("offers Run on a ready task and Continue on a stopped one once the composer can send", () => {
+    showJournal([
+      journalPlan(0, ["baseline"], ["ship"], ["docs", ["ship"]]),
+      status(1, "baseline", "started"),
+    ]);
+    renderPanel();
+    expect(screen.queryByTestId("tasks-row-menu")).toBeNull();
+    cleanup();
+
+    const taskAction = vi.fn();
+    const withdraw = registerTaskAction("conv", taskAction);
+    try {
+      renderPanel();
+      const [stopped, ready, waiting] = screen.getAllByTestId("tasks-row");
+      fireEvent.pointerDown(within(stopped!).getByTestId("tasks-row-menu"), { button: 0 });
+      fireEvent.click(screen.getByTestId("tasks-row-continue"));
+      expect(taskAction).toHaveBeenLastCalledWith("continue", "baseline");
+      fireEvent.pointerDown(within(ready!).getByTestId("tasks-row-menu"), { button: 0 });
+      fireEvent.click(screen.getByTestId("tasks-row-run"));
+      expect(taskAction).toHaveBeenLastCalledWith("run", "ship");
+      // A task still waiting on another has nothing to offer.
+      expect(within(waiting!).queryByTestId("tasks-row-menu")).toBeNull();
+
+      // Once the agent works on the started task again, it has nothing to continue.
+      setSession({ sessionStatus: "running" });
+      const [running] = screen.getAllByTestId("tasks-row");
+      expect(within(running!).queryByTestId("tasks-row-menu")).toBeNull();
+    } finally {
+      act(withdraw);
+    }
+  });
+
+  it("offers Stop on a running task while the composer can stop the agent", () => {
+    showJournal([journalPlan(0, ["baseline"]), status(1, "baseline", "started")]);
+    setSession({ sessionStatus: "running" });
+    renderPanel();
+    expect(screen.queryByTestId("tasks-row-menu")).toBeNull();
+    cleanup();
+
+    const stop = vi.fn();
+    const withdraw = registerStopWork("conv", stop);
+    try {
+      renderPanel();
+      fireEvent.pointerDown(screen.getByTestId("tasks-row-menu"), { button: 0 });
+      fireEvent.click(screen.getByTestId("tasks-row-stop"));
+      expect(stop).toHaveBeenCalledTimes(1);
+    } finally {
+      act(withdraw);
     }
   });
 

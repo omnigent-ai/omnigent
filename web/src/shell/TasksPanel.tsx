@@ -5,11 +5,22 @@ import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } fr
 import {
   CheckIcon,
   ChevronRightIcon,
+  EllipsisIcon,
   ListChecksIcon,
   Loader2Icon,
   MessageCircleQuestionMarkIcon,
+  PlayIcon,
+  SquareIcon,
+  WorkflowIcon,
   XIcon,
 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useNow } from "@/hooks/useNow";
 import { useSessionTasks } from "@/hooks/useSessionTasks";
@@ -40,6 +51,7 @@ import { messageDeepLinkParams } from "@/lib/messageDeepLink";
 import { useSearchParams } from "@/lib/routing";
 import { taskMarkerTarget } from "@/lib/taskActivity";
 import { cn } from "@/lib/utils";
+import type { TaskAction } from "@/lib/workflow";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
 
 const NO_ENTRIES: JournalEntry[] = [];
@@ -57,7 +69,7 @@ const STATE_LABELS: Record<StepState, string> = {
 const SEGMENT_COLORS: Record<StepState, string> = {
   waiting: "bg-foreground/10",
   ready: "bg-session-active/25",
-  running: "bg-session-active",
+  running: "bg-session-active animate-pulse motion-reduce:animate-none",
   stopped: "bg-status-gray",
   needs_input: "bg-brand-accent",
   done: "bg-success",
@@ -320,6 +332,36 @@ function StepHistory({
   );
 }
 
+// What a task's ⋯ menu offers: Run while it's ready, Continue once it's stopped, Stop while it runs.
+type RowAction = TaskAction | "stop";
+const ROW_ACTION_LABELS: Record<RowAction, string> = {
+  run: "Run",
+  continue: "Continue",
+  stop: "Stop",
+};
+
+interface RowMenuAction {
+  action: RowAction;
+  onSelect: () => void;
+}
+
+/** A task's menu action for its state, when this viewer's composer offers it. */
+function rowMenuAction(
+  item: StepProgress,
+  onTaskAction: ((action: TaskAction, taskName: string) => void) | undefined,
+  onStop: (() => void) | undefined,
+): RowMenuAction | undefined {
+  if (item.state === "running") return onStop && { action: "stop", onSelect: onStop };
+  const action: TaskAction | null =
+    item.state === "ready" ? "run" : item.state === "stopped" ? "continue" : null;
+  if (action === null || !onTaskAction) return undefined;
+  return { action, onSelect: () => onTaskAction(action, item.step.name) };
+}
+
+// A task row's small icon buttons: its ⋯ menu and the chevron that opens its history.
+const ROW_ICON_BUTTON =
+  "mt-1.5 shrink-0 cursor-pointer rounded-md p-1 text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50";
+
 function StepRow({
   item,
   number,
@@ -328,6 +370,7 @@ function StepRow({
   names,
   flash,
   onShowInChat,
+  menuAction,
 }: {
   item: StepProgress;
   number: number;
@@ -338,6 +381,8 @@ function StepRow({
   flash: boolean;
   /** Scroll the chat to a marker, e.g. ``journal-<entry id>``. */
   onShowInChat: (markerId: string) => void;
+  /** What its ⋯ menu offers: Run, Continue or Stop; absent for none. */
+  menuAction?: RowMenuAction;
 }) {
   const [open, setOpen] = useState(false);
   const detail = stepDetail(item);
@@ -414,13 +459,40 @@ function StepRow({
         ) : (
           <div className={rowClassName}>{content}</div>
         )}
+        {menuAction && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                aria-label={`Actions for ${item.step.name}`}
+                className={cn(ROW_ICON_BUTTON, !hasHistory && "mr-1")}
+                data-testid="tasks-row-menu"
+              >
+                <EllipsisIcon aria-hidden className="size-4" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem
+                data-testid={`tasks-row-${menuAction.action}`}
+                onSelect={() => menuAction.onSelect()}
+              >
+                {menuAction.action === "stop" ? (
+                  <SquareIcon className="size-3.5 fill-current" />
+                ) : (
+                  <PlayIcon className="size-4" />
+                )}
+                {ROW_ACTION_LABELS[menuAction.action]}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
         {hasHistory && (
           <button
             type="button"
             aria-expanded={open}
             aria-label={`${open ? "Hide" : "Show"} ${item.step.name} history`}
             onClick={() => setOpen((value) => !value)}
-            className="mt-1.5 mr-1 shrink-0 cursor-pointer rounded-md p-1 text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            className={cn(ROW_ICON_BUTTON, "mr-1")}
             data-testid="tasks-row-history"
           >
             <ChevronRightIcon
@@ -608,7 +680,7 @@ function ProgressStrip({
                     className={cn(
                       "h-1.5 w-full rounded-full transition-[height,opacity] duration-150 group-hover:h-2 group-focus-visible:h-2 group-focus-visible:ring-2 group-focus-visible:ring-ring/50",
                       SEGMENT_COLORS[item.state],
-                      !lit(index) && "opacity-30",
+                      !lit(index) && "animate-none opacity-30",
                     )}
                   />
                 </button>
@@ -649,12 +721,15 @@ function TasksHeader({
   paused,
   stuck,
   onSelect,
+  onSaveWorkflow,
 }: {
   plan: JournalEntry | null;
   progress: readonly StepProgress[];
   paused: PausedLabel | null;
   stuck: boolean;
   onSelect: (stepId: string) => void;
+  /** Opens the composer's Save as workflow dialog; absent when the agent can't save. */
+  onSaveWorkflow?: () => void;
 }) {
   const tally = planTally(progress);
   const updatedAt = Math.max(
@@ -669,6 +744,8 @@ function TasksHeader({
   const finished = finishedTaskCount(progress);
   const allDone = tally.done === progress.length;
   const name = planName(plan);
+  // Save opens the composer's dialog once this menu has closed, so the dialog keeps focus.
+  const saveAfterCloseRef = useRef(false);
   return (
     <header
       className={cn(
@@ -689,11 +766,47 @@ function TasksHeader({
                 {name}
               </h3>
             )}
-            {updatedAt > 0 && (
-              <span className="ml-auto shrink-0 text-sm text-muted-foreground">
-                Updated <Ago seconds={updatedAt} />
-              </span>
-            )}
+            <span className="ml-auto flex shrink-0 items-center gap-1">
+              {updatedAt > 0 && (
+                <span className="text-sm text-muted-foreground">
+                  Updated <Ago seconds={updatedAt} />
+                </span>
+              )}
+              {onSaveWorkflow && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label="Plan actions"
+                      className="shrink-0 self-center text-muted-foreground"
+                      data-testid="tasks-plan-menu"
+                    >
+                      <EllipsisIcon className="size-3.5" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent
+                    align="end"
+                    onCloseAutoFocus={(event) => {
+                      if (!saveAfterCloseRef.current) return;
+                      saveAfterCloseRef.current = false;
+                      event.preventDefault();
+                      requestAnimationFrame(() => onSaveWorkflow());
+                    }}
+                  >
+                    <DropdownMenuItem
+                      data-testid="tasks-save-workflow"
+                      onSelect={() => {
+                        saveAfterCloseRef.current = true;
+                      }}
+                    >
+                      <WorkflowIcon className="size-3.5" />
+                      Save as workflow…
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
+            </span>
           </div>
         )}
         {!name && <h3 className="sr-only">Tasks</h3>}
@@ -731,12 +844,18 @@ function TaskList({
   names,
   flashStep,
   onShowInChat,
+  onTaskAction,
+  onStop,
 }: {
   progress: readonly StepProgress[];
   entries: readonly JournalEntry[];
   names: ReadonlyMap<string, string>;
   flashStep: string | null;
   onShowInChat: (markerId: string) => void;
+  /** The composer's Run or Continue, given a task's name; absent when this viewer can't send. */
+  onTaskAction?: (action: TaskAction, taskName: string) => void;
+  /** The composer's Stop; present only while the agent works. */
+  onStop?: () => void;
 }) {
   return (
     <section aria-label="Tasks">
@@ -751,6 +870,7 @@ function TaskList({
             names={names}
             flash={flashStep === item.step.id}
             onShowInChat={onShowInChat}
+            menuAction={rowMenuAction(item, onTaskAction, onStop)}
           />
         ))}
       </ol>
@@ -780,6 +900,9 @@ export function TasksPanel({
   const tasks = useSessionTasks(conversationId, active);
   const { journal, plan, progress } = tasks;
   const startWorkflow = useSessionTasksActions((state) => state.startWorkflow[conversationId]);
+  const saveWorkflow = useSessionTasksActions((state) => state.saveWorkflow[conversationId]);
+  const taskAction = useSessionTasksActions((state) => state.taskAction[conversationId]);
+  const stopWork = useSessionTasksActions((state) => state.stopWork[conversationId]);
   const entries = tasks.journalSupported ? journal.entries : NO_ENTRIES;
   const names = new Map(progress.map((item) => [item.step.id, item.step.name]));
   const empty = progress.length === 0;
@@ -879,6 +1002,9 @@ export function TasksPanel({
               paused={tasks.paused}
               stuck={stuck}
               onSelect={jumpToStep}
+              onSaveWorkflow={
+                saveWorkflow && plan ? () => saveWorkflow(planName(plan) ?? "") : undefined
+              }
             />
             <TaskList
               progress={progress}
@@ -886,6 +1012,8 @@ export function TasksPanel({
               names={names}
               flashStep={flashStep}
               onShowInChat={showInChat}
+              onTaskAction={taskAction}
+              onStop={stopWork}
             />
           </>
         )}

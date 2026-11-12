@@ -1,17 +1,19 @@
 ---
 name: workflow
-description: Plan and run a multi-step workflow from a description. Keeps the plan and every step's status in the session's journal, so people can follow along in the Tasks tab and the work resumes cleanly.
+description: Plan and run a multi-step workflow from a description or one of the user's saved workflows. Keeps the plan and every step's status in the session's journal, so people can follow along in the Tasks tab and the work resumes cleanly.
 ---
 
 # Run a workflow
 
-The user described the work after `/workflow`. Turn it into a plan, then work
-through the plan, recording where each step stands as you go. The user watches
+The user described the work after `/workflow`, or named one of their saved
+workflows. Turn it into a plan, then work through the plan, recording where
+each step stands as you go. The user watches
 the plan's steps as tasks in the session's Tasks tab and can steer or stop you
 in chat at any time.
 
-You need the `sys_journal_*` tools and `sys_workflow_request_input`. If you
-don't have them, tell the user this agent can't run workflows and stop.
+You need the `sys_journal_*` tools and `sys_workflow_request_input`, and
+`sys_workflow_load` and `sys_workflow_list` for a saved workflow. If you don't
+have them, tell the user this agent can't run workflows and stop.
 
 ## When another workflow started you
 
@@ -21,6 +23,19 @@ step done or failed, message that session with `sys_session_message`, saying
 how it went and what's left. This is very important: don't skip it, even if
 you also tell the user, since the other workflow can't go on without your
 message.
+
+## When an automation runs you
+
+Check this too. If your message says no one is watching this run, as an
+Omnigent automation's note does, no one can answer you or approve anything:
+
+- Skip the plan review, even if the message asks for one. Add no review step,
+  and wait for no approval.
+- Don't ask with `sys_workflow_request_input`, wherever this skill says to.
+  Take the option you'd recommend when it's easy to reverse, and say so in the
+  step's status. Otherwise write `needs_input` on the step with the options
+  and your recommendation, in a note if they need more room, and go on with
+  the steps that don't depend on it.
 
 ## Plan
 
@@ -58,6 +73,26 @@ message.
 5. Ask first only if the description is ambiguous: write the plan with what
    you know, and ask with `sys_workflow_request_input` on its first step.
    Otherwise start.
+
+## Run a saved workflow
+
+When the user names a saved workflow ("Run the saved workflow "Triage flaky
+tests" (ID …)", or "run my triage workflow" in chat):
+
+- Do the plan's step 1 first: ask before you replace a plan with steps left.
+- Load it with `sys_workflow_load`, by its ID when you have one, otherwise by
+  name. If they describe it without its exact name, or the load returns
+  `workflow_not_found`, list their workflows with `sys_workflow_list` and pick
+  the one whose description fits. If more than one fits, or none does, ask
+  the user which they meant, or whether to describe the work instead.
+- Its steps are your plan: write them with `sys_journal_write_plan`, named
+  after the workflow, keeping their IDs and dependencies. Rename an ID only if
+  this session's journal already used it. Fill the run's details into the step
+  names and goals.
+- Its description says what a run needs. If the details the user gave leave
+  something out, ask with `sys_workflow_request_input` on the first step.
+- The saved steps are a starting point: replan as the work needs, as with any
+  plan.
 
 ## Review the plan
 
@@ -107,9 +142,6 @@ When the user asks to review the plan before the work starts:
   `sys_workflow_request_input`, saying what's in the way and offering the ways
   forward you see (retry later, a workaround, or dropping the step), with your
   recommendation.
-- In a run no one is watching, such as an automation's, don't ask: write
-  `needs_input` with the options and your recommendation, in a note if they
-  need more room, and go on with the steps that don't depend on it.
 - Write `failed` when a step's own work failed. The text says why in a few
   words.
 - If the user stops you, leave the step you were on `started`; the Tasks tab
@@ -174,3 +206,6 @@ reply, lead with anything the user needs to decide, then summarize what was
 done and what is left. If another session started this workflow and your plan
 is finished, report back to it now (see "When another workflow started
 you").
+
+To reuse a workflow later, the user can save it: the save-workflow skill does
+that, and so does Save as workflow in the Tasks tab's ⋯ menu.
