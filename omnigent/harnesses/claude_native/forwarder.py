@@ -3198,7 +3198,7 @@ async def _forward_child_costs(
     dedupe: _ForwardDedupeState,
     cost_cache: dict[Path, _TranscriptCostCacheEntry],
 ) -> None:
-    """Report one eligible child's own cost, rotating fairly across the snapshot."""
+    """Scan one snapshot and attempt at most one changed child's cost POST."""
     directory = _subagents_dir_for_transcript(parent_transcript_path)
     entries = list(subagent_state.subagents.values())
     for _ in entries:
@@ -3219,7 +3219,7 @@ async def _forward_child_costs(
             cache=cost_cache,
         )
         if cost is None or cost <= dedupe.attributed_costs.get(child_id, -1):
-            return
+            continue
         try:
             # Bound optional delivery below the child-history client's timeout.
             async with asyncio.timeout(_POST_TIMEOUT_S):
@@ -3238,7 +3238,7 @@ async def _forward_child_costs(
                 _logger.warning(
                     "Disabling Claude child cost attribution; child=%s http_status=%s",
                     child_id,
-                    _http_status_for_log(exc) if isinstance(exc, httpx.HTTPError) else None,
+                    _http_status_for_log(exc),
                 )
                 return
             delay = _HTTP_POST_RETRY_BASE_DELAY_S

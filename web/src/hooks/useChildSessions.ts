@@ -3,11 +3,12 @@ import {
   replaceEqualDeep,
   useQuery,
   useQueryClient,
+  type Query,
   type QueryClient,
 } from "@tanstack/react-query";
 import { useCallback, useSyncExternalStore } from "react";
 import { authenticatedFetch } from "@/lib/identity";
-import { setSessionParent } from "@/lib/sessionHost";
+import { getSessionParent, setSessionParent } from "@/lib/sessionHost";
 import { isTempConvId } from "@/lib/tempConversationId";
 
 /**
@@ -110,13 +111,87 @@ export function childSessionsQueryKey(conversationId: string): readonly unknown[
   return ["conversation", conversationId, "child_sessions"];
 }
 
+interface ChildSessionsMembership {
+  excluded: Set<string>;
+  restoring: Set<string>;
+}
+
 interface ChildSessionsJournal {
   patches: Map<string, Partial<ChildSessionInfo>>;
+  membership: ChildSessionsMembership;
   retire: () => void;
 }
 
 const childSessionsRequests = new WeakMap<QueryClient, Map<string, ChildSessionsJournal>>();
 const childSessionsResponses = new WeakMap<ChildSessionInfo[], ChildSessionsJournal>();
+const childSessionsMembership = new WeakMap<Query, ChildSessionsMembership>();
+
+/** Explicit lifecycle observations outrank field-only deltas until membership is restored. */
+export function setChildSessionMembership(
+  client: QueryClient,
+  childId: string,
+  included: boolean,
+  parentId?: string | null,
+): void {
+  for (const query of client.getQueryCache().findAll({
+    predicate: (candidate) => isChildSessionsQueryKey(candidate.queryKey),
+  })) {
+    const queryParent = query.queryKey[1];
+    if (typeof queryParent !== "string") continue;
+    const children = query.state.data as ChildSessionInfo[] | undefined;
+    const membership = childSessionsMembership.get(query) ?? {
+      excluded: new Set<string>(),
+      restoring: new Set<string>(),
+    };
+    const { excluded, restoring } = membership;
+    const journal = childSessionsRequests.get(client)?.get(queryParent);
+    const known =
+      parentId === queryParent ||
+      getSessionParent(childId) === queryParent ||
+      children?.some((child) => child.id === childId) ||
+      journal?.patches.has(childId) ||
+      excluded.has(childId) ||
+      restoring.has(childId);
+    if (!known) continue;
+    const includeHere = included && (parentId === undefined || parentId === queryParent);
+    if (includeHere ? !excluded.delete(childId) : excluded.has(childId)) continue;
+    if (includeHere) restoring.add(childId);
+    else {
+      excluded.add(childId);
+      restoring.delete(childId);
+    }
+    childSessionsMembership.set(query, membership);
+
+    // Cancellation starts synchronously; never let delayed cleanup undo a restoration.
+    void client.cancelQueries({ queryKey: query.queryKey, exact: true }, { revert: false });
+    if (!includeHere) {
+      client.setQueryData<ChildSessionInfo[]>(
+        query.queryKey,
+        (current) => current?.filter((child) => child.id !== childId),
+        { updatedAt: query.state.dataUpdatedAt },
+      );
+    }
+    void client.invalidateQueries(
+      { queryKey: query.queryKey, exact: true },
+      { cancelRefetch: false },
+    );
+  }
+}
+
+/** Keep excluded children watched so remote unarchive/access restoration remains observable. */
+export function watchedChildSessionIds(client: QueryClient): Set<string> {
+  const ids = new Set<string>();
+  for (const query of client.getQueryCache().findAll({
+    predicate: (candidate) => isChildSessionsQueryKey(candidate.queryKey),
+  })) {
+    for (const child of (query.state.data as ChildSessionInfo[] | undefined) ?? [])
+      ids.add(child.id);
+    const membership = childSessionsMembership.get(query);
+    for (const id of membership?.excluded ?? []) ids.add(id);
+    for (const id of membership?.restoring ?? []) ids.add(id);
+  }
+  return ids;
+}
 
 /** Apply the same sparse upserts to live cache writes and completed HTTP lists. */
 function applyChildSessionPatches(
@@ -154,16 +229,20 @@ export function patchChildSessionsCache(
   parentId: string,
   childId: string,
   patch: Partial<ChildSessionInfo>,
-): void {
+): boolean {
+  const key = childSessionsQueryKey(parentId);
+  const query = client.getQueryCache().find({ queryKey: key, exact: true });
+  if (query && childSessionsMembership.get(query)?.excluded.has(childId)) return false;
   const journal = childSessionsRequests.get(client)?.get(parentId);
   if (journal) journal.patches.set(childId, { ...journal.patches.get(childId), ...patch });
-  const key = childSessionsQueryKey(parentId);
+  setSessionParent(childId, parentId);
   const updatedAt = client.getQueryState(key)?.dataUpdatedAt ?? 0;
   client.setQueryData<ChildSessionInfo[]>(
     key,
     (children) => applyChildSessionPatches(children ?? [], new Map([[childId, patch]])),
     { updatedAt },
   );
+  return true;
 }
 
 /** Shared by observers and imperative reads so every HTTP commit replays live receipts. */
@@ -173,12 +252,19 @@ export function childSessionsQueryOptions(sessionId: string | null) {
       sessionId === null
         ? ["conversation", null, "child_sessions"]
         : childSessionsQueryKey(sessionId),
-    queryFn: async ({ client, signal }): Promise<ChildSessionInfo[]> => {
+    queryFn: async ({ client, queryKey, signal }): Promise<ChildSessionInfo[]> => {
       if (sessionId === null) return [];
+      const query = client.getQueryCache().find({ queryKey, exact: true })!;
+      const membership = childSessionsMembership.get(query) ?? {
+        excluded: new Set<string>(),
+        restoring: new Set<string>(),
+      };
+      childSessionsMembership.set(query, membership);
       const requests = childSessionsRequests.get(client) ?? new Map<string, ChildSessionsJournal>();
       childSessionsRequests.set(client, requests);
       const journal: ChildSessionsJournal = {
         patches: new Map(),
+        membership,
         retire: () => {
           if (requests.get(sessionId) === journal) requests.delete(sessionId);
           signal.removeEventListener("abort", journal.retire);
@@ -201,7 +287,11 @@ export function childSessionsQueryOptions(sessionId: string | null) {
       const journal = childSessionsResponses.get(children);
       if (!journal) return replaceEqualDeep(previous, children);
       try {
-        return replaceEqualDeep(previous, applyChildSessionPatches(children, journal.patches));
+        // Pre-transition requests are cancelled; a fresh complete read can restore presence.
+        for (const child of children) journal.membership.excluded.delete(child.id);
+        const merged = applyChildSessionPatches(children, journal.patches);
+        for (const child of merged) journal.membership.restoring.delete(child.id);
+        return replaceEqualDeep(previous, merged);
       } finally {
         childSessionsResponses.delete(children);
         journal.retire();
@@ -348,12 +438,11 @@ export async function fetchChildSessions(
     if (cursors.has(after)) throw new Error("Repeated child-session cursor");
     cursors.add(after);
   }
-  const json = { data: [...rows.values()] };
   // Children run on this session's runner: record the link so their
   // session-scoped requests key by this session's host before their own
   // snapshot loads.
-  for (const row of json.data) setSessionParent(row.id, sessionId);
-  return json.data.map((row) => ({
+  for (const row of rows.values()) setSessionParent(row.id, sessionId);
+  return [...rows.values()].map((row) => ({
     id: row.id,
     title: row.title,
     task_summary: row.task_summary ?? null,

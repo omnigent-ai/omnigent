@@ -1,5 +1,6 @@
 import { useCallback, useContext, useEffect, useRef } from "react";
 import { useViewerId } from "./useViewerId";
+import { setChildSessionMembership } from "./useChildSessions";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { revokePermission } from "@/lib/permissionsApi";
 // TanStack Query wrapper around `GET /v1/sessions`, plus mutation
@@ -1137,6 +1138,7 @@ export function useArchiveConversation() {
       );
     },
     onSuccess: (updated, { archived }, context) => {
+      setChildSessionMembership(queryClient, updated.id, !archived);
       markConversationSeen(updated.id, updated.updated_at);
       queryClient.setQueryData<Session>(["session", updated.id], (old) =>
         old ? { ...old, archived } : old,
@@ -1274,6 +1276,7 @@ function finalizeDeletedConversations(
   snapshot?: DeletedListsSnapshot,
 ): void {
   for (const id of ids) {
+    setChildSessionMembership(queryClient, id, false);
     queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
     queryClient.removeQueries({ queryKey: ["session", id] });
   }
@@ -1476,11 +1479,13 @@ export function useBulkArchiveConversations() {
       const failed: string[] = [];
       for (let i = 0; i < results.length; i++) {
         if (results[i].status === "rejected") failed.push(ids[i]);
-        else
+        else {
+          setChildSessionMembership(queryClient, ids[i], !archived);
           markConversationSeen(
             ids[i],
             (results[i] as PromiseFulfilledResult<Conversation>).value.updated_at,
           );
+        }
       }
       if (failed.length > 0) {
         throw new BulkConversationMutationError("archive", { failed, total: ids.length });
@@ -1589,8 +1594,10 @@ export async function undoArchiveConversations(
     const failed: string[] = [];
     for (let i = 0; i < results.length; i++) {
       const result = results[i];
-      if (result.status === "fulfilled") markConversationSeen(ids[i], result.value.updated_at);
-      else failed.push(ids[i]);
+      if (result.status === "fulfilled") {
+        setChildSessionMembership(queryClient, ids[i], true);
+        markConversationSeen(ids[i], result.value.updated_at);
+      } else failed.push(ids[i]);
     }
     if (failed.length > 0) {
       // The ids that stayed archived: drop them from the keep-alive so they stop
@@ -2894,6 +2901,7 @@ export function useDeleteProject() {
       for (let i = 0; i < results.length; i++) {
         if (results[i].status === "fulfilled") {
           succeeded.push(ids[i]);
+          setChildSessionMembership(queryClient, ids[i], false);
           markConversationSeen(
             ids[i],
             (results[i] as PromiseFulfilledResult<Conversation>).value.updated_at,

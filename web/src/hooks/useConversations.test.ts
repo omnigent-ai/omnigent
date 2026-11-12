@@ -52,6 +52,13 @@ import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
 import { useScopeCache } from "./useScopeCache";
+import {
+  childSessionsQueryKey,
+  patchChildSessionsCache,
+  setChildSessionMembership,
+  watchedChildSessionIds,
+  type ChildSessionInfo,
+} from "./useChildSessions";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
 
@@ -2383,6 +2390,7 @@ describe("fetchPinnedConversations filter-honored detection", () => {
       ).toBe("b");
       const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
       client.setQueryData(PINNED_CONVERSATIONS_KEY, result);
+      patchChildSessionsCache(client, "parent", "b", { own_cost_usd: 0 });
       const invalidate = vi.spyOn(client, "invalidateQueries");
       const wrapper = ({ children }: { children: ReactNode }) =>
         createElement(QueryClientProvider, { client }, children);
@@ -2399,6 +2407,7 @@ describe("fetchPinnedConversations filter-honored detection", () => {
         await expect(mutate()).rejects.toThrow();
       });
       expect(client.getQueryData(PINNED_CONVERSATIONS_KEY)).toEqual(result);
+      expect(patchChildSessionsCache(client, "parent", "b", { own_cost_usd: 1 })).toBe(true);
       fetchMock.mockResolvedValue(mockResponse({ id: "b", archived: true, deleted: true }));
       await act(async () => {
         await mutate();
@@ -2409,6 +2418,8 @@ describe("fetchPinnedConversations filter-honored detection", () => {
           ?.conversations.map((item) => item.id),
       ).toEqual(["old", "a", "c"]);
       expect(invalidate).toHaveBeenCalledWith({ queryKey: PINNED_CONVERSATIONS_KEY });
+      expect(client.getQueryData(childSessionsQueryKey("parent"))).toEqual([]);
+      expect(patchChildSessionsCache(client, "parent", "b", { own_cost_usd: 2 })).toBe(false);
     },
   );
 
@@ -2598,6 +2609,8 @@ describe("useBulkArchiveConversations", () => {
       ),
     );
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    for (const id of ["conv_a", "conv_b"])
+      patchChildSessionsCache(queryClient, "parent", id, { own_cost_usd: 0 });
     const key = ["conversations", "", true];
     queryClient.setQueryData(key, {
       pages: [
@@ -2652,6 +2665,17 @@ describe("useBulkArchiveConversations", () => {
     ).pages[0].data;
     const archivedById = Object.fromEntries(rows.map((r) => [r.id, r.archived]));
     expect(archivedById).toEqual({ conv_a: true, conv_b: false });
+    expect(patchChildSessionsCache(queryClient, "parent", "conv_a", { own_cost_usd: 1 })).toBe(
+      false,
+    );
+    expect(patchChildSessionsCache(queryClient, "parent", "conv_b", { own_cost_usd: 1 })).toBe(
+      true,
+    );
+    expect(
+      queryClient
+        .getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("parent"))
+        ?.map((row) => row.id),
+    ).toEqual(["conv_b"]);
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
   });
 });
@@ -2725,6 +2749,8 @@ describe("useBulkDeleteConversations", () => {
       .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 })); // delete conv_b fails
 
     const { queryClient, rendered } = renderBulkDeleteHook();
+    for (const id of ["conv_a", "conv_b"])
+      patchChildSessionsCache(queryClient, "parent", id, { own_cost_usd: 0 });
     rendered.result.current.mutate({ ids: ["conv_a", "conv_b"] });
     await waitFor(() => expect(rendered.result.current.isError).toBe(true));
 
@@ -2734,6 +2760,12 @@ describe("useBulkDeleteConversations", () => {
     expect(ids).not.toContain("conv_a");
     expect(ids).toContain("conv_b");
     expect(ids).toContain("conv_keep");
+    expect(patchChildSessionsCache(queryClient, "parent", "conv_a", { own_cost_usd: 1 })).toBe(
+      false,
+    );
+    expect(patchChildSessionsCache(queryClient, "parent", "conv_b", { own_cost_usd: 1 })).toBe(
+      true,
+    );
     expect(rendered.result.current.error).toBeInstanceOf(Error);
     expect(rendered.result.current.error).toMatchObject({
       message: "Failed to delete 1 of 2 conversations",
@@ -4315,12 +4347,17 @@ describe("undoArchiveConversations optimistic restore", () => {
       const sharedKey = ["conversations", "", false, null, "shared"];
       queryClient.setQueryData(mineKey, infinitePage([]));
       queryClient.setQueryData(sharedKey, infinitePage([]));
-      fetchMock.mockResolvedValueOnce(
-        mockResponse(conversation({ id: "conv_owned", archived: false })),
-      );
+      for (const id of ["conv_owned", "conv_failed"]) {
+        patchChildSessionsCache(queryClient, "parent", id, { own_cost_usd: 0 });
+        setChildSessionMembership(queryClient, id, false);
+      }
+      fetchMock
+        .mockResolvedValueOnce(mockResponse(conversation({ id: "conv_owned", archived: false })))
+        .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
 
       await undoArchiveConversations(queryClient, [
         conversation({ id: "conv_owned", owner: "local", archived: true }),
+        conversation({ id: "conv_failed", owner: "local", archived: true }),
       ]);
 
       const mine = queryClient.getQueryData<ConversationsInfiniteData>(mineKey);
@@ -4328,6 +4365,12 @@ describe("undoArchiveConversations optimistic restore", () => {
       expect(mine?.pages[0].data.map((row) => row.id)).toEqual(["conv_owned"]);
       expect(mine?.pages[0].data[0].archived).toBe(false);
       expect(shared?.pages[0].data).toEqual([]);
+      expect(
+        patchChildSessionsCache(queryClient, "parent", "conv_owned", { own_cost_usd: 0 }),
+      ).toBe(true);
+      expect(
+        patchChildSessionsCache(queryClient, "parent", "conv_failed", { own_cost_usd: 1 }),
+      ).toBe(false);
     } finally {
       viewer.mockRestore();
     }
@@ -4335,6 +4378,8 @@ describe("undoArchiveConversations optimistic restore", () => {
 
   it("re-injects evicted rows into cached lists before the unarchive PATCH settles", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    patchChildSessionsCache(queryClient, "parent", "conv_a", { own_cost_usd: 0 });
+    setChildSessionMembership(queryClient, "conv_a", false);
     // A refetch already evicted the archived row from the sidebar list, so the
     // flag-flip overlay has nothing to un-hide — this exercises the injection.
     queryClient.setQueryData(
@@ -4373,9 +4418,16 @@ describe("undoArchiveConversations optimistic restore", () => {
       false,
     ]);
     expect(search?.pages[0].data).toEqual([]);
+    expect(patchChildSessionsCache(queryClient, "parent", "conv_a", { own_cost_usd: 1 })).toBe(
+      false,
+    );
 
     resolvePatch(mockResponse(conversation({ id: "conv_a", archived: false, updated_at: 101 })));
     await undo;
+    expect(watchedChildSessionIds(queryClient)).toContain("conv_a");
+    expect(patchChildSessionsCache(queryClient, "parent", "conv_a", { own_cost_usd: 0 })).toBe(
+      true,
+    );
   });
 });
 

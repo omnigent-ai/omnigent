@@ -20,7 +20,12 @@ import {
   type ConversationsPage,
 } from "@/hooks/useConversations";
 import { clearRecentlyCreated, type ConversationsInfiniteData } from "@/lib/sessionListCache";
-import { childSessionsQueryKey } from "@/hooks/useChildSessions";
+import {
+  childSessionsQueryKey,
+  childSessionsQueryOptions,
+  type ChildSessionInfo,
+} from "@/hooks/useChildSessions";
+import { handleSessionEvent, initChatStore } from "@/store/chatStore";
 
 // Mock the socket transport so setWatched is observable and start/stop are
 // inert. subscribe/subscribeStatus return no-op unsubscribers.
@@ -578,6 +583,141 @@ describe("SessionUpdatesProvider project folders", () => {
   });
 });
 
+describe("SessionUpdatesProvider child membership", () => {
+  it.each(["removed", "archived"])(
+    "orders %s, late SSE, and reappearance across held pagination without losing watches",
+    async (transition) => {
+      const client = new QueryClient();
+      initChatStore(client);
+      const options = childSessionsQueryOptions("membership-parent");
+      const rows = () => client.getQueryData<ChildSessionInfo[]>(options.queryKey)!;
+      const send = (id: string, fields: Record<string, unknown>) =>
+        handleSessionEvent({
+          type: "session_child_session_updated",
+          conversationId: "membership-parent",
+          childSessionId: id,
+          child: fields,
+        });
+      const reads: { resolve: (response: Response) => void; signal: AbortSignal }[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          (_url: string, init: RequestInit) =>
+            new Promise<Response>((resolve) => {
+              reads.push({ resolve, signal: init.signal! });
+            }),
+        ),
+      );
+      const page = (data: Partial<ChildSessionInfo>[], hasMore = false) =>
+        new Response(JSON.stringify({ data, has_more: hasMore, last_id: data.at(-1)?.id }));
+      send("member-a", { own_cost_usd: 1 });
+      send("member-b", { own_cost_usd: 2 });
+      renderProvider(client, ["/"]);
+      const observer = new QueryObserver(client, options);
+      const unobserve = observer.subscribe(() => {});
+      try {
+        const observeArchive = (archived: boolean) =>
+          frameHandler()({
+            type: "changed",
+            items: [{ ...conv("member-a"), parent_session_id: "membership-parent", archived }],
+          });
+        const exclude = () =>
+          transition === "removed"
+            ? frameHandler()({ type: "removed", ids: ["member-a"] })
+            : observeArchive(true);
+        await waitFor(() => expect(reads).toHaveLength(1));
+        reads[0].resolve(page([{ id: "member-a" }, { id: "member-b" }], true));
+        await waitFor(() => expect(reads).toHaveLength(2));
+        act(() => {
+          send("member-a", { own_cost_usd: 3 });
+          send("member-b", { own_cost_usd: 4, last_message_preview: null });
+          send("inserted", { own_cost_usd: 0 });
+          frameHandler()({ type: "snapshot", items: [] });
+        });
+        expect(reads[1].signal.aborted).toBe(false);
+        act(exclude);
+        expect(reads[1].signal.aborted).toBe(true);
+        expect(rows()).toMatchObject([
+          { id: "inserted", own_cost_usd: 0 },
+          { id: "member-b", own_cost_usd: 4, last_message_preview: null },
+        ]);
+        await waitFor(() => expect(reads).toHaveLength(3));
+        act(() => {
+          send("member-a", { own_cost_usd: 99, busy: false });
+          send("member-b", { own_cost_usd: 4, last_message_preview: null });
+          send("concurrent", { own_cost_usd: 0 });
+          exclude();
+        });
+        expect(reads[2].signal.aborted).toBe(false);
+        reads[1].resolve(page([{ id: "member-a", own_cost_usd: 99 }], true));
+        reads[2].resolve(
+          page([{ id: "member-b", title: "fresh", own_cost_usd: 1 }, { id: "inserted" }]),
+        );
+        await waitFor(() =>
+          expect(client.getQueryState(options.queryKey)?.fetchStatus).toBe("idle"),
+        );
+        expect(rows().find((row) => row.id === "member-a")).toBeUndefined();
+        expect(rows().find((row) => row.id === "member-b")).toMatchObject({
+          title: "fresh",
+          own_cost_usd: 4,
+          last_message_preview: null,
+        });
+        expect(rows().find((row) => row.id === "concurrent")).toMatchObject({ own_cost_usd: 0 });
+        await waitFor(() => expect(lastWatched()).toContain("member-a"));
+
+        // Restoring must remain watched before HTTP supplies any visible row.
+        setWatched.mockClear();
+        act(() => observeArchive(false));
+        await waitFor(() => expect(reads).toHaveLength(4));
+        act(() => observeArchive(false));
+        expect(reads[3].signal.aborted).toBe(false);
+        await waitFor(() => expect(lastWatched()).toContain("member-a"));
+
+        // A completed read omitting the restoring child must not end its watch.
+        setWatched.mockClear();
+        reads[3].resolve(page([{ id: "member-b" }]));
+        await waitFor(() =>
+          expect(client.getQueryState(options.queryKey)?.fetchStatus).toBe("idle"),
+        );
+        expect(rows().map((row) => row.id)).toEqual(["member-b"]);
+        await waitFor(() => expect(lastWatched()).toContain("member-a"));
+        void observer.refetch();
+        await waitFor(() => expect(reads).toHaveLength(5));
+        act(exclude);
+        expect(reads[4].signal.aborted).toBe(true);
+        await waitFor(() => expect(reads).toHaveLength(6));
+        act(() => send("member-a", { own_cost_usd: 100 }));
+        reads[4].resolve(page([{ id: "member-a", title: "superseded restoration" }]));
+        reads[5].resolve(page([{ id: "member-b" }]));
+        await waitFor(() =>
+          expect(client.getQueryState(options.queryKey)?.fetchStatus).toBe("idle"),
+        );
+        expect(rows().map((row) => row.id)).toEqual(["member-b"]);
+
+        // Both explicit unarchive and a fresh positive HTTP read can restore membership.
+        if (transition === "archived") act(() => observeArchive(false));
+        const restored = observer.refetch({ cancelRefetch: false });
+        await waitFor(() => expect(reads).toHaveLength(7));
+        reads[6].resolve(page([{ id: "member-a", title: "restored", own_cost_usd: 5 }]));
+        await restored;
+        act(() => send("member-a", { own_cost_usd: null }));
+        expect(rows()).toMatchObject([{ id: "member-a", title: "restored", own_cost_usd: null }]);
+        expect(reads).toHaveLength(7);
+
+        unobserve();
+        act(exclude);
+        client.removeQueries({ queryKey: options.queryKey, exact: true });
+        await waitFor(() => expect(lastWatched()).not.toContain("member-a"));
+        act(() => send("member-a", { own_cost_usd: 0 }));
+        expect(rows()).toMatchObject([{ id: "member-a", own_cost_usd: 0 }]);
+      } finally {
+        unobserve();
+        client.clear();
+      }
+    },
+  );
+});
+
 describe("SessionUpdatesProvider fingerprint pruning", () => {
   it("prunes de-watched sessions on snapshot so they re-baseline on return", () => {
     const client = new QueryClient();
@@ -1050,7 +1190,10 @@ describe("SessionUpdatesProvider list invalidation", () => {
 
       expect(listInvalidations(invalidate)).toEqual([]);
       // Its tree view still refreshes.
-      expect(invalidate).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_a") });
+      expect(invalidate).toHaveBeenCalledWith(
+        { queryKey: childSessionsQueryKey("conv_a") },
+        { cancelRefetch: false },
+      );
     } finally {
       vi.useRealTimers();
     }

@@ -548,18 +548,23 @@ async def test_flush_telemetry_reports_the_callers_installation_id(db_uri: str) 
 
 
 @pytest.mark.parametrize(
-    "child,mixed",
+    "child,data,error",
     [
-        (False, {}),
-        (True, {"cumulative_cost_usd": 3.0}),
-        (True, {"policy_cost_usd": 4.0}),
-        (True, {"cumulative_input_tokens": 10}),
+        (False, {"attributed_cost_usd": 1.0}, "Cost attribution"),
+        (True, {"attributed_cost_usd": 1.0, "cumulative_cost_usd": 3.0}, "Cost attribution"),
+        (True, {"attributed_cost_usd": 1.0, "policy_cost_usd": 4.0}, "Cost attribution"),
+        (True, {"attributed_cost_usd": 1.0, "cumulative_input_tokens": 10}, "Cost attribution"),
+        (True, {"attributed_cost_usd": -1.0}, "finite non-negative number"),
+        (True, {"attributed_cost_usd": float("nan")}, "finite non-negative number"),
+        (True, {"attributed_cost_usd": float("inf")}, "finite non-negative number"),
+        (True, {"attributed_cost_usd": float("-inf")}, "finite non-negative number"),
     ],
 )
-def test_attributed_cost_rejects_non_child_and_mixed_billing(
+def test_attributed_cost_rejects_invalid_updates(
     db_uri: str,
     child: bool,
-    mixed: dict,
+    data: dict,
+    error: str,
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     parent = store.create_conversation(title="parent", agent_id=_AGENT_ID)
@@ -573,6 +578,6 @@ def test_attributed_cost_rejects_non_child_and_mixed_billing(
         else parent
     )
     store.set_session_usage(target.id, {"total_cost_usd": 2.0})
-    with pytest.raises(OmnigentError, match="Cost attribution"):
-        _persist_native_cumulative_usage(target.id, {"attributed_cost_usd": 1.0, **mixed}, store)
+    with pytest.raises(OmnigentError, match=error):
+        _persist_native_cumulative_usage(target.id, data, store)
     assert _usage(store, target.id) == {"total_cost_usd": 2.0}

@@ -256,7 +256,7 @@ the header menu), and each place is a separate entry point.
 
 ## How to get to it (user POV)
 
-- **Session overview:** open a session, close Workspace on a wide window, or click the persistent header cost control. Select a child row to open that session.
+- **Session overview:** open a session, close Workspace on a wide window, or click the persistent header cost control. Select a child row to open that session. The first five children appear initially; **Show all** expands the list and **Show fewer** collapses it. **Nested agents** fetches a child's children only when expanded, down to three levels below the root; **Hide nested agents** collapses that branch.
 
 - For siblings, open an owned active session's sidebar kebab, right-click menu,
   or header menu and choose **Add nested agent**. Mobile row/header menus offer

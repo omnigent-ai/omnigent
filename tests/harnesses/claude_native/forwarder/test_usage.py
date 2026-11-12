@@ -786,16 +786,22 @@ async def test_child_attribution_backfills_dedupes_and_retries_without_health_fa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("rejection", [400, 404, 422, 429, 503, "timeout"])
+@pytest.mark.parametrize("rejection", [None, 400, 404, 422, 429, 503, "timeout"])
 async def test_child_attribution_rejection_does_not_suppress_siblings(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, rejection: int | str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, rejection: int | str | None
 ) -> None:
     clock = [100.0]
-    price = [0.5]
+    prices = {"unchanged": 0.5, "unpriceable": None, "rejected": 0.5, "valid": 0.5}
+    priced: list[str] = []
     monkeypatch.setattr(forwarder, "time", SimpleNamespace(monotonic=lambda: clock[0]))
-    monkeypatch.setattr(
-        forwarder, "_transcript_cost_size_cached", lambda *args, **kwargs: price[0]
-    )
+
+    def price(path: Path, *, include_sidechains: bool, cache: dict) -> float | None:
+        assert include_sidechains is True
+        child = path.stem.removeprefix("agent-")
+        priced.append(child)
+        return prices[child]
+
+    monkeypatch.setattr(forwarder, "_transcript_cost_size_cached", price)
     posts: list[str] = []
 
     monkeypatch.setattr(forwarder, "_POST_TIMEOUT_S", 0.01)
@@ -805,15 +811,17 @@ async def test_child_attribution_rejection_does_not_suppress_siblings(
         posts.append(child)
         if child == "rejected" and rejection == "timeout":
             await asyncio.Event().wait()
-        return httpx.Response(int(rejection) if child == "rejected" else 202)
+        return httpx.Response(
+            int(rejection) if child == "rejected" and rejection is not None else 202
+        )
 
     state = forwarder.SubagentForwardState(
         subagents={
             child: forwarder.SubagentEntry(subagent_id=child, child_conversation_id=child)
-            for child in ("rejected", "valid")
+            for child in prices
         }
     )
-    dedupe = forwarder._ForwardDedupeState()
+    dedupe = forwarder._ForwardDedupeState(attributed_costs={"unchanged": 0.5})
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(respond), base_url="https://example.test"
     ) as client:
@@ -829,16 +837,31 @@ async def test_child_attribution_rejection_does_not_suppress_siblings(
 
         await run()
         assert posts == ["rejected"]
+        assert priced == ["unchanged", "unpriceable", "rejected"]
         await run()
-        price[0] = 1.0
+        assert posts == ["rejected", "valid"]
+        prices["valid"] = 1.0
         await run()
         assert posts == ["rejected", "valid", "valid"]
         clock[0] += 31
+        priced.clear()
         await run()
-    assert dedupe.attributed_costs == {"valid": 1.0}
+    assert dedupe.attributed_costs == {
+        "unchanged": 0.5,
+        "valid": 1.0,
+        **({"rejected": 0.5} if rejection is None else {}),
+    }
     if rejection in (429, 503, "timeout"):
         assert posts == ["rejected", "valid", "valid", "rejected"]
         assert dedupe.attribution_disabled_children == set()
     else:
         assert posts == ["rejected", "valid", "valid"]
-        assert dedupe.attribution_disabled_children == {"rejected"}
+        assert dedupe.attribution_disabled_children == (
+            set() if rejection is None else {"rejected"}
+        )
+        assert priced == [
+            "unchanged",
+            "unpriceable",
+            *(["rejected"] if rejection is None else []),
+            "valid",
+        ]

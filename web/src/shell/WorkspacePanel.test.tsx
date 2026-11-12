@@ -1911,6 +1911,10 @@ describe("WorkspacePanel sub-agent tabs", () => {
       expect(useChatStore.getState().sideChatComposers["pending:two"]).toBeUndefined();
       expect(view.onRightRailTabChange).toHaveBeenCalledWith("sidechat");
       expect(within(rail).getByRole("tab", { name: "Research agent" })).toBeInTheDocument();
+      view.rerender({ rightRailTab: "sidechat", selectedFilePath: null });
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_second");
+      fireEvent.click(within(rail).getByRole("tab", { name: "Side chat 1" }));
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_fork");
     } finally {
       useChatStore.setState({
         sessionHarness: before.sessionHarness,

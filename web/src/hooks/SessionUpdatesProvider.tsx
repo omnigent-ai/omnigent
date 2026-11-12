@@ -25,7 +25,11 @@ import { type ReactNode, useCallback, useContext, useEffect, useRef } from "reac
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { getCurrentUserId } from "@/lib/identity";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
-import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import {
+  childSessionsQueryKey,
+  setChildSessionMembership,
+  watchedChildSessionIds,
+} from "@/hooks/useChildSessions";
 import {
   isSessionArchiving,
   isSessionDeleting,
@@ -287,16 +291,8 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     // server streams status changes for them. When a child's changed frame
     // arrives below, we invalidate its parent's child_sessions query key,
     // giving the tree views push-style freshness without polling.
-    const childEntries = queryClient.getQueriesData<ChildSessionInfo[]>({
-      queryKey: ["conversation"],
-    });
-    for (const [key, childSessions] of childEntries) {
-      // Only ["conversation", <id>, "child_sessions"] entries carry child lists.
-      if (Array.isArray(key) && key[2] === "child_sessions" && Array.isArray(childSessions)) {
-        for (const child of childSessions) {
-          if (!ids.includes(child.id)) ids.push(child.id);
-        }
-      }
+    for (const id of watchedChildSessionIds(queryClient)) {
+      if (!ids.includes(id)) ids.push(id);
     }
     sessionUpdatesSocket.setWatched(ids.filter((id) => !isTempConvId(id)));
   }, [queryClient]);
@@ -420,6 +416,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           return;
         case "removed":
           for (const id of frame.ids) {
+            setChildSessionMembership(queryClient, id, false);
             commentsFingerprintsRef.current.delete(id);
             // A revoked share or a deletion must not be re-injected by the
             // keep-alive once the refetch correctly leaves it out.
@@ -466,10 +463,22 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           // without polling.
           const parentIds = new Set<string>();
           for (const item of frame.items) {
-            if (item.parent_session_id) parentIds.add(item.parent_session_id);
+            if (typeof item.archived === "boolean") {
+              setChildSessionMembership(
+                queryClient,
+                item.id,
+                !item.archived,
+                item.parent_session_id,
+              );
+            }
+            if (item.parent_session_id && item.archived !== true)
+              parentIds.add(item.parent_session_id);
           }
           for (const parentId of parentIds) {
-            void queryClient.invalidateQueries({ queryKey: childSessionsQueryKey(parentId) });
+            void queryClient.invalidateQueries(
+              { queryKey: childSessionsQueryKey(parentId) },
+              { cancelRefetch: false },
+            );
           }
           const { missingIds, needsRefetch } = applyItemsToCache(
             queryClient,

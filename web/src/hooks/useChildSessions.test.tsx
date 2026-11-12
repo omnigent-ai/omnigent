@@ -133,6 +133,7 @@ describe("child-session fetch ownership", () => {
   it("keeps recording after queryFn resolves until the cache commit", async () => {
     const client = new QueryClient();
     const options = childSessionsQueryOptions("parent");
+    client.setQueryData(options.queryKey, []);
     vi.mocked(authenticatedFetch).mockResolvedValueOnce(
       childPage([{ id: "known", own_cost_usd: 1 }]),
     );

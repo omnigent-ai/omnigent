@@ -9524,7 +9524,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Child status delta pushed to the parent stream — patch the
       // child-sessions cache in place (no refetch). Also covers the
       // snapshot-on-connect frames, which reuse this event shape.
-      applyChildSessionUpdated(event.conversationId, event.childSessionId, event.child);
+      if (!applyChildSessionUpdated(event.conversationId, event.childSessionId, event.child))
+        return;
       // A claude-native child's turn-complete delta carries busy=false but no
       // last_message_preview (its reply lives in the tmux pane, not the
       // runner's in-process history). Refetch the parent's child list so the
@@ -9713,8 +9714,8 @@ function applyChildSessionUpdated(
   parentId: string,
   childId: string,
   child: Record<string, unknown>,
-): void {
-  if (queryClient === null) return;
+): boolean {
+  if (queryClient === null) return false;
 
   // Build a patch from only the fields PRESENT in the payload (undefined
   // = "not in this delta, leave as-is"); explicit null is a real value.
@@ -9754,7 +9755,7 @@ function applyChildSessionUpdated(
     patch.pending_elicitations_count =
       typeof child.pending_elicitations_count === "number" ? child.pending_elicitations_count : 0;
 
-  patchChildSessionsCache(queryClient, parentId, childId, patch);
+  return patchChildSessionsCache(queryClient, parentId, childId, patch);
 }
 
 /**

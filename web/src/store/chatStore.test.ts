@@ -11485,7 +11485,18 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
     });
 
     it("upserts a new child into the cached list", () => {
+      setSessionHost("conv_parent", "host_parent");
+      onTestFinished(() => {
+        setSessionHost("conv_parent", null);
+        setSessionParent("conv_child1", null);
+      });
       client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), []);
+      const hostsAtPublication: (string | null)[] = [];
+      const unsubscribe = client.getQueryCache().subscribe((event) => {
+        if (event.query.queryKey[2] === "child_sessions")
+          hostsAtPublication.push(getSessionHost("conv_child1"));
+      });
+      onTestFinished(unsubscribe);
       handleSessionEvent({
         type: "session_child_session_updated",
         conversationId: "conv_parent",
@@ -11493,6 +11504,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
         child: child(),
       });
       const cached = client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"));
+      expect(hostsAtPublication).toEqual(["host_parent"]);
       expect(cached).toEqual([
         {
           id: "conv_child1",
@@ -18480,10 +18492,14 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       // No parent link yet, so the child resolves no host of its own.
       expect(route.opens[0]!.headers.get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
 
-      // A cold /c/<child> open learns the parent from the child's own snapshot
-      // after the parent's host is already on the map.
+      // A live-only child receipt learns its routing parent before any child-list read.
       extras.set(child, { host_id: null, parent_session_id: parent });
-      setSessionParent(child, parent);
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: parent,
+        childSessionId: child,
+        child: { own_cost_usd: 0 },
+      });
       expect(getSessionHost(child)).toBe("host_p");
       await drainAsync(50);
 
