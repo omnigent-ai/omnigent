@@ -8754,6 +8754,13 @@
             "description": "Why the session's agent is parked on a terminal prompt, e.g. `\"permission prompt\"`, from the last status edge, truncated to 128 characters. The sidebar shows such a session as needing input even when no web card exists for the prompt. `None` when it is not parked or its runner is offline.",
             "title": "Blocked On"
           },
+          "child_session_count": {
+            "default": 0,
+            "description": "Number of non-archived direct sub-agent children, the members `GET /v1/sessions/{id}/child_sessions` lists. A change tells a client its cached child list gained or lost a member.",
+            "format": "int64",
+            "title": "Child Session Count",
+            "type": "integer"
+          },
           "comments_count": {
             "default": 0,
             "description": "Total number of review comments (any status) on this session. Together with `comments_updated_at` it forms a change fingerprint: an add or edit bumps the timestamp, a delete changes the count, so the web client can invalidate its cached comment list when either field changes in a `WS /v1/sessions/updates` frame. `0` when the session has no comments or the server has no comment store wired.",
@@ -8862,6 +8869,38 @@
             "description": "Session-scoped guardrails labels.",
             "title": "Labels",
             "type": "object"
+          },
+          "last_task_error": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Error details from the session's most recent failed run, e.g. `{\"code\": \"...\", \"message\": \"...\"}`; same value as `ChildSessionSummary.last_task_error`. `None` when there is no durable failure detail.",
+            "title": "Last Task Error"
+          },
+          "own_status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "idle",
+                  "running",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The session's own status, without the `status` roll-up of running sub-agent children or the booting promotion, e.g. `\"running\"`. Lets a client patch a sub-agent tree row (whose `busy` reflects only that child) from this item without refetching `GET /v1/sessions/{id}/child_sessions`.",
+            "title": "Own Status"
           },
           "owner": {
             "anyOf": [
@@ -9010,6 +9049,18 @@
             ],
             "title": "Status",
             "type": "string"
+          },
+          "task_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Task-derived label, the same value as `ChildSessionSummary.task_summary`, e.g. `\"Investigate auth flow\"`. `None` until one is generated.",
+            "title": "Task Summary"
           },
           "title": {
             "anyOf": [

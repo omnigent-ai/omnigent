@@ -254,6 +254,130 @@ def test_child_busy_rollup_flows_through_updates_stream(
         sessions_routes._session_status_cache.pop(child.id, None)
 
 
+def test_updates_stream_carries_child_tree_fields(
+    app: FastAPI,
+    stores,
+    fast_rescan: None,
+) -> None:
+    """
+    Stream rows carry what a sub-agent tree row needs to patch itself.
+
+    The web tree patches its cached child lists from these rows instead of
+    refetching them, so a row must report its own status apart from the child
+    roll-up, its last error, and a child count that changes when a sub-agent
+    is spawned without any other announcement.
+    """
+    conversation_store = stores[0]
+    parent_id = _seed_session(stores, owner=ALICE, title="parent")
+    child = conversation_store.create_conversation(
+        kind="sub_agent",
+        title="coder:auth",
+        parent_conversation_id=parent_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        labels={
+            "omnigent.last_task_error_code": "runner_disconnected",
+            "omnigent.last_task_error_message": "tunnel dropped",
+        },
+    )
+    stores[2].grant(ALICE, child.id, LEVEL_OWNER)
+    sessions_routes._session_status_cache.pop(parent_id, None)
+    sessions_routes._session_status_cache[child.id] = "waiting"
+    try:
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+        ) as ws:
+            ws.send_text(json.dumps({"type": "watch", "session_ids": [parent_id, child.id]}))
+            snapshot = _recv_until(ws, {"snapshot"})
+            items = {item["id"]: item for item in snapshot["items"]}  # type: ignore[index]
+            # The parent rolls up to running, but has no status of its own.
+            assert items[parent_id]["status"] == "running"
+            assert items[parent_id]["own_status"] is None
+            assert items[parent_id]["child_session_count"] == 1
+            assert items[child.id]["own_status"] == "running"
+            assert items[child.id]["last_task_error"] == {
+                "code": "runner_disconnected",
+                "message": "tunnel dropped",
+            }
+            assert items[child.id]["parent_session_id"] == parent_id
+
+            second = conversation_store.create_conversation(
+                kind="sub_agent",
+                title="coder:tests",
+                parent_conversation_id=parent_id,
+                agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+            )
+            changed = _recv_until(ws, {"changed"})
+            changed_items = {item["id"]: item for item in changed["items"]}  # type: ignore[index]
+            assert changed_items[parent_id]["child_session_count"] == 2
+
+            # The count matches what child_sessions lists: archived children
+            # drop out, and an unarchive elsewhere brings the member back.
+            conversation_store.update_conversation(second.id, archived=True)
+            changed = _recv_until(ws, {"changed"})
+            changed_items = {item["id"]: item for item in changed["items"]}  # type: ignore[index]
+            assert changed_items[parent_id]["child_session_count"] == 1
+            conversation_store.update_conversation(second.id, archived=False)
+            changed = _recv_until(ws, {"changed"})
+            changed_items = {item["id"]: item for item in changed["items"]}  # type: ignore[index]
+            assert changed_items[parent_id]["child_session_count"] == 2
+    finally:
+        sessions_routes._session_status_cache.pop(parent_id, None)
+        sessions_routes._session_status_cache.pop(child.id, None)
+
+
+def test_child_list_and_stream_agree_on_one_row(
+    app: FastAPI,
+    stores,
+) -> None:
+    """
+    ``GET child_sessions`` and the updates stream report one child the same way.
+
+    The web tree shows whichever source wrote the row last, so the two must
+    agree on status, error, and parked prompts, including when the status
+    cache misses and the row's persisted values are all there is.
+    """
+    conversation_store = stores[0]
+    parent_id = _seed_session(stores, owner=ALICE, title="parent")
+    child = conversation_store.create_conversation(
+        kind="sub_agent",
+        title="coder:auth",
+        parent_conversation_id=parent_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        labels={
+            "omnigent.last_task_error_code": "tool_failed",
+            "omnigent.last_task_error_message": "the tool broke",
+        },
+    )
+    stores[2].grant(ALICE, child.id, LEVEL_OWNER)
+    assert conversation_store.set_runner_id(child.id, "runner_on_another_replica")
+    conversation_store.set_session_live_status(child.id, "running")
+    # The replica holding the runner mirrored a parked approval to the row.
+    conversation_store.set_pending_elicitation_count(child.id, 2)
+    sessions_routes._session_status_cache.pop(child.id, None)
+
+    client = TestClient(app)
+    listed = client.get(
+        f"/v1/sessions/{parent_id}/child_sessions", headers={"X-Forwarded-Email": ALICE}
+    )
+    assert listed.status_code == 200
+    summary = next(row for row in listed.json()["data"] if row["id"] == child.id)
+    with client.websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [child.id]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+    frame = next(item for item in snapshot["items"] if item["id"] == child.id)  # type: ignore[index]
+
+    assert summary["busy"] is True
+    assert frame["own_status"] == "running"
+    # A recorded failure wins over the running status on both paths (the web
+    # client maps a frame with an error to "failed" the same way).
+    assert summary["current_task_status"] == "failed"
+    assert summary["last_task_error"] == frame["last_task_error"]
+    assert summary["last_task_error"]["code"] == "tool_failed"
+    assert summary["pending_elicitations_count"] == frame["pending_elicitations_count"] == 2
+
+
 def test_runner_offline_pushes_changed_frame(
     app: FastAPI, stores, liveness_state: dict[str, SessionLiveness], fast_rescan: None
 ) -> None:

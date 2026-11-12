@@ -1362,6 +1362,43 @@ def _session_status_from_cache(
     return "idle"
 
 
+def _pending_elicitations_count(conv: Conversation, indexed_count: int) -> int:
+    """
+    Count a session's parked approval prompts the same way on every read path.
+
+    The persisted row count is a cross-replica mirror written by the replica
+    holding the runner's tunnel; a replica without it falls back to the row
+    (``max()`` prefers showing the parked prompt whichever side lags). Only a
+    runner-bound session has a tunnel anywhere, so an unbound one reads the
+    local index alone and the row (which lags a resolve) can't override it.
+
+    :param conv: The session's row.
+    :param indexed_count: This replica's in-memory count for it.
+    :returns: The count to report, e.g. ``1``.
+    """
+    if conv.runner_id is None:
+        return indexed_count
+    return max(indexed_count, conv.pending_elicitation_count or 0)
+
+
+def _session_own_status(
+    conversation_id: str,
+    db_status: str | None = None,
+) -> Literal["idle", "running", "failed"] | None:
+    """
+    Map a session's own recorded status to a list-item status, with no roll-up.
+
+    :param conversation_id: Session/conversation identifier,
+        e.g. ``"conv_abc123"``.
+    :param db_status: ``Conversation.live_status`` when the caller has the row.
+    :returns: Same mapping as :func:`_session_status_from_cache`, or ``None``
+        when neither the cache nor the row has recorded a status.
+    """
+    if _session_status_cache.get(conversation_id) is None and db_status is None:
+        return None
+    return _session_status_from_cache(conversation_id, db_status)
+
+
 def _session_status_with_child_rollup(
     conversation_id: str,
     child_session_ids: list[str],
@@ -11774,9 +11811,10 @@ def _child_session_summary_from_conversation(
         child-message lookup, or ``None`` when no visible message exists.
     :param cached_status: Session status to derive ``busy`` /
         ``current_task_status`` from, e.g. ``"running"``. ``None`` reads the
-        live ``_session_status_cache``; a status-edge publisher passes the
-        edge's own value so a burst of transitions fans out one summary per
-        edge instead of the latest status repeated.
+        live ``_session_status_cache``, then the row's ``live_status``; a
+        status-edge publisher passes the edge's own value so a burst of
+        transitions fans out one summary per edge instead of the latest status
+        repeated.
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
@@ -11823,9 +11861,13 @@ def _child_session_summary_from_conversation(
         tool = display_title or None
         session_name = None
 
-    # Derive busy from the relay-fed cache; tasks table is gone.
+    # Derive busy from the relay-fed cache, falling back to the persisted row
+    # status like the session list does, so a replica without the runner's
+    # tunnel reports the same status as the updates stream.
     if cached_status is None:
         cached_status = _session_status_cache.get(conv.id)
+    if cached_status is None:
+        cached_status = conv.live_status
     if cached_status in ("running", "waiting"):
         busy = True
     else:
@@ -11867,7 +11909,9 @@ def _child_session_summary_from_conversation(
         # Surface the sub-agent's parked-elicitation count from the same
         # in-memory index that feeds the sidebar badge, so the Agents
         # rail can flag a child that's awaiting user input.
-        pending_elicitations_count=pending_elicitations.count_for(conv.id),
+        pending_elicitations_count=_pending_elicitations_count(
+            conv, pending_elicitations.count_for(conv.id)
+        ),
         # The model routing picked for this child, reported only when a
         # decision actually produced it: a user-pinned model_override is not a
         # routed model, and reporting one with a null decision id makes the
@@ -12889,6 +12933,7 @@ __all__ = [
     "_parse_session_create_metadata",
     "_parse_skill_slash_command",
     "_pending_elicitation_snapshot_for_session",
+    "_pending_elicitations_count",
     "_permission_level_from_grants",
     "_persist_external_assistant_message",
     "_persist_external_codex_approval_mode_change",
@@ -12973,6 +13018,7 @@ __all__ = [
     "_same_provider_family_impl",
     "_seed_missing_title",
     "_seed_missing_title_from_user_message",
+    "_session_own_status",
     "_session_status_from_cache",
     "_session_status_with_child_rollup",
     "_set_background_tasks",

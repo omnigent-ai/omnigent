@@ -10316,3 +10316,26 @@ def test_family_membership_is_independent_of_labels(conversation_store) -> None:
         source.id,
         sibling.id,
     }
+
+
+def test_list_child_conversation_ids_with_archived_flags_archived_children(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The archived flag rides the same batched read, so callers can count
+    the non-archived children ``child_sessions`` lists without a second query."""
+    parent = conversation_store.create_conversation()
+    live = conversation_store.create_conversation(
+        kind="sub_agent", title="coder:live", parent_conversation_id=parent.id
+    )
+    archived = conversation_store.create_conversation(
+        kind="sub_agent", title="coder:old", parent_conversation_id=parent.id
+    )
+    conversation_store.update_conversation(archived.id, archived=True)
+
+    result = conversation_store.list_child_conversation_ids_with_archived_by_parent([parent.id])
+
+    assert sorted(result[parent.id]) == sorted([(live.id, False), (archived.id, True)])
+    # The id-only listing still includes both, for the status roll-up.
+    assert sorted(
+        conversation_store.list_child_conversation_ids_by_parent([parent.id])[parent.id]
+    ) == sorted([live.id, archived.id])

@@ -1634,14 +1634,41 @@ class SqlAlchemyConversationStore(ConversationStore):
             child ids. Parents with no direct sub-agent children, or ids
             that do not exist, map to an empty list.
         """
+        return {
+            parent_id: [child_id for child_id, _ in children]
+            for parent_id, children in self.list_child_conversation_ids_with_archived_by_parent(
+                parent_conversation_ids
+            ).items()
+        }
+
+    def list_child_conversation_ids_with_archived_by_parent(
+        self,
+        parent_conversation_ids: list[str],
+    ) -> dict[str, list[tuple[str, bool]]]:
+        """
+        Return direct sub-agent child ids with their archived flag, by parent.
+
+        Same single batched query as
+        :meth:`list_child_conversation_ids_by_parent`; ``archived`` lives on
+        the same AP ``conversations`` row, so it costs no extra read.
+
+        :param parent_conversation_ids: Parent conversation ids to inspect,
+            e.g. ``["conv_parent1"]``. Duplicates are tolerated.
+        :returns: Mapping from every unique input parent id to
+            ``(child_id, archived)`` pairs, newest first.
+        """
         unique_ids = list(dict.fromkeys(parent_conversation_ids))
-        result: dict[str, list[str]] = {parent_id: [] for parent_id in unique_ids}
+        result: dict[str, list[tuple[str, bool]]] = {parent_id: [] for parent_id in unique_ids}
         if not unique_ids:
             return result
 
         with self._conv_session("list_child_conversation_ids_by_parent") as ap_sess:
             rows = ap_sess.execute(
-                select(SqlConversation.parent_conversation_id, SqlConversation.id)
+                select(
+                    SqlConversation.parent_conversation_id,
+                    SqlConversation.id,
+                    SqlConversation.archived,
+                )
                 .where(SqlConversation.workspace_id == current_workspace_id())
                 .where(SqlConversation.parent_conversation_id.in_(unique_ids))
                 .order_by(
@@ -1650,9 +1677,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     desc(self._tiebreaker_col),
                 )
             ).all()
-        for parent_id, child_id in rows:
+        for parent_id, child_id, archived in rows:
             if parent_id is not None:
-                result[parent_id].append(child_id)
+                result[parent_id].append((child_id, bool(archived)))
         return result
 
     def list_child_conversation_ids_page(

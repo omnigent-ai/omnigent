@@ -514,7 +514,7 @@ class _SessionBatchReads:
     conv_ids: list[str]
     perms_by_conv: dict[str, list[SessionPermission]]
     agents_by_id: dict[str, Agent]
-    child_ids_by_parent: dict[str, list[str]]
+    child_ids_by_parent: dict[str, list[tuple[str, bool]]]
     comments_fingerprints: dict[str, CommentsFingerprint]
     pull_request_summaries: dict[str, SessionSummary]
 
@@ -2696,7 +2696,9 @@ def register_core_routes(
                             ),
                             agents_by_id=_session_agents(list_batch),
                             child_ids_by_parent=(
-                                conversation_store.list_child_conversation_ids_by_parent(conv_ids)
+                                conversation_store.list_child_conversation_ids_with_archived_by_parent(
+                                    conv_ids
+                                )
                             ),
                             comments_fingerprints=_comments_fingerprints_sync(conv_ids),
                             pull_request_summaries=_pull_request_summaries_sync(conv_ids),
@@ -2758,7 +2760,10 @@ def register_core_routes(
                         user_is_admin=user_is_admin,
                         permissions_enabled=permission_store is not None,
                         pending_count=pending_counts.get(conv.id, 0),
-                        child_session_ids=child_ids_by_parent[conv.id],
+                        child_session_ids=[cid for cid, _ in child_ids_by_parent[conv.id]],
+                        child_session_count=sum(
+                            1 for _, archived in child_ids_by_parent[conv.id] if not archived
+                        ),
                         comments_fingerprint=comments_fingerprints.get(conv.id),
                         pull_request=pull_requests.get(conv.id, (None, None))[0],
                         pull_requests_synced=pull_requests.get(conv.id, (None, None))[1],
@@ -2962,7 +2967,7 @@ def register_core_routes(
         ) = await asyncio.gather(
             asyncio.to_thread(_session_agent_metadata, convs),
             asyncio.to_thread(
-                conversation_store.list_child_conversation_ids_by_parent,
+                conversation_store.list_child_conversation_ids_with_archived_by_parent,
                 conv_ids,
             ),
             _comments_fingerprints_for(conv_ids),
@@ -2980,7 +2985,10 @@ def register_core_routes(
                 user_is_admin=user_is_admin,
                 permissions_enabled=permission_store is not None,
                 pending_count=pending_counts.get(conv.id, 0),
-                child_session_ids=child_ids_by_parent[conv.id],
+                child_session_ids=[cid for cid, _ in child_ids_by_parent[conv.id]],
+                child_session_count=sum(
+                    1 for _, archived in child_ids_by_parent[conv.id] if not archived
+                ),
                 comments_fingerprint=comments_fingerprints.get(conv.id),
                 pull_request=pull_requests.get(conv.id, (None, None))[0],
                 pull_requests_synced=pull_requests.get(conv.id, (None, None))[1],

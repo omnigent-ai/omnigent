@@ -330,6 +330,7 @@ from omnigent.server.routes._sessions.helpers import (
     _parse_background_tasks,
     _parse_external_conversation_item,
     _pending_elicitation_snapshot_for_session,
+    _pending_elicitations_count,
     _permission_level_from_grants,
     _persist_native_policy_notice,
     _persist_session_for_uploaded_agent,
@@ -369,6 +370,7 @@ from omnigent.server.routes._sessions.helpers import (
     _runner_supports_side_chat_settings,
     _RunnerForwardResult,
     _seed_missing_title_from_user_message,
+    _session_own_status,
     _session_status_from_cache,
     _session_status_with_child_rollup,
     _SessionEventDispatchResult,
@@ -1286,6 +1288,7 @@ def _build_session_list_item(
     child_session_ids: list[str],
     comments_fingerprint: CommentsFingerprint | None,
     harness: str | None = None,
+    child_session_count: int | None = None,
     pull_request: SessionPullRequestSummary | None = None,
     pull_requests_synced: bool | None = None,
 ) -> SessionListItem:
@@ -1330,6 +1333,9 @@ def _build_session_list_item(
         ``comments_updated_at=None`` so the two states look identical
         on the wire.
     :param harness: Resolved session harness from the batch's cached agent specs.
+    :param child_session_count: Non-archived direct children, the members
+        ``GET /v1/sessions/{id}/child_sessions`` lists. ``None`` counts
+        ``child_session_ids``.
     :param pull_request: The conversation's first linked pull request,
         from the server's PR store; ``None`` when it has none.
     :param pull_requests_synced: Whether the server has imported the
@@ -1374,21 +1380,7 @@ def _build_session_list_item(
         owner=owner,
         external_session_id=conv.external_session_id,
         shared_with_others=shared_with_others,
-        # The persisted row count is a CROSS-REPLICA mirror: the replica
-        # holding the runner's tunnel writes it, and a replica that doesn't
-        # hold it falls back to the row (max() prefers "shows the parked
-        # approval" whichever side lags). That fallback only makes sense for
-        # a runner-bound session — an unbound session (no runner_id) has no
-        # tunnel on any replica, so the local in-memory index is
-        # authoritative and the row (an async mirror that lags a resolve's
-        # decrement) must not override it. Gating on runner_id keeps the
-        # cross-replica fallback where it's needed while making the unbound
-        # path index-only and free of the persist-lag race.
-        pending_elicitations_count=(
-            max(pending_count, conv.pending_elicitation_count or 0)
-            if conv.runner_id is not None
-            else pending_count
-        ),
+        pending_elicitations_count=_pending_elicitations_count(conv, pending_count),
         background_work_running=conv.background_work_running is True,
         blocked_on=_blocked_on_for(conv.id, conv.blocked_on),
         workspace=conv.workspace,
@@ -1407,6 +1399,12 @@ def _build_session_list_item(
         project_id=conv.project_id,
         pull_request=pull_request,
         pull_requests_synced=pull_requests_synced,
+        own_status=_session_own_status(conv.id, conv.live_status),
+        last_task_error=_last_task_error_from_labels(conv.labels),
+        task_summary=conv.task_summary,
+        child_session_count=(
+            len(child_session_ids) if child_session_count is None else child_session_count
+        ),
     )
 
 

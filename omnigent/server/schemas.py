@@ -3380,6 +3380,21 @@ class SessionListItem(BaseModel):
     :param pull_requests_synced: Whether the server has imported the session's
         PRs from its host, so a missing ``pull_request`` means "none" rather than
         "not known yet". ``None`` on servers without PR storage.
+    :param own_status: The session's own status, without the ``status``
+        roll-up of running sub-agent children or the booting promotion, e.g.
+        ``"running"``. Lets a client patch a sub-agent tree row (whose
+        ``busy`` reflects only that child) from this item without refetching
+        ``GET /v1/sessions/{id}/child_sessions``.
+    :param last_task_error: Error details from the session's most recent
+        failed run, e.g. ``{"code": "...", "message": "..."}``; same value as
+        :attr:`ChildSessionSummary.last_task_error`. ``None`` when there is no
+        durable failure detail.
+    :param child_session_count: Number of non-archived direct sub-agent
+        children, the members ``GET /v1/sessions/{id}/child_sessions`` lists.
+        A change tells a client its cached child list gained or lost a member.
+    :param task_summary: Task-derived label, the same value as
+        :attr:`ChildSessionSummary.task_summary`, e.g.
+        ``"Investigate auth flow"``. ``None`` until one is generated.
     """
 
     family: SessionFamily | None = None
@@ -3419,6 +3434,10 @@ class SessionListItem(BaseModel):
     project_id: str | None = None
     pull_request: SessionPullRequestSummary | None = None
     pull_requests_synced: bool | None = None
+    own_status: Literal["idle", "running", "failed"] | None = None
+    last_task_error: dict[str, str] | None = None
+    child_session_count: int = 0
+    task_summary: str | None = None
 
 
 class SessionPageBoundary(BaseModel):

@@ -785,6 +785,28 @@ class ConversationStore(ABC):
         """
         ...
 
+    def list_child_conversation_ids_with_archived_by_parent(
+        self,
+        parent_conversation_ids: list[str],
+    ) -> dict[str, list[tuple[str, bool]]]:
+        """
+        Like :meth:`list_child_conversation_ids_by_parent`, with each child's
+        archived flag, so one read serves both the status roll-up (every
+        child) and the live child count (non-archived children only).
+
+        :param parent_conversation_ids: Parent conversation ids to inspect.
+        :returns: Mapping from every unique input parent id to
+            ``(child_id, archived)`` pairs, newest first.
+        """
+        by_parent = self.list_child_conversation_ids_by_parent(parent_conversation_ids)
+        children = self.get_conversations([cid for ids in by_parent.values() for cid in ids])
+        return {
+            parent_id: [
+                (cid, bool(children[cid].archived) if cid in children else False) for cid in ids
+            ]
+            for parent_id, ids in by_parent.items()
+        }
+
     @abstractmethod
     def list_child_conversation_ids_page(
         self,
