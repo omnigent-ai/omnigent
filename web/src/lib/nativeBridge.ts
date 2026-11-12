@@ -20,6 +20,66 @@
 //   * This module never throws: a broken/old shell must not take down
 //     notifications in the browser path.
 
+import type {
+  ArcaConnectResult,
+  ArcaExtendMode,
+  ArcaExtendResult,
+  BrowserHostOptions,
+  BrowserRecentSessionInput,
+  CliStatus,
+  DbcertRefreshOptions,
+  DbcertRefreshResult,
+  DbcertStatusResult,
+  DesktopFeatures,
+  ElectronDesktopBridge,
+  GlobalShortcutChange,
+  GlobalShortcutSaveResult,
+  GlobalShortcutStatus,
+  HostActionResult,
+  HostControlAction,
+  HostIdentity,
+  NativeNotifyParams,
+  OnboardingRunner,
+  ServerManifest,
+  ServerPickerInfo,
+  ThemeSource,
+  UpdateConfig,
+  UpdateStatus,
+} from "../../electron/src/ipc/bridge.ts";
+
+// Shell data types are defined once by the Electron shell.
+export type {
+  ArcaConnectResult,
+  ArcaExtendMode,
+  ArcaExtendResult,
+  BrowserHostOptions,
+  BrowserRecentSessionInput,
+  ChromeCookieImportResult,
+  ChromeCookiePreviewResult,
+  ChromeCookieProfile,
+  ChromeCookieScopeCount,
+  CliStatus,
+  DbcertRefreshOptions,
+  DbcertRefreshResult,
+  DbcertStatusResult,
+  DesktopFeatures,
+  GlobalShortcutChange,
+  GlobalShortcutSaveResult,
+  GlobalShortcutSetting,
+  GlobalShortcutStatus,
+  HostActionResult,
+  HostControlAction,
+  HostIdentity,
+  NativeNotifyParams,
+  OnboardingRunner,
+  ServerManifest,
+  ServerPickerInfo,
+  ThemeSource,
+  UpdateConfig,
+  UpdateMode,
+  UpdateStatus,
+} from "../../electron/src/ipc/bridge.ts";
+
 /**
  * Phase of a native sidebar-drag gesture (see `onSidebarDrag`). `begin` and
  * `move` are live drag frames carrying an open fraction; `open` and `close`
@@ -30,24 +90,8 @@ export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 // Mirrors SESSION_HOST_PROTOCOL in electron/src/hostIdentity.ts.
 export const SESSION_HOST_PROTOCOL = 1;
 
-export interface BrowserHostOptions {
-  sourceHostId?: string | null;
-  sessionHostProtocol?: number;
-}
-
 export function navigationHostOptions(hostId: string | null): BrowserHostOptions {
   return hostId ? { sourceHostId: hostId, sessionHostProtocol: SESSION_HOST_PROTOCOL } : {};
-}
-
-export interface BrowserRecentSessionInput {
-  type: "keydown" | "keyup";
-  key: "Tab" | "Control" | "Escape";
-  code: string;
-  ctrlKey: boolean;
-  shiftKey: boolean;
-  altKey: boolean;
-  metaKey: boolean;
-  repeat: boolean;
 }
 
 /**
@@ -164,8 +208,6 @@ interface NativeShellApi {
   onKeyboardViewportChanged?: (callback: () => void) => () => void;
 }
 
-export type ThemeSource = "light" | "dark" | "system";
-
 /** Footprints (CSS px) of the native floating bars, reported by the shell. */
 export interface NativeInsets {
   /** Server switcher pill height + its top padding. */
@@ -188,14 +230,13 @@ export interface NativeViewModeParams {
 }
 
 /**
- * Electron-specific bridge. The server-picker trio is optional: the SPA is
- * server-served and may be newer than the installed shell, whose preload then
- * lacks these methods.
+ * `View`, once the compiler has checked that the current shell's `Bridge`
+ * satisfies it, so the web's view cannot drift from what the preload exposes.
  */
-interface ElectronDesktopApi extends NativeShellApi {
-  kind: "electron";
-  /** The runner picked during onboarding for this server, returned once. */
-  takeOnboardingRunner?: () => Promise<OnboardingRunner | null>;
+type CheckedBridgeView<Bridge extends View, View> = Bridge extends View ? View : never;
+
+/** Members whose web view differs from the current shell's, for older shells. */
+interface ElectronDesktopCompatibility {
   /**
    * Desktop auto-update bridge — CONFIG ONLY on current shells. Update
    * notifications are shell-owned (native corner overlay + Server menu); this
@@ -205,83 +246,6 @@ interface ElectronDesktopApi extends NativeShellApi {
    * idle, so the web never shows a (duplicate) banner. Absent on older shells.
    */
   updates?: ElectronUpdateBridge;
-  /** Reveal one of this machine's files in the OS file manager. */
-  revealFile?: (hostId: string, path: string) => Promise<boolean>;
-  /** OS folder chooser on this machine; resolves the chosen path, or null on cancel. */
-  chooseDirectory?: (defaultPath?: string) => Promise<string | null>;
-  /** This machine's path for a dropped File; "" if none or off the pinned server. */
-  getPathForFile?: (file: File) => Promise<string>;
-  /** This machine's identity (CLI installed + host id) — fast, no subprocess. */
-  getHostIdentity?: () => Promise<HostIdentity | null>;
-  /** Start / stop / restart this machine's host daemon for the window's server. */
-  controlHost?: (action: HostControlAction) => Promise<HostActionResult>;
-  /** Subscribe to host status-change pings (re-read on fire); returns an unsubscribe. */
-  onHostStatusChanged?: (callback: () => void) => () => void;
-  /** Desktop feature gates; absent on older shells. */
-  getDesktopFeatures?: () => Promise<DesktopFeatures | null>;
-  /** Connect the user's Arca instance to the window's server as a host. */
-  connectArcaHost?: () => Promise<ArcaConnectResult>;
-  /** Connect a machine the user reaches over SSH; absent on Windows and older shells. */
-  connectSshHost?: (destination: string) => Promise<ArcaConnectResult>;
-  /** Extend this machine's running Arca instance with an approved mode. */
-  extendArca?: (mode: ArcaExtendMode) => Promise<ArcaExtendResult>;
-  /** Renew this machine's dbcert. */
-  refreshDbcert?: (options?: DbcertRefreshOptions) => Promise<DbcertRefreshResult>;
-  /** Check local credentials before an Arclet launch without starting sign-in. */
-  checkDbcert?: () => Promise<DbcertStatusResult>;
-
-  /** The local `omni` CLI status (installed, resolved path, version, source). */
-  getCliStatus?: () => Promise<CliStatus | null>;
-  /** Clear the CLI-path override (revert to auto-detection); resolves status. */
-  resetCliPath?: () => Promise<CliStatus | null>;
-  /**
-   * Open/navigate a conversation's embedded browser view. Present only on
-   * desktop shells new enough to ship the embedded browser feature — its
-   * presence is the capability marker the whole `browser*` suite ships with.
-   */
-  browserOpenOrNavigate?: (
-    conversationId: string,
-    url: string,
-    bounds?: unknown,
-    opts?: BrowserHostOptions & {
-      force?: boolean;
-      agent?: boolean;
-      rememberedArcaHostId?: string;
-      sourceIsArcaHost?: boolean;
-    },
-  ) => Promise<{ ok: boolean; created?: boolean; hostIsThisMachine?: boolean; error?: string }>;
-  /**
-   * Hide/show the active embedded browser view while a DOM overlay is open.
-   * The native view paints above the renderer, so this is how overlays
-   * (dialogs, menus, tooltips, toasts) avoid being covered. Absent on shells
-   * predating the feature — callers must optional-chain.
-   */
-  browserSetSuppressed?: (suppressed: boolean) => Promise<{ ok: boolean; error?: string }>;
-  /** Forward the recent-session gesture from a focused embedded Browser page. */
-  onBrowserRecentSessionInput?: (
-    callback: (input: BrowserRecentSessionInput) => void,
-  ) => () => void;
-  /** Enable native input interception only while this renderer supports it. */
-  browserSetRecentSessionSwitchSupported?: (
-    supported: boolean,
-  ) => Promise<{ ok: boolean; error?: string }>;
-  /** Clear native key interception when the recent-session gesture was declined. */
-  browserCancelRecentSessionSwitch?: () => Promise<{ ok: boolean; error?: string }>;
-  /**
-   * Inspect the local Google Chrome profiles for cookies in the site tree the
-   * conversation's view is on. Metadata only (profile + per-scope counts): no
-   * Keychain access and no cookie values. Absent on shells predating the feature.
-   */
-  browserChromeCookiePreview?: (conversationId: string) => Promise<ChromeCookiePreviewResult>;
-  /**
-   * Copy that site's cookies out of one Chrome profile into the conversation's
-   * own in-memory browser session. Decrypts via the Keychain (system prompt on
-   * the first import); `expectedHost` must still match the view's current site.
-   */
-  browserChromeCookieImport?: (
-    conversationId: string,
-    args: { profileId: string; expectedHost: string; scope?: string },
-  ) => Promise<ChromeCookieImportResult>;
   /** Subscribe to native menu commands for this window; returns an unsubscribe. */
   onDesktopCommand?: (
     callback: (event: {
@@ -291,27 +255,20 @@ interface ElectronDesktopApi extends NativeShellApi {
       quitDetail?: string | null;
     }) => void,
   ) => () => void;
-  /** Report which menu commands this page can run now (fire-and-forget). */
-  setDesktopCommandState?: (state: DesktopCommandState) => void;
-  /** Close this window once the page has confirmed. Resolves whether it closed. */
-  closeWindow?: () => Promise<boolean>;
-  /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
-  confirmQuit?: (options: { dontAskAgain: boolean }) => Promise<boolean>;
-  /**
-   * Start macOS Dictation (Edit > Start Dictation…) in the focused field. Only
-   * macOS shells expose it. Resolves whether the shell started it.
-   */
-  startSystemDictation?: () => Promise<boolean>;
-  /** The "Show Omnigent from anywhere" shortcut; absent on shells predating it. */
-  getGlobalShortcut?: () => Promise<GlobalShortcutStatus | null>;
-  /** Saves the shortcut; resolves `{ ok: false, error }` when the shell refuses the chord. */
-  setGlobalShortcut?: (change: GlobalShortcutChange) => Promise<GlobalShortcutSaveResult>;
-  /** Takes the next chord ahead of the page's shortcuts and the menu; null when cancelled. */
-  recordGlobalShortcut?: () => Promise<string | null>;
-  cancelGlobalShortcutRecording?: () => Promise<boolean>;
-  /** The attached browser page's view id if it has keyboard focus; absent on older shells. */
-  browserFocusedView?: () => Promise<string | null>;
 }
+
+/**
+ * The web's view of the Electron bridge. The SPA is server-served and may be
+ * newer than the installed shell, whose preload then lacks any member added
+ * after the original badge and notification bridge.
+ */
+type ElectronDesktopApi = CheckedBridgeView<
+  ElectronDesktopBridge,
+  NativeShellApi & { kind: "electron" } & Partial<
+      ElectronDesktopCompatibility &
+        Omit<ElectronDesktopBridge, keyof NativeShellApi | keyof ElectronDesktopCompatibility>
+    >
+>;
 
 /** Native menu commands the desktop shell hands to the page (see lib/desktopCommands). */
 export type DesktopCommand =
@@ -364,211 +321,6 @@ export interface DesktopCommandState {
   sessionArchived: boolean;
 }
 
-/** One importable site tree and how many cookies a profile holds for it. */
-export interface ChromeCookieScopeCount {
-  /** The page's host or one of its parent domains. */
-  host: string;
-  /** Cookies on that domain and its subdomains, plus inherited domain cookies. */
-  cookieCount: number;
-}
-
-/** One local Chrome profile that holds cookies for the current site. */
-export interface ChromeCookieProfile {
-  /** Chrome's profile directory name (e.g. `Default`, `Profile 2`). */
-  id: string;
-  /** Chrome's profile display name, falling back to the directory name. */
-  name: string;
-  /** How many cookies the profile holds for the page's own host tree. */
-  cookieCount: number;
-  /** Counts per scope, narrowest first (see {@link ChromeCookiePreviewResult.scopes}).
-   *  Only scopes this profile actually holds cookies for are listed. */
-  scopes?: ChromeCookieScopeCount[];
-}
-
-export interface ChromeCookiePreviewResult {
-  ok: boolean;
-  /** Host whose page asked for the import (main-derived from the real URL). */
-  host?: string;
-  /** Scopes the user may pick: `host`, then each parent domain Chrome holds
-   *  a domain cookie for. */
-  scopes?: string[];
-  /** Profiles with at least one cookie for any scope; empty when none match. */
-  profiles?: ChromeCookieProfile[];
-  error?: string;
-}
-
-export interface ChromeCookieImportResult {
-  ok: boolean;
-  /** The user declined the shell's own confirmation; nothing was read. */
-  cancelled?: boolean;
-  host?: string;
-  /** The site tree actually copied (the page's host unless the user widened it). */
-  scope?: string;
-  profileId?: string;
-  profileName?: string;
-  /** Cookies matching the site tree (before decryption). */
-  found?: number;
-  /** Cookies written into the conversation's session. */
-  imported?: number;
-  /** Matched cookies we could not decrypt and left out. */
-  skipped?: number;
-  /** Cookies Chrome believes are valid but the session rejected. */
-  failed?: number;
-  error?: string;
-}
-
-/** A lifecycle action for the host daemon. */
-export type HostControlAction = "start" | "stop" | "restart";
-
-export type ArcaExtendMode = "overnight" | "workweek";
-export type ArcaExtendResult =
-  { ok: true; shutdownAt: number | null } | { ok: false; error: string };
-export type DbcertRefreshResult = { ok: true } | { ok: false; error: string };
-export interface DbcertRefreshOptions {
-  skipArcaSync?: boolean;
-}
-export type DbcertStatusResult = { ok: true; valid: boolean } | { ok: false; error: string };
-
-/** Result of connecting the Arca instance as a host, from the desktop shell. */
-export interface ArcaConnectResult extends HostActionResult {
-  /** Actual daemon identity captured on Arca for this selected server target. */
-  identity?: { serverUrl: string; hostId: string };
-  /**
-   * The box's host daemon was already connected to this server (the command
-   * reused it) — so no new host will appear in the host list.
-   */
-  alreadyRunning?: boolean;
-  /**
-   * The user deliberately declined or dismissed the connect console (before
-   * or during the run) — not a failure; UIs should stay silent.
-   */
-  canceled?: boolean;
-  /**
-   * The outcome (success or failure) was already displayed in the connect
-   * console's terminal — UIs must not echo it a second time.
-   */
-  shownInConsole?: boolean;
-}
-
-/**
- * Desktop-shell feature gates the server can't know about. All fields
- * optional: an older shell reports fewer.
- */
-export interface DesktopFeatures {
-  /**
-   * Managed features (e.g. the Arca host option) are enabled.
-   * Already scoped by the shell: true only when the flag is set AND the
-   * window's server is a managed server.
-   */
-  databricksInternalFeatures?: boolean;
-  /** This window may offer one-click Arca extension. */
-  canExtendArca?: boolean;
-  /** This window may renew the laptop's dbcert. */
-  canRefreshDbcert?: boolean;
-  /** Shell can restore Arca preview identity after a desktop restart. */
-  arcaPreviewRecovery?: boolean;
-  /** This shell can import the current site's cookies from local Google Chrome. */
-  chromeCookieImport?: boolean;
-}
-
-/** Status of the local `omni` CLI, from the desktop shell. */
-export interface CliStatus {
-  /** Whether the CLI was found and is runnable. */
-  installed: boolean;
-  /** The resolved binary path (configured override or auto-detected), or null. */
-  path: string | null;
-  /** The CLI's reported version, or null. */
-  version: string | null;
-  /** How the path was resolved: an explicit override, PATH, or a known location. */
-  source: "configured" | "path" | "candidate" | null;
-  /** The install one-liner to show when the CLI is missing. */
-  installCommand: string;
-  /** Whether a just-submitted path was accepted (present on pick/set results). */
-  accepted?: boolean;
-  /** Policy disables set/browse/reset of custom CLI paths. */
-  customizationDisabled?: boolean;
-}
-
-/** This machine's identity, read from local config (fast — no subprocess). */
-export interface HostIdentity {
-  /** Whether the `omnigent` CLI was found and is runnable. */
-  cliInstalled: boolean;
-  /** This machine's host id, or null if it has none yet. */
-  hostId: string | null;
-}
-
-/** Result of a host control action from the desktop shell. */
-export interface HostActionResult {
-  ok: boolean;
-  error?: string;
-  /**
-   * True when the failure was an authentication/sign-in problem — e.g. the
-   * server needs a Databricks/OIDC login the desktop couldn't complete
-   * headlessly — so the UI can offer a sign-in/retry affordance rather than a
-   * generic error. Set by the desktop's `omnigent:host-control` handler.
-   */
-  authError?: boolean;
-}
-
-/** The "Show Omnigent from anywhere" shortcut; `accelerator` is an Electron accelerator. */
-export interface GlobalShortcutSetting {
-  enabled: boolean;
-  accelerator: string;
-}
-
-/** A chord to save, or `{ enabled: false }` to turn the shortcut off and keep its chord. */
-export type GlobalShortcutChange = GlobalShortcutSetting | { enabled: false; accelerator?: never };
-
-/** `setting` is what the shell saved, which may differ from what a stale window showed. */
-export interface GlobalShortcutSaveResult {
-  ok: boolean;
-  setting?: GlobalShortcutSetting;
-  error?: string;
-}
-
-/** The saved shortcut, with `error` while it is on but the shell couldn't register it. */
-export interface GlobalShortcutStatus extends GlobalShortcutSetting {
-  error?: string;
-}
-
-export type UpdateMode = "none" | "manual" | "start" | "default";
-
-export interface UpdateConfig {
-  mode: UpdateMode;
-  autoInstall: boolean;
-  skippedVersion: string | null;
-}
-
-export type UpdateStatus = {
-  /** Installed Electron app version; absent on older desktop shells. */
-  currentVersion?: string;
-} & (
-  | {
-      state: "idle" | "checking" | "none";
-      info?: undefined;
-      progress?: undefined;
-      lastError?: string;
-    }
-  | {
-      state: "available" | "downloaded";
-      info?: { version: string; releaseNotes?: string };
-      progress?: undefined;
-      lastError?: string;
-    }
-  | {
-      state: "downloading";
-      info?: { version: string; releaseNotes?: string };
-      progress?: { percent: number };
-      lastError?: string;
-    }
-  | {
-      state: "error-security";
-      info?: { version: string; releaseNotes?: string };
-      progress?: undefined;
-      lastError?: string;
-    }
-);
-
 export interface ElectronUpdateBridge {
   getConfig: () => Promise<UpdateConfig>;
   getStatus: () => Promise<UpdateStatus>;
@@ -581,74 +333,6 @@ export interface ElectronUpdateBridge {
   getOverlayHeight?: () => Promise<number>;
   /** Subscribe to shell-owned update card height changes. */
   onOverlayHeight?: (callback: (height: number) => void) => () => void;
-}
-
-/** Data backing the title-bar server picker, from the Electron shell. */
-export interface ServerPickerInfo {
-  /** Origin this window is connected to, e.g. `"http://localhost:8000"`. */
-  currentOrigin: string;
-  /**
-   * The server URL the user picked when sign-in moved to `currentOrigin`'s host
-   * (it may carry a workspace `?o=` selector), else null. Absent on older shells.
-   */
-  currentServer?: string | null;
-  /** Recent URL → the server URL the user picked for it, for display. Absent on older shells. */
-  recentLabels?: Record<string, string>;
-  /**
-   * Server URLs supplied through macOS Managed Preferences. Optional because a
-   * newer server-served SPA can run inside a desktop shell that predates this.
-   */
-  managedServers?: string[];
-  /** Display names for managed servers, server URL → name. Absent on older shells. */
-  managedServerNames?: Record<string, string>;
-  /**
-   * Whether the shell owns this server's sign-in (Databricks or OIDC browser
-   * sign-in) and can sign it out. Absent on older shells.
-   */
-  canSignOut?: boolean;
-  /**
-   * Names servers gave themselves in their manifest, origin → name. Display
-   * only (a server can call itself anything), so show the host alongside.
-   * Absent on older shells.
-   */
-  serverNames?: Record<string, string>;
-  /** Recently-connected server URLs, most recent first. */
-  recentServers: string[];
-  /**
-   * The connected server's version manifest (`/.well-known/omnigent.json`),
-   * forwarded by the shell. Optional: shells older than the manifest simply
-   * don't send it — see {@link serverManifestOf}, which supplies the
-   * pre-manifest baseline so callers never handle `undefined`.
-   */
-  serverManifest?: ServerManifest;
-}
-
-/**
- * The server's version manifest, as forwarded by the desktop shell from
- * `GET /.well-known/omnigent.json`.
- *
- * Read it through {@link serverManifestOf} and gate on `manifestVersion >= N`,
- * never `=== N`: a newer server must keep working with an older client, which
- * is the entire point of the document.
- */
-export interface ServerManifest {
-  /**
-   * Envelope version. `0` is the pre-manifest baseline — a server older than
-   * the manifest route, or one the shell could not read — so the ordinary
-   * `>= 1` gate excludes it without callers testing for null.
-   */
-  manifestVersion: number;
-  /** Installed omnigent package version. Display only, never gate on it. */
-  serverVersion: string | null;
-  /** Oldest supported desktop build, or null for no floor (the normal case). */
-  minDesktopVersion: string | null;
-  /**
-   * Where server-driven chrome lives. `server_picker` is `"sidebar"` on builds
-   * that dock the picker at the sidebar's bottom, `"titlebar"` on older ones.
-   * Loosely typed on purpose: unknown keys are the extension point, so a newer
-   * server can add shapes this build has never heard of.
-   */
-  ui: Record<string, unknown>;
 }
 
 /**
@@ -993,20 +677,6 @@ export function isNativeShell(): boolean {
   return nativeApi() !== undefined;
 }
 
-export interface NativeNotifyParams {
-  /** Headline — typically the conversation's display label. */
-  title: string;
-  /** Secondary line, e.g. "Agent finished and is ready for your input." */
-  body?: string;
-  /**
-   * In-app path the shell should open when the user clicks this notification,
-   * e.g. `"/c/conv_abc123"`. A click closure can't cross the process boundary,
-   * so we forward the destination as a string and route to it on click via
-   * `onNativeNotificationActivated`. Omitted -> click only focuses the window.
-   */
-  navigatePath?: string;
-}
-
 /**
  * Show an OS-native notification via the Electron preload bridge (which calls
  * the main-process `Notification` API and wires click-to-focus on its side).
@@ -1341,9 +1011,6 @@ export async function getHostIdentity(): Promise<HostIdentity | null> {
     return null;
   }
 }
-
-/** Where desktop onboarding connected a runner: this machine, or a remote host like Arca. */
-export type OnboardingRunner = "local" | "remote";
 
 /** Features that each take the onboarding runner once per page load. */
 export type OnboardingRunnerConsumer = "hostPicker" | "importReview";
