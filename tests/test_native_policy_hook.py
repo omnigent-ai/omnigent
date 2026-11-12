@@ -104,6 +104,24 @@ def test_post_tool_use_failure_maps_to_phase_tool_result_error() -> None:
     }
 
 
+def test_interrupted_tool_call_is_not_evaluated() -> None:
+    """A user interrupt is not a tool error, so result policies never count it."""
+    assert (
+        hook_payload_to_evaluation_request(
+            "PostToolUseFailure",
+            {
+                "hook_event_name": "PostToolUseFailure",
+                "tool_name": "Bash",
+                "tool_input": {"command": "sleep 30"},
+                "tool_use_id": "toolu_1",
+                "error": "Interrupted by user",
+                "is_interrupt": True,
+            },
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize("hook_event", ["PreToolUse", "PostToolUse", "PostToolUseFailure"])
 def test_omnigent_mcp_tools_are_skipped(hook_event: str) -> None:
     """

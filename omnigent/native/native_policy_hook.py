@@ -316,7 +316,8 @@ def hook_payload_to_evaluation_request(
         "tool_input": {"command": "rm -rf /"}}``.
     :returns: An ``EvaluationRequest`` dict suitable for POSTing to
         ``/policies/evaluate``, or ``None`` when the event is not
-        policy-relevant (unknown event or an ``mcp__omnigent__*`` tool).
+        policy-relevant (unknown event, an ``mcp__omnigent__*`` tool, or a
+        failure the user caused by interrupting the tool).
     """
     if hook_event == _USER_PROMPT_SUBMIT:
         # Request-phase gate for native sessions. The server reads REQUEST
@@ -352,6 +353,9 @@ def hook_payload_to_evaluation_request(
                 "context": {},
             },
         }
+    if hook_event == _POST_TOOL_USE_FAILURE and payload.get("is_interrupt") is True:
+        # A user cancelling the tool is not a tool error.
+        return None
     if hook_event in (_POST_TOOL_USE, _POST_TOOL_USE_FAILURE):
         if hook_event == _POST_TOOL_USE_FAILURE:
             tool_output: object = {"error": payload.get("error", "")}
