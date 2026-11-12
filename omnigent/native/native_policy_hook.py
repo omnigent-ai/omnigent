@@ -66,6 +66,9 @@ _POST_TOOL_USE = "PostToolUse"
 # Claude Code fires this instead of ``PostToolUse`` when the tool fails
 # (e.g. Bash exiting non-zero).
 _POST_TOOL_USE_FAILURE = "PostToolUseFailure"
+# A harness adapter sets this on a ``PostToolUse`` payload when its harness
+# reported that the call failed, since its own field names differ.
+TOOL_FAILED_PAYLOAD_KEY = "omnigent_tool_failed"
 # ``UserPromptSubmit`` fires when a new user prompt reaches the harness —
 # for native sessions this is the request-phase gate (the server-level
 # ``_evaluate_input_policy`` is bypassed for native message events, so
@@ -300,8 +303,11 @@ def hook_payload_to_evaluation_request(
     and ``PostToolUseFailure`` to a ``PHASE_TOOL_RESULT`` event, and
     ``UserPromptSubmit`` to a ``PHASE_REQUEST`` event (the prompt text
     from the payload's ``prompt`` field becomes the request content). A
-    failure's ``error`` text becomes the result ``{"error": ...}`` so
-    result policies such as ``detect_thrashing`` see a failed call.
+    failure's ``error`` text becomes the result ``{"error": ...}``, and
+    the event data gets ``"is_error": True``, as does a ``PostToolUse``
+    whose payload has :data:`TOOL_FAILED_PAYLOAD_KEY` set to ``True``.
+    Result policies such as ``detect_thrashing`` then count the failure
+    without parsing its text.
     Omnigent MCP tools (``mcp__omnigent__*``) are skipped because they
     are already policy-checked by the relay path (``ProxyMcpManager`` →
     Omnigent ``/mcp`` endpoint → ``_evaluate_tool_call_policy``);
@@ -359,15 +365,18 @@ def hook_payload_to_evaluation_request(
     if hook_event in (_POST_TOOL_USE, _POST_TOOL_USE_FAILURE):
         if hook_event == _POST_TOOL_USE_FAILURE:
             tool_output: object = {"error": payload.get("error", "")}
+            tool_failed = True
         else:
             tool_output = payload.get("tool_response", payload.get("tool_output", ""))
+            tool_failed = payload.get(TOOL_FAILED_PAYLOAD_KEY) is True
+        result_data: dict[str, object] = {"result": tool_output}
+        if tool_failed:
+            result_data["is_error"] = True
         return {
             "event": {
                 "type": "PHASE_TOOL_RESULT",
                 "target": "",
-                "data": {
-                    "result": tool_output,
-                },
+                "data": result_data,
                 "context": {},
                 "request_data": {
                     "name": tool_name,
