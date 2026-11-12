@@ -87,6 +87,7 @@ from ._subprocess_lifecycle import (
 from .async_utils import run_sync_on_thread
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
 from .codex_goal_command import goal_objective_length_error as _goal_objective_length_error
+from .codex_rpc_errors import CodexAppServerResponseError, is_required_mcp_startup_timeout
 from .codex_staging import (
     CODEX_HOME_PREFIX,
     CODEX_SKILLS_PREFIX,
@@ -3967,6 +3968,26 @@ class _CodexAppServerSession:
             "start a new session."
         )
 
+    async def _start_thread(self, params: CodexParams) -> CodexMessage:
+        for attempt in range(self._retry_policy.max_retries + 1):
+            try:
+                return await self._request("thread/start", params)
+            except CodexAppServerResponseError as error:
+                if (
+                    attempt == self._retry_policy.max_retries
+                    or not is_required_mcp_startup_timeout(error)
+                ):
+                    raise
+                retry_index = attempt + 1
+                logger.info(
+                    "Retrying Codex initialization after a required MCP handshake timeout "
+                    "(retry %d/%d)",
+                    retry_index,
+                    self._retry_policy.max_retries,
+                )
+                await asyncio.sleep(self._retry_policy.compute_backoff_delay(retry_index))
+        raise AssertionError("Codex thread initialization exhausted its retry loop")
+
     async def run_turn(
         self,
         *,
@@ -4018,7 +4039,7 @@ class _CodexAppServerSession:
                 if self._disable_native_tools:
                     tool_config["features.shell_tool"] = False
                 params["config"] = tool_config
-            response = await self._request("thread/start", params)
+            response = await self._start_thread(params)
             thread = response.get("result", {}).get("thread", {})
             raw_thread_id = thread.get("id")
             # The Codex App Server is required to return a thread id
@@ -4699,7 +4720,7 @@ class _CodexAppServerSession:
                 future.exception()
         error = response.get("error")
         if error:
-            raise RuntimeError(str(error))
+            raise CodexAppServerResponseError(error)
         return response
 
     async def _send_response(self, request_id: int, result: CodexParams) -> None:

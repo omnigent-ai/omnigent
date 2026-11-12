@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
 from omnigent.inner.codex_executor import (
     _TURN_EVENT_WARN_SECONDS,
     CodexExecutor,
@@ -64,6 +65,13 @@ from omnigent.inner.model_auth import ProviderAuthRequired
 from omnigent.inner.model_egress import FrozenModelRoute
 from omnigent.inner.model_signer import SignerLaunchConfig, SubprocessModelSigner
 from omnigent.native import _native_forwarder_health as native_forwarder_health
+from omnigent.spec.types import RetryPolicy
+
+_MCP_STARTUP_TIMEOUT = (
+    "error creating thread: Fatal error: Failed to initialize session: "
+    "required MCP servers failed to initialize: github: "
+    "timed out handshaking with MCP server after 29.999999705s: deadline has elapsed"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -454,6 +462,174 @@ class _FakeProcess:
 
     async def wait(self) -> int:
         return self.returncode or 0
+
+
+@pytest.mark.parametrize("failures", [1, 2])
+async def test_required_mcp_startup_timeout_recovers_before_sending_one_turn(failures):
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+        retry_policy=RetryPolicy(max_retries=2, backoff_base_s=0.001, jitter=False),
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    calls = []
+
+    async def respond(payload):
+        calls.append(payload)
+        if len(calls) <= failures:
+            response = {"error": {"code": -32603, "message": _MCP_STARTUP_TIMEOUT}}
+        elif payload["method"] == "thread/start":
+            response = {"result": {"thread": {"id": "recovered-thread"}}}
+        else:
+            response = {"result": {"turn": {"id": "only-turn"}}}
+            session._events.put_nowait(
+                {"method": "turn/completed", "params": {"turn": {"id": "only-turn"}}}
+            )
+        session._pending_requests[payload["id"]].set_result(response)
+
+    session._send_message = AsyncMock(side_effect=respond)
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "original request"}],
+            tools=[],
+            system_prompt="original instructions",
+            model=None,
+            cwd="/tmp/workspace",
+            sandbox="workspace-write",
+        )
+    ]
+    assert isinstance(events[-1], TurnComplete)
+    assert [call["method"] for call in calls] == ["thread/start"] * (failures + 1) + ["turn/start"]
+    assert all(call["params"] == calls[0]["params"] for call in calls[:-1])
+    assert calls[-1]["params"] == {
+        "threadId": "recovered-thread",
+        "input": [{"type": "text", "text": "original request"}],
+    }
+    assert not session._pending_requests
+
+
+@pytest.mark.parametrize("max_retries", [0, 2])
+@pytest.mark.parametrize(
+    ("method", "error"),
+    [
+        pytest.param(
+            "thread/start", {"code": -32603, "message": _MCP_STARTUP_TIMEOUT}, id="timeout"
+        ),
+        pytest.param(
+            "thread/start", {"code": -32602, "message": _MCP_STARTUP_TIMEOUT}, id="bad-code"
+        ),
+        pytest.param(
+            "thread/start",
+            {
+                "code": -32603,
+                "message": _MCP_STARTUP_TIMEOUT.replace(
+                    "deadline has elapsed", "401 Unauthorized"
+                ),
+            },
+            id="authentication",
+        ),
+        pytest.param(
+            "thread/start",
+            {"code": -32603, "message": "failed to load configuration: invalid MCP transport"},
+            id="configuration",
+        ),
+        pytest.param(
+            "thread/start",
+            {"code": -32603, "message": _MCP_STARTUP_TIMEOUT + "; other: invalid configuration"},
+            id="mixed-failures",
+        ),
+        pytest.param(
+            "turn/start", {"code": -32603, "message": _MCP_STARTUP_TIMEOUT}, id="turn-refusal"
+        ),
+    ],
+)
+async def test_mcp_startup_retry_budget_and_nonretryable_errors(method, error, max_retries):
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+        retry_policy=RetryPolicy(max_retries=max_retries, backoff_base_s=0.001, jitter=False),
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    if method == "turn/start":
+        session.thread_id = "existing-thread"
+    calls = []
+
+    async def respond(payload):
+        calls.append(payload)
+        assert payload["method"] == method
+        session._pending_requests[payload["id"]].set_result({"error": error})
+
+    session._send_message = AsyncMock(side_effect=respond)
+    with pytest.raises(RuntimeError) as raised:
+        _ = [
+            event
+            async for event in session.run_turn(
+                messages=[{"role": "user", "content": "keep this request"}],
+                tools=[],
+                system_prompt="",
+                model=None,
+                cwd="/tmp/workspace",
+                sandbox="workspace-write",
+            )
+        ]
+    expected_attempts = (
+        max_retries + 1
+        if method == "thread/start" and error == {"code": -32603, "message": _MCP_STARTUP_TIMEOUT}
+        else 1
+    )
+    assert len(calls) == expected_attempts
+    assert isinstance(raised.value, CodexAppServerResponseError)
+    assert raised.value.error == error
+    assert str(raised.value) == str(error)
+    assert not session._pending_requests
+    assert session.active_turn_id is None
+
+
+async def test_mcp_startup_retry_stops_on_cancelled_backoff():
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+    )
+    error = CodexAppServerResponseError({"code": -32603, "message": _MCP_STARTUP_TIMEOUT})
+    session._request = AsyncMock(side_effect=error)
+    backing_off = asyncio.Event()
+
+    def delay(retry_index):
+        backing_off.set()
+        return 60.0
+
+    with patch.object(RetryPolicy, "compute_backoff_delay", side_effect=delay):
+        startup = asyncio.create_task(session._start_thread({"cwd": "/tmp/workspace"}))
+        await backing_off.wait()
+        startup.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await startup
+    assert session._request.await_count == 1
+    assert session.thread_id is None
+
+
+@pytest.mark.parametrize("error", [BrokenPipeError("closed"), ConnectionResetError("closed")])
+async def test_mcp_startup_does_not_retry_uncertain_transport_failures(error):
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+    )
+    session._request = AsyncMock(side_effect=error)
+    with pytest.raises(type(error)) as raised:
+        await session._start_thread({"cwd": "/tmp/workspace"})
+    assert raised.value is error
+    assert session._request.await_count == 1
 
 
 class TestCodexExecutor(unittest.TestCase):
