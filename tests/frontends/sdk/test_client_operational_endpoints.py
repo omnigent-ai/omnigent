@@ -14,8 +14,7 @@ import httpx
 import pytest
 from omnigent_client._client import OmnigentClient
 from omnigent_client._errors import OmnigentError
-
-from omnigent.server.schemas import UsageReport
+from omnigent_client.wire import UsageReport
 
 
 def _mock_client(

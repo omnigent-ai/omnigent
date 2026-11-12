@@ -3639,15 +3639,13 @@ version = "0.22.0.dev0"
 source = { editable = "sdks/python-client" }
 dependencies = [
     { name = "httpx" },
-    { name = "omnigent" },
     { name = "pydantic" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
-    { name = "omnigent", editable = "." },
-    { name = "pydantic", specifier = ">=2.0,<3" },
+    { name = "pydantic", specifier = ">=2.12,<3" },
 ]
 
 [[package]]

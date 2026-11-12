@@ -8,9 +8,6 @@ from typing import Any, Literal, overload
 import httpx
 from pydantic import ValidationError
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
-from omnigent.server.schemas import UsageReport
-
 from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
 from ._files import FilesNamespace
 from ._http import is_loopback_url, session_url
@@ -20,6 +17,7 @@ from ._session import Session
 from ._sessions import SessionsNamespace
 from ._sessions_chat import SessionsChat, ToolCallable
 from ._tool_handler import StreamHooks, ToolHandler
+from .wire import OMNIGENT_INTERNAL_WS_ORIGIN, UsageReport
 
 
 def _port_or_default(url: httpx.URL) -> int | None:
@@ -362,7 +360,7 @@ class OmnigentClient:
         Fetch the calling user's aggregated LLM spend.
 
         Calls ``GET /v1/usage`` and validates the body into
-        :class:`omnigent.server.schemas.UsageReport`: UTC calendar-day
+        :class:`omnigent_client.wire.UsageReport`: UTC calendar-day
         windows (``cost_today``, ``cost_last_7d``, ``cost_last_30d``),
         the all-time ``total_cost_usd``, the ``daily_costs`` timeline
         and per-session ``sessions`` detail.

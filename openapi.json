@@ -1822,7 +1822,7 @@
         "type": "object"
       },
       "CompletedEvent": {
-        "description": "Terminal event for a successfully completed turn.\n\nCarries the final\n`omnigent.server.schemas.ResponseObject`.",
+        "description": "Terminal event for a successfully completed turn.\n\nCarries the final\n`ResponseObject`.",
         "properties": {
           "response": {
             "$ref": "#/components/schemas/ResponseObject",
@@ -2301,7 +2301,7 @@
         "type": "object"
       },
       "CreatedEvent": {
-        "description": "Initial event emitted at the start of every streaming response.\n\nCarries the freshly-allocated\n`omnigent.server.schemas.ResponseObject` (status will\nbe `\"queued\"` or `\"in_progress\"` depending on whether the\ntask started immediately).",
+        "description": "Initial event emitted at the start of every streaming response.\n\nCarries the freshly-allocated\n`ResponseObject` (status will\nbe `\"queued\"` or `\"in_progress\"` depending on whether the\ntask started immediately).",
         "properties": {
           "response": {
             "$ref": "#/components/schemas/ResponseObject",
@@ -3126,7 +3126,7 @@
         "type": "object"
       },
       "FailedEvent": {
-        "description": "Terminal event for a turn that ended with an error.\n\nCarries a `omnigent.server.schemas.FailedResponseObject`\nwhose `error` field describes the failure. Response metadata may\nbe absent when the failure occurs before response allocation.",
+        "description": "Terminal event for a turn that ended with an error.\n\nCarries a `FailedResponseObject`\nwhose `error` field describes the failure. Response metadata may\nbe absent when the failure occurs before response allocation.",
         "properties": {
           "response": {
             "anyOf": [
@@ -11210,7 +11210,7 @@
               }
             ],
             "default": null,
-            "description": "Sandbox provider being launched, e.g. `\"arclet\"`, or `None` when unknown.",
+            "description": "Sandbox provider being launched, e.g. `\"modal\"`, or `None` when unknown.",
             "title": "Provider"
           },
           "sequence_number": {
@@ -11845,7 +11845,7 @@
         "type": "object"
       },
       "SessionUsage": {
-        "description": "One session's rolled-up LLM spend for the `GET /v1/usage` report.\n\n`cost_usd` is the subtree total \u2014 the session plus every sub-agent it\nspawned \u2014 read from `session_usage` via\n`omnigent.runtime.policies.builder.load_session_usage`. It is the\nauthoritative session figure (the same value the web session sidebar\nshows as \"Session cost\" and the daily rollup records).\n\n`models` is the per-model cost breakdown, mirroring the web session\nsidebar's per-model list. Deliberately **not guaranteed to sum to\n`cost_usd`**: native harnesses report a single cumulative session\ntotal and the server attributes it to the currently-active model, so on\na session that switched models mid-run each model's bucket is a snapshot\nof the running total rather than that model's own spend. The header\n`cost_usd` stays authoritative; the per-model values are shown\nfaithfully as recorded (same convention as the web UI).",
+        "description": "One session's rolled-up LLM spend for the `GET /v1/usage` report.\n\n`cost_usd` is the subtree total \u2014 the session plus every sub-agent it\nspawned. It is the authoritative session figure (the same value the web\nsession sidebar shows as \"Session cost\" and the daily rollup records).\n\n`models` is the per-model cost breakdown, mirroring the web session\nsidebar's per-model list. Deliberately **not guaranteed to sum to\n`cost_usd`**: native harnesses report a single cumulative session\ntotal and the server attributes it to the currently-active model, so on\na session that switched models mid-run each model's bucket is a snapshot\nof the running total rather than that model's own spend. The header\n`cost_usd` stays authoritative; the per-model values are shown\nfaithfully as recorded (same convention as the web UI).",
         "properties": {
           "agent_name": {
             "anyOf": [
