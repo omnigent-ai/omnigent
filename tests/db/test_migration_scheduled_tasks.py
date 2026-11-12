@@ -186,10 +186,11 @@ def test_no_foreign_keys(db_engine: Engine) -> None:
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_scheduled_task_shares_columns(db_engine: Engine) -> None:
-    """``scheduled_task_shares`` has the expected columns, all NOT NULL."""
+    """``scheduled_task_shares`` has the expected columns, all NOT NULL with no DB default."""
     columns = {c["name"]: c for c in sa.inspect(db_engine).get_columns("scheduled_task_shares")}
     assert set(columns) == {"workspace_id", "scheduled_task_id", "user_id", "level"}
     assert all(column["nullable"] is False for column in columns.values())
+    assert all(column["default"] is None for column in columns.values())
     assert columns["user_id"]["type"].length == 128
     assert "INT" in str(columns["level"]["type"]).upper()
 

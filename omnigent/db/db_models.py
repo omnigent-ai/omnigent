@@ -1803,11 +1803,11 @@ class SqlScheduledTaskShare(OmnigentBase):
     __tablename__ = "scheduled_task_shares"
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    # No database default; the ORM always supplies it.
     workspace_id: Mapped[int] = mapped_column(
         BigInteger,
         primary_key=True,
         nullable=False,
-        server_default="0",
         default=current_workspace_id,
     )
     scheduled_task_id: Mapped[str] = mapped_column(Uuid16, primary_key=True, nullable=False)

@@ -53,7 +53,7 @@ def upgrade() -> None:
         ]
     op.create_table(
         "scheduled_task_shares",
-        sa.Column("workspace_id", sa.BigInteger(), nullable=False, server_default="0"),
+        sa.Column("workspace_id", sa.BigInteger(), nullable=False),
         # UUID stored as 16 raw bytes (Uuid16), read back as bare hex.
         sa.Column("scheduled_task_id", Uuid16(), nullable=False),
         # String(128) matches session_permissions.user_id; a user or group ID.
