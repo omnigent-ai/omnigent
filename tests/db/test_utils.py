@@ -1226,6 +1226,35 @@ def test_shared_read_scope_cleans_up_on_error(
         assert session.get(SqlUser, (0, "scope_failure")) is None
 
 
+def test_shared_read_scope_closes_every_session_when_one_close_fails(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing close must not leak the other engines' connections or the
+    scope's context var."""
+    from sqlalchemy.exc import OperationalError
+
+    engine_a = get_or_create_engine(db_uri)
+    engine_b = get_or_create_engine(f"sqlite:///{tmp_path / 'other.db'}")
+    maker_a = make_managed_session_maker(engine_a)
+    maker_b = make_managed_session_maker(engine_b)
+    failing_error = engine_a.dialect.loaded_dbapi.OperationalError
+
+    def _fail_rollback(_dbapi_connection: Any) -> None:
+        raise failing_error("simulated rollback failure")
+
+    with pytest.raises(OperationalError, match="simulated rollback failure"):
+        with shared_read_scope():
+            with maker_a() as session:
+                session.execute(text("SELECT 1"))
+            with maker_b() as session:
+                session.execute(text("SELECT 1"))
+            monkeypatch.setattr(engine_a.dialect, "do_rollback", _fail_rollback)
+
+    assert _shared_read_sessions.get() is None
+    assert engine_a.pool.checkedout() == 0
+    assert engine_b.pool.checkedout() == 0
+
+
 def test_shared_read_scope_nesting_reuses_outer(db_uri: str) -> None:
     """A nested scope defers to the outer one rather than opening a second layer."""
     engine = get_or_create_engine(db_uri)

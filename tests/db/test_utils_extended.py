@@ -22,13 +22,15 @@ from typing import Any
 
 import pytest
 from sqlalchemy import Engine, event, insert, inspect, select, text
+from sqlalchemy import create_engine as create_plain_engine
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.exc import DBAPIError, OperationalError
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
-from omnigent.db.db_models import SqlUser
+from omnigent.db.db_models import OmnigentBase, SqlUser
 from omnigent.db.query_context import current_query_name, query_name_scope
 from omnigent.db.utils import (
     _ITEM_TYPES,
@@ -269,6 +271,11 @@ def _write_with_cte(session: Session, user_id: str) -> None:
     )
 
 
+def _write_in_savepoint(session: Session, user_id: str) -> None:
+    with session.begin_nested():
+        session.add(SqlUser(id=user_id, is_admin=False))
+
+
 _WRITE_PATHS: dict[str, Callable[[Session, str], object]] = {
     "orm_add_pending": lambda session, user_id: session.add(SqlUser(id=user_id, is_admin=False)),
     "orm_add_flushed": lambda session, user_id: (
@@ -289,6 +296,15 @@ _WRITE_PATHS: dict[str, Callable[[Session, str], object]] = {
         _upsert_user(session.get_bind().dialect.name, user_id)
     ),
     "cte_insert": _write_with_cte,
+    "begin_nested_add": _write_in_savepoint,
+    "merge": lambda session, user_id: session.merge(SqlUser(id=user_id, is_admin=False)),
+    "executemany_insert": lambda session, user_id: session.execute(
+        insert(SqlUser),
+        [
+            {"id": user_id, "is_admin": False},
+            {"id": f"{user_id}_second", "is_admin": False},
+        ],
+    ),
 }
 
 
@@ -439,6 +455,98 @@ class TestSingleTransactionTerminator:
         assert engine.pool.checkedout() == 0
         assert other_engine.pool.checkedout() == 0
 
+    def test_dirty_object_update_commits(
+        self, db_uri: str, record_terminators: Callable[[Engine], list[str]]
+    ) -> None:
+        engine = get_or_create_engine(db_uri)
+        managed = make_managed_session_maker(engine)
+        with managed() as session:
+            session.add(SqlUser(id="dirty_user", is_admin=False))
+        terminators = record_terminators(engine)
+
+        with managed() as session:
+            user = session.get(SqlUser, (0, "dirty_user"))
+            assert user is not None
+            user.is_admin = True
+
+        assert terminators == ["COMMIT", "ROLLBACK"]
+        with managed() as session:
+            reloaded = session.get(SqlUser, (0, "dirty_user"))
+        assert reloaded is not None
+        assert reloaded.is_admin is True
+
+    def test_delete_commits(
+        self, db_uri: str, record_terminators: Callable[[Engine], list[str]]
+    ) -> None:
+        engine = get_or_create_engine(db_uri)
+        managed = make_managed_session_maker(engine)
+        with managed() as session:
+            session.add(SqlUser(id="deleted_user", is_admin=False))
+        terminators = record_terminators(engine)
+
+        with managed() as session:
+            user = session.get(SqlUser, (0, "deleted_user"))
+            session.delete(user)
+
+        assert terminators == ["COMMIT", "ROLLBACK"]
+        assert "deleted_user" not in _user_ids(db_uri)
+
+    def test_write_after_an_explicit_mid_block_commit_commits(
+        self, db_uri: str, record_terminators: Callable[[Engine], list[str]]
+    ) -> None:
+        engine = get_or_create_engine(db_uri)
+        managed = make_managed_session_maker(engine)
+        terminators = record_terminators(engine)
+
+        with managed() as session:
+            session.add(SqlUser(id="before_mid_commit", is_admin=False))
+            session.commit()
+            session.add(SqlUser(id="after_mid_commit", is_admin=False))
+
+        assert terminators == ["COMMIT", "COMMIT", "ROLLBACK"]
+        assert {"before_mid_commit", "after_mid_commit"} <= _user_ids(db_uri)
+
+    def test_flush_failure_at_exit_rolls_back_and_returns_the_connection(
+        self, db_uri: str, record_terminators: Callable[[Engine], list[str]]
+    ) -> None:
+        engine = get_or_create_engine(db_uri)
+        managed = make_managed_session_maker(engine)
+        with managed() as session:
+            session.add(SqlUser(id="duplicate_user", is_admin=False))
+        terminators = record_terminators(engine)
+
+        with pytest.raises(IntegrityError):
+            with managed() as session:
+                session.add(SqlUser(id="unflushed_user", is_admin=False))
+                session.add(SqlUser(id="duplicate_user", is_admin=True))
+
+        assert "COMMIT" not in terminators
+        assert terminators[-1] == "ROLLBACK"
+        assert engine.pool.checkedout() == 0
+        assert "unflushed_user" not in _user_ids(db_uri)
+
+    def test_nested_sessions_on_a_shared_connection_pool_keep_outer_writes(self) -> None:
+        # StaticPool hands every checkout the same DBAPI connection, so the
+        # inner session shares the outer transaction.
+        engine = create_plain_engine(
+            "sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False}
+        )
+        try:
+            OmnigentBase.metadata.create_all(engine, tables=[SqlUser.__table__])
+            managed = make_managed_session_maker(engine)
+
+            with managed() as outer:
+                outer.add(SqlUser(id="outer_write", is_admin=False))
+                outer.flush()
+                with managed() as inner:
+                    inner.execute(select(SqlUser.id)).all()
+
+            with engine.connect() as connection:
+                persisted = set(connection.execute(select(SqlUser.id)).scalars())
+            assert "outer_write" in persisted
+        finally:
+            engine.dispose()
+
     def test_ddl_commits(
         self, db_uri: str, record_terminators: Callable[[Engine], list[str]]
     ) -> None:
@@ -557,6 +665,35 @@ class TestPooledConnectionReuse:
         user_ids = _user_ids(db_uri)
         assert "after_skipped_rollback" in user_ids
         assert "rollback_skipped" not in user_ids
+
+    def test_failed_rollback_on_close_returns_the_connection(
+        self,
+        db_uri: str,
+        pooled_engine: tuple[Engine, list[int]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        engine, _ = pooled_engine
+        managed = make_managed_session_maker(engine)
+        real_rollback = engine.dialect.do_rollback
+        failures = [engine.dialect.loaded_dbapi.OperationalError("simulated rollback failure")]
+
+        def _fail_first_rollback(dbapi_connection: Any) -> None:
+            if failures:
+                raise failures.pop()
+            real_rollback(dbapi_connection)
+
+        monkeypatch.setattr(engine.dialect, "do_rollback", _fail_first_rollback)
+        with pytest.raises(OperationalError, match="simulated rollback failure"):
+            with managed() as session:
+                session.execute(insert(SqlUser).values(id="rollback_failed", is_admin=False))
+                raise ValueError("abandon the write")
+
+        assert engine.pool.checkedout() == 0
+        with managed() as session:
+            session.add(SqlUser(id="after_failed_rollback", is_admin=False))
+        user_ids = _user_ids(db_uri)
+        assert "after_failed_rollback" in user_ids
+        assert "rollback_failed" not in user_ids
 
     def test_failed_commit_is_rolled_back_on_return(
         self,

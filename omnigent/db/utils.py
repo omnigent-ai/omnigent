@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from alembic.config import Config
     from sqlalchemy.engine.interfaces import DBAPICursor, ExecutionContext
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import SingletonThreadPool, StaticPool
 
 from omnigent.db.cockroachdb import (
     _crdb_server_version,
@@ -856,7 +857,10 @@ def clear_engine_cache() -> None:
 # session ends with one ROLLBACK: closing that Connection while its
 # transaction is still active rolls it back and tells the pool the
 # transaction was already reset. Sessions that may have written COMMIT; the
-# pool then still issues its usual rollback-on-return.
+# pool then still issues its usual rollback-on-return. Pools that hand every
+# checkout the same DBAPI connection (StaticPool, SingletonThreadPool) keep the
+# always-COMMIT behaviour: a nested session there shares the outer
+# transaction, so rolling it back would discard the outer session's writes.
 
 # Connection-record ``info`` key, reset at every transaction begin.
 _TRANSACTION_WROTE_KEY = "omnigent.transaction_wrote"
@@ -876,11 +880,20 @@ _WRITE_SQL_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+# Longer statements (expanded IN lists, multi-row inserts) are classified
+# without caching so the cache cannot retain large SQL strings.
+_MAX_CACHED_STATEMENT_LENGTH = 2048
+
 _write_tracking_lock = threading.Lock()
 
 
-@functools.lru_cache(maxsize=4096)
 def _is_read_only_statement(statement: str) -> bool:
+    if len(statement) > _MAX_CACHED_STATEMENT_LENGTH:
+        return _classify_read_only_statement(statement)
+    return _cached_read_only_statement(statement)
+
+
+def _classify_read_only_statement(statement: str) -> bool:
     """Return whether ``statement`` is certainly read-only.
 
     Deliberately conservative: anything not recognised as a plain read counts
@@ -894,6 +907,9 @@ def _is_read_only_statement(statement: str) -> bool:
     if keyword is None or keyword.group().lower() not in _READ_ONLY_LEADING_KEYWORDS:
         return False
     return _WRITE_SQL_KEYWORDS.search(body) is None
+
+
+_cached_read_only_statement = functools.lru_cache(maxsize=4096)(_classify_read_only_statement)
 
 
 def _reset_transaction_wrote(connection: Connection) -> None:
@@ -911,8 +927,18 @@ def _record_transaction_write(
     info = connection.info
     if info.get(_TRANSACTION_WROTE_KEY):
         return
-    if context is not None and context.execution_options.get(_SESSION_SETUP_OPTION):
-        return
+    if context is not None:
+        if context.execution_options.get(_SESSION_SETUP_OPTION):
+            return
+        # ``isdelete``/``isddl`` live on the default execution context only.
+        if (
+            context.isinsert
+            or context.isupdate
+            or getattr(context, "isdelete", False)
+            or getattr(context, "isddl", False)
+        ):
+            info[_TRANSACTION_WROTE_KEY] = True
+            return
     if not _is_read_only_statement(statement):
         info[_TRANSACTION_WROTE_KEY] = True
 
@@ -960,46 +986,48 @@ def _session_may_have_written(session: Session, connection: Connection) -> bool:
     return bool(connection.info.get(_TRANSACTION_WROTE_KEY, True))
 
 
-def _managed_connection(session: Session) -> Connection:
-    connection = session.bind
-    if not isinstance(connection, Connection):
-        raise TypeError("managed sessions must be bound to a Connection")
-    return connection
-
-
-def _open_managed_session(
-    factory: sessionmaker[_ConnectionBoundSession], engine: Engine
-) -> Session:
-    connection = engine.connect()
-    try:
-        return factory(bind=connection)
-    except BaseException:
-        connection.close()
-        raise
-
-
 def _end_session_transaction(session: Session) -> None:
     """Commit ``session`` if it may have written; otherwise leave it for close.
 
     A read-only transaction stays open so :func:`_close_managed_session` ends
-    it with the single ROLLBACK issued by closing its Connection.
+    it with the single ROLLBACK issued by closing its Connection. Sessions on
+    a shared-connection pool (bound to the Engine) always COMMIT.
     """
+    connection = session.bind
+    if not isinstance(connection, Connection):
+        session.commit()
+        return
     session.flush()
-    if _session_may_have_written(session, _managed_connection(session)):
+    if _session_may_have_written(session, connection):
         session.commit()
 
 
 def _close_managed_session(session: Session) -> None:
     """Close the Connection first, then the Session; never leak the checkout."""
     try:
-        connection = _managed_connection(session)
+        connection = session.bind
+        if isinstance(connection, Connection):
+            _close_managed_connection(connection)
+    finally:
+        session.close()
+
+
+def _close_managed_connection(connection: Connection) -> None:
+    try:
         if connection.get_transaction() is not None and not connection.in_transaction():
             # A failed COMMIT leaves an inactive transaction behind; closing over
             # it would skip the pool's rollback-on-return with work still open.
             connection.rollback()
         connection.close()
-    finally:
-        session.close()
+    except BaseException:
+        # A failed ROLLBACK leaves the connection checked out; invalidating
+        # returns its pool slot and discards the possibly-open transaction.
+        if not connection.invalidated:
+            try:
+                connection.invalidate()
+            except Exception:
+                _logger.warning("could not invalidate a managed connection", exc_info=True)
+        raise
 
 
 def _configure_sqlite_session(session: Session) -> None:
@@ -1048,10 +1076,14 @@ def shared_read_scope() -> Iterator[None]:
         for session in sessions.values():
             _end_session_transaction(session)
     finally:
-        # Closing each Connection rolls back whatever is still open.
-        for session in sessions.values():
-            _close_managed_session(session)
-        _shared_read_sessions.reset(token)
+        try:
+            # Closing each Connection rolls back whatever is still open.
+            # ExitStack runs every close even if an earlier one raises.
+            with ExitStack() as cleanup:
+                for session in sessions.values():
+                    cleanup.callback(_close_managed_session, session)
+        finally:
+            _shared_read_sessions.reset(token)
 
 
 def make_managed_session_maker(
@@ -1070,7 +1102,9 @@ def make_managed_session_maker(
     back and the pool skips its own reset. Raw DBAPI cursor writes and
     SELECTs with transactional side effects count as reads and are rolled
     back. The session is confined to that Connection: passing another bind
-    raises.
+    raises. Engines whose pool shares one DBAPI connection (StaticPool,
+    SingletonThreadPool) keep sessions bound to the Engine and always COMMIT,
+    so a nested session cannot roll back an outer session's writes.
     When the underlying dialect is SQLite, each session additionally
     enables ``PRAGMA foreign_keys`` and sets a 20-second
     ``busy_timeout``.
@@ -1090,9 +1124,24 @@ def make_managed_session_maker(
     # DetachedInstanceError. This is safe here because each managed session
     # is short-lived and single-writer, so there is no cross-session stale
     # data concern.
-    factory = sessionmaker(class_=_ConnectionBoundSession, expire_on_commit=False)
-    _install_write_tracking(engine)
     is_sqlite = engine.dialect.name == "sqlite"
+    if isinstance(engine.pool, (StaticPool, SingletonThreadPool)):
+        engine_factory = sessionmaker(bind=engine, expire_on_commit=False)
+
+        def open_session() -> Session:
+            return engine_factory()
+
+    else:
+        _install_write_tracking(engine)
+        connection_factory = sessionmaker(class_=_ConnectionBoundSession, expire_on_commit=False)
+
+        def open_session() -> Session:
+            connection = engine.connect()
+            try:
+                return connection_factory(bind=connection)
+            except BaseException:
+                connection.close()
+                raise
 
     @contextmanager
     def managed_session() -> Iterator[Session]:
@@ -1113,7 +1162,7 @@ def make_managed_session_maker(
                 key = id(engine)
                 session = shared.get(key)
                 if session is None:
-                    session = _open_managed_session(factory, engine)
+                    session = open_session()
                     # Register before the PRAGMAs so that, if one raises, the
                     # scope still closes the checked-out connection.
                     shared[key] = session
@@ -1121,7 +1170,7 @@ def make_managed_session_maker(
                         _configure_sqlite_session(session)
                 yield session
                 return
-        session = _open_managed_session(factory, engine)
+        session = open_session()
         try:
             if is_sqlite:
                 # PRAGMAs must run before BEGIN IMMEDIATE: foreign_keys is
