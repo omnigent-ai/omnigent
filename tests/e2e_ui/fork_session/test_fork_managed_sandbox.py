@@ -176,7 +176,7 @@ def test_fork_onto_managed_sandbox_with_no_host_online(
         forwarded = {
             key: value
             for key, value in body.items()
-            if key not in {"host_type", "sandbox_provider", "workspace", "workspaces"}
+            if key not in {"host_type", "host_id", "sandbox_provider", "workspace", "workspaces"}
         }
         response = route.fetch(post_data=json.dumps(forwarded))
         route.fulfill(response=response)
@@ -245,5 +245,7 @@ def test_fork_onto_managed_sandbox_with_no_host_online(
     assert body["host_type"] == "managed", body
     assert body["sandbox_provider"] == "modal", body
     assert body["workspaces"] == [_SOURCE_REPO], body
+    # The client names the sandbox host so its tunnel and requests share a key.
+    assert re.fullmatch(r"[0-9a-f]{32}", body["host_id"]), body
     # The server provisions the host, so the dialog must not also bind one.
     assert runner_launches == [], runner_launches
