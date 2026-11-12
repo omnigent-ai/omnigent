@@ -63,6 +63,9 @@ _HELD_POLL_SEVER_ERRORS = (httpx.RemoteProtocolError, httpx.ReadError)
 # ``PostToolUse`` fires after (observational — can only warn).
 _PRE_TOOL_USE = "PreToolUse"
 _POST_TOOL_USE = "PostToolUse"
+# Claude Code fires this instead of ``PostToolUse`` when the tool fails
+# (e.g. Bash exiting non-zero).
+_POST_TOOL_USE_FAILURE = "PostToolUseFailure"
 # ``UserPromptSubmit`` fires when a new user prompt reaches the harness —
 # for native sessions this is the request-phase gate (the server-level
 # ``_evaluate_input_policy`` is bypassed for native message events, so
@@ -294,13 +297,15 @@ def hook_payload_to_evaluation_request(
     Convert a native-harness tool-hook payload into a proto ``EvaluationRequest``.
 
     Maps ``PreToolUse`` to a ``PHASE_TOOL_CALL`` event, ``PostToolUse``
-    to a ``PHASE_TOOL_RESULT`` event, and ``UserPromptSubmit`` to a
-    ``PHASE_REQUEST`` event (the prompt text from the payload's
-    ``prompt`` field becomes the request content). Omnigent MCP tools
-    (``mcp__omnigent__*``) are skipped because they are already
-    policy-checked by the relay path (``ProxyMcpManager`` → Omnigent
-    ``/mcp`` endpoint → ``_evaluate_tool_call_policy``); evaluating
-    them here would double-count. Connector-native MCP tools
+    and ``PostToolUseFailure`` to a ``PHASE_TOOL_RESULT`` event, and
+    ``UserPromptSubmit`` to a ``PHASE_REQUEST`` event (the prompt text
+    from the payload's ``prompt`` field becomes the request content). A
+    failure's ``error`` text becomes the result ``{"error": ...}`` so
+    result policies such as ``detect_thrashing`` see a failed call.
+    Omnigent MCP tools (``mcp__omnigent__*``) are skipped because they
+    are already policy-checked by the relay path (``ProxyMcpManager`` →
+    Omnigent ``/mcp`` endpoint → ``_evaluate_tool_call_policy``);
+    evaluating them here would double-count. Connector-native MCP tools
     (for example ``mcp__github__*``) still need this pre-call gate.
 
     :param hook_event: Hook event name from the payload's
@@ -347,8 +352,11 @@ def hook_payload_to_evaluation_request(
                 "context": {},
             },
         }
-    if hook_event == _POST_TOOL_USE:
-        tool_output = payload.get("tool_response", payload.get("tool_output", ""))
+    if hook_event in (_POST_TOOL_USE, _POST_TOOL_USE_FAILURE):
+        if hook_event == _POST_TOOL_USE_FAILURE:
+            tool_output: object = {"error": payload.get("error", "")}
+        else:
+            tool_output = payload.get("tool_response", payload.get("tool_output", ""))
         return {
             "event": {
                 "type": "PHASE_TOOL_RESULT",
@@ -392,9 +400,9 @@ def evaluation_response_to_hook_output(
     to the web UI), collapsing two independent gates — the deployment's
     policy gate and the user's own consent gate — into one. The policy
     layer may block (DENY) or demand approval (ASK); it must not silence
-    the user's consent. For ``PostToolUse`` a ``DENY`` is surfaced as
-    ``additionalContext`` because the tool result is already committed
-    — PostToolUse hooks cannot block.
+    the user's consent. For ``PostToolUse`` and ``PostToolUseFailure``
+    a ``DENY`` is surfaced as ``additionalContext`` because the tool
+    result is already committed — these hooks cannot block.
 
     For ``UserPromptSubmit`` the output uses the top-level ``decision`` /
     ``reason`` contract (not ``permissionDecision``): ``DENY`` → ``{"decision":
@@ -458,11 +466,11 @@ def evaluation_response_to_hook_output(
             output["permissionDecisionReason"] = reason
         return {"hookSpecificOutput": output}
 
-    if hook_event == _POST_TOOL_USE:
+    if hook_event in (_POST_TOOL_USE, _POST_TOOL_USE_FAILURE):
         if action == "POLICY_ACTION_DENY" and reason:
             return {
                 "hookSpecificOutput": {
-                    "hookEventName": _POST_TOOL_USE,
+                    "hookEventName": hook_event,
                     "additionalContext": f"[Policy violation] {reason}",
                 },
             }
@@ -499,9 +507,9 @@ def fail_closed_hook_output(
       ``{"decision": "block", ...}``. This is the sole pre-turn enforcement
       point for native sessions; a server hiccup must not let an over-budget
       or otherwise-blocked request proceed.
-    - ``PostToolUse`` (``PHASE_TOOL_RESULT``) fails OPEN → ``None``. By the
-      result phase the tool has already executed, so denying would only block
-      an already-incurred side effect.
+    - ``PostToolUse`` / ``PostToolUseFailure`` (``PHASE_TOOL_RESULT``) fail
+      OPEN → ``None``. By the result phase the tool has already executed, so
+      denying would only block an already-incurred side effect.
 
     :param hook_event: Hook event name, e.g. ``"PreToolUse"``.
     :param detail: Optional short diagnostic string appended to the reason
