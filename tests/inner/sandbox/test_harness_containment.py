@@ -147,6 +147,7 @@ def test_requested_sandbox_never_falls_back_to_bare_worker(
         resolve.assert_called_once()
 
 
+# Goose/Qwen's executor scenarios already cover absent and explicit-none policies.
 @pytest.mark.parametrize("harness", [name for name in _HARNESSES if name not in ("goose", "qwen")])
 @pytest.mark.parametrize("declared", [False, True])
 def test_unsandboxed_worker_requires_no_policy_or_explicit_none(
@@ -160,6 +161,46 @@ def test_unsandboxed_worker_requires_no_policy_or_explicit_none(
     workspace.mkdir()
     with _prepared_launch(harness, executable, workspace, spec) as path:
         assert path == str(executable)
+
+
+@pytest.mark.parametrize("harness", [name for name in _HARNESSES if name != "claude-sdk"])
+@pytest.mark.parametrize("declared_cwd", ["./sub", "sub"])
+def test_relative_policy_cwd_preserves_non_claude_workspace(
+    harness: str,
+    declared_cwd: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    active_sandbox_type: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    (workspace / "sub").mkdir(parents=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    executable = tmp_path / "install" / "bin" / "agent"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\npwd\n")
+    executable.chmod(0o755)
+    spec = OSEnvSpec(
+        cwd=declared_cwd,
+        sandbox=OSEnvSandboxSpec(
+            type=active_sandbox_type,
+            read_paths=["."],
+            write_paths=[],
+            allow_network=False,
+        ),
+    )
+    with _prepared_launch(harness, executable, workspace, spec) as launch_path:
+        result = subprocess.run(
+            [launch_path],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env={"PATH": os.environ["PATH"], "HOME": str(home)},
+        )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(workspace.resolve())
 
 
 @pytest.mark.parametrize(
@@ -197,15 +238,26 @@ def test_harness_without_egress_broker_rejects_egress_rules(harness: str, tmp_pa
 
 
 @pytest.mark.parametrize("harness", ["copilot", "cursor", "hermes"])
+@pytest.mark.parametrize("sandbox_type", ["linux_bwrap", "none"])
 def test_harness_without_process_sandbox_rejects_requested_confinement(
-    harness: str, tmp_path: Path
+    harness: str, sandbox_type: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from omnigent.inner.copilot_executor import CopilotExecutor
     from omnigent.inner.cursor_executor import CursorExecutor
     from omnigent.inner.hermes_executor import HermesExecutor
 
-    constructors = {"copilot": CopilotExecutor, "cursor": CursorExecutor, "hermes": HermesExecutor}
-    spec = OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
+    monkeypatch.setattr(HermesExecutor, "_setup_hermes_home", lambda self: None)
+    constructors = {
+        "copilot": lambda **kwargs: CopilotExecutor(
+            github_token="test-token", github_host="github.example.test", **kwargs
+        ),
+        "cursor": CursorExecutor,
+        "hermes": HermesExecutor,
+    }
+    spec = OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type=sandbox_type))
+    if sandbox_type == "none":
+        assert constructors[harness](os_env=spec, cwd=str(tmp_path))._cwd == str(tmp_path)
+        return
     with pytest.raises(ValueError, match="cannot enforce"):
         constructors[harness](os_env=spec)
 

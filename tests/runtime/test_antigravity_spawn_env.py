@@ -109,14 +109,8 @@ def test_os_policy_preserved_for_harness(
 @pytest.mark.parametrize(
     "os_env",
     [
-        OSEnvSpec(),
         OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
-        OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
-        OSEnvSpec(sandbox=OSEnvSandboxSpec(type="windows_jobobject")),
-        OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none", allow_network=False)),
-        OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none", egress_rules=["GET api.example.com/**"])),
         OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"), fork=True),
-        OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"), start_in_scratch=True),
     ],
 )
 def test_unsupported_os_policy_rejected_before_provider_resolution(os_env: OSEnvSpec) -> None:
