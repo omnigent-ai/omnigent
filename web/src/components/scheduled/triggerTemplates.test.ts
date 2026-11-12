@@ -58,7 +58,23 @@ const SOURCE_MODES = TRIGGER_SOURCES.flatMap((source) =>
   (["new", "continue"] as const).map((taskSessionMode) => ({ source, taskSessionMode })),
 );
 
+/** Workers on the polling session's agent with its defaults. */
+const AGENT_DEFAULT_WORKERS = { agentId: null, model: "", effort: "", permissionMode: "" };
+
 describe("saved trigger prompts", () => {
+  it("passes the workers' permission mode to sys_session_create and reads it back", () => {
+    const prompt = renderTriggerPrompt("jira", fields(), {
+      ...CTX,
+      effort: "high",
+      permissionMode: "approve-for-me",
+    });
+    expect(prompt).toContain(
+      'title "Jira <ticket key>", reasoning_effort "high", permission_mode "approve-for-me", and a message under 8000 characters.',
+    );
+    expect(readTriggerWorkerSettings(prompt)?.permissionMode).toBe("approve-for-me");
+    expect(renderTriggerPrompt("jira", fields(), CTX)).not.toContain("permission_mode");
+  });
+
   it.each(SOURCE_MODES)(
     "edits $source worker settings in $taskSessionMode mode without changing authored instructions",
     ({ source, taskSessionMode }) => {
@@ -73,8 +89,14 @@ describe("saved trigger prompts", () => {
         agentId: null,
         model: "old-model",
         effort: "high",
+        permissionMode: "",
       });
-      const settings = { agentId: "worker-agent", model: 'model-with-"quotes"', effort: "low" };
+      const settings = {
+        agentId: "worker-agent",
+        model: 'model-with-"quotes"',
+        effort: "low",
+        permissionMode: "approve-for-me",
+      };
       const updated = updateTriggerWorkerSettings(original, settings)!;
       expect(readTriggerWorkerSettings(updated)).toEqual(settings);
       expect(updated).toContain(
@@ -82,7 +104,9 @@ describe("saved trigger prompts", () => {
           ? 'agent_id "worker-agent", placement "same_host", title "Triage \\"orchestrator\\""'
           : 'agent_id "worker-agent", placement "same_host"',
       );
-      expect(updated).toContain('model "model-with-\\"quotes\\"", reasoning_effort "low"');
+      expect(updated).toContain(
+        'model "model-with-\\"quotes\\"", reasoning_effort "low", permission_mode "approve-for-me", and a message',
+      );
       expect(updated).toContain("Keep this custom instruction.");
       const context = { ...CTX, taskSessionMode };
       expect(renderTriggerPrompt(source, fields(), { ...context, ...settings })).toBe(
@@ -90,15 +114,17 @@ describe("saved trigger prompts", () => {
       );
       expect(splitTriggerPrompt(updated).userPrompt).toBe(splitTriggerPrompt(original).userPrompt);
       expect(
-        updateTriggerWorkerSettings(updated, { agentId: null, model: "old-model", effort: "high" }),
+        updateTriggerWorkerSettings(updated, {
+          agentId: null,
+          model: "old-model",
+          effort: "high",
+          permissionMode: "",
+        }),
       ).toBe(original);
-      const defaults = updateTriggerWorkerSettings(updated, {
-        agentId: null,
-        model: "",
-        effort: "",
-      })!;
-      expect(readTriggerWorkerSettings(defaults)).toEqual({ agentId: null, model: "", effort: "" });
+      const defaults = updateTriggerWorkerSettings(updated, AGENT_DEFAULT_WORKERS)!;
+      expect(readTriggerWorkerSettings(defaults)).toEqual(AGENT_DEFAULT_WORKERS);
       expect(defaults).not.toContain('reasoning_effort "low"');
+      expect(defaults).not.toContain("permission_mode");
     },
   );
 
@@ -124,13 +150,11 @@ describe("saved trigger prompts", () => {
       ),
     ]) {
       expect(readTriggerWorkerSettings(customized)).toBeNull();
-      expect(
-        updateTriggerWorkerSettings(customized, { agentId: null, model: "", effort: "" }),
-      ).toBeNull();
+      expect(updateTriggerWorkerSettings(customized, AGENT_DEFAULT_WORKERS)).toBeNull();
     }
     // The worker's task can quote an API call without changing manager configuration.
     const quoted = renderTriggerPrompt("jira", fields({ instructions: call }), CTX);
-    expect(readTriggerWorkerSettings(quoted)).toEqual({ agentId: null, model: "", effort: "" });
+    expect(readTriggerWorkerSettings(quoted)).toEqual(AGENT_DEFAULT_WORKERS);
   });
 
   it.each([
@@ -146,8 +170,9 @@ describe("saved trigger prompts", () => {
       agentId: null,
       model: "old-model",
       effort: "",
+      permissionMode: "",
     });
-    const settings = { agentId: null, model: "new-model", effort: "high" };
+    const settings = { agentId: null, model: "new-model", effort: "high", permissionMode: "" };
     const updated = updateTriggerWorkerSettings(prompt, settings);
     expect(updated).toBe(
       prompt.replace('model "old-model"', 'model "new-model", reasoning_effort "high"'),
@@ -994,7 +1019,7 @@ describe("renderTriggerPrompt", () => {
       'If it returns a conversation_id with status created_initial_message_failed, the session exists but its task wasn\'t delivered: don\'t create another or resend now; list it as "<title> <conversation_id>" on a "Delivery pending:" line and go on.',
     );
     expect(prompt).toContain(
-      "2. For each pending delivery, find its session: by its conversation_id, or, for an unconfirmed start listed without one, by its title among the sessions you created (sys_session_list with include_archived true).",
+      "2. For each pending delivery, find its session: by its conversation_id, or, for an unconfirmed start listed without one, by its title among the sessions you created (sys_session_list with include_archived true, following next_cursor through every page).",
     );
     // An unconfirmed start that never happened is fetched again by key, since the
     // checkpoint may have moved past its creation time while it was pending.
