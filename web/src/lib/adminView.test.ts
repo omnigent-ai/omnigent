@@ -11,7 +11,8 @@ it.each([true, false])("sets admin view to %s and reloads the page", (enabled) =
   const reload = vi.fn();
   const writeCookie = vi.spyOn(document, "cookie", "set");
   vi.stubGlobal("location", { protocol: "http:", reload });
-  expect(isAdminViewEnabled()).toBe(true);
+  if (enabled) document.cookie = "omnigent_admin_view=off; Path=/";
+  expect(isAdminViewEnabled()).toBe(!enabled);
   setAdminViewEnabled(enabled);
   expect(writeCookie).toHaveBeenCalledWith(expect.stringContaining("Max-Age=31536000"));
   expect(isAdminViewEnabled()).toBe(enabled);
