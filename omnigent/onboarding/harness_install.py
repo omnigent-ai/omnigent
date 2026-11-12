@@ -1169,11 +1169,17 @@ def harness_install_display(key: str) -> str:
     return " ".join(harness_install_command(key))
 
 
-# Lines of installer stderr kept for diagnosis. The output is teed straight to
-# this process as it arrives, so this buffer only has to be long enough to hold
-# npm's error block — not the whole install log, which must not grow the host
-# daemon's memory.
-_INSTALLER_STDERR_TAIL_LINES = 80
+# Characters of installer stderr kept for diagnosis. The output is teed straight
+# to this process as it arrives, so this buffer only has to be long enough to
+# hold npm's error block — not the whole install log, which must not grow the
+# host daemon's memory. Bounded in characters, not lines: a line has no length
+# limit, so a line count bounds nothing.
+_INSTALLER_STDERR_TAIL_CHARS = 16_384
+
+# Largest single read from the installer's stderr. ``readline`` with a size
+# returns at a newline or after this many characters, whichever comes first,
+# so one unterminated line is never buffered whole.
+_INSTALLER_STDERR_READ_CHARS = 4_096
 
 # Grace for the tee thread to drain after the installer exits. Bounded so a
 # pipe that never reaches EOF cannot hang the install call.
@@ -1228,9 +1234,12 @@ def _run_installer(cmd: list[str], *, timeout: float) -> tuple[int, str]:
 
     The installer's output has to keep streaming to this process — that is what
     makes a failure visible in the setup terminal and the host log — but the
-    reason string also needs to read it. So stderr is piped and each line is
-    written straight through as it arrives, while a bounded tail is retained
-    for :func:`_installer_failure_reason`. stdout is left inheriting, untouched.
+    reason string also needs to read it. So stderr is piped and read in sized
+    chunks, each written straight through as it arrives, while a tail of at most
+    :data:`_INSTALLER_STDERR_TAIL_CHARS` characters is retained for
+    :func:`_installer_failure_reason`. Both what is retained and what any single
+    read buffers are bounded, whatever the installer emits. stdout is left
+    inheriting, untouched.
 
     The tee thread owns the pipe and closes it at EOF. A child the installer
     leaves running can hold the pipe open after the installer exits, so the
@@ -1244,7 +1253,8 @@ def _run_installer(cmd: list[str], *, timeout: float) -> tuple[int, str]:
         installer and its child processes are killed before this propagates.
     :raises OSError: If the installer cannot be executed at all.
     """
-    tail: deque[str] = deque(maxlen=_INSTALLER_STDERR_TAIL_LINES)
+    tail: deque[str] = deque()
+    tail_chars = 0
     tail_lock = threading.Lock()
     # Not _proc.spawn_kwargs(): a new session would cut the setup wizard's
     # installers off from the terminal (prompts, /dev/tty, Ctrl-C).
@@ -1259,11 +1269,17 @@ def _run_installer(cmd: list[str], *, timeout: float) -> tuple[int, str]:
     assert stream is not None  # stderr=PIPE above
 
     def _tee() -> None:
+        nonlocal tail_chars
         with stream:
-            for line in stream:
+            # Sized reads, not line iteration: ``for line in stream`` buffers a
+            # whole line before yielding it, and a line has no length limit.
+            while chunk := stream.readline(_INSTALLER_STDERR_READ_CHARS):
                 with tail_lock:
-                    tail.append(line)
-                sys.stderr.write(line)
+                    tail.append(chunk)
+                    tail_chars += len(chunk)
+                    while tail_chars - len(tail[0]) >= _INSTALLER_STDERR_TAIL_CHARS:
+                        tail_chars -= len(tail.popleft())
+                sys.stderr.write(chunk)
                 sys.stderr.flush()
 
     # A reader thread, so a wedged installer still hits the timeout below
@@ -1281,7 +1297,8 @@ def _run_installer(cmd: list[str], *, timeout: float) -> tuple[int, str]:
     finally:
         pump.join(timeout=_INSTALLER_TEE_DRAIN_TIMEOUT_S)
     with tail_lock:
-        return returncode, "".join(tail)
+        # Retained is at most the budget plus one read; return exactly the budget.
+        return returncode, "".join(tail)[-_INSTALLER_STDERR_TAIL_CHARS:]
 
 
 class HarnessInstallResult(NamedTuple):

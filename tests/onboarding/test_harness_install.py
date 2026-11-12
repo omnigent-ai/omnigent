@@ -2123,3 +2123,53 @@ def test_missing_harness_cli_lets_a_slow_kimi_through_sub_agent_dispatch(
     assert probe_timeouts == [hi._DEFAULT_CLI_PROBE_TIMEOUT_S]
     # The probe stays inconclusive for callers that need a verified CLI.
     assert hi.harness_cli_installed(hi.KIMI_KEY) is False
+
+
+def test_installer_stderr_tail_is_bounded_by_characters(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One unterminated line far larger than the budget still yields a bounded tail.
+
+    The tail used to be bounded by lines, and a line has no length limit (#12507).
+    The cause after the long line must still be found, and everything is still teed.
+    """
+    huge = "#" * (hi._INSTALLER_STDERR_TAIL_CHARS * 10)
+    monkeypatch.setattr(
+        hi.subprocess, "Popen", fake_installer(returncode=1, stderr=huge + "\n" + NPM_EACCES)
+    )
+
+    returncode, stderr_tail = hi._run_installer(["npm", "install", "-g", "x"], timeout=5)
+
+    assert returncode == 1
+    assert len(stderr_tail) <= hi._INSTALLER_STDERR_TAIL_CHARS
+    assert hi._installer_failure_reason(returncode, stderr_tail).endswith("(npm EACCES)")
+    assert huge in capsys.readouterr().err
+
+
+def test_installer_stderr_reads_are_bounded_on_a_real_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Against a real process, a newline-free stream is read in bounded chunks.
+
+    ``for line in stream`` would buffer the whole 200 KB line before yielding it.
+    """
+    monkeypatch.setattr(hi.subprocess, "Popen", _REAL_POPEN)
+    reads: list[int] = []
+    # chr(10), not an escaped newline: the -c argument must stay one line.
+    script = (
+        "import sys; sys.stderr.write('#' * 200_000); "
+        "sys.stderr.write(chr(10) + 'npm error code EACCES' + chr(10)); sys.exit(1)"
+    )
+
+    def _record(chunk: str) -> int:
+        reads.append(len(chunk))
+        return len(chunk)
+
+    monkeypatch.setattr(sys.stderr, "write", _record)
+    returncode, stderr_tail = hi._run_installer([sys.executable, "-c", script], timeout=30)
+    monkeypatch.undo()
+
+    assert returncode == 1
+    assert max(reads) <= hi._INSTALLER_STDERR_READ_CHARS
+    assert len(stderr_tail) <= hi._INSTALLER_STDERR_TAIL_CHARS
+    assert "npm error code EACCES" in stderr_tail
