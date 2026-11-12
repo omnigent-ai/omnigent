@@ -89,9 +89,13 @@ MCP independent creation.
   change only how the session is listed, so running sessions, including the
   caller, keep their turn. Archiving stops the target and its running
   sub-agents, as the sidebar's Archive does, so the server refuses an
-  agent-tool archive of the caller or any session it runs under (its parent
-  chain or a side chat's source), and the tool also refuses a session on the
-  caller's runner. An archive cannot also file the session into a project that
+  agent-tool archive of any session the caller runs under (its parent chain
+  or a side chat's source), and the tool also refuses another session on the
+  caller's runner. A session may archive itself, for example an ephemeral
+  check that is done: the server keeps its runner until that turn ends (at
+  most an hour), and an Undo before then keeps it running. The wait is held in
+  that server's memory, so a server restart during it leaves the runner up
+  until its idle timeout. An archive cannot also file the session into a project that
   does not exist yet, so a refused archive never leaves a new empty project. `sys_project_update` renames a project or sets or clears
   its emoji icon, keeping its other stored defaults; like the sidebar's
   rename it re-files sessions that still belong through the legacy label,

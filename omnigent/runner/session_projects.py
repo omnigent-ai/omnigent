@@ -496,11 +496,13 @@ async def execute_session_update(
 
     Every field goes through the sidebar's ``PATCH /v1/sessions/{id}`` in one
     request. Filing, renaming and pinning only change how the session is listed,
-    so a running session keeps its turn; archiving stops its runner, so the
-    calling session may not archive itself. The calling session is sent as the
-    orchestration source on every write, so the server refuses both the update
-    and any project creation from a session shared with edit access. A project
-    is created only after the session is known to be updatable.
+    so a running session keeps its turn; archiving stops its runner. The calling
+    session may archive itself, which the server tears down only after this turn
+    ends, but not another session whose teardown would stop its runner mid-turn.
+    The calling session is sent as the orchestration source on every write, so
+    the server refuses both the update and any project creation from a session
+    shared with edit access. A project is created only after the session is
+    known to be updatable.
 
     :param args: Tool arguments: ``session_id`` plus any of ``project``
         (``""`` unfiles), ``title``, ``pinned`` and ``archived``.
@@ -543,20 +545,18 @@ async def execute_session_update(
         return json.dumps({"session_id": session_id, "error": "invalid session ID"})
     if client is None or source_id is None:
         return json.dumps({"error": "sys_session_update requires an authenticated runner"})
-    if changes.get("archived") is True and _same_session(canonical, source_id):
-        return json.dumps(
-            {
-                "session_id": session_id,
-                "error": "this session cannot archive itself; archiving stops its runner",
-            }
-        )
+    archives_itself = changes.get("archived") is True and _same_session(canonical, source_id)
     flag = _MOVE_SOURCE_CHECKS if requested == ["project"] else _ORGANIZE_SOURCE_CHECKS
     if not await _server_checks_source(client, flag):
         return _unchecked_server_error("sys_session_update", "a session")
     current, error = await _updatable_snapshot(client, canonical, set_project=set_project)
     if current is None:
         return json.dumps({"session_id": session_id, "error": error})
-    if changes.get("archived") is True and await _shares_runner(client, current, source_id):
+    if (
+        changes.get("archived") is True
+        and not archives_itself
+        and await _shares_runner(client, current, source_id)
+    ):
         return json.dumps(
             {
                 "session_id": session_id,
@@ -610,6 +610,11 @@ async def execute_session_update(
         result["project"] = name or None
         result["project_created"] = created
     result.update(changes)
+    if archives_itself and status == "updated":
+        result["note"] = (
+            "this session is archived; its runner stops once this turn ends, so finish "
+            "the turn now"
+        )
     return json.dumps(result)
 
 

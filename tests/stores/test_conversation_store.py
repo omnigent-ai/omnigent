@@ -455,6 +455,7 @@ def test_get_session_activity(
         kind="sub_agent", title="child", parent_conversation_id=a.id
     )
     conversation_store.set_session_usage(child.id, {"total_cost_usd": 5.0})
+    conversation_store.update_conversation(b.id, archived=True)
 
     statements: list[str] = []
 
@@ -484,6 +485,8 @@ def test_get_session_activity(
     assert result[b.id].live_status is None
     assert result[b.id].runner_id is None
     assert result[b.id].total_cost_usd is None
+    assert result[a.id].archived is False
+    assert result[b.id].archived is True
     assert conversation_store.get_session_activity([]) == {}
 
 

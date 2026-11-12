@@ -829,6 +829,10 @@ _pending_archive_stops: dict[str, asyncio.Task[None]] = {}
 # failure, not a sustained outage.
 _ARCHIVE_STOP_LOOKUP_ATTEMPTS = 3
 _ARCHIVE_STOP_LOOKUP_RETRY_S = 0.2
+# A session that archives itself keeps its runner until the turn that asked
+# ends. The wait is bounded so a turn that never settles still gets torn down.
+_SELF_ARCHIVE_TURN_POLL_S = 2.0
+_SELF_ARCHIVE_TURN_WAIT_S = 60 * 60
 _RUNNER_STOP_STATUS_BATCH_SIZE = 200
 
 
@@ -1068,6 +1072,54 @@ async def _archive_stop(
             )
 
 
+async def _await_archived_turn_end(session_id: str, conversation_store: ConversationStore) -> bool:
+    """
+    Wait until an archived session's own turn ends, or the wait runs out.
+
+    The status comes from this replica's relay cache, falling back to the row's
+    persisted live status, so the wait works on a replica without the tunnel.
+    Each poll reads only the session's activity, never its labels. A failed
+    read says nothing about the turn, so the wait keeps polling.
+
+    :returns: ``False`` once the session is no longer archived (an Undo), so the
+        caller skips the teardown; ``True`` otherwise.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _SELF_ARCHIVE_TURN_WAIT_S
+    while True:
+        try:
+            activity = await asyncio.to_thread(
+                conversation_store.get_session_activity, [session_id]
+            )
+        except Exception:  # noqa: BLE001
+            _logger.debug(
+                "Self-archive turn check failed for %s; retrying",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        else:
+            row = activity.get(session_id)
+            # A missing row is a deleted session. A store that doesn't report
+            # the flag (None) keeps waiting; _archive_stop re-reads it anyway.
+            if row is None or row.archived is False:
+                return False
+            # No relay status here and none persisted says nothing about the
+            # turn (the first status write may have failed), so keep waiting.
+            known = session_id in _session_status_cache or row.live_status is not None
+            if known and _session_status_from_cache(session_id, row.live_status) != "running":
+                return True
+        if loop.time() >= deadline:
+            _logger.warning(
+                "Self-archived session %s still running after %ss; tearing it down",
+                session_id,
+                _SELF_ARCHIVE_TURN_WAIT_S,
+                extra={"session_id": session_id},
+            )
+            return True
+        await asyncio.sleep(_SELF_ARCHIVE_TURN_POLL_S)
+
+
 def _spawn_archive_stop(
     session_id: str,
     conversation_store: ConversationStore,
@@ -1076,6 +1128,7 @@ def _spawn_archive_stop(
     *,
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
+    after_turn: bool = False,
 ) -> None:
     """
     Defer :func:`_archive_stop` past the undo grace, as a retained task.
@@ -1104,6 +1157,11 @@ def _spawn_archive_stop(
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
     :param delete_worktree: Forwarded to :func:`_archive_stop`.
+    :param after_turn: Also wait for the session's current turn to end before
+        tearing it down; set when the session archived itself. That wait, like
+        the grace, lives only in this replica's memory: if the replica restarts
+        first, the archived session's runner keeps running until its idle
+        timeout or a later stop.
     """
     # Replace any pending stop from an earlier archive of this session.
     _cancel_pending_archive_stop(session_id)
@@ -1115,6 +1173,8 @@ def _spawn_archive_stop(
 
         try:
             await asyncio.sleep(_facade._ARCHIVE_STOP_UNDO_GRACE_S)
+            if after_turn and not await _await_archived_turn_end(session_id, conversation_store):
+                return
         except asyncio.CancelledError:
             return
         await _archive_stop(
