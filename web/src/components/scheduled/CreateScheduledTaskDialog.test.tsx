@@ -1481,6 +1481,28 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(screen.getByLabelText("Instructions")).toHaveValue("Summarize open PRs");
   });
 
+  it("says nothing about hosts until /v1/info settles, then starts on its sandbox", () => {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "offline" }],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    const view = render(
+      <CapabilitiesProvider info="loading">
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+      </CapabilitiesProvider>,
+    );
+    expect(screen.queryByTestId("task-no-host-online")).not.toBeInTheDocument();
+
+    view.rerender(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, managed_sandboxes_enabled: true }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+      </CapabilitiesProvider>,
+    );
+    expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Sandbox");
+    expect(screen.queryByTestId("task-no-host-online")).not.toBeInTheDocument();
+  });
+
   it("says no host is connected when the host list is empty", () => {
     vi.mocked(hostsHook.useHosts).mockReturnValue({
       data: [],

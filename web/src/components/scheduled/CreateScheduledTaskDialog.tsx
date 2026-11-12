@@ -718,10 +718,11 @@ export function CreateScheduledTaskDialog({
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
   // Say so when no host can take the automation; a picked offline host has its own note,
-  // and a failed lookup proves nothing about the hosts.
+  // and a failed lookup proves nothing about the hosts. Wait for /v1/info too, which can
+  // still pick a sandbox instead.
   const showNoHostOnline =
     !sandboxMode &&
-    !hostsPending &&
+    targetInputsLoaded &&
     !hostsFailed &&
     selectedHost?.status !== "offline" &&
     !hostOptions.some((h) => h.status === "online");
