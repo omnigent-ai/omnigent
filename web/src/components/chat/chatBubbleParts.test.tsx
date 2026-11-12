@@ -1,10 +1,14 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ElicitationBlock } from "@/lib/blocks";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
+import { PEER_SESSION_MESSAGES_STORAGE_KEY } from "@/lib/peerSessionMessagePreferences";
+import { formatLocalReviewComments } from "@/lib/localReviewComments";
+import type { Comment } from "@/hooks/useComments";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { useChatStore, type ChatState } from "@/store/chatStore";
@@ -86,6 +90,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  localStorage.removeItem(PEER_SESSION_MESSAGES_STORAGE_KEY);
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   useChatStore.setState(initialStoreState);
@@ -407,6 +412,31 @@ describe("UserBubble messages from another session", () => {
     expect(screen.getByTestId("message-origin").textContent).toBe("From@Casual greeting");
     expect(screen.getByText("[System: build finished]")).toBeInTheDocument();
   });
+
+  it("collapses a message from another session to its first line until expanded", () => {
+    const client = new QueryClient();
+    client.setQueryData(["session", "s_src"], { title: "Reviewer", parentSessionId: null });
+    renderOriginBubble(client, "[Message from session s_src]\n\nVerdict: approve\nDetails follow");
+    expect(screen.getByTestId("collapsed-session-message")).toBeInTheDocument();
+    expect(screen.getByTestId("message-origin").textContent).toBe("From@Reviewer");
+    expect(screen.getByTestId("expand-session-message").textContent).toBe("Verdict: approve");
+    expect(screen.queryByTestId("user-message-content")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("expand-session-message"));
+    expect(screen.queryByTestId("collapsed-session-message")).not.toBeInTheDocument();
+    expect(screen.getByTestId("user-message-content").textContent).toContain("Details follow");
+
+    fireEvent.click(screen.getByTestId("collapse-session-message"));
+    expect(screen.getByTestId("collapsed-session-message")).toBeInTheDocument();
+  });
+
+  it("shows a message from another session in full when the reader chose to", () => {
+    localStorage.setItem(PEER_SESSION_MESSAGES_STORAGE_KEY, "show");
+    renderOriginBubble(new QueryClient(), "[Message from session s_src]\nfull text");
+    expect(screen.queryByTestId("collapsed-session-message")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("collapse-session-message")).not.toBeInTheDocument();
+    expect(screen.getByTestId("user-message-content").textContent).toContain("full text");
+  });
 });
 
 describe("UserBubble literal session markers", () => {
@@ -428,6 +458,91 @@ describe("UserBubble literal session markers", () => {
 });
 
 describe("UserBubble literal text", () => {
+  it("renders sent review snapshots as Markdown cards with expandable references", async () => {
+    const user = userEvent.setup();
+    const comment: Comment = {
+      id: "comment-1",
+      conversation_id: "session",
+      path: "src/a`name[1].tsx",
+      start_index: 0,
+      end_index: 0,
+      body: "**Preserve the existing check**\n\n- Handle `null` values.\n\nKeep <div> and `[Attached: example.ts]` visible.",
+      status: "draft",
+      created_at: 0,
+      updated_at: 0,
+      anchor_content: null,
+      created_by: null,
+      anchor_metadata: {
+        pr_url: "https://example.com/repo/pull/1",
+        side: "RIGHT",
+        line: 12,
+        start_line: null,
+        head_sha: "a".repeat(40),
+        base_sha: "b".repeat(40),
+      },
+    };
+    const nested = {
+      ...comment,
+      id: "comment-2",
+      body: formatLocalReviewComments([comment]),
+      anchor_metadata: { ...comment.anchor_metadata!, side: "LEFT" as const, start_line: 10 },
+    };
+    const text = `${formatLocalReviewComments([comment, nested])}\n\nPlease fix these.`;
+    const renderBubble = (messageText: string) => (
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "user",
+            itemId: "user_review",
+            content: [{ type: "input_text", text: messageText }],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(renderBubble(text));
+
+    const cards = screen.getAllByRole("region", { name: "Local review comment preview" });
+    expect(cards).toHaveLength(2);
+    expect(within(cards[0]).getByText(comment.path)).toBeVisible();
+    expect(within(cards[0]).getByText("New line 12")).toBeVisible();
+    expect(within(cards[0]).getByText("Preserve the existing check")).toHaveAttribute(
+      "data-streamdown",
+      "strong",
+    );
+    expect(within(cards[0]).getByRole("list")).toHaveTextContent("Handle null values.");
+    expect(cards[0]).toHaveTextContent("Keep <div> and [Attached: example.ts] visible.");
+    expect(within(cards[1]).getByText("Old lines 10–12")).toBeVisible();
+    expect(within(cards[1]).getByRole("button", { name: "Copy Code" })).toBeVisible();
+    expect(screen.getByText("Please fix these.")).toBeVisible();
+    const summary = within(cards[0]).getByText("Comment reference", { selector: "summary" });
+    const reference = summary.closest("details")!;
+    const identifier = within(reference).getByText(comment.id);
+    expect(reference).not.toHaveAttribute("open");
+    expect(identifier).not.toBeVisible();
+    expect(summary).toHaveClass("cursor-pointer");
+    await user.click(summary);
+    expect(reference).toHaveAttribute("open");
+    expect(identifier).toBeVisible();
+    expect(within(reference).getByText(comment.anchor_metadata!.head_sha)).toBeVisible();
+
+    rerender(renderBubble('```local-review-comment\n{"body": "Invalid snapshot"}\n```'));
+    expect(screen.queryByRole("region", { name: "Local review comment preview" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Copy Code" })).toBeVisible();
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent("Invalid snapshot");
+
+    // A fresh long message mounts collapsed; expanding recovers the intact snapshot.
+    cleanup();
+    render(renderBubble(formatLocalReviewComments([{ ...comment, body: "word ".repeat(2600) }])));
+    expect(screen.queryByRole("region", { name: "Local review comment preview" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Copy Code" })).toBeNull();
+    expect(screen.getByText("Expand the prompt to read more review comments.")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: /Show full prompt/ }));
+    expect(screen.getByRole("region", { name: "Local review comment preview" })).toHaveTextContent(
+      "word word word",
+    );
+  });
+
   it.each(["", "[Attached: docs/a.md]\n\n", "[Attached file: docs/a.md]\r\n\r\n"])(
     "keeps indented bullets as siblings after stripping %j",
     (preamble) => {

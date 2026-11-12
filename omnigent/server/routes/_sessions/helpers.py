@@ -2044,6 +2044,7 @@ def _resolve_harness_impl(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     agents_by_id: Mapping[str, Agent] | None = None,
+    agent: Agent | None = None,
 ) -> str | None:
     """
     Resolve the canonical harness for a conversation's bound agent.
@@ -2061,6 +2062,8 @@ def _resolve_harness_impl(
     :param agent_store: Optional store for resolving the bound agent.
     :param agent_cache: Optional cache for loading the bound agent spec.
     :param agents_by_id: Optional preloaded agents, avoiding per-session store reads.
+    :param agent: The bound agent row when the caller already holds it, so
+        the store is not read again. Ignored unless it is ``conv``'s agent.
     :returns: The canonical harness (e.g. ``"openai-agents"`` or
         ``"claude-sdk"``), or ``None`` when unavailable.
     """
@@ -2079,7 +2082,7 @@ def _resolve_harness_impl(
 
         if agents_by_id is not None:
             agent = agents_by_id.get(conv.agent_id)
-        else:
+        elif agent is None or agent.id != conv.agent_id:
             if agent_store is None:
                 from omnigent.runtime._globals import _agent_store
 
@@ -9502,6 +9505,7 @@ def _filesystem_attachment_in_history(
     file_store: FileStore | None,
     *,
     up_to_response_id: str | None = None,
+    before_item_id: str | None = None,
     content: Sequence[dict[str, Any]] = (),
 ) -> str | None:
     """Find a retained attachment requiring filesystem tools, using its stored name.
@@ -9510,6 +9514,8 @@ def _filesystem_attachment_in_history(
     :param conversation_store: Store containing the ordered source history.
     :param file_store: Store containing authoritative attachment filenames.
     :param up_to_response_id: Inclusive fork cutoff, or all history when absent.
+    :param before_item_id: Exclusive cutoff: only the items before this one
+        are retained, e.g. ``"msg_abc"``.
     :param content: Additional incoming message blocks to check before stored history.
     :returns: A referenced filesystem attachment's name, or ``None``.
     """
@@ -9537,7 +9543,7 @@ def _filesystem_attachment_in_history(
 
     # Descending order finds the last item of the cutoff response first,
     # matching the fork store's inclusive position cutoff.
-    retained = up_to_response_id is None
+    retained = up_to_response_id is None and before_item_id is None
     items_after: str | None = None
     while True:
         page = conversation_store.list_items(
@@ -9546,6 +9552,9 @@ def _filesystem_attachment_in_history(
         for item in page.data:
             if item.response_id == up_to_response_id:
                 retained = True
+            if before_item_id is not None and item.id == before_item_id:
+                retained = True
+                continue
             if not retained or not isinstance(item.data, MessageData):
                 continue
             for block in item.data.content:
@@ -9610,14 +9619,15 @@ def _load_agent_spec_for_session(*args: Any, **kwargs: Any) -> AgentSpec | None:
 def _load_agent_spec_for_session_impl(
     conv: Conversation,
     agent_store: AgentStore,
+    agent: Agent | None = None,
 ) -> AgentSpec | None:
-    # Split from _build_policy_engine_from_spec so the caller can run the
-    # cheap guardrails/default-policy skip check between the two and avoid
-    # paying for engine construction when no policy could fire. Both halves
-    # are blocking DB/IO, so each is run under asyncio.to_thread.
+    # Split from _build_policy_engine_from_spec so callers can skip engine
+    # construction when no policy could fire; both halves run in to_thread.
+    # A caller already holding conv's agent row passes it to skip the store read.
     if conv.agent_id is None:
         return None
-    agent = agent_store.get(conv.agent_id)
+    if agent is None or agent.id != conv.agent_id:
+        agent = agent_store.get(conv.agent_id)
     if agent is None:
         return None
     agent_cache = cast(AgentCache, get_agent_cache())

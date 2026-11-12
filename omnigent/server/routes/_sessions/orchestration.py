@@ -28,7 +28,12 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.db.utils import generate_agent_id, generate_task_id
+from omnigent.db.utils import (
+    generate_agent_id,
+    generate_task_id,
+    rollback_shared_reads,
+    shared_read_scope,
+)
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import (
@@ -71,7 +76,7 @@ from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
 from omnigent.llms.context_window import resolve_effective_context_window
-from omnigent.mcp_selection import mcp_selection_revision
+from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import (
     FailureContext,
@@ -169,8 +174,13 @@ from omnigent.server.managed_hosts import (
     host_sandbox_is_running,
     parse_repo_workspace,
     read_managed_repo_workspaces,
+    stop_archived_session_sandbox,
 )
 from omnigent.server.permissions import check_session_access
+from omnigent.server.routes._auth_helpers import (
+    SessionAccess,
+    require_access_and_level_sync,
+)
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -400,6 +410,7 @@ from omnigent.server.schemas import (
     SessionStatusEvent,
     SessionUsageEvent,
 )
+from omnigent.server.session_mcp_selection import session_mcp_selection
 from omnigent.server.startup_inputs import (
     STARTUP_LABEL,
     StartupInputContext,
@@ -961,6 +972,7 @@ async def _archive_stop(
     *,
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
+    sandbox_config: ManagedSandboxDeployment | None = None,
 ) -> None:
     """
     Stop an archived session and tear down its host-launched runner.
@@ -991,6 +1003,11 @@ async def _archive_stop(
         tunnels, or ``None`` when host support is not wired.
     :param delete_worktree: After the stop, also remove the session's
         server-created worktree directory (the branch is kept).
+    :param host_store: Persistent host registrations, or ``None`` when host
+        support is not wired.
+    :param sandbox_config: The deployment's managed-sandbox config; when the
+        host's provider opts in (``stop_on_archive``), the session's sandbox is
+        stopped last.
     """
     # Resolve through the facade so a test's monkeypatch is honored here.
     from omnigent.server.routes import sessions as _facade
@@ -1070,6 +1087,9 @@ async def _archive_stop(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
+    # Last: the worktree cleanup above needs the sandbox's host online.
+    if host_store is not None:
+        await stop_archived_session_sandbox(conv, host_store, conversation_store, sandbox_config)
 
 
 async def _await_archived_turn_end(session_id: str, conversation_store: ConversationStore) -> bool:
@@ -1128,6 +1148,7 @@ def _spawn_archive_stop(
     *,
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
+    sandbox_config: ManagedSandboxDeployment | None = None,
     after_turn: bool = False,
 ) -> None:
     """
@@ -1157,6 +1178,7 @@ def _spawn_archive_stop(
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
     :param delete_worktree: Forwarded to :func:`_archive_stop`.
+    :param sandbox_config: Forwarded to :func:`_archive_stop`.
     :param after_turn: Also wait for the session's current turn to end before
         tearing it down; set when the session archived itself. That wait, like
         the grace, lives only in this replica's memory: if the replica restarts
@@ -1184,6 +1206,7 @@ def _spawn_archive_stop(
             host_registry,
             delete_worktree=delete_worktree,
             host_store=host_store,
+            sandbox_config=sandbox_config,
         )
 
     task = asyncio.create_task(_stop_after_grace())
@@ -1486,6 +1509,7 @@ def _build_session_response(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     side_chat_sealed: bool = False,
+    agent: Agent | None = None,
     background_agents: list[BackgroundTaskInfo] | None = None,
 ) -> SessionResponse:
     """
@@ -1557,6 +1581,8 @@ def _build_session_response(
         ``None`` is treated as ``[]``.
     :param agent_store: Optional store used to resolve the session harness.
     :param agent_cache: Optional cache used to load the session harness spec.
+    :param agent: The bound agent row when the caller already read it, so the
+        harness resolution does not read it again.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
     """
@@ -1570,7 +1596,7 @@ def _build_session_response(
     # usage. Shared by the cost indicator and the per-model breakdown so
     # both read the same numbers.
     display_usage = subtree_usage if subtree_usage is not None else (conv.session_usage or {})
-    harness = _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
+    harness = _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache, agent=agent)
     native_usage_baseline = None
     if harness == "pi-native":
         own_usage = conv.session_usage or {}
@@ -11821,6 +11847,48 @@ async def _resolve_native_smart_routing(
     return native_agent.agent_name, model, verdict, None
 
 
+async def _inherited_mcp_labels(
+    request: Request,
+    source_labels: Mapping[str, str],
+    labels: Mapping[str, str],
+    *,
+    spec: AgentSpec | None,
+    user_id: str | None,
+    host_id: str | None,
+    runner_id: str | None,
+) -> dict[str, str]:
+    """The source session's MCP selection labels for a worker it starts.
+
+    Empty when the worker already carries a selection, the source has none, or
+    the worker's agent could not be loaded to check for name collisions. A
+    selection the worker cannot use (a disconnected account, a name its agent
+    uses for a custom server, or a runtime without registry support) is dropped
+    whole, so the worker still starts.
+    """
+    from omnigent.server.mcp_compatibility import registry_services, require_registry_mcp_runtime
+
+    selection = session_mcp_selection(request.app.state)
+    services = selection.selected_services(source_labels)
+    if not services or selection.selected_services(labels) or spec is None:
+        return {}
+    inherited = selection.session_labels(services)
+    try:
+        await asyncio.to_thread(selection.validate, request, services, spec=spec, user_id=user_id)
+        require_registry_mcp_runtime(
+            registry_services(selected_mcp_spec(spec, inherited)),
+            host_id=host_id,
+            runner_id=runner_id,
+            host_registry=getattr(request.app.state, "host_registry", None),
+            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+        )
+    except OmnigentError as exc:
+        if exc.code == ErrorCode.WRONG_REPLICA:
+            raise
+        _logger.warning("worker session does not inherit MCP services: %s", exc)
+        return {}
+    return inherited
+
+
 async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -11837,6 +11905,8 @@ async def _create_session_from_existing_agent(
     project_store: ProjectStore | None = None,
     created_by_session_id: str | None = None,
     created_by_project_id: str | None = None,
+    created_by_scheduled_task_id: str | None = None,
+    created_by_labels: Mapping[str, str] | None = None,
 ) -> tuple[SessionResponse, Conversation]:
     """
     Create a session bound to an already-registered agent.
@@ -11869,6 +11939,10 @@ async def _create_session_from_existing_agent(
     :param created_by_session_id: Server-authorized source of an independent worker.
     :param created_by_project_id: That source's project. A worker whose request names
         no project is filed there, so it sits beside the session that started it.
+    :param created_by_scheduled_task_id: The automation whose run is that source, if
+        any. A worker whose request carries no launch args runs in its permission mode.
+    :param created_by_labels: That source's labels. A worker that picks no MCP
+        services of its own starts with the source's.
     :returns: The newly created session snapshot and its conversation row.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
@@ -12286,6 +12360,17 @@ async def _create_session_from_existing_agent(
         host_registry=getattr(request.app.state, "host_registry", None),
         tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
     )
+    inherited_mcp_labels: dict[str, str] = {}
+    if created_by_labels and not body.mcp_registry_services and not body.sub_agent_name:
+        inherited_mcp_labels = await _inherited_mcp_labels(
+            request,
+            created_by_labels,
+            body.labels or {},
+            spec=selection_spec,
+            user_id=user_id,
+            host_id=body.host_id,
+            runner_id=inherited_runner_id,
+        )
 
     selected_harness = (
         harness_override or _spec_harness(selection_spec)
@@ -12310,6 +12395,22 @@ async def _create_session_from_existing_agent(
         labels=body.labels,
         host_registry=getattr(request.app.state, "host_registry", None),
     )
+    # Checked before a worktree exists, so a refused mode leaves nothing behind.
+    permission_launch_args: list[str] | None = None
+    if body.permission_mode is not None:
+        from omnigent.native.permission_modes import created_session_launch_args
+
+        if body.sub_agent_name or body.terminal_launch_args is not None:
+            raise OmnigentError(
+                "permission_mode can't be combined with terminal_launch_args or sub_agent_name",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            permission_launch_args = created_session_launch_args(
+                selected_harness, body.permission_mode
+            )
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
     # Git worktree options (optional). Two modes on body.git:
     #  - create (default): make a worktree; it becomes the stored
@@ -12364,9 +12465,11 @@ async def _create_session_from_existing_agent(
     # the validated body args (e.g. ``["--permission-mode",
     # "bypassPermissions"]`` from the web permission-mode selector). The
     # flat-list shape plus this bounds check is the security boundary;
-    # mirrors the multipart create + PATCH paths. When the body carries no
-    # args, the agent's own trusted spec seeds them below — explicit
-    # opt-ins only, never the headless worker default bypass.
+    # mirrors the multipart create + PATCH paths. A ``permission_mode``
+    # (from ``sys_session_create``) maps to its harness's args instead, and
+    # never to a mode that skips approval. When the body carries neither,
+    # the agent's own trusted spec seeds them below — explicit opt-ins
+    # only, never the headless worker default bypass.
     sub_spec: AgentSpec | None = None
     if body.sub_agent_name:
         sub_spec = _resolve_subagent_spec(
@@ -12383,6 +12486,8 @@ async def _create_session_from_existing_agent(
                 f"invalid terminal_launch_args in sub-agent spec: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+    elif body.permission_mode is not None:
+        validated_launch_args = permission_launch_args
     else:
         try:
             validated_launch_args = _validate_terminal_launch_args(body.terminal_launch_args)
@@ -12392,11 +12497,36 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    # Workers an automation's run starts are unattended like the run itself, so they
+    # use the automation's permission mode instead of their agent's default. A mode
+    # the request names wins.
+    automation_launch_options: tuple[list[str] | None, dict[str, str]] | None = None
+    if not body.sub_agent_name and validated_launch_args is None and body.permission_mode is None:
+        from omnigent.server.scheduled.harness_settings import automation_session_launch_options
+
+        automation_launch_options = await automation_session_launch_options(
+            getattr(request.app.state, "scheduled_task_store", None),
+            created_by_scheduled_task_id,
+            source_session_id=created_by_session_id,
+            user_id=user_id,
+            harness=selected_harness,
+        )
+    automation_permission_labels: dict[str, str] = {}
+    if automation_launch_options is not None:
+        validated_launch_args, automation_permission_labels = automation_launch_options
+
     # Spec-seeded defaults: a self-resolved agent's stored spec supplies the
     # spec-level reasoning effort and, when the body carried no launch args,
     # its explicit native-bypass opt-ins; one tolerant load serves both.
     own_spec: AgentSpec | None = None
-    needs_launch_args_from_spec = not body.sub_agent_name and validated_launch_args is None
+    # A requested or inherited mode, even the harness default, replaces the spec's
+    # own opt-ins.
+    needs_launch_args_from_spec = (
+        not body.sub_agent_name
+        and validated_launch_args is None
+        and body.permission_mode is None
+        and automation_launch_options is None
+    )
     needs_effort_from_spec = reasoning_effort is None and sub_spec is None
     if (
         (needs_launch_args_from_spec or needs_effort_from_spec)
@@ -12449,6 +12579,8 @@ async def _create_session_from_existing_agent(
     if created_by_session_id is not None:
         initial_labels[CREATED_BY_SESSION_LABEL_KEY] = created_by_session_id
     initial_labels.update(registry_labels)
+    initial_labels.update(automation_permission_labels)
+    initial_labels.update(inherited_mcp_labels)
     if created_worktree_path is not None:
         from omnigent.server.routes._host_worktree import (
             WORKTREE_ROOT_LABEL_KEY,
@@ -13484,6 +13616,7 @@ async def _fetch_model_options(
     session_id: str,
     conv: Conversation,
     agent_store: AgentStore | None = None,
+    agent: Agent | None = None,
 ) -> list[dict[str, Any]]:
     """
     Resolve the Web UI model-picker options for a native session.
@@ -13516,6 +13649,8 @@ async def _fetch_model_options(
     :param conv: Conversation row whose labels identify the wrapper.
     :param agent_store: Optional store for the ACP spec lookup; resolves
         from the runtime globals when ``None``.
+    :param agent: The bound agent row when the caller already read it, so the
+        harness check does not read it again.
     :returns: Model options, or ``[]`` when the session has no model picker or
         the runner-owned options are not yet available.
     """
@@ -13533,8 +13668,8 @@ async def _fetch_model_options(
         # Generic ACP sessions carry no native wrapper label; their picker
         # serves the deployment's curated provider ``models:`` shortlist
         # resolved from the spec instead of a runner-owned catalog.
-        if _resolve_harness_impl_is_acp(conv, agent_store):
-            return await _load_acp_model_options(session_id, conv, agent_store)
+        if _resolve_harness_impl_is_acp(conv, agent_store, agent=agent):
+            return await _load_acp_model_options(session_id, conv, agent_store, agent=agent)
         return []
     cached = _model_options_cache.get(session_id)
     if runner_client is None:
@@ -13635,7 +13770,9 @@ async def _codex_side_chat_fork_lost(
     return status in {"dead", "unknown"}
 
 
-def _resolve_harness_impl_is_acp(conv: Conversation, agent_store: AgentStore | None) -> bool:
+def _resolve_harness_impl_is_acp(
+    conv: Conversation, agent_store: AgentStore | None, agent: Agent | None = None
+) -> bool:
     """Return whether *conv* runs a generic ``acp`` harness.
 
     ``canonicalize_harness`` folds ``acp:<slug>`` ids to ``"acp"``, so any
@@ -13644,11 +13781,13 @@ def _resolve_harness_impl_is_acp(conv: Conversation, agent_store: AgentStore | N
     :param conv: Conversation row the session snapshot was built from.
     :param agent_store: Optional store for the harness lookup; ``None`` lets
         :func:`_resolve_harness` fall back to the runtime global.
+    :param agent: The bound agent row when the caller already read it.
     :returns: ``True`` when the session's resolved harness is ``"acp"``.
     """
     from omnigent.harness_aliases import canonicalize_harness
 
-    return canonicalize_harness(_resolve_harness(conv, agent_store=agent_store)) == "acp"
+    harness = _resolve_harness(conv, agent_store=agent_store, agent=agent)
+    return canonicalize_harness(harness) == "acp"
 
 
 def _validate_acp_spec_models(
@@ -13739,6 +13878,7 @@ async def _load_acp_model_options(
     session_id: str,
     conv: Conversation,
     agent_store: AgentStore | None,
+    agent: Agent | None = None,
 ) -> list[dict[str, Any]]:
     """Resolve the curated picker options for a generic ACP session.
 
@@ -13754,6 +13894,8 @@ async def _load_acp_model_options(
     :param conv: Conversation row the options are resolved for.
     :param agent_store: Store for the bound-agent spec load; ``None`` falls
         back to the runtime global store.
+    :param agent: The bound agent row when the caller already read it, so the
+        spec load does not read it again.
     :returns: Option dicts (``id`` / ``displayName`` / ``isDefault``), or
         ``[]`` when nothing was curated.
     """
@@ -13766,7 +13908,11 @@ async def _load_acp_model_options(
         agent_store = _agent_store
     if agent_store is None:
         return []
-    spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+    # Callers without a prefetched row keep the loader's two-argument call shape.
+    loader_kwargs = {"agent": agent} if agent is not None else {}
+    spec = await asyncio.to_thread(
+        _load_agent_spec_for_session, conv, agent_store, **loader_kwargs
+    )
     if spec is None:
         return []
     from omnigent.models.model_catalog import _acp_launch_model, acp_curated_models
@@ -13948,6 +14094,7 @@ async def _get_session_snapshot(
     viewer_id: str | None = None,
     request: Request | None = None,
     include_usage: bool = True,
+    agent: Agent | None = None,
 ) -> SessionResponse:
     """
     Read a full session snapshot from the store.
@@ -13993,6 +14140,9 @@ async def _get_session_snapshot(
         overlays for this session before building the response. Browser
         reloads use this so a refresh re-reads current live-session
         capabilities instead of serving stale AP-process caches.
+    :param agent: The already-fetched bound agent row to reuse, skipping the
+        ``agent_store.get`` read here and in the harness resolutions below.
+        ``None`` reads it here as before.
     :returns: The fully populated :class:`SessionResponse`.
     :raises OmnigentError: 404 if no session exists, 500 if the
         underlying conversation has no agent binding
@@ -14118,7 +14268,8 @@ async def _get_session_snapshot(
     harness_owns_model = False
     if agent_store is not None and agent_cache is not None and conv.agent_id is not None:
         try:
-            agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
+            if agent is None or agent.id != conv.agent_id:
+                agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
             if agent is not None:
                 agent_name = agent.name
                 if agent.bundle_location is not None:
@@ -14200,7 +14351,9 @@ async def _get_session_snapshot(
         if not conv.reported_model:
             llm_model = conv.model_override or catalog.get("default_model")
     else:
-        model_options = await _fetch_model_options(runner_client, session_id, conv, agent_store)
+        model_options = await _fetch_model_options(
+            runner_client, session_id, conv, agent_store, agent=agent
+        )
     # Dynamic override from the forwarder (real Claude Code window).
     # Only present after the first statusLine tick; before that the
     # spec default applies.
@@ -14280,6 +14433,7 @@ async def _get_session_snapshot(
         viewer_id=viewer_id,
         agent_store=agent_store,
         agent_cache=agent_cache,
+        agent=agent,
     )
     if request is not None:
         from omnigent.server.session_families import project_families
@@ -14310,6 +14464,50 @@ async def _get_session_snapshot(
         known = {item["pending_id"] for item in response.pending_inputs}
         response.pending_inputs.extend(item for item in queued if item["pending_id"] not in known)
     return response
+
+
+def _read_session_snapshot_inputs(
+    user_id: str | None,
+    session_id: str,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+    agent_store: AgentStore,
+) -> tuple[SessionAccess, Conversation, Agent | None]:
+    """Authorize a snapshot read and fetch its store inputs over one checkout.
+
+    Read authorization and snapshot inputs synchronously (for
+    :func:`asyncio.to_thread`) in one :func:`shared_read_scope`; the scope is
+    released before the snapshot's network lookups.
+
+    :returns: The access result, the conversation (read here when the access
+        check did not), and the bound agent row, or ``None`` when the session
+        has no agent binding, the row is gone, or its read failed.
+    :raises OmnigentError: 401 / 403 / 404 from the access check, or 404 when
+        the conversation does not exist.
+    """
+    with shared_read_scope():
+        access = require_access_and_level_sync(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = conversation_store.get_conversation(session_id)
+        if conv is None:
+            raise _session_not_found()
+        agent: Agent | None = None
+        if conv.agent_id is not None:
+            try:
+                agent = agent_store.get(conv.agent_id)
+            except Exception:  # noqa: BLE001 - enrichment only; the snapshot retries best-effort
+                # Clear the failed transaction before subsequent shared reads.
+                rollback_shared_reads()
+                _logger.warning(
+                    "Agent row read failed on snapshot build for session=%s",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+    return access, conv, agent
 
 
 __all__ = [
@@ -14367,6 +14565,7 @@ __all__ = [
     "_publish_and_wait_for_harness_elicitation",
     "_publish_runner_recovered_status",
     "_publish_subtree_cost_to_ancestors",
+    "_read_session_snapshot_inputs",
     "_recover_subagent_status_forward_via_parent",
     "_register_policy_elicitation",
     "_relay_runner_stream",

@@ -17,8 +17,14 @@
             "title": "Anchor Content"
           },
           "anchor_metadata": {
-            "title": "Anchor Metadata",
-            "type": "null"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PullRequestCommentAnchor"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "body": {
             "description": "The comment text.",
@@ -1456,6 +1462,137 @@
         "title": "CodexGoalResponse",
         "type": "object"
       },
+      "Comment": {
+        "description": "A single review comment anchored to a text range in a file.",
+        "properties": {
+          "anchor_content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Plain-text snapshot of the selected range at comment creation time. Used to re-anchor the comment when the file is subsequently edited. `None` for legacy comments.",
+            "title": "Anchor Content"
+          },
+          "anchor_metadata": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PullRequestCommentAnchor"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Immutable provider-specific coordinates used to locate the comment outside a workspace file. When set, character offsets do not locate the comment in the workspace file."
+          },
+          "body": {
+            "description": "The comment text.",
+            "title": "Body",
+            "type": "string"
+          },
+          "conversation_id": {
+            "description": "The conversation this comment belongs to, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "created_at": {
+            "description": "Unix timestamp (seconds) when the comment was created.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Email of the user who created the comment, e.g. `\"alice@example.com\"`. `None` for legacy comments created before per-user attribution was added, or in single-user mode.",
+            "title": "Created By"
+          },
+          "end_index": {
+            "description": "0-based absolute character offset (exclusive) within the file where the anchor range ends.",
+            "format": "int64",
+            "title": "End Index",
+            "type": "integer"
+          },
+          "id": {
+            "description": "UUID for this comment, e.g. `\"a1b2c3d4-...\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "path": {
+            "description": "File path relative to the workspace root, e.g. `\"src/App.tsx\"`.",
+            "title": "Path",
+            "type": "string"
+          },
+          "start_index": {
+            "description": "0-based absolute character offset (inclusive) within the file where the anchor range begins.",
+            "format": "int64",
+            "title": "Start Index",
+            "type": "integer"
+          },
+          "status": {
+            "description": "One of `\"draft\"` (open, not yet addressed) or `\"addressed\"` (fixed by the agent or user).",
+            "title": "Status",
+            "type": "string"
+          },
+          "updated_at": {
+            "description": "Unix timestamp in **microseconds** when the comment was last mutated (body or status change); set at creation time for never-edited comments. Microsecond precision (vs `created_at`'s seconds) so back-to-back mutations inside the same second still produce distinct, ordered values for the session comments fingerprint, while staying an exact integer in JavaScript (epoch-\u00b5s < `Number.MAX_SAFE_INTEGER`).",
+            "format": "int64",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "conversation_id",
+          "path",
+          "start_index",
+          "end_index",
+          "body",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "Comment",
+        "type": "object"
+      },
+      "CommentPage": {
+        "description": "A bounded comment page; filtered pages can be empty and still have a cursor.",
+        "properties": {
+          "comments": {
+            "items": {
+              "$ref": "#/components/schemas/Comment"
+            },
+            "title": "Comments",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "comments",
+          "next_cursor"
+        ],
+        "title": "CommentPage",
+        "type": "object"
+      },
       "CompactionCompletedEvent": {
         "description": "Conversation history compaction has finished.\n\nEmitted after compaction completes \u2014 either by the server after\n`compact_conversation_now()` (explicit `/compact`), or by a\nharness that compacted its own internal context. Clients that\nrendered a \"Compacting\u2026\" spinner on\n`CompactionInProgressEvent` should upgrade it to the\npermanent \"Conversation compacted\" marker on this event.\n\nWhen emitted by a harness, `summary` and `summary_model`\nare populated so the runner can persist a compaction item for\nsession resume. When emitted by the server's explicit\n`/compact` path, those fields are `None`.",
         "properties": {
@@ -2006,6 +2143,14 @@
               }
             ],
             "title": "Max Cost Usd"
+          },
+          "mcp_services": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 40,
+            "title": "Mcp Services",
+            "type": "array"
           },
           "model_override": {
             "anyOf": [
@@ -5569,6 +5714,54 @@
         "title": "ProjectOrderResponse",
         "type": "object"
       },
+      "PullRequestCommentAnchor": {
+        "description": "Immutable PR coordinates for a session-only review comment.",
+        "properties": {
+          "base_sha": {
+            "title": "Base Sha",
+            "type": "string"
+          },
+          "head_sha": {
+            "title": "Head Sha",
+            "type": "string"
+          },
+          "line": {
+            "format": "int64",
+            "title": "Line",
+            "type": "integer"
+          },
+          "pr_url": {
+            "title": "Pr Url",
+            "type": "string"
+          },
+          "side": {
+            "title": "Side",
+            "type": "string"
+          },
+          "start_line": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Line"
+          }
+        },
+        "required": [
+          "pr_url",
+          "side",
+          "line",
+          "start_line",
+          "head_sha",
+          "base_sha"
+        ],
+        "title": "PullRequestCommentAnchor",
+        "type": "object"
+      },
       "QueuedEvent": {
         "description": "Optional event emitted between `created` and `in_progress`\nfor background tasks that are queued before they start.\n\nForeground streaming responses skip this event.",
         "properties": {
@@ -6548,6 +6741,11 @@
             "title": "Codex Nonblocking Decline",
             "type": "boolean"
           },
+          "comment_anchor_metadata": {
+            "default": true,
+            "title": "Comment Anchor Metadata",
+            "type": "boolean"
+          },
           "databricks_features": {
             "title": "Databricks Features",
             "type": "boolean"
@@ -6655,6 +6853,14 @@
             ],
             "title": "Sandbox Provider"
           },
+          "sandbox_provider_automation_notices": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "title": "Sandbox Provider Automation Notices",
+            "type": "object"
+          },
           "sandbox_provider_capabilities": {
             "additionalProperties": {
               "additionalProperties": {
@@ -6688,6 +6894,11 @@
             "title": "Scheduled Task Inbox",
             "type": "boolean"
           },
+          "scheduled_task_mcp_services": {
+            "default": true,
+            "title": "Scheduled Task Mcp Services",
+            "type": "boolean"
+          },
           "scheduled_task_projects": {
             "default": false,
             "title": "Scheduled Task Projects",
@@ -6718,6 +6929,11 @@
             "title": "Scheduled Task Worktrees",
             "type": "boolean"
           },
+          "scripted_sessions": {
+            "default": false,
+            "title": "Scripted Sessions",
+            "type": "boolean"
+          },
           "server_version": {
             "title": "Server Version",
             "type": "string"
@@ -6735,6 +6951,11 @@
           "session_claude_sdk_clear": {
             "default": false,
             "title": "Session Claude Sdk Clear",
+            "type": "boolean"
+          },
+          "session_create_permission_modes": {
+            "default": true,
+            "title": "Session Create Permission Modes",
             "type": "boolean"
           },
           "session_event_types": {
@@ -6773,6 +6994,11 @@
           "session_pull_requests": {
             "default": false,
             "title": "Session Pull Requests",
+            "type": "boolean"
+          },
+          "session_rewind": {
+            "default": false,
+            "title": "Session Rewind",
             "type": "boolean"
           },
           "session_search_scope": {
@@ -8505,6 +8731,18 @@
             ],
             "description": "The plan step the entry is about.",
             "title": "Step"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "For a plan that starts a run of one of the user's saved workflows, that workflow's ID.",
+            "title": "Workflow Id"
           }
         },
         "required": [
@@ -8639,6 +8877,18 @@
             ],
             "description": "The plan step it is about, e.g. `\"propose\"`, or `None`.",
             "title": "Step"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The saved workflow the entry was written under, or `None`: set on the plan that starts a run of it, and on the statuses and notes written while that plan is current.",
+            "title": "Workflow Id"
           }
         },
         "required": [
@@ -11134,6 +11384,120 @@
         "title": "SessionResponse",
         "type": "object"
       },
+      "SessionRewindAttachment": {
+        "description": "A file the chosen `/rewind` prompt attached, as the rewound session holds it.\n\nExactly one of *file_id*, *image_url* and *file_data* is set.",
+        "properties": {
+          "file_data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A document the prompt carried inline instead of as a stored file, as a base64 `data:` URI, e.g. `\"data:application/pdf;base64,...\"`; uploaded on send like *image_url*.",
+            "title": "File Data"
+          },
+          "file_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The rewound session's copy of the file, e.g. `\"file_abc\"`; read it from `/v1/sessions/{session_id}/resources/files/{file_id}`.",
+            "title": "File Id"
+          },
+          "filename": {
+            "description": "The attachment's name, e.g. `\"diagram.png\"`.",
+            "title": "Filename",
+            "type": "string"
+          },
+          "image_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "An image the prompt carried inline instead of as a stored file, as a `data:image/...` URI (e.g. from a session imported from another harness); the client uploads it on send like any attachment.",
+            "title": "Image Url"
+          },
+          "type": {
+            "description": "The prompt's content block type, `\"input_file\"` or `\"input_image\"`.",
+            "enum": [
+              "input_file",
+              "input_image"
+            ],
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "filename"
+        ],
+        "title": "SessionRewindAttachment",
+        "type": "object"
+      },
+      "SessionRewindRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `POST /v1/sessions/{session_id}/rewind`.",
+        "properties": {
+          "item_id": {
+            "description": "The session's user prompt to rewind to, e.g. `\"msg_abc123\"`. The new session keeps only the history before it.",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_id"
+        ],
+        "title": "SessionRewindRequest",
+        "type": "object"
+      },
+      "SessionRewindResponse": {
+        "description": "Result of `POST /v1/sessions/{session_id}/rewind`.",
+        "properties": {
+          "attachments": {
+            "description": "The prompt's attachments, in prompt order, for the client to put back in the composer; empty when it had none.",
+            "items": {
+              "$ref": "#/components/schemas/SessionRewindAttachment"
+            },
+            "title": "Attachments",
+            "type": "array"
+          },
+          "attachments_incomplete": {
+            "default": false,
+            "description": "Some attachments could not be restored; warn the user to attach them again before sending.",
+            "title": "Attachments Incomplete",
+            "type": "boolean"
+          },
+          "prompt": {
+            "description": "Text of the chosen prompt, for the client to put back in the composer, e.g. `\"Add a test for the parser\"`.",
+            "title": "Prompt",
+            "type": "string"
+          },
+          "session_id": {
+            "description": "The rewound session that continues the work, e.g. `\"conv_new\"`. The source session gets a notice linking to it.",
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "prompt"
+        ],
+        "title": "SessionRewindResponse",
+        "type": "object"
+      },
       "SessionRoutingDecisionItem": {
         "description": "`routing_decision` item: common fields plus `RoutingDecisionData`.",
         "properties": {
@@ -11616,9 +11980,12 @@
             "type": "string"
           },
           "reason": {
-            "const": "clear",
             "default": "clear",
-            "description": "Why the session was superseded. Currently always `\"clear\"` (a Claude Code `/clear`); kept as a field so the client can branch on future supersession causes.",
+            "description": "Why the session was superseded: `\"clear\"` (a `/clear`) or `\"rewind\"` (a `/rewind` onto a truncated fork).",
+            "enum": [
+              "clear",
+              "rewind"
+            ],
             "title": "Reason",
             "type": "string"
           },
@@ -13131,6 +13498,21 @@
             ],
             "title": "Max Cost Usd"
           },
+          "mcp_services": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 40,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mcp Services"
+          },
           "model_override": {
             "anyOf": [
               {
@@ -13993,6 +14375,156 @@
           "steps"
         ],
         "title": "WorkflowObject",
+        "type": "object"
+      },
+      "WorkflowRun": {
+        "description": "One run of a saved workflow: a session that started it.",
+        "properties": {
+          "archived": {
+            "default": false,
+            "description": "Whether the session is archived.",
+            "title": "Archived",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "The run's ID: that of the plan entry that started it.",
+            "title": "Id",
+            "type": "string"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/WorkflowRunProgress",
+            "description": "Where the run's steps stand."
+          },
+          "session_id": {
+            "description": "The session that ran it.",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "session_status": {
+            "description": "The session's status, `\"idle\"`, `\"running\"` or `\"failed\"`.",
+            "enum": [
+              "idle",
+              "running",
+              "failed"
+            ],
+            "title": "Session Status",
+            "type": "string"
+          },
+          "started_at": {
+            "description": "Unix epoch seconds when the run's plan was written.",
+            "format": "int64",
+            "title": "Started At",
+            "type": "integer"
+          },
+          "statuses": {
+            "description": "Each of those steps' newest status entry; a step with none yet is left out.",
+            "items": {
+              "$ref": "#/components/schemas/SessionJournalEntry"
+            },
+            "title": "Statuses",
+            "type": "array"
+          },
+          "steps": {
+            "description": "The steps of the plan that started the run.",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowStep"
+            },
+            "title": "Steps",
+            "type": "array"
+          },
+          "title": {
+            "description": "The session's title; empty when it has none yet.",
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "session_id",
+          "title",
+          "started_at",
+          "session_status",
+          "progress"
+        ],
+        "title": "WorkflowRun",
+        "type": "object"
+      },
+      "WorkflowRunList": {
+        "description": "One page of a saved workflow's runs, newest first, for\n`GET /v1/workflows/{id}/runs`.",
+        "properties": {
+          "data": {
+            "description": "The page's runs in sessions the caller can read.",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRun"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Pass it as `before` for the next page; `None` on the last page.",
+            "title": "Next Cursor"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "description": "Discriminator; always `\"list\"`.",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "WorkflowRunList",
+        "type": "object"
+      },
+      "WorkflowRunProgress": {
+        "description": "Where a run's steps stand: the steps of the plan that started it, counted\nby their current status in the session.",
+        "properties": {
+          "done": {
+            "default": 0,
+            "description": "Steps done.",
+            "format": "int64",
+            "title": "Done",
+            "type": "integer"
+          },
+          "failed": {
+            "default": 0,
+            "description": "Steps that failed.",
+            "format": "int64",
+            "title": "Failed",
+            "type": "integer"
+          },
+          "needs_input": {
+            "default": 0,
+            "description": "Steps waiting for the user.",
+            "format": "int64",
+            "title": "Needs Input",
+            "type": "integer"
+          },
+          "started": {
+            "default": 0,
+            "description": "Steps in progress.",
+            "format": "int64",
+            "title": "Started",
+            "type": "integer"
+          },
+          "total": {
+            "description": "Steps in that plan, e.g. `5`.",
+            "format": "int64",
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total"
+        ],
+        "title": "WorkflowRunProgress",
         "type": "object"
       },
       "WorkflowStep": {
@@ -17696,6 +18228,79 @@
         ]
       }
     },
+    "/v1/scheduled-tasks/{scheduled_task_id}/run-steps": {
+      "get": {
+        "description": "The plan steps of one page of a scheduled task's runs, for their timelines.\n\nPages like `GET /scheduled-tasks/{id}/runs`, most recent first. Each\nrun that wrote a plan lists the steps of its first plan and each step's\nnewest status entry: one run-index lookup per run, then one\nkind-and-step lookup per step. The response is `{\"runs\": [{\"run_id\", \"workflow_id\", \"steps\", \"statuses\"}], \"next_cursor\"}`.",
+        "operationId": "list_scheduled_task_run_steps_v1_scheduled_tasks__scheduled_task_id__run_steps_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Scheduled Task Run Steps V1 Scheduled Tasks  Scheduled Task Id  Run Steps Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Scheduled Task Run Steps",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
     "/v1/scheduled-tasks/{scheduled_task_id}/runs": {
       "get": {
         "description": "List the run history for one of the caller's scheduled tasks.\n\nOwner-scoped: a task owned by someone else (or absent) 404s via\n`_require_owned`, so runs aren't enumerable across users. Runs come\nback most-recent-first (`scheduled_at DESC`); an empty history is an\nempty list.\n\nCursor-paginated so history is never silently truncated: pass `limit`\n(1-1000, default 100) and `after` (a prior page's `next_cursor`).\nThe response is `{\"runs\": [...], \"next_cursor\": <id or null>}`; a\n`null` cursor marks the last page.\n\nLazy-on-read backstop: before listing, force-fail any of this task's\nruns still `running` past the 6h max age (`incomplete`). Completion\nitself is event-driven (the `_publish_status` hook); this only\ncatches a genuine orphan \u2014 a run whose terminal event never fired (host\ndied mid-turn) \u2014 so the \"every run eventually terminal\" invariant holds\nwithout a background poll or startup sweep. Pure age check (no\nconversation I/O); a young in-flight run is untouched, and the\nconditional `update_run` never clobbers an already-terminal row.",
@@ -19101,7 +19706,7 @@
     },
     "/v1/sessions/{session_id}/comments": {
       "get": {
-        "description": "List comments for a session, optionally filtered by file.\n\nRequires `LEVEL_READ` on the session in multi-user mode.\n\n**Returns:** List of serialized comment dicts.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks read permission.",
+        "description": "List comments for a session, optionally filtered by file.\n\nRequires `LEVEL_READ` on the session in multi-user mode.\n\n**Returns:** A Files-only array, or a page in ID order when opted in. Path filtering happens after paging; follow next_cursor even when comments is empty. Pagination parameters apply only to this mode.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks read permission.",
         "operationId": "list_comments_v1_sessions__session_id__comments_get",
         "parameters": [
           {
@@ -19130,6 +19735,48 @@
               ],
               "title": "Path"
             }
+          },
+          {
+            "description": "Opt in to bounded pages including PR anchors. Legacy callers receive the Files-only array.",
+            "in": "query",
+            "name": "include_pr_comments",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Pr Comments",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Maximum rows examined per page, plus one continuation row.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Exclusive comment ID from the previous page's next_cursor.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{32}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
           }
         ],
         "responses": {
@@ -19137,12 +19784,19 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "additionalProperties": true,
-                    "type": "object"
-                  },
-                  "title": "Response List Comments V1 Sessions  Session Id  Comments Get",
-                  "type": "array"
+                  "anyOf": [
+                    {
+                      "items": {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommentPage"
+                    }
+                  ],
+                  "title": "Response List Comments V1 Sessions  Session Id  Comments Get"
                 }
               }
             },
@@ -19467,6 +20121,24 @@
               "pattern": "^(asc|desc)$",
               "title": "Order",
               "type": "string"
+            }
+          },
+          {
+            "description": "Only items of this type, e.g. `\"message\"`; `None` lists every type. An unknown type is a 422.",
+            "in": "query",
+            "name": "type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^(message|function_call|function_call_output|error|reasoning|compaction|native_tool|resource_event|routing_decision|slash_command|terminal_command)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Type"
             }
           }
         ],
@@ -22669,6 +23341,48 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/github/merge-as": {
+      "post": {
+        "description": "Merge the selected PR as the account the merge dialog showed.\n\nA route apart from `/merge`, so a server, runner, or host that can't\nbind the account refuses the request instead of merging as the saved one.\n\n**Returns:** A `session.github.pr_merge`.",
+        "operationId": "merge_session_github_pr_as_v1_sessions__session_id__resources_github_merge_as_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Merge Session Github Pr As",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/github/merge-options": {
       "get": {
         "description": "List the merge methods the selected PR's repository allows, for the merge dialog.\n\nRequires edit access, like the merge it feeds. Falls back to the host\ntunnel when the runner is offline.\n\n**Returns:** A `session.github.merge_options` with `methods` and `default`.",
@@ -23410,6 +24124,60 @@
         "summary": "Get Session Resource",
         "tags": [
           "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/rewind": {
+      "post": {
+        "description": "Rewind a Claude session to just before one of its prompts.\n\nForks the session with the history before `body.item_id` onto the\nsame host, workspace and runner, links the source to the fork, and\nredirects live viewers there. The source keeps its full history. A\nclaude-native fork rebuilds Claude's transcript from the kept items.\nAdvertised by `GET /v1/info` `session_rewind`.\n\n**Parameters**\n\n- `body` \u2014 The prompt to rewind to.\n\n**Returns:** The new session id and the chosen prompt's text.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 for a harness without `/rewind`, an item that is not one of the session's prompts, a sub-agent, or a running turn; 403/404 when the caller does not own the session; 503 when neither its runner nor its host can take the fork.",
+        "operationId": "rewind_session_v1_sessions__session_id__rewind_post",
+        "parameters": [
+          {
+            "description": "Session to rewind, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionRewindRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionRewindResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rewind Session",
+        "tags": [
+          "sessions"
         ]
       }
     },
@@ -24214,6 +24982,79 @@
           }
         },
         "summary": "Update Workflow",
+        "tags": [
+          "workflows"
+        ]
+      }
+    },
+    "/v1/workflows/{workflow_id}/runs": {
+      "get": {
+        "description": "List one of the caller's workflows' runs, newest first.\n\nA run is the plan that named the workflow, so a session that ran it\ntwice is listed twice. Sessions the caller can't read are left out.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow, 400 for an invalid cursor.",
+        "operationId": "list_workflow_runs_v1_workflows__workflow_id__runs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, e.g. `20`.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The previous page's `next_cursor`.",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRunList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Workflow Runs",
         "tags": [
           "workflows"
         ]

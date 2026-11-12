@@ -786,3 +786,22 @@ async def test_agent_contents_404_for_nonexistent_session(
     """GET /v1/sessions/{id}/agent/contents returns 404 for a missing session."""
     resp = await client.get("/v1/sessions/conv_nonexistent/agent/contents")
     assert resp.status_code == 404
+
+
+async def test_archive_passes_the_servers_sandbox_config_to_the_teardown(
+    app, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The archive teardown gets the deployment config that decides a sandbox stop."""
+    session = await create_test_session(client, name="archive-sandbox-stop")
+    sandbox_config, host_store = object(), object()
+    monkeypatch.setattr(app.state, "sandbox_config", sandbox_config, raising=False)
+    monkeypatch.setattr(app.state, "host_store", host_store, raising=False)
+    stop_sandbox = AsyncMock(return_value=False)
+    with patch.object(_sessions_orchestration, "stop_archived_session_sandbox", stop_sandbox):
+        resp = await client.patch(f"/v1/sessions/{session['id']}", json={"archived": True})
+        await _drain_detached_stops()
+    assert resp.status_code == 200, resp.text
+    (call,) = stop_sandbox.await_args_list
+    conv, passed_host_store, _conversations, passed_config = call.args
+    assert conv.id == session["id"] and conv.archived is True
+    assert passed_host_store is host_store and passed_config is sandbox_config

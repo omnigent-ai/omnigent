@@ -25,6 +25,7 @@ class Feature(StrEnum):
 
     SANDBOX_PROFILES = "sandbox_profiles"
     SESSION_ORCHESTRATION = "session_orchestration"
+    SCRIPTED_SESSIONS = "scripted_sessions"
     SIBLING_SESSIONS = "sibling_sessions"
     PEER_SESSION_MESSAGING = "peer_session_messaging"
     CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
@@ -81,6 +82,13 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         # The Automations page offers trigger templates only when managers can
         # start workers.
         default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.SCRIPTED_SESSIONS,
+        description="Explicit host placement and PR linking for scripted sessions",
+        owner="server",
+        review_by_release="0.24.0",
+        frontend_visible=False,
     ),
     FeatureDefinition(
         feature=Feature.SIBLING_SESSIONS,

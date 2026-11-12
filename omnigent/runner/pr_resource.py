@@ -39,6 +39,7 @@ from omnigent.git_providers import (
 from omnigent.runner import pr_reports
 from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
+    AccountMergeFacet,
     CommitCompareFacet,
     CommitsFacet,
     PinnedRevisionFacet,
@@ -801,6 +802,15 @@ def pr_merge_options(
     return facet.merge_options(root, reference)
 
 
+def _merge_request(merge_method: object, expected_head: object) -> tuple[str, str]:
+    """Validate a merge's method and head, which must reach the provider unchanged."""
+    if not isinstance(merge_method, str) or merge_method not in _MERGE_METHODS:
+        raise ValueError("Expected merge_method to be merge, squash, or rebase")
+    if not isinstance(expected_head, str) or not _COMMIT_SHA.fullmatch(expected_head):
+        raise ValueError("Expected expected_head to be the pull request's head commit SHA")
+    return merge_method, expected_head
+
+
 def merge_pr(
     root: str,
     *,
@@ -817,12 +827,43 @@ def merge_pr(
     :raises ValueError: On an unknown method or malformed SHA, without a
         selected tracked PR, or when the provider refuses the merge.
     """
-    if not isinstance(merge_method, str) or merge_method not in _MERGE_METHODS:
-        raise ValueError("Expected merge_method to be merge, squash, or rebase")
-    if not isinstance(expected_head, str) or not _COMMIT_SHA.fullmatch(expected_head):
-        raise ValueError("Expected expected_head to be the pull request's head commit SHA")
+    method, head = _merge_request(merge_method, expected_head)
     facet, reference = _merge_target(session_id, pr_url)
-    return facet.merge(root, reference, merge_method=merge_method, expected_head=expected_head)
+    return facet.merge(root, reference, merge_method=method, expected_head=head)
+
+
+def merge_pr_as(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    merge_method: object = None,
+    expected_head: object = None,
+    account: object = None,
+) -> dict[str, Any]:
+    """Merge like :func:`merge_pr`, as ``account``, the account the user confirmed.
+
+    The merge runs as ``account`` even when the panel's view of the saved account
+    is stale, and ``account`` becomes the PR's account for later requests.
+
+    :raises ValueError: Also on a missing account, or when the provider can't
+        merge as a chosen account. It never merges as the saved account instead.
+    """
+    method, head = _merge_request(merge_method, expected_head)
+    if not isinstance(account, str) or not account.strip():
+        raise ValueError("Expected account to be an account login")
+    facet, reference = _merge_target(session_id, pr_url)
+    capabilities = facet.capabilities
+    if not (
+        capabilities.account_switching
+        and capabilities.merge_as_account
+        and isinstance(facet, AccountMergeFacet)
+    ):
+        raise ValueError("This provider can't merge as a chosen account.")
+    facet.set_preference(root, reference, account=account, remote=None)
+    return facet.merge_as(
+        root, reference, merge_method=method, expected_head=head, account=account
+    )
 
 
 def disable_pr_auto_merge(

@@ -47,7 +47,10 @@ from omnigent.onboarding.sandboxes.profiles import SandboxProfileSummary
 
 # ── Shared ──────────────────────────────────────────────────────
 
-McpRegistryServiceId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,39}$")]
+MCP_REGISTRY_SERVICE_ID_PATTERN = r"^[a-z][a-z0-9_-]{0,39}$"
+# Most registry services one session (or automation) can select.
+MAX_MCP_REGISTRY_SERVICES = 40
+McpRegistryServiceId = Annotated[str, Field(pattern=MCP_REGISTRY_SERVICE_ID_PATTERN)]
 
 
 class PaginatedList(BaseModel):
@@ -1708,6 +1711,12 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
         non-native sessions. Mirrors the multipart create path
         (:class:`SessionCreateMetadata`). See
         designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
+    :param permission_mode: Optional native permission mode for the new
+        session's harness, e.g. ``"approve-for-me"`` for Codex, which the
+        server turns into launch args. Set by ``sys_session_create``. Modes
+        that skip approval are refused, and it can't be combined with
+        ``terminal_launch_args`` or ``sub_agent_name``. ``None`` keeps the
+        agent's default.
     :param model_override: Optional per-session LLM model override to
         persist at create time, e.g. ``"databricks-claude-sonnet-4-6"``.
         Set by ``sys_session_send``'s per-dispatch ``model`` arg so the
@@ -1768,7 +1777,9 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     project_id: str | None = None
     initial_items: list[SessionEventInput] = Field(default_factory=list)
     initial_input: SessionStartupInput | None = None
-    mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
+    mcp_registry_services: list[McpRegistryServiceId] = Field(
+        default_factory=list, max_length=MAX_MCP_REGISTRY_SERVICES
+    )
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
     sibling_source_id: str | None = None
@@ -1784,6 +1795,7 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     workspaces: list[str] | None = None
     git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
+    permission_mode: str | None = Field(default=None, min_length=1, max_length=64)
     model_override: str | None = None
     reasoning_effort: str | None = None
     cost_control_mode_override: str | None = None
@@ -2016,7 +2028,9 @@ class SessionCreateMetadata(_SandboxProfileSelection):
 
     inference_configuration_revision: str | None = None
 
-    mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
+    mcp_registry_services: list[McpRegistryServiceId] = Field(
+        default_factory=list, max_length=MAX_MCP_REGISTRY_SERVICES
+    )
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     project_id: str | None = None
@@ -3140,6 +3154,66 @@ class SessionManagedHostRequest(BaseModel):
             self.host_id, [self.workspace] if self.workspace is not None else []
         )
         return self
+
+
+class SessionRewindRequest(BaseModel):
+    """
+    Request body for ``POST /v1/sessions/{session_id}/rewind``.
+
+    :param item_id: The session's user prompt to rewind to, e.g.
+        ``"msg_abc123"``. The new session keeps only the history before it.
+    """
+
+    item_id: str = Field(min_length=1, max_length=256)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SessionRewindAttachment(BaseModel):
+    """
+    A file the chosen ``/rewind`` prompt attached, as the rewound session holds it.
+
+    Exactly one of *file_id*, *image_url* and *file_data* is set.
+
+    :param type: The prompt's content block type, ``"input_file"`` or
+        ``"input_image"``.
+    :param file_id: The rewound session's copy of the file, e.g. ``"file_abc"``;
+        read it from ``/v1/sessions/{session_id}/resources/files/{file_id}``.
+    :param image_url: An image the prompt carried inline instead of as a stored
+        file, as a ``data:image/...`` URI (e.g. from a session imported from
+        another harness); the client uploads it on send like any attachment.
+    :param file_data: A document the prompt carried inline instead of as a
+        stored file, as a base64 ``data:`` URI, e.g.
+        ``"data:application/pdf;base64,..."``; uploaded on send like
+        *image_url*.
+    :param filename: The attachment's name, e.g. ``"diagram.png"``.
+    """
+
+    type: Literal["input_file", "input_image"]
+    file_id: str | None = None
+    image_url: str | None = None
+    file_data: str | None = None
+    filename: str
+
+
+class SessionRewindResponse(BaseModel):
+    """
+    Result of ``POST /v1/sessions/{session_id}/rewind``.
+
+    :param session_id: The rewound session that continues the work, e.g.
+        ``"conv_new"``. The source session gets a notice linking to it.
+    :param prompt: Text of the chosen prompt, for the client to put back in
+        the composer, e.g. ``"Add a test for the parser"``.
+    :param attachments: The prompt's attachments, in prompt order, for the
+        client to put back in the composer; empty when it had none.
+    :param attachments_incomplete: Some attachments could not be restored;
+        warn the user to attach them again before sending.
+    """
+
+    session_id: str
+    prompt: str
+    attachments: list[SessionRewindAttachment] = Field(default_factory=list)
+    attachments_incomplete: bool = False
 
 
 class ReadStatePutRequest(BaseModel):
@@ -4803,7 +4877,7 @@ class SessionCreatedEvent(_SSEEventBase):
 
 
 # Why a session's work moved to another session (``session.superseded``).
-SupersessionReason = Literal["clear"]
+SupersessionReason = Literal["clear", "rewind"]
 
 
 class SessionSupersededEvent(_SSEEventBase):
@@ -4835,9 +4909,8 @@ class SessionSupersededEvent(_SSEEventBase):
         event rides the stream of, e.g. ``"conv_old"``.
     :param target_conversation_id: The conversation to follow to, e.g.
         ``"conv_new"``.
-    :param reason: Why the session was superseded. Currently always
-        ``"clear"`` (a Claude Code ``/clear``); kept as a field so the
-        client can branch on future supersession causes.
+    :param reason: Why the session was superseded: ``"clear"`` (a
+        ``/clear``) or ``"rewind"`` (a ``/rewind`` onto a truncated fork).
     """
 
     type: Literal["session.superseded"]

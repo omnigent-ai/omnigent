@@ -209,7 +209,8 @@ function restoreSourcePrompt(
     saved === null ||
     (saved.agentId === workerSettings.agentId &&
       saved.model === workerSettings.model &&
-      saved.effort === workerSettings.effort)
+      saved.effort === workerSettings.effort &&
+      saved.permissionMode === workerSettings.permissionMode)
   ) {
     return restored;
   }
@@ -275,6 +276,10 @@ export function CreateScheduledTaskDialog({
     info !== "loading" && info.scheduled_task_sandbox_workspaces === true && info.sandbox_provider
       ? (info.sandbox_provider_capabilities?.[info.sandbox_provider]?.repo_catalog ?? [])
       : [];
+  const sandboxAutomationNotice =
+    info !== "loading" && info.sandbox_provider
+      ? (info.sandbox_provider_automation_notices?.[info.sandbox_provider] ?? null)
+      : null;
 
   const {
     data: projects = [],
@@ -791,6 +796,16 @@ export function CreateScheduledTaskDialog({
     harnessSettings.harness !== "claude-native" && permissionChoice === "default"
       ? ""
       : permissionChoice;
+  const sessionPermissionModesSupported =
+    info !== "loading" && info.session_create_permission_modes === true;
+  // A new template's workers run the polling session's agent, so its mode applies to them,
+  // except one that skips approval, which the server refuses for a session an agent starts.
+  const workerPermissionMode =
+    sessionPermissionModesSupported &&
+    effectivePermission !== "" &&
+    !APPROVAL_SKIPPING_PERMISSION_MODES.has(effectivePermission)
+      ? effectivePermission
+      : undefined;
   const originalTargetSelected =
     editingTask?.executionTarget === "managed_sandbox"
       ? sandboxMode
@@ -957,16 +972,18 @@ export function CreateScheduledTaskDialog({
             schedule.preset === "custom" && schedule.customFreq === "minutely"
               ? schedule.interval
               : 60,
-          // A switched edit keeps the saved workers' harness, model, and effort.
+          // A switched edit keeps the saved workers' harness, model, effort, and mode.
           ...(workerSettings !== null
             ? {
                 agentId: workerSettings.agentId,
                 model: workerSettings.model || undefined,
                 effort: workerSettings.effort || undefined,
+                permissionMode: workerSettings.permissionMode || undefined,
               }
             : {
                 model: supportsModel && pickedModel !== "" ? pickedModel : undefined,
                 effort: supportsModel && pickedEffort !== "" ? pickedEffort : undefined,
+                permissionMode: workerPermissionMode,
               }),
           taskSessionMode: triggerTaskSessionMode,
           taskSessionTitle: name,
@@ -1554,6 +1571,14 @@ export function CreateScheduledTaskDialog({
                         This host is offline. Runs fail until it reconnects.
                       </p>
                     )}
+                    {sandboxMode && sandboxAutomationNotice && (
+                      <p
+                        className="text-sm text-muted-foreground"
+                        data-testid="task-sandbox-automation-notice"
+                      >
+                        {sandboxAutomationNotice}
+                      </p>
+                    )}
                   </div>
 
                   {editingWorkerSettings ? (
@@ -1970,6 +1995,7 @@ export function CreateScheduledTaskDialog({
                         <TriggerWorkerSettingsFields
                           value={workerSettings}
                           settings={workerHarnessSettings}
+                          permissionModesSupported={sessionPermissionModesSupported}
                           taskSession={sendsToTaskSession}
                           disabled={curationPending}
                           onSelectOpenChange={handleSelectOpenChange}

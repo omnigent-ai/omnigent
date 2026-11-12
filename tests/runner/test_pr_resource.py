@@ -43,6 +43,7 @@ GITHUB_CAPABILITIES = {
     "details_editing": True,
     "attachment_uploads": True,
     "commit_history": True,
+    "merge_as_account": True,
 }
 # An ssh config host alias (``Host github.com-work`` / ``HostName github.com``).
 ALIAS_ORIGIN = "git@github.com-work:o/r.git"

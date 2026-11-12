@@ -147,6 +147,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     antigravity: "Antigravity",
     copilot: "Copilot",
   }),
+  useFileMentionHarnesses: () => new Set<string>(),
 }));
 
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";

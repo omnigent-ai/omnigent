@@ -1085,7 +1085,8 @@ def register_resources_routes(
         :param op: Host-side write op — ``"github_set_preference"``,
             ``"github_prs_update"``, ``"github_labels_update"``,
             ``"github_reviewers_update"``, ``"github_details_update"``,
-            ``"github_comment_create"``, ``"github_attachment_upload"``, ``"github_merge"``, or
+            ``"github_comment_create"``, ``"github_attachment_upload"``, ``"github_merge"``,
+            ``"github_merge_as"``, or
             ``"github_disable_auto_merge"``.
         :param host_params: Op-specific args for the host writer.
         :param timeout: Seconds to wait for the host; the tunnel's default when ``None``.
@@ -3795,6 +3796,11 @@ def register_resources_routes(
             runner_path=f"/v1/sessions/{session_id}/resources/github/commits",
         )
 
+    @router.post(
+        "/sessions/{session_id}/resources/github/prs/orchestrated",
+        response_model=None,
+        include_in_schema=False,
+    )
     @router.post("/sessions/{session_id}/resources/github/prs", response_model=None)
     async def update_session_github_pr(request: Request, session_id: str) -> dict[str, Any]:
         """
@@ -3808,6 +3814,25 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :returns: The refreshed ``session.github.info`` object.
         """
+        from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+        from omnigent.server.session_orchestration import require_orchestration_source
+
+        if request.url.path.endswith("/prs/orchestrated") and not request.headers.get(
+            ORCHESTRATION_SOURCE_HEADER
+        ):
+            raise OmnigentError(
+                "PR linking requires an orchestration source", code=ErrorCode.FORBIDDEN
+            )
+        if ORCHESTRATION_SOURCE_HEADER in request.headers:
+            if not request.app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS):
+                raise OmnigentError("Scripted sessions are disabled", code=ErrorCode.FORBIDDEN)
+            await asyncio.to_thread(
+                require_orchestration_source,
+                request,
+                _get_user_id(request, auth_provider),
+                conversation_store,
+                permission_store,
+            )
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         body = await request.json()
         if not isinstance(body, dict) or not isinstance(body.get("url"), str):
@@ -3997,6 +4022,44 @@ def register_resources_routes(
                 "pr_url": body["pr_url"],
                 "merge_method": body.get("merge_method"),
                 "expected_head": body.get("expected_head"),
+            },
+            failure_detail="Cannot merge the pull request",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/merge-as",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def merge_session_github_pr_as(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Merge the selected PR as the account the merge dialog showed.
+
+        A route apart from ``/merge``, so a server, runner, or host that can't
+        bind the account refuses the request instead of merging as the saved one.
+
+        :param request: JSON body with the ``/merge`` fields and ``account``, the
+            login the merge runs as.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_merge``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        account = body.get("account")
+        if not isinstance(account, str) or not account.strip():
+            raise HTTPException(status_code=400, detail="Expected an account to merge as")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/merge-as",
+            host_op="github_merge_as",
+            params={
+                "pr_url": body["pr_url"],
+                "merge_method": body.get("merge_method"),
+                "expected_head": body.get("expected_head"),
+                "account": account,
             },
             failure_detail="Cannot merge the pull request",
         )

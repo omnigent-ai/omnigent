@@ -113,6 +113,7 @@ from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_gateway import McpGatewayBackend
 from omnigent.server.mcp_pool import ServerMcpPool
+from omnigent.server.openapi_stream_events import install_stream_event_schemas
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
     ServerPerformanceMetrics,
@@ -172,6 +173,7 @@ from omnigent.server.server_config import (
     RESTRICT_TO_AGENT_NAMES_KEY,
     PickerCuration,
 )
+from omnigent.server.session_mcp_selection import SessionMcpSelection
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -273,6 +275,10 @@ class ServerInfoResponse(BaseModel):
     # ``{"agent_sandbox": {"multi_repo": true}}``. The web branches on these
     # (multi-repo picker vs single). Providers absent from the map default off.
     sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
+    # What each launchable provider's unattended runs need from their owner, e.g.
+    # ``{"agent_sandbox": "Keep your laptop signed in."}``. The automation form
+    # shows the run target's notice. Providers without one are absent.
+    sandbox_provider_automation_notices: dict[str, str] = {}
     enabled_connections: list[str]
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
@@ -304,11 +310,16 @@ class ServerInfoResponse(BaseModel):
     # Scheduled tasks accept ``source_session_id``: each run starts from a copy
     # of a session. Older servers reject it.
     scheduled_task_source_sessions: bool = True
+    # Scheduled tasks accept ``mcp_services``; older servers reject it.
+    scheduled_task_mcp_services: bool = True
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
     automation_trigger_poll_minutes: int = 10
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
+    # Session creates accept ``permission_mode``; older servers ignore it.
+    session_create_permission_modes: bool = True
+    scripted_sessions: bool = False
     # Scheduled tasks accept explicit modes that skip approval; servers that omit
     # this may reject them, so clients hide those modes.
     scheduled_task_approval_skipping_modes: bool = True
@@ -343,6 +354,9 @@ class ServerInfoResponse(BaseModel):
     # Declining a non-blocking Codex question card leaves the turn running; older
     # servers interrupt Codex, so the forwarder keeps those questions in the terminal.
     codex_nonblocking_decline: bool = False
+    # POST /v1/sessions/{id}/rewind and GET .../items?type=; absent on older servers,
+    # which clients treat as unsupported.
+    session_rewind: bool = False
     # GET/DELETE /v1/sessions/{id}/pull-requests and SessionListItem.pull_request;
     # absent on older servers, which clients treat as unsupported.
     session_pull_requests: bool = False
@@ -356,6 +370,8 @@ class ServerInfoResponse(BaseModel):
     # which clients treat as unsupported.
     session_title_instructions: bool = False
     admin_view: bool = False
+    # Session comments accept and preserve immutable PR coordinates.
+    comment_anchor_metadata: bool = True
     # Absent on older servers, which clients treat as the default extensions.
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     # Scheduled tasks accept ``project_id``; older servers reject it.
@@ -1700,6 +1716,7 @@ def create_app(
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
+    session_mcp_selection: SessionMcpSelection | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1746,6 +1763,9 @@ def create_app(
     :param scheduled_task_dispatch: Overrides for automations_v2: host ownership,
         the owner identity fires act under, or a replacement executor. ``None``
         uses the built-in executor with every host owned by this replica.
+    :param session_mcp_selection: How sessions the server creates for an owner
+        (scheduled-task fires and the workers a session starts) record their MCP
+        services. ``None`` uses the MCP registry's labels.
     :param scheduled_task_scheduler_config: Overrides the server config's
         scheduled_task_scheduler section. With automations_v2 off, only
         startup_retry_seconds applies. Changes require restarting the app.
@@ -2402,8 +2422,10 @@ def create_app(
     app.state.startup_inputs = startup_inputs
     app.state.permission_store = permission_store
     app.state.host_store = host_store
+    app.state.scheduled_task_store = scheduled_task_store
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
+    app.state.session_mcp_selection = session_mcp_selection
     app.state.mcp_registry_auth = auth_provider
     app.state.runner_tunnel_tokens = runner_tunnel_tokens
 
@@ -3687,11 +3709,13 @@ def create_app(
         sandbox_provider = None
         sandbox_providers: list[str] = []
         sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
+        sandbox_provider_automation_notices: dict[str, str] = {}
         if sandbox_config is not None and sandbox_config.managed_launch_supported:
             managed_sandboxes_enabled = True
             sandbox_provider = sandbox_config.default.provider
             sandbox_providers = list(sandbox_config.launchable_providers())
             sandbox_provider_capabilities = sandbox_config.provider_ui_capabilities()
+            sandbox_provider_automation_notices = sandbox_config.provider_automation_notices()
         # enabled_connections lists the connection providers this deploy has
         # wired (config + store present), in a stable order. The web UI shows
         # the Sandbox Integrations nav when the list is non-empty and renders
@@ -3772,6 +3796,7 @@ def create_app(
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
+                "sandbox_provider_automation_notices": sandbox_provider_automation_notices,
                 "enabled_connections": enabled_connections,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
@@ -3788,6 +3813,7 @@ def create_app(
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
                 "session_list_scoped_archives": True,
+                "scripted_sessions": app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS),
                 "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
@@ -3800,6 +3826,7 @@ def create_app(
                 "session_event_types": sorted(CLIENT_SESSION_EVENT_TYPES),
                 "session_claude_sdk_clear": True,
                 "codex_nonblocking_decline": True,
+                "session_rewind": True,
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
                 is not None,
                 "session_journal": session_journal.open_store(conversation_store) is not None,
@@ -5573,6 +5600,7 @@ def create_app(
         # no per-request cost.
         app.add_middleware(BasePathMiddleware, base_path=resolved_base_path)
 
+    install_stream_event_schemas(app)
     return app
 
 
