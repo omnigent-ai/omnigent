@@ -597,7 +597,12 @@ def test_grant_many_refuses_the_whole_call_when_the_actor_is_revoked(
 def test_grant_many_refreshes_a_cached_resolve_access(
     grant_many: GrantMany, store: SqlAlchemyPermissionStore, db_uri: str
 ) -> None:
-    """A positive resolve_access cached before grant_many reflects the raised grant."""
+    """A positive resolve_access cached before grant_many reflects the raised grant.
+
+    The second half requests a spelling that differs only in case. A case-insensitive
+    database matches it to the stored row, so the returned grant is the stored
+    spelling. The cached access must agree with the database on any engine.
+    """
     conv_id = _create_conversation(db_uri)
     _seed_grant(store, "vic@example.com", conv_id, 1)
     assert store.resolve_access("vic@example.com", conv_id).user_grant_level == 1
@@ -607,6 +612,62 @@ def test_grant_many_refreshes_a_cached_resolve_access(
     assert store.resolve_access("vic@example.com", conv_id).user_grant_level == 3, (
         "The cached read must be evicted when grant_many raises the grant."
     )
+
+    _seed_grant(store, "wren@example.com", conv_id, 1)
+    assert store.resolve_access("wren@example.com", conv_id).user_grant_level == 1
+
+    written = grant_many(conv_id, [("WREN@example.com", 2)])
+
+    assert [grant.level for grant in written] == [2], f"Expected one raised grant, got {written}."
+    stored = store.get(written[0].user_id, conv_id)
+    assert stored is not None and stored.level == 2, "The returned grant must be stored at 2."
+    session_user_ids = {row.user_id for row in store.list_for_session(conv_id, limit=100)[0]}
+    assert written[0].user_id in session_user_ids, (
+        "The returned user_id must be the stored spelling."
+    )
+    assert store.resolve_access(written[0].user_id, conv_id).user_grant_level == 2
+    original = store.get("wren@example.com", conv_id)
+    assert original is not None
+    assert store.resolve_access("wren@example.com", conv_id).user_grant_level == original.level, (
+        "The cached access for the requested spelling must agree with the database."
+    )
+
+
+def test_grant_many_returns_a_mixed_case_duplicate_by_its_stored_spelling(
+    grant_many: GrantMany, store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """Mixed-case spellings of one ID in one call are granted, and returned IDs match the database.
+
+    A case-insensitive database holds one row for both spellings, and a case-sensitive
+    one holds two. On either, the highest requested level is stored, each returned grant
+    matches the database, and cached access agrees with it.
+    """
+    conv_id = _create_conversation(db_uri)
+    _seed_grant(store, "dan-dup@example.com", conv_id, 1)
+    assert store.resolve_access("dan-dup@example.com", conv_id).user_grant_level == 1
+
+    written = grant_many(conv_id, [("Dan-dup@example.com", 1), ("DAN-DUP@example.com", 3)])
+
+    assert written, "The raised grant must be returned."
+    assert max(grant.level for grant in written) == 3, f"Expected level 3, got {written}."
+    session_user_ids = {row.user_id for row in store.list_for_session(conv_id, limit=100)[0]}
+    assert {grant.user_id for grant in written} <= session_user_ids, (
+        "Returned user_ids must be the stored spelling."
+    )
+    for grant in written:
+        stored = store.get(grant.user_id, conv_id)
+        assert stored is not None and stored.level == grant.level, (
+            f"Returned {grant} but the database holds {stored}."
+        )
+    for requested_id, requested_level in (("Dan-dup@example.com", 1), ("DAN-DUP@example.com", 3)):
+        stored = store.get(requested_id, conv_id)
+        assert stored is not None and stored.level >= requested_level
+    for spelling in ("dan-dup@example.com", "Dan-dup@example.com", "DAN-DUP@example.com"):
+        stored = store.get(spelling, conv_id)
+        assert stored is not None
+        assert store.resolve_access(spelling, conv_id).user_grant_level == stored.level, (
+            f"Cached access for {spelling!r} disagrees with the database."
+        )
 
 
 def test_grant_many_on_a_store_that_reorders_levels_runs_the_default_loop(db_uri: str) -> None:

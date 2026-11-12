@@ -123,9 +123,10 @@ class PermissionStore(ABC):
         :param grants: ``(user_id, level)`` pairs, e.g.
             ``[("alice@example.com", 1)]``. An empty list writes nothing.
         :returns: The grants now stored at the requested level that were missing or
-            lower when the call began, in the first-appearance order of their user
-            IDs. A concurrent writer that stored the same level may also appear, which
-            is accepted.
+            lower when the call began. Each ``user_id`` is the stored spelling, which
+            can differ from the request on a case-insensitive database. The order
+            follows the request. A concurrent writer that stored the same level may
+            also appear, which is accepted.
         """
         written: list[SessionPermission] = []
         for user_id, level in self._collapse_grants(grants).items():
@@ -134,7 +135,9 @@ class PermissionStore(ABC):
                 if not self._should_write_grant(level, existing.level if existing else None):
                     continue
                 self.ensure_user(user_id)
-                written.append(self.grant(user_id, conversation_id, level))
+                granted = self.grant(user_id, conversation_id, level)
+                # Re-read so the returned user_id is the stored spelling.
+                written.append(self.get(user_id, conversation_id) or granted)
             except OmnigentError as error:
                 logger.warning("grant_many skipped grantee %r: %s", user_id, error)
         return written

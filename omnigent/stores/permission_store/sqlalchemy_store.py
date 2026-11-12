@@ -226,8 +226,11 @@ class SqlAlchemyPermissionStore(PermissionStore):
         read is never lowered.
 
         The result lists the grants now stored at the requested level that were
-        missing or lower when the call began. A concurrent writer that stored the
-        same level in that window may also appear, which is accepted.
+        missing or lower when the call began. Each ``user_id`` is the stored
+        spelling, which can differ from the request on a case-insensitive database,
+        where one row matches several spellings. A concurrent writer that stored the
+        same level in that window may also appear, which is accepted. The session's
+        cached access is evicted whenever the upsert runs.
 
         Callers pin each grantee with ``target_account_scope``, as the share route
         does, to refuse a replaced account. An unpinned grantee is only checked for
@@ -248,15 +251,17 @@ class SqlAlchemyPermissionStore(PermissionStore):
         if not requested:
             return []
 
-        def write(session: Session) -> tuple[list[SessionPermission], frozenset[str]]:
+        def write(session: Session) -> tuple[list[SessionPermission], frozenset[str], bool]:
             workspace_id = current_workspace_id()
             refused = lock_grantee_accounts(session, list(requested))
             grantable = {
                 user_id: level for user_id, level in requested.items() if user_id not in refused
             }
             if not grantable:
-                return [], refused
-            existing = {
+                return [], refused, False
+            # Rows are keyed by their stored spelling. On a case-insensitive database
+            # one row can match several requested spellings.
+            before = {
                 row.user_id: row.level
                 for row in session.execute(
                     select(SqlSessionPermission.user_id, SqlSessionPermission.level)
@@ -272,35 +277,53 @@ class SqlAlchemyPermissionStore(PermissionStore):
             to_write = {
                 user_id: level
                 for user_id, level in grantable.items()
-                if self._should_write_grant(level, existing.get(user_id))
+                if self._should_write_grant(level, before.get(user_id))
             }
             if not to_write:
-                return [], refused
+                return [], refused, False
             session.execute(self._insert_missing_users(list(to_write)))
             session.execute(self._upsert_grants(conversation_id, to_write, only_raise=True))
-            stored = {
+            after = {
                 row.user_id: row.level
                 for row in session.execute(
-                    select(SqlSessionPermission.user_id, SqlSessionPermission.level).where(
+                    select(SqlSessionPermission.user_id, SqlSessionPermission.level)
+                    .where(
                         SqlSessionPermission.workspace_id == workspace_id,
                         SqlSessionPermission.conversation_id == conversation_id,
                         SqlSessionPermission.user_id.in_(list(to_write)),
                     )
+                    .order_by(SqlSessionPermission.user_id)
                 )
             }
-            written = [
-                SessionPermission(user_id=user_id, conversation_id=conversation_id, level=level)
-                for user_id, level in to_write.items()
-                if stored.get(user_id) == level
+            # Compare stored rows, not request spellings: a row counts when it was absent
+            # or raised, and now holds a level this call requested. A concurrent raise
+            # above the request is left out.
+            requested_levels = set(to_write.values())
+            written_rows = [
+                (stored_user_id, level)
+                for stored_user_id, level in after.items()
+                if level in requested_levels
+                and (stored_user_id not in before or level > before[stored_user_id])
             ]
-            return written, refused
+            # Request order where the stored spelling matches the request; others last.
+            request_position = {user_id: index for index, user_id in enumerate(to_write)}
+            written_rows.sort(
+                key=lambda item: (request_position.get(item[0], len(request_position)), item[0])
+            )
+            written = [
+                SessionPermission(
+                    user_id=stored_user_id, conversation_id=conversation_id, level=level
+                )
+                for stored_user_id, level in written_rows
+            ]
+            return written, refused, True
 
-        written, refused = run_write_transaction(
+        written, refused, upsert_ran = run_write_transaction(
             self._session_immediate, "grant_permissions", write
         )
         for user_id in sorted(refused):
             logger.warning("grant_many skipped grantee %r: account refused", user_id)
-        if written:
+        if upsert_ran:
             self._invalidate_resolve_cache_for_session(conversation_id)
         return written
 
