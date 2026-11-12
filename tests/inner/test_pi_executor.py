@@ -5534,8 +5534,16 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     assert "FAKE_HOST_SECRET" not in allowlist
 
 
-@pytest.mark.parametrize("failure", ["policy", "setup"])
-def test_pi_rejects_sandbox_before_version_probe(failure: str, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "failure,error_type,message",
+    [
+        ("policy", ValueError, "Pi does not support os_env.start_in_scratch"),
+        ("setup", OSError, "sandbox unavailable"),
+    ],
+)
+def test_pi_rejects_sandbox_before_version_probe(
+    failure: str, error_type: type[Exception], message: str, tmp_path: Path
+) -> None:
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     spec = OSEnvSpec(
@@ -5547,7 +5555,7 @@ def test_pi_rejects_sandbox_before_version_probe(failure: str, tmp_path: Path) -
         patch(
             "omnigent.inner.sandbox.resolve_sandbox", side_effect=OSError("sandbox unavailable")
         ),
-        pytest.raises((ValueError, OSError), match=r"start_in_scratch|sandbox unavailable"),
+        pytest.raises(error_type, match=message),
     ):
         PiExecutor(pi_path="/usr/bin/pi", cwd=str(tmp_path), os_env=spec)
     probe.assert_not_called()

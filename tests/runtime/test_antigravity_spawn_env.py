@@ -114,6 +114,7 @@ def test_os_policy_preserved_for_harness(
         OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
         OSEnvSpec(sandbox=OSEnvSandboxSpec(type="windows_jobobject")),
         OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none", allow_network=False)),
+        OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none", egress_rules=["GET api.example.com/**"])),
         OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"), fork=True),
         OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"), start_in_scratch=True),
     ],
