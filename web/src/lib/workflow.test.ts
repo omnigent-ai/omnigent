@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   REVIEW_PLAN_FIRST,
+  continueTaskMessage,
   createWorkflowPrompt,
   runSavedWorkflowPrompt,
   offersSaveWorkflow,
@@ -11,6 +12,12 @@ import {
   saveWorkflowMessage,
   workflowMessage,
 } from "./workflow";
+
+describe("continueTaskMessage", () => {
+  it("names the task to pick back up", () => {
+    expect(continueTaskMessage("Review #6109")).toBe('Continue the task "Review #6109".');
+  });
+});
 
 describe("workflowMessage", () => {
   it("asks for the plan review in its own paragraph", () => {

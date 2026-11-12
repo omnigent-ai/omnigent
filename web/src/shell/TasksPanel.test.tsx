@@ -16,6 +16,7 @@ import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import {
   openTasksTab,
+  registerContinueTask,
   registerSaveWorkflow,
   registerStartWorkflow,
   useSessionTasksActions,
@@ -379,6 +380,31 @@ describe("TasksPanel", () => {
       fireEvent.pointerDown(screen.getByTestId("tasks-plan-menu"), { button: 0 });
       fireEvent.click(screen.getByTestId("tasks-save-workflow"));
       await waitFor(() => expect(save).toHaveBeenCalledWith("Cut GET /orders p95 by 20%"));
+    } finally {
+      act(withdraw);
+    }
+  });
+
+  it("offers Continue on a stopped task once the composer can send", () => {
+    showJournal([journalPlan(0, ["baseline"], ["ship"]), status(1, "baseline", "started")]);
+    renderPanel();
+    expect(screen.queryByTestId("tasks-row-menu")).toBeNull();
+    cleanup();
+
+    const continueTask = vi.fn();
+    const withdraw = registerContinueTask("conv", continueTask);
+    try {
+      renderPanel();
+      // Only the stopped task has the menu; one that isn't started has nothing to continue.
+      const [stopped, notStarted] = screen.getAllByTestId("tasks-row");
+      expect(within(notStarted!).queryByTestId("tasks-row-menu")).toBeNull();
+      fireEvent.pointerDown(within(stopped!).getByTestId("tasks-row-menu"), { button: 0 });
+      fireEvent.click(screen.getByTestId("tasks-row-continue"));
+      expect(continueTask).toHaveBeenCalledWith("baseline");
+
+      // Once the agent is working on it again, there's nothing to continue.
+      setSession({ sessionStatus: "running" });
+      expect(screen.queryByTestId("tasks-row-menu")).toBeNull();
     } finally {
       act(withdraw);
     }
