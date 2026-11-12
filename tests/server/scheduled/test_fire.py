@@ -1577,6 +1577,42 @@ async def test_launch_failure_is_swallowed() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["dispatch", "unexpected"])
+async def test_failed_legacy_fire_stops_counting_its_session_as_the_run(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """A legacy fire notes its session until the run row exists; a failed fire
+    must drop that note, whether it records a failed run or never records one."""
+    from omnigent.server.scheduled import harness_settings
+
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    noted: list[list[str]] = []
+
+    async def _dispatch(conv: Any, task: Any) -> None:
+        noted.append(harness_settings._UNRECORDED_LEGACY_RUN_SESSIONS.keys())
+        raise RuntimeError("launch exploded")
+
+    if failure == "unexpected":
+
+        async def _budget_fails(*args: Any, **kwargs: Any) -> None:
+            noted.append(harness_settings._UNRECORDED_LEGACY_RUN_SESSIONS.keys())
+            raise RuntimeError("budget store down")
+
+        monkeypatch.setattr(fire_mod, "_attach_cost_budget", _budget_fails)
+
+    on_fire = build_on_fire(_deps(store), launch_dispatch=_dispatch)
+    await on_fire(0, "task_1")
+    await _drain()
+    assert len(noted) == 1 and len(noted[0]) == 1
+    assert harness_settings._UNRECORDED_LEGACY_RUN_SESSIONS.keys() == []
+    if failure == "dispatch":
+        assert store.runs[0]["error_code"] == "launch_failed"
+    else:
+        # The fire raised before recording a run; the caller's cleanup drops the note.
+        assert store.runs == []
+
+
+@pytest.mark.asyncio
 async def test_validation_failure_records_failed_without_session() -> None:
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(model_override="--danger")})
