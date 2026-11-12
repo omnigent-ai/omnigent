@@ -1114,12 +1114,16 @@ describe("PermissionsModal", () => {
       expect(grantMock).not.toHaveBeenCalled();
     });
 
-    it.each([true, false])(
-      "enables workspace files only after a recipient grant succeeds (success: %s)",
-      async (succeeds) => {
+    it.each([
+      [true, false],
+      [false, false],
+      [true, true],
+    ])(
+      "enables workspace files only after a recipient grant succeeds (success: %s, already shared: %s)",
+      async (succeeds, workspaceShared) => {
         listMock.mockResolvedValue([]);
         useSessionMock.mockReturnValue({
-          session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: false }),
+          session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: workspaceShared }),
           isLoading: false,
           error: null,
         });
@@ -1151,8 +1155,20 @@ describe("PermissionsModal", () => {
         expect(updateSessionMock).not.toHaveBeenCalled();
         expect(screen.getByRole("button", { name: "Copy link" })).toBeDisabled();
         expect(screen.getByRole("button", { name: "Open in mobile app" })).toBeDisabled();
+        const workspaceToggle = within(screen.getByTestId("share-workspace-files")).getByRole(
+          "switch",
+        );
+        expect(workspaceToggle).toBeDisabled();
+        fireEvent.click(workspaceToggle);
+        expect(workspaceToggle).toHaveAttribute("aria-checked", String(workspaceShared));
+        expect(updateSessionMock).not.toHaveBeenCalled();
         finishGrant();
-        if (succeeds) {
+        if (succeeds && workspaceShared) {
+          await waitFor(() =>
+            expect(screen.getByPlaceholderText("alice@example.com")).toHaveValue(""),
+          );
+          expect(updateSessionMock).not.toHaveBeenCalled();
+        } else if (succeeds) {
           await waitFor(() =>
             expect(updateSessionMock).toHaveBeenCalledWith("conv_abc", {
               shareWorkspaceFiles: true,

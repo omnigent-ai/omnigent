@@ -347,7 +347,7 @@ export function PermissionsModal({
                 setError(null);
                 shareWorkspace.mutate(checked);
               }}
-              disabled={shareWorkspace.isPending}
+              disabled={shareBusy}
               componentId="diagnostics.permissions.share_workspace_toggle"
             />
           </div>
