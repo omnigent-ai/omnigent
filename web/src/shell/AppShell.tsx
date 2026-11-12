@@ -2120,14 +2120,17 @@ function AppShellImpl() {
     // Phones hide the rail, so the side chat opens in its drawer instead.
     if (isMobileViewport()) openSideChatsPanel();
   }, [sideChatToOpen, conversationId, openSideChatsPanel, setRightPanelOpenAnimated]);
-  // The chat's task preview asks for this session's Tasks tab: open the rail
-  // on it, or its drawer on a phone, then clear the one-shot request.
+  // The chat's task preview, a task's marker, or the agent's first plan asks
+  // for this session's Tasks tab: open the rail on it, or its drawer on a phone
+  // unless the agent asked, then clear the one-shot request.
   const tasksTabToOpen = useSessionTasksActions((state) => state.tasksTabToOpen);
   useEffect(() => {
     if (tasksTabToOpen === null || tasksTabToOpen !== conversationId) return;
-    useSessionTasksActions.setState({ tasksTabToOpen: null });
+    const automatic = useSessionTasksActions.getState().tasksTabAutoOpen;
+    useSessionTasksActions.setState({ tasksTabToOpen: null, tasksTabAutoOpen: false });
     if (isMobileViewport()) {
-      openTasksPanel();
+      // A drawer the agent opened would cover the chat it's working in.
+      if (!automatic) openTasksPanel();
       return;
     }
     selectRightRailTab("tasks");

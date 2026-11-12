@@ -184,6 +184,8 @@ export function AppShellWorkspacePanels({
               active={tasksPanelOpen}
               // Close the drawer so the workflow dialog opens over the chat.
               onStartWorkflow={() => setTasksPanelOpen(false)}
+              // And so the chat a task's click scrolls to shows.
+              onShowInChat={() => setTasksPanelOpen(false)}
             />
           </RenderErrorBoundary>
         </MobilePanelDrawer>

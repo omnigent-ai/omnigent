@@ -12,6 +12,7 @@ import { parseNativePermissionDelivery } from "./nativePermissionDelivery";
 import { assistantMessagePhase } from "./conversationItems";
 import type { JournalEntry } from "./sessionJournal";
 import { readSubagentActivity } from "./subagentActivity";
+import { readTaskActivity } from "./taskActivity";
 import type {
   BrowserActionRequestEvent,
   ClientTaskCancel,
@@ -1381,7 +1382,8 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
     } satisfies TerminalCommandEvent;
   }
 
-  if (readSubagentActivity(rec)) {
+  // Task markers place and fold like sub-agent markers, so they share the notice kind.
+  if (readSubagentActivity(rec) || readTaskActivity(rec)) {
     return {
       type: "native_tool_call",
       toolType: "subagent_activity",

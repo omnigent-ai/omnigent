@@ -10,6 +10,8 @@ import {
 } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
+import { TaskMarkersProvider } from "@/components/blocks/TaskActivityMessage";
+import { readTaskActivity, taskMarkerId } from "@/lib/taskActivity";
 import { cn } from "@/lib/utils";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { hasCommandModifier } from "@/lib/hotkeys";
@@ -101,6 +103,17 @@ function isHiddenSubagentWakeBubble(bubble: Bubble): boolean {
 }
 
 /** Keep model-facing sub-agent wake messages out of the visible row geometry. */
+/** Whether *bubble* holds the task marker *markerId*, as a notice of its own or beside its work. */
+function bubbleHasMarker(bubble: Bubble, markerId: string): boolean {
+  const matches = (data: Record<string, unknown>) => {
+    const activity = readTaskActivity(data);
+    return activity !== null && taskMarkerId(activity) === markerId;
+  };
+  if (bubble.kind === "subagent_activity") return matches(bubble.data);
+  if (bubble.kind !== "assistant") return false;
+  return bubble.items.some((item) => item.kind === "subagent_activity" && matches(item.data));
+}
+
 export function visibleTranscriptBubbles(bubbles: Bubble[]): Bubble[] {
   let visible: Bubble[] | null = null;
   for (let index = 0; index < bubbles.length; index += 1) {
@@ -163,6 +176,16 @@ function TranscriptImpl({
   const conversationId = useChatStore((s) => s.conversationId);
   const tasks = useSessionTasks(conversationId ?? undefined, true);
   const hasTasks = hasTaskPreview(tasks);
+  // Task markers link to the tasks in the Tasks tab now; keyed by their IDs so
+  // the markers re-render only when that list changes.
+  const taskIdsKey = tasks.progress.map((item) => item.step.id).join("\n");
+  const taskMarkers = useMemo(
+    () =>
+      conversationId
+        ? { conversationId, taskIds: new Set(taskIdsKey ? taskIdsKey.split("\n") : []) }
+        : null,
+    [conversationId, taskIdsKey],
+  );
 
   // Build bubbles once per blocks/activeResponse change. Per-surface reuse
   // cache so a streaming append rebuilds only the active bubble, reusing the
@@ -371,7 +394,7 @@ function TranscriptImpl({
   const showArcaBanner = arcaWarning.showForHost(hostId);
   const hasPinnedBanner = display.hasTasks || showArcaBanner;
   return (
-    <>
+    <TaskMarkersProvider value={taskMarkers}>
       {/* Task preview pinned above the thread. Sibling of the viewport (not an
       overlay) so it shrinks the scroll area rather than covering messages.
       Self-hides with no tasks. */}
@@ -524,7 +547,7 @@ function TranscriptImpl({
           />
         )}
       </div>
-    </>
+    </TaskMarkersProvider>
   );
 }
 
@@ -1053,11 +1076,14 @@ export function VirtualBubbleList({
   }, [conversationId, scrollEl, messageId, anchorStart]);
 
   const scrollToItem = useCallback((itemId: string): boolean => {
-    const index = bubblesRef.current.findIndex(
+    let index = bubblesRef.current.findIndex(
       (b) =>
         (b.kind === "user" && b.itemId === itemId) ||
         (b.kind === "assistant" && b.responseId === itemId),
     );
+    // A task marker, alone or in the work beside it. One of the agent's own
+    // tasks can mark the same start twice, so the newest wins.
+    if (index < 0) index = bubblesRef.current.findLastIndex((b) => bubbleHasMarker(b, itemId));
     if (index < 0) return false;
     const c = ctxRef.current;
     c.stopScroll();

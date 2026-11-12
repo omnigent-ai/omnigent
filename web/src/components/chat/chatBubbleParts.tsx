@@ -52,7 +52,7 @@ import {
   RoutingDecisionCard,
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
-import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
+import { ActivityNotice } from "@/components/blocks/TaskActivityMessage";
 import {
   isSystemUserContent,
   parseSystemMessage,
@@ -806,7 +806,7 @@ export const BubbleView = memo(
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
     if (bubble.kind === "subagent_activity") {
-      return <SubagentActivityMessage data={bubble.data} />;
+      return <ActivityNotice data={bubble.data} />;
     }
     if (bubble.kind === "routing_decision") {
       return (
@@ -1537,7 +1537,7 @@ function AssistantBubble({
         )}
         {trailingNotices.map((notice, index) =>
           notice.kind === "subagent_activity" ? (
-            <SubagentActivityMessage
+            <ActivityNotice
               key={notice.itemId ?? `subagent-activity-${index}`}
               data={notice.data}
             />

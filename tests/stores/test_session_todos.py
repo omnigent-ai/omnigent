@@ -13,6 +13,9 @@ TODOS = [{"content": "Verify the example", "status": "in_progress", "activeForm"
 
 def test_plan_validation_is_canonical_and_bounded():
     assert validate_session_todos([{**TODOS[0], "unknown": "discard"}]) == TODOS
+    # A harness's own task ID is kept, within bounds.
+    assert validate_session_todos([{**TODOS[0], "id": "7"}]) == [{**TODOS[0], "id": "7"}]
+    assert validate_session_todos([{**TODOS[0], "id": "x" * 129}]) == TODOS
     assert validate_session_todos([{**TODOS[0], "status": []}]) == []
     invalid = (
         TODOS * 101,

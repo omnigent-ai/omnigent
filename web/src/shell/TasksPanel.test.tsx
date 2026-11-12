@@ -3,6 +3,7 @@ import type * as UseSessionJournalModule from "@/hooks/useSessionJournal";
 import type * as CapabilitiesModule from "@/lib/CapabilitiesContext";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { type SessionJournalView, useSessionJournal } from "@/hooks/useSessionJournal";
@@ -11,7 +12,11 @@ import { formatMessageTimestamp } from "@/lib/relativeTime";
 import type { JournalEntry } from "@/lib/sessionJournal";
 import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
-import { registerStartWorkflow } from "@/store/sessionTasksActions";
+import {
+  openTasksTab,
+  registerStartWorkflow,
+  useSessionTasksActions,
+} from "@/store/sessionTasksActions";
 import { journalEntry, journalPlan } from "@/test/journalFixtures";
 import { TasksPanel } from "./TasksPanel";
 
@@ -53,8 +58,23 @@ function status(position: number, step: string, value: string, text?: string, ru
   });
 }
 
-function renderPanel(onStartWorkflow?: () => void) {
-  return render(<TasksPanel conversationId="conv" active onStartWorkflow={onStartWorkflow} />);
+/** Shows the URL's search string, where a task's click asks the chat for its marker. */
+function SearchProbe() {
+  return <output data-testid="search">{useLocation().search}</output>;
+}
+
+function renderPanel(onStartWorkflow?: () => void, onShowInChat?: () => void) {
+  return render(
+    <MemoryRouter initialEntries={["/c/conv"]}>
+      <TasksPanel
+        conversationId="conv"
+        active
+        onStartWorkflow={onStartWorkflow}
+        onShowInChat={onShowInChat}
+      />
+      <SearchProbe />
+    </MemoryRouter>,
+  );
 }
 
 /** The session's live state: whether it works, and the agent's own task list. */
@@ -114,8 +134,11 @@ describe("TasksPanel", () => {
     const rows = screen.getAllByTestId("tasks-row");
     expect(rows.map((row) => row.dataset.state)).toEqual(["done", "running", "waiting"]);
     expect(rows[1].textContent).toContain("Documenting it");
-    // Their rows have no history to open, and nothing waits on another.
-    expect(within(rows[1]).queryByRole("button")).toBeNull();
+    // Their rows have no history to open, and nothing waits on another. A
+    // started one links to its marker in the chat; one not started yet doesn't.
+    expect(within(rows[1]).queryByTestId("tasks-row-history")).toBeNull();
+    expect(within(rows[1]).getByTestId("tasks-row-show-in-chat")).toBeTruthy();
+    expect(within(rows[2]).queryByRole("button")).toBeNull();
     // The list says nothing about what waits on what, so its strip's gaps mean nothing either.
     expect(screen.getByTestId("tasks-progress").dataset.links).toBeUndefined();
     expect(within(rows[2]).getByRole("img", { name: "Not started" }).textContent).toBe("3");
@@ -252,6 +275,48 @@ describe("TasksPanel", () => {
     }
   });
 
+  it("takes a started task's click to its newest marker in the chat; one not started doesn't link", () => {
+    const onShowInChat = vi.fn();
+    showJournal([
+      journalPlan(0, ["deploy"], ["verify", ["deploy"]], ["video", ["verify"]]),
+      status(1, "deploy", "started"),
+      status(2, "deploy", "done", "Pod 1/1"),
+      status(3, "verify", "started"),
+    ]);
+    renderPanel(undefined, onShowInChat);
+    const [deploy, verify, video] = screen.getAllByTestId("tasks-row");
+    // A finished task goes to where it ended, a running one to its newest start.
+    for (const [row, marker] of [
+      [deploy, "journal-e2"],
+      [verify, "journal-e3"],
+    ] as const) {
+      fireEvent.click(within(row).getByTestId("tasks-row-show-in-chat"));
+      const search = new URLSearchParams(screen.getByTestId("search").textContent ?? "");
+      expect(search.get("message")).toBe(marker);
+      expect(search.get("message_request")).toBeTruthy();
+    }
+    expect(onShowInChat).toHaveBeenCalledTimes(2);
+    expect(within(video).queryByTestId("tasks-row-show-in-chat")).toBeNull();
+    // Its history opens from the chevron instead.
+    expect(within(video).getByTestId("tasks-row-history")).toBeTruthy();
+  });
+
+  it("scrolls to and highlights the task a chat marker asks for", async () => {
+    const scrollIntoView = vi.fn();
+    Element.prototype.scrollIntoView = scrollIntoView;
+    try {
+      showJournal([journalPlan(0, ["a"], ["b"], ["c"])]);
+      renderPanel();
+      act(() => openTasksTab("conv", "c"));
+      const row = screen.getAllByTestId("tasks-row")[2];
+      await waitFor(() => expect(row.dataset.flash).toBe("true"));
+      expect(scrollIntoView.mock.contexts[0]).toBe(row);
+      expect(useSessionTasksActions.getState().taskToShow).toBeNull();
+    } finally {
+      delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+    }
+  });
+
   it("heads the list with the plan's name", () => {
     const named = journalPlan(0, ["baseline"]);
     named.payload.name = "Cut GET /orders p95 by 20%";
@@ -382,7 +447,7 @@ describe("TasksPanel", () => {
       status(3, "deploy", "started", "Redeploying"),
     ]);
     renderPanel();
-    fireEvent.click(within(screen.getByTestId("tasks-row")).getAllByRole("button")[0]);
+    fireEvent.click(within(screen.getByTestId("tasks-row")).getByTestId("tasks-row-history"));
     const history = screen.getByRole("list", { name: "deploy history" });
     expect(
       within(history)
@@ -404,7 +469,7 @@ describe("TasksPanel", () => {
     ]);
     renderPanel();
     const pool = screen.getAllByTestId("tasks-row")[2];
-    fireEvent.click(within(pool).getAllByRole("button")[0]);
+    fireEvent.click(within(pool).getByTestId("tasks-row-history"));
     expect(within(pool).getByText(/^After/).textContent).toBe("After profile and batch");
     const history = screen.getByRole("list", { name: "pool history" });
     expect(
@@ -448,7 +513,7 @@ describe("TasksPanel", () => {
       journalEntry(3, { payload: { body: "Measure first" } }),
     ]);
     renderPanel();
-    fireEvent.click(within(screen.getByTestId("tasks-row")).getAllByRole("button")[0]);
+    fireEvent.click(within(screen.getByTestId("tasks-row")).getByTestId("tasks-row-history"));
     const history = screen.getByRole("list", { name: "pool history" });
     expect(
       within(history)

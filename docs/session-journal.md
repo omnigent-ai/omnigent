@@ -140,9 +140,40 @@ segment of the strip for that task's status, or click it to jump to the task. In
 a plan, the strip links two neighboring tasks when one waits on the other, so a
 gap between them means they can run at the same time; hovering a task's segment
 arcs it to the tasks it waits on and the tasks that wait on it. When the agent replans, the new
-tasks simply appear. Click a plan's task for what it waits on, its goal and its
+tasks simply appear. A task's chevron opens what it waits on, its goal and its
 history: each status, oldest first. Tasks from the agent's own list show only
 their name and state.
+
+### Tasks in the chat
+
+The chat marks where each task starts and ends, in the same form as a
+sub-agent's start and end: "Started", "Completed", "Failed" or "Waiting for
+you on", then the task's name. Each plan the agent writes adds one
+line too, such as "Made a plan: Cut GET /orders p95 by 20% · 5 tasks" or
+"Updated the plan: added Pre-warm the pool, removed Overlap the check". Tasks
+from the agent's own list get Started and Completed.
+
+The two link to each other. Clicking a marker's task opens the Tasks tab
+scrolled to it, and clicking the plan line opens the tab. Clicking a task in
+the tab scrolls the chat to its newest start while it runs, or to where it
+ended, loading older history if needed; a task that hasn't started has no
+marker yet. A task the agent drops from its plan leaves the tab, and its
+markers stay in the chat but no longer link; hovering one says so.
+
+The server writes the markers into the transcript (`resource_event` items
+whose `event_type` is `session.journal.task` or `session.journal.plan`) when
+the journal accepts a status or a plan, or when the agent's own list changes.
+A retried write adds no second marker, and sessions from before markers have
+none.
+
+A marker stands in for the journal write behind it, so the chat shows no tool
+row for a `sys_journal_write_status` or `sys_journal_write_plan` call the
+journal accepted, or one still running. A rejected write gets no marker, so its
+row stays and shows the error. Reads and notes show as tool calls.
+
+When the agent writes the session's first plan while you're watching, the
+Tasks tab opens beside the chat; on phones the drawer stays closed so the chat
+stays in view.
 
 The tab doesn't show the agent's notes; they're for the agent, which reads them
 back with `sys_journal_read`. With no tasks yet, the tab links to starting a

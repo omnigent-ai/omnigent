@@ -34,7 +34,8 @@ import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
 import { SlashCommandCard } from "./SlashCommandCard";
 import { SmartRoutingCard } from "./SmartRoutingCard";
-import { SubagentActivityMessage } from "./SubagentActivityMessage";
+import { readTaskActivity } from "@/lib/taskActivity";
+import { ActivityNotice } from "./TaskActivityMessage";
 import { TerminalCommandCard } from "./TerminalCommandCard";
 import { ErrorBanner, PolicyDeniedBanner, RetryIndicator } from "./StatusBlocks";
 import { ToolCard, ToolGroupSummary } from "./ToolCard";
@@ -187,6 +188,9 @@ function hasFoldableShape(
     .findLast((item) => !isTrailingWrapup(item) && item.kind !== "subagent_activity");
   // A terminal failure or denial must stay visible beside the assistant text.
   if (isFailureItem(lastItem)) return false;
+  // A turn that moves tasks keeps its task markers in view: they're the turn's
+  // outline, and its tool calls stay in their own "Called N tools" groups.
+  if (items.some(isTaskMarker)) return false;
   return (
     !isProvisionalTrace(items) &&
     segments.some((segment) => segment.kind === "work") &&
@@ -481,6 +485,11 @@ function isTrailingWrapup(item: RenderItem): boolean {
  * Split work from assistant text while preserving order. Every completed
  * message stays visible unless `foldNarration` asks to fold narration.
  */
+/** A task's start or end, or a plan change, in the chat (sub-agent notices aren't). */
+function isTaskMarker(item: RenderItem): boolean {
+  return item.kind === "subagent_activity" && readTaskActivity(item.data) !== null;
+}
+
 function partitionTurn(
   items: RenderItem[],
   foldNarration = false,
@@ -1007,7 +1016,7 @@ function renderItem(
     case "elicitation":
       return <ElicitationCard key={key} item={item} />;
     case "subagent_activity":
-      return <SubagentActivityMessage key={key} data={item.data} />;
+      return <ActivityNotice key={key} data={item.data} />;
   }
 }
 

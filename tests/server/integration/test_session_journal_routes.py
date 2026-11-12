@@ -67,6 +67,42 @@ def _write(kind: str, payload: dict[str, object], key: str, **fields: object) ->
     return {"kind": kind, "payload": payload, "idempotency_key": key, **fields}
 
 
+async def test_plans_and_statuses_mark_the_chat_once_each(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id = _session(db_uri)
+    url = f"/v1/sessions/{session_id}/journal"
+    steps = [
+        {"id": "deploy", "name": "Deploy the swap"},
+        {"id": "verify", "name": "Verify routing", "depends_on": ["deploy"]},
+    ]
+    added = [*steps, {"id": "video", "name": "Record the video"}]
+    for body in (
+        _write("plan", {"name": "Ship the demo", "steps": steps}, "tool:1"),
+        _write("status", {"status": "started"}, "tool:2", step="deploy"),
+        _write("status", {"status": "done", "text": "Pod 1/1"}, "tool:3", step="deploy"),
+        _write("note", {"body": "Notes get no marker"}, "tool:4"),
+        # A retried status, the same plan again, then a replan that adds a task.
+        _write("status", {"status": "done", "text": "Pod 1/1"}, "tool:3", step="deploy"),
+        _write("plan", {"name": "Ship the demo", "steps": steps}, "tool:5"),
+        _write("plan", {"name": "Ship the demo", "steps": added}, "tool:6"),
+    ):
+        resp = await client.post(url, json=body, headers=_runner(session_id))
+        assert resp.status_code == 200, resp.text
+    items = SqlAlchemyConversationStore(db_uri).list_items(session_id, limit=50).data
+    markers = [item.data.resource for item in items if item.type == "resource_event"]
+    assert [(m.get("change") or m["status"], m["name"]) for m in markers] == [
+        ("made", "Ship the demo"),
+        ("started", "Deploy the swap"),
+        ("done", "Deploy the swap"),
+        ("updated", "Ship the demo"),
+    ]
+    assert markers[2]["text"] == "Pod 1/1" and markers[2]["native"] is False
+    assert markers[3]["added"] == ["Record the video"] and markers[3]["removed"] == []
+    statuses = (await client.get(url, params={"kind": "status"}, headers=_headers())).json()
+    assert markers[2]["entry_id"] == statuses["data"][-1]["id"]
+
+
 async def test_the_runner_appends_and_people_page_the_journal(
     client: httpx.AsyncClient, db_uri: str
 ) -> None:

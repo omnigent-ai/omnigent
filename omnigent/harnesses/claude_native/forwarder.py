@@ -4630,6 +4630,8 @@ async def _forward_available_status_events(
             elif native_todos_changed and task_order:
                 todos_to_post = [
                     {
+                        # Claude's task ID keeps a renamed task the same task.
+                        "id": tid,
                         "content": task_subjects.get(tid, tid),
                         "status": task_statuses.get(tid, "pending"),
                         # activeForm is the gerund form used by Claude's TodoWrite tool.
