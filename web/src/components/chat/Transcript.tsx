@@ -27,8 +27,6 @@ import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
 import { DbcertBanner } from "@/components/DbcertBanner";
-import { ArcaShutdownBanner } from "@/components/ArcaShutdownBanner";
-import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { onFindOpened } from "@/lib/nativeBridge";
@@ -365,16 +363,13 @@ function TranscriptImpl({
 
   const showWorkingIndicator =
     !sandboxFailed && shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
-  const arcaWarning = useArcaShutdownBanner();
-  const showArcaBanner = arcaWarning.showForHost(hostId);
-  const hasPinnedBanner = display.hasTasks || showArcaBanner;
+  const hasPinnedBanner = display.hasTasks;
   return (
     <>
       {/* Task tracker pinned above the thread. Sibling of the viewport (not an
       overlay) so it shrinks the scroll area rather than covering messages.
       Self-hides with no tasks. */}
       <ChatPlanAccordion className="mt-14 md:mt-12" />
-      {showArcaBanner && <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks} />}
       {/* Wrapper div gives us a ref to scope the SelectionPopup to the
       conversation area without requiring Conversation to forward refs. */}
       <div
@@ -393,7 +388,6 @@ function TranscriptImpl({
             className={cn(
               "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6 md:px-[clamp(0px,calc((var(--chat-column-width)+3.5rem-100cqi)*0.5),1.75rem)]",
               hasPinnedBanner ? "pt-4" : "pt-20",
-              showArcaBanner && "chat-content-under-arca-banner",
               CHAT_COLUMN_WIDTH,
             )}
           >
