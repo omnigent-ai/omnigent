@@ -49,7 +49,7 @@ from omnigent.entities.conversation import (
     parse_item_data,
 )
 from omnigent.entities.permission import SessionPermission
-from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
+from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
     HARNESS_CLI_UNRESPONSIVE,
@@ -5190,7 +5190,7 @@ async def _maybe_relaunch_managed_sandbox(
     # replica — and this one then holds no tunnel to write ``host.launch_runner``
     # to, so letting the caller fall through would spend its whole runner budget
     # waiting for a launch that cannot happen here. Raise WRONG_REPLICA instead:
-    # the client re-addresses without the routing key, lands on the replica that
+    # the client re-addresses with the slice key it names, lands on the replica that
     # owns the tunnel, and the message-dispatch relaunch path there finds it in
     # its LOCAL registry and launches the runner inline (``routes_events``, gated
     # only on host presence, rebinding a stale ``runner_id`` on the way) — so the
@@ -5208,10 +5208,9 @@ async def _maybe_relaunch_managed_sandbox(
         and local_host_registry.get(conv.host_id) is None
         and await asyncio.to_thread(host_store.is_online, conv.host_id)
     ):
-        raise OmnigentError(
-            f"host {conv.host_id} is live on another replica after its managed "
-            "launch; retry without the routing key",
-            code=ErrorCode.WRONG_REPLICA,
+        raise WrongReplicaError(
+            f"host {conv.host_id} is live on another replica after its managed launch",
+            host_id=conv.host_id,
         )
     return True
 
@@ -5598,9 +5597,9 @@ async def _recover_side_chat_runner_via_source(
             and source.host_id is not None
             and await asyncio.to_thread(runner_router.host_is_on_another_replica, source.host_id)
         ):
-            raise OmnigentError(
+            raise WrongReplicaError(
                 "side chat runner is connected to another server replica",
-                code=ErrorCode.WRONG_REPLICA,
+                host_id=source.host_id,
             )
         source_client, source = await ensure_runner_connected(
             session_id=source_id,

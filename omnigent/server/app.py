@@ -33,6 +33,7 @@ from starlette.routing import Match, Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
+from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 from omnigent.db.db_models import InvalidUuidError
 from omnigent.debug_logging import (
     add_audit_attrs,
@@ -53,6 +54,7 @@ from omnigent.errors import (
     ErrorImpact,
     ErrorPhase,
     OmnigentError,
+    WrongReplicaError,
     is_cancelled_rpc_error,
     is_permission_denied_rpc_error,
 )
@@ -714,6 +716,41 @@ def _error_audit_extra(
         phase=phase,
         **attributes,
     )
+
+
+def _wrong_replica_error_body(request: Request, exc: WrongReplicaError) -> dict[str, Any]:
+    """Name the slice key that reaches the replica holding the host's tunnel.
+
+    A request not keyed to the host must resend keyed to it. A request already
+    keyed to it missed because the tunnel dialed the default route, so it must
+    resend without the key in either form, as first-party clients do.
+
+    :param request: The rejected request; its slice-key header, or the query
+        parameter ingress falls back to when the header is empty, is compared
+        with the host.
+    :param exc: The wrong-replica error naming the host.
+    :returns: The ``error`` object: code, message ending in the remedy,
+        ``slice_key_header``, and ``slice_key`` to resend with (``None`` to
+        resend without the header).
+    """
+    request_slice_key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER) or (
+        request.query_params.get("omnigent_slice_key")
+    )
+    if request_slice_key == exc.host_id:
+        resend_slice_key = None
+        remedy = (
+            f"resend without the {OMNIGENT_SLICE_KEY_HEADER} header "
+            "or omnigent_slice_key query parameter"
+        )
+    else:
+        resend_slice_key = exc.host_id
+        remedy = f"resend with header {OMNIGENT_SLICE_KEY_HEADER}: {exc.host_id}"
+    return {
+        "code": exc.code,
+        "message": f"{exc.message}; {remedy}",
+        "slice_key_header": OMNIGENT_SLICE_KEY_HEADER,
+        "slice_key": resend_slice_key,
+    }
 
 
 # polly's and debby's multi-file bundles are packaged under
@@ -1817,9 +1854,8 @@ def create_app(
         and runner tunnels by host_id. When ``True``, a host-scoped request
         for a live host whose tunnel is on another replica returns 400
         ``wrong_replica``; otherwise it returns 409 "host is offline". The
-        400 recovers only for a client that sent the slice-key header and
-        retries without it, which the web client does only for requests it
-        keyed itself.
+        400 names the slice key to resend with, or says to resend without it
+        when the request was already keyed to the host.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
@@ -2961,10 +2997,12 @@ def create_app(
                     error_phase=exc.phase.value,
                 ),
             )
-        return JSONResponse(
-            status_code=exc.http_status,
-            content={"error": {"code": exc.code, "message": exc.message}},
+        error = (
+            _wrong_replica_error_body(request, exc)
+            if isinstance(exc, WrongReplicaError)
+            else {"code": exc.code, "message": exc.message}
         )
+        return JSONResponse(status_code=exc.http_status, content={"error": error})
 
     @app.exception_handler(RequestValidationError)
     async def _handle_validation_error(
