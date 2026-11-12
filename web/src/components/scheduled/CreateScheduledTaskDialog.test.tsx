@@ -1137,14 +1137,17 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
       sandbox_provider: "agent_sandbox",
       sandbox_provider_automation_notices: {
         agent_sandbox: "Keep your laptop's credentials fresh.",
+        other_sandbox: "Another provider's notice.",
       },
     });
     // The sandbox default wins over the online host and shows the fresh-sandbox
     // copy and the provider's notice; the connected-host workspace picker never appears.
     expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Sandbox");
+    // Only the run target's provider notice shows.
     expect(screen.getByTestId("task-sandbox-automation-notice")).toHaveTextContent(
       "Keep your laptop's credentials fresh.",
     );
+    expect(screen.queryByText("Another provider's notice.")).not.toBeInTheDocument();
     expect(screen.queryByText("pick-workspace")).not.toBeInTheDocument();
     openHostSelect();
     fireEvent.click(screen.getByRole("option", { name: /laptop/ }));

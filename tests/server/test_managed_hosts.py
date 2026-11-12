@@ -2371,18 +2371,34 @@ class _NoticeLauncher(FakeSandboxLauncher):
     automation_notice = "Keep your laptop's credentials fresh."
 
 
-def test_provider_automation_notices_list_only_providers_that_set_one() -> None:
-    """A provider's automation notice reaches /v1/info for the automation form; a
-    provider without one is absent."""
+def test_provider_automation_notices_list_only_launchable_providers_that_set_one() -> None:
+    """A launchable provider's automation notice reaches /v1/info for the automation
+    form; a provider without one, or one that can't launch, is absent."""
+
+    def unlaunchable_factory() -> _NoticeLauncher:
+        raise AssertionError("a provider that can't launch must not be instantiated")
+
     deployment = ManagedSandboxDeployment(
-        configs=tuple(
+        configs=(
+            *(
+                ManagedSandboxConfig(
+                    server_url="https://s",
+                    provider=provider,
+                    token_ttl_s=3600,
+                    launcher_factory=factory,
+                )
+                for provider, factory in (
+                    ("noted", _NoticeLauncher),
+                    ("plain", FakeSandboxLauncher),
+                )
+            ),
             ManagedSandboxConfig(
                 server_url="https://s",
-                provider=provider,
+                provider="unlaunchable",
                 token_ttl_s=3600,
-                launcher_factory=factory,
-            )
-            for provider, factory in (("noted", _NoticeLauncher), ("plain", FakeSandboxLauncher))
+                launcher_factory=unlaunchable_factory,
+                managed_launch_supported=False,
+            ),
         )
     )
 
