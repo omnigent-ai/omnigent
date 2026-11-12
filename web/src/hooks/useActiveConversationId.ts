@@ -1,23 +1,30 @@
-// Shared hook for the conversation id of the currently-viewed chat route.
-//
-// Both RunnerHealthProvider and SessionUpdatesProvider render above the
-// router's `<Routes>`, so `useParams` has no match there — they match the
-// pathname directly instead. Kept in one place so the route shape (`/c/:id`)
-// is defined once.
+// Health and live-update providers sit above `<Routes>`, where useParams
+// has no match. Read both conversation routes under the app's mount path.
 
 import { useMemo } from "react";
-import { useLocation } from "@/lib/routing";
+import { useLocation, useRebasePath } from "@/lib/routing";
 
 /**
- * Extract the active conversation id from the `/c/:id` route.
+ * Extract the active conversation id from a chat or Canvas session route.
  *
  * @returns The conversation id when on a chat route (e.g. `"conv_abc123"`),
  *   otherwise `undefined`.
  */
 export function useActiveConversationId(): string | undefined {
   const { pathname } = useLocation();
+  const rebasePath = useRebasePath();
   return useMemo(() => {
-    const match = pathname.match(/^\/c\/([^/]+)/);
-    return match ? match[1] : undefined;
-  }, [pathname]);
+    for (const prefix of [rebasePath("/c/"), rebasePath("/canvas/c/")]) {
+      if (!pathname.startsWith(prefix)) continue;
+      const match = pathname.slice(prefix.length).match(/^([^/]+)\/?$/);
+      if (match) {
+        try {
+          return decodeURIComponent(match[1]);
+        } catch {
+          return match[1];
+        }
+      }
+    }
+    return undefined;
+  }, [pathname, rebasePath]);
 }

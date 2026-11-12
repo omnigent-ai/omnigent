@@ -4,12 +4,18 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { sidebarConfig } from "@/lib/sidebarConfig";
 import { SidebarDataProvider } from "./useSidebarData";
 import { useAgents } from "./useAgents";
 import { refreshScopeWindow } from "@/lib/sidebarData";
 import type { Conversation } from "./useConversations";
-import { useAvailableAgents, prefetchAvailableAgentDetails } from "./useAvailableAgents";
+import {
+  useAgentCatalog,
+  useAvailableAgents,
+  prefetchAvailableAgentDetails,
+} from "./useAvailableAgents";
 
 // The template catalog and sidebar Mine cache load through authenticatedFetch.
 // URL-keyed stubs exercise the real fetch and mapping path.
@@ -25,7 +31,8 @@ function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
 const fetchMock = vi.fn();
 
 const BUILTINS_URL = "/v1/agents";
-const MINE_URL = "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=mine";
+const MINE_URL =
+  "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=mine&expand_families=true";
 const HARNESSES_URL = "/v1/harnesses";
 
 /**
@@ -45,9 +52,10 @@ function routeFetch(routes: Record<string, Response>) {
 
 function wrapper({ children }: { children: ReactNode }) {
   // retry off so the no-network/error case resolves on the first
-  // attempt instead of stalling the test on TanStack's backoff.
+  // attempt instead of stalling the test on TanStack's backoff. Queries
+  // that set their own retry policy still retry, so make that immediate.
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
+    defaultOptions: { queries: { retry: false, retryDelay: 0 } },
   });
   return (
     <QueryClientProvider client={client}>
@@ -152,10 +160,11 @@ describe("useAvailableAgents", () => {
     client.setQueryData(mineKey, cache(rows));
     routeFetch({
       [BUILTINS_URL]: mockResponse({ data: [], has_more: false }),
-      "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=shared": mockResponse({
-        data: [{ ...rows[0], id: "shared", agent_id: "ag_shared", permission_level: 1 }],
-        has_more: false,
-      }),
+      "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=shared&expand_families=true":
+        mockResponse({
+          data: [{ ...rows[0], id: "shared", agent_id: "ag_shared", permission_level: 1 }],
+          has_more: false,
+        }),
     });
     const { result } = renderHook(
       () => ({
@@ -419,6 +428,119 @@ describe("useAvailableAgents", () => {
       },
     ]);
   });
+
+  it("keeps custom agents on a native harness as their own rows, named by their own name", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "ag_native", name: "claude-native-ui", harness: "claude-native", builtin: true },
+          { id: "ag_kiro", name: "kiro-native-ui", harness: "kiro-native", builtin: true },
+          // Seeded via OMNIGENT_BUILTIN_AGENT_DIRS: a built-in, but not the stock wrapper.
+          { id: "ag_teamresearch", name: "teamresearch", harness: "claude-native", builtin: true },
+          // Registered with `omnigent server --agent` (builtin: false).
+          {
+            id: "ag_autoresearch",
+            name: "autoresearch",
+            harness: "claude-native",
+            builtin: false,
+            created_at: 2,
+          },
+          {
+            id: "ag_fieldnotes",
+            name: "fieldnotes",
+            harness: "kiro-native",
+            builtin: false,
+            created_at: 1,
+          },
+        ],
+        has_more: false,
+      }),
+      [MINE_URL]: EMPTY_MINE,
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
+
+    // Only the stock wrappers carry the vendor label; a custom agent on the same
+    // native harness keeps its own name and its own row, never folded away.
+    expect((result.current.data ?? []).map((a) => [a.id, a.display_name])).toEqual([
+      ["ag_native", "Claude Code"],
+      ["ag_kiro", "Kiro"],
+      ["ag_teamresearch", "Teamresearch"],
+      ["ag_autoresearch", "Autoresearch"],
+      ["ag_fieldnotes", "Fieldnotes"],
+    ]);
+  });
+
+  it("a seeded built-in custom Kiro agent does not shadow legacy Kiro rows", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "ag_native", name: "claude-native-ui", harness: "claude-native", builtin: true },
+          // Seeded on kiro-native under its own name, not the stock
+          // kiro-native-ui wrapper, so it is not the Kiro built-in.
+          { id: "ag_teamkiro", name: "teamkiro", harness: "kiro-native", builtin: true },
+        ],
+        has_more: false,
+      }),
+      [MINE_URL]: sessionResponse({
+        object: "list",
+        // A legacy plain-"kiro" row is hidden only when the stock Kiro wrapper
+        // exists; with no wrapper seeded it keeps its own session row.
+        data: [{ id: "ag_legacy_kiro", name: "kiro" }],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
+
+    const rows = (result.current.data ?? []).map((a) => [a.id, a.display_name]);
+    expect(rows).toContainEqual(["ag_teamkiro", "Teamkiro"]);
+    expect(rows).toContainEqual(["ag_legacy_kiro", "Kiro"]);
+  });
+
+  it.each([true, false])(
+    "folds a builtin=%s stock wrapper clone into the single vendor row",
+    async (builtin) => {
+      routeFetch({
+        [BUILTINS_URL]: mockResponse({
+          object: "list",
+          data: [
+            { id: "ag_native", name: "claude-native-ui", harness: "claude-native", builtin: true },
+            // A fork clone carries the stock wrapper's name, so it folds into the
+            // vendor row even when flagged: stock-name recognition wins over the exemption.
+            {
+              id: "ag_clone",
+              name: "claude-native-ui (fork conv_7)",
+              harness: "claude-native",
+              builtin,
+            },
+          ],
+          has_more: false,
+        }),
+        [MINE_URL]: EMPTY_MINE,
+      });
+
+      const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+      await waitFor(() => {
+        expect(result.current.isSuccess).toBe(true);
+        expect(result.current.isPlaceholderData).toBe(false);
+      });
+
+      expect((result.current.data ?? []).map((a) => [a.id, a.display_name])).toEqual([
+        ["ag_native", "Claude Code"],
+      ]);
+    },
+  );
 
   it("defaults a missing harness to null", async () => {
     routeFetch({
@@ -1000,6 +1122,49 @@ describe("prefetchAvailableAgentDetails", () => {
     // Shadow removed; only the seeded built-in remains.
     expect(queryClient.getQueryData(["available-agents"])).toEqual([kiroBuiltin]);
   });
+
+  it("keeps a session agent when its only native peer is an explicitly flagged custom agent", async () => {
+    // The sole kiro peer is a user-flagged custom agent, not the stock
+    // wrapper, so enrichment must not fold the session row into it. Both keep
+    // their own rows.
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const customKiro = testAgent("ag_teamkiro", "teamkiro", {
+      display_name: "Teamkiro",
+      harness: "kiro-native",
+      builtin: true,
+    });
+    const sessionKiro = testAgent("ag_session_kiro", "kiro-naitive", {
+      display_name: "Kiro-naitive",
+      harness: null,
+      sessionId: "conv_kiro",
+    });
+    queryClient.setQueryData(["available-agents"], [customKiro, sessionKiro]);
+
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "ag_session_kiro",
+        object: "agent",
+        name: "kiro-naitive",
+        harness: "kiro-native",
+        skills: [],
+      }),
+    );
+
+    await prefetchAvailableAgentDetails(sessionKiro, queryClient);
+
+    expect(queryClient.getQueryData(["available-agents"])).toEqual([
+      customKiro,
+      {
+        id: "ag_session_kiro",
+        name: "kiro-naitive",
+        display_name: "Kiro-naitive",
+        description: null,
+        harness: "kiro-native",
+        skills: [],
+        sessionId: "conv_kiro",
+      },
+    ]);
+  });
 });
 
 // Pinned agents (e.g. a project's configured default) must survive discovery:
@@ -1236,5 +1401,349 @@ describe("useAvailableAgents slow discovery scan", () => {
     // GET /v1/agents — the placeholder must not double the catalog load.
     const catalogCalls = fetchMock.mock.calls.filter((c) => c[0] === BUILTINS_URL);
     expect(catalogCalls).toHaveLength(1);
+  });
+
+  it("drops a suppressed built-in that session history would otherwise resurface", async () => {
+    // A deployment trimmed polly via OMNIGENT_SEEDED_AGENTS after the row was
+    // seeded, so a user's older sessions still bind it. The catalog omits the
+    // row and names it as suppressed; the discovery pass must not promote it
+    // back into the picker as a "custom" agent.
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [{ id: "ag_native", name: "claude-native-ui", harness: "claude-native" }],
+        has_more: false,
+        suppressed_agent_names: ["polly"],
+      }),
+      [MINE_URL]: sessionResponse({
+        object: "list",
+        data: [
+          { id: "ag_polly", name: "polly" },
+          { id: "ag_polly_fork", name: "polly (fork conv_3)" },
+          { id: "ag_doc", name: "doc-writer" },
+        ],
+        has_more: false,
+      }),
+    });
+    // A project default pinning the trimmed row must not bring it back either.
+    const { result } = renderHook(
+      () => ({ ...useAvailableAgents({ pinnedAgentIds: ["ag_polly"] }) }),
+      { wrapper },
+    );
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
+    const names = (result.current.data ?? []).map((a) => a.name);
+    expect(names).toEqual(["claude-native-ui", "doc-writer"]);
+  });
+});
+
+describe("useAvailableAgents user agents (scope=user)", () => {
+  const USER_AGENTS_URL = "/v1/agents?scope=user&limit=50";
+
+  function wrapperWithInfo(agentInstall: boolean) {
+    return function InfoWrapper({ children }: { children: ReactNode }) {
+      return wrapper({
+        children: (
+          <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, agent_install: agentInstall }}>
+            {children}
+          </CapabilitiesProvider>
+        ),
+      });
+    };
+  }
+
+  const CATALOG = mockResponse({
+    data: [{ id: "ag_polly", name: "polly", harness: "claude-sdk", builtin: true }],
+    has_more: false,
+  });
+  const MINE = sessionResponse({
+    object: "list",
+    data: [{ id: "ag_orion", name: "orion", created_at: 5 }],
+    has_more: false,
+  });
+
+  it("merges the caller's agents in, one per name, keeping built-in names", async () => {
+    routeFetch({
+      [BUILTINS_URL]: CATALOG,
+      [MINE_URL]: MINE,
+      [USER_AGENTS_URL]: mockResponse({
+        data: [
+          { id: "ag_vega", name: "vega", harness: "claude-sdk", builtin: false, created_at: 9 },
+          // Also used by a recent session: listed once.
+          { id: "ag_orion", name: "orion", builtin: false, created_at: 5 },
+          // A built-in's name: the built-in wins.
+          { id: "ag_polly_copy", name: "polly (fork 1a2b)", builtin: false, created_at: 8 },
+          { id: "ag_atlas", name: "atlas", builtin: false, created_at: 1 },
+        ],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
+      wrapper: wrapperWithInfo(true),
+    });
+    await waitFor(() => {
+      expect(result.current.isPlaceholderData).toBe(false);
+      expect(result.current.data?.map((a) => a.id)).toEqual([
+        "ag_polly",
+        "ag_vega",
+        "ag_orion",
+        "ag_atlas",
+      ]);
+    });
+  });
+
+  it("follows the cursor past a page the server filled only with skipped copies", async () => {
+    routeFetch({
+      [BUILTINS_URL]: CATALOG,
+      [MINE_URL]: sessionResponse({ object: "list", data: [], has_more: false }),
+      // 50 newer copies: the server read them, skipped them, and returned nothing.
+      [USER_AGENTS_URL]: mockResponse({ data: [], has_more: true, last_id: "ag_copy_50" }),
+      [`${USER_AGENTS_URL}&after=ag_copy_50`]: mockResponse({
+        data: [{ id: "ag_orion", name: "orion", builtin: false, created_at: 1 }],
+        has_more: false,
+        last_id: "ag_orion",
+      }),
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
+      wrapper: wrapperWithInfo(true),
+    });
+    await waitFor(() => {
+      expect(result.current.isPlaceholderData).toBe(false);
+      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion"]);
+    });
+  });
+
+  it("names your agents by their own name, whatever their harness", async () => {
+    routeFetch({
+      [BUILTINS_URL]: CATALOG,
+      [MINE_URL]: sessionResponse({ object: "list", data: [], has_more: false }),
+      [HARNESSES_URL]: mockResponse({
+        data: [
+          { id: "grok", label: "Grok Build", capabilities: { integration_mode: "acp-subprocess" } },
+        ],
+      }),
+      [USER_AGENTS_URL]: mockResponse({
+        data: [
+          {
+            id: "ag_orion",
+            name: "orion",
+            harness: "claude-native",
+            builtin: false,
+            created_at: 2,
+          },
+          { id: "ag_scout", name: "scout", harness: "grok", builtin: false, created_at: 1 },
+        ],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
+      wrapper: wrapperWithInfo(true),
+    });
+    await waitFor(() =>
+      expect(result.current.data?.find((a) => a.id === "ag_scout")?.acpHarness).toBe(true),
+    );
+    const mine = (result.current.data ?? []).filter((a) => a.mine);
+    expect(mine.map((a) => [a.id, a.display_name])).toEqual([
+      ["ag_orion", "Orion"],
+      ["ag_scout", "Scout"],
+    ]);
+  });
+
+  it("follows the cursor past a page of one name's repeats to older agents", async () => {
+    // An older server kept a row per `omnigent run --harness codex`.
+    const codexRuns = Array.from({ length: 50 }, (_, i) => ({
+      id: `ag_codex_${i}`,
+      name: "codex",
+      harness: "codex",
+      builtin: false,
+      created_at: 100 - i,
+    }));
+    routeFetch({
+      [BUILTINS_URL]: CATALOG,
+      [MINE_URL]: sessionResponse({ object: "list", data: [], has_more: false }),
+      [USER_AGENTS_URL]: mockResponse({ data: codexRuns, has_more: true, last_id: "ag_codex_49" }),
+      [`${USER_AGENTS_URL}&after=ag_codex_49`]: mockResponse({
+        data: [{ id: "ag_orion", name: "orion", builtin: false, created_at: 1 }],
+        has_more: false,
+        last_id: "ag_orion",
+      }),
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
+      wrapper: wrapperWithInfo(true),
+    });
+    await waitFor(() => {
+      expect(result.current.isPlaceholderData).toBe(false);
+      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_codex_0", "ag_orion"]);
+    });
+  });
+
+  it("shows the most recently changed of same-named agents, so an install is selectable", async () => {
+    routeFetch({
+      [BUILTINS_URL]: CATALOG,
+      // A recent session uses an older upload named orion.
+      [MINE_URL]: MINE,
+      [USER_AGENTS_URL]: mockResponse({
+        data: [
+          { id: "ag_orion", name: "orion", builtin: false, created_at: 5, updated_at: 5 },
+          // Installed earlier, just reinstalled (or imported).
+          {
+            id: "ag_orion_installed",
+            name: "orion",
+            builtin: false,
+            created_at: 3,
+            updated_at: 10,
+          },
+        ],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
+      wrapper: wrapperWithInfo(true),
+    });
+    await waitFor(() => {
+      expect(result.current.isPlaceholderData).toBe(false);
+      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion_installed"]);
+    });
+  });
+
+  it("ranks the caller's agents by their own changes, not by session activity", async () => {
+    routeFetch({
+      [BUILTINS_URL]: CATALOG,
+      // A fork just started on the older upload named orion.
+      [MINE_URL]: sessionResponse({
+        object: "list",
+        data: [{ id: "ag_orion", name: "orion", created_at: 20 }],
+        has_more: false,
+      }),
+      [USER_AGENTS_URL]: mockResponse({
+        data: [
+          { id: "ag_orion", name: "orion", builtin: false, created_at: 5, updated_at: 5 },
+          {
+            id: "ag_orion_installed",
+            name: "orion",
+            builtin: false,
+            created_at: 3,
+            updated_at: 10,
+          },
+        ],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
+      wrapper: wrapperWithInfo(true),
+    });
+    await waitFor(() => {
+      expect(result.current.isPlaceholderData).toBe(false);
+      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion_installed"]);
+    });
+  });
+
+  it("does not ask for the caller's agents when the server lacks agent_install", async () => {
+    routeFetch({ [BUILTINS_URL]: CATALOG, [MINE_URL]: MINE });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
+      wrapper: wrapperWithInfo(false),
+    });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
+
+    expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion"]);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("scope=user"))).toBe(false);
+  });
+
+  it("keeps the existing list when the caller's agents fail to load", async () => {
+    routeFetch({
+      [BUILTINS_URL]: CATALOG,
+      [MINE_URL]: MINE,
+      [USER_AGENTS_URL]: mockResponse({}, { ok: false, status: 500 }),
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
+      wrapper: wrapperWithInfo(true),
+    });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
+
+    expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion"]);
+    expect(fetchMock.mock.calls.some(([url]) => url === USER_AGENTS_URL)).toBe(true);
+  });
+});
+
+describe("useAgentCatalog", () => {
+  it("lists the caller's agents and flags ACP harnesses without a sidebar provider", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        data: [
+          { id: "ag_jcode", name: "jcode", harness: "jcode", builtin: true },
+          { id: "ag_polly", name: "polly", harness: "claude-sdk", builtin: true },
+        ],
+        has_more: false,
+      }),
+      "/v1/agents?scope=user&limit=50": mockResponse({
+        data: [{ id: "ag_helper", name: "my-helper", harness: "claude-sdk", builtin: false }],
+        has_more: false,
+      }),
+      [HARNESSES_URL]: mockResponse({
+        data: [
+          { id: "jcode", label: "Jcode", capabilities: { integration_mode: "acp-subprocess" } },
+        ],
+      }),
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(() => useAgentCatalog(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>
+          <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, agent_install: true }}>
+            {children}
+          </CapabilitiesProvider>
+        </QueryClientProvider>
+      ),
+    });
+
+    await waitFor(() => {
+      expect(result.current.data?.find((a) => a.name === "my-helper")?.mine).toBe(true);
+      expect(result.current.data?.find((a) => a.name === "jcode")?.acpHarness).toBe(true);
+    });
+  });
+
+  it("reports a failed catalog and loads it on retry", async () => {
+    const harnesses = mockResponse({ data: [] });
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({ detail: "down" }, { ok: false, status: 503 }),
+      [HARNESSES_URL]: harnesses,
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(() => useAgentCatalog(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>
+          <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>{children}</CapabilitiesProvider>
+        </QueryClientProvider>
+      ),
+    });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.data).toBeUndefined();
+
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        data: [{ id: "ag_polly", name: "polly", harness: "claude-sdk", builtin: true }],
+        has_more: false,
+      }),
+      [HARNESSES_URL]: harnesses,
+    });
+    act(() => result.current.retry());
+    await waitFor(() => expect(result.current.data?.map((a) => a.name)).toEqual(["polly"]));
+    expect(result.current.isError).toBe(false);
   });
 });

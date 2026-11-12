@@ -75,9 +75,13 @@ def _stdio(tmp_path, **env):
     )
 
 
-def _assert_reaped(tmp_path):
-    for pid in json.loads((tmp_path / "pids.json").read_text()):
-        assert not psutil.pid_exists(pid) or psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+async def _assert_reaped(tmp_path):
+    async with asyncio.timeout(budget(5)):
+        for pid in json.loads((tmp_path / "pids.json").read_text()):
+            with suppress(psutil.NoSuchProcess):
+                process = psutil.Process(pid)
+                while process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+                    await asyncio.sleep(0.01)
 
 
 async def _wait_for_stdio_tree(tmp_path, task):
@@ -110,7 +114,7 @@ async def test_stdio_caps_pagination_private_output_and_cleanup(
         sys.executable,
     ):
         assert secret not in output
-    _assert_reaped(tmp_path)
+    await _assert_reaped(tmp_path)
 
 
 @pytest.mark.parametrize("startup_delay", [0, 3])
@@ -131,7 +135,7 @@ async def test_timeout_reaps_stdio_tree(tmp_path, monkeypatch, startup_delay):
         monkeypatch.setattr(mcp_tools, "PROBE_TIMEOUT_SECONDS", 0.05)
         result = await HostMcpTools().probe("claude", "docs")
         assert result["connection"] == "timeout"
-        _assert_reaped(tmp_path)
+        await _assert_reaped(tmp_path)
     finally:
         worker.cancel()
         with suppress(asyncio.CancelledError):
@@ -147,7 +151,7 @@ async def test_cancellation_reaps_stdio_tree(tmp_path, monkeypatch):
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        _assert_reaped(tmp_path)
+        await _assert_reaped(tmp_path)
     finally:
         task.cancel()
         with suppress(asyncio.CancelledError):
@@ -295,7 +299,7 @@ def test_transport_timeouts_keep_the_timeout_status():
 
     timeout = httpx.ReadTimeout("synthetic-private-URL")
     assert mcp_tools._failure_status(timeout) == "timeout"
-    assert mcp_tools._failure_status(ExceptionGroup("transport", [timeout])) == "timeout"  # noqa: F821
+    assert mcp_tools._failure_status(ExceptionGroup("transport", [timeout])) == "timeout"
 
 
 async def test_plugin_identity_selects_marketplace_and_never_probes_disabled(
@@ -412,3 +416,12 @@ async def test_http_network_settings_invalidate_probe_cache(monkeypatch):
         "http://first.example:8080",
         "http://second.example:8080",
     ]
+
+
+@pytest.mark.parametrize("name,plugin", [("renamed", None), ("docs", "other")])
+async def test_source_id_also_requires_matching_name_and_plugin(monkeypatch, name, plugin):
+    entry = _entry({"url": "https://example.test/mcp"})
+    entry.summary["source_id"] = "a" * 64
+    monkeypatch.setattr(mcp_tools, "configured_mcp_servers", lambda: [entry])
+    with pytest.raises(LookupError):
+        await HostMcpTools().probe("claude", name, plugin, "a" * 64)

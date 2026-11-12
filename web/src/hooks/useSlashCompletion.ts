@@ -17,6 +17,8 @@ function commandContinuationLength(token: string | undefined, tokenSuffix: strin
   return 0;
 }
 
+const NO_LABELS: Readonly<Record<string, string>> = {};
+
 /** The slice of a textarea keydown the menu reads. */
 export interface SlashCompletionKeyEvent {
   key: string;
@@ -41,6 +43,8 @@ export interface UseSlashCompletionOptions {
   commands: Record<string, string>;
   /** Explicit skill inventory, including names that collide with built-ins. */
   skills: Record<string, string>;
+  /** Skill display names by prefixed command; a query may match either. */
+  labels?: Readonly<Record<string, string>>;
   textareaRef?: RefObject<HTMLTextAreaElement | null>;
   /**
    * The command prefix this surface's inventory uses ("$" for codex-native,
@@ -77,6 +81,8 @@ export interface UseSlashCompletionResult {
   /** Inventory for this token; inline suggestions contain only skills. */
   commands: Record<string, string>;
   builtinNames: ReadonlySet<string>;
+  /** Display names the ranking matched against, for the menu to reuse. */
+  labels: Readonly<Record<string, string>>;
   inline: boolean;
   onSelectionChange: (element: HTMLTextAreaElement) => void;
   complete: (cmd: string) => { text: string; caret: number };
@@ -106,6 +112,7 @@ export function useSlashCompletion({
   text,
   commands,
   skills,
+  labels = NO_LABELS,
   textareaRef,
   prefix,
   status,
@@ -153,7 +160,7 @@ export function useSlashCompletion({
   // Kept in sync with what the menu renders so keyboard nav indexes into
   // the same list.
   const baseMatches = baseOpen
-    ? rankedSlashCommandNames(menuCommands, baseQuery, builtinNames)
+    ? rankedSlashCommandNames(menuCommands, baseQuery, builtinNames, labels)
     : [];
   const query = open ? baseQuery : "";
   const matches = open ? baseMatches : [];
@@ -266,6 +273,7 @@ export function useSlashCompletion({
     commands: menuCommands,
     inline,
     builtinNames,
+    labels,
     onSelectionChange,
     complete: (cmd) => {
       const consumedContinuation = commandContinuationLength(token, tokenSuffix, cmd);

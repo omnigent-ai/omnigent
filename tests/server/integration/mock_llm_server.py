@@ -26,15 +26,19 @@ Endpoints:
 - ``POST /mock/configure`` — load a keyed response sequence.
 - ``POST /mock/reset`` — clear all state.
 - ``GET /mock/requests`` — return captured request bodies.
+- ``POST /mock/context_window`` — reject oversized ``/v1/messages`` prompts.
 - ``GET /gate/pending`` — check if any request is blocked on a gate.
-- ``POST /gate/release`` — release the oldest pending gate.
+- ``POST /gate/release`` — release the oldest pending gate, or with
+  ``?gate=<label>`` the oldest one whose response carries that ``gate`` label.
 - ``GET /stats`` — return ``{"request_count": N}``.
 
 Usage::
 
     python tests/server/integration/mock_llm_server.py 9999
 
-Configuration via ``POST /mock/configure``::
+Configuration via ``POST /mock/configure``:
+
+.. code-block:: json
 
     {
         "key": "mock-model",
@@ -65,12 +69,13 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import time as _time_mod
 import uuid as _uuid_mod
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import uvicorn
@@ -135,6 +140,10 @@ _DEFAULT_KEY = "default"
 # ── SSE event builders (following Codex pattern) ─────────
 
 
+def _estimated_prompt_tokens(body: bytes) -> int:
+    return len(body) // 4
+
+
 def _response_id() -> str:
     """Generate a unique response id."""
     return f"resp_{_uuid_mod.uuid4().hex[:12]}"
@@ -147,7 +156,9 @@ def _response_usage(output_tokens: int, overrides: dict | None = None) -> dict:
     return usage
 
 
-def sse_text_response(text: str, model: str = "mock-model", usage: dict | None = None) -> str:
+def sse_text_response(
+    text: str, model: str = "mock-model", usage: dict | None = None, *, stream: bool = False
+) -> str:
     """
     Build a complete SSE stream for a simple text response.
 
@@ -159,6 +170,7 @@ def sse_text_response(text: str, model: str = "mock-model", usage: dict | None =
     :param text: The assistant response text.
     :param model: Model name to include in the response.
     :param usage: Optional token-usage overrides.
+    :param stream: Include incremental text deltas before completing the message.
     :returns: SSE-formatted string.
     """
     resp_id = _response_id()
@@ -205,8 +217,26 @@ def sse_text_response(text: str, model: str = "mock-model", usage: dict | None =
     _add(
         "response.output_item.added",
         output_index=0,
-        item=message_item,
+        item={**message_item, "status": "in_progress", "content": []} if stream else message_item,
     )
+    if stream:
+        _add(
+            "response.content_part.added",
+            output_index=0,
+            item_id=msg_id,
+            content_index=0,
+            part={"type": "output_text", "text": "", "annotations": [], "logprobs": []},
+        )
+        # Keep original whitespace so streamed text agrees with the final message.
+        for delta in re.findall(r"\s+|\S+\s*", text):
+            _add(
+                "response.output_text.delta",
+                output_index=0,
+                item_id=msg_id,
+                content_index=0,
+                delta=delta,
+                logprobs=[],
+            )
     _add(
         "response.output_text.done",
         output_index=0,
@@ -214,6 +244,14 @@ def sse_text_response(text: str, model: str = "mock-model", usage: dict | None =
         content_index=0,
         text=text,
     )
+    if stream:
+        _add(
+            "response.content_part.done",
+            output_index=0,
+            item_id=msg_id,
+            content_index=0,
+            part={"type": "output_text", "text": text, "annotations": [], "logprobs": []},
+        )
     _add(
         "response.output_item.done",
         output_index=0,
@@ -272,7 +310,8 @@ def sse_tool_call_response(
     Build a complete SSE stream for a function call response.
 
     :param tool_calls: List of tool call dicts, each with
-        ``"call_id"``, ``"name"``, and ``"arguments"`` keys.
+        ``"call_id"``, ``"name"``, and ``"arguments"`` keys, plus an optional
+        ``"namespace"`` for native Codex MCP calls.
     :param model: Model name to include in the response.
     :param usage: Optional token-usage overrides.
     :returns: SSE-formatted string.
@@ -289,6 +328,7 @@ def sse_tool_call_response(
                 "name": tc["name"],
                 "arguments": tc.get("arguments", "{}"),
                 "status": "completed",
+                **({"namespace": tc["namespace"]} if "namespace" in tc else {}),
             }
         )
     response_obj = {
@@ -349,6 +389,17 @@ def truncate_sse(body: str, keep_events: int) -> str:
     return "".join(f"{seg}\n\n" for seg in kept)
 
 
+async def paced_sse(sse_body: str, chunk_delay: float) -> AsyncIterator[str]:
+    """Yield SSE events with real delays, or the entire body when delay is zero."""
+    if chunk_delay > 0:
+        for index, event in enumerate(filter(None, sse_body.split("\n\n"))):
+            if index:
+                await asyncio.sleep(chunk_delay)
+            yield event + "\n\n"
+    else:
+        yield sse_body
+
+
 def sse_streaming_text(text: str, model: str = "mock-model", usage: dict | None = None) -> str:
     """
     Build SSE with text deltas followed by a completed event.
@@ -358,12 +409,7 @@ def sse_streaming_text(text: str, model: str = "mock-model", usage: dict | None 
     :param usage: Optional token-usage overrides.
     :returns: SSE-formatted string with delta events.
     """
-    events = []
-    for word in text.split():
-        delta = {"delta": word + " "}
-        events.append(f"event: response.output_text.delta\ndata: {json.dumps(delta)}\n\n")
-    events.append(sse_text_response(text, model, usage))
-    return "".join(events)
+    return sse_text_response(text, model, usage, stream=True)
 
 
 def sse_text_with_native_items(
@@ -763,6 +809,8 @@ class QueuedResponse:
     :param native_items: Raw output items (e.g. ``web_search_call``)
         included alongside text in the response.
     :param block: If True, block until gate is released.
+    :param gate: Label that lets ``POST /gate/release?gate=<label>`` release
+        this blocked response ahead of older ones.
     :param stream: If True, stream text deltas before completed.
     :param error: If set, return an error response with this message.
     :param status_code: HTTP status code for error responses.
@@ -784,9 +832,12 @@ class QueuedResponse:
     """
 
     text: str = "Mock LLM response"
+    # Optional Chat wire content blocks, including provider-specific metadata.
+    chat_content: list[dict[str, object]] | None = None
     tool_calls: list[dict[str, str]] | None = None
     native_items: list[dict] | None = None
     block: bool = False
+    gate: str | None = None
     stream: bool = False
     error: str | None = None
     status_code: int = 500
@@ -809,9 +860,10 @@ class QueuedResponse:
     # this text before the ``text`` block — scripts a turn where the model
     # visibly thinks before answering.
     thinking: str | None = None
-    # Seconds to sleep between SSE events on ``/v1/messages``. ``0`` keeps the
-    # historical single-chunk body; a small value paces the stream so live
-    # surfaces (a native TUI) visibly render intermediate deltas.
+    # Seconds to sleep between SSE events on ``/v1/messages`` and
+    # ``/v1/responses``. ``0`` keeps the historical single-chunk body; a small
+    # value paces the stream so live surfaces (the web SPA, a native TUI)
+    # visibly render intermediate deltas.
     chunk_delay: float = 0.0
     _gate: asyncio.Event = field(default_factory=asyncio.Event)
     _pending: asyncio.Event = field(default_factory=asyncio.Event)
@@ -887,10 +939,14 @@ class MockState:
     def __init__(self) -> None:
         self.queues: dict[str, _ResponseQueue] = {}
         self.captured_requests: list[dict] = []
+        # Anthropic Messages requests with the beta flags their headers carried.
+        self.captured_message_requests: list[dict] = []
         self.request_count: int = 0
         self.pending_gates: list[QueuedResponse] = []
         # Ids ``GET /v1/models`` reports; see ``POST /mock/served_models``.
         self.served_models: list[str] = []
+        # See ``POST /mock/context_window``.
+        self.context_window_tokens: int | None = None
         self._lock = asyncio.Lock()
 
     def get_queue(self, key: str) -> _ResponseQueue:
@@ -1056,8 +1112,10 @@ class MockState:
         if record_evidence:
             _record_evidence("reset", accepted_at_ns=_time_mod.time_ns())
         self.captured_requests.clear()
+        self.captured_message_requests.clear()
         self.request_count = 0
         self.served_models = []
+        self.context_window_tokens = None
 
 
 _state = MockState()
@@ -1067,6 +1125,7 @@ _state = MockState()
 
 
 @app.post("/v1/responses", response_model=None)
+@app.post("/ai-gateway/codex/v1/responses", response_model=None)
 async def create_response(
     request: Request,
 ) -> StreamingResponse | JSONResponse:
@@ -1137,13 +1196,26 @@ async def create_response(
     if qr.truncate_after is not None:
         sse_body = truncate_sse(sse_body, qr.truncate_after)
 
-    async def _generate() -> AsyncIterator[str]:
-        yield sse_body
-
     return StreamingResponse(
-        _generate(),
+        paced_sse(sse_body, qr.chunk_delay),
         media_type="text/event-stream",
     )
+
+
+def _anthropic_betas(request: Request, body: object) -> list[str]:
+    """Return the beta flags an Anthropic client sent, e.g. ``["context-1m-2025-08-07"]``.
+
+    SDKs send them in the ``anthropic-beta`` header; a ``betas`` body field is kept too.
+    """
+    flags = [
+        flag.strip()
+        for header in request.headers.getlist("anthropic-beta")
+        for flag in header.split(",")
+        if flag.strip()
+    ]
+    if isinstance(body, dict) and isinstance(body.get("betas"), list):
+        flags += [flag for flag in body["betas"] if isinstance(flag, str)]
+    return flags
 
 
 @app.post("/v1/messages", response_model=None)
@@ -1161,14 +1233,31 @@ async def create_message(
     except (json.JSONDecodeError, ValueError):
         parsed = {"raw": body.decode(errors="replace")}
 
+    prompt_tokens = _estimated_prompt_tokens(body)
     async with _state._lock:
         accepted_at_ns = _time_mod.time_ns()
         _state.request_count += 1
         _state.captured_requests.append(parsed)
-        queue = _state.resolve_queue_for_request(parsed)
-        qr = queue.next()
+        _state.captured_message_requests.append(
+            {"body": parsed, "betas": _anthropic_betas(request, parsed)}
+        )
+        window = _state.context_window_tokens
+        overflow = window is not None and prompt_tokens > window
+        qr = QueuedResponse() if overflow else _state.resolve_queue_for_request(parsed).next()
 
     await _record_evidence_async("request", parsed, accepted_at_ns)
+
+    if overflow:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": f"prompt is too long: {prompt_tokens} tokens > {window} maximum",
+                },
+            },
+        )
 
     # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
     if qr.delay:
@@ -1187,6 +1276,9 @@ async def create_message(
         qr._pending.set()
         _state.pending_gates.append(qr)
         await qr._gate.wait()
+
+    if window is not None:
+        qr = replace(qr, usage={"input_tokens": prompt_tokens, **(qr.usage or {})})
 
     req_model = parsed.get("model") if isinstance(parsed, dict) else None
     echo_model = req_model if isinstance(req_model, str) and req_model else "mock-model"
@@ -1246,27 +1338,14 @@ async def create_message(
     if qr.truncate_after is not None:
         sse_body = truncate_sse(sse_body, qr.truncate_after)
 
-    chunk_delay = qr.chunk_delay
-
-    async def _generate() -> AsyncIterator[str]:
-        if chunk_delay > 0:
-            # Pace the stream one SSE event at a time so live surfaces
-            # render intermediate deltas instead of one instant repaint.
-            for event in sse_body.split("\n\n"):
-                if not event:
-                    continue
-                yield event + "\n\n"
-                await asyncio.sleep(chunk_delay)
-        else:
-            yield sse_body
-
     return StreamingResponse(
-        _generate(),
+        paced_sse(sse_body, qr.chunk_delay),
         media_type="text/event-stream",
     )
 
 
 @app.post("/v1/chat/completions", response_model=None)
+@app.post("/ai-gateway/mlflow/v1/chat/completions", response_model=None)
 async def create_chat_completion(
     request: Request,
 ) -> StreamingResponse | JSONResponse:
@@ -1320,6 +1399,11 @@ async def create_chat_completion(
                     "name": tc.get("name", ""),
                     "arguments": tc.get("arguments", "{}"),
                 },
+                **(
+                    {"thoughtSignature": tc["thoughtSignature"]}
+                    if "thoughtSignature" in tc
+                    else {}
+                ),
             }
             for tc in qr.tool_calls
         ]
@@ -1327,7 +1411,8 @@ async def create_chat_completion(
         else None
     )
     finish_reason = "tool_calls" if cc_tool_calls else "stop"
-    cc_message: dict[str, object] = {"role": "assistant", "content": text or None}
+    content = qr.chat_content if qr.chat_content is not None else text or None
+    cc_message: dict[str, object] = {"role": "assistant", "content": content}
     if cc_tool_calls:
         cc_message["tool_calls"] = cc_tool_calls
     resp_id = _response_id()
@@ -1350,7 +1435,7 @@ async def create_chat_completion(
         "usage": cc_usage,
     }
     if parsed.get("stream"):
-        delta: dict[str, object] = {"role": "assistant", "content": text or None}
+        delta: dict[str, object] = {"role": "assistant", "content": content}
         if cc_tool_calls:
             delta["tool_calls"] = [{"index": i, **tc} for i, tc in enumerate(cc_tool_calls)]
         chunk = {
@@ -1422,6 +1507,27 @@ async def set_served_models(request: Request) -> dict[str, object]:
     return {"configured": True, "count": len(_state.served_models)}
 
 
+@app.post("/mock/context_window")
+async def set_context_window(request: Request) -> dict[str, object]:
+    """Enforce a context window on ``/v1/messages`` (cleared by ``/mock/reset``).
+
+    Prompts are estimated at four request-body bytes per token. Larger prompts
+    get the Anthropic ``prompt is too long`` 400 without consuming a queued
+    response; accepted prompts report the estimate as ``input_tokens``.
+
+    Body::
+
+        {"max_input_tokens": 100000}
+    """
+    body = await request.json()
+    limit = body.get("max_input_tokens")
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0):
+        raise HTTPException(status_code=400, detail="max_input_tokens must be a positive int")
+    async with _state._lock:
+        _state.context_window_tokens = limit
+    return {"configured": True, "max_input_tokens": limit}
+
+
 @app.post("/mock/configure")
 async def configure(request: Request) -> dict[str, object]:
     """
@@ -1487,9 +1593,11 @@ async def configure(request: Request) -> dict[str, object]:
             queue.responses.append(
                 QueuedResponse(
                     text=entry.get("text", "Mock LLM response"),
+                    chat_content=entry.get("chat_content"),
                     tool_calls=entry.get("tool_calls"),
                     native_items=entry.get("native_items"),
                     block=entry.get("block", False),
+                    gate=entry.get("gate"),
                     stream=entry.get("stream", False),
                     error=entry.get("error"),
                     status_code=entry.get("status_code", 500),
@@ -1562,6 +1670,25 @@ async def get_requests(key: str | None = None) -> dict[str, list]:
     return {"requests": filtered}
 
 
+@app.get("/mock/message_requests")
+async def get_message_requests(key: str | None = None) -> dict[str, list]:
+    """Return captured Anthropic Messages requests with their beta flags.
+
+    Each entry is ``{"body": <request body>, "betas": [<flag>, ...]}``.
+
+    :param key: When set, only return requests whose ``model`` field
+        matches this key.
+    """
+    requests = _state.captured_message_requests
+    if key is not None:
+        requests = [
+            entry
+            for entry in requests
+            if isinstance(entry["body"], dict) and entry["body"].get("model") == key
+        ]
+    return {"requests": requests}
+
+
 @app.get("/gate/pending")
 async def gate_pending() -> dict[str, bool]:
     """Check if any request is waiting on a gate."""
@@ -1570,10 +1697,10 @@ async def gate_pending() -> dict[str, bool]:
 
 
 @app.post("/gate/release")
-async def gate_release() -> dict[str, bool]:
-    """Release the oldest pending gate."""
+async def gate_release(gate: str | None = None) -> dict[str, bool]:
+    """Release the oldest pending gate, or the oldest labelled *gate*."""
     for qr in _state.pending_gates:
-        if qr._pending.is_set() and not qr._gate.is_set():
+        if qr._pending.is_set() and not qr._gate.is_set() and gate in (None, qr.gate):
             qr._gate.set()
             return {"released": True}
     return {"released": False}

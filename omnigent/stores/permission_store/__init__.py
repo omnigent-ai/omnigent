@@ -2,7 +2,7 @@
 
 Each grant is a ``(user_id, conversation_id, level)`` triple where
 level is an integer: 1=read, 2=edit, 3=manage. The ``"__public__"``
-sentinel user ID represents public read access.
+sentinel user ID represents public link access, capped by the live server policy.
 """
 
 from abc import ABC, abstractmethod
@@ -110,12 +110,15 @@ class PermissionStore(ABC):
         ...
 
     @abstractmethod
-    def list_for_sessions(self, conversation_ids: list[str]) -> dict[str, list[SessionPermission]]:
+    def list_for_sessions(
+        self, conversation_ids: list[str], *, user_id: str | None = None
+    ) -> dict[str, list[SessionPermission]]:
         """Return all grants for multiple sessions in one batched query.
 
         Issues a single ``WHERE conversation_id IN (…)`` query and
-        returns ALL grants for those sessions (all users, including
-        the ``"__public__"`` sentinel).  Callers filter in memory
+        returns all grants unless ``user_id`` restricts it to one caller.
+        Without that filter, it includes all users, including
+        the ``"__public__"`` sentinel. Callers filter in memory
         for the specific user or owner they care about.
 
         :param conversation_ids: List of conversation IDs to fetch,
@@ -221,7 +224,7 @@ class PermissionStore(ABC):
         """Check whether *user_id* has a grant at *required_level* or above.
 
         Checks the user's direct grant and the ``__public__`` sentinel
-        grant.  Does NOT handle admin bypass or sub-agent parent
+        grant, subject to the live public ceiling. Does NOT handle admin bypass or sub-agent parent
         delegation — callers are responsible for those.
 
         :param user_id: The authenticated user, or ``None`` if unauthenticated.

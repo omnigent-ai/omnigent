@@ -25,6 +25,12 @@ const mobileMenu = {
   onOpenSubagents: () => undefined,
   githubPanelOpen: false,
   onOpenGithub: () => undefined,
+  contentSearchPanelOpen: false,
+  showContentSearch: false,
+  onOpenContentSearch: () => undefined,
+  sideChatsPanelOpen: false,
+  showSideChats: false,
+  onOpenSideChats: () => undefined,
   onOpenMainExecutionLog: () => undefined,
 };
 

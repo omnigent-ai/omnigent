@@ -6,6 +6,7 @@ import { ChevronRightIcon, SparklesIcon } from "lucide-react";
 import type { ComponentProps, ReactNode } from "react";
 import { createContext, memo, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { Streamdown } from "streamdown";
+import { MERMAID_STREAMDOWN_PROPS } from "@/components/ai-elements/MermaidBlock";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 
 import { normalizeExplicitMathDelimiters } from "./mathMarkdown";
@@ -204,6 +205,7 @@ export const ReasoningContent = memo(({ className, children, ...props }: Reasoni
         {/* Streamdown is memoized and its comparator ignores the mermaid prop,
             so remount on theme change to recolor already-rendered diagrams. */}
         <Streamdown
+          {...MERMAID_STREAMDOWN_PROPS}
           key={themeMode}
           plugins={STREAMDOWN_PLUGINS}
           mermaid={mermaidOptions}

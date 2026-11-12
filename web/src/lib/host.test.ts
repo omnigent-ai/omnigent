@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { getCliServerUrl, hostFetch, resolveWebSocketUrl, setOmnigentHostConfig } from "./host";
+import {
+  getCliServerUrl,
+  hostFetch,
+  resolveMediaUrl,
+  resolveWebSocketUrl,
+  setOmnigentHostConfig,
+} from "./host";
 
 afterEach(() => {
   setOmnigentHostConfig({});
@@ -70,6 +76,19 @@ describe("resolveWebSocketUrl base path", () => {
   });
 });
 
+describe("resolveMediaUrl", () => {
+  it("is null without a host resolver, so standalone media keeps the fetch path", () => {
+    expect(resolveMediaUrl("/v1/sessions/abc/demo.mp4?download=true")).toBeNull();
+  });
+
+  it("delegates to the host resolver", () => {
+    setOmnigentHostConfig({ resolveMediaUrl: (path) => `/host${path}&csrf=t` });
+    expect(resolveMediaUrl("/v1/sessions/abc/demo.mp4?download=true")).toBe(
+      "/host/v1/sessions/abc/demo.mp4?download=true&csrf=t",
+    );
+  });
+});
+
 describe("isDatabricksWorkspace", () => {
   // `hostConfig` and the inlined `import.meta.env` are module state, so each case
   // resets modules and re-imports for a clean slate (the `setOmnigentHostConfig`
@@ -96,5 +115,30 @@ describe("isDatabricksWorkspace", () => {
     vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
     const { isDatabricksWorkspace } = await import("./host");
     expect(isDatabricksWorkspace()).toBe(true);
+  });
+});
+
+describe("isHostRoutingEnabled", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it("defaults to disabled for an OSS server", async () => {
+    const { isHostRoutingEnabled } = await import("./host");
+    expect(isHostRoutingEnabled()).toBe(false);
+  });
+
+  it("enables OSS host routing without enabling Databricks behavior", async () => {
+    vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+    const { isHostRoutingEnabled, isDatabricksWorkspace } = await import("./host");
+    expect(isHostRoutingEnabled()).toBe(true);
+    expect(isDatabricksWorkspace()).toBe(false);
+  });
+
+  it("keeps host routing enabled for Databricks", async () => {
+    vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
+    const { isHostRoutingEnabled } = await import("./host");
+    expect(isHostRoutingEnabled()).toBe(true);
   });
 });

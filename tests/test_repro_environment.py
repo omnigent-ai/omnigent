@@ -21,6 +21,7 @@ def test_isolates_inherited_native_state(tmp_path):
             "OMNIGENT_CONFIG_HOME": "/parent",
             "CLAUDE_CONFIG_DIR": "/parent-claude",
             "OPENAI_API_KEY": "parent-key",
+            "OMNIGENT_PROCESS_LOG_FILE": "/parent/logs/runner/runner.log",
             "NO_PROXY": "example.test",
         },
         tmp_path,
@@ -28,17 +29,17 @@ def test_isolates_inherited_native_state(tmp_path):
     assert "LLM_API_KEY" not in env
     assert "OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD" not in env
     assert "OPENAI_API_KEY" not in env
+    assert "OMNIGENT_PROCESS_LOG_FILE" not in env
     assert env["OMNIGENT_CONFIG_HOME"] == str(tmp_path / "config")
     assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "claude-config")
     assert "127.0.0.1" in env["NO_PROXY"]
 
 
-def test_onboarding_uses_selected_claude_directory(monkeypatch, tmp_path):
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "selected"))
-    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+def test_onboarding_uses_selected_claude_directory(tmp_path):
+    env = isolated_env({"HOME": str(tmp_path / "home"), "CLAUDE_CONFIG_DIR": "/parent"}, tmp_path)
     workspace = tmp_path / "workspace"
-    ensure_claude_workspace_trusted(workspace)
-    state = json.loads((tmp_path / "selected/.claude.json").read_text())
+    ensure_claude_workspace_trusted(workspace, env=env)
+    state = json.loads((Path(env["CLAUDE_CONFIG_DIR"]) / ".claude.json").read_text())
     assert state["hasCompletedOnboarding"]
     assert state["projects"][str(workspace)]["hasTrustDialogAccepted"]
     assert not (tmp_path / "home/.claude.json").exists()

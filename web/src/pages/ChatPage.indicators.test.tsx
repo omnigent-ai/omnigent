@@ -1,6 +1,14 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
+import { WorkingIndicatorRow } from "@/components/chat/chatBubbleParts";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import {
+  TerminalFirstContextProvider,
+  type TerminalFirstContextValue,
+} from "@/shell/TerminalFirstContext";
+import type { ElicitationBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { BubbleView, WorkingIndicator } from "./ChatPage";
@@ -22,7 +30,9 @@ afterEach(() => {
   useChatStore.setState({
     sandboxStatus: null,
     backgroundTaskCount: 0,
+    backgroundAgents: [],
     blockedOn: null,
+    blocks: [],
     sessionStatus: "idle",
     status: "idle",
   });
@@ -51,9 +61,7 @@ describe("SandboxFailedIndicator", () => {
 describe("ConnectionIndicator", () => {
   const onShowReconnectHelp = () => {};
 
-  it("renders the failed-sandbox band when a launch died (sandboxStatus wins)", () => {
-    // WHY: a failed launch owns this band ahead of any liveness state — the
-    // sandbox branch short-circuits before the liveness checks.
+  it("leaves a failed launch to the transcript instead of duplicating it below the composer", () => {
     useChatStore.setState({ sandboxStatus: { stage: "failed", error: "boom" } });
     render(
       <ConnectionIndicator
@@ -61,7 +69,7 @@ describe("ConnectionIndicator", () => {
         onShowReconnectHelp={onShowReconnectHelp}
       />,
     );
-    expect(screen.getByTestId("sandbox-failed-indicator")).toBeInTheDocument();
+    expect(screen.queryByTestId("sandbox-failed-indicator")).not.toBeInTheDocument();
   });
 
   it("renders nothing while a launch is still in flight (non-failed sandbox)", () => {
@@ -156,29 +164,244 @@ describe("RunnerStartingIndicator", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("renders nothing for a terminal sandbox stage (ready/failed handled elsewhere)", () => {
-    // WHY: "failed" gets the destructive band in ConnectionIndicator, so this
-    // in-thread indicator must skip it rather than show stale launch copy.
+  it("replaces launch progress with the recorded failure", () => {
     useChatStore.setState({ sandboxStatus: { stage: "failed", error: "x" } });
-    const { container } = render(<RunnerStartingIndicator variant="row" />);
-    expect(container).toBeEmptyDOMElement();
+    render(<RunnerStartingIndicator variant="row" />);
+    expect(screen.getByTestId("sandbox-failed-indicator")).toBeInTheDocument();
+    expect(screen.queryByTestId("runner-starting-indicator")).not.toBeInTheDocument();
+  });
+});
+
+describe("WorkingIndicatorRow", () => {
+  const closings: { onfinish: (() => void) | null; cancel: () => void }[] = [];
+
+  beforeEach(() => {
+    useChatStore.setState({ backgroundTaskCount: 0, blockedOn: null, sessionStatus: "running" });
+    // jsdom has no Web Animations; record each close so the test can finish it.
+    Element.prototype.animate = vi.fn(() => {
+      const closing = { onfinish: null, cancel: vi.fn() };
+      closings.push(closing);
+      return closing as unknown as Animation;
+    });
+  });
+
+  afterEach(() => {
+    delete (Element.prototype as { animate?: unknown }).animate;
+    closings.length = 0;
+    vi.unstubAllGlobals();
+    cleanup();
+  });
+
+  it("keeps the row while it eases closed after the turn ends", () => {
+    const { rerender } = render(<WorkingIndicatorRow show />);
+    rerender(<WorkingIndicatorRow show={false} />);
+    expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+    expect(closings).toHaveLength(1);
+
+    act(() => closings[0]!.onfinish?.());
+    expect(screen.queryByTestId("working-indicator")).toBeNull();
+  });
+
+  it("stays when the next turn starts while it closes", () => {
+    const { rerender } = render(<WorkingIndicatorRow show />);
+    rerender(<WorkingIndicatorRow show={false} />);
+    rerender(<WorkingIndicatorRow show />);
+
+    expect(closings[0]!.cancel).toHaveBeenCalled();
+    expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+  });
+
+  it("goes at once under reduced motion", () => {
+    vi.stubGlobal("matchMedia", (query: string) => ({ matches: query.includes("reduce") }));
+    const { rerender } = render(<WorkingIndicatorRow show />);
+    rerender(<WorkingIndicatorRow show={false} />);
+
+    expect(screen.queryByTestId("working-indicator")).toBeNull();
+    expect(closings).toHaveLength(0);
   });
 });
 
 describe("WorkingIndicator", () => {
-  it("stays hidden when only background tasks remain and returns for foreground work", () => {
+  it("shows a background-task spinner after the turn ends and the shimmer for foreground work", () => {
     useChatStore.setState({
-      backgroundTaskCount: 1,
+      backgroundTaskCount: 2,
       blockedOn: null,
       sessionStatus: "idle",
       status: "idle",
     });
     const { rerender } = render(<WorkingIndicator />);
     expect(screen.queryByTestId("working-indicator")).toBeNull();
+    expect(screen.getByTestId("background-tasks-indicator")).toHaveTextContent(
+      "2 background tasks running",
+    );
+    expect(screen.getByTestId("running-dot")).toBeInTheDocument();
+    // The composer pill owns the announcement; the transcript log must not repeat it.
+    expect(screen.getByTestId("background-tasks-indicator")).toHaveAttribute("aria-hidden", "true");
+    expect(screen.queryByRole("status")).toBeNull();
 
     act(() => useChatStore.setState({ sessionStatus: "running" }));
     rerender(<WorkingIndicator />);
     expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+    expect(screen.queryByTestId("background-tasks-indicator")).toBeNull();
+
+    act(() => useChatStore.setState({ sessionStatus: "idle", backgroundTaskCount: 0 }));
+    rerender(<WorkingIndicator />);
+    expect(screen.queryByTestId("background-tasks-indicator")).toBeNull();
+  });
+
+  it("names a background agent a finished turn left running instead of shimmering", () => {
+    useChatStore.setState({
+      backgroundAgents: [{ id: "a1", type: "subagent", description: "Audit the auth flow" }],
+      blockedOn: null,
+      sessionStatus: "waiting",
+      status: "idle",
+    });
+    const { rerender } = render(<WorkingIndicator />);
+    expect(screen.queryByTestId("working-indicator")).toBeNull();
+    expect(screen.getByTestId("background-agents-indicator")).toHaveTextContent(
+      "Background agent running: Audit the auth flow",
+    );
+    // No composer pill announces agents, so the indicator owns the live region.
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Background agent running: Audit the auth flow",
+    );
+
+    act(() =>
+      useChatStore.setState({
+        backgroundAgents: [{ id: "a1" }, { id: "a2", description: "Lint" }],
+      }),
+    );
+    rerender(<WorkingIndicator />);
+    expect(screen.getByTestId("background-agents-indicator")).toHaveTextContent(
+      "2 background agents running",
+    );
+
+    // A follow-up the user just sent is foreground work again.
+    act(() => useChatStore.setState({ status: "streaming" }));
+    rerender(<WorkingIndicator />);
+    expect(screen.queryByTestId("background-agents-indicator")).toBeNull();
+    expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+
+    // An SDK orchestrator's `waiting` names no agents and keeps the shimmer.
+    act(() => useChatStore.setState({ status: "idle", backgroundAgents: [] }));
+    rerender(<WorkingIndicator />);
+    expect(screen.queryByTestId("background-agents-indicator")).toBeNull();
+    expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+  });
+
+  describe("parked on a terminal permission prompt", () => {
+    const sideChatId = "conv_side_child";
+    const terminalFirstSession: TerminalFirstContextValue = {
+      isClaudeNative: true,
+      isNativeWrapper: true,
+      isTerminalFirst: true,
+      isShellView: false,
+      view: "chat",
+      terminalViewKey: null,
+      setView: () => {},
+      terminalsAvailable: true,
+      terminalStartingUp: false,
+    };
+    const pendingApproval: ElicitationBlock = {
+      type: "elicitation",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_1", itemId: null },
+      elicitationId: "elic_1",
+      targetSessionId: null,
+      message: "Allow shell command?",
+      phase: "tool_call",
+      policyName: "ask-before-shell",
+      contentPreview: "{}",
+      requestedSchema: {},
+      url: null,
+      status: "pending",
+      response: null,
+    };
+
+    afterEach(() => {
+      cleanup();
+      conversationRegistry.release(sideChatId);
+      useChatStore.setState({ conversationId: null });
+    });
+
+    function renderInTerminalFirstSession(scope: string | null = null) {
+      return render(
+        <TerminalFirstContextProvider value={terminalFirstSession}>
+          <ConversationScopeContext.Provider value={scope}>
+            <WorkingIndicator />
+          </ConversationScopeContext.Provider>
+        </TerminalFirstContextProvider>,
+      );
+    }
+
+    it("sends the user to the Terminal view when no chat card mirrors the prompt", () => {
+      useChatStore.setState({ sessionStatus: "running", blockedOn: "permission prompt" });
+      renderInTerminalFirstSession();
+
+      const expected =
+        "Waiting for your approval in the agent's terminal. Open the Terminal view to respond.";
+      expect(screen.getByTestId("working-indicator")).toHaveTextContent(expected);
+      expect(screen.getByRole("status")).toHaveTextContent(expected);
+    });
+
+    it("keeps the block reason beside a pending approval card", () => {
+      useChatStore.setState({
+        sessionStatus: "running",
+        blockedOn: "permission prompt",
+        blocks: [pendingApproval],
+      });
+      renderInTerminalFirstSession();
+
+      expect(screen.getByTestId("working-indicator")).toHaveTextContent(
+        "Blocked on: permission prompt",
+      );
+    });
+
+    it("still points at the terminal when the only pending card is a sub-agent's", () => {
+      useChatStore.setState({
+        conversationId: "conv_root",
+        sessionStatus: "running",
+        blockedOn: "permission prompt",
+        blocks: [{ ...pendingApproval, targetSessionId: "conv_sub_agent" }],
+      });
+      renderInTerminalFirstSession();
+
+      expect(screen.getByTestId("working-indicator")).toHaveTextContent(
+        "Waiting for your approval in the agent's terminal. Open the Terminal view to respond.",
+      );
+    });
+
+    it("keeps the block reason beside a side chat's own pending card", () => {
+      conversationRegistry.acquire(sideChatId).setState({
+        sessionStatus: "running",
+        blockedOn: "permission prompt",
+        blocks: [{ ...pendingApproval, targetSessionId: sideChatId }],
+      });
+      renderInTerminalFirstSession(sideChatId);
+
+      expect(screen.getByTestId("working-indicator")).toHaveTextContent(
+        "Blocked on: permission prompt",
+      );
+    });
+
+    it("leaves out the Terminal view hint outside a terminal-first session", () => {
+      useChatStore.setState({ sessionStatus: "running", blockedOn: "permission prompt" });
+      render(<WorkingIndicator />);
+
+      const indicator = screen.getByTestId("working-indicator");
+      expect(indicator).toHaveTextContent("Waiting for your approval in the agent's terminal.");
+      expect(indicator).not.toHaveTextContent("Open the Terminal view");
+    });
+
+    it("does not offer the root session's Terminal view from a side chat", () => {
+      conversationRegistry
+        .acquire(sideChatId)
+        .setState({ sessionStatus: "running", blockedOn: "permission prompt" });
+      renderInTerminalFirstSession(sideChatId);
+
+      const indicator = screen.getByTestId("working-indicator");
+      expect(indicator).toHaveTextContent("Waiting for your approval in the agent's terminal.");
+      expect(indicator).not.toHaveTextContent("Open the Terminal view");
+    });
   });
 });
 
@@ -286,6 +509,7 @@ describe("BubbleView dispatch", () => {
 
     const bubble = screen.getByTestId("message-bubble");
     expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+    expect(screen.queryByTestId("turn-worked-fold")).not.toBeInTheDocument();
     expect(bubble).toHaveClass("max-w-full");
     expect(bubble.firstElementChild).toHaveClass("w-full");
     expect(screen.getByTestId("message-timestamp")).toBeInTheDocument();
@@ -349,11 +573,7 @@ describe("BubbleView dispatch", () => {
     continued: true,
   });
 
-  it("gives fold-only turns the same chrome whether or not the hidden trace narrated", () => {
-    // WHY: the copy/fork row keys off ALL the bubble's text, including text
-    // sealed inside the fold — so an otherwise identical collapsed row grew a
-    // row of hover-only chrome purely because its hidden trace happened to
-    // narrate, and consecutive "Worked for" rows sat at two different gaps.
+  it("keeps narration and its actions visible while tool-only turns stay fold-only", () => {
     render(
       <BubbleView
         bubble={foldOnlyBubble([
@@ -363,9 +583,8 @@ describe("BubbleView dispatch", () => {
       />,
     );
     expect(screen.getByTestId("turn-worked-fold")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Copy" })).not.toBeInTheDocument();
-    // Nothing below the fold: the collapsed row is the bubble's whole height.
-    expect(screen.getByTestId("message-bubble").children).toHaveLength(1);
+    expect(screen.getByText("Let me look at the code.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
     cleanup();
 
     render(<BubbleView bubble={foldOnlyBubble([toolItem("c2"), toolItem("c3")])} />);
@@ -374,14 +593,66 @@ describe("BubbleView dispatch", () => {
     expect(screen.getByTestId("message-bubble").children).toHaveLength(1);
   });
 
+  it("folds a finished Codex turn's commentary into one Worked row by default", () => {
+    const codexTurn: AssistantBubble = {
+      ...foldOnlyBubble([
+        {
+          kind: "text",
+          itemId: "t1",
+          text: "Reading the tests.",
+          final: true,
+          phase: "commentary",
+        },
+        toolItem("c6"),
+        { kind: "text", itemId: "t2", text: "Adding the case.", final: true, phase: "commentary" },
+        toolItem("c7"),
+        { kind: "text", itemId: "t3", text: "Added the test.", final: true, phase: "final_answer" },
+      ]),
+      continued: false,
+    };
+    render(<BubbleView bubble={codexTurn} />);
+    expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Worked for 2m 27s" })).toBeInTheDocument();
+    expect(screen.queryByText("Reading the tests.")).not.toBeInTheDocument();
+    expect(screen.getByText("Added the test.")).toBeVisible();
+    cleanup();
+
+    // Without answer labels, progress messages stay visible unless the user opts in.
+    const unlabeled = codexTurn.items.map((item) =>
+      item.kind === "text" ? { ...item, phase: undefined } : item,
+    );
+    render(<BubbleView bubble={{ ...codexTurn, items: unlabeled }} />);
+    expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(2);
+    expect(screen.getByText("Reading the tests.")).toBeVisible();
+  });
+
   it("spans the column for a fold-only turn so the row's hairline draws", () => {
     // WHY: shrink-wrapped to the ~110px summary row, the trailing hairline
     // (a flex-1 span) collapses to zero width and the click target stops
-    // short of the column. The max-w-3xl cap keeps it aligned with the rule
+    // short of the column. The prose cap keeps it aligned with the rule
     // under an answered turn.
     render(<BubbleView bubble={foldOnlyBubble([toolItem("c4")])} />);
     const bubble = screen.getByTestId("message-bubble");
-    expect(bubble).toHaveClass("max-w-3xl", "min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]");
+    expect(bubble).toHaveClass("max-w-[var(--chat-prose-width)]");
+    expect(bubble.firstElementChild).toHaveClass("w-full");
+    expect(bubble.firstElementChild).not.toHaveClass("w-fit");
+  });
+
+  it("spans the prose width for tool rows beside a short reply", () => {
+    // WHY: shrink-wrapped to "Done.", the rows above it would cut their titles off mid-column.
+    render(
+      <BubbleView
+        bubble={{
+          ...foldOnlyBubble([
+            toolItem("c5"),
+            { kind: "text", itemId: "t5", text: "Done.", final: true },
+          ]),
+          continued: false,
+        }}
+      />,
+    );
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveClass("max-w-[var(--chat-prose-width)]");
     expect(bubble.firstElementChild).toHaveClass("w-full");
     expect(bubble.firstElementChild).not.toHaveClass("w-fit");
   });

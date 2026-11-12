@@ -51,6 +51,66 @@ export const MONACO_SPLIT_BREAKPOINT = 900;
  */
 export const SPLIT_DIFF_MIN_WIDTH = 920;
 
+export const MAX_RICH_MARKDOWN_BYTES = 256 * 1024;
+
+export const MAX_PREVIEW_MARKDOWN_BYTES = 1024 * 1024;
+
+/** Large Markdown skips the rich editor, whose load and resize cost grow with the document. */
+export function isMarkdownTooLargeForRichView(lang: string, content: string): boolean {
+  return (
+    lang === "markdown" && new TextEncoder().encode(content).byteLength > MAX_RICH_MARKDOWN_BYTES
+  );
+}
+
+/** Very large Markdown opens straight in source; the rendered preview still parses it all. */
+export function isMarkdownTooLargeForPreview(lang: string, content: string): boolean {
+  return (
+    lang === "markdown" && new TextEncoder().encode(content).byteLength > MAX_PREVIEW_MARKDOWN_BYTES
+  );
+}
+
+interface HastNode {
+  type: string;
+  children?: readonly HastNode[];
+}
+
+/** True when a rehype tree holds raw HTML that rehype-raw must parse. */
+export function hasRawHtmlNode(node: HastNode): boolean {
+  return node.type === "raw" || (node.children?.some(hasRawHtmlNode) ?? false);
+}
+
+export type PreviewableViewMode = "editor" | "preview" | "source";
+
+/**
+ * Resolve the surface a file opens on. Large Markdown opens in Preview and edits
+ * in source; HTML and notebooks have no rich editor, so "editor" means Preview.
+ */
+export function resolveFileViewMode({
+  isPreviewable,
+  lang,
+  largeMarkdown,
+  largeMarkdownVisitMode,
+  deepLinkedComment,
+  preference,
+}: {
+  isPreviewable: boolean;
+  lang: string;
+  largeMarkdown: boolean;
+  /** Preview/Source picked during this visit to a large Markdown file. */
+  largeMarkdownVisitMode?: "preview" | "source";
+  /** A ?comment= link targets this file and needs a surface that shows anchors. */
+  deepLinkedComment: boolean;
+  preference: PreviewableViewMode;
+}): PreviewableViewMode {
+  if (!isPreviewable) return "source";
+  if (lang === "markdown" && largeMarkdown) {
+    if (largeMarkdownVisitMode) return largeMarkdownVisitMode;
+    return deepLinkedComment || preference === "source" ? "source" : "preview";
+  }
+  if (lang === "markdown") return deepLinkedComment ? "editor" : preference;
+  return preference === "editor" ? "preview" : preference;
+}
+
 // ---------------------------------------------------------------------------
 // File-type helpers
 // ---------------------------------------------------------------------------
@@ -260,94 +320,96 @@ export function modelViewerTheme(resolved: ResolvedThemeMode): ModelViewerTheme 
   return MODEL_VIEWER_THEMES[resolved];
 }
 
+/** The Shiki language for each file extension the viewer highlights. */
+export const LANGUAGE_BY_EXTENSION: Readonly<Record<string, BundledLanguage>> = {
+  js: "javascript",
+  jsx: "jsx",
+  ts: "typescript",
+  tsx: "tsx",
+  py: "python",
+  rs: "rust",
+  go: "go",
+  java: "java",
+  scala: "scala",
+  sc: "scala",
+  kt: "kotlin",
+  kts: "kotlin",
+  groovy: "groovy",
+  gradle: "groovy",
+  clj: "clojure",
+  cljs: "clojure",
+  cljc: "clojure",
+  ex: "elixir",
+  exs: "elixir",
+  erl: "erlang",
+  hrl: "erlang",
+  hs: "haskell",
+  ml: "ocaml",
+  mli: "ocaml",
+  rb: "ruby",
+  php: "php",
+  swift: "swift",
+  dart: "dart",
+  lua: "lua",
+  pl: "perl",
+  pm: "perl",
+  r: "r",
+  jl: "julia",
+  cs: "csharp",
+  c: "c",
+  cpp: "cpp",
+  cc: "cpp",
+  cxx: "cpp",
+  h: "c",
+  hpp: "cpp",
+  hh: "cpp",
+  m: "objective-c",
+  mm: "objective-c",
+  css: "css",
+  scss: "scss",
+  less: "less",
+  html: "html",
+  htm: "html",
+  xml: "xml",
+  svg: "xml",
+  vue: "vue",
+  svelte: "svelte",
+  astro: "astro",
+  json: "json",
+  jsonc: "json",
+  yaml: "yaml",
+  yml: "yaml",
+  toml: "toml",
+  ini: "ini",
+  cfg: "ini",
+  md: "markdown",
+  markdown: "markdown",
+  tex: "latex",
+  sh: "bash",
+  bash: "bash",
+  zsh: "bash",
+  ps1: "powershell",
+  bat: "bat",
+  cmd: "bat",
+  sql: "sql",
+  graphql: "graphql",
+  gql: "graphql",
+  proto: "proto",
+  dockerfile: "dockerfile",
+  diff: "diff",
+  patch: "diff",
+  csv: "csv",
+  cmake: "cmake",
+};
+
 export function detectLang(path: string): BundledLanguage | "text" {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
-  const map: Record<string, BundledLanguage> = {
-    js: "javascript",
-    jsx: "jsx",
-    ts: "typescript",
-    tsx: "tsx",
-    py: "python",
-    rs: "rust",
-    go: "go",
-    java: "java",
-    scala: "scala",
-    sc: "scala",
-    kt: "kotlin",
-    kts: "kotlin",
-    groovy: "groovy",
-    gradle: "groovy",
-    clj: "clojure",
-    cljs: "clojure",
-    cljc: "clojure",
-    ex: "elixir",
-    exs: "elixir",
-    erl: "erlang",
-    hrl: "erlang",
-    hs: "haskell",
-    ml: "ocaml",
-    mli: "ocaml",
-    rb: "ruby",
-    php: "php",
-    swift: "swift",
-    dart: "dart",
-    lua: "lua",
-    pl: "perl",
-    pm: "perl",
-    r: "r",
-    jl: "julia",
-    cs: "csharp",
-    c: "c",
-    cpp: "cpp",
-    cc: "cpp",
-    cxx: "cpp",
-    h: "c",
-    hpp: "cpp",
-    hh: "cpp",
-    m: "objective-c",
-    mm: "objective-c",
-    css: "css",
-    scss: "scss",
-    less: "less",
-    html: "html",
-    htm: "html",
-    xml: "xml",
-    svg: "xml",
-    vue: "vue",
-    svelte: "svelte",
-    astro: "astro",
-    json: "json",
-    jsonc: "json",
-    yaml: "yaml",
-    yml: "yaml",
-    toml: "toml",
-    ini: "ini",
-    cfg: "ini",
-    md: "markdown",
-    markdown: "markdown",
-    tex: "latex",
-    sh: "bash",
-    bash: "bash",
-    zsh: "bash",
-    ps1: "powershell",
-    bat: "bat",
-    cmd: "bat",
-    sql: "sql",
-    graphql: "graphql",
-    gql: "graphql",
-    proto: "proto",
-    dockerfile: "dockerfile",
-    diff: "diff",
-    patch: "diff",
-    csv: "csv",
-    cmake: "cmake",
-  };
   // Files commonly identified by name rather than extension.
   const base = path.split(/[/\\]/).pop()?.toLowerCase() ?? "";
   if (base === "dockerfile") return "dockerfile";
   if (base === "makefile") return "make";
   if (base === "cmakelists.txt") return "cmake";
-  return map[ext] ?? "text";
+  return LANGUAGE_BY_EXTENSION[ext] ?? "text";
 }
 
 // ---------------------------------------------------------------------------
@@ -382,55 +444,224 @@ export const HTML_PREVIEW_SANDBOX =
   "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals";
 
 /**
- * Prepare HTML artifact content for the preview iframe by forcing every link to
+ * In-frame handler for same-page links: a srcdoc document resolves `#x` against its
+ * embedder, so with `<base target="_blank">` the host page would open in a new window.
+ * A capture-phase listener on `window` only arranges for `finish` to run last: a
+ * listener added to `window` during a dispatch joins the end of its bubble-phase list,
+ * so every handler the artifact registered beforehand — at any level, by any means —
+ * has run and may have cancelled the click before the preview decides, and none of
+ * them sees a modified event, element or document. `finish` then navigates this
+ * document to the fragment, which scrolls, styles `:target`, fires `hashchange` and
+ * re-scrolls on a repeat click like a native anchor.
+ */
+const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
+  function activatedLink(event) {
+    const path = event.composedPath ? event.composedPath() : [];
+    for (let i = 0; i < path.length; i++) {
+      if (path[i].matches && path[i].matches("a[href],area[href]")) return path[i];
+    }
+    const target = event.target;
+    return target && target.closest ? target.closest("a[href],area[href]") : null;
+  }
+  function fragmentHref(anchor) {
+    // Clean the href as URL parsing does: ASCII tab/newline go anywhere, other C0 controls
+    // and spaces only at the ends; a non-breaking space stays and makes a relative path.
+    const href = anchor.getAttribute("href").replace(/[\\t\\n\\r]/g, "").replace(/^[\\u0000-\\u0020]+|[\\u0000-\\u0020]+$/g, "");
+    return href.charAt(0) === "#" ? href : "";
+  }
+  function arrange(event) {
+    if (event.type === "auxclick" && event.button !== 1) return;
+    const anchor = activatedLink(event);
+    const href = anchor ? fragmentHref(anchor) : "";
+    if (!href) return;
+    function finish(later) {
+      if (later !== event) return;
+      window.removeEventListener(event.type, finish);
+      if (event.defaultPrevented) return;
+      // Plain, modifier and middle clicks alike, and links with their own target: a new window
+      // could only show the host page or a blank page, never this document.
+      event.preventDefault();
+      location.assign(location.href.split("#")[0] + href);
+    }
+    window.addEventListener(event.type, finish);
+    // Propagation stopped below window (accepted) would leave the finisher behind: drop it.
+    setTimeout(function () { window.removeEventListener(event.type, finish); }, 0);
+  }
+  window.addEventListener("click", arrange, true);
+  window.addEventListener("auxclick", arrange, true);
+})();</script>`;
+
+/** Markup `prepareHtmlPreviewDoc` places at the start of `<head>`. */
+export const HTML_PREVIEW_HEAD = '<base target="_blank">' + SAME_PAGE_ANCHOR_SCRIPT;
+
+/** Whitespace as the HTML tokenizer defines it. */
+const TOKENIZER_SPACE = " \t\n\f\r";
+
+/** Characters that end a tag name in the tokenizer: whitespace, `/` and `>`. */
+const TAG_NAME_END = `${TOKENIZER_SPACE}/>`;
+
+/** Whether `html` has the tag opener `name` (e.g. `</script`) at `at`, delimited as the tokenizer requires. */
+function hasTagAt(html: string, at: number, name: string): boolean {
+  const next = html.charAt(at + name.length);
+  return (
+    next !== "" &&
+    TAG_NAME_END.includes(next) &&
+    html.slice(at, at + name.length).toLowerCase() === name
+  );
+}
+
+/**
+ * Index just past the `>` that ends the tag whose name ends at `from`, or -1 when
+ * the tag is still open at end of input (the parser then drops it and everything
+ * after it). Attribute states follow the tokenizer: a quote delimits a value only
+ * right after `=`, and inside an unquoted value quotes and `=` are plain text.
+ */
+function tagEnd(html: string, from: number): number {
+  let state: "name" | "beforeValue" | "unquoted" = "name";
+  for (let i = from; i < html.length; i++) {
+    const c = html.charAt(i);
+    if (c === ">") return i + 1;
+    if (state === "beforeValue" && (c === '"' || c === "'")) {
+      const close = html.indexOf(c, i + 1);
+      if (close === -1) return -1;
+      i = close;
+      state = "name";
+    } else if (TOKENIZER_SPACE.includes(c)) {
+      if (state === "unquoted") state = "name";
+    } else if (state === "name") {
+      if (c === "=") state = "beforeValue";
+    } else {
+      state = "unquoted";
+    }
+  }
+  return -1;
+}
+
+/**
+ * Index just past the end tag that closes a `<script>` whose start tag ended at
+ * `from`, or -1 when the element is still open at end of input. Follows the
+ * tokenizer's script states: `<!--` enters the escaped state and a `<script`
+ * inside it the double-escaped state, where `</script>` only steps back to the
+ * escaped state instead of closing the element; `-->` returns to plain script data.
+ */
+function scriptEnd(html: string, from: number): number {
+  let state: "data" | "escaped" | "double" = "data";
+  for (let i = from; i < html.length; i++) {
+    const c = html.charAt(i);
+    if (c === "-" && state !== "data") {
+      let j = i + 1;
+      while (html.charAt(j) === "-") j++;
+      if (j - i >= 2 && html.charAt(j) === ">") {
+        state = "data";
+        i = j;
+      } else {
+        i = j - 1;
+      }
+    } else if (c !== "<") {
+      continue;
+    } else if (state === "data" && html.startsWith("<!--", i)) {
+      // `<!--` followed only by dashes and `>` is already back in plain script data.
+      let j = i + 4;
+      while (html.charAt(j) === "-") j++;
+      if (html.charAt(j) === ">") {
+        i = j;
+      } else {
+        state = "escaped";
+        i += 3;
+      }
+    } else if (hasTagAt(html, i, "</script")) {
+      if (state !== "double") return tagEnd(html, i + 8);
+      state = "escaped";
+      i += 7;
+    } else if (state === "escaped" && hasTagAt(html, i, "<script")) {
+      state = "double";
+      i += 6;
+    }
+  }
+  return -1;
+}
+
+/**
+ * End offset of the first real `<head>`/`<html>` start tag, or -1: comments and
+ * `<script>` elements are skipped whole so nothing is inserted into them, and
+ * anything still open at end of input swallows the rest, as in the parser. The
+ * scan only moves forward because artifact text is processed on the host page.
+ */
+export function startTagEnd(html: string, tag: "head" | "html"): number {
+  for (let i = html.indexOf("<"); i !== -1; i = html.indexOf("<", i)) {
+    if (html.startsWith("<!--", i)) {
+      // An empty comment may close abruptly (`<!-->`, `<!--->`); otherwise `-->` or `--!>` ends it.
+      let j = i + 4;
+      while (html.charAt(j) === "-") j++;
+      if (html.charAt(j) === ">") {
+        i = j + 1;
+        continue;
+      }
+      const terminator = /--!?>/g;
+      terminator.lastIndex = i + 4;
+      const match = terminator.exec(html);
+      if (!match) return -1;
+      i = match.index + match[0].length;
+    } else if (hasTagAt(html, i, "<script")) {
+      const open = tagEnd(html, i + 7);
+      if (open === -1) return -1;
+      const close = scriptEnd(html, open);
+      if (close === -1) return -1;
+      i = close;
+    } else if (hasTagAt(html, i, "<head") || hasTagAt(html, i, "<html")) {
+      const end = tagEnd(html, i + 5);
+      if (end === -1) return -1;
+      if (html.slice(i + 1, i + 5).toLowerCase() === tag) return end;
+      i = end;
+    } else {
+      i += 1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Prepare HTML artifact content for the preview iframe: force every link to
  * open in a new tab (issue #777: "We should always make it open in a new
- * window").
+ * window") while same-page `#fragment` links keep scrolling the preview.
  *
- * We inject `<base target="_blank">` rather than rewriting individual anchors so
- * it covers links created at runtime by scripts too. Placement matters: a
+ * We inject `<base target="_blank">` (with the anchor script) rather than
+ * rewriting individual anchors so it covers links created at runtime by scripts
+ * too. Placement matters: a
  * `<base>` (or anything) before the `<!DOCTYPE>` would push the document into
  * quirks mode and change how the artifact renders, so we insert *inside* the
  * existing `<head>`/`<html>` when present and only fall back to prepending for
  * bare fragments that have no doctype to displace.
  *
- * The matcher is a deliberately simple regex, NOT a full HTML parser: parsing
+ * The matcher is a small forward-only scanner, NOT a full HTML parser: parsing
  * and re-serializing untrusted artifact content could subtly alter how it
- * renders. The known trade-off is that a `<head>` literal appearing earlier in
- * the source (e.g. inside a comment or a script string) is matched textually.
- * That only ever mis-places the base tag *inside the sandboxed preview* — it
- * can break that one artifact's own link-targeting, never the host app's
- * security — so it's an accepted limitation rather than a bug to parse around.
+ * renders. Comments and `<script>` blocks are skipped so a look-alike tag inside
+ * them is not mistaken for the real one; a literal in other text (a `<style>` or
+ * `<title>`) is still matched textually, which can only mis-place the markup
+ * *inside the sandboxed preview* — never affect the host app's security.
  */
 export function prepareHtmlPreviewDoc(html: string): string {
-  const baseTag = '<base target="_blank">';
-
-  const headMatch = html.match(/<head[^>]*>/i);
-  if (headMatch?.index !== undefined) {
-    const insertAt = headMatch.index + headMatch[0].length;
-    // Idempotency guard, scoped to the actual injection point: only skip if our
-    // base tag is ALREADY right after <head> (i.e. content was prepared twice).
-    // We must NOT use a loose `html.includes(baseTag)` — the literal string can
-    // legitimately appear elsewhere in artifact content (a comment, a code
-    // sample), and skipping injection there would leave the document with no
-    // real <base>, so links navigate the preview in place instead of opening a
-    // new tab.
-    if (html.startsWith(baseTag, insertAt)) return html;
-    return html.slice(0, insertAt) + baseTag + html.slice(insertAt);
+  const headEnd = startTagEnd(html, "head");
+  if (headEnd !== -1) {
+    // Skip only if our markup is already right after <head> (prepared twice). A loose
+    // `includes` check would false-positive on the literal appearing in artifact content
+    // and leave the document without a real <base>.
+    if (html.startsWith(HTML_PREVIEW_HEAD, headEnd)) return html;
+    return html.slice(0, headEnd) + HTML_PREVIEW_HEAD + html.slice(headEnd);
   }
 
-  // No <head>: create one right after <html> so the base still lands inside the
-  // document head (after the doctype, preserving standards mode). A second pass
-  // matches the <head> we created above, so this path is idempotent too.
-  const htmlMatch = html.match(/<html[^>]*>/i);
-  if (htmlMatch?.index !== undefined) {
-    const insertAt = htmlMatch.index + htmlMatch[0].length;
-    return `${html.slice(0, insertAt)}<head>${baseTag}</head>${html.slice(insertAt)}`;
+  // No <head>: create one right after <html> so the markup still lands inside
+  // the document head (after the doctype, preserving standards mode). A second
+  // pass matches the <head> we created above, so this path is idempotent too.
+  const htmlEnd = startTagEnd(html, "html");
+  if (htmlEnd !== -1) {
+    return `${html.slice(0, htmlEnd)}<head>${HTML_PREVIEW_HEAD}</head>${html.slice(htmlEnd)}`;
   }
 
   // Bare fragment (no <html>/<head>, hence no doctype to displace) — the browser
-  // wraps it in an implicit head, so a leading base tag is safe.
-  if (html.startsWith(baseTag)) return html;
-  return baseTag + html;
+  // wraps it in an implicit head, so leading head markup is safe.
+  if (html.startsWith(HTML_PREVIEW_HEAD)) return html;
+  return HTML_PREVIEW_HEAD + html;
 }
 
 /**

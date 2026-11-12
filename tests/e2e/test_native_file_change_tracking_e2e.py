@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -53,7 +52,7 @@ async def test_native_write_reaches_changes_registry(
         file_change_observer=_observe,
     )
     hook = hook_settings(bridge_dir, sys.executable, f"omnigent.harnesses.{harness}.hook")
-    command = shlex.split(str(hook["command"]))
+    command = ["/bin/sh", "-c", str(hook["command"])]
     try:
         report = workspace / "report.md"
         report.write_text("hi\n")
@@ -106,7 +105,7 @@ async def test_native_write_reaches_changes_registry(
 
     entries = registry.list_changed_files(_SESSION_ID, limit=10)
     assert [(entry["path"], entry["status"]) for entry in entries] == [("report.md", "created")]
-    # The Edit's originalFile seeds the diff baseline.
-    assert registry.get_baseline("report.md") == "hello\n"
+    # Later edits must retain the confirmed creation's empty original.
+    assert registry.get_baseline("report.md") == ""
     # Changes bind to the relay's session, not the provider's own id.
     assert registry.list_changed_files("provider-session", limit=10) == []

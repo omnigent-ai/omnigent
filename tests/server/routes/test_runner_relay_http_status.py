@@ -11,6 +11,7 @@ import pytest
 
 from omnigent.server.routes._sessions import orchestration
 from omnigent.stores.conversation_store import ConversationStore
+from tests.debug_log_helpers import capture_debug_rows
 
 
 @pytest.mark.asyncio
@@ -108,3 +109,30 @@ async def test_ready_diagnostic_requires_a_heartbeat_and_emits_once(
     assert len(records) == (1 if heartbeat_count else 0)
     if records:
         assert records[0].session_id == "conv_http_ready"
+
+
+@pytest.mark.asyncio
+async def test_connected_and_ready_rows_carry_runner_identity_and_schema() -> None:
+    async with httpx.AsyncClient(
+        base_url="http://runner",
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                text='data: {"type":"session.heartbeat"}\n\ndata: [DONE]\n\n',
+            )
+        ),
+    ) as client:
+        with capture_debug_rows("server") as rows:
+            await orchestration._relay_runner_stream_once(
+                "conv_http_marker",
+                client,
+                Mock(spec=ConversationStore),
+                runner_id="runner_http_marker",
+            )
+
+    for event_name in ("runner_stream_connected", "runner_stream_ready"):
+        row = next(row for row in rows if row["event_name"] == event_name)
+        assert row["session_id"] == "conv_http_marker"
+        assert row["attributes"]["runner_id"] == "runner_http_marker"
+        assert row["attributes"]["telemetry_schema"] == "runner_stream_recovery.v1"
+    assert not any(row["event_name"] == "runner_stream_recovered" for row in rows)

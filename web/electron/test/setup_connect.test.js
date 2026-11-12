@@ -12,7 +12,10 @@ const tick = () =>
     setImmediate(resolve);
   });
 
-async function harness(t, { cancel = async () => true, search = "" } = {}) {
+async function harness(
+  t,
+  { cancel = async () => true, search = "", recents = [SERVER], serverNames } = {},
+) {
   const dom = new JSDOM(fs.readFileSync(path.join(__dirname, "../setup/index.html"), "utf8"), {
     url: `https://setup.example/${search}`,
     runScripts: "outside-only",
@@ -24,7 +27,8 @@ async function harness(t, { cancel = async () => true, search = "" } = {}) {
   dom.window.omnigentSetup = {
     getServerUrl: async () => SERVER,
     getManagedServers: async () => [],
-    getRecentServers: async () => [SERVER],
+    getRecentServers: async () => recents,
+    ...(serverNames ? { getServerNames: async () => serverNames } : {}),
     onConnectionProgress: (listener) => {
       progress = listener;
       return () => {
@@ -58,6 +62,22 @@ async function harness(t, { cancel = async () => true, search = "" } = {}) {
     progress: (requestId, phase) => progress?.({ requestId, phase }),
   };
 }
+
+it("provides a full-width 48px window drag region and a clickable settings gear", async (t) => {
+  const { document } = await harness(t);
+  const style = document.querySelector("style").textContent;
+  const dragMatch = style.match(/\.drag-strip\s*\{[^}]*\}/);
+  assert.ok(dragMatch, "expected a .drag-strip rule in the setup page styles");
+  const dragRule = dragMatch[0];
+  assert.match(dragRule, /height:\s*48px/);
+  assert.match(dragRule, /left:\s*0/);
+  assert.match(dragRule, /right:\s*0/);
+  assert.match(dragRule, /-webkit-app-region:\s*drag/);
+  const gearMatch = style.match(/\.gear-btn\s*\{[^}]*\}/);
+  assert.ok(gearMatch, "expected a .gear-btn rule in the setup page styles");
+  const gearRule = gearMatch[0];
+  assert.match(gearRule, /-webkit-app-region:\s*no-drag/);
+});
 
 it("shows a concise expiry message without repeating the prefilled server URL", async (t) => {
   const message = "Session expired. Connect to sign in again.";
@@ -164,21 +184,21 @@ it("does not pretend login stopped if cancellation itself fails", async (t) => {
   assert.match(h.error.textContent, /Could not cancel sign-in/);
 });
 
-it("offers a fresh browser sign-in for Databricks workspaces only", async (t) => {
-  const h = await harness(t);
-  const other = h.document.getElementById("other-account");
-  assert.equal(other.hidden, false);
-  other.click();
-  assert.equal(h.requests[0].url, SERVER);
-  assert.equal(h.requests[0].browserSignIn, true);
-  assert.equal(other.disabled, true);
-  h.requests[0].resolve({});
+it("names recent servers that named themselves, keeping the host visible", async (t) => {
+  const h = await harness(t, {
+    recents: ["https://omni.example/", "http://localhost:6767/"],
+    serverNames: { "https://omni.example": "Acme Engineering" },
+  });
   await tick();
-  h.connect.click();
-  assert.equal(h.requests[1].browserSignIn, undefined);
-  h.requests[1].resolve({});
+  const labels = [...h.document.querySelectorAll("#recents-list .recent-btn")].map(
+    (button) => button.textContent,
+  );
+  assert.deepEqual(labels, ["Acme Engineering (omni.example)", "localhost:6767"]);
+});
+
+it("lists hosts when the shell has no server names", async (t) => {
+  const h = await harness(t, { recents: ["https://omni.example/"] });
   await tick();
-  h.input.value = "http://localhost:6767";
-  h.input.dispatchEvent(new h.window.Event("input"));
-  assert.equal(other.hidden, true);
+  const [button] = h.document.querySelectorAll("#recents-list .recent-btn");
+  assert.equal(button.textContent, "omni.example");
 });

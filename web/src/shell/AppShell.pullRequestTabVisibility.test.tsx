@@ -1,0 +1,486 @@
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
+// The workspace rail's Pull Requests tab is shown whenever the workspace/Files gate is
+// open. Non-git workspaces (not_a_git_repo) show an empty state inside the panel
+// rather than hiding the tab entirely.
+
+import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseSessionModule from "@/hooks/useSession";
+import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
+
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useContext, useState } from "react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { Link, MemoryRouter, Route, Routes } from "react-router-dom";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
+import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
+
+const pullRequestFault = vi.hoisted(() => ({ error: null as Error | null }));
+
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseConversationsModule>()),
+  useConversations: vi.fn(),
+  useStopSession: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+}));
+vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
+  // Keep the real module (inventoryTerminals etc.) — only the
+  // network-backed hook is replaced.
+  ...(await importOriginal<typeof UseTerminalsModule>()),
+  useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
+}));
+vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
+  useWorkspaceEnvironment: vi.fn(() => ({
+    data: { available: true, root: null },
+    isLoading: false,
+  })),
+  useWorkspaceChangedFiles: vi.fn(() => ({
+    data: { data: [] },
+    isSuccess: true,
+    isLoading: false,
+  })),
+}));
+vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
+  // Keep the real module (types, the panel's sibling hooks) — only the
+  // info hook AppShell reads is replaced, per-test below.
+  ...(await importOriginal<typeof UsePullRequestsModule>()),
+  usePullRequestInfo: vi.fn(() => ({ data: undefined, isLoading: true })),
+}));
+vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
+  useChildSessions: vi.fn(() => ({ children: [], isLoading: false, error: null })),
+}));
+vi.mock("@/hooks/useSession", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseSessionModule>()),
+  useSession: vi.fn(() => ({ session: null, isLoading: false, error: null })),
+}));
+vi.mock("@/hooks/useAgents", () => ({
+  useSessionAgent: vi.fn(() => ({ data: undefined })),
+  useCreateMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
+  useUpdateMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
+  useDeleteMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
+}));
+vi.mock("./Sidebar", () => ({
+  Sidebar: () => (
+    <div data-testid="sidebar">
+      <Link to="/inbox">Inbox</Link>
+    </div>
+  ),
+  isMobileViewport: vi.fn(() => false),
+}));
+vi.mock("./PullRequestPanel", () => ({
+  PullRequestPanel: () => {
+    if (pullRequestFault.error) throw pullRequestFault.error;
+    return <div data-testid="github-panel">Pull request details</div>;
+  },
+}));
+vi.mock("./FilesPanel", () => ({
+  FilesPanel: () => <div data-testid="files-panel" />,
+  revealFolderInFilesPanel: vi.fn(),
+}));
+vi.mock("./FileViewer", () => ({
+  FileViewer: () => <div data-testid="file-viewer" />,
+}));
+vi.mock("./InlineTerminalsSection", () => ({
+  InlineTerminalsSection: () => <div data-testid="inline-terminals-section" />,
+}));
+vi.mock("./FilesPanelDrawer", () => ({
+  FilesPanelDrawer: ({ open, flatView }: { open: boolean; flatView: boolean }) => (
+    <div
+      data-testid="files-panel-drawer"
+      data-state={open ? "open" : "closed"}
+      data-flat-view={String(flatView)}
+    />
+  ),
+}));
+vi.mock("./TerminalsPanel", () => ({
+  TerminalsPanel: () => <div data-testid="terminals-panel" />,
+}));
+
+import { AppShell } from "./AppShell";
+import { FileViewerContext, useFolderOpener, useOpenGithubTab } from "./FileViewerContext";
+import { revealFolderInFilesPanel } from "./FilesPanel";
+import { isMobileViewport } from "./Sidebar";
+import { usePullRequestInfo } from "@/hooks/usePullRequests";
+import { useConversations } from "@/hooks/useConversations";
+
+const usePullRequestInfoMock = vi.mocked(usePullRequestInfo);
+const routeError = new Error("Route rendering failed");
+
+function suppressPullRequestFault(event: ErrorEvent) {
+  if (event.error === pullRequestFault.error || event.error === routeError) event.preventDefault();
+}
+
+afterEach(() => {
+  cleanup();
+  window.removeEventListener("error", suppressPullRequestFault);
+  vi.restoreAllMocks();
+});
+
+beforeEach(() => {
+  pullRequestFault.error = null;
+  window.addEventListener("error", suppressPullRequestFault);
+  // The rail persists per-session state (selected tab, width) in
+  // localStorage; clear it so one test's writes can't leak into another.
+  localStorage.clear();
+  writeWorkspacePanelDefault("open");
+  sessionStorage.clear();
+  vi.mocked(isMobileViewport).mockReturnValue(false);
+  usePullRequestInfoMock.mockReset();
+  usePullRequestInfoMock.mockReturnValue({ data: undefined, isLoading: true } as ReturnType<
+    typeof usePullRequestInfo
+  >);
+  vi.mocked(useConversations).mockReset();
+  vi.mocked(useConversations).mockReturnValue({
+    data: {
+      pages: [
+        {
+          data: [
+            {
+              id: "conv_ws",
+              object: "conversation" as const,
+              title: null,
+              created_at: 0,
+              updated_at: 0,
+              labels: {},
+              permission_level: null,
+              host_id: null,
+              runner_id: null,
+            },
+          ],
+          first_id: null,
+          last_id: null,
+          has_more: false,
+        },
+      ],
+      pageParams: [undefined],
+    },
+  } as never);
+});
+
+const LINKED_FOLDER = "/home/u/ws/experimental/data";
+
+function ChatLinkProbe() {
+  const [broken, setBroken] = useState(false);
+  const openGithubTab = useOpenGithubTab();
+  const openFolder = useFolderOpener();
+  const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
+  if (broken) throw routeError;
+  return (
+    <>
+      <input aria-label="Chat draft" defaultValue="" />
+      <button type="button" onClick={() => setBroken(true)}>
+        Crash route
+      </button>
+      <button type="button" onClick={() => registerNavigationGuard?.(() => {})}>
+        Hold navigation
+      </button>
+      <button type="button" onClick={() => openGithubTab?.()}>
+        Open PR
+      </button>
+      <button type="button" onClick={() => openFolder?.(LINKED_FOLDER)}>
+        Open folder
+      </button>
+      <Link to="/c/conv_other">Another session</Link>
+    </>
+  );
+}
+
+function renderShell() {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_ws"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route path="c/:conversationId" element={<ChatLinkProbe />} />
+                <Route path="inbox" element={<p>Healthy inbox</p>} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
+    </QueryClientProvider>,
+  );
+}
+
+describe("Pull Requests rail tab visibility", () => {
+  it("shows the Pull Requests tab even when the workspace isn't a git repository", () => {
+    usePullRequestInfoMock.mockReturnValue({
+      data: { object: "session.github.info", available: false, reason: "not_a_git_repo" },
+      isLoading: false,
+    } as ReturnType<typeof usePullRequestInfo>);
+
+    renderShell();
+
+    // The workspace gate is on: Files renders, so the strip is up — and the
+    // Pull Requests tab must also be present (its panel shows an empty state instead).
+    expect(screen.getByRole("tab", { name: /^Files$/ })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /^Agents/ })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Pull Requests" })).toBeInTheDocument();
+  });
+
+  it("shows the Pull Requests tab for a git workspace", () => {
+    usePullRequestInfoMock.mockReturnValue({
+      data: { object: "session.github.info", available: true },
+      isLoading: false,
+    } as ReturnType<typeof usePullRequestInfo>);
+
+    renderShell();
+
+    expect(screen.getByRole("tab", { name: "Pull Requests" })).toBeInTheDocument();
+  });
+
+  it("keeps the Pull Requests tab when the host is outdated", () => {
+    // An outdated host 404s the info endpoint (reason: host_outdated). The
+    // panel renders an actionable "update your host" prompt, so the tab must
+    // stay reachable rather than being hidden like the non-git dead end.
+    usePullRequestInfoMock.mockReturnValue({
+      data: { object: "session.github.info", available: false, reason: "host_outdated" },
+      isLoading: false,
+    } as ReturnType<typeof usePullRequestInfo>);
+
+    renderShell();
+
+    expect(screen.getByRole("tab", { name: "Pull Requests" })).toBeInTheDocument();
+  });
+
+  it("keeps the Pull Requests tab while the info is still loading (no flash)", () => {
+    // Default beforeEach mock: data undefined, isLoading true — matches the
+    // Files gate's optimistic default so tabs don't pop in after load.
+    renderShell();
+
+    expect(screen.getByRole("tab", { name: "Pull Requests" })).toBeInTheDocument();
+  });
+});
+
+describe("opening Pull Requests from the composer", () => {
+  beforeEach(() => {
+    writeSessionWorkspaceState("conv_ws", { open: false, rightRailTab: "files" });
+  });
+
+  it("opens and dismisses the mobile drawer without opening the hidden desktop rail", () => {
+    vi.mocked(isMobileViewport).mockReturnValue(true);
+    renderShell();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+
+    const drawer = screen.getByTestId("github-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(within(drawer).getByTestId("github-panel")).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_ws").open).toBe(false);
+    expect(screen.getAllByTestId("github-panel")).toHaveLength(1);
+
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(within(drawer).queryByTestId("github-panel")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open PR" })).toBeInTheDocument();
+  });
+
+  it.each([true, false])(
+    "opens the desktop Pull Requests tab without mounting the mobile panel (pinned: %s)",
+    (isPinned) => {
+      if (!isPinned) writePinnedWorkspaceTabs(["files", "changes", "subagents"]);
+      renderShell();
+
+      fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+
+      const workspace = screen.getByRole("complementary", { name: "Workspace" });
+      expect(within(workspace).getByRole("tab", { name: "Pull Requests" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(within(workspace).getByTestId("github-panel")).toBeInTheDocument();
+      expect(
+        within(workspace).queryAllByRole("button", { name: "Close Pull Requests" }),
+      ).toHaveLength(isPinned ? 0 : 1);
+      expect(readSessionWorkspaceState("conv_ws")).toMatchObject({
+        open: true,
+        rightRailTab: "github",
+        openPanels: isPinned ? [] : ["github"],
+      });
+      const drawer = screen.getByTestId("github-panel-drawer");
+      expect(drawer).toHaveAttribute("data-state", "closed");
+      expect(within(drawer).queryByTestId("github-panel")).not.toBeInTheDocument();
+    },
+  );
+
+  it("closes the mobile Pull Requests drawer when navigating to another session", () => {
+    vi.mocked(isMobileViewport).mockReturnValue(true);
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+    expect(screen.getByTestId("github-panel-drawer")).toHaveAttribute("data-state", "open");
+
+    fireEvent.click(screen.getByRole("link", { name: "Another session" }));
+
+    expect(screen.getByTestId("github-panel-drawer")).toHaveAttribute("data-state", "closed");
+  });
+});
+
+describe("route render failures", () => {
+  it("keeps the sidebar and workspace mounted and recovers through navigation", () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+    const sidebar = screen.getByTestId("sidebar");
+    const workspace = screen.getByRole("complementary", { name: "Workspace" });
+    const panel = within(workspace).getByTestId("github-panel");
+
+    fireEvent.click(screen.getByRole("button", { name: "Crash route" }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Unable to display this page.");
+    expect(screen.getByTestId("sidebar")).toBe(sidebar);
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBe(workspace);
+    expect(within(workspace).getByTestId("github-panel")).toBe(panel);
+    fireEvent.mouseDown(within(workspace).getByRole("tab", { name: /^Files$/ }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(within(workspace).getByTestId("files-panel")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("link", { name: "Inbox" }));
+    expect(screen.getByText("Healthy inbox")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByTestId("sidebar")).toBe(sidebar);
+  });
+
+  it("preserves the healthy route's draft when the pathname changes", () => {
+    renderShell();
+    const draft = screen.getByRole("textbox", { name: "Chat draft" });
+    fireEvent.change(draft, { target: { value: "Unsent message" } });
+    fireEvent.click(screen.getByRole("link", { name: "Another session" }));
+    expect(screen.getByRole("textbox", { name: "Chat draft" })).toBe(draft);
+    expect(draft).toHaveValue("Unsent message");
+  });
+});
+
+describe("Pull Requests render failures", () => {
+  beforeEach(() => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    writeSessionWorkspaceState("conv_ws", { open: false, rightRailTab: "files" });
+    pullRequestFault.error = new Error("Pull request panel render failed");
+  });
+
+  it("keeps desktop chat, sidebar, and workspace tabs usable and allows retry", () => {
+    renderShell();
+    const draft = screen.getByRole("textbox", { name: "Chat draft" });
+    fireEvent.change(draft, { target: { value: "Unsent message" } });
+    fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+
+    const workspace = screen.getByRole("complementary", { name: "Workspace" });
+    expect(within(workspace).getByRole("alert")).toHaveTextContent(
+      "Unable to display pull requests.",
+    );
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Chat draft" })).toBe(draft);
+    expect(draft).toHaveValue("Unsent message");
+    expect(screen.getByRole("button", { name: "Open folder" })).toBeInTheDocument();
+
+    fireEvent.mouseDown(within(workspace).getByRole("tab", { name: /^Files$/ }));
+    expect(within(workspace).getByRole("tab", { name: /^Files$/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(within(workspace).getByTestId("files-panel")).toBeInTheDocument();
+    expect(within(workspace).queryByRole("alert")).not.toBeInTheDocument();
+
+    fireEvent.mouseDown(within(workspace).getByRole("tab", { name: "Pull Requests" }));
+    expect(within(workspace).getByRole("alert")).toBeInTheDocument();
+    pullRequestFault.error = null;
+    fireEvent.click(within(workspace).getByRole("button", { name: "Try again" }));
+    expect(within(workspace).getByTestId("github-panel")).toBeInTheDocument();
+    expect(within(workspace).queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("recovers the desktop panel when navigating to another session", () => {
+    writeSessionWorkspaceState("conv_other", { open: true, rightRailTab: "github" });
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+
+    pullRequestFault.error = null;
+    fireEvent.click(screen.getByRole("link", { name: "Another session" }));
+
+    expect(screen.getByTestId("github-panel")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open PR" })).toBeInTheDocument();
+  });
+
+  it("keeps the mobile drawer Close button usable after a panel failure", () => {
+    vi.mocked(isMobileViewport).mockReturnValue(true);
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+
+    const drawer = screen.getByTestId("github-panel-drawer");
+    expect(within(drawer).getByRole("alert")).toHaveTextContent("Unable to display pull requests.");
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open PR" })).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_ws").open).toBe(false);
+
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(within(drawer).queryByRole("alert")).not.toBeInTheDocument();
+
+    pullRequestFault.error = null;
+    fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+    expect(within(drawer).getByTestId("github-panel")).toBeInTheDocument();
+  });
+});
+
+describe("opening a folder from a chat link", () => {
+  beforeEach(() => {
+    vi.mocked(revealFolderInFilesPanel).mockClear();
+    writeSessionWorkspaceState("conv_ws", { open: false, rightRailTab: "github" });
+  });
+
+  it("opens the desktop rail on the Files tab browsing that folder", () => {
+    renderShell();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open folder" }));
+
+    expect(revealFolderInFilesPanel).toHaveBeenCalledWith("conv_ws", LINKED_FOLDER);
+    const workspace = screen.getByRole("complementary", { name: "Workspace" });
+    expect(within(workspace).getByRole("tab", { name: /^Files$/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(within(workspace).getByTestId("files-panel")).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_ws")).toMatchObject({
+      open: true,
+      rightRailTab: "files",
+    });
+    expect(screen.getByTestId("files-panel-drawer")).toHaveAttribute("data-state", "closed");
+  });
+
+  it("leaves the rail alone while an unsaved-edit guard holds navigation", () => {
+    renderShell();
+
+    fireEvent.click(screen.getByRole("button", { name: "Hold navigation" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open folder" }));
+
+    expect(revealFolderInFilesPanel).not.toHaveBeenCalled();
+    expect(readSessionWorkspaceState("conv_ws")).toMatchObject({
+      open: false,
+      rightRailTab: "github",
+    });
+  });
+
+  it("opens the mobile Files drawer in tree view without opening the hidden rail", () => {
+    vi.mocked(isMobileViewport).mockReturnValue(true);
+    renderShell();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open folder" }));
+
+    expect(revealFolderInFilesPanel).toHaveBeenCalledWith("conv_ws", LINKED_FOLDER);
+    const drawer = screen.getByTestId("files-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(drawer).toHaveAttribute("data-flat-view", "false");
+    expect(readSessionWorkspaceState("conv_ws").open).toBe(false);
+  });
+});

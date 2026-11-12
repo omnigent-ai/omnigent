@@ -103,11 +103,10 @@ class ZygoteHarnessProc:
             be determined because the zygote went away (the harness is gone
             either way — a lost code reads as failure, never as clean exit).
         """
-        # A teardown that cancels the manager's task should not turn wait() into
-        # a hard error; fall through to the cached returncode.
+        # A caller's timeout must not cancel the shared poller or masquerade as
+        # an exit: teardown still needs to escalate and wait for the real code.
         if self._poll_task is not None:
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._poll_task
+            await asyncio.shield(self._poll_task)
         return self.returncode if self.returncode is not None else _ZYGOTE_LOST_EXIT_CODE
 
     def send_signal(self, sig: int) -> None:

@@ -496,6 +496,51 @@ def test_list_conversations_by_runner_id(store: SqlAlchemyConversationStore) -> 
     assert results[0].title == "a"
 
 
+def test_runner_session_status_pages_do_not_read_conversation_db(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    from sqlalchemy import event
+
+    a = store.create_conversation(runner_id="runner_x")
+    b = store.create_conversation(runner_id="runner_x")
+    store.set_session_live_status(a.id, "running")
+    store.set_session_live_status(b.id, "waiting")
+
+    def unavailable(*_args):
+        pytest.fail("runner teardown must not hydrate data from the conversation database")
+
+    event.listen(store._conv_engine, "before_cursor_execute", unavailable)
+    try:
+        first = store.list_runner_session_statuses("runner_x", limit=1)
+        second = store.list_runner_session_statuses("runner_x", after=first[-1][0], limit=1)
+        assert first + second == sorted([(a.id, "running"), (b.id, "waiting")])
+        assert store.list_runner_session_statuses("runner_x", after=second[-1][0], limit=1) == []
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", unavailable)
+
+
+def test_intentional_stop_settlement_uses_only_metadata(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    from sqlalchemy import event
+
+    conv = store.create_conversation(runner_id="runner-stopped")
+    store.set_session_live_status(conv.id, "running")
+    store.set_labels(conv.id, {"omnigent.last_task_error_code": "preserved"})
+
+    def unavailable(*_args):
+        pytest.fail("Stop settlement must not read or write the conversation database")
+
+    event.listen(store._conv_engine, "before_cursor_execute", unavailable)
+    try:
+        assert store.settle_intentionally_stopped_session(conv.id, "runner-stopped")
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", unavailable)
+    after = store.get_conversation(conv.id)
+    assert after.live_status == "idle"
+    assert after.labels["omnigent.last_task_error_code"] == "preserved"
+
+
 # ── fork_conversation ──────────────────────────────────
 
 
@@ -623,12 +668,13 @@ def test_update_conversation_archives_without_metadata_row(
 # ── Session-scoped agent cleanup on conversation delete ───────────────
 
 
-def test_delete_conversation_deletes_session_scoped_agent(
+def test_delete_conversation_keeps_its_user_agent(
     omnigent_db: Path,
     conv_db: Path,
     store: SqlAlchemyConversationStore,
 ) -> None:
-    """Deleting a session deletes the session-scoped agent row backing it."""
+    """Deleting a session never deletes the agent it used: agents outlive their
+    sessions and only an explicit agent removal deletes one."""
     created = store.create_session_with_agent(
         agent_id="d6f21846ee961735d477aae06247b99c",
         agent_name="del-agent",
@@ -639,7 +685,7 @@ def test_delete_conversation_deletes_session_scoped_agent(
     assert _count(omnigent_db, "agents") == 1
 
     asyncio.run(store.delete_conversation(created.conversation.id))
-    assert _count(omnigent_db, "agents") == 0
+    assert _col(omnigent_db, "agents", "id") == ["d6f21846ee961735d477aae06247b99c"]
     assert _count(conv_db, "conversations") == 0
 
 

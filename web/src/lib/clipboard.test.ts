@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { copyText } from "./clipboard";
+import { copyRichText, copyText } from "./clipboard";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
@@ -117,5 +117,53 @@ describe("copyText", () => {
 
     expect(writeText).toHaveBeenCalledWith("fallback text");
     expect(document.execCommand).toHaveBeenCalledWith("copy");
+  });
+});
+
+describe("copyRichText", () => {
+  it("carries both flavors through the fallback copy event", async () => {
+    const setData = vi.fn();
+
+    Object.defineProperty(Navigator.prototype, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+    vi.spyOn(HTMLTextAreaElement.prototype, "select").mockImplementation(() => {});
+    Object.defineProperty(Document.prototype, "execCommand", {
+      configurable: true,
+      value: vi.fn(() => {
+        const event = new Event("copy", { bubbles: true, cancelable: true }) as ClipboardEvent;
+        Object.defineProperty(event, "clipboardData", {
+          configurable: true,
+          value: { setData },
+        });
+        document.dispatchEvent(event);
+        return true;
+      }),
+    });
+
+    await expect(
+      copyRichText({ html: "<p><strong>hi</strong></p>", text: "**hi**" }),
+    ).resolves.toBeUndefined();
+
+    expect(setData).toHaveBeenCalledWith("text/plain", "**hi**");
+    expect(setData).toHaveBeenCalledWith("text/html", "<p><strong>hi</strong></p>");
+  });
+
+  it("degrades to a plain-text write when no path can carry the HTML", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+
+    Object.defineProperty(Navigator.prototype, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    Object.defineProperty(Document.prototype, "execCommand", {
+      configurable: true,
+      value: vi.fn(() => false),
+    });
+
+    await expect(copyRichText({ html: "<p>hi</p>", text: "hi" })).resolves.toBeUndefined();
+
+    expect(writeText).toHaveBeenCalledWith("hi");
   });
 });

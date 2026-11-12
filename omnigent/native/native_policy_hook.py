@@ -20,6 +20,7 @@ model sees it).
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import secrets
@@ -28,17 +29,21 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from typing import NotRequired, TypedDict
+from urllib.parse import urlsplit
 
 import httpx
 
-# How long to keep retrying transient 5xx / connect errors on the
+from omnigent.util.http_retry import bounded_retry_after_seconds
+
+# How long to keep retrying transient 429 / 5xx / connect errors on the
 # policy evaluate POST before failing closed. Keeps the pre-execution
 # gate from blocking long on a sick server while still absorbing brief
-# DB hiccups on a hosted deployment. A gateway-severed held poll resets
+# hosted-deployment failures. A gateway-severed held poll resets
 # it — see :func:`post_evaluate_with_retry`.
 _EVALUATE_POLICY_RETRY_BUDGET_S = 30.0
 _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S = 1.0
 _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S = 10.0
+_EVALUATE_POLICY_MAX_RETRY_AFTER_S = 10.0
 # Fast connect budget so an unreachable server fails into the retry
 # loop quickly rather than blocking on the day-long read timeout.
 _EVALUATE_POLICY_CONNECT_TIMEOUT_S = 5.0
@@ -58,6 +63,9 @@ _HELD_POLL_SEVER_ERRORS = (httpx.RemoteProtocolError, httpx.ReadError)
 # ``PostToolUse`` fires after (observational — can only warn).
 _PRE_TOOL_USE = "PreToolUse"
 _POST_TOOL_USE = "PostToolUse"
+# Claude Code fires this instead of ``PostToolUse`` when the tool fails
+# (e.g. Bash exiting non-zero).
+_POST_TOOL_USE_FAILURE = "PostToolUseFailure"
 # ``UserPromptSubmit`` fires when a new user prompt reaches the harness —
 # for native sessions this is the request-phase gate (the server-level
 # ``_evaluate_input_policy`` is bypassed for native message events, so
@@ -289,13 +297,15 @@ def hook_payload_to_evaluation_request(
     Convert a native-harness tool-hook payload into a proto ``EvaluationRequest``.
 
     Maps ``PreToolUse`` to a ``PHASE_TOOL_CALL`` event, ``PostToolUse``
-    to a ``PHASE_TOOL_RESULT`` event, and ``UserPromptSubmit`` to a
-    ``PHASE_REQUEST`` event (the prompt text from the payload's
-    ``prompt`` field becomes the request content). Omnigent MCP tools
-    (``mcp__omnigent__*``) are skipped because they are already
-    policy-checked by the relay path (``ProxyMcpManager`` → Omnigent
-    ``/mcp`` endpoint → ``_evaluate_tool_call_policy``); evaluating
-    them here would double-count. Connector-native MCP tools
+    and ``PostToolUseFailure`` to a ``PHASE_TOOL_RESULT`` event, and
+    ``UserPromptSubmit`` to a ``PHASE_REQUEST`` event (the prompt text
+    from the payload's ``prompt`` field becomes the request content). A
+    failure's ``error`` text becomes the result ``{"error": ...}`` so
+    result policies such as ``detect_thrashing`` see a failed call.
+    Omnigent MCP tools (``mcp__omnigent__*``) are skipped because they
+    are already policy-checked by the relay path (``ProxyMcpManager`` →
+    Omnigent ``/mcp`` endpoint → ``_evaluate_tool_call_policy``);
+    evaluating them here would double-count. Connector-native MCP tools
     (for example ``mcp__github__*``) still need this pre-call gate.
 
     :param hook_event: Hook event name from the payload's
@@ -306,7 +316,8 @@ def hook_payload_to_evaluation_request(
         "tool_input": {"command": "rm -rf /"}}``.
     :returns: An ``EvaluationRequest`` dict suitable for POSTing to
         ``/policies/evaluate``, or ``None`` when the event is not
-        policy-relevant (unknown event or an ``mcp__omnigent__*`` tool).
+        policy-relevant (unknown event, an ``mcp__omnigent__*`` tool, or a
+        failure the user caused by interrupting the tool).
     """
     if hook_event == _USER_PROMPT_SUBMIT:
         # Request-phase gate for native sessions. The server reads REQUEST
@@ -342,8 +353,14 @@ def hook_payload_to_evaluation_request(
                 "context": {},
             },
         }
-    if hook_event == _POST_TOOL_USE:
-        tool_output = payload.get("tool_response", payload.get("tool_output", ""))
+    if hook_event == _POST_TOOL_USE_FAILURE and payload.get("is_interrupt") is True:
+        # A user cancelling the tool is not a tool error.
+        return None
+    if hook_event in (_POST_TOOL_USE, _POST_TOOL_USE_FAILURE):
+        if hook_event == _POST_TOOL_USE_FAILURE:
+            tool_output: object = {"error": payload.get("error", "")}
+        else:
+            tool_output = payload.get("tool_response", payload.get("tool_output", ""))
         return {
             "event": {
                 "type": "PHASE_TOOL_RESULT",
@@ -387,9 +404,9 @@ def evaluation_response_to_hook_output(
     to the web UI), collapsing two independent gates — the deployment's
     policy gate and the user's own consent gate — into one. The policy
     layer may block (DENY) or demand approval (ASK); it must not silence
-    the user's consent. For ``PostToolUse`` a ``DENY`` is surfaced as
-    ``additionalContext`` because the tool result is already committed
-    — PostToolUse hooks cannot block.
+    the user's consent. For ``PostToolUse`` and ``PostToolUseFailure``
+    a ``DENY`` is surfaced as ``additionalContext`` because the tool
+    result is already committed — these hooks cannot block.
 
     For ``UserPromptSubmit`` the output uses the top-level ``decision`` /
     ``reason`` contract (not ``permissionDecision``): ``DENY`` → ``{"decision":
@@ -453,11 +470,11 @@ def evaluation_response_to_hook_output(
             output["permissionDecisionReason"] = reason
         return {"hookSpecificOutput": output}
 
-    if hook_event == _POST_TOOL_USE:
+    if hook_event in (_POST_TOOL_USE, _POST_TOOL_USE_FAILURE):
         if action == "POLICY_ACTION_DENY" and reason:
             return {
                 "hookSpecificOutput": {
-                    "hookEventName": _POST_TOOL_USE,
+                    "hookEventName": hook_event,
                     "additionalContext": f"[Policy violation] {reason}",
                 },
             }
@@ -494,9 +511,9 @@ def fail_closed_hook_output(
       ``{"decision": "block", ...}``. This is the sole pre-turn enforcement
       point for native sessions; a server hiccup must not let an over-budget
       or otherwise-blocked request proceed.
-    - ``PostToolUse`` (``PHASE_TOOL_RESULT``) fails OPEN → ``None``. By the
-      result phase the tool has already executed, so denying would only block
-      an already-incurred side effect.
+    - ``PostToolUse`` / ``PostToolUseFailure`` (``PHASE_TOOL_RESULT``) fail
+      OPEN → ``None``. By the result phase the tool has already executed, so
+      denying would only block an already-incurred side effect.
 
     :param hook_event: Hook event name, e.g. ``"PreToolUse"``.
     :param detail: Optional short diagnostic string appended to the reason
@@ -581,6 +598,34 @@ def fail_ask_hook_output(hook_event: str, detail: str | None = None) -> dict[str
     return fail_closed_hook_output(hook_event, detail)
 
 
+def is_loopback_url(url: str) -> bool:
+    """
+    Report whether *url* addresses this machine's loopback interface.
+
+    Mirrors :func:`omnigent_client._http.is_loopback_url`; duplicated here
+    because importing the SDK package loads the server schemas and roughly
+    triples this hook's startup on every tool call.
+
+    :param url: Absolute URL to classify, e.g. ``"http://127.0.0.1:28700"``.
+    :returns: ``True`` for ``localhost``, any ``.localhost`` name,
+        ``127.0.0.0/8``, or ``::1``; ``False`` otherwise, including a URL
+        with no host.
+    """
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        # A malformed authority (e.g. an unterminated IPv6 bracket) is not loopback.
+        return False
+    if host is None:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def post_evaluate_with_retry(
     url: str,
     headers: dict[str, str],
@@ -592,10 +637,12 @@ def post_evaluate_with_retry(
     """
     POST to the Omnigent policy evaluate endpoint, retrying on transient errors.
 
-    Retries on 5xx HTTP responses and connection-level errors
+    Retries on explicit 429 and 5xx HTTP responses and connection-level errors
     (:class:`httpx.ConnectError`, :class:`httpx.ConnectTimeout`) within
     :data:`_EVALUATE_POLICY_RETRY_BUDGET_S`. Returns the successful response,
     or ``None`` if the budget is exhausted or a non-retryable error occurs.
+    A 429 ``Retry-After`` hint takes precedence over exponential backoff but
+    is capped by :data:`_EVALUATE_POLICY_MAX_RETRY_AFTER_S`.
 
     A 5xx or torn connection that arrives only after the POST was held at
     least :data:`_EVALUATE_POLICY_HELD_POLL_FLOOR_S` is not a fault but a
@@ -607,14 +654,15 @@ def post_evaluate_with_retry(
 
     A stable ``_omnigent_elicitation_id`` is minted once and stamped on
     every attempt. When the server parks an ASK gate and the connection
-    drops (5xx or :class:`httpx.ConnectError`), the retry re-POSTs the
-    same id so the server re-attaches to the existing elicitation rather
-    than minting a new one — mirroring the ``_post_hook_with_reattach``
+    drops or rejects the request (429, 5xx, or :class:`httpx.ConnectError`),
+    each retry re-POSTs the same id so the server re-attaches to the existing
+    elicitation rather than minting a new one — mirroring the
+    ``_post_hook_with_reattach``
     idiom used by the ``PermissionRequest`` hook. This prevents a
     second approval card from appearing when the first was already
     published before the error.
 
-    4xx responses are final — a bad request won't succeed on retry. A
+    Other 4xx responses are final — a bad request won't succeed on retry. A
     :class:`httpx.ReadTimeout` is final too: it fires only after the server
     held the poll for the whole read budget, i.e. the ask itself timed out.
     The caller is responsible for fail-closed handling on ``None``.
@@ -652,11 +700,18 @@ def post_evaluate_with_retry(
     timeout = httpx.Timeout(read_timeout, connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S)
     reauthed = False
     last_error: str = "unknown error"
+    # Loopback callbacks cannot traverse an environment-configured proxy.
+    trust_env = not is_loopback_url(url)
     while True:
+        retry_delay_s = backoff_s
         attempt_started = time.monotonic()
         held_poll_severed = False
         try:
-            with httpx.Client(headers=headers, timeout=timeout) as client:
+            with httpx.Client(
+                headers=headers,
+                timeout=timeout,
+                trust_env=trust_env,
+            ) as client:
                 resp = client.post(url, json=request_body)
                 if (
                     reauth is not None
@@ -706,25 +761,36 @@ def post_evaluate_with_retry(
             last_error = f"server returned {status}" + (
                 f": {body_preview}" if body_preview else ""
             )
-            if status < 500:
+            if status == 429:
+                retry_delay_s = bounded_retry_after_seconds(
+                    exc.response,
+                    fallback=backoff_s,
+                    max_delay=_EVALUATE_POLICY_MAX_RETRY_AFTER_S,
+                )
+                print(
+                    f"omnigent {hook_label}: Omnigent returned 429; retrying",
+                    file=sys.stderr,
+                )
+            elif status < 500:
                 print(
                     f"omnigent {hook_label}: Omnigent returned {status}"
                     + (f": {body_preview}" if body_preview else ""),
                     file=sys.stderr,
                 )
                 return None, last_error
-            held_poll_severed = (
-                time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
-            )
-            print(
-                f"omnigent {hook_label}: Omnigent returned {status}"
-                + (
-                    " after a held poll (gateway sever); re-parking"
-                    if held_poll_severed
-                    else "; retrying"
-                ),
-                file=sys.stderr,
-            )
+            else:
+                held_poll_severed = (
+                    time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
+                )
+                print(
+                    f"omnigent {hook_label}: Omnigent returned {status}"
+                    + (
+                        " after a held poll (gateway sever); re-parking"
+                        if held_poll_severed
+                        else "; retrying"
+                    ),
+                    file=sys.stderr,
+                )
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             last_error = f"connection error: {exc}"
             print(
@@ -759,12 +825,12 @@ def post_evaluate_with_retry(
             reauthed = False
             time.sleep(backoff_s)
             continue
-        if time.monotonic() + backoff_s >= deadline:
+        if time.monotonic() + retry_delay_s >= deadline:
             print(
                 f"omnigent {hook_label}: retry budget exhausted",
                 file=sys.stderr,
             )
             return None, f"retry budget exhausted (last error: {last_error})"
         # Two-step backoff; not worth a retry library in this dependency-light hook.
-        time.sleep(backoff_s)
+        time.sleep(retry_delay_s)
         backoff_s = min(backoff_s * 2, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S)

@@ -69,8 +69,9 @@ After starting, you can also add or remove policies at runtime through the REST 
 
 ### Attachment admission controls
 
-The upload, copy, and fork routes apply additional server settings to `.zip`, `.docx`,
-`.xlsx`, `.pptx`, `.db`, `.sqlite`, and `.sqlite3` files. These formats require
+The upload, copy, and fork routes apply additional server settings to files
+delivered through the harness's filesystem tools: by default `.zip`, `.docx`,
+`.xlsx`, `.pptx`, `.db`, `.sqlite`, and `.sqlite3` files. These files require
 Claude Code or Codex and an updated execution host/runner that supports their
 delivery and restoration. They are stored without extraction; the harness
 reads a local copy outside the working checkout. See
@@ -78,10 +79,35 @@ reads a local copy outside the working checkout. See
 
 | Server config key | Default | Scope |
 |-------------------|---------|-------|
+| `filesystem_attachment_allowed_extensions` | the seven extensions above | Which files are delivered as files (see below) |
 | `filesystem_attachment_max_bytes` | `52428800` (50 MiB) | Bytes per file |
 | `filesystem_attachment_max_files` | `20` | Stored files of these types per session |
 | `filesystem_attachment_max_total_bytes` | `209715200` (200 MiB) | Combined bytes of these types per session |
 | `filesystem_attachment_denied_extensions` | `[]` | Further restrict the allowlist, e.g. `[".zip", ".db"]` |
+
+`filesystem_attachment_allowed_extensions` accepts:
+
+- a list of extensions, which replaces the defaults, e.g. `[".zip", ".gz", ".har"]`.
+  Files match on their last extension, so list `.gz` for `.tar.gz` files; a
+  compound entry such as `.tar.gz` is skipped with a warning.
+  A listed text or image type, such as `.log` or `.png`, is delivered as a file,
+  with its original bytes, instead of inline. It then needs a Claude Code or
+  Codex session, like any other file delivered as a file.
+  A default extension left off the list is refused, even when the browser
+  labels it as text.
+- `[]`, which turns filesystem attachments off.
+- `"*"` (or a list containing `"*"`), which keeps the defaults and also delivers
+  every other file that can't be inlined, such as `.gz`, `.tar`, `.har`, or video.
+  Images, PDFs, and text/code files stay inline, except for extensions listed
+  beside `"*"`: `["*", ".log"]` also delivers `.log` files as files.
+
+The server reads this key at startup. Each upload records how it is delivered,
+so changing the setting does not change files a session already holds. Types
+outside the default extensions need a host and runner that advertise
+`filesystem_attachment_delivery`; older builds refuse them with an update
+message. `GET /v1/info` reports the effective setting as
+`filesystem_attachments`, which the web composer uses to accept files before
+uploading them.
 
 These are filename-based admission and storage limits, not content inspection.
 Classification uses the stored filename's extension, even when the browser
@@ -89,7 +115,7 @@ reports a different MIME type. It does not identify file formats from their
 bytes, inspect archive entries, or detect renamed binary content. The denylist
 does not restrict files the agent creates or downloads through other tools.
 Images, PDFs, and text/code uploads retain their separate existing limits;
-the web composer also has a fixed 50 MiB ceiling for the formats listed above.
+the web composer also has a fixed 50 MiB ceiling for files delivered as files.
 
 Request-phase policies receive the filename and content type for these files,
 with an empty `text` value. Their document, archive, and database contents are
@@ -277,6 +303,20 @@ An agent that fails during its `initialize` handshake for no obvious reason is
 worth checking against this first; the ACP executor logs a hint pointing back at
 this field.
 
+> **How the start probe is evaluated.** `enforce_sandbox` runs when the runner
+> replays your tool-call policies over a synthetic `sys_agent_start` probe at
+> launch. Only a transform takes effect there: a policy that ALLOWs the probe
+> and returns a replacement payload (preserving the `name` and `arguments`
+> fields) reshapes the launch, chaining through later policies. A plain `DENY`
+> or `ASK` verdict on this probe does **not** block agent start — it is logged
+> and ignored, so a general-purpose tool allowlist or cost gate that happens to
+> reject the `sys_agent_start` name will not stop the agent from launching. The
+> runner only refuses to start (fails closed) when a policy cannot be evaluated
+> at all — it raised, could not be resolved, or returned a transform that drops
+> the probe's `name`/`arguments` shape — because then its intended sandbox
+> transform is unknown. Do not rely on a tool-call `DENY` to gate which agents
+> may launch; there is no agent-start policy phase today.
+
 #### `deny_pii_in_llm_request`
 
 Scans user messages and LLM prompts for PII patterns (SSN, credit card, email, phone).
@@ -333,6 +373,15 @@ daily_budget:
 #### `github_policy`
 
 Controls GitHub access across MCP tools and `git`/`gh` shell commands. Restricts reads to an allowlist (unless `read_all`) and writes to specific repos/branches. Shell commands with ambiguous targets return ASK.
+
+Shell comments, here-documents (including here-strings), line continuations, and
+command substitutions are not classified. Completed command segments before
+and after these regions retain their policy decisions when the parser can
+determine their boundaries, including commands surrounding a comment. Unsupported
+syntax adds an ASK decision; DENY takes precedence over ASK, which takes
+precedence over ALLOW. Substitutions inside double quotes
+also require approval, as do ANSI-C (`$'...'`) and locale-specific (`$"..."`)
+quoting. Ordinary single-quoted or escaped literal delimiters remain arguments.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -399,6 +448,13 @@ Controls Google Calendar access. Defaults to read-only.
 #### `block_working_dir_changes`
 
 Blocks shell commands that change the working directory (`cd`, `pushd`, `git -C`) or manage git worktrees. Parses chained and wrapped commands to prevent trivial bypasses.
+
+Shell comments, here-documents (including here-strings), line continuations, and
+command substitutions take the configured `action` because the parser cannot
+classify them reliably. This also applies when the visible command does not
+change directories. ANSI-C (`$'...'`) and locale-specific (`$"..."`) quoting also
+take this action; ordinary single-quoted or escaped literal delimiters remain
+arguments.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|

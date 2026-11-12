@@ -1,14 +1,18 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { setEmbedScopeRoot } from "./host";
 import {
   applyDesktopUiFontSize,
+  applyStoredUiFontSize,
   applyUiFontFamily,
+  readAppliedUiFontSizePx,
   readUiFontFamily,
   readUiFontSizePx,
   UI_FONT_FAMILY_DEFAULT,
   UI_FONT_SIZE_DEFAULT,
   UI_FONT_SIZE_MAX,
   UI_FONT_SIZE_MIN,
+  UI_FONT_SIZE_MOBILE_DEFAULT,
+  UI_FONT_SIZE_MOBILE_QUERY,
   writeUiFontFamily,
   writeUiFontSizePx,
 } from "./uiFontPreferences";
@@ -17,6 +21,7 @@ const STORAGE_KEY = "omnigent:ui-font-size";
 const FAMILY_STORAGE_KEY = "omnigent:ui-font-family";
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   localStorage.clear();
   setEmbedScopeRoot(null);
   document.documentElement.style.removeProperty("--desktop-ui-font-size");
@@ -26,7 +31,41 @@ afterEach(() => {
 describe("uiFontPreferences", () => {
   it("returns the default when nothing is stored", () => {
     expect(readUiFontSizePx()).toBe(UI_FONT_SIZE_DEFAULT);
-    expect(UI_FONT_SIZE_DEFAULT).toBe(13);
+    expect(UI_FONT_SIZE_DEFAULT).toBe(14);
+  });
+
+  it("uses a 15px default on mobile without scaling explicit choices", () => {
+    vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true }));
+    expect(readUiFontSizePx()).toBe(UI_FONT_SIZE_MOBILE_DEFAULT);
+    expect(UI_FONT_SIZE_MOBILE_DEFAULT).toBe(15);
+
+    writeUiFontSizePx(12);
+    expect(readUiFontSizePx()).toBe(12);
+  });
+
+  it.each([
+    ["narrow viewport", true, true, 15],
+    ["wide touch viewport", false, true, 14],
+    ["wide mouse viewport", false, false, 14],
+  ] as const)("uses one applied size on a %s", (_label, narrow, coarse, size) => {
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn((query: string) => ({
+        matches:
+          query === UI_FONT_SIZE_MOBILE_QUERY ? narrow : query === "(pointer: coarse)" && coarse,
+      })),
+    );
+    expect(readUiFontSizePx()).toBe(size);
+    expect(readAppliedUiFontSizePx()).toBe(size);
+    for (const saved of [11, 13, 18]) {
+      writeUiFontSizePx(saved);
+      expect(readUiFontSizePx()).toBe(saved);
+      applyDesktopUiFontSize(saved);
+      expect(readAppliedUiFontSizePx()).toBe(saved);
+      expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe(
+        `${saved}px`,
+      );
+    }
   });
 
   it("round-trips a valid size", () => {
@@ -65,11 +104,22 @@ describe("uiFontPreferences", () => {
   it("applies the discrete desktop size on the document root", () => {
     applyDesktopUiFontSize(18);
     expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("18px");
+    expect(readAppliedUiFontSizePx()).toBe(18);
   });
 
   it("clamps before applying the desktop size", () => {
     applyDesktopUiFontSize(99);
     expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("18px");
+  });
+
+  it("only applies an inline override when a saved choice exists", () => {
+    applyDesktopUiFontSize(18);
+    applyStoredUiFontSize();
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("");
+
+    writeUiFontSizePx(12);
+    applyStoredUiFontSize();
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("12px");
   });
 
   it("applies onto the embed scope root when embedded, not the document root", () => {
@@ -81,6 +131,7 @@ describe("uiFontPreferences", () => {
     applyDesktopUiFontSize(16);
     applyUiFontFamily("Comic Sans");
     expect(scope.style.getPropertyValue("--desktop-ui-font-size")).toBe("16px");
+    expect(readAppliedUiFontSizePx()).toBe(16);
     expect(scope.style.getPropertyValue("--ui-font-family")).toBe("Comic Sans, var(--font-sans)");
     expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");

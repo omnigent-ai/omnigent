@@ -21,8 +21,8 @@ const pluginSkills = (plugin: string, count: number) =>
 
 export const MOCK_IMPORT_CONTEXT: ImportContext = {
   credentials: [
-    { harness: "claude", source: "Databricks AI Gateway" },
-    { harness: "codex", source: "Databricks (dbc-a5d4177a-49dc)" },
+    { harness: "claude", source: "Databricks Unity Gateway" },
+    { harness: "codex", source: "Databricks (dbc-12345678-abcd)" },
     { harness: "cursor", source: "Signed in" },
   ],
   mcps: [

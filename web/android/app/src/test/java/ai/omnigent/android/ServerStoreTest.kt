@@ -79,18 +79,29 @@ class ServerStoreTest {
     }
 
     @Test
+    fun `clearing the current server keeps it available for explicit reconnect`() {
+        val store = storeWithPresets()
+        store.connect("https://workspace.example.com")
+
+        store.clearCurrent()
+
+        assertFalse(store.hasServer())
+        assertTrue(store.recentServers().contains("https://workspace.example.com"))
+    }
+
+    @Test
     fun `a databricks workspace connects to its omnigent mount`() {
         val store = storeWithPresets()
 
-        store.connect("https://dbc-a5d4177a-49dc.cloud.databricks.com")
+        store.connect("https://dbc-12345678-abcd.cloud.databricks.com")
 
         assertEquals(
-            "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent",
+            "https://dbc-12345678-abcd.cloud.databricks.com/omnigent",
             store.currentServerUrl(),
         )
         // The offered entry stays what the user typed.
         assertEquals(
-            listOf("https://dbc-a5d4177a-49dc.cloud.databricks.com"),
+            listOf("https://dbc-12345678-abcd.cloud.databricks.com"),
             store.recentServers(),
         )
     }

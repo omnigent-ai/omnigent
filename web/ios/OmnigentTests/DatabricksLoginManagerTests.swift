@@ -326,7 +326,7 @@ private final class Harness {
 }
 
 @MainActor
-private final class FakeAuthenticationSession: DatabricksAuthenticationSession {
+private final class FakeAuthenticationSession: WebAuthenticationSession {
   let url: URL
   let callback: ASWebAuthenticationSession.Callback
   let completion: ASWebAuthenticationSession.CompletionHandler

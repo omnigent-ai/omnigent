@@ -10,6 +10,8 @@
 
 "use strict";
 
+const { diagnostics } = require("./diagnostics");
+
 const { net } = require("electron");
 const {
   runInteractiveLogin,
@@ -35,18 +37,20 @@ const NETWORK_TIMEOUT_MS = 20_000;
  * workspace origin. Two entry points with deliberately different behavior:
  *
  * - Explicit connect/login (``interactive: true``): try the stored credentials
- *   for the entered origin (unless ``useStoredCredentials: false``), else
- *   authenticate fresh in the browser. Tokens are keyed by WORKSPACE origin, so a
- *   SPOG URL still re-runs the account flow + picker for THIS window. The result
- *   is persisted keyed by the resolved workspace origin.
+ *   for ``storedOrigin`` or else the entered origin (unless
+ *   ``useStoredCredentials: false``), else authenticate fresh in the browser.
+ *   Tokens are keyed by WORKSPACE origin, so a SPOG URL re-runs the account
+ *   flow + picker for THIS window unless the caller names the workspace it
+ *   reached before as ``storedOrigin``. The result is persisted keyed by the
+ *   resolved workspace origin.
  * - Restore/renewal (``interactive: false``): reuse the stored token for this
  *   (already-resolved) workspace, refreshing if needed, and re-mint the cookie
  *   against the SAME workspace — no browser, no picker.
  *
  * @param {Electron.Session} ses The session whose cookie jar to seed.
  * @param {string} origin The entered/pinned origin (account or workspace host).
- * @param {{ interactive?: boolean, useStoredCredentials?: boolean, nextPath?: string,
- *   workspaceId?: string, signal?: AbortSignal,
+ * @param {{ interactive?: boolean, useStoredCredentials?: boolean, storedOrigin?: string,
+ *   nextPath?: string, workspaceId?: string, signal?: AbortSignal,
  *   pickWorkspace?: (workspaces: Array<{workspaceId: string, name: string, fqdn: string}>)
  *     => Promise<{fqdn: string, name: string} | null> }} [opts]
  *   ``workspaceId`` (from a ``?o=`` hint) auto-selects that workspace for an
@@ -59,6 +63,7 @@ async function ensureDatabricksSession(
   {
     interactive = true,
     useStoredCredentials = true,
+    storedOrigin = origin,
     nextPath = "/omnigent",
     pickWorkspace,
     workspaceId,
@@ -76,12 +81,22 @@ async function ensureDatabricksSession(
   });
   if (interactive && useStoredCredentials) {
     try {
-      return await ensureDatabricksSession(ses, origin, { interactive: false, nextPath, signal });
+      return await ensureDatabricksSession(ses, storedOrigin, {
+        interactive: false,
+        nextPath,
+        signal,
+      });
     } catch (error) {
       signal?.throwIfAborted();
       // A browser sign-in can't finish while the workspace is unreachable either.
-      if (isTransientRenewalError(error)) throw error;
-      console.log("[omnigent] databricks session: stored credentials unusable", { origin });
+      // Reconnecting resumes the workspace whose credentials were tried.
+      if (isTransientRenewalError(error)) {
+        if (storedOrigin !== origin) error.storedOrigin = storedOrigin;
+        throw error;
+      }
+      console.log("[omnigent] databricks session: stored credentials unusable", {
+        origin: storedOrigin,
+      });
     }
   }
   let bridgeOrigin;
@@ -287,6 +302,12 @@ async function mintSessionCookie(
         const id =
           response.headers?.["x-databricks-request-id"] ?? response.headers?.["x-request-id"];
         if (typeof id === "string" && /^[a-zA-Z0-9._:-]{1,128}$/.test(id)) requestId = id;
+        diagnostics.record("databricks_bridge", {
+          origin,
+          phase: phase === "session-create" ? "session_create" : "workspace_landing",
+          status: response.statusCode,
+          requestId,
+        });
         console.log("[omnigent] databricks session: bridge response", {
           origin,
           phase,
@@ -365,6 +386,7 @@ async function mintSessionCookie(
     if (!minted) {
       throw new Error(`${SESSION_CREATE_PATH}: no new DBAUTH cookie stored`);
     }
+    diagnostics.record("databricks_session", { origin, outcome: "signed_in" });
     console.log(`[omnigent] databricks session: signed in to ${origin}`);
   } finally {
     ses.cookies.removeListener("changed", onCookieChanged);

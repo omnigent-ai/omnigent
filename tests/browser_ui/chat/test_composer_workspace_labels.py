@@ -1,0 +1,255 @@
+"""Composer workspace labels scale and their details wrap without clipping."""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+from playwright.sync_api import Locator, Page, expect
+
+from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item
+
+_WORKSPACE = "/workspace/projects/" + "long-unbroken-directory-name-" * 4 + "/checkout"
+_BRANCH = "feature/" + "long-branch-name-" * 5
+
+
+@pytest.mark.parametrize("viewport_width", [1440, 390], ids=["desktop", "mobile"])
+@pytest.mark.parametrize("font_size", [13, 18], ids=["default-font", "large-font"])
+@pytest.mark.parametrize("has_binding", [True, False], ids=["long-label", "fallback"])
+def test_composer_details_wrap_without_clipping(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    tmp_path: Path,
+    viewport_width: int,
+    font_size: int,
+    has_binding: bool,
+) -> None:
+    """Long values and fallback explanations fit both informational popovers."""
+    chat = chat_session_contract
+    base_url, session_id = chat.base_url, chat.session_id
+    page.add_init_script("localStorage.setItem('omnigent:default-workspace-panel', 'open')")
+    chat.set_items(
+        [
+            message_item("reply", "assistant", "Inspect the session details.", response_id="turn"),
+            message_item("prompt", "user", "Hello", response_id="turn"),
+        ]
+    )
+
+    chat.update_session(
+        workspace=_WORKSPACE if has_binding else None,
+        git_branch=_BRANCH if has_binding else None,
+    )
+    page.route(
+        f"**/v1/sessions/{session_id}/resources/github",
+        lambda route: route.fulfill(
+            json={
+                "object": "session.github.info",
+                "available": has_binding,
+                "repo": {"name_with_owner": "example/repo"} if has_binding else None,
+                "prs": [],
+            }
+        ),
+    )
+    page.route(
+        f"**/v1/hosts/{chat.host_id}/worktrees?*",
+        lambda route: route.fulfill(
+            json={
+                "data": [
+                    {
+                        "path": _WORKSPACE,
+                        "branch": _BRANCH,
+                        "is_main": False,
+                        "detached": False,
+                    }
+                ]
+            }
+        ),
+    )
+    page.add_init_script(f"localStorage.setItem('omnigent:ui-font-size', '{font_size}')")
+    page.set_viewport_size({"width": viewport_width, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}")
+    controls = page.get_by_test_id("composer-workspace-controls")
+    if viewport_width < 768:
+        expect(controls).to_have_count(0)
+        page.get_by_role("button", name=re.compile(r"^(?:Conversation|Session) actions$")).click()
+        if has_binding:
+            directory = page.get_by_label(f"Working directory: {_WORKSPACE}", exact=True)
+            expect(directory).to_have_text("checkout")
+            expect(directory).to_have_attribute("title", _WORKSPACE)
+        else:
+            expect(page.locator('[aria-label^="Working directory:"]')).to_have_count(0)
+        return
+    expect(controls).to_be_visible(timeout=30_000)
+    expect(controls.get_by_role("button")).to_have_count(0)
+    workspace = controls.get_by_test_id("composer-workspace-dir")
+    workspace_title = (
+        f"Working directory: {_WORKSPACE}" if has_binding else "No working directory bound"
+    )
+    _expect_tooltip_fits(page, workspace, workspace_title, viewport_width)
+    if has_binding:
+        worktree = controls.get_by_test_id("composer-git-branch")
+        _expect_tooltip_fits(page, worktree, f"Worktree: {_WORKSPACE}. {_BRANCH}", viewport_width)
+    else:
+        expect(controls.get_by_test_id("composer-git-branch")).to_have_count(0)
+    controls.screenshot(path=tmp_path / f"details-{viewport_width}.png", animations="disabled")
+
+
+def _expect_tooltip_fits(page: Page, chip: Locator, text: str, viewport_width: int) -> None:
+    chip.hover()
+    tooltip = page.get_by_role("tooltip")
+    expect(tooltip).to_have_text(text)
+    surface = page.locator("[data-slot='tooltip-content']")
+    box = surface.bounding_box()
+    assert box is not None
+    assert box["x"] >= 0
+    assert box["x"] + box["width"] <= viewport_width
+    page.keyboard.press("Escape")
+    expect(tooltip).to_have_count(0)
+
+
+@pytest.mark.parametrize(
+    "viewport_width", [1440, 3200, 390], ids=["desktop", "ultrawide", "mobile"]
+)
+@pytest.mark.parametrize("font_size", [13, 18], ids=["default-font", "large-font"])
+@pytest.mark.parametrize("long_labels", [False, True], ids=["readable-name", "long-labels"])
+def test_composer_workspace_labels_use_available_width(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    tmp_path: Path,
+    viewport_width: int,
+    font_size: int,
+    long_labels: bool,
+) -> None:
+    """Names fit wide bars; when they can't, the bar collapses to icons, not ellipses."""
+    chat = chat_session_contract
+    base_url, session_id = chat.base_url, chat.session_id
+    page.add_init_script("localStorage.setItem('omnigent:default-workspace-panel', 'open')")
+    chat.set_items(
+        [
+            message_item(
+                "reply", "assistant", "Inspect the workspace labels.", response_id="turn"
+            ),
+            message_item("prompt", "user", "Hello", response_id="turn"),
+        ]
+    )
+    name = "new-composer-width" * (8 if long_labels else 1)
+
+    chat.update_session(
+        workspace=f"/workspace/{name}",
+        git_branch="creation-branch",
+    )
+    page.route(
+        f"**/v1/sessions/{session_id}/resources/github",
+        lambda route: route.fulfill(
+            json={
+                "object": "session.github.info",
+                "available": True,
+                "repo": {"name_with_owner": "example/repo"},
+                "prs": [],
+            }
+        ),
+    )
+    page.route(
+        f"**/v1/hosts/{chat.host_id}/worktrees?*",
+        lambda route: route.fulfill(
+            json={
+                "data": [
+                    {
+                        "path": f"/workspace/{name}",
+                        "branch": name,
+                        "is_main": False,
+                        "detached": False,
+                    }
+                ]
+            }
+        ),
+    )
+    page.add_init_script(f"localStorage.setItem('omnigent:ui-font-size', '{font_size}')")
+    page.set_viewport_size({"width": viewport_width, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}")
+    controls = page.get_by_test_id("composer-workspace-controls")
+    if viewport_width < 768:
+        expect(controls).to_have_count(0)
+        page.get_by_role("button", name=re.compile(r"^(?:Conversation|Session) actions$")).click()
+        menu = page.get_by_role("menu")
+        directory = menu.get_by_label(f"Working directory: /workspace/{name}", exact=True)
+        expect(directory).to_have_text(name)
+        expect(directory).to_have_attribute("title", f"/workspace/{name}")
+        menu_box, label_box = menu.bounding_box(), directory.bounding_box()
+        assert menu_box is not None and label_box is not None
+        assert menu_box["x"] >= 16
+        assert menu_box["x"] + menu_box["width"] <= viewport_width - 16
+        assert label_box["x"] >= menu_box["x"]
+        assert label_box["x"] + label_box["width"] <= menu_box["x"] + menu_box["width"]
+        label = directory.locator("span")
+        assert label.evaluate(
+            "el => el.clientWidth > 0 && getComputedStyle(el).textOverflow === 'ellipsis'"
+        )
+        return
+    expect(controls).to_be_visible(timeout=30_000)
+    expect(controls.get_by_role("button")).to_have_count(0)
+    controls.screenshot(path=tmp_path / f"labels-{viewport_width}-{font_size}.png")
+
+    # The bar shows the full names while they fit; once a name would have to
+    # truncate, every chip drops to its icon instead of showing clipped text.
+    # The normalized inner padding (bar px-2 -> px-3, chip px-0.5 -> px-1)
+    # leaves ~10px less room at 390px, so even default-font readable names
+    # collapse to icons there.
+    collapsed = long_labels or viewport_width == 390
+    if collapsed:
+        expect(controls).to_have_attribute("data-labels", "collapsed")
+        for label in controls.locator("span.truncate").all():
+            expect(label).to_be_hidden()
+    else:
+        expect(controls).not_to_have_attribute("data-labels", "collapsed")
+        expect(controls.locator("span.truncate")).to_have_text([name, name])
+
+    dimensions = controls.evaluate(
+        """bar => {
+          const bounds = bar.getBoundingClientRect();
+          return {
+            left: bounds.left,
+            right: bounds.right,
+            bottom: bounds.bottom,
+            viewport: window.innerWidth,
+            items: [...bar.querySelectorAll(
+              '[data-testid="composer-workspace-dir"], [data-testid="composer-git-branch"]',
+            )].map(item => {
+              const itemBounds = item.getBoundingClientRect();
+              const label = item.querySelector('span.truncate');
+              return {
+                left: itemBounds.left,
+                right: itemBounds.right,
+                top: itemBounds.top,
+                bottom: itemBounds.bottom,
+                labelWidth: label.clientWidth,
+                textWidth: label.scrollWidth,
+                icons: [...item.querySelectorAll('svg')].map(icon => {
+                  const iconBounds = icon.getBoundingClientRect();
+                  return { left: iconBounds.left, right: iconBounds.right };
+                }),
+              };
+            }),
+          };
+        }"""
+    )
+    assert dimensions["left"] >= 0
+    assert dimensions["right"] <= dimensions["viewport"]
+    workspace, worktree = dimensions["items"]
+    assert workspace["right"] < worktree["left"]
+    assert workspace["top"] == pytest.approx(worktree["top"], abs=1)
+    for item in dimensions["items"]:
+        assert item["left"] >= dimensions["left"]
+        assert item["right"] <= dimensions["right"]
+        assert item["bottom"] <= dimensions["bottom"]
+        if collapsed:
+            # Collapsed: the label is hidden, so only the icon remains.
+            assert item["labelWidth"] == 0
+        else:
+            assert item["labelWidth"] > 0
+            assert item["textWidth"] <= item["labelWidth"] + 1
+        for icon in item["icons"]:
+            assert icon["right"] - icon["left"] >= 12
+            assert icon["left"] >= item["left"]
+            assert icon["right"] <= item["right"]

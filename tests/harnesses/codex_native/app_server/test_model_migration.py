@@ -43,16 +43,22 @@ def test_codex_model_upgrade_target_reads_gateway_model_list_migration() -> None
 
 
 def test_acknowledge_codex_model_migration_updates_private_config(tmp_path: Path) -> None:
-    """Acknowledgement preserves user notices while suppressing one prompt."""
+    """Acknowledgement suppresses the prompt while preserving the selected model and effort."""
     from omnigent.harnesses.codex_native.app_server import _acknowledge_codex_model_migration
 
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
     config_path = codex_home / "config.toml"
-    config_path.write_text("[notice]\nhide_rate_limit_model_nudge = true\n", encoding="utf-8")
+    config_path.write_text(
+        'model = "gpt-5.4"\nmodel_reasoning_effort = "xhigh"\n'
+        "[notice]\nhide_rate_limit_model_nudge = true\n",
+        encoding="utf-8",
+    )
 
     _acknowledge_codex_model_migration(codex_home, "gpt-5.4", "gpt-5.6-terra")
 
     config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert config["model"] == "gpt-5.4"
+    assert config["model_reasoning_effort"] == "xhigh"
     assert config["notice"]["hide_rate_limit_model_nudge"] is True
     assert config["notice"]["model_migrations"] == {"gpt-5.4": "gpt-5.6-terra"}

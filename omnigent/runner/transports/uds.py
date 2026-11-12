@@ -35,6 +35,7 @@ from pathlib import Path
 import httpx
 
 from omnigent.inner import _proc
+from omnigent.scheduled_context import add_scheduled_run_header
 
 
 def _is_socket_listening(socket_path: str) -> bool:
@@ -98,6 +99,7 @@ class RunnerSubprocess:
         # (including the omnigent source) are importable.
         cmd = [
             sys.executable,
+            "-P",
             "-m",
             "uvicorn",
             "--factory",
@@ -170,4 +172,6 @@ def create_uds_client(socket_path: str, *, base_url: str = "http://runner") -> h
     :returns: An ``httpx.AsyncClient`` pointed at the UDS.
     """
     transport = httpx.AsyncHTTPTransport(uds=socket_path)
-    return httpx.AsyncClient(transport=transport, base_url=base_url)
+    return httpx.AsyncClient(
+        event_hooks={"request": [add_scheduled_run_header]}, transport=transport, base_url=base_url
+    )

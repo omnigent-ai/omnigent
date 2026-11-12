@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import logging
 import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -14,8 +17,11 @@ from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
 )
-from omnigent.runner import create_runner_app, subagent_work
+from omnigent.runner import app as runner_app
+from omnigent.runner import create_runner_app, subagent_work, tool_dispatch
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests._helpers.polling import poll_until_async
+from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
     _BlockingHarnessClient,
     _build_app_for_spec,
@@ -29,6 +35,70 @@ from tests.runner.conftest import (
     _sse,
 )
 from tests.runner.helpers import NullServerClient
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["interrupt", "delete", "shutdown", "unknown"])
+async def test_background_cancellation_records_request_and_state(
+    origin: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    gate = asyncio.Event()
+    app, _pm, harness = _build_interrupt_app(gate)
+    conv_id = "cancellation-evidence-session"
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_int_test",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "private message"}],
+                "harness": "openai-agents",
+            },
+        )
+        assert response.status_code == 202
+        await asyncio.wait_for(harness.post_seen.wait(), timeout=5)
+        if origin == "interrupt":
+            response = await client.post(
+                f"/v1/sessions/{conv_id}/events", json={"type": "interrupt"}
+            )
+            assert response.status_code == 204
+        elif origin == "delete":
+            response = await client.delete(f"/v1/sessions/{conv_id}")
+            assert response.status_code == 200
+        else:
+            if origin == "shutdown":
+                app.state.shutting_down.set()
+            task = app.state.active_turns[conv_id]
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    [observed] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "runner_turn_cancelled"
+    ]
+    requested = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_turn_cancel_requested"
+    ]
+    assert observed.levelno == logging.ERROR
+    assert observed.session_id == conv_id
+    assert observed.attributes["runner_shutting_down"] == (origin == "shutdown")
+    assert observed.attributes["interrupt_marked"] == (origin == "interrupt")
+    assert observed.attributes["task_cancel_count"] >= 1
+    assert "private" not in json.dumps(observed.attributes)
+    if origin in {"interrupt", "delete"}:
+        [request] = requested
+        assert request.attributes["cancel_origin"] == (
+            "interrupt_or_stop" if origin == "interrupt" else "session_delete"
+        )
+        assert request.attributes["turn_epoch"] == observed.attributes["turn_epoch"]
+    else:
+        assert not requested
 
 
 @pytest.mark.asyncio
@@ -333,7 +403,7 @@ async def test_interrupt_during_setup_phase_recovers_stuck_turn() -> None:
         try:
             await _aio.wait_for(resolver_entered.wait(), timeout=5.0)
             fresh_turn_started = True
-        except _aio.TimeoutError:
+        except TimeoutError:
             fresh_turn_started = False
 
         resolver_gate.set()  # release the blocked turn for clean teardown
@@ -1526,24 +1596,208 @@ async def test_subagent_completion_during_parent_wake_turn_posts_followup_wake()
     assert "sys_read_inbox" in followup_text
 
 
+class _PolicyAllowingWakeRecordingServerClient(_WakeRecordingServerClient):
+    """Allows the ``PHASE_TOOL_CALL`` check a background task makes before it runs."""
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        """Allow policy evaluations, else record wakes like the base.
+
+        :param url: Request URL, e.g. ``"/v1/sessions/<id>/policies/evaluate"``.
+        :param kwargs: Request kwargs.
+        :returns: An allow verdict for policy evaluations, else the base response.
+        """
+        if url.endswith("/policies/evaluate"):
+            return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"})
+        return await super().post(url, **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("finishes", "drained_mid_turn", "subagent_finishes", "wakes"),
+    [
+        pytest.param("after_turn", False, None, True, id="finishes-after-turn-end"),
+        pytest.param("mid_turn", False, None, True, id="finishes-mid-turn-undrained"),
+        pytest.param("mid_turn", True, None, False, id="finishes-mid-turn-drained"),
+        pytest.param("mid_turn", False, "before", True, id="newer-than-subagent-result"),
+        pytest.param("mid_turn", False, "after", True, id="older-than-subagent-result"),
+    ],
+)
+async def test_background_task_result_wakes_session_whose_turn_ended(
+    monkeypatch: pytest.MonkeyPatch,
+    finishes: str,
+    drained_mid_turn: bool,
+    subagent_finishes: str | None,
+    wakes: bool,
+) -> None:
+    """
+    A finished ``sys_call_async`` task wakes its session once no turn can collect it.
+
+    A native harness dispatches ``sys_call_async`` through ``/mcp/execute`` and
+    its turn usually ends before the task finishes. The result lands in the
+    session inbox, and the runner must post a wake notice to the session's own
+    ``/events`` so it takes a turn and calls ``sys_read_inbox``. A result that
+    lands mid-turn defers that decision to turn end: the turn may drain it
+    itself, in which case a wake would only start an extra turn, even when a
+    later cancelled task left its own result unread and a child is still
+    running. When a sub-agent result is also waiting, the turn-end notice names
+    the newer one.
+    """
+    session_id = "b7e0c4a1d2f34e5a9c8b7a6f5e4d3c2b"
+    child_id = "5d4c3b2a1f0e4d9c8b7a6f5e4d3c2b1a"
+    agent_id = "0c1d2e3f4a5b4c6d8e9f0a1b2c3d4e5f"
+    spec = AgentSpec(spec_version=1, name="background-agent", async_enabled=True)
+    server_client = _PolicyAllowingWakeRecordingServerClient(session_id)
+    gate = asyncio.Event()
+    harness_client = _BlockingHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_dispatch"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_dispatch"}}),
+        ],
+        gate,
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        spec_resolver=await _spec_resolver_returning(spec),
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    release = asyncio.Event()
+
+    async def _slow_session_list(*_args: Any, **_kwargs: Any) -> str:
+        await release.wait()
+        return "BACKGROUND_DONE"
+
+    monkeypatch.setattr(tool_dispatch, "_execute_session_query_tool", _slow_session_list)
+
+    async def _call(client: Any, name: str, arguments: dict[str, Any]) -> str:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={"method": "tools/call", "params": {"name": name, "arguments": arguments}},
+        )
+        assert resp.status_code == 200, resp.text
+        return str(resp.json()["result"]["output"])
+
+    async def _finish_subagent(client: Any) -> None:
+        subagent_work.register_subagent_work(
+            parent_session_id=session_id,
+            child_session_id=child_id,
+            agent="researcher",
+            title="check",
+        )
+        resp = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "output": "SUBAGENT_DONE"},
+            },
+        )
+        assert resp.status_code == 204, resp.text
+        await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+        server_client.wake_seen.clear()
+
+    try:
+        async with _runner_client(app) as client:
+            init = await client.post(
+                "/v1/sessions",
+                json={"session_id": session_id, "agent_id": agent_id, "sub_agent_name": None},
+            )
+            assert init.status_code == 201, init.text
+            turn = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": agent_id,
+                    "model": "background-agent",
+                    "harness": "openai-agents",
+                    "content": [{"type": "input_text", "text": "start the background task"}],
+                },
+            )
+            assert turn.status_code == 202, turn.text
+            await asyncio.wait_for(harness_client.post_seen.wait(), timeout=5.0)
+            handle = json.loads(
+                await _call(client, "sys_call_async", {"tool": "sys_session_list", "args": "{}"})
+            )
+            inbox = subagent_work._session_inboxes_ref[session_id]
+            pending = 1 if subagent_finishes is None else 2
+
+            if finishes == "after_turn":
+                gate.set()
+                await poll_until_async(
+                    lambda: session_id not in app.state.active_turns, timeout_s=5.0
+                )
+                release.set()
+            else:
+                if subagent_finishes == "before":
+                    await _finish_subagent(client)
+                release.set()
+                await poll_until_async(
+                    lambda: inbox.qsize() == (2 if subagent_finishes == "before" else 1),
+                    timeout_s=5.0,
+                )
+                if subagent_finishes == "after":
+                    await _finish_subagent(client)
+                if drained_mid_turn:
+                    assert "BACKGROUND_DONE" in await _call(client, "sys_read_inbox", {})
+                    # A later cancelled task leaves an unread item that owes no wake.
+                    release.clear()
+                    cancelled = json.loads(
+                        await _call(
+                            client, "sys_call_async", {"tool": "sys_session_list", "args": "{}"}
+                        )
+                    )
+                    await _call(client, "sys_cancel_async", {"handle_id": cancelled["handle_id"]})
+                    await poll_until_async(lambda: inbox.qsize() == 1, timeout_s=5.0)
+                    # A child that is still running has nothing to announce either.
+                    subagent_work.register_subagent_work(
+                        parent_session_id=session_id,
+                        child_session_id=child_id,
+                        agent="researcher",
+                        title="check",
+                    )
+                # The turn is still active, so it could collect the result itself.
+                assert len(server_client.wake_posts) == (0 if subagent_finishes is None else 1)
+                gate.set()
+                await poll_until_async(
+                    lambda: session_id not in app.state.active_turns, timeout_s=5.0
+                )
+
+            if wakes:
+                await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            else:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(server_client.wake_seen.wait(), timeout=0.5)
+    finally:
+        gate.set()
+        release.set()
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(session_id, None)
+
+    if not wakes:
+        assert server_client.wake_posts == []
+        return
+    assert len(server_client.wake_posts) == pending
+    wake_text = server_client.wake_posts[-1]["data"]["content"][0]["text"]
+    if subagent_finishes == "after":
+        assert "sub-agent researcher/check finished" in wake_text
+    else:
+        assert (
+            f"background task {handle['handle_id']} (sys_session_list) finished (completed)"
+            in wake_text
+        )
+    noun = "result" if pending == 1 else "results"
+    assert f"{pending} {noun} waiting in inbox" in wake_text
+    assert "sys_read_inbox" in wake_text
+
+
 @pytest.mark.asyncio
 async def test_parent_idle_with_stuck_wake_flag_posts_recovery_wake() -> None:
     """
-    A parent going idle while holding a stuck wake flag posts a recovery wake.
+    Unread results keep a parent busy through its recovery wake.
 
-    Guards the multi-round fan-out stranding bug. ``_subagent_wake_pending`` is
-    cleared only at turn start, so a child that completes mid-turn re-arms the
-    flag with no later turn to clear it; the parent then idles with the flag
-    stuck and results still in the inbox, and further completions are debounced
-    and stranded. The fix (``_rewake_parent_if_inbox_stranded`` from
-    ``_check_and_start_next_turn``) re-arms one wake on idle.
-
-    Sequence (wake counts bracketed): (1) child A completes idle → wake [1],
-    parent turn starts (clears flag); (2) child B completes mid-turn → wake [2],
-    re-arms flag; (3) turn ends → recovery wake [3] WITH the fix, stays [2]
-    without it (the discriminator); (4) child C completes → correctly
-    *coalesced* against the re-armed flag (inbox grows, no 4th wake). Child C is
-    kept only to pin that coalesce contract — the signal is the step-3 wake.
+    Child A wakes the parent; B finishes during that turn and re-arms the
+    wake flag. When the parent ends its turn without reading the inbox, a
+    third wake must be scheduled without publishing idle. A later child C
+    coalesces against that wake. Headless clients can then await synthesis.
     """
 
     parent_id = "22b91e208e5501fb8d2b502837391f04"
@@ -1637,9 +1891,7 @@ async def test_parent_idle_with_stuck_wake_flag_posts_recovery_wake() -> None:
                 f"parent goes idle, got {wakes_before_idle}."
             )
 
-            # 3. End the parent turn → _check_and_start_next_turn runs the
-            # re-arm. Await the recovery wake directly (not a fixed sleep);
-            # without the fix it never posts and this wait_for times out.
+            # End the parent turn with unread results, then await the recovery wake.
             gate.set()
             try:
                 await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
@@ -1658,9 +1910,20 @@ async def test_parent_idle_with_stuck_wake_flag_posts_recovery_wake() -> None:
                 f"Expected the recovery wake to bring the count to 3, got "
                 f"{len(server_client.wake_posts)}."
             )
+            parent_statuses = [
+                event["status"]
+                for event in _drain_session_event_queue(
+                    runner_app._session_event_queues_ref.get(parent_id)
+                )
+                if event.get("type") == "session.status"
+            ]
+            assert parent_statuses[-1] in {"waiting", "running"}
+            assert "idle" not in parent_statuses, (
+                "Headless clients must not see completion before the inbox recovery turn."
+            )
             server_client.wake_seen.clear()
 
-            # Let the turn fully settle so C is unambiguously a post-idle event.
+            # Let the turn end so C arrives while the recovery wake is pending.
             _deadline = asyncio.get_running_loop().time() + 5.0
             while app.state.has_active_work():
                 if asyncio.get_running_loop().time() > _deadline:
@@ -1669,9 +1932,7 @@ async def test_parent_idle_with_stuck_wake_flag_posts_recovery_wake() -> None:
             for _ in range(5):
                 await asyncio.sleep(0)
 
-            # 4. Child C finishes post-idle. The recovery wake re-armed the
-            # flag, so C must COALESCE: result lands in the inbox, no new wake.
-            # Yield generously so a (wrongly) scheduled extra wake would land.
+            # Child C coalesces against the pending recovery wake.
             subagent_work.register_subagent_work(
                 parent_session_id=parent_id,
                 child_session_id=child_c,
@@ -2108,6 +2369,14 @@ async def test_repeat_identical_recovery_wake_is_suppressed() -> None:
             #    wrongly-scheduled 5th wake room to land before asserting.
             gate.set()
             await _wait_turn_idle()
+            parent_statuses = [
+                event["status"]
+                for event in _drain_session_event_queue(
+                    runner_app._session_event_queues_ref.get(parent_id)
+                )
+                if event.get("type") == "session.status"
+            ]
+            assert parent_statuses[-1] == "idle", "A suppressed duplicate wake must settle."
     finally:
         gate.set()
         for child in (child_a, child_b, child_c):
@@ -2624,6 +2893,8 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
 async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harnesses(
     harness: str,
     expected_statuses: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """
     Runner lifecycle status is edge-specific for terminal-backed harnesses.
@@ -2648,6 +2919,7 @@ async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harn
     """
     from omnigent.runner.app import _session_event_queues_ref
 
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
     session_id = uuid.uuid4().hex
     spec = AgentSpec(
         spec_version=1,

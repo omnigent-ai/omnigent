@@ -1,5 +1,5 @@
 # Keep the repo's public lockfiles consistent with the manifests, validated via
-# a Docker build + CLI smoke. Runs on GitHub-hosted ubuntu-latest so resolution
+# a Docker build + CLI smoke. Runs on a GitHub-hosted runner so resolution
 # sees public registries directly (lockfiles must record public sources, never
 # a proxy). Exists because sync PRs land manifest changes without lockfile
 # updates and the Dockerfile COPYs pnpm-lock.yaml, so the tree is not
@@ -34,11 +34,11 @@ jobs:
       pull-requests: write # open / update the regen PR
     # Gated to this repository; inert in forks and mirrors.
     if: github.repository == 'omnigent-ai/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up uv (clean public resolution, no proxy cache)
         uses: ./.github/actions/setup-uv
@@ -57,23 +57,32 @@ jobs:
       # one ecosystem from forcing a from-scratch re-resolve of the other, which
       # would reintroduce the in-range transitive churn this job avoids. `any`
       # drives the shared token/PR steps below.
+      #
+      # The uv.lock *format* is a third flag. `uv lock --check` passes on an
+      # older lock revision, but Dependabot's current uv rewrites the header in
+      # every Python bump and the auto-merge policy refuses the header change.
+      # The script flags a committed revision older than the one this (pinned)
+      # uv writes, so the lock follows the uv pin in .github/actions/setup-uv.
       - name: Check lockfile consistency
         id: check
         run: |
           drifted_uv=false
+          drifted_uv_format=false
           drifted_pnpm=false
           uv lock --check || drifted_uv=true
+          python3 .github/scripts/uv_lock_format.py check || drifted_uv_format=true
           # --lockfile-only: verify the lock satisfies the manifests without a
           # full node_modules install; --frozen-lockfile fails on any desync.
           pnpm install --frozen-lockfile --lockfile-only || drifted_pnpm=true
           any=false
-          if [ "$drifted_uv" = "true" ] || [ "$drifted_pnpm" = "true" ]; then
+          if [ "$drifted_uv" = "true" ] || [ "$drifted_uv_format" = "true" ] || [ "$drifted_pnpm" = "true" ]; then
             any=true
           fi
           echo "drifted_uv=$drifted_uv" >> "$GITHUB_OUTPUT"
+          echo "drifted_uv_format=$drifted_uv_format" >> "$GITHUB_OUTPUT"
           echo "drifted_pnpm=$drifted_pnpm" >> "$GITHUB_OUTPUT"
           echo "drifted=$any" >> "$GITHUB_OUTPUT"
-          echo "uv.lock drifted=$drifted_uv, pnpm-lock.yaml drifted=$drifted_pnpm"
+          echo "uv.lock drifted=$drifted_uv (format: $drifted_uv_format), pnpm-lock.yaml drifted=$drifted_pnpm"
 
       # 7-day cooldown comes from uv.toml (`exclude-newer = "P7D"`) and from
       # pnpm-workspace.yaml (`minimumReleaseAge: 10080`), recorded as a relative
@@ -83,17 +92,19 @@ jobs:
         if: steps.check.outputs.drifted_uv == 'true'
         run: uv lock
 
-      # pnpm's cooldown is configured in pnpm-workspace.yaml and respected by
-      # the workspace root. Delete the lockfile so pnpm RESOLVES from scratch:
-      # --lockfile-only keeps an existing in-range pin without re-applying the
-      # cooldown, so we drop it first.
+      # Rewrites the lock in the pinned uv's format with every pin unchanged
+      # (the script fails and restores the file if a pin would move).
+      - name: Migrate uv.lock to the pinned uv's lock format
+        if: steps.check.outputs.drifted_uv_format == 'true'
+        run: python3 .github/scripts/uv_lock_format.py migrate
+
+      # Preserve existing resolutions; only manifest drift needs a new pin.
+      # pnpm applies the workspace cooldown to newly selected releases.
       - name: Regenerate pnpm-lock.yaml
         if: steps.check.outputs.drifted_pnpm == 'true'
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        run: |
-          rm -f pnpm-lock.yaml
-          pnpm install --lockfile-only
+        run: pnpm install --lockfile-only --ignore-scripts
 
       # Always run, on both paths: when drifted, this validates the freshly
       # regenerated locks BEFORE they're committed; when not drifted, it's the
@@ -112,7 +123,7 @@ jobs:
       - name: Mint App token
         id: app-token
         if: steps.check.outputs.drifted == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510  # v3.3.0
         with:
           app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
           private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
@@ -138,7 +149,7 @@ jobs:
           BRANCH="automation/oss-lockfile-regen"
           git checkout -b "$BRANCH"
           git add uv.lock pnpm-lock.yaml
-          git commit -m "chore(oss): regenerate public lockfiles against public PyPI/npmjs.org"
+          git commit -s -m "chore(oss): regenerate public lockfiles against public PyPI/npmjs.org"
           git push --force "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$BRANCH"
           # An already-open PR just picks up the force-pushed update.
           if [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')" ]; then
@@ -150,7 +161,7 @@ jobs:
           # exempts gh from `set -e`, so a non-zero exit hits the else branch.)
           if gh pr create --base main --head "$BRANCH" \
               --title "chore(oss): regenerate public lockfiles against public PyPI/npm" \
-              --body "Automated: the lockfiles were out of sync with the manifests, so uv.lock + pnpm-lock.yaml were regenerated against public PyPI/npm and validated by a Docker build + omnigent --help smoke (run ${{ github.run_id }}). Merge to keep the public lockfiles consistent and buildable."; then
+              --body "Automated: the lockfiles were out of sync with the manifests or uv.lock was in an older lock format, so uv.lock + pnpm-lock.yaml were regenerated against public PyPI/npm and validated by a Docker build + omnigent --help smoke (run ${{ github.run_id }}). Merge to keep the public lockfiles consistent, buildable and in the format Dependabot writes."; then
             echo "Opened the regen PR."
           else
             echo "::warning::Could not open the regen PR automatically (the GITHUB_TOKEN may be disallowed from creating PRs). The branch '$BRANCH' is pushed with the regenerated lockfiles — open the PR by hand:"

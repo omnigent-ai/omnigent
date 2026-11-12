@@ -322,6 +322,10 @@ function createDatabricksAuth({
     rejectConnection,
     reset,
     recover,
+    /** Resolves once any renewal already running for `origin` has finished. */
+    async whenSettled(origin) {
+      await renewals.get(origin)?.catch(() => {});
+    },
     dispose() {
       for (const win of connections.keys()) detach(win);
       for (const win of rejectedWindows.keys()) reset(win);

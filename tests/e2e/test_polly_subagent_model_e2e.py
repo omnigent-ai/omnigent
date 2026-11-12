@@ -44,11 +44,11 @@ from typing import Any
 
 import pytest
 
+from tests._helpers.live_server import find_free_port
 from tests.e2e.test_polly_e2e import (
     _MOCK_BRAIN_MODEL,
     _REPO,
     _SERVER_BOOT_TIMEOUT_SEC,
-    _free_port,
     _mock_env,
     _mock_polly_spec_dir,
     _wait_for_health,
@@ -108,7 +108,7 @@ def local_polly_server(tmp_path: Path) -> Iterator[str]:
     :param tmp_path: pytest-provided per-test temp dir for the DB + artifacts.
     :yields: The base URL of the running server.
     """
-    port = _free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     import os
 
