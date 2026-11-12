@@ -5097,10 +5097,8 @@ async def release_session_managed_host(
     )
 
 
-# Most sessions examined before stopping a sandbox on archive: the host's own
-# sessions plus the side chats and sub-agents that use it through them. Past
-# this the sandbox is left running: stopping is a cost saving, and the check
-# must not grow with a host's history. Also the size of each page read.
+# Caps each page and the whole walk of a sandbox's sessions on archive; a larger
+# or incomplete set leaves the sandbox running.
 _ARCHIVE_STOP_MAX_SESSIONS = 100
 
 
@@ -5193,8 +5191,8 @@ async def stop_archived_session_sandbox(
     Nothing holds new work off while the provider stops the sandbox, so a
     session unarchived and messaged during that call can start a runner the
     stop then ends. The check is repeated after the stop, and a sandbox that
-    gained a user meanwhile is resumed at once; the interrupted turn still
-    fails.
+    gained a user meanwhile is woken at once through :func:`resume_managed_host`;
+    the interrupted turn still fails.
 
     :param conv: The archived session, as re-read by the teardown.
     :param host_store: Store holding the session's host row.
@@ -5245,7 +5243,9 @@ async def stop_archived_session_sandbox(
                 conv.id,
                 extra={"session_id": conv.id},
             )
-            await asyncio.to_thread(launcher.resume, host.sandbox_id)
+            # Forced: this server just stopped the sandbox, so the host row can
+            # still look online. A wake also restarts the host inside it.
+            await resume_managed_host(host.host_id, host_store, config, force=True)
             return False
     except SandboxCapabilityError:
         _logger.debug(

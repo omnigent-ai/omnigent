@@ -7,6 +7,7 @@ from dataclasses import replace
 import click
 import pytest
 
+from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
 from omnigent.server import managed_hosts
 from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
@@ -224,9 +225,12 @@ async def test_a_sandbox_that_gains_a_user_while_stopping_is_resumed(db_uri, mon
         real_stop(stopped_id)
 
     monkeypatch.setattr(fake, "stop", stop_while_unarchived)
+    starts_before = len(fake.host_starts)
     assert await _stop(fake, host_store, conversations, conv) is False
     assert fake.stopped == [sandbox_id]
+    # Woken through the normal wake path: the sandbox and the host inside it.
     assert fake.resumed == [sandbox_id]
+    assert len(fake.host_starts) == starts_before + 1
 
 
 async def test_keeps_a_sandbox_its_provider_cannot_resume(db_uri):
@@ -237,10 +241,19 @@ async def test_keeps_a_sandbox_its_provider_cannot_resume(db_uri):
     assert fake.stopped == []
 
 
-async def test_keeps_a_scheduled_task_runs_sandbox(db_uri):
+@pytest.mark.parametrize("archived", ["run", "its-side-chat"])
+async def test_keeps_a_scheduled_task_runs_sandbox(db_uri, archived):
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(
         db_uri, labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task-1"}
     )
+    if archived == "its-side-chat":
+        # An unlabeled side chat runs on the run's sandbox, which the task manages.
+        side_chat = conversations.create_conversation(
+            side_chat_parent_id=conv.id,
+            labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: conv.id},
+        )
+        conversations.update_conversation(side_chat.id, archived=True)
+        conv = conversations.get_conversation(side_chat.id)
     assert await _stop(fake, host_store, conversations, conv) is False
     assert fake.stopped == []
 
@@ -279,11 +292,16 @@ async def test_keeps_the_sandbox_when_the_hosts_sessions_exceed_the_page_cap(
     assert len(fake.stopped) == (1 if stops else 0)
 
 
-async def test_a_failed_stop_does_not_raise(db_uri, monkeypatch):
+@pytest.mark.parametrize(
+    "error",
+    [click.ClickException("provider stop failed"), SandboxCapabilityError("cannot stop")],
+    ids=["failed", "unsupported"],
+)
+async def test_a_failed_stop_does_not_raise(db_uri, monkeypatch, error):
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
 
     def fail(_sandbox_id: str) -> None:
-        raise click.ClickException("provider stop failed")
+        raise error
 
     monkeypatch.setattr(fake, "stop", fail)
     assert await _stop(fake, host_store, conversations, conv) is False
