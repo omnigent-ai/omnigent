@@ -37,20 +37,37 @@ jobs:
   # (security-gate.yml); trusted authors and non-PR events pass through.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   pre-commit:
     name: Pre-commit checks
     needs: gate
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
 
     steps:
       - name: Check out repo
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Check reference policy
+        env:
+          POLICY_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          POLICY_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ -z "$POLICY_BASE" ] || [ "$POLICY_BASE" = "0000000000000000000000000000000000000000" ]; then
+            POLICY_BASE=origin/main
+          elif ! git cat-file -e "${POLICY_BASE}^{commit}"; then
+            git fetch --no-tags origin "$POLICY_BASE"
+          fi
+          python3 dev/lint/lint_reference_policy.py --base "$POLICY_BASE" --head "$POLICY_HEAD"
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 
@@ -66,7 +83,7 @@ jobs:
           enable-cache: true
 
       - name: Cache virtualenv
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
@@ -79,7 +96,7 @@ jobs:
         # Compose capability extras with lint tooling instead of duplicating
         # runtime dependencies in the repository-only lint group.
         run: |
-          uv sync --locked --group lint \
+          uv sync --locked --group lint --group test \
             --extra hindsight \
             --extra nimble \
             --extra s3 \
@@ -89,6 +106,15 @@ jobs:
       # workspace lockfile. pnpm is pinned in .github/actions/setup-pnpm.
       - name: Set up pnpm
         uses: ./.github/actions/setup-pnpm
+
+      - name: Test Merge Ready expiry sweep
+        run: node --test .github/scripts/merge-ready/sweep.test.js
+
+      - name: Check Merge Ready shell syntax
+        run: |
+          for script in .github/scripts/merge-ready/*.sh; do
+            bash -n "$script"
+          done
 
       - name: Install TypeScript dependencies
         # Pin the npm registry to the npmjs default; limit installs to packages
@@ -129,12 +155,15 @@ jobs:
           KTLINT_VERSION: "1.8.0"
           KTLINT_SHA256: "a3fd620207d5c40da6ca789b95e7f823c54e854b7fade7f613e91096a3706d75"
         run: |
-          curl -sSLf \
+          curl -sSLf --retry 3 --retry-max-time 60 \
             "https://github.com/ktlint/ktlint/releases/download/${KTLINT_VERSION}/ktlint" \
             -o /tmp/ktlint
           echo "${KTLINT_SHA256}  /tmp/ktlint" | sha256sum -c
           chmod +x /tmp/ktlint
           sudo mv /tmp/ktlint /usr/local/bin/ktlint
+
+      - name: Check locked dependency regression guards
+        run: uv run --no-sync pytest tests/e2e/test_lockfile_vulnerable_pins.py -q --reruns 0 -p tests._helpers.required_tests
 
       - name: Run formatting, lint, and type checks
         run: uv run pre-commit run --all-files --show-diff-on-failure
@@ -146,14 +175,14 @@ jobs:
     name: Version lockstep check
     needs: gate
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Check out repo
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 

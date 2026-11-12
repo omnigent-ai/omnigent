@@ -20,6 +20,7 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.runtime import telemetry
 from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.scheduled_context import add_scheduled_run_header
 from omnigent.spec import AgentSpec
 from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 
@@ -90,8 +91,19 @@ def routing_host_id(
     :returns: The routing host id, or ``None`` when no host is bound anywhere
         in the chain or the read budget is exhausted.
     """
+    owner = routing_host_session(conv, conversation_store, max_ancestor_reads=max_ancestor_reads)
+    return owner.host_id if owner is not None else None
+
+
+def routing_host_session(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    *,
+    max_ancestor_reads: int = 16,
+) -> Conversation | None:
+    """Return the session owning the routing host and its workspace together."""
     if conv.host_id is not None:
-        return conv.host_id
+        return conv
     reads = 0
     visited = {conv.id}
     current = conv
@@ -128,7 +140,7 @@ def routing_host_id(
         ):
             return None
         if ancestor.host_id is not None:
-            return ancestor.host_id
+            return ancestor
         current = ancestor
 
     # Retain the root fallback when an intermediate parent is missing or cyclic.
@@ -137,7 +149,7 @@ def routing_host_id(
             return None
         root = conversation_store.get_conversation(root_id)
         if root is not None:
-            return root.host_id
+            return root if root.host_id is not None else None
     return None
 
 
@@ -300,6 +312,17 @@ class RunnerRouter:
         """
         return self._registry.get(runner_id) is not None
 
+    def runner_has_capability(self, runner_id: str, capability: str) -> bool:
+        """
+        Return whether connected runner *runner_id* advertised *capability*.
+
+        :param runner_id: Runner UUID, e.g. ``"runner_0123456789abcdef"``.
+        :param capability: Hello capability token, e.g. ``"mcp_registry"``.
+        :returns: ``False`` when the runner is offline or lacks the token.
+        """
+        connection = self._registry.get(runner_id)
+        return connection is not None and capability in connection.hello.capabilities
+
     def require_mcp_registry_support(self, conversation: Conversation) -> None:
         """Validate the connected runner before sending it a registry-backed agent."""
         from omnigent.host.frames import CAP_MCP_REGISTRY
@@ -451,6 +474,7 @@ class RunnerRouter:
             client = self._clients.get(runner_id)
             if client is None:
                 client = httpx.AsyncClient(
+                    event_hooks={"request": [add_scheduled_run_header]},
                     transport=WSTunnelTransport(self._registry, runner_id),
                     base_url="http://runner",
                     timeout=httpx.Timeout(5.0, read=None),

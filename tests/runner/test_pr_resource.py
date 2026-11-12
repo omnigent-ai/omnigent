@@ -33,6 +33,16 @@ GITHUB_CAPABILITIES = {
     "base_remote_selection": True,
     "line_counts": True,
     "linked_pr_diff": True,
+    "label_editing": True,
+    "merging": True,
+    "reviewer_editing": True,
+    "comment_posting": True,
+    "review_threads": True,
+    "review_thread_replies": True,
+    "review_thread_creation": True,
+    "details_editing": True,
+    "attachment_uploads": True,
+    "commit_history": True,
 }
 # An ssh config host alias (``Host github.com-work`` / ``HostName github.com``).
 ALIAS_ORIGIN = "git@github.com-work:o/r.git"
@@ -218,19 +228,31 @@ def test_an_unknown_origin_is_an_unsupported_remote(
 
 
 @pytest.mark.parametrize("gh_state", ["missing", "signed_out"])
-def test_an_unclaimed_origin_keeps_the_cli_and_sign_in_guidance(
-    repo: Path, monkeypatch: pytest.MonkeyPatch, gh_state: str
+@pytest.mark.parametrize("remote", ["https://unknown-forge.example.test/g/p.git", ALIAS_ORIGIN])
+def test_an_unclaimed_origin_does_not_require_github_auth(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, gh_state: str, remote: str
 ) -> None:
-    _git(repo, "remote", "add", "origin", "https://unknown-forge.example.test/g/p.git")
+    _git(repo, "remote", "add", "origin", remote)
     _stub_gh(monkeypatch, {("auth", "status"): (1, "", "not logged in")})
     if gh_state == "missing":
         monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
 
     info = pr_resource.pr_info(str(repo))
 
-    assert (info["available"], info["provider"], info.get("reason")) == (True, "github", None)
-    assert info["auth"]["cli"] == {"name": "gh", "available": gh_state == "signed_out"}
+    assert (info["available"], info["provider"], info["reason"]) == (
+        False,
+        None,
+        "unsupported_remote",
+    )
+    assert info["remote_host"] == host_of(remote)
+    assert info["auth"] is None
+
+    _git(repo, "config", "--local", "omnigent.gitprovider", "github")
+    info = pr_resource.pr_info(str(repo))
+
+    assert (info["available"], info["provider"]) == (True, "github")
     assert info["auth"]["authenticated"] is False
+    assert info["auth"]["cli"] == {"name": "gh", "available": gh_state != "missing"}
 
 
 def test_an_unclaimed_origin_keeps_the_account_choice(

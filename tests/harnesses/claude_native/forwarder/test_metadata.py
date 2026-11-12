@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -598,6 +601,121 @@ async def test_relay_permission_mode_retries_after_transient_failure() -> None:
             {"permission_mode": "plan", "initial_observation": False},
         ]
         assert dedupe.posted_permission_mode == "plan"  # now committed
+
+
+@contextlib.asynccontextmanager
+async def _relay_against_rejecting_server(
+    reject: set[str],
+    *,
+    status: int = 400,
+) -> AsyncIterator[
+    tuple[
+        list[dict[str, Any]],
+        forwarder._ForwardDedupeState,
+        Callable[[str | None], Awaitable[None]],
+    ]
+]:
+    """Relay pane modes to a server that rejects the modes in ``reject`` with *status*."""
+    dedupe = forwarder._ForwardDedupeState()
+    posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Reject the modes in ``reject`` with *status*; accept the rest."""
+        payload = json.loads(request.content.decode("utf-8"))
+        posts.append(payload)
+        if payload["data"]["permission_mode"] in reject:
+            return httpx.Response(status, json={"error": {"code": "invalid_input"}})
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+
+        async def _relay(mode: str | None) -> None:
+            """Run one permission-mode relay pass for the given pane mode."""
+            await forwarder._relay_permission_mode(
+                client,
+                session_id="conv_abc",
+                mode=mode,
+                dedupe=dedupe,
+            )
+
+        yield posts, dedupe, _relay
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 422])
+async def test_relay_permission_mode_stops_reposting_a_mode_the_server_rejects(
+    status: int,
+) -> None:
+    """
+    An older server's 400 for a newer footer value is not retried every poll.
+
+    A runner that reads ``dontAsk`` can report to a server whose read-back
+    set predates it, which rejects the report as invalid input. Unlike a 503
+    that will clear, re-posting would fail on every pane poll for the life
+    of the session, so the relay pauses before trying again. A changed footer
+    is still reported right away as the switch it is.
+    """
+    async with _relay_against_rejecting_server({"dontAsk"}, status=status) as (
+        posts,
+        dedupe,
+        relay,
+    ):
+        await relay("dontAsk")
+        assert len(posts) == 1
+        assert dedupe.posted_permission_mode is None
+        assert dedupe.rejected_permission_mode == "dontAsk"
+
+        # The same footer on later polls is not re-posted during the pause.
+        await relay("dontAsk")
+        await relay("dontAsk")
+        assert len(posts) == 1
+
+        # Leaving don't-ask is reported as the observed switch it is.
+        await relay("default")
+        assert posts[-1]["data"] == {"permission_mode": "default", "initial_observation": False}
+        assert dedupe.posted_permission_mode == "default"
+        assert dedupe.rejected_permission_mode is None
+
+
+@pytest.mark.asyncio
+async def test_relay_permission_mode_retries_a_rejected_mode_after_the_pause() -> None:
+    """
+    A rejected mode is offered again once the pause passes, so an upgrade lands.
+
+    The server can be upgraded under a live runner; with the footer unchanged,
+    only a later retry can bring the read-back up to date.
+    """
+    reject = {"dontAsk"}
+    async with _relay_against_rejecting_server(reject) as (posts, dedupe, relay):
+        await relay("dontAsk")
+        assert len(posts) == 1
+        # The pause is the documented interval, measured from the rejection.
+        assert dedupe.rejected_permission_mode_retry_at - time.monotonic() == pytest.approx(
+            forwarder._REJECTED_PERMISSION_MODE_RETRY_S, abs=5.0
+        )
+
+        # Suppressed while the deadline is still ahead, however close.
+        await relay("dontAsk")
+        dedupe.rejected_permission_mode_retry_at = time.monotonic() + 60.0
+        await relay("dontAsk")
+        assert len(posts) == 1
+
+        # Still rejected after the pause: one more attempt, then a new pause.
+        dedupe.rejected_permission_mode_retry_at = 0.0
+        await relay("dontAsk")
+        assert len(posts) == 2
+        assert dedupe.rejected_permission_mode == "dontAsk"
+        await relay("dontAsk")
+        assert len(posts) == 2
+
+        # The server now knows the mode: the next attempt lands as the launch mode.
+        reject.clear()
+        dedupe.rejected_permission_mode_retry_at = 0.0
+        await relay("dontAsk")
+        assert posts[-1]["data"] == {"permission_mode": "dontAsk", "initial_observation": True}
+        assert dedupe.posted_permission_mode == "dontAsk"
+        assert dedupe.rejected_permission_mode is None
 
 
 @pytest.mark.parametrize(

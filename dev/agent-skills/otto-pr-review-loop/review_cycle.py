@@ -23,6 +23,8 @@ REVIEW_BOTS = {"github-actions[bot]", "omnigent-ci[bot]"}
 RESOLVE_BOT = "omni-resolve-agent[bot]"
 # The permission endpoint reports legacy roles only; maintain is reported as write.
 PERMISSIONS = {"admin", "write"}
+# Success outcomes per agent: Resolve and the feature agent.
+SUCCESS_OUTCOMES = {"fixed", "implemented"}
 
 
 class GitHubError(RuntimeError):
@@ -357,9 +359,10 @@ def snapshot(repository: str, number: int, request=gh_json):
 def validate(state, handoff):
     if not isinstance(handoff, dict):
         raise RuntimeError("Handoff must be an object")
-    if handoff.get("outcome") != "fixed":
+    if handoff.get("outcome") not in SUCCESS_OUTCOMES:
         raise RuntimeError(
-            "Review cycle is incomplete: outcome must be fixed, not partially_fixed"
+            "Review cycle is incomplete: outcome must be fixed or implemented, "
+            f"not {handoff.get('outcome')!r}"
         )
     missing = [name for name, complete in state["completed"].items() if not complete]
     if missing:

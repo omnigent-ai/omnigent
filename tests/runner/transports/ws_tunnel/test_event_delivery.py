@@ -10,6 +10,7 @@ from urllib.parse import unquote
 
 import httpx
 import pytest
+from websockets.exceptions import ConnectionClosedError
 
 from omnigent.errors import ErrorCode
 from omnigent.runner.transports.ws_tunnel.event_delivery import (
@@ -215,6 +216,71 @@ async def test_stalled_session_leaves_a_worker_for_other_sessions() -> None:
         await asyncio.gather(*dispatcher._workers, return_exceptions=True)
 
 
+@pytest.mark.parametrize("retrying_sessions", [1, 2])
+@pytest.mark.parametrize("healthy_sessions", [1, 33])
+async def test_retrying_sessions_do_not_starve_healthy_delivery(
+    retrying_sessions: int, healthy_sessions: int
+) -> None:
+    dispatcher = RunnerEventDispatcher()
+    release = asyncio.Event()
+    rejected = asyncio.Event()
+    blocked = {f"session-{index}" for index in range(retrying_sessions)}
+    retried: set[str] = set()
+    sent: dict[str, list[list[str]]] = {}
+    second_item = {**_ITEM, "data": {**_ITEM["data"], "source_id": "record-2"}}
+    later_item = {**_ITEM, "data": {**_ITEM["data"], "source_id": "record-3"}}
+
+    async def send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        batches = sent.setdefault(frame.session_id, [])
+        batches.append([event["data"]["source_id"] for event in frame.events])
+        if frame.session_id in blocked and not release.is_set():
+            # Commit the prefix once, then reject only the remaining item.
+            applied = 1 if len(batches) == 1 else 0
+            dispatcher.acknowledge(EventAckFrame(frame.id, applied, "busy", retryable=True))
+            retried.add(frame.session_id)
+            if retried == blocked:
+                rejected.set()
+        else:
+            dispatcher.acknowledge(EventAckFrame(frame.id, len(frame.events)))
+
+    dispatcher.ready(send)
+    tasks = [
+        asyncio.create_task(dispatcher.submit(session_id, [_ITEM, second_item]))
+        for session_id in sorted(blocked)
+    ]
+    healthy_tasks: list[asyncio.Task[EventAckFrame]] = []
+    try:
+        await asyncio.wait_for(rejected.wait(), timeout=2)
+        tasks.append(asyncio.create_task(dispatcher.submit("session-0", [later_item])))
+        healthy_tasks = [
+            asyncio.create_task(dispatcher.submit(f"healthy-{index}", [_ITEM]))
+            for index in range(healthy_sessions)
+        ]
+        healthy = await asyncio.wait_for(asyncio.gather(*healthy_tasks), timeout=2)
+        assert all(ack.applied == 1 for ack in healthy)
+        assert all(not task.done() for task in tasks)
+        release.set()
+        results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
+        assert [ack.applied for ack in results] == [2] * retrying_sessions + [1]
+        for session_id in blocked:
+            batches = sent[session_id]
+            assert batches[0] == ["record-1", "record-2"]
+            remainder = batches[1:-1] if session_id == "session-0" else batches[1:]
+            assert remainder and all(batch == ["record-2"] for batch in remainder)
+        assert sent["session-0"][-1] == ["record-3"]
+        assert not dispatcher.has_pending
+    finally:
+        release.set()
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, *healthy_tasks, return_exceptions=True), timeout=2
+        )
+        for worker in dispatcher._workers:
+            worker.cancel()
+        await asyncio.gather(*dispatcher._workers, return_exceptions=True)
+
+
 async def test_cancelled_admission_does_not_send_or_block_a_later_item() -> None:
     dispatcher = RunnerEventDispatcher()
     started = asyncio.Event()
@@ -327,7 +393,7 @@ async def test_cancelled_queue_admission_releases_session_for_later_delivery() -
         dispatcher.acknowledge(EventAckFrame(frame.id, len(frame.events)))
 
     async def wait_for_backpressure() -> None:
-        while not dispatcher._queue.full():
+        while not dispatcher._capacity.locked():
             await asyncio.sleep(0)
 
     dispatcher.ready(send)
@@ -531,19 +597,34 @@ async def test_acknowledged_batch_stamps_last_dispatch_at() -> None:
     assert dispatched is not None and before <= dispatched <= loop.time()
 
 
-async def test_unacknowledged_batch_does_not_stamp_last_dispatch_at() -> None:
+@pytest.mark.parametrize("send_error", ["pending_ack", "transport", "websocket"])
+async def test_unacknowledged_batch_does_not_stamp_last_dispatch_at(send_error: str) -> None:
     dispatcher = RunnerEventDispatcher()
 
     async def send(_text: str) -> None:
         # The tunnel drops before any ACK: nothing reached the server.
         dispatcher.disconnected()
+        if send_error == "transport":
+            raise OSError("tunnel transport failed")
+        if send_error == "websocket":
+            raise ConnectionClosedError(None, None)
 
     dispatcher.ready(send)
     preview = {"type": "external_output_text_delta", "data": {"delta": "hi"}}
     async with _client(dispatcher, []) as client:
         response = await asyncio.wait_for(client.post(_URL, json=preview), timeout=3)
-    assert response.status_code == 503
-    assert dispatcher.last_dispatch_at is None
+        assert response.status_code == 503
+        assert dispatcher.last_dispatch_at is None
+
+        async def recovered_send(text: str) -> None:
+            frame = decode_frame(text)
+            assert isinstance(frame, EventBatchFrame)
+            dispatcher.acknowledge(EventAckFrame(frame.id, len(frame.events)))
+
+        dispatcher.ready(recovered_send)
+        recovered = await asyncio.wait_for(client.post(_URL, json=_ITEM), timeout=3)
+    assert recovered.status_code == 202
+    assert dispatcher.last_dispatch_at is not None
 
 
 async def test_disconnect_during_failed_send_leaves_no_unretrieved_future_error() -> None:

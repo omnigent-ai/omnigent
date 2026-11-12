@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
 
+from omnigent.telemetry.surface import CLIENT_SURFACE_ENV_VAR
+
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
 from .model_auth import (
@@ -149,7 +151,7 @@ class ModelSignerSession(Protocol):
 
 
 def _signer_child_argv() -> list[str]:
-    return [sys.executable, "-m", "omnigent.inner.model_signer_service"]
+    return [sys.executable, "-P", "-m", "omnigent.inner.model_signer_service"]
 
 
 class SubprocessModelSigner:
@@ -176,7 +178,7 @@ class SubprocessModelSigner:
 
         env = {
             name: value
-            for name in ("HOME", "PATH", "LANG", "LC_ALL", "TZ")
+            for name in ("HOME", "PATH", "LANG", "LC_ALL", "TZ", CLIENT_SURFACE_ENV_VAR)
             if (value := os.environ.get(name)) is not None
         }
         try:
@@ -228,12 +230,12 @@ class SubprocessModelSigner:
                 try:
                     proc.stdin.write(b"shutdown\n")
                     await asyncio.wait_for(proc.stdin.drain(), timeout=1)
-                except (asyncio.TimeoutError, BrokenPipeError, ConnectionError):
+                except (TimeoutError, BrokenPipeError, ConnectionError):
                     pass
             if proc.returncode is None:
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=_SHUTDOWN_TIMEOUT_SECONDS)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     await terminate_subprocess(
                         proc,
                         terminate_timeout=2,

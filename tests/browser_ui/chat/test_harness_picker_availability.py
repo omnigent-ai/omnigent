@@ -25,6 +25,7 @@ _CLAUDE_AGENT_ID = "ag_claude_e2e"
 _CODEX_AGENT_ID = "ag_codex_e2e"
 _CURSOR_AGENT_ID = "ag_cursor_e2e"
 _PI_AGENT_ID = "ag_pi_e2e"
+_POLLY_AGENT_ID = "ag_polly_e2e"
 _CODEX_HARNESS = "codex-native"
 
 # Only the agent-discovery scan uses ``visibility=mine`` without ``pinned``.
@@ -61,6 +62,7 @@ _CURSOR = _agent(
     _CURSOR_AGENT_ID, "cursor-native-ui", "Cursor", "Cursor's coding agent", "cursor-native"
 )
 _PI = _agent(_PI_AGENT_ID, "pi-native-ui", "Pi", "Pi coding agent", "pi-native")
+_POLLY = _agent(_POLLY_AGENT_ID, "polly", "Polly", "Multi-agent coding", "claude-sdk")
 
 
 def _stub_picker(
@@ -206,6 +208,26 @@ def test_picker_leads_with_primary_harnesses(
     expect(page.get_by_test_id("new-chat-landing-harness-more")).to_have_count(0)
     expect(pi_row).to_be_visible()
     expect(_agent_row(page, _PI_AGENT_ID)).to_have_attribute("data-active", "true")
+
+
+def test_roster_without_primary_harnesses_keeps_one_inline(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """With no primary harness and an agent selected, Pi is offered inline, not under Other."""
+    _stub_picker(
+        page,
+        chat_session_contract,
+        agents=[_PI, _POLLY],
+        configured_harnesses={"pi-native": True},
+    )
+    # A selected harness is always promoted, so select the agent instead.
+    page.add_init_script(f"localStorage.setItem('omnigent:last-agent-id', '{_POLLY_AGENT_ID}')")
+    _open_landing(page, chat_session_contract)
+    _open_picker(page)
+
+    expect(_agent_row(page, _POLLY_AGENT_ID)).to_have_attribute("data-active", "true")
+    expect(_agent_row(page, _PI_AGENT_ID)).to_be_visible()
+    expect(page.get_by_test_id("new-chat-landing-harness-more")).to_have_count(0)
 
 
 def test_missing_harness_is_disabled_with_repair_tooltip(

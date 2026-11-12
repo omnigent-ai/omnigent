@@ -1,3 +1,5 @@
+import type { AssistantMessagePhase } from "./conversationItems";
+import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_events.py.
 //
 // Hand-ported. When _events.py changes, update this file and the
@@ -14,6 +16,7 @@ import type {
   BackgroundTaskInfo,
   CodexPersistMode,
   ErrorInfo,
+  FileEditRequest,
   ModelUsage,
   RememberScope,
   Response,
@@ -180,6 +183,7 @@ export interface PolicyDenied {
 }
 
 export interface ElicitationRequest {
+  nativeDelivery?: NativePermissionDelivery;
   type: "elicitation_request";
   elicitationId: string;
   /**
@@ -231,6 +235,8 @@ export interface ElicitationRequest {
    * Optional/null for any other elicitation.
    */
   exitPlanMode?: Record<string, unknown> | null;
+  /** Claude-native file-edit prompts only: the full tool call, so the card can show a diff. */
+  fileEdit?: FileEditRequest | null;
   /**
    * Producer-supplied extra (codex-native command approvals only):
    * structured command details that let the UI render the approval
@@ -263,6 +269,8 @@ export interface ElicitationRequest {
    * ``setMode(auto)`` in the hook decision.
    */
   allowAutoMode?: boolean;
+  /** Native directories the user may explicitly allow for this session. */
+  permissionDirectories?: string[];
   /**
    * Producer-supplied extra (claude-native non-edit tool prompts only):
    * present when the PermissionRequest endpoint is gating a tool that
@@ -329,6 +337,8 @@ export interface MessageDone {
   responseId: string;
   /** Native live-preview stream finalized by this item. */
   messageId?: string;
+  /** Harness label for the message, when the harness reports one (Codex). */
+  phase?: AssistantMessagePhase;
 }
 
 /**
@@ -513,8 +523,10 @@ export interface ClientTaskCancel {
  *
  * `launching` means a task/session exists but has not emitted a concrete
  * harness-start signal. `waiting` arrives when the parent agent loop parks
- * on background tools / sub-agents. The session snapshot's `status` never
- * reports `waiting`; it is live-only.
+ * on background tools / sub-agents, or when a claude-native turn ends with a
+ * background agent still running (then `backgroundAgents` names them). The
+ * session snapshot's wire status stays `running` for that claude-native case,
+ * with `background_agents` set; the API adapter turns that pair into `waiting`.
  */
 export interface SessionStatusEvent {
   type: "session_status";
@@ -529,6 +541,11 @@ export interface SessionStatusEvent {
    */
   backgroundTasks?: BackgroundTaskInfo[];
   /**
+   * Background agents a finished claude-native turn left running, on its
+   * `waiting` edge. Absent on every other edge.
+   */
+  backgroundAgents?: BackgroundTaskInfo[];
+  /**
    * Short phrase naming what a still-`running` session is parked on, e.g.
    * "permission prompt". Terminal-backed agents can block on a dialog the
    * web UI does not mirror; this says why nothing is moving. Absent when
@@ -542,6 +559,13 @@ export interface SessionStatusEvent {
    */
   error?: ErrorInfo;
 }
+
+/**
+ * Runner's `blockedOn` reason when the agent still reads as working but its
+ * terminal shows something it did not report, e.g. a dialog opened mid-reply.
+ * Inferred from the screen, so the UI words it tentatively.
+ */
+export const TERMINAL_PROMPT_BLOCKED_ON = "terminal prompt";
 
 /**
  * `session.usage` — token-usage update from a terminal-backed runtime.
@@ -650,6 +674,18 @@ export interface SessionCodexApprovalModeEvent {
 }
 
 /**
+ * `session.background_tasks` — background tasks that changed between turns,
+ * e.g. a codex-native session's background terminals. The count is
+ * authoritative, like the one on a `session.status` edge.
+ */
+export interface SessionBackgroundTasksEvent {
+  type: "session_background_tasks";
+  conversationId: string;
+  backgroundTaskCount: number;
+  backgroundTasks: BackgroundTaskInfo[];
+}
+
+/**
  * `session.agent_changed`: the session's bound agent changed (e.g. its
  * MCP servers were edited).
  *
@@ -717,6 +753,10 @@ export interface SessionSandboxStatusEvent {
   stage: SandboxLaunchStage;
   /** Failure detail when `stage === "failed"`; `null` otherwise. */
   error: string | null;
+  /** Sandbox provider being launched, e.g. `"arclet"`, when the server reports it. */
+  provider?: string;
+  /** What the user needs to do when `stage === "action_required"`; `null` otherwise. */
+  details?: string | null;
 }
 
 /** Startup state of one harness MCP server (Codex's `McpServerStartupState`). */
@@ -977,6 +1017,11 @@ export interface BrowserActionRequestEvent {
   args: Record<string, unknown>;
 }
 
+export interface UiOpenFileEvent {
+  type: "ui_open_file";
+  path: string;
+}
+
 // ── Union type for all events ────────────────────────────
 
 export type StreamEvent =
@@ -1018,6 +1063,7 @@ export type StreamEvent =
   | SessionCollaborationModeEvent
   | SessionPermissionModeEvent
   | SessionCodexApprovalModeEvent
+  | SessionBackgroundTasksEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent
@@ -1035,4 +1081,5 @@ export type StreamEvent =
   | SessionModelOptionsEvent
   | SessionPresenceEvent
   | SessionBtwSidechatEvent
-  | BrowserActionRequestEvent;
+  | BrowserActionRequestEvent
+  | UiOpenFileEvent;

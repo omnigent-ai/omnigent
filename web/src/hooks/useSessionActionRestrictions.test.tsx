@@ -8,7 +8,6 @@ import { authenticatedFetch } from "@/lib/identity";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 import {
-  SANDBOX_FORK_UNSUPPORTED,
   SANDBOX_SWITCH_HOST_UNSUPPORTED,
   SESSION_ACTIONS_LOADING,
   SESSION_ACTIONS_UNAVAILABLE,
@@ -33,8 +32,9 @@ const unlistedHost = {
   forkDisabledReason: undefined,
   switchHostDisabledReason: SESSION_ACTIONS_UNAVAILABLE,
 };
-const unsupported = {
-  forkDisabledReason: SANDBOX_FORK_UNSUPPORTED,
+// Sandbox sources fork to every destination; only switching the host stays restricted.
+const switchOnly = {
+  forkDisabledReason: undefined,
   switchHostDisabledReason: SANDBOX_SWITCH_HOST_UNSUPPORTED,
 };
 
@@ -87,30 +87,62 @@ describe("useSessionActionRestrictions", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it.each(["arclet", "lakebox"])(
-    "uses the fetched %s provider without a managed label",
-    async (provider) => {
-      fetchMock.mockImplementation(async () => hostsResponse(provider));
-      const { result } = renderRestrictions();
-      await waitFor(() => expect(result.current).toEqual(unsupported));
-    },
-  );
+  it.each([
+    ["arclet", {}],
+    ["arclet", { "omnigent.host_type": "managed" }],
+    ["lakebox", {}],
+    ["lakebox", { "omnigent.host_type": "managed" }],
+  ])("forks a %s source with labels %j to every destination", async (provider, labels) => {
+    getSessionMock.mockResolvedValue(session(labels));
+    fetchMock.mockImplementation(async () => hostsResponse(provider));
+    const { result } = renderRestrictions();
+    await waitFor(() => expect(result.current).toEqual(switchOnly));
+  });
 
-  it("retains a known managed restriction when both lookups fail", async () => {
+  it("retains the known switch-host restriction when both lookups fail", async () => {
     getSessionMock.mockRejectedValue(new Error("Session unavailable"));
     fetchMock.mockRejectedValue(new Error("Hosts unavailable"));
     const { client, result } = renderRestrictions({
       hostId: "host-1",
       labels: { "omnigent.host_type": "managed" },
     });
-    expect(result.current).toEqual(unsupported);
+    expect(result.current).toEqual({
+      forkDisabledReason: SESSION_ACTIONS_LOADING,
+      switchHostDisabledReason: SANDBOX_SWITCH_HOST_UNSUPPORTED,
+    });
     await waitFor(() =>
       expect(client.getQueryState(["session", "session-1"])?.status).toBe("error"),
     );
     await waitFor(() =>
       expect(client.getQueryState(["hosts", { includeSandbox: true }])?.status).toBe("error"),
     );
-    expect(result.current).toEqual(unsupported);
+    expect(result.current).toEqual({
+      forkDisabledReason: SESSION_ACTIONS_UNAVAILABLE,
+      switchHostDisabledReason: SANDBOX_SWITCH_HOST_UNSUPPORTED,
+    });
+  });
+
+  it("offers Fork while the source host loads and settles switching once it arrives", async () => {
+    let resolveHosts: (response: Response) => void = () => {};
+    getSessionMock.mockResolvedValue(session({ "omnigent.host_type": "managed" }));
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveHosts = resolve;
+        }),
+    );
+    const { result } = renderRestrictions();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(result.current).toEqual({
+        forkDisabledReason: undefined,
+        switchHostDisabledReason: SANDBOX_SWITCH_HOST_UNSUPPORTED,
+      }),
+    );
+
+    act(() => resolveHosts(hostsResponse("arclet")));
+
+    await waitFor(() => expect(result.current).toEqual(switchOnly));
   });
 
   it("explains a failed snapshot lookup instead of enabling actions", async () => {
@@ -124,12 +156,13 @@ describe("useSessionActionRestrictions", () => {
     );
   });
 
-  it("keeps an unknown host disabled on lookup failure and recovers after a successful refetch", async () => {
+  it("keeps switching disabled on a host lookup failure and recovers after a successful refetch", async () => {
     fetchMock.mockRejectedValue(new Error("Hosts unavailable"));
     const { client, result } = renderRestrictions();
+    // Fork depends only on the session snapshot, so a failed host lookup leaves it available.
     await waitFor(() =>
       expect(result.current).toEqual({
-        forkDisabledReason: SESSION_ACTIONS_UNAVAILABLE,
+        forkDisabledReason: undefined,
         switchHostDisabledReason: SESSION_ACTIONS_UNAVAILABLE,
       }),
     );
@@ -149,7 +182,7 @@ describe("useSessionActionRestrictions", () => {
       await waitFor(() =>
         expect(client.getQueryState(["hosts", { includeSandbox: true }])?.status).toBe("success"),
       );
-      expect(result.current).toEqual(managed ? unsupported : unlistedHost);
+      expect(result.current).toEqual(managed ? switchOnly : unlistedHost);
     },
   );
 
@@ -175,7 +208,7 @@ describe("useSessionActionRestrictions", () => {
       await waitFor(() =>
         expect(client.getQueryState(["session", "session-1"])?.status).toBe("success"),
       );
-      expect(result.current).toEqual(managed ? unsupported : unrestricted);
+      expect(result.current).toEqual(managed ? switchOnly : unrestricted);
       expect(fetchMock).not.toHaveBeenCalled();
     },
   );

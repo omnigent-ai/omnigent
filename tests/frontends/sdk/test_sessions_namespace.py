@@ -31,8 +31,9 @@ What each test claims to prove (and what failure indicates):
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from typing import Any, Literal
 
 import httpx
@@ -43,6 +44,7 @@ from omnigent_client._sessions import (
     SessionsNamespace,
 )
 
+from omnigent.server.routes._host_launch import _MAX_LAUNCH_TIMEOUT_S
 from omnigent.server.schemas import (
     CompletedEvent,
     OutputTextDeltaEvent,
@@ -228,9 +230,8 @@ async def test_get_returns_typed_session() -> None:
         assert str(request.url) == "http://srv/v1/sessions/conv_abc"
         return httpx.Response(
             200,
-            json=_session_response_body(
-                items=[{"id": "msg_1", "type": "message"}],
-            ),
+            json=_session_response_body(items=[{"id": "msg_1", "type": "message"}])
+            | {"sandbox_status": {"stage": "failed", "error": "Launch failed"}},
         )
 
     ns, client = _make_namespace(handler)
@@ -244,6 +245,45 @@ async def test_get_returns_typed_session() -> None:
     # un-modeled per the namespace docstring).
     assert session.items == [{"id": "msg_1", "type": "message"}]
     assert session.updated_at == 1700000042
+    assert session.sandbox_status == {"stage": "failed", "error": "Launch failed"}
+
+
+@pytest.mark.asyncio
+async def test_get_sends_only_the_parts_turned_off() -> None:
+    """Each disabled part becomes ``include_<part>=false``; enabled parts send nothing,
+    so a default call is unchanged and older servers, which ignore the flags, still work."""
+    seen: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.url.params))
+        return httpx.Response(200, json=_session_response_body(items=[]))
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.get("conv_abc")
+        await ns.get("conv_abc", include_items=False)
+        await ns.get("conv_abc", include_items=False, include_usage=False)
+        await ns.get(
+            "conv_abc",
+            include_items=False,
+            include_liveness=False,
+            include_live_status=False,
+            include_usage=False,
+        )
+    finally:
+        await client.aclose()
+
+    assert seen == [
+        {},
+        {"include_items": "false"},
+        {"include_items": "false", "include_usage": "false"},
+        {
+            "include_items": "false",
+            "include_liveness": "false",
+            "include_live_status": "false",
+            "include_usage": "false",
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -263,6 +303,7 @@ async def test_get_updated_at_defaults_to_none_when_omitted() -> None:
         await client.aclose()
 
     assert session.updated_at is None
+    assert session.sandbox_status is None
 
 
 @pytest.mark.asyncio
@@ -1197,7 +1238,8 @@ def _tree_handler(
         # …/v1/sessions/<id>/child_sessions
         assert parts[-1] == "child_sessions"
         parent_id = parts[-2]
-        return httpx.Response(200, json={"data": tree.get(parent_id, [])})
+        limit = int(request.url.params.get("limit", "100"))
+        return httpx.Response(200, json={"data": tree.get(parent_id, [])[:limit]})
 
     return handler
 
@@ -1263,6 +1305,249 @@ async def test_child_sessions_tree_cycle_guard() -> None:
 
     # 'root' is the seed (already seen) so the back-edge is dropped; 'a1' stays.
     assert [n["id"] for n in nodes] == ["a", "a1"]
+
+
+def _counting_tree_handler(
+    tree: dict[str, list[dict[str, Any]]],
+    requests: list[httpx.Request],
+    *,
+    descendants: Callable[[str, httpx.QueryParams], dict[str, Any]] | None = None,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Like :func:`_tree_handler`, recording requests and optionally serving
+    ``descendants=true`` the way a server that supports it does.
+
+    :param tree: Parent id → its direct children.
+    :param requests: Receives every request, in order.
+    :param descendants: Builds the ``descendants=true`` body from the parent
+        id and query; ``None`` ignores the flag like an older server.
+    """
+    per_level = _tree_handler(tree)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if descendants is not None and request.url.params.get("descendants") == "true":
+            parent_id = request.url.path.split("/")[-2]
+            return httpx.Response(200, json=descendants(parent_id, request.url.params))
+        return per_level(request)
+
+    return handler
+
+
+def _descendants_body(
+    tree: dict[str, list[dict[str, Any]]],
+    parent_id: str,
+    params: httpx.QueryParams,
+    *,
+    page_size: int = 1000,
+) -> dict[str, Any]:
+    """One page of the breadth-first ``descendants=true`` body for *tree*,
+    honouring ``max_depth``, ``limit`` and ``after`` like the server."""
+    max_depth = int(params.get("max_depth", "3"))
+    rows: list[dict[str, Any]] = []
+    frontier, depth = [parent_id], 0
+    while frontier and depth < max_depth:
+        depth += 1
+        nxt: list[str] = []
+        for node in frontier:
+            for row in tree.get(node, []):
+                rows.append({**row, "parent_session_id": node, "depth": depth})
+                nxt.append(row["id"])
+        frontier = nxt
+    start = 0
+    if "after" in params:
+        start = [r["id"] for r in rows].index(params["after"]) + 1
+    size = min(int(params["limit"]), page_size)
+    page = rows[start : start + size]
+    return {
+        "data": page,
+        "last_id": page[-1]["id"] if page else None,
+        "has_more": start + size < len(rows),
+    }
+
+
+_DEEP_TREE = {
+    "root": [_child("a"), _child("b")],
+    "a": [_child("a1")],
+    "a1": [_child("a1x")],
+}
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_uses_one_request_when_the_server_returns_descendants() -> None:
+    """A server that honours ``descendants=true`` answers the whole tree at once.
+
+    Failure means the CLI tree poll still costs one request per sub-agent.
+    """
+    requests: list[httpx.Request] = []
+    handler = _counting_tree_handler(
+        _DEEP_TREE,
+        requests,
+        descendants=lambda parent, params: _descendants_body(_DEEP_TREE, parent, params),
+    )
+    ns, client = _make_namespace(handler)
+    try:
+        nodes = await ns.child_sessions_tree("root")
+    finally:
+        await client.aclose()
+
+    assert len(requests) == 1
+    assert requests[0].url.params["descendants"] == "true"
+    assert requests[0].url.params["max_depth"] == "3"
+    assert [(n["id"], n["parent_id"]) for n in nodes] == [
+        ("a", "root"),
+        ("b", "root"),
+        ("a1", "a"),
+        ("a1x", "a1"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("depth_field", ["omitted", "null"])
+async def test_child_sessions_tree_reuses_a_one_level_answer(depth_field: str) -> None:
+    """A one-level answer, whether from an older server (no ``depth`` key) or
+    from a server declining a tree too big for one read (``depth: null``),
+    becomes the walk's first level, so it costs no more requests than before."""
+
+    def one_level(parent: str, params: httpx.QueryParams) -> dict[str, Any]:
+        rows = _DEEP_TREE.get(parent, [])
+        return {"data": rows if depth_field == "omitted" else [{**r, "depth": None} for r in rows]}
+
+    requests: list[httpx.Request] = []
+    ns, client = _make_namespace(
+        _counting_tree_handler(_DEEP_TREE, requests, descendants=one_level)
+    )
+    try:
+        nodes = await ns.child_sessions_tree("root")
+    finally:
+        await client.aclose()
+
+    # root (the descendants attempt, reused), a, b, a1: one per node, as before.
+    assert [r.url.path.split("/")[-2] for r in requests] == ["root", "a", "b", "a1"]
+    assert [(n["id"], n["parent_id"]) for n in nodes] == [
+        ("a", "root"),
+        ("b", "root"),
+        ("a1", "a"),
+        ("a1x", "a1"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_follows_descendant_pages() -> None:
+    """A subtree longer than one server page is read by following ``after``."""
+    requests: list[httpx.Request] = []
+    handler = _counting_tree_handler(
+        _DEEP_TREE,
+        requests,
+        descendants=lambda parent, params: _descendants_body(
+            _DEEP_TREE, parent, params, page_size=2
+        ),
+    )
+    ns, client = _make_namespace(handler)
+    try:
+        nodes = await ns.child_sessions_tree("root")
+    finally:
+        await client.aclose()
+
+    assert [n["id"] for n in nodes] == ["a", "b", "a1", "a1x"]
+    assert [r.url.params.get("after") for r in requests] == [None, "b"]
+    assert all(r.url.params["descendants"] == "true" for r in requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("later_page", ["stale_cursor", "one_level", "empty_one_level"])
+async def test_child_sessions_tree_restarts_the_walk_when_a_later_page_cannot_continue(
+    later_page: str,
+) -> None:
+    """If the tree outgrows one read between pages, the pages already read are
+    dropped and the tree is walked from scratch, never stitched together."""
+    requests: list[httpx.Request] = []
+    per_level = _tree_handler(_DEEP_TREE)
+    # The first page saw a sub-agent that the walk no longer finds; keeping
+    # any already-read page would leak it into the result.
+    before_restart = {**_DEEP_TREE, "root": [_child("gone"), *_DEEP_TREE["root"]]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        params = request.url.params
+        if params.get("descendants") != "true":
+            return per_level(request)
+        if "after" not in params:
+            return httpx.Response(
+                200, json=_descendants_body(before_restart, "root", params, page_size=2)
+            )
+        if later_page == "stale_cursor":
+            return httpx.Response(
+                400, json={"error": {"message": "stale", "code": "stale_cursor"}}
+            )
+        rows = [] if later_page == "empty_one_level" else _DEEP_TREE["root"]
+        return httpx.Response(200, json={"data": rows})
+
+    ns, client = _make_namespace(handler)
+    try:
+        nodes = await ns.child_sessions_tree("root")
+    finally:
+        await client.aclose()
+
+    assert [(n["id"], n["parent_id"]) for n in nodes] == [
+        ("a", "root"),
+        ("b", "root"),
+        ("a1", "a"),
+        ("a1x", "a1"),
+    ]
+    assert "gone" not in {n["id"] for n in nodes}
+    walk = [r for r in requests if "descendants" not in r.url.params]
+    assert [r.url.path.split("/")[-2] for r in walk] == ["root", "a", "b", "a1"]
+
+
+_WIDE_TREE = {
+    "root": [_child("a"), _child("b")],
+    "a": [_child("a1"), _child("a2")],
+    "b": [_child("b1")],
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server_has_descendants", [True, False])
+async def test_child_sessions_tree_keeps_limit_children_per_parent(
+    server_has_descendants: bool,
+) -> None:
+    """``limit`` still caps each parent's children, and nothing below a child
+    it cut is returned, whichever way the server answers."""
+    descendants = (
+        (lambda parent, params: _descendants_body(_WIDE_TREE, parent, params))
+        if server_has_descendants
+        else None
+    )
+    ns, client = _make_namespace(_counting_tree_handler(_WIDE_TREE, [], descendants=descendants))
+    try:
+        one_level = await ns.child_sessions_tree("root", limit=1, max_depth=1)
+        nested = await ns.child_sessions_tree("root", limit=1)
+    finally:
+        await client.aclose()
+
+    assert [n["id"] for n in one_level] == ["a"]
+    assert [(n["id"], n["parent_id"]) for n in nested] == [("a", "root"), ("a1", "a")]
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_depth_bounds() -> None:
+    """Depth 0 sends nothing; a depth past the server's batch limit walks levels."""
+    requests: list[httpx.Request] = []
+    handler = _counting_tree_handler(
+        _DEEP_TREE,
+        requests,
+        descendants=lambda parent, params: _descendants_body(_DEEP_TREE, parent, params),
+    )
+    ns, client = _make_namespace(handler)
+    try:
+        assert await ns.child_sessions_tree("root", max_depth=0) == []
+        assert requests == []
+        deep = await ns.child_sessions_tree("root", max_depth=11)
+    finally:
+        await client.aclose()
+
+    assert [n["id"] for n in deep] == ["a", "b", "a1", "a1x"]
+    assert all("descendants" not in r.url.params for r in requests)
 
 
 @pytest.mark.asyncio
@@ -1468,3 +1753,536 @@ async def test_list_preserves_host_id_on_rows() -> None:
     assert by_id["conv_unbound"].parent_session_id is None
     assert by_id["conv_child"].host_id is None
     assert by_id["conv_child"].parent_session_id == "conv_host_bound"
+
+
+# ── session metadata: cost / usage / lineage / kind ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_parses_cost_usage_and_lineage_metadata() -> None:
+    usage_by_model = {
+        "claude-sonnet-4-6": {
+            "input_tokens": 12000,
+            "output_tokens": 800,
+            "total_tokens": 12800,
+        }
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json=_session_response_body()
+            | {
+                "total_cost_usd": 0.42,
+                "usage_included": True,
+                "usage_by_model": usage_by_model,
+                "parent_session_id": "conv_parent",
+                "root_conversation_id": "conv_root",
+                "kind": "sub_agent",
+                "sub_agent_name": "summarizer",
+            },
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.get("conv_abc")
+    finally:
+        await client.aclose()
+
+    assert session.total_cost_usd == 0.42
+    assert session.usage_included is True
+    assert session.usage_by_model == usage_by_model
+    assert session.parent_session_id == "conv_parent"
+    assert session.root_conversation_id == "conv_root"
+    assert session.kind == "sub_agent"
+    assert session.sub_agent_name == "summarizer"
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected_usage_included"),
+    [
+        # An older server omits the metadata keys entirely.
+        pytest.param({}, True, id="keys-omitted"),
+        # include_usage=false: usage is unknown rather than zero.
+        pytest.param(
+            {"usage_included": False, "total_cost_usd": None, "usage_by_model": None},
+            False,
+            id="usage-not-included",
+        ),
+    ],
+)
+def test_session_from_dict_metadata_compatibility(
+    extra: dict[str, Any], expected_usage_included: bool
+) -> None:
+    session = Session.from_dict(_session_response_body() | extra)
+
+    assert session.total_cost_usd is None
+    assert session.usage_included is expected_usage_included
+    assert session.usage_by_model is None
+    assert session.parent_session_id is None
+    assert session.root_conversation_id is None
+    assert session.kind == "default"
+    assert session.sub_agent_name is None
+
+
+# ── set_labels() ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_set_labels_patches_labels_and_returns_snapshot() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["method"] = request.method
+        captured["body"] = json.loads(request.content.decode())
+        # The server upserts: a key the patch omits survives and an
+        # empty value is stored rather than deleting its key.
+        return httpx.Response(
+            200,
+            json=_session_response_body(status="idle")
+            | {"labels": {"env": "test", "team": "platform", "note": ""}},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.set_labels("conv_abc", {"team": "platform", "note": ""})
+    finally:
+        await client.aclose()
+
+    assert captured == {
+        "url": "http://srv/v1/sessions/conv_abc",
+        "method": "PATCH",
+        "body": {"labels": {"team": "platform", "note": ""}},
+    }
+    assert session.labels == {"env": "test", "team": "platform", "note": ""}
+
+
+# ── delete() ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("delete_branch", "expected_url"),
+    [
+        (False, "http://srv/v1/sessions/conv_abc"),
+        (True, "http://srv/v1/sessions/conv_abc?delete_branch=true"),
+    ],
+)
+async def test_delete_sends_delete_request(delete_branch: bool, expected_url: str) -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(f"{request.method} {request.url}")
+        return httpx.Response(
+            200,
+            json={"id": "conv_abc", "object": "conversation.deleted", "deleted": True},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.delete("conv_abc", delete_branch=delete_branch)
+    finally:
+        await client.aclose()
+
+    assert calls == [f"DELETE {expected_url}"]
+
+
+@pytest.mark.asyncio
+async def test_delete_omits_branch_cleanup_by_default() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(f"{request.method} {request.url}")
+        return httpx.Response(
+            200,
+            json={"id": "conv_abc", "object": "conversation.deleted", "deleted": True},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.delete("conv_abc")
+    finally:
+        await client.aclose()
+
+    assert calls == ["DELETE http://srv/v1/sessions/conv_abc"]
+
+
+@pytest.mark.asyncio
+async def test_delete_404_raises_omnigent_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            404,
+            json={"error": {"code": "not_found", "message": "Session not found"}},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        with pytest.raises(OmnigentError) as exc_info:
+            await ns.delete("conv_missing")
+    finally:
+        await client.aclose()
+
+    assert "Session not found" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_set_labels_forbidden_raises_omnigent_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            403,
+            json={
+                "error": {"code": "forbidden", "message": "cost_control labels are runner-owned"}
+            },
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        with pytest.raises(OmnigentError) as exc_info:
+            await ns.set_labels("conv_abc", {"cost_control.mode": "on"})
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.status_code == 403
+    assert "runner-owned" in str(exc_info.value)
+
+
+# ── caller-supplied ids stay inside the session path ─────────────────
+
+
+async def _drain(events: AsyncIterator[Any]) -> None:
+    async for _ in events:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_delete_keeps_reserved_characters_inside_the_session_id() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # raw_path keeps the wire encoding and would carry any query string.
+        captured["raw_path"] = request.url.raw_path
+        return httpx.Response(
+            200,
+            json={"id": "conv_x", "object": "conversation.deleted", "deleted": True},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.delete("conv_x?delete_branch=true")
+    finally:
+        await client.aclose()
+
+    assert captured == {"raw_path": b"/v1/sessions/conv_x%3Fdelete_branch%3Dtrue"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda ns, sid: ns.get(sid), id="get"),
+        pytest.param(lambda ns, sid: ns.set_labels(sid, {"team": "platform"}), id="set_labels"),
+        pytest.param(lambda ns, sid: ns.delete(sid), id="delete"),
+        pytest.param(lambda ns, sid: ns.set_archived(sid, archived=True), id="set_archived"),
+        pytest.param(
+            lambda ns, sid: ns.post_event(sid, {"type": "interrupt", "data": {}}),
+            id="post_event",
+        ),
+        pytest.param(
+            lambda ns, sid: ns.resolve_elicitation("conv_abc", sid, {"action": "accept"}),
+            id="elicitation_id",
+        ),
+        pytest.param(lambda ns, sid: _drain(ns.stream(sid)), id="stream"),
+    ],
+)
+async def test_session_routes_reject_ids_that_escape_the_session_path(
+    call: Callable[[SessionsNamespace, str], Awaitable[Any]],
+) -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(f"{request.method} {request.url.path}")
+        return httpx.Response(200, json=_session_response_body())
+
+    ns, client = _make_namespace(handler)
+    try:
+        with pytest.raises(ValueError):
+            await call(ns, "conv_abc/permissions/alice")
+    finally:
+        await client.aclose()
+
+    assert calls == []
+
+
+# ── create_from_agent_id() / list_launch_hosts() ──────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "host_id,host_type", [(None, "external"), ("host_1", "external"), (None, "managed")]
+)
+@pytest.mark.parametrize("read_timeout", [0.05, 7200.0, None])
+async def test_create_from_agent_id_preserves_request_timeouts(
+    host_id: str | None, host_type: Literal["external", "managed"], read_timeout: float | None
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode())
+        captured["timeout"] = request.extensions["timeout"]
+        return httpx.Response(200, json=_session_response_body(status="idle"))
+
+    ns, client = _make_namespace(handler)
+    client.timeout = httpx.Timeout(connect=2, read=read_timeout, write=3, pool=4)
+    workspace = "https://github.com/example/repo" if host_type == "managed" else "/w"
+    try:
+        await ns.create_from_agent_id(
+            "ag_abc",
+            workspace=workspace,
+            host_id=host_id,
+            host_type=host_type,
+            sandbox_provider="modal" if host_type == "managed" else None,
+        )
+    finally:
+        await client.aclose()
+
+    expected_body: dict[str, object] = {"agent_id": "ag_abc", "workspace": workspace}
+    if host_id is not None:
+        expected_body["host_id"] = host_id
+    if host_type == "managed":
+        expected_body.update(host_type="managed", sandbox_provider="modal")
+    assert captured["body"] == expected_body
+    timeout = captured["timeout"]
+    assert {key: timeout[key] for key in ("connect", "write", "pool")} == {
+        "connect": 2,
+        "write": 3,
+        "pool": 4,
+    }
+    if host_id is not None and read_timeout is not None:
+        assert timeout["read"] > _MAX_LAUNCH_TIMEOUT_S
+        assert timeout["read"] >= read_timeout
+    else:
+        assert timeout["read"] == read_timeout
+    assert client.timeout.read == read_timeout
+
+
+@pytest.mark.asyncio
+async def test_host_launch_waits_past_the_ordinary_http_read_timeout() -> None:
+    """A real HTTP read waits for a delayed launch without extending ordinary requests."""
+    pending: set[asyncio.Task[None]] = set()
+
+    async def respond(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            await asyncio.sleep(0.2)
+            body = json.dumps(_session_response_body(status="idle")).encode()
+            writer.write(
+                b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                + body
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    def connected(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.create_task(respond(reader, writer))
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+
+    server = await asyncio.start_server(connected, "127.0.0.1", 0)
+    base_url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+    try:
+        async with server, httpx.AsyncClient(timeout=0.05, trust_env=False) as http:
+            sessions = SessionsNamespace(http, base_url)
+            launched = await sessions.create_from_agent_id("ag_abc", host_id="host_1")
+            assert launched.id == "conv_abc"
+            with pytest.raises(httpx.ReadTimeout):
+                await sessions.create_from_agent_id("ag_abc")
+    finally:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def _host(
+    host_id: str,
+    *,
+    status: str = "online",
+    sandbox_provider: str | None = None,
+    harnesses: dict[str, object] | None = None,
+    name: str | None = "",
+) -> dict[str, object]:
+    """Build one ``GET /v1/hosts`` row; ``name=""`` means ``<host_id>.local``."""
+    return {
+        "host_id": host_id,
+        "name": f"{host_id}.local" if name == "" else name,
+        "status": status,
+        "sandbox_provider": sandbox_provider,
+        "configured_harnesses": harnesses,
+    }
+
+
+async def _launch_hosts(
+    body: object,
+    *,
+    status_code: int = 200,
+    **kwargs: Any,
+) -> list[tuple[str, str, bool, str | None]]:
+    """Run ``list_launch_hosts`` on a mocked listing; return (id, name, launchable, reason)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/hosts"
+        return httpx.Response(status_code, json=body)
+
+    ns, client = _make_namespace(handler)
+    try:
+        hosts = await ns.list_launch_hosts(**kwargs)
+    finally:
+        await client.aclose()
+    return [(h.host_id, h.name, h.launchable, h.unavailable_reason) for h in hosts]
+
+
+@pytest.mark.asyncio
+async def test_list_launch_hosts_flags_hosts_that_cannot_launch() -> None:
+    """Readiness follows the server's launch check; auth and unresponsive CLIs are advisory."""
+    hosts = [
+        _host("offline", status="offline", harnesses={"claude-sdk": True}),
+        _host("sandbox", sandbox_provider="modal", harnesses={"claude-sdk": True}),
+        _host("missing", harnesses={"claude-sdk": "binary-missing"}),
+        _host("old", harnesses={"claude-sdk": "version-too-low"}),
+        _host("disabled", harnesses={"claude-sdk": False}),
+        _host("absent", harnesses={"codex": True}),
+        _host("needs_auth", harnesses={"claude-sdk": "needs-auth"}),
+        _host("unresponsive", harnesses={"claude-sdk": "cli-unresponsive"}),
+        _host("ready", harnesses={"claude-sdk": True}),
+        _host("unknown", harnesses=None),
+        _host("future", harnesses={"claude-sdk": {"state": "future"}}),
+    ]
+
+    listed = await _launch_hosts({"hosts": hosts}, harness="claude-sdk")
+
+    assert [(h, ok, why) for h, _, ok, why in listed] == [
+        ("missing", False, "binary-missing"),
+        ("old", False, "version-too-low"),
+        ("disabled", False, "unconfigured"),
+        ("absent", False, "unconfigured"),
+        ("needs_auth", True, None),
+        ("unresponsive", True, None),
+        ("ready", True, None),
+        ("unknown", True, None),
+        ("future", True, None),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("reported", "launchable"), [("claude-sdk", True), ("claude", False)])
+async def test_list_launch_hosts_matches_server_canonical_key(
+    reported: str, launchable: bool
+) -> None:
+    hosts = [_host("h1", harnesses={reported: True})]
+
+    listed = await _launch_hosts(
+        {"hosts": hosts},
+        harness="claude",
+    )
+
+    assert [(h, ok) for h, _, ok, _ in listed] == [("h1", launchable)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", [None, "auto", ""])
+async def test_list_launch_hosts_without_harness_marks_every_host_launchable(
+    harness: str | None,
+) -> None:
+    hosts = [_host("h1", harnesses={"claude-sdk": False})]
+
+    assert [ok for _, _, ok, _ in await _launch_hosts({"hosts": hosts}, harness=harness)] == [True]
+
+
+@pytest.mark.asyncio
+async def test_list_launch_hosts_skips_malformed_rows_and_names_by_id() -> None:
+    hosts: list[object] = [
+        "not-a-row",
+        {"status": "online"},
+        _host(""),
+        _host("unnamed", name=None),
+        _host("ok"),
+    ]
+
+    assert [(h, n) for h, n, _, _ in await _launch_hosts({"hosts": hosts})] == [
+        ("unnamed", "unnamed"),
+        ("ok", "ok.local"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [{}, {"hosts": None}, {"hosts": {"oops": True}}])
+async def test_list_launch_hosts_rejects_a_non_list_listing(body: dict[str, object]) -> None:
+    with pytest.raises(OmnigentError, match=r"GET /v1/hosts.*unexpected hosts listing"):
+        await _launch_hosts(body)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [404, 500])
+async def test_list_launch_hosts_http_failure_raises(status: int) -> None:
+    """Like other SDK calls, a 404 raises; callers decide what an older server means."""
+    with pytest.raises(OmnigentError):
+        await _launch_hosts({}, status_code=status)
+
+
+# ── resolve_agent() user-agent fallback ───────────────────────────────
+
+
+def _agents_handler(
+    server: list[str], user: list[str]
+) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/agents"
+        if request.url.params.get("scope") == "user":
+            rows = [{"id": f"uid_{n}", "name": n, "harness": "codex"} for n in user]
+        else:
+            rows = [{"id": f"id_{n}", "name": n, "harness": "claude-sdk"} for n in server]
+        return httpx.Response(200, json={"data": rows, "has_more": False})
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_falls_back_to_the_callers_user_agents() -> None:
+    ns, client = _make_namespace(_agents_handler(["scribe"], ["mine"]))
+    try:
+        agent = await ns.resolve_agent("mine")
+    finally:
+        await client.aclose()
+
+    assert (agent.id, agent.harness) == ("uid_mine", "codex")
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_miss_lists_both_kinds_of_agent() -> None:
+    ns, client = _make_namespace(_agents_handler(["scribe"], ["mine"]))
+    try:
+        with pytest.raises(LookupError) as excinfo:
+            await ns.resolve_agent("ghost")
+    finally:
+        await client.aclose()
+
+    assert "scribe" in str(excinfo.value) and "mine" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_validates_the_whole_matching_page() -> None:
+    """A matching first row cannot hide malformed registrations later in that page."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"id": "ag_good", "name": "good"}, {}]})
+
+    namespace, client = _make_namespace(handler)
+    async with client:
+        with pytest.raises(OmnigentError, match="malformed agent row"):
+            await namespace.resolve_agent("good")

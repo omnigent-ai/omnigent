@@ -231,6 +231,7 @@ def test_polly_requires_a_real_current_head_review(login, body):
     "mutation",
     [
         "partial",
+        "partial_feature",
         "missing",
         "stale",
         "pending",
@@ -246,6 +247,8 @@ def test_invalid_handoffs_cannot_claim_ready(mutation):
     result = handoff(state)
     if mutation == "partial":
         result["outcome"] = "partially_fixed"
+    elif mutation == "partial_feature":
+        result["outcome"] = "partially_implemented"
     elif mutation == "missing":
         result["review_cycle"]["dispositions"].pop()
     elif mutation == "stale":
@@ -264,6 +267,7 @@ def test_invalid_handoffs_cannot_claim_ready(mutation):
         result["remaining_work"] = ["Fix the retry race."]
     errors = {
         "partial": "outcome must be fixed",
+        "partial_feature": "outcome must be fixed or implemented",
         "missing": "Feedback review:3 needs an evidenced disposition",
         "stale": "receipt is stale or absent",
         "pending": "Feedback comment:1 needs an evidenced disposition",
@@ -275,6 +279,14 @@ def test_invalid_handoffs_cannot_claim_ready(mutation):
     }
     with pytest.raises(RuntimeError, match=errors[mutation]):
         cycle.validate(state, result)
+
+
+@pytest.mark.parametrize("outcome", ["fixed", "implemented"])
+def test_each_agent_success_outcome_can_claim_ready(outcome):
+    state = cycle.snapshot("o/r", 7, Github())
+    result = handoff(state)
+    result["outcome"] = outcome
+    cycle.validate(state, result)
 
 
 def test_do_not_dispatch_completed_reviews():

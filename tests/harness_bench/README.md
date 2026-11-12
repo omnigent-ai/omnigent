@@ -4,6 +4,11 @@ A pluggable conformance suite that probes harness behavior and reconciles the
 observed verdicts with the capability model to surface drift. Design and
 rationale: [`docs/harness-bench-design.md`](../../docs/harness-bench-design.md).
 
+For user-workflow acceptance, use the feature map's
+[harness checklist](../../feature-map/harness-acceptance.md). It maps these
+probes to SDK/native journeys, identifies narrower coverage and missing checks,
+and separates available coverage from results for a particular harness/run.
+
 ## Run it
 
 ```bash

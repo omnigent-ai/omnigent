@@ -243,6 +243,11 @@ def test_host_report_after_handoff_preserves_only_completed_turns(
                 assert snapshot.get("last_task_error") is None
                 assert answer in json.dumps(snapshot["items"])
             else:
-                assert snapshot["last_task_error"]["code"] == "runner_failed_to_start"
+                expected_code = (
+                    "runner_failed_to_start"
+                    if phase == "never_connected"
+                    else "runner_process_crash"
+                )
+                assert snapshot["last_task_error"]["code"] == expected_code
         if phase == "active":
             release_mock_gate(mock_url)

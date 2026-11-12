@@ -25,6 +25,17 @@ catalog is available. `/v1/info` advertises this capability as `default_models`.
 `ManagedSandboxConfig.default_model_options` supplies request-scoped choices for
 the selected harness and authenticated user. "Default" describes the source of
 these choices; it does not select a default model or bind an inference profile.
+The catalog is advisory: an empty or failed listing keeps "Default" launchable.
+A provider that is certain no model can serve the harness raises
+`NoReachableModels`; the preview then reports `unsupported` with the provider's
+reason, and the picker blocks launch for that harness and disables its harness
+row once the preview is known (the picker prefetches the harness rows it shows).
+Agent rows are never disabled; selecting one that has no models blocks launch.
+A failed or timed-out request never blocks: only a successful `unsupported`
+answer does. Picker previews stay fresh for 5 minutes and the selected agent
+polls every 15 seconds, so a harness whose access an admin removes mid-visit can
+be submitted until its next poll, and one whose access is restored can stay
+grayed out until the picker reopens with stale data.
 
 An unbound gateway configured through `sandbox.model_discovery` and
 `sandbox.host_config.providers` also enables this capability. The preview

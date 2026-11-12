@@ -19,10 +19,10 @@ def _resolve_procedures() -> str:
             build_instructions(spec, None, []),
             skills["resolve-inputs"],
             skills["resolve-investigate"],
-            resource("resolve-inputs", "review-remediation.md"),
+            skills["otto-review-remediation"],
             resource("resolve-inputs", "ticket-only.md"),
             resource("resolve-inputs", "reproduction.md"),
-            skills["resolve-impact-assessment"],
+            skills["otto-impact-assessment"],
             skills["resolve-repro-audit"],
             resource("resolve-inputs", "existing-fix.md"),
             skills["resolve-review-pr"],
@@ -30,15 +30,11 @@ def _resolve_procedures() -> str:
             skills["resolve-publish"],
             skills["resolve-drive-pr"],
             skills["otto-pr-review-loop"],
-            *(
-                resource("resolve-drive-pr", name)
-                for name in (
-                    "preview.md",
-                    "ci.md",
-                    "validation-prompt.md",
-                    "final-review.md",
-                )
-            ),
+            skills["otto-drive-pr"],
+            resource("otto-drive-pr", "preview.md"),
+            resource("otto-drive-pr", "ci.md"),
+            resource("resolve-drive-pr", "validation-prompt.md"),
+            resource("resolve-drive-pr", "final-review.md"),
             skills["resolve-handoff"],
         ]
     )
@@ -98,7 +94,7 @@ def _shared_impact_assessment() -> str:
 def test_impact_assessment_applies_to_all_resolution_paths() -> None:
     instructions = _normalized_resolve_instructions()
     for start, end in (
-        ("### Review-remediation mode", "### Ticket-only mode"),
+        ("# Review-remediation mode", "### Ticket-only mode"),
         ("### Ticket-only mode", "### Recovering the handoff"),
         ("## Step 2A", "## Step 2B"),
         ("### 2B.5", "## Step 3"),
@@ -248,7 +244,10 @@ def test_output_outcomes_include_repro_audit_blockers() -> None:
 
 def test_repro_audit_preserves_non_repro_mode_contracts() -> None:
     instructions = _normalized_resolve_instructions()
-    assert "Skip reproduction handoff recovery, fail-before proof" in instructions
+    assert (
+        "Skip the agent's other entry phases (Resolve: reproduction handoff recovery, "
+        "fail-before proof" in instructions
+    )
     assert (
         "the **selected regression check from 2B.4 supplies the fail→pass proof** "
         "for a behavioral bug" in instructions
@@ -335,20 +334,38 @@ def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None
     assert set(handoff["review_cycle"]) == {"head_sha", "fingerprint", "dispositions"}
 
 
-def test_resolve_agent_bundle_ships_the_shared_review_loop(tmp_path: Path) -> None:
-    """The linked review-loop skill reaches the server as files, with one copy of the helper."""
+def test_resolve_delegates_review_remediation_to_the_shared_skill() -> None:
+    inputs = (_RESOLVE_AGENT / "skills" / "resolve-inputs" / "SKILL.md").read_text()
+    agents = (_RESOLVE_AGENT / "AGENTS.md").read_text()
+    assert "- `review_pr`: load the shared `otto-review-remediation` skill." in inputs
+    assert "- `review_pr`: follow the shared `otto-review-remediation` skill." in agents
+    assert not (_RESOLVE_AGENT / "skills" / "resolve-inputs" / "review-remediation.md").exists()
+
+
+def test_resolve_agent_bundle_ships_the_shared_skills(tmp_path: Path) -> None:
+    """Linked shared skills reach the server as files, with one copy of the review helper."""
     from omnigent.cli import _bundle
     from omnigent.spec.tar_utils import extract_safe
 
-    shared = _RESOLVE_AGENT.parent / "agent-skills" / "otto-pr-review-loop"
-    assert (_RESOLVE_AGENT / "skills" / "otto-pr-review-loop").resolve() == shared.resolve()
-
+    shared = _RESOLVE_AGENT.parent / "agent-skills"
     extracted = tmp_path / "bundle"
     extract_safe(_bundle(_RESOLVE_AGENT), extracted)
+    bundled_skills = {skill.name for skill in load(extracted).skills}
 
-    assert "otto-pr-review-loop" in {skill.name for skill in load(extracted).skills}
-    helper = (shared / "review_cycle.py").read_text(encoding="utf-8")
-    bundled = extracted / "skills" / "otto-pr-review-loop" / "review_cycle.py"
-    assert not bundled.is_symlink()
-    assert bundled.read_text(encoding="utf-8") == helper
+    for name, path in (
+        ("otto-pr-review-loop", "SKILL.md"),
+        ("otto-pr-review-loop", "review_cycle.py"),
+        ("otto-review-remediation", "SKILL.md"),
+        ("otto-impact-assessment", "SKILL.md"),
+        ("otto-drive-pr", "SKILL.md"),
+        ("otto-drive-pr", "ci.md"),
+        ("otto-drive-pr", "preview.md"),
+    ):
+        assert (_RESOLVE_AGENT / "skills" / name).resolve() == (shared / name).resolve()
+        assert name in bundled_skills
+        bundled = extracted / "skills" / name / path
+        assert not bundled.is_symlink()
+        assert bundled.read_text(encoding="utf-8") == (shared / name / path).read_text(
+            encoding="utf-8"
+        )
     assert not (extracted / "skills" / "resolve-drive-pr" / "review_cycle.py").exists()
