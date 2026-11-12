@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -26,6 +27,7 @@ from omnigent.runner.app import (
     register_timer,
     unregister_timer,
 )
+from tests._helpers.polling import poll_until_async
 from tests.runner.helpers import NullServerClient
 
 
@@ -787,20 +789,23 @@ async def test_sdk_session_status_does_not_pin_idle_watchdog() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "evidence",
+    ("evidence", "block_scan"),
     [
-        "permission_prompt",
-        "background_agent",
-        "background_shell",
-        "pane_output",
-        "pane_input",
-        "no_evidence",
+        ("permission_prompt", False),
+        ("background_agent", False),
+        ("background_shell", False),
+        ("pane_output", False),
+        ("pane_input", False),
+        ("no_evidence", False),
+        ("permission_prompt", True),
+        ("no_evidence", True),
     ],
 )
 async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     evidence: str,
+    block_scan: bool,
 ) -> None:
     """A pane that reads idle but shows live work keeps the idle watchdog open.
 
@@ -813,6 +818,7 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
     :param monkeypatch: Pytest monkeypatch fixture.
     :param evidence: Live-work signal to stage, e.g. ``"permission_prompt"``. ``"no_evidence"``
         leaves the pane idle.
+    :param block_scan: Hold the actual approval-marker glob until explicitly released.
     :returns: None.
     """
     from omnigent.harnesses.claude_native import bridge
@@ -885,6 +891,46 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
                 # started outlives the turn; that command is still agent work.
                 background(conv_id, True)
             assert app.state.native_pane_status[conv_id] == "idle"
+            if block_scan:
+                entered = threading.Event()
+                release_scan = threading.Event()
+                original_glob = Path.glob
+                calls: list[Path] = []
+
+                def held_glob(path: Path, pattern: str):
+                    if path == approval_root:
+                        calls.append(path)
+                        entered.set()
+                        assert release_scan.wait(5), "approval scan was not released"
+                    return original_glob(path, pattern)
+
+                monkeypatch.setattr(Path, "glob", held_glob)
+                backstop = threading.Timer(2, release_scan.set)
+                backstop.start()
+                try:
+                    app.state.has_active_work()
+                    assert not release_scan.is_set(), "active-work check blocked the runner loop"
+                    assert await asyncio.to_thread(entered.wait, 1)
+                    for _ in range(20):
+                        assert app.state.has_active_work() is True
+                        assert app.state.has_sandbox_work() is True
+                    assert (await client.get("/health")).status_code == 200
+                    assert not release_scan.is_set(), "health request blocked on approval storage"
+                    assert len(calls) == 1, "busy checks queued duplicate approval scans"
+                finally:
+                    release_scan.set()
+                    backstop.cancel()
+
+            expected_sandbox_work = evidence in (
+                "permission_prompt",
+                "background_agent",
+                "background_shell",
+            )
+            await poll_until_async(
+                lambda: app.state.has_sandbox_work() is expected_sandbox_work,
+                timeout_s=3,
+                interval_s=0.01,
+            )
             assert app.state.has_active_work() is (evidence != "no_evidence")
             # Sandbox keepalive counts agent work only: recent pane input or output
             # also comes from someone viewing the pane, so only the prompt, a
@@ -894,5 +940,6 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
             )
             if evidence == "background_shell":
                 background(conv_id, False)
+                await poll_until_async(lambda: not app.state.has_sandbox_work(), timeout_s=3)
                 assert app.state.has_active_work() is False
                 assert app.state.has_sandbox_work() is False
