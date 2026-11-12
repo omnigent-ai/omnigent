@@ -1417,7 +1417,8 @@ async def forward_claude_transcript_to_session(
                     subagent_task = None
                 async with _forward_progress_timeout(client, _FORWARD_LOOP_STALL_DEADLINE_S):
                     current_session_id = read_active_session_id(bridge_dir) or session_id
-                    observer_stderr_offset = _log_new_observer_hook_stderr(
+                    observer_stderr_offset = await asyncio.to_thread(
+                        _log_new_observer_hook_stderr,
                         bridge_dir=bridge_dir,
                         session_id=current_session_id,
                         byte_offset=observer_stderr_offset,
@@ -3559,6 +3560,15 @@ async def _maybe_rotate_session_on_clear(
         )
     await _write_hook_state_async(bridge_dir, durable)
     reset_transcript_forward_state(bridge_dir, reset_hooks=False)
+    if clear_record.transcript_path is not None:
+        # A cleared native conversation has no copied history to skip.
+        await _ensure_state_for_transcript(
+            bridge_dir=bridge_dir,
+            state=None,
+            transcript_path=clear_record.transcript_path,
+            start_at_end=False,
+            session_id=new_session_id or session_id,
+        )
     return new_session_id
 
 

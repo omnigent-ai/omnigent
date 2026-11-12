@@ -26,6 +26,7 @@ DisconnectReason = Literal[
     "peer_closed",
     "ping_timeout",
     "protocol_error",
+    "scheduled_renewal",
     "server_rehome",
     "server_restart",
     "suspend_resume",
@@ -108,6 +109,7 @@ def classify_disconnect_reason(
     *,
     local_shutdown: bool = False,
     resumed_from_suspend: bool = False,
+    scheduled_renewal: bool = False,
 ) -> DisconnectReason:
     """Map tunnel termination details to a bounded reason.
 
@@ -119,12 +121,16 @@ def classify_disconnect_reason(
     :param local_shutdown: Whether the local process requested shutdown.
     :param resumed_from_suspend: Whether a suspend watcher dropped the stale
         socket to reconnect.
+    :param scheduled_renewal: Whether this side closed a healthy socket to
+        renew it before a proxy's connection lifetime ran out.
     :returns: A stable low-cardinality disconnect reason.
     """
     if local_shutdown:
         return "local_shutdown"
     if resumed_from_suspend:
         return "suspend_resume"
+    if scheduled_renewal:
+        return "scheduled_renewal"
 
     code = websocket_close_code(error)
     close_reason = websocket_close_reason(error) or ""
@@ -205,6 +211,7 @@ class ClientWebSocketMetrics:
         *,
         local_shutdown: bool = False,
         resumed_from_suspend: bool = False,
+        scheduled_renewal: bool = False,
     ) -> None:
         """Record one ended established WebSocket connection.
 
@@ -213,6 +220,7 @@ class ClientWebSocketMetrics:
         :param local_shutdown: Whether the local process requested shutdown.
         :param resumed_from_suspend: Whether the stale socket was dropped after
             system resume.
+        :param scheduled_renewal: Whether this side closed it for a planned renewal.
         """
         attributes: dict[str, str | int] = {
             "tunnel.kind": kind,
@@ -220,6 +228,7 @@ class ClientWebSocketMetrics:
                 error,
                 local_shutdown=local_shutdown,
                 resumed_from_suspend=resumed_from_suspend,
+                scheduled_renewal=scheduled_renewal,
             ),
         }
         close_code = websocket_close_code(error)
@@ -250,6 +259,7 @@ def record_websocket_disconnected(
     *,
     local_shutdown: bool = False,
     resumed_from_suspend: bool = False,
+    scheduled_renewal: bool = False,
 ) -> None:
     """Best-effort record of an ended client WebSocket connection."""
     if not telemetry_enabled():
@@ -260,6 +270,7 @@ def record_websocket_disconnected(
             error,
             local_shutdown=local_shutdown,
             resumed_from_suspend=resumed_from_suspend,
+            scheduled_renewal=scheduled_renewal,
         )
     except Exception:  # Telemetry must never disrupt the tunnel.
         _logger.debug("failed to record WebSocket disconnection metric", exc_info=True)

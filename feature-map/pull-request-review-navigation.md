@@ -27,7 +27,8 @@ and a changed file is flagged.
   `Opening files isn’t supported for <provider>`.
 - `viewed`: Per-file **Viewed** checkbox in each file header. Marking collapses the
   file; unmarking leaves it as it is. Viewed files show a check and a dimmed name in
-  the file list. Viewed controls are hidden when viewed state is unavailable.
+  the file list. A mark made in another tab on the same head also collapses the file.
+  Viewed controls are hidden when viewed state is unavailable.
 - `progress`: `X / Y files viewed`, with `(partial)` when the changed-file list is
   truncated. A bar sits beside it outside the mobile layout; mobile shows the text only.
 - `hide-viewed`: **Hide viewed** toggle, off by default. When every file the path
@@ -47,6 +48,12 @@ and a changed file is flagged.
   shows its patch with the same file list, diff and find bar, plus **Back to commits**,
   **Previous commit** and **Next commit**. A commit view has no viewed controls, review
   conversations or drafts, or context expansion, and **Open in** uses the commit's sha.
+  In Changes, **Changes since** picks a start point: the PR base (default, every change)
+  or one of the PR's commits, newest first, leaving out the head. Picking a commit shows
+  only the changes after it, up to the head, so a stacked PR is reviewed by picking its
+  parent's head; a commit that is another PR's head is labeled `head of #N`. Like a
+  commit view, it has no viewed controls, conversations or context expansion, and
+  **Open in** uses the head.
 
 ## How to get to it (user POV)
 
@@ -128,12 +135,16 @@ new head where only `main.py` changes. `README.md` keeps its mark, `main.py` sho
 covers `rail`. It checks the viewed controls in Changes, switches to Commits, searches
 the list, opens a commit and checks that only its file is listed and the viewed
 controls are gone, steps with **Next commit**, and returns with **Back to commits**.
+Back in Changes it picks a commit in **Changes since**, checks only the later changes
+are listed from a read pinned to the head, and picks the PR base again.
 
 - `composer-desktop`, `composer-mobile` and `canvas`: Open Changes on a GitHub pull
   request with several commits and choose **Commits**. Search by an author's name and
   confirm the list narrows. Open a commit: only its files should be listed, with no
   **Viewed** checkbox or **Hide viewed**. Use **Next commit**, then **Back to commits**,
-  then **Changes**, and confirm your viewed marks are unchanged.
+  then **Changes**, and confirm your viewed marks are unchanged. On a stacked PR, open
+  **Changes since**: the parent PR's head should be labeled `head of #N`, and picking it
+  should leave only this PR's own changes.
 
 Component coverage for these helpers and views lives in
 `web/src/shell/PullRequestChangesTab.test.tsx`,
@@ -170,11 +181,12 @@ Component coverage for these helpers and views lives in
 - **Open uses the list's revision, not the newest head.** A commit pushed while you
   read does not change the link until the list reloads. The link goes to the file
   without a line anchor.
-- **Open and viewed need a pinned list.** GitLab and Azure DevOps lists do not report
-  their revision, so **Open in** shows `Revision unknown`, and the Viewed checkbox,
-  progress row and Hide viewed are all hidden. A workspace-branch list (no pull
-  request selected) behaves the same way. Real GitLab and Azure DevOps pull requests
-  have not been exercised; these results come from the code paths.
+- **Open and viewed need a pinned list.** GitHub, GitLab and Azure DevOps lists report
+  the revision they show, so **Open in** and the Viewed checkbox work for each. A
+  workspace-branch list (no pull request selected) reports no revision, so **Open in**
+  shows `Revision unknown`, and the Viewed checkbox, progress row and Hide viewed are
+  all hidden. Real GitLab and Azure DevOps pull requests have not been exercised; these
+  results come from the code paths.
 - **Viewed marks are browser-local.** They do not sync to GitHub or other browsers.
   They are separate for each Omnigent server, signed-in user and pull request, and
   clearing site data removes them. If the browser refuses storage, your changes stay in
@@ -201,10 +213,6 @@ Component coverage for these helpers and views lives in
   conversation reveal a conversation on a file the path filter or Hide viewed hides,
   clearing that filter first and showing `Filter cleared to show <file>`. Other
   conversations on hidden files stay hidden with their files.
-- **Known rough edges.** Marking a file while Hide viewed is on removes it from the
-  list and drops keyboard focus. Marks made in another tab on the same head show as
-  checked but do not collapse the file until the Changes view remounts (for example
-  after a reload) or the head changes.
 - **Commits need GitHub and a current server.** GitLab and Azure DevOps show Changes
   only. If the Omnigent server predates the commit view, the switch disappears for that
   pull request and the toast `Commits need an updated Omnigent server.` appears.

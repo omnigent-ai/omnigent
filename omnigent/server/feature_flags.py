@@ -44,6 +44,7 @@ class Feature(StrEnum):
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS_V2 = "automations_v2"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
+    SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,7 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Create nested agents on shared or separate compute",
         owner="server",
         review_by_release="0.24.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.PEER_SESSION_MESSAGING,
@@ -204,6 +206,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Search workspace file contents through the session runner",
         owner="web",
         review_by_release="0.20.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.SIDEBAR_WINDOWED_ROWS,
+        description="Mount only the sidebar session rows near the viewport",
+        owner="web",
+        review_by_release="0.24.0",
     ),
 )
 

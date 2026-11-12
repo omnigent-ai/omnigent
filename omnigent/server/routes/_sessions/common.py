@@ -31,7 +31,7 @@ from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import WrongReplicaError
 from omnigent.harness_capabilities import ForkHistory
 from omnigent.harness_plugins import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
@@ -675,6 +675,13 @@ _session_background_tasks_cache: WorkspaceScopedCache[str, list[BackgroundTaskIn
 )
 
 
+# Background agents a finished claude-native turn left running, as of this
+# replica's last ``waiting`` edge. Any other status edge drops the entry.
+_session_background_agents_cache: WorkspaceScopedCache[str, list[BackgroundTaskInfo]] = (
+    WorkspaceScopedCache()
+)
+
+
 # Why a running session's agent is parked on a terminal prompt, as of the last
 # status edge this replica published; ``""`` when that edge was not parked.
 # Absent when this replica has no edge, in which case the list reads the row.
@@ -1079,10 +1086,7 @@ def host_interactive_shells_for_request(
         and runner_router is not None
         and runner_router.host_is_on_another_replica(host_id)
     ):
-        raise OmnigentError(
-            "host shell inventory is on another replica",
-            code=ErrorCode.WRONG_REPLICA,
-        )
+        raise WrongReplicaError("host shell inventory is on another replica", host_id=host_id)
     return normalize_interactive_shells(host_registry.interactive_shells(host_id))
 
 
@@ -1298,6 +1302,7 @@ __all__ = [
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",
+    "_session_background_agents_cache",
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
     "_session_blocked_on_cache",

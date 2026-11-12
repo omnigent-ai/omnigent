@@ -36,7 +36,7 @@ import enum
 import hashlib
 import secrets
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -100,8 +100,8 @@ class TokenResult:
     stands alone and the bot re-logs-in on expiry.
     """
 
-    access_token: str
-    refresh_token: str
+    access_token: str = field(repr=False)
+    refresh_token: str = field(repr=False)
     expires_in: int
 
 

@@ -22,6 +22,7 @@ import {
   FileTextIcon,
   Link2Icon,
   Loader2Icon,
+  PencilIcon,
   SplitIcon,
   XIcon,
 } from "lucide-react";
@@ -71,11 +72,12 @@ import {
   ELICITATION_RESPONSE_PREFIX,
   hasPendingOwnElicitation,
   imagePreview,
+  isPendingBlockingElicitation,
   isTextBlock,
   keyedAttachments,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
-import { getCurrentAuthorId } from "@/lib/identity";
+import { getCurrentAuthorId, getCurrentUserId } from "@/lib/identity";
 import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
@@ -94,13 +96,15 @@ import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/components/SessionImage";
 import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNotice";
+import { EditSentMessageContext } from "@/components/chat/editSentMessage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
 import { copyMarkdown } from "@/lib/copyMarkdown";
+import { codexAsyncQuestionReplyText } from "@/lib/codexAsyncQuestionReply";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
-import type { PendingInput, SessionStatus } from "@/lib/types";
+import type { BackgroundTaskInfo, PendingInput, SessionStatus } from "@/lib/types";
 import {
   TRANSCRIPT_SCROLLBAR_DRAG_EVENT,
   type TranscriptScrollbarDragDetail,
@@ -120,7 +124,7 @@ export const SessionSharedContext = createContext(false);
 /** A user message's raw text, minus runtime context and any sender prefix. */
 function userMessageBody(content: MessageContentBlock[]): string {
   const text = stripAutomationContext(joinTextBlocks(content));
-  return splitSessionMessageOrigin(text)?.body ?? text;
+  return codexAsyncQuestionReplyText(splitSessionMessageOrigin(text)?.body ?? text);
 }
 
 /** A user message's text for reading and copying: mention markers become ``@name``. */
@@ -230,6 +234,7 @@ export function buildPendingBubbles(
       pending: true,
       ...(p.sentMidTurn ? { awaitingAgent: true } : {}),
       ...(p.stillSending && p.posted !== true ? { stillSending: true } : {}),
+      ...(p.posted === true ? { accepted: true } : {}),
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
@@ -487,6 +492,30 @@ export function isBackgroundTasksOnly(
 }
 
 /**
+ * Waiting only on background agents a FINISHED claude-native turn left running.
+ * The turn is over, so this replaces the shimmer; a dialog or a new local send
+ * wins.
+ */
+export function isBackgroundAgentsOnly(
+  sessionStatus: SessionStatus,
+  agents: readonly BackgroundTaskInfo[],
+  blockedOn: string | null,
+  localSending: boolean,
+): boolean {
+  return sessionStatus === "waiting" && agents.length > 0 && !blockedOn && !localSending;
+}
+
+/**
+ * What the session still waits on, e.g. "Background agent running: Audit the
+ * auth flow", or "2 background agents running" when there are several.
+ */
+export function backgroundAgentsLabel(agents: readonly BackgroundTaskInfo[]): string {
+  if (agents.length !== 1) return `${agents.length} background agents running`;
+  const description = agents[0]?.description?.trim();
+  return description ? `Background agent running: ${description}` : "Background agent running";
+}
+
+/**
  * Whether the agent's own turn is in progress — server `running`/`waiting`, or
  * a local send in flight.
  */
@@ -500,9 +529,9 @@ function useAgentTurnActive(): boolean {
   return computeIsTurnActive(sessionStatus, localSending);
 }
 
-/** Whether any elicitation card is still awaiting the user's answer. */
+/** Whether any elicitation card still parks the turn on the user's answer. */
 function hasPendingElicitationBlock(blocks: readonly AnyBlock[]): boolean {
-  return blocks.some((b) => b.type === "elicitation" && b.status === "pending");
+  return blocks.some(isPendingBlockingElicitation);
 }
 
 /**
@@ -543,6 +572,9 @@ export function WorkingIndicator() {
   const scopedConversationId = useContext(ConversationScopeContext);
   const scopedState = useConversationEntryState(scopedConversationId);
   const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
+  const rootBackgroundAgents = useChatStore((s) => s.backgroundAgents);
+  const rootSessionStatus = useChatStore((s) => s.sessionStatus);
+  const rootLocalSending = useChatStore((s) => s.status === "streaming");
   const rootBlockedOn = useChatStore((s) => s.blockedOn);
   const rootHasOwnPendingElicitation = useChatStore((s) =>
     hasPendingOwnElicitation(s.blocks, s.conversationId),
@@ -558,6 +590,35 @@ export function WorkingIndicator() {
     ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
     : rootAgentWorking;
   const tick = useWorkingLabelTick();
+  const backgroundAgents = scopedConversationId
+    ? scopedState.backgroundAgents
+    : rootBackgroundAgents;
+  const waitsOnBackgroundAgents = isBackgroundAgentsOnly(
+    scopedConversationId ? scopedState.sessionStatus : rootSessionStatus,
+    backgroundAgents,
+    blockedOn,
+    scopedConversationId ? scopedState.status === "streaming" : rootLocalSending,
+  );
+  if (waitsOnBackgroundAgents) {
+    // The turn ended and the composer is free, but the session isn't idle:
+    // name the agent it still waits on rather than shimmering "Working…".
+    const label = backgroundAgentsLabel(backgroundAgents);
+    return (
+      <>
+        <span role="status" aria-live="polite" className="sr-only">
+          {label}
+        </span>
+        <Message from="assistant" data-testid="background-agents-indicator" aria-hidden="true">
+          <MessageContent>
+            <div className="flex min-w-0 items-center gap-1.5 py-0.5 text-muted-foreground">
+              <RunningDot className="size-3.5 shrink-0" />
+              <span className="truncate text-sm font-mono">{label}</span>
+            </div>
+          </MessageContent>
+        </Message>
+      </>
+    );
+  }
   // Background shells outliving a finished turn keep the session in progress,
   // but the agent isn't thinking: show a plain spinner instead of the shimmer.
   // The main composer's pill announces the count; side chats have no pill.
@@ -940,6 +1001,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useScopedConversationId();
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
+  const editSentMessage = useContext(EditSentMessageContext);
   // - input_image: `imagePreview` picks the variant — an uploaded file, an
   //   imported inline data URI, an in-flight upload chip, or a placeholder
   //   for a block carrying neither.
@@ -984,6 +1046,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Badge OTHER contributors' messages only (never your own).
   const author = bubble.createdBy;
   const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
+  // Edit copies the text of a message you sent, shared session or not; single-user
+  // messages carry no author. A pending message counts once the server has it.
+  const canEdit =
+    editSentMessage !== null &&
+    (!bubble.pending || bubble.accepted === true) &&
+    (author === undefined || author === getCurrentUserId()) &&
+    text.trim().length > 0;
 
   return (
     <Message
@@ -1190,6 +1259,21 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
               </MessageAction>
             )}
+            {canEdit && (
+              <MessageAction
+                tooltip="Edit and resend"
+                size="icon-xxs"
+                className="[@media(pointer:coarse)]:size-8"
+                onClick={() =>
+                  editSentMessage({
+                    text: isShellCommand ? text : userMessageBody(bubble.content),
+                  })
+                }
+                componentId="chat.message.edit_user"
+              >
+                <PencilIcon size={14} />
+              </MessageAction>
+            )}
             <MessageAction
               tooltip={isLinkCopied ? "Copied!" : "Copy link"}
               size="icon-xxs"
@@ -1237,7 +1321,7 @@ function AssistantBubble({
   const rootSessionStatus = useChatStore((s) => s.sessionStatus);
   const rootHasPendingElicitation = useChatStore((s) => hasPendingElicitationBlock(s.blocks));
   const sessionStatus = scopedConversationId ? scopedState.sessionStatus : rootSessionStatus;
-  // A pending elicitation means the turn is parked awaiting the user — still in
+  // A pending blocking elicitation means the turn is parked awaiting the user — still in
   // flight even when its lifecycle or the session status reads settled.
   const hasPendingElicitation = scopedConversationId
     ? hasPendingElicitationBlock(scopedState.blocks)
@@ -1275,7 +1359,7 @@ function AssistantBubble({
           current.sessionStatus === "running" ||
           current.sessionStatus === "waiting" ||
           current.pendingUserMessages.length > 0 ||
-          current.blocks.some((block) => block.type === "elicitation" && block.status === "pending")
+          current.blocks.some(isPendingBlockingElicitation)
         ) {
           throw new Error("Wait for the current turn to finish before retrying");
         }

@@ -13,7 +13,10 @@ import json as _json
 import re as _re
 from typing import Literal
 
-from omnigent.native.permission_modes import APPROVAL_SKIPPING_PERMISSION_MODES
+from omnigent.native.permission_modes import (
+    AGENT_DEFAULT_PERMISSION_MODE_HINT,
+    APPROVAL_SKIPPING_PERMISSION_MODES,
+)
 from omnigent.policies.schema import (
     PolicyCallable,
     PolicyEvent,
@@ -421,6 +424,7 @@ _PREVIEW_VALUE_CHARS = 60
 _PREVIEW_EXTRA_CHARS = 200
 
 _SCHEDULED_TASK_REVIEW_FIELDS = frozenset({"prompt", "permission_mode"})
+_PERMISSION_MODE_VALUES = f"a mode name, or {AGENT_DEFAULT_PERMISSION_MODE_HINT}"
 
 
 def _clip(value: str) -> str:
@@ -466,7 +470,7 @@ def scheduled_task_review_error(
         hint = (
             "List the task and retry with its full prompt and permission_mode."
             if action == "update"
-            else "Retry with prompt and permission_mode (null for the agent default)."
+            else f"Retry with prompt and permission_mode: {_PERMISSION_MODE_VALUES}."
         )
         return f"Missing review fields ({', '.join(missing)}). {hint}"
     if "prompt" in args or action == "create":
@@ -475,8 +479,10 @@ def scheduled_task_review_error(
             return "The automation prompt must be a non-empty string."
     if "permission_mode" in args:
         mode = args["permission_mode"]
-        if mode is not None and (not isinstance(mode, str) or not mode.strip()):
-            return "permission_mode must be a non-empty string or null for the agent default."
+        if mode is not None and (
+            not isinstance(mode, str) or mode.strip().lower() in ("", "null")
+        ):
+            return f"permission_mode must be {_PERMISSION_MODE_VALUES}."
     if action == "update" and not args.get("scheduled_task_id"):
         return "Provide the scheduled_task_id of the automation to update."
     return None

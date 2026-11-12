@@ -557,6 +557,10 @@ def test_commit_ids_must_be_full_lowercase_shas(
         pr_resource.pr_commits(tracked, session_id="session", pr_url=B, head_sha=bad_sha)
     with pytest.raises(ValueError, match="full commit SHA"):
         pr_resource.pr_commit_diff(tracked, session_id="session", pr_url=B, commit_sha=bad_sha)
+    with pytest.raises(ValueError, match="full commit SHA"):
+        pr_resource.pr_compare_diff(
+            tracked, session_id="session", pr_url=B, head_sha="a" * 40, from_sha=bad_sha
+        )
 
 
 async def test_commits_route_pins_head_and_diff_route_reads_one_commit(
@@ -583,6 +587,10 @@ async def test_commits_route_pins_head_and_diff_route_reads_one_commit(
             return 0, json.dumps(pr), ""
         if args[-1] == "repos/example/two/pulls/42/commits?per_page=100":
             return 0, json.dumps(listing), ""
+        if args[-1] == f"repos/example/two/compare/{commit}...{head}":
+            return 0, "compare-patch", ""
+        if "graphql" in args:
+            return 1, "", "no associated PRs here"
         assert args[-1] == f"repos/example/two/commits/{commit}"
         return 0, "commit-patch", ""
 
@@ -617,6 +625,10 @@ async def test_commits_route_pins_head_and_diff_route_reads_one_commit(
             "/v1/sessions/session/resources/github/commit-diff",
             params={"pr_url": B, "commit_sha": "e" * 40},
         )
+        compared = await client.get(
+            "/v1/sessions/session/resources/github/compare-diff",
+            params={"pr_url": B, "head_sha": head, "from_sha": commit},
+        )
 
     assert commits.status_code == 200, commits.text
     assert commits.json() == {
@@ -638,6 +650,8 @@ async def test_commits_route_pins_head_and_diff_route_reads_one_commit(
     assert "pull request changed" in moved.json()["detail"]
     assert patch.status_code == 200, patch.text
     assert patch.json() == {"object": "session.github.pr_diff", "patch": "commit-patch"}
+    assert compared.status_code == 200, compared.text
+    assert compared.json() == {"object": "session.github.pr_diff", "patch": "compare-patch"}
     assert any("Accept: application/vnd.github.diff" in args for args in gh_args)
     assert malformed.status_code == 400
     assert foreign.status_code == 400

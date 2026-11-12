@@ -77,6 +77,44 @@ def _write_claude_plugin(config_dir: Path, *, enabled: bool = True) -> None:
     _write_json(config_dir / "settings.json", {"enabledPlugins": {"figma@market": enabled}})
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_unreadable_plugin_install_path_skips_only_that_plugin(home: Path) -> None:
+    """A plugin dir that can't be stat'ed must not drop the rest of the Claude inventory."""
+    config = home / ".claude"
+    cache = config / "plugins" / "cache" / "market"
+    healthy = cache / "figma" / "1.0"
+    _write_json(healthy / ".mcp.json", {"mcpServers": {"figma": _stdio()}})
+    locked_parent = cache / "locked"
+    locked = locked_parent / "tool" / "1.0"
+    _write_json(locked / ".mcp.json", {"mcpServers": {"tool": _stdio()}})
+    _write_json(home / ".claude.json", {"mcpServers": {"github": _stdio()}})
+    _write_json(
+        config / "plugins" / "installed_plugins.json",
+        {
+            "version": 2,
+            "plugins": {
+                "tool@market": [{"scope": "user", "installPath": str(locked)}],
+                "figma@market": [{"scope": "user", "installPath": str(healthy)}],
+            },
+        },
+    )
+    _write_json(
+        config / "settings.json",
+        {"enabledPlugins": {"tool@market": True, "figma@market": True}},
+    )
+
+    locked_parent.chmod(0)
+    try:
+        servers = discover_mcp_servers()
+    finally:
+        locked_parent.chmod(0o755)
+
+    assert [(s["name"], s.get("plugin")) for s in servers if s["harness"] == "claude"] == [
+        ("github", None),
+        ("figma", "figma"),
+    ]
+
+
 def test_reads_each_harness_and_drops_secrets(home: Path) -> None:
     _write_json(
         home / ".claude.json",
@@ -430,11 +468,13 @@ def test_auth_status_is_fresh_while_the_config_scan_is_cached(
     assert "auth_status" not in inventory.discover()[0]
 
 
-def test_managed_config_servers_are_discovered_and_outrank_user_config(
+def test_a_managed_config_lists_only_the_servers_claude_code_loads(
     home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An organization's pinned servers are often the ones needing sign-in, so the
-    inventory has to see them; they also win their name against the user's own config."""
+    inventory has to see them. While the file exists Claude Code loads no user, project
+    or plugin server, so those rows would name servers no session can reach."""
+    _write_claude_plugin(home / ".claude")
     _write_managed_mcp(
         tmp_path,
         monkeypatch,
@@ -474,9 +514,25 @@ def test_managed_config_servers_are_discovered_and_outrank_user_config(
             "scope": "user",
             "managed": "true",
         },
-        {"name": "own", "harness": "claude", "transport": "stdio", "scope": "user"},
     ]
     assert _SECRET not in json.dumps(servers)
+
+    # A file that can't be parsed or read still keeps exclusive control, so Claude Code
+    # loads nothing.
+    managed = tmp_path / "managed" / "managed-mcp.json"
+    managed.write_text("not json")
+    assert discover_mcp_servers() == []
+
+    managed.write_text(json.dumps({"mcpServers": {"linear": _stdio()}}))
+    read_text = Path.read_text
+
+    def deny_managed(path: Path, *args: object, **kwargs: object) -> str:
+        if path == managed:
+            raise PermissionError(13, "Permission denied", str(path))
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", deny_managed)
+    assert discover_mcp_servers() == []
 
 
 def test_only_the_first_readable_managed_config_counts(
