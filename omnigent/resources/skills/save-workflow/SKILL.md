@@ -21,8 +21,9 @@ does ("Triage flaky tests") in your reply, and save once they agree.
   for the plan's graph, then its statuses and notes. Keep the steps worth
   repeating, and drop one-off steps and tries that were abandoned.
 - From a description: read the repo if it helps, and draft the steps you'd
-  plan for it, without doing the work. The draft stays in chat: don't write it
-  as the session's plan.
+  plan for it, without doing the work. Write the draft as the session's plan
+  with `sys_journal_write_plan`, named for the workflow, so the user sees it in
+  the Tasks tab, and don't start its steps.
 - Keep the exploration step first, written for the next run ("Explore the
   failing tests"). Leave out the review step: a run adds one when the user asks
   to review its plan.
@@ -47,12 +48,13 @@ and the agent running it asks for any that are missing.
 
 - A plan this session ran: save it now, with `sys_workflow_save`.
 - A workflow drafted from a description waits for the user's go-ahead. Reply
-  with the draft, its steps in order and what a run needs, and end it with
-  both choices: "Save it now, or try it once first: tell me what to run it
-  on." Revise the draft as they ask, and save when they say so. To try it
-  first, get the run's details, say what the trial will touch, and run it with
-  the workflow skill. When the run is done, offer to save it, with anything the
-  trial taught you.
+  with what it does and what a run needs, point to its steps in the Tasks tab,
+  and end with both choices: "Save it now, or try it once first: tell me what
+  to run it on." Revise it as they ask by writing the plan again, and save its
+  steps when they say so. To try it first, get the run's details, say what the
+  trial will touch, and work through the plan with the workflow skill: it's
+  already the plan, so don't plan it again. When the run is done, offer to save
+  it, with anything the trial taught you.
 
 On `name_taken`, ask the user for another name. After saving, reply with what
 you saved, its name, description and steps, and say it's now under Run a
