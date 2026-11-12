@@ -369,7 +369,7 @@ def credential_label(
     if kind == DATABRICKS_KIND:
         return f"Databricks ({profile})" if profile else "Databricks"
     if kind == CLI_CONFIG_KIND:
-        # Use the entry name (e.g. "isaac-databricks-codex" → "Isaac-Databricks-Codex")
+        # Use the entry name (e.g. "gateway-databricks-codex" → "Gateway-Databricks-Codex")
         # so cli-config providers show consistently alongside other provider kinds.
         return provider_display_name(provider_name)
     if kind == KEY_KIND:

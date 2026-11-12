@@ -754,7 +754,7 @@ def test_describe_active_credential_cli_config() -> None:
     """The /model readout describes a cli-config default truthfully.
 
     Failure means the readout would crash on (or misname) an adopted
-    isaac-style provider.
+    gateway provider.
     """
     from omnigent.onboarding.provider_config import describe_active_credential
 

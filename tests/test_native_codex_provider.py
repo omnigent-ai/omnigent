@@ -440,7 +440,7 @@ def test_resolve_native_codex_launch_cli_config_default_pins_provider(
     The provider table + credential live in ~/.codex/config.toml (bridged
     into the session CODEX_HOME), so the launch must carry exactly the pin —
     no synthesized base_url/auth overrides, no profile, no forced model.
-    Failure on the pin means an adopted isaac-style provider launches the
+    Failure on the pin means an adopted gateway provider launches the
     native terminal on codex's built-in (unauthenticated) path; extra
     overrides mean we fabricated a transport over the config.toml one.
     """
@@ -507,7 +507,7 @@ def test_resolve_native_codex_launch_undismissed_config_provider_routes_via_pin(
 ) -> None:
     """The same config WITHOUT a dismissal routes through the detected provider.
 
-    Counterpart to the dismissal test above: an isaac-configured machine
+    Counterpart to the dismissal test above: a machine configured for a gateway
     that never Removed anything must keep routing through the gateway (via
     the detected cli-config provider's pin), not get force-pinned to
     ``openai``. Failure here means the no-provider neutralization fires too
