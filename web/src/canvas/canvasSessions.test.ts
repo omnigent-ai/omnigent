@@ -439,50 +439,47 @@ describe("useCanvasSessions", () => {
     });
   });
 
-  it.each([true, false])(
-    "restores only owned rows from the current view's reload cache (admin view %s)",
-    async (enabled) => {
-      if (!enabled) document.cookie = "omnigent_admin_view=off; Path=/";
-      window.sessionStorage.setItem(
-        "omnigent:canvas-sessions:server-a:me:true",
-        JSON.stringify({
-          version: 1,
-          sessions: [
-            session("a", 9, { owner: "me" }),
-            session("b", 8),
-            session("shared-owner", 7, { owner: "someone-else", permission_level: 4 }),
-            session("shared-grant", 6, { permission_level: 1 }),
-          ],
-        }),
-      );
-      vi.mocked(identity.resolveIdentity).mockResolvedValue("me");
-      const reloadedClient = new QueryClient();
-      reloadedClient.setQueryData(["conversations", "", true], {
-        pageParams: [undefined],
-        pages: [page([session("preview", 10)], null, false)],
-      });
-      vi.mocked(identity.authenticatedFetch).mockReturnValueOnce(new Promise<Response>(() => {}));
-      const reloaded = renderHook(() => useCanvasSessions(), {
-        wrapper: wrapper(reloadedClient),
-      });
+  it.each([true, false])("restores cached owned rows for admin view %s", async (enabled) => {
+    if (!enabled) document.cookie = "omnigent_admin_view=off; Path=/";
+    window.sessionStorage.setItem(
+      "omnigent:canvas-sessions:server-a:me:true",
+      JSON.stringify({
+        version: 1,
+        sessions: [
+          session("a", 9, { owner: "me" }),
+          session("b", 8),
+          session("shared-owner", 7, { owner: "someone-else", permission_level: 4 }),
+          session("shared-grant", 6, { permission_level: 1 }),
+        ],
+      }),
+    );
+    vi.mocked(identity.resolveIdentity).mockResolvedValue("me");
+    const reloadedClient = new QueryClient();
+    reloadedClient.setQueryData(["conversations", "", true], {
+      pageParams: [undefined],
+      pages: [page([session("preview", 10)], null, false)],
+    });
+    vi.mocked(identity.authenticatedFetch).mockReturnValueOnce(new Promise<Response>(() => {}));
+    const reloaded = renderHook(() => useCanvasSessions(), {
+      wrapper: wrapper(reloadedClient),
+    });
 
-      // Do not flash the short preview while the persisted cache's viewer resolves.
+    // Do not flash the short preview while the persisted cache's viewer resolves.
+    expect(reloaded.result.current.sessions.map((row) => row.id)).toEqual(
+      enabled ? [] : ["preview"],
+    );
+    expect(reloaded.result.current.loaded).toBe(!enabled);
+    await waitFor(() =>
       expect(reloaded.result.current.sessions.map((row) => row.id)).toEqual(
-        enabled ? [] : ["preview"],
-      );
-      expect(reloaded.result.current.loaded).toBe(!enabled);
-      await waitFor(() =>
-        expect(reloaded.result.current.sessions.map((row) => row.id)).toEqual(
-          enabled ? ["a", "b"] : ["preview"],
-        ),
-      );
-      expect(reloaded.result.current).toMatchObject({
-        loaded: true,
-        complete: enabled,
-        networkConfirmed: false,
-      });
-    },
-  );
+        enabled ? ["a", "b"] : ["preview"],
+      ),
+    );
+    expect(reloaded.result.current).toMatchObject({
+      loaded: true,
+      complete: enabled,
+      networkConfirmed: false,
+    });
+  });
 
   it("resolves identity before fetching and never stores an authenticated list as anonymous", async () => {
     let finishIdentity!: (viewerId: string) => void;
