@@ -71,6 +71,7 @@ from omnigent.harness_plugins import (
     spawn_env_builders,
 )
 from omnigent.llms.errors import detect_request_size_overflow
+from omnigent.native._native_forwarder_health import has_pending_delivery
 from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
@@ -1628,6 +1629,8 @@ def create_runner_app(
     _sessions_with_background_shell: set[str] = set()
 
     def _has_active_work(*, include_pane_activity: bool = True) -> bool:
+        if has_pending_delivery():
+            return True
         if _active_turns:
             return True
         if _claude_prompt_waiters:
@@ -8966,6 +8969,8 @@ def create_runner_app(
 
         async def _native_pane_is_busy(pane: PaneRef) -> bool:
             conv_id = pane.conversation_id
+            if has_pending_delivery(conv_id):
+                return True
             if conv_id in _active_turns or (
                 process_manager is not None and process_manager.has_active_turn(conv_id)
             ):

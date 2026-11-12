@@ -3940,10 +3940,21 @@ async def test_codex_session_needs_runner_terminal_false_without_client() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["none", "drained", "expired", "successor", "progress"])
 async def test_codex_child_from_init_envelope_gets_sub_agent_idle_window(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delivery: str
 ) -> None:
     """A Codex child identified only by its init envelope's parent is reaped after an hour."""
+    from types import SimpleNamespace
+
+    from omnigent.native import _native_forwarder_health as health
+    from omnigent.native import native_cost_popup
+
+    clock = [100.0]
+    monkeypatch.setattr(health, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    input_probe, output_probe = Mock(return_value=None), Mock(return_value=None)
+    monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", input_probe)
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", output_probe)
     monkeypatch.delenv("OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S", raising=False)
     terminal_registry = TerminalRegistry()
     app = create_runner_app(
@@ -3991,6 +4002,37 @@ async def test_codex_child_from_init_envelope_gets_sub_agent_idle_window(
     assert reapable_at(3599.0) == set()
     assert reapable_at(3600.0) == {"conv_child"}
     assert reapable_at(86400.0) == {"conv_top", "conv_child"}
+
+    if delivery == "none":
+        return
+    pane = next(pane for pane in panes if pane.conversation_id == "conv_child")
+    owner, successor = object(), object()
+    health.begin_pending_delivery("conv_child", owner)
+    try:
+        assert await reaper._is_busy(pane)
+        input_probe.assert_not_called()
+        output_probe.assert_not_called()
+        if delivery == "progress":
+            clock[0] += 50
+            health.note_pending_delivery_progress("conv_child", owner)
+            clock[0] += 11
+            assert await reaper._is_busy(pane)
+            input_probe.assert_not_called()
+            clock[0] += 50
+        elif delivery == "expired":
+            clock[0] += 61
+        elif delivery == "successor":
+            health.begin_pending_delivery("conv_child", successor)
+            health.clear_pending_delivery("conv_child", owner)
+            assert await reaper._is_busy(pane)
+            health.clear_pending_delivery("conv_child", successor)
+        else:
+            health.clear_pending_delivery("conv_child", owner)
+        assert not await reaper._is_busy(pane)
+        input_probe.assert_called_once()
+    finally:
+        health.clear_pending_delivery("conv_child", owner)
+        health.clear_pending_delivery("conv_child", successor)
 
 
 @pytest.mark.asyncio

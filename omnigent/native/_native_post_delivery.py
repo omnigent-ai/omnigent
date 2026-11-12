@@ -16,15 +16,23 @@ the codex/antigravity forwarders so a single implementation is maintained.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import hashlib
 import json
 import logging
+import os
+import sys
 import time
+import uuid
+from collections import defaultdict, deque
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
+from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
 
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
@@ -43,6 +51,11 @@ _DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024  # 50 MB per session
 _DEAD_LETTER_BACKUP_FILE = _DEAD_LETTER_FILE + ".1"
 
 
+def _dead_letter_lock(bridge_dir: Path) -> FileLock:
+    """Serialize journal reads and writes without holding a lock during delivery."""
+    return FileLock(str(bridge_dir / "dead_letter.lock"), timeout=1.0, mode=0o600)
+
+
 def append_dead_letter(
     bridge_dir: Path,
     *,
@@ -53,7 +66,8 @@ def append_dead_letter(
     delivered_ambiguous: bool = False,
     http_status: int | None = None,
     transport_error: str | None = None,
-) -> None:
+    rejection_reason: str | None = None,
+) -> bool:
     """
     Append one undeliverable forward payload to ``{bridge_dir}/dead_letter.jsonl`` (#1120).
 
@@ -81,25 +95,15 @@ def append_dead_letter(
         ``503`` or ``400``; ``None`` for a transport failure that saw no response.
     :param transport_error: Transport-error class name when the POST raised without a
         response, e.g. ``"ConnectError"``; ``None`` when the server responded.
-    :returns: None.
+    :param rejection_reason: Permanent local validation failure, if any.
+    :returns: Whether the payload was written to the journal.
     """
     try:
         path = bridge_dir / _DEAD_LETTER_FILE
         bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        # Keep-newest: at the cap, rotate to a single .1 backup and start fresh.
-        if path.exists() and path.stat().st_size >= _DEAD_LETTER_MAX_BYTES:
-            path.replace(bridge_dir / _DEAD_LETTER_BACKUP_FILE)
-            # Log session_id, not path (logging a bridge path trips CodeQL's
-            # clear-text-sensitive-data heuristic; a bridge dir is not a secret).
-            _logger.warning(
-                "dead-letter file reached cap (%d bytes); rotated to %s and "
-                "started fresh (oldest dead-lettered forwards dropped): session=%s",
-                _DEAD_LETTER_MAX_BYTES,
-                _DEAD_LETTER_BACKUP_FILE,
-                session_id,
-            )
         line = json.dumps(
             {
+                "record_id": uuid.uuid4().hex,
                 "ts": time.time(),
                 "session_id": session_id,
                 "event_type": event_type,
@@ -107,11 +111,27 @@ def append_dead_letter(
                 "delivered_ambiguous": delivered_ambiguous,
                 "http_status": http_status,
                 "transport_error": transport_error,
+                "rejection_reason": rejection_reason,
                 "payload": payload,
             }
         )
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        with _dead_letter_lock(bridge_dir):
+            if path.exists() and path.stat().st_size >= _DEAD_LETTER_MAX_BYTES:
+                path.replace(bridge_dir / _DEAD_LETTER_BACKUP_FILE)
+                _logger.warning(
+                    "dead-letter file reached cap (%d bytes); rotated to %s and "
+                    "started fresh (oldest dead-lettered forwards dropped): session=%s",
+                    _DEAD_LETTER_MAX_BYTES,
+                    _DEAD_LETTER_BACKUP_FILE,
+                    session_id,
+                )
+            with path.open("a+b") as fh:
+                if fh.tell():
+                    fh.seek(-1, os.SEEK_END)
+                    if fh.read(1) != b"\n":
+                        fh.write(b"\n")
+                fh.write((line + "\n").encode())
+        return True
     except Exception as exc:  # noqa: BLE001 - dead-lettering must never disrupt forwarding.
         _logger.warning(
             "failed to dead-letter undeliverable forward: type=%s session=%s error=%r",
@@ -119,6 +139,7 @@ def append_dead_letter(
             session_id,
             exc,
         )
+        return False
 
 
 # Transport failures proving a POST never reached the server (no bytes
@@ -352,11 +373,13 @@ class RepostResult:
     :param http_status: Final HTTP status code when the server responded, or
         ``None`` for a transport failure that saw no response. Used to refresh
         the retained record's classification.
+    :param rejection_reason: Permanent local validation failure during replay.
     """
 
     delivered: bool
     delivered_ambiguous: bool = False
     http_status: int | None = None
+    rejection_reason: str | None = None
 
 
 def _dead_letter_record_replayable(
@@ -397,6 +420,8 @@ def _dead_letter_record_replayable(
         return False
     if "delivered_ambiguous" not in record:
         return False
+    if record.get("rejection_reason"):
+        return False
     if record.get("delivered_ambiguous"):
         payload = record.get("payload")
         source_id = payload.get("source_id") if isinstance(payload, dict) else None
@@ -428,7 +453,7 @@ def _read_dead_letter_entries(path: Path) -> list[object] | None:
     if not path.exists():
         return None
     entries: list[object] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="surrogateescape").splitlines():
         stripped = line.strip()
         if not stripped:
             continue
@@ -458,8 +483,68 @@ def _rewrite_dead_letter_entries(path: Path, entries: list[object]) -> None:
         return
     lines = [entry if isinstance(entry, str) else json.dumps(entry) for entry in entries]
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8", errors="surrogateescape")
     tmp.replace(path)
+
+
+def _dead_letter_snapshot(bridge_dir: Path) -> list[object]:
+    """Read the retained journal in append order."""
+    if not bridge_dir.exists():
+        return []
+    with _dead_letter_lock(bridge_dir):
+        return [
+            entry
+            for name in (_DEAD_LETTER_BACKUP_FILE, _DEAD_LETTER_FILE)
+            for entry in (_read_dead_letter_entries(bridge_dir / name) or [])
+        ]
+
+
+def _dead_letter_entry_key(entry: object) -> str:
+    """Identify an unchanged journal record across append and rotation."""
+    serialized = json.dumps(entry, sort_keys=True)
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _apply_dead_letter_updates(
+    bridge_dir: Path, updates: dict[str, deque[dict[str, object] | None]]
+) -> None:
+    """Apply delivery results only to their original records, retaining newer appends."""
+    if not updates:
+        return
+    with _dead_letter_lock(bridge_dir):
+        for name in (_DEAD_LETTER_BACKUP_FILE, _DEAD_LETTER_FILE):
+            path = bridge_dir / name
+            entries = _read_dead_letter_entries(path)
+            if entries is None:
+                continue
+            retained: list[object] = []
+            changed = False
+            for entry in entries:
+                replacements = updates.get(_dead_letter_entry_key(entry))
+                if replacements:
+                    replacement = replacements.popleft()
+                    changed = changed or replacement != entry
+                    if replacement is not None:
+                        retained.append(replacement)
+                else:
+                    retained.append(entry)
+            if changed:
+                _rewrite_dead_letter_entries(path, retained)
+
+
+def has_replayable_dead_letters(
+    bridge_dir: Path,
+    *,
+    retryable_status_codes: frozenset[int],
+    record_filter: Callable[[dict[str, object]], bool] | None = None,
+) -> bool:
+    """Whether the journal retains a safe record selected by the caller."""
+    return any(
+        _dead_letter_record_replayable(entry, retryable_status_codes=retryable_status_codes)
+        and isinstance(entry, dict)
+        and (record_filter is None or record_filter(entry))
+        for entry in _dead_letter_snapshot(bridge_dir)
+    )
 
 
 async def replay_dead_letters(
@@ -470,6 +555,7 @@ async def replay_dead_letters(
     logger_name: str | None = None,
     max_records: int | None = None,
     deadline_seconds: float | None = None,
+    record_filter: Callable[[dict[str, object]], bool] | None = None,
 ) -> int:
     """
     Re-POST proven-undelivered dead-lettered forwards on forwarder startup (#1579).
@@ -490,8 +576,8 @@ async def replay_dead_letters(
     silently dropped. The remaining latency lever, a short per-POST timeout and a
     single attempt, is the caller's responsibility (via ``repost``).
 
-    Intended to run once at startup, before live forwarding begins, so no other
-    writer races the dead-letter files for this ``bridge_dir``.
+    Journal snapshots and result updates use short file locks. Concurrent appends
+    and rotation survive replay, and cancellation still removes acknowledged records.
 
     :param bridge_dir: Native forwarder bridge directory holding the dead-letter
         files.
@@ -508,49 +594,65 @@ async def replay_dead_letters(
     :param deadline_seconds: Wall-clock budget for the whole drain, e.g.
         ``30.0``; ``None`` for no deadline. Once exceeded, the remaining
         replayable records are deferred to a later startup.
+    :param record_filter: Optional restriction, such as source-idempotent records
+        belonging to one conversation during live recovery.
     :returns: The number of records successfully replayed (and removed).
     """
-    log = logging.getLogger(logger_name) if logger_name else _logger
-    sources = [
-        bridge_dir / _DEAD_LETTER_BACKUP_FILE,
-        bridge_dir / _DEAD_LETTER_FILE,
-    ]
-    loaded: list[tuple[Path, list[object]]] = []
-    any_replayable = False
-    for path in sources:
-        entries = _read_dead_letter_entries(path)
-        if entries is None:
-            continue
-        loaded.append((path, entries))
-        if any(
-            _dead_letter_record_replayable(entry, retryable_status_codes=retryable_status_codes)
-            for entry in entries
-        ):
-            any_replayable = True
-    if not any_replayable:
-        # Nothing recoverable — leave the forensic files untouched.
+    if not bridge_dir.exists():
         return 0
+    deadline = time.monotonic() + deadline_seconds if deadline_seconds is not None else None
+    drain_lock = FileLock(str(bridge_dir / "dead_letter.replay.lock"), mode=0o600)
+    while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            return 0
+        try:
+            drain_lock.acquire(timeout=0)
+            break
+        except FileLockTimeout:
+            await asyncio.sleep(0.05)
+    try:
+        return await _replay_dead_letters_locked(
+            bridge_dir,
+            repost=repost,
+            retryable_status_codes=retryable_status_codes,
+            logger_name=logger_name,
+            max_records=max_records,
+            deadline=deadline,
+            record_filter=record_filter,
+        )
+    finally:
+        drain_lock.release()
 
+
+async def _replay_dead_letters_locked(
+    bridge_dir: Path,
+    *,
+    repost: Callable[[dict[str, object]], Coroutine[None, None, RepostResult]],
+    retryable_status_codes: frozenset[int],
+    logger_name: str | None,
+    max_records: int | None,
+    deadline: float | None,
+    record_filter: Callable[[dict[str, object]], bool] | None,
+) -> int:
+    """Drain one snapshot while a separate lock excludes another replayer."""
+    log = logging.getLogger(logger_name) if logger_name else _logger
+    entries = await asyncio.to_thread(_dead_letter_snapshot, bridge_dir)
+    updates: dict[str, deque[dict[str, object] | None]] = defaultdict(deque)
     replayed = 0
     attempted = 0
     deferred = 0
     stop = False
-    deadline = time.monotonic() + deadline_seconds if deadline_seconds is not None else None
-    # ``loaded`` preserves the .1-then-current source order, so records replay
-    # in the order they were originally dropped.
-    for path, entries in loaded:
-        retained: list[object] = []
-        changed = False
+    try:
         for entry in entries:
             if not _dead_letter_record_replayable(
                 entry, retryable_status_codes=retryable_status_codes
             ):
-                # Forensic record (ambiguous / permanent-4xx / malformed) — keep as is.
-                retained.append(entry)
+                continue
+            assert isinstance(entry, dict)
+            if record_filter is not None and not record_filter(entry):
                 continue
             if stop:
                 deferred += 1
-                retained.append(entry)
                 continue
             over_records = max_records is not None and attempted >= max_records
             over_deadline = deadline is not None and time.monotonic() >= deadline
@@ -559,28 +661,54 @@ async def replay_dead_letters(
                 # to the next startup rather than stall here.
                 stop = True
                 deferred += 1
-                retained.append(entry)
                 continue
-            assert isinstance(entry, dict)  # narrowed by _dead_letter_record_replayable
             attempted += 1
             result = await repost(entry)
+            key = _dead_letter_entry_key(entry)
             if result.delivered:
                 replayed += 1
-                changed = True
+                updates[key].append(None)
                 continue
             if (
                 entry.get("delivered_ambiguous") != result.delivered_ambiguous
                 or entry.get("http_status") != result.http_status
+                or entry.get("rejection_reason") != result.rejection_reason
             ):
-                entry = {
+                replacement = {
                     **entry,
                     "delivered_ambiguous": result.delivered_ambiguous,
                     "http_status": result.http_status,
+                    "rejection_reason": result.rejection_reason,
                 }
-                changed = True
-            retained.append(entry)
-        if changed:
-            _rewrite_dead_letter_entries(path, retained)
+                updates[key].append(replacement)
+            else:
+                updates[key].append(entry)
+    finally:
+        if updates:
+            commit = asyncio.create_task(
+                asyncio.to_thread(_apply_dead_letter_updates, bridge_dir, updates)
+            )
+            cancelled = isinstance(sys.exception(), asyncio.CancelledError)
+            while not commit.done():
+                try:
+                    await asyncio.shield(commit)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:  # noqa: BLE001 - inspect the completed task below.
+                    break
+            try:
+                commit.result()
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception as exc:
+                if not cancelled:
+                    raise
+                _logger.warning(
+                    "Journal update incomplete during cancellation: error_type=%s",
+                    type(exc).__name__,
+                )
+            if cancelled:
+                raise asyncio.CancelledError
     if replayed:
         log.info(
             "replayed %d proven-undelivered dead-lettered forward(s) on startup",
@@ -589,9 +717,8 @@ async def replay_dead_letters(
     if deferred:
         log.info(
             "deferred %d replayable dead-lettered forward(s) to a later startup "
-            "(replay budget reached: max_records=%s deadline_seconds=%s)",
+            "(replay budget reached: max_records=%s)",
             deferred,
             max_records,
-            deadline_seconds,
         )
     return replayed

@@ -123,3 +123,32 @@ def test_note_post_success_stamps_last_post_at(monkeypatch: pytest.MonkeyPatch) 
         assert health.last_post_at() is None
     finally:
         health.clear()
+
+
+def test_pending_delivery_lease_has_fixed_deadline_and_owning_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retries never renew a lease, and a retiring worker cannot clear its successor."""
+    clock = _FakeClock(start=1000.0)
+    monkeypatch.setattr(health, "time", clock)
+    monkeypatch.setattr(health, "_pending_deliveries", {})
+    first = object()
+    successor = object()
+    health.begin_pending_delivery("conv_first", first)
+    assert health.has_pending_delivery("conv_first")
+    assert health.has_pending_delivery()
+    assert not health.has_pending_delivery("conv_other")
+
+    clock.now += health._PENDING_DELIVERY_GRACE_S
+    health.begin_pending_delivery("conv_first", first)
+    assert not health.has_pending_delivery()
+    health.begin_pending_delivery("conv_first", successor)
+    health.clear_pending_delivery("conv_first", first)
+    assert health.has_pending_delivery("conv_first")
+
+    health.begin_pending_delivery("conv_other", first)
+    health.clear_pending_delivery("conv_first", successor)
+    assert not health.has_pending_delivery("conv_first")
+    assert health.has_pending_delivery()
+    health.clear_pending_delivery("conv_other", first)
+    assert not health.has_pending_delivery()

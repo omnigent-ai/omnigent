@@ -22,6 +22,7 @@ unrelated stall.
 
 from __future__ import annotations
 
+import threading
 import time
 
 # Single-slot holder rather than a module global + ``global`` statement: one
@@ -34,6 +35,56 @@ _state: dict[str, tuple[float, str] | None] = {"last_post_failure": None}
 # idle watchdog reads it, so a sub-agent still streaming while its parent is idle
 # counts as activity; once posts stop, the idle window bounds the hold.
 _last_post_at: dict[str, float | None] = {"value": None}
+_PENDING_DELIVERY_GRACE_S = 60.0
+_pending_deliveries: dict[str, list[tuple[object, float]]] = {}
+_pending_deliveries_lock = threading.Lock()
+
+
+def begin_pending_delivery(session_id: str, owner: object) -> None:
+    """Give an owning worker one fixed grace window to finish durable mirror delivery."""
+    deadline = time.monotonic() + _PENDING_DELIVERY_GRACE_S
+    with _pending_deliveries_lock:
+        leases = _pending_deliveries.setdefault(session_id, [])
+        if not any(current_owner is owner for current_owner, _ in leases):
+            leases.append((owner, deadline))
+
+
+def note_pending_delivery_progress(session_id: str, owner: object) -> None:
+    """Extend only an existing owner's lease after new acknowledged delivery progress."""
+    deadline = time.monotonic() + _PENDING_DELIVERY_GRACE_S
+    with _pending_deliveries_lock:
+        leases = _pending_deliveries.get(session_id, [])
+        for index, (current_owner, _) in enumerate(leases):
+            if current_owner is owner:
+                leases[index] = (owner, deadline)
+                return
+
+
+def clear_pending_delivery(session_id: str, owner: object) -> None:
+    """Retire only the calling worker's delivery lease."""
+    with _pending_deliveries_lock:
+        leases = _pending_deliveries.get(session_id)
+        if leases is not None:
+            retained = [
+                (current_owner, deadline)
+                for current_owner, deadline in leases
+                if current_owner is not owner
+            ]
+            if retained:
+                _pending_deliveries[session_id] = retained
+            else:
+                del _pending_deliveries[session_id]
+
+
+def has_pending_delivery(session_id: str | None = None) -> bool:
+    """Read bounded delivery work without file I/O or extending its first deadline."""
+    now = time.monotonic()
+    with _pending_deliveries_lock:
+        if session_id is not None:
+            return any(now < deadline for _, deadline in _pending_deliveries.get(session_id, []))
+        return any(
+            now < deadline for leases in _pending_deliveries.values() for _, deadline in leases
+        )
 
 
 def record_post_failure(event_type: str, error: BaseException) -> None:
