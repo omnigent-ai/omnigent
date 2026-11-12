@@ -623,6 +623,10 @@ class SqlSessionPermission(OmnigentBase):
     )
 
 
+# Largest stored value of a new compressed column: under the 16 KiB per-value
+# limit in docs/DATABASE_BEST_PRACTICES.md, which forbids exactly 16,384 bytes.
+MAX_STORED_VALUE_BYTES = 16 * 1024 - 1
+
 # MySQL stores these documents as BLOB (at most 65,535 bytes), so writes that
 # compress past that fail before reaching MySQL. Other dialects keep the uncapped codec.
 _MYSQL_BLOB_TEXT = CompressedText().with_variant(CompressedText(max_stored_bytes=65_535), "mysql")
@@ -1810,8 +1814,8 @@ class SqlSessionJournalEntry(OmnigentBase):
         for entries about no step, such as plans.
     :param idempotency_key: Names the write that appended the entry, e.g.
         ``"tool:toolu_01…"``, so a retried append returns the existing entry.
-    :param payload: The kind's fields as compressed JSON, kept under 16,384
-        stored bytes by ``SessionJournalStore``.
+    :param payload: The kind's fields as compressed JSON, at most
+        :data:`MAX_STORED_VALUE_BYTES` bytes stored.
     """
 
     __tablename__ = "session_journal_entries"
@@ -1833,7 +1837,9 @@ class SqlSessionJournalEntry(OmnigentBase):
     workflow_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     step: Mapped[str | None] = mapped_column(String(64), nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    payload: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    payload: Mapped[str] = mapped_column(
+        CompressedText(max_stored_bytes=MAX_STORED_VALUE_BYTES), nullable=False
+    )
 
     # Every index is non-unique and ends with the primary key: the heads lock,
     # not the database, keeps positions and idempotency keys unique.

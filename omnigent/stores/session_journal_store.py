@@ -7,8 +7,9 @@ other sessions' appends and the session's metadata updates don't wait. An
 append carries an idempotency key, so a retried append returns the entry its
 first attempt wrote instead of writing it twice.
 
-Payloads are the kind's compressed JSON, kept under the 16,384-byte limit on
-a stored column value.
+Payloads are the kind's compressed JSON, at most
+:data:`~omnigent.db.db_models.MAX_STORED_VALUE_BYTES` bytes stored. The store
+checks the size before writing, so an agent gets ``entry_too_large``.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from omnigent.db import compression
 from omnigent.db.db_models import (
+    MAX_STORED_VALUE_BYTES,
     SqlConversationMetadata,
     SqlSessionJournalEntry,
     SqlSessionJournalHead,
@@ -55,8 +57,6 @@ from omnigent.entities.session_journal import (
 from omnigent.errors import StaleCursorError
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
-# Below the 16,384-byte limit on a stored column value, after compression.
-JOURNAL_PAYLOAD_MAX_STORED_BYTES = 16_383
 # Headroom for compression framing on incompressible text.
 _FRAMING_BYTES = 32
 _PLAN_KIND = encode_journal_entry_kind("plan")
@@ -99,11 +99,11 @@ class JournalSessionNotFoundError(Exception):
 def _stored_payload(payload: Mapping[str, Any]) -> str:
     """The payload's JSON, refused when it doesn't fit the column compressed."""
     text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    if len(text.encode()) + _FRAMING_BYTES <= JOURNAL_PAYLOAD_MAX_STORED_BYTES:
+    if len(text.encode()) + _FRAMING_BYTES <= MAX_STORED_VALUE_BYTES:
         return text
     size = len(compression.encode(text) or b"")
-    if size > JOURNAL_PAYLOAD_MAX_STORED_BYTES:
-        raise JournalEntryTooLargeError("the stored entry", size, JOURNAL_PAYLOAD_MAX_STORED_BYTES)
+    if size > MAX_STORED_VALUE_BYTES:
+        raise JournalEntryTooLargeError("the stored entry", size, MAX_STORED_VALUE_BYTES)
     return text
 
 
