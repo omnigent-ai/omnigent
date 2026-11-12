@@ -1924,3 +1924,50 @@ class SqlSessionJournalHead(OmnigentBase):
     )
     conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     next_position: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class SqlWorkflow(OmnigentBase):
+    """
+    SQLAlchemy model for the ``workflows`` table.
+
+    A saved workflow: a named plan its owner can run. A run copies the plan into
+    the session's journal, whose entries then carry the workflow's ID in
+    ``session_journal_entries.workflow_id``. Workflows have no versions: an edit
+    rewrites the row, and each run's journal keeps the plan it ran.
+
+    :param id: UUID of the workflow, in the session ID's format (bare hex).
+    :param user_id: The owning user, or ``None`` in single-user mode. Names are
+        unique per owner, checked by the store rather than by a unique key.
+    :param name: One line, e.g. ``"nightly-build"``; a run's plan takes this name.
+    :param description: What the workflow is for; a run gives it to the agent as
+        the goal.
+    :param plan: The plan in the journal's plan format, as compressed JSON, at
+        most :data:`MAX_STORED_VALUE_BYTES` bytes stored.
+    :param created_at: Unix epoch seconds when the workflow was saved.
+    :param updated_at: Unix epoch seconds of the last write; ``created_at`` until
+        the first edit.
+    """
+
+    __tablename__ = "workflows"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # String(128) matches every other user-identity column.
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # A run's plan takes this name, and plan names are at most 80 characters.
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
+    # A few paragraphs: at most 8,000 bytes in UTF-8.
+    description: Mapped[str] = mapped_column(String(2000), nullable=False)
+    plan: Mapped[str] = mapped_column(
+        CompressedText(max_stored_bytes=MAX_STORED_VALUE_BYTES), nullable=False
+    )
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        # An owner's workflows by name: the list, `/workflow <name>` and the
+        # store's duplicate-name check. Not unique: NULL owners never collide.
+        Index("ix_workflows_user_id_name", "workspace_id", "user_id", "name", "id"),
+    )

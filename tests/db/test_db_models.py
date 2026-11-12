@@ -19,6 +19,7 @@ from sqlalchemy.dialects import mysql, sqlite
 from sqlalchemy.exc import IntegrityError, OperationalError, StatementError
 
 from omnigent.db.db_models import (
+    MAX_STORED_VALUE_BYTES,
     SqlAccountToken,
     SqlAgent,
     SqlComment,
@@ -32,6 +33,7 @@ from omnigent.db.db_models import (
     SqlSessionPermission,
     SqlUser,
     SqlUserDailyCost,
+    SqlWorkflow,
 )
 from omnigent.db.enum_codecs import (
     encode_account_token_kind,
@@ -1044,3 +1046,36 @@ class TestSqlUserDailyCost:
         with managed() as session:
             rows = session.query(SqlUserDailyCost).filter_by(user_id="u1").all()
             assert len(rows) == 2
+
+
+# ── SqlWorkflow ───────────────────────────────────────
+
+
+class TestSqlWorkflow:
+    def test_plan_writes_enforce_the_16_kib_stored_limit(self) -> None:
+        table = SqlWorkflow.__table__
+        assert table.c.plan.type.max_stored_bytes == MAX_STORED_VALUE_BYTES == 16 * 1024 - 1
+        plan = '{"steps":[{"id":"build","name":"Build","goal":null,"depends_on":[]}]}'
+        engine = sa.create_engine("sqlite://")
+        try:
+            table.create(engine)
+            with engine.begin() as connection:
+                connection.execute(
+                    table.insert().values(
+                        workspace_id=0,
+                        id="0123456789abcdef0123456789abcdef",
+                        user_id="alice@example.com",
+                        name="nightly-build",
+                        description="Build and test main every night.",
+                        plan=plan,
+                        created_at=1_762_534_860,
+                        updated_at=1_762_534_860,
+                    )
+                )
+                assert connection.execute(sa.select(table.c.plan)).scalar_one() == plan
+            # Random text barely compresses, so this stores above the limit.
+            oversized = "".join(random.Random(0).choices(string.ascii_letters, k=24_000))
+            with pytest.raises(StatementError, match="size limit"), engine.begin() as connection:
+                connection.execute(table.update().values(plan=oversized))
+        finally:
+            engine.dispose()
