@@ -3670,25 +3670,29 @@ def _manage_opencode_harness() -> None:
 def _repair_removal_dismissals(removed: dict[str, object], kept: dict[str, object]) -> set[str]:
     """Return live ambient detections that would re-adopt the *removed* entries.
 
-    Unlike :func:`_remove_credential`, setup's repair does not sign out, so a removed
-    subscription dismisses its CLI's login unless a *kept* entry still covers that CLI.
+    A detection matches a removed entry's name or a removed subscription's CLI. Unlike
+    :func:`_remove_credential`, setup's repair does not sign out, so a login is dismissed
+    too unless a *kept* subscription still covers that CLI.
     """
     from omnigent.onboarding.ambient import SUBSCRIPTION_KIND, detect_providers
 
-    def subscription_clis(block: dict[str, object]) -> set[object]:
+    def subscription_clis(block: dict[str, object]) -> set[str]:
         return {
-            entry.get("cli")
+            entry["cli"]
             for entry in block.values()
-            if isinstance(entry, dict) and entry.get("kind") == SUBSCRIPTION_KIND
+            if isinstance(entry, dict)
+            and entry.get("kind") == SUBSCRIPTION_KIND
+            and isinstance(entry.get("cli"), str)
         }
 
-    removed_clis = subscription_clis(removed) - subscription_clis(kept)
-    dismissed: set[str] = set()
-    for detection in detect_providers():
-        names = removed_clis if detection.kind == SUBSCRIPTION_KIND else removed.keys()
-        if detection.name in names:
-            dismissed.add(detection.name)
-    return dismissed
+    removed_names = set(removed) | subscription_clis(removed)
+    covered_clis = subscription_clis(kept)
+    return {
+        detection.name
+        for detection in detect_providers()
+        if detection.name in removed_names
+        and not (detection.kind == SUBSCRIPTION_KIND and detection.name in covered_clis)
+    }
 
 
 def _repair_invalid_provider_entries() -> bool:

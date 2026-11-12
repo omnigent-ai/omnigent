@@ -1696,10 +1696,7 @@ def set_default_provider(
             result[provider_name] = entry
             continue
         parsed = _parse_provider(provider_name, entry)
-        served = set(provider_families(parsed))
-        if parsed.kind in {GATEWAY_KIND, LOCAL_KIND}:
-            # Preserve Gemini's explicit opt-in when serializing new defaults.
-            served.discard(GEMINI_FAMILY)
+        served = _default_render_scopes(parsed)
         if provider_name == name:
             new_defaults = parsed.default_families | scope
         else:
@@ -1711,6 +1708,15 @@ def set_default_provider(
             body["default"] = raw_value
         result[provider_name] = body
     return result
+
+
+def _default_render_scopes(entry: ProviderEntry) -> set[str]:
+    """Return the scopes :func:`_default_raw_value` may render as ``default: true``."""
+    served = set(provider_families(entry))
+    if entry.kind in {GATEWAY_KIND, LOCAL_KIND}:
+        # Preserve Gemini's explicit opt-in when serializing new defaults.
+        served.discard(GEMINI_FAMILY)
+    return served
 
 
 def _parses(name: str, raw: dict[str, object]) -> bool:
@@ -1734,19 +1740,22 @@ def drop_unserved_default_scopes(name: str, entry: dict[str, object]) -> dict[st
         the entry is invalid for another reason.
     """
     body = {key: value for key, value in entry.items() if key != "default"}
-    if not _parses(name, body):
+    try:
+        parsed = _parse_provider(name, body)
+    except OmnigentError:
         return None
     if _parses(name, entry):
         return dict(entry)
     default_raw = entry.get("default")
     requested = default_raw if isinstance(default_raw, (list, tuple)) else [default_raw]
-    kept = [
+    kept = frozenset(
         scope
         for scope in requested
         if isinstance(scope, str) and _parses(name, {**body, "default": [scope]})
-    ]
-    if kept:
-        body["default"] = kept[0] if len(kept) == 1 else kept
+    )
+    default_value = _default_raw_value(kept, _default_render_scopes(parsed))
+    if default_value is not None:
+        body["default"] = default_value
     return body
 
 

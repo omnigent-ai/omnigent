@@ -417,11 +417,25 @@ def test_databricks_does_not_serve_gemini_surface() -> None:
                 "native_gemini": True,
                 "default": ["openai", "gemini"],
             },
-            {"kind": "databricks", "profile": "ws", "native_gemini": True, "default": "gemini"},
+            {"kind": "databricks", "profile": "ws", "native_gemini": True, "default": True},
         ),
         (
             {"kind": "databricks", "profile": "ws", "default": ["anthropic", "pi", "gemini"]},
             {"kind": "databricks", "profile": "ws", "default": ["anthropic", "pi"]},
+        ),
+        (
+            {
+                "kind": "gateway",
+                "anthropic": {"base_url": "https://gw.example.com/a", "api_key_ref": "env:K"},
+                "gemini": {"base_url": "https://gw.example.com/g", "api_key_ref": "env:G"},
+                "default": ["anthropic", "gemini", "openai"],
+            },
+            {
+                "kind": "gateway",
+                "anthropic": {"base_url": "https://gw.example.com/a", "api_key_ref": "env:K"},
+                "gemini": {"base_url": "https://gw.example.com/g", "api_key_ref": "env:G"},
+                "default": ["anthropic", "gemini"],
+            },
         ),
         ({"kind": "databricks", "native_gemini": True, "default": "openai"}, None),
     ],

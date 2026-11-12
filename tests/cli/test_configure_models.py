@@ -4079,13 +4079,14 @@ def test_setup_removing_invalid_subscription_keeps_login_and_dismisses_detection
     assert auth.read_text() == login
 
 
-def test_repair_removal_keeps_a_login_that_a_kept_subscription_covers(monkeypatch):
+@pytest.mark.parametrize("cli", ["codex", ["codex"], {"name": "codex"}])
+def test_repair_removal_keeps_a_login_that_a_kept_subscription_covers(monkeypatch, cli):
     from omnigent.cli_config import _repair_removal_dismissals
     from omnigent.onboarding.ambient import DetectedProvider
 
     login = DetectedProvider(name="codex", kind="subscription", family="openai", source="login")
     monkeypatch.setattr("omnigent.onboarding.ambient.detect_providers", lambda: [login])
-    removed = {"codex": {"kind": "subscription", "cli": "codex", "default": "anthropic"}}
+    removed = {"codex": {"kind": "subscription", "cli": cli, "default": "anthropic"}}
     kept = {"codex-subscription": {"kind": "subscription", "cli": "codex"}}
     assert _repair_removal_dismissals(removed, {}) == {"codex"}
     assert _repair_removal_dismissals(removed, kept) == set()
