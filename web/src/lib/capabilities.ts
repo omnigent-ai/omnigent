@@ -265,6 +265,12 @@ export interface ServerInfo {
    */
   scheduled_task_session_modes?: boolean;
   /**
+   * True when a session create (and so ``sys_session_create``) accepts
+   * ``permission_mode``. Older servers ignore the field, so trigger templates
+   * write a worker mode only here. Fails to ``false``.
+   */
+  session_create_permission_modes?: boolean;
+  /**
    * True when a scheduled task can start every run from a copy of an existing
    * session (``source_session_id``). Gates the session menu's "Create
    * automation…" item. Fails to ``false``.
@@ -473,6 +479,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   automations_enabled: true,
   session_search_scope: false,
   scheduled_task_session_modes: false,
+  session_create_permission_modes: false,
   scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
   scheduled_task_sandbox_workspaces: false,
@@ -655,6 +662,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           automations_enabled: data.automations_enabled !== false,
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
+          session_create_permission_modes: data.session_create_permission_modes === true,
           scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
           automation_trigger_poll_minutes:
