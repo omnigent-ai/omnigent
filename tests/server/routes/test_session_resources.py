@@ -10864,6 +10864,13 @@ async def test_selected_pr_reaches_offline_host(
             404,
         ),
         (
+            "/compare-diff",
+            {"head_sha": "a" * 40, "from_sha": "c" * 40},
+            "github_compare_diff",
+            "unknown fs op: 'github_compare_diff'",
+            404,
+        ),
+        (
             "/commits",
             {"head_sha": "a" * 40},
             "github_commits",

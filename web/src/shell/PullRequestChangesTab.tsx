@@ -1295,10 +1295,16 @@ export function PullRequestChangesTab({
                 {mode === "changes" && (
                   <PullRequestChangesSince
                     commits={commitList}
+                    headSha={renderedHeadSha}
+                    hasMore={!!commits.data?.has_more}
                     loading={commits.isLoading}
+                    errorMessage={commits.error ? readErrorText(commits.error) : null}
                     sinceSha={sinceSha}
                     onChange={setSinceSha}
-                    onOpen={() => setCommitsWanted(true)}
+                    onOpen={() => {
+                      setCommitsWanted(true);
+                      if (commits.error) void commits.refetch();
+                    }}
                   />
                 )}
               </>

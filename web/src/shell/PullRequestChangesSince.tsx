@@ -9,7 +9,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { PullRequestCommit } from "@/hooks/usePullRequests";
+import { PULL_REQUEST_COMMITS_LIMIT, type PullRequestCommit } from "@/hooks/usePullRequests";
 
 const PR_BASE = "base";
 
@@ -21,22 +21,31 @@ export function headOfLabel(commit: PullRequestCommit): string | null {
 
 export function PullRequestChangesSince({
   commits,
+  headSha,
+  hasMore,
   loading,
+  errorMessage,
   sinceSha,
   onChange,
   onOpen,
 }: {
   /** The PR's commits, oldest first. */
   commits: readonly PullRequestCommit[];
+  /** The head the tab shows; nothing comes after it, so it is not a start point. */
+  headSha: string | null;
+  /** GitHub listed only the first commits, so the newest may be missing. */
+  hasMore: boolean;
   loading: boolean;
+  /** Why the commit list failed to load; opening the picker again retries. */
+  errorMessage: string | null;
   /** The picked commit, or null for the PR base. */
   sinceSha: string | null;
   onChange: (sinceSha: string | null) => void;
-  /** The commit list loads only once the picker is first opened. */
+  /** The commit list loads once the picker is first opened, and reloads after a failure. */
   onOpen: () => void;
 }) {
-  // Newest first; the head itself is left out, since nothing comes after it.
-  const options = commits.slice(0, -1).reverse();
+  // Newest first. The head is matched by sha: a capped list may end before it.
+  const options = commits.filter((commit) => commit.sha !== headSha).reverse();
   const picked = commits.find((commit) => commit.sha === sinceSha);
   return (
     <Select
@@ -61,6 +70,16 @@ export function PullRequestChangesSince({
         className="max-h-80 w-md max-w-(--radix-select-content-available-width)"
       >
         <SelectItem value={PR_BASE}>PR base (all changes)</SelectItem>
+        {hasMore && (
+          <div className="px-2 py-1 text-xs text-muted-foreground">
+            {`Only the first ${PULL_REQUEST_COMMITS_LIMIT} commits are listed`}
+          </div>
+        )}
+        {errorMessage && (
+          <div role="alert" className="px-2 py-1.5 text-xs text-destructive">
+            {`${errorMessage} Open this list again to retry.`}
+          </div>
+        )}
         {loading && commits.length === 0 && (
           <div className="flex items-center gap-2 px-2 py-1.5 text-xs text-muted-foreground">
             <Loader2Icon className="size-3.5 animate-spin" aria-hidden="true" />

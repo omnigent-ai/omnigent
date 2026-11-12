@@ -1069,13 +1069,15 @@ def _stub_commits_with_heads(
     calls: list[list[str]] = []
 
     def fake_gh(
-        argv: Sequence[str], *, cwd: str, token: str | None = None
+        argv: Sequence[str], *, cwd: str, token: str | None = None, timeout: float | None = None
     ) -> tuple[int, str, str]:
         calls.append(list(argv))
         if argv[-1] == "repos/example/two/pulls/42":
             pr = {"head": {"sha": _HEAD}, "base": {"sha": _BASE}, "commits": 2}
             return 0, json.dumps({**pr, "user": {"login": "ada"}}), ""
         if "graphql" in argv:
+            # A slow search must not cost the commit list its deadline.
+            assert timeout is not None and timeout <= 5
             return graphql
         entries = [_commit_entry(_COMMIT_ONE, "Parent work"), _commit_entry(_HEAD, "Own work")]
         return 0, json.dumps([entries]), ""

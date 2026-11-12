@@ -185,7 +185,8 @@ def _in_sandbox() -> bool:
 def _gh(
     argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
 ) -> tuple[int | None, str, str]:
-    # ``timeout`` raises the per-call limit for a slow call, such as a video upload.
+    # ``timeout`` replaces the per-call limit: higher for a slow call such as a video
+    # upload, lower for a best-effort one.
     timeout = timeout or _gh_timeout_seconds()
     if (deadline := _gh_deadline.get()) is not None:
         timeout = min(timeout, deadline - time.monotonic())
@@ -1628,8 +1629,8 @@ def _pr_commits(root: str, reference: PullRequestRef, *, head_sha: str) -> dict[
         pr = _check_pr_revision(root, reference, head_sha=head_sha)
         commits = _pr_commit_entries(root, reference)
         _check_pr_revision(root, reference, head_sha=head_sha)
-    shown = commits[:_MAX_PR_COMMITS]
-    heads = _other_pr_heads(root, reference, pr, [commit["sha"] for commit in shown])
+        shown = commits[:_MAX_PR_COMMITS]
+        heads = _other_pr_heads(root, reference, pr, [commit["sha"] for commit in shown])
     for commit in shown:
         if commit["sha"] in heads:
             commit["head_of"] = heads[commit["sha"]]
@@ -1643,6 +1644,8 @@ def _pr_commits(root: str, reference: PullRequestRef, *, head_sha: str) -> dict[
 
 # How many of the author's recently updated PRs one lookup reads for stack parents.
 _AUTHOR_PR_LOOKUPS = 100
+# The lookup only adds hints, so a slow search must not cost the commit list its deadline.
+_AUTHOR_PR_LOOKUP_SECONDS = 4.0
 _AUTHOR_PRS_QUERY = """query($search: String!, $first: Int!) {
   search(query: $search, type: ISSUE, first: $first) {
     nodes { ... on PullRequest { number url state headRefOid } }
@@ -1679,6 +1682,7 @@ def _other_pr_heads(
             ],
             cwd=root,
             token=_pr_token(root, reference),
+            timeout=_AUTHOR_PR_LOOKUP_SECONDS,
         )
     except ValueError:
         return {}
