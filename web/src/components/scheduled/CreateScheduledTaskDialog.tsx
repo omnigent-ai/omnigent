@@ -857,6 +857,11 @@ export function CreateScheduledTaskDialog({
       setPickedEffort("");
     }
   }
+  function handlePermissionModeChange(mode: string) {
+    sourcePrefilledRef.current = true;
+    setPickedPermission(mode);
+    setPermissionPicked(true);
+  }
 
   const workspaceHostOffline = !sandboxMode && selectedHost?.status === "offline";
   const workspacePickerVisible =
@@ -969,14 +974,14 @@ export function CreateScheduledTaskDialog({
   const summarySettings = editingWorkerSettings ? workerHarnessSettings : harnessSettings;
   const summaryModel = editingWorkerSettings ? (workerSettings?.model ?? "") : displayedModel;
   const summaryEffort = editingWorkerSettings ? (workerSettings?.effort ?? "") : displayedEffort;
-  const summaryPermission = editingWorkerSettings ? "" : displayedPermission;
   const overrideSummary = [
     summarySettings.models.find((option) => option.id === summaryModel)?.displayName ??
       summaryModel,
     summarySettings.efforts.find((option) => option.value === summaryEffort)?.label ??
       summaryEffort,
-    summarySettings.permissions.find((option) => option.value === summaryPermission)?.label ??
-      summaryPermission,
+    // Matching sessions take no permission mode, so this is always the polling or task session's.
+    harnessSettings.permissions.find((option) => option.value === displayedPermission)?.label ??
+      displayedPermission,
     !triggerMode && schedule.end ? "End limit" : null,
     trigger !== null && triggerTaskSessionMode === "continue" ? "One task session" : null,
   ]
@@ -1962,11 +1967,7 @@ export function CreateScheduledTaskDialog({
                                   sourcePrefilledRef.current = true;
                                   setPickedEffort(effort);
                                 }}
-                                onPermissionModeChange={(mode) => {
-                                  sourcePrefilledRef.current = true;
-                                  setPickedPermission(mode);
-                                  setPermissionPicked(true);
-                                }}
+                                onPermissionModeChange={handlePermissionModeChange}
                                 onSelectOpenChange={handleSelectOpenChange}
                               />
                               {reusesExistingSession ? (
@@ -2022,6 +2023,31 @@ export function CreateScheduledTaskDialog({
                             </div>
                           )}
                         </>
+                      )}
+
+                      {editingWorkerSettings && supportsPermission && (
+                        <div data-testid="task-polling-permission-field">
+                          <ModelEffortFields
+                            model=""
+                            effort=""
+                            permissionMode={displayedPermission}
+                            settings={{
+                              ...harnessSettings,
+                              supportsModel: false,
+                              catalogMessage: null,
+                            }}
+                            disabled={curationPending || reusesExistingSession}
+                            onModelChange={() => {}}
+                            onEffortChange={() => {}}
+                            onPermissionModeChange={handlePermissionModeChange}
+                            onSelectOpenChange={handleSelectOpenChange}
+                          />
+                          <p className="mt-1.5 text-sm text-muted-foreground">
+                            {reusesExistingSession
+                              ? `Applies to the polling session, which keeps its current mode.${sessionModesSupported ? " Check Start a new session on the next run to change it." : ""}`
+                              : "Applies to the polling session the next run starts. Modes that require approval may pause a run until you respond."}
+                          </p>
+                        </div>
                       )}
                     </div>
                     {!triggerMode && endingFields}
