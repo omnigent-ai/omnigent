@@ -1694,7 +1694,7 @@ def _other_pr_heads(
         if not isinstance(node, dict) or node.get("number") == reference.number:
             continue
         sha = node.get("headRefOid")
-        if sha in wanted:
+        if isinstance(sha, str) and sha in wanted:
             heads.setdefault(sha, []).append(
                 {"number": node.get("number"), "url": node.get("url"), "state": node.get("state")}
             )
