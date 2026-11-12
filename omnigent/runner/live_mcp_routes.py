@@ -9,6 +9,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
+from omnigent.inner.executor import LiveMcpServerUnknown
 from omnigent.runner.app_support import _client_safe_error_detail
 from omnigent.runner.native import _forward_harness_response
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
@@ -16,6 +17,9 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 # Answers a live-MCP request for a claude-native session; ``None`` for any other.
 _ClaudeNativeLiveMcp = Callable[[str], Awaitable[_JsonObject | None]]
+# Reconnects one named server of a claude-native session; ``None`` for any other.
+# Raises :class:`LiveMcpServerUnknown` for a name the session has no server for.
+_ClaudeNativeReconnect = Callable[[str, str], Awaitable[_JsonObject | None]]
 
 _logger = logging.getLogger("omnigent.runner.app")
 
@@ -30,7 +34,7 @@ def register_live_mcp_routes(
     *,
     process_manager: HarnessProcessManager | None,
     claude_native_live_mcp: _ClaudeNativeLiveMcp | None = None,
-    reconnect_claude_native_mcp: _ClaudeNativeLiveMcp | None = None,
+    reconnect_claude_native_mcp: _ClaudeNativeReconnect | None = None,
 ) -> None:
     """Register ``/v1/sessions/{session_id}/live-mcp-servers[/reconnect]`` on *app*.
 
@@ -70,10 +74,13 @@ def register_live_mcp_routes(
             return JSONResponse(
                 {"error": "invalid_request", "detail": "name is required"}, status_code=400
             )
-        if reconnect_claude_native_mcp is not None and (
-            native := await reconnect_claude_native_mcp(session_id)
-        ):
-            return JSONResponse(native)
+        if reconnect_claude_native_mcp is not None:
+            try:
+                native = await reconnect_claude_native_mcp(session_id, name)
+            except LiveMcpServerUnknown:
+                return JSONResponse({"error": "mcp_server_unknown"}, status_code=404)
+            if native:
+                return JSONResponse(native)
         client = await _running_harness_client(process_manager, session_id)
         if client is None:
             return JSONResponse({"error": "harness_not_running"}, status_code=409)

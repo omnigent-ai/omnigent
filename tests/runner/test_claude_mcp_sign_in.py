@@ -33,7 +33,11 @@ def _launch(tracker: ClaudeMcpSignInTracker, session_id: str) -> _Pane:
 
 
 def test_a_server_signed_in_after_launch_is_named(statuses: dict[str, str]) -> None:
-    """Only a server that needed sign-in as the pane started, and is connected now, counts."""
+    """Only a server that needed sign-in as the pane started, and is connected now, counts.
+
+    The launch's record belongs to its pane, so a sign-in that finished before
+    the pane is first checked still counts.
+    """
     tracker = ClaudeMcpSignInTracker()
     statuses.update({"linear": "sign_in_required", "plugin:docs:notion": "sign_in_required"})
     pane = _launch(tracker, "conv_a")
@@ -44,14 +48,19 @@ def test_a_server_signed_in_after_launch_is_named(statuses: dict[str, str]) -> N
     assert tracker.signed_in_since_launch("conv_a", pane) == {"linear", "plugin:docs:notion"}
 
 
-def test_a_sign_in_long_before_the_first_check_still_counts(statuses: dict[str, str]) -> None:
-    """The launch's record belongs to its pane however late the pane is first checked."""
+def test_a_moved_pane_keeps_its_record(statuses: dict[str, str]) -> None:
+    """/clear and fork hand the running pane to a successor session; its record follows."""
     tracker = ClaudeMcpSignInTracker()
     statuses["linear"] = "sign_in_required"
     pane = _launch(tracker, "conv_a")
-    statuses["linear"] = "connected"  # e.g. an OAuth flow that took minutes
+    statuses["linear"] = "connected"
 
-    assert tracker.signed_in_since_launch("conv_a", pane) == {"linear"}
+    tracker.transfer("conv_a", "conv_b")
+
+    assert tracker.signed_in_since_launch("conv_b", pane) == {"linear"}
+    # The source keeps nothing, so its later deletion can't drop the successor's record.
+    tracker.forget("conv_a")
+    assert tracker.signed_in_since_launch("conv_b", pane) == {"linear"}
 
 
 def test_a_relaunched_pane_starts_afresh(statuses: dict[str, str]) -> None:
@@ -62,6 +71,21 @@ def test_a_relaunched_pane_starts_afresh(statuses: dict[str, str]) -> None:
     assert tracker.signed_in_since_launch("conv_a", first) == {"linear"}
 
     assert tracker.signed_in_since_launch("conv_a", _launch(tracker, "conv_a")) == frozenset()
+
+
+def test_a_launch_that_finds_its_pane_running_keeps_the_pane_record(
+    statuses: dict[str, str],
+) -> None:
+    """Attaching to a running pane must not reset what that pane started with."""
+    tracker = ClaudeMcpSignInTracker()
+    statuses["linear"] = "sign_in_required"
+    pane = _launch(tracker, "conv_a")
+    statuses["linear"] = "connected"
+
+    tracker.note_launching("conv_a")
+    tracker.note_launched("conv_a", pane, previous=pane)
+
+    assert tracker.signed_in_since_launch("conv_a", pane) == {"linear"}
 
 
 def test_a_launch_without_a_pane_leaves_nothing_for_a_later_pane(
