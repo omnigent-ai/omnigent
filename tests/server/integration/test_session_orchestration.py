@@ -555,11 +555,19 @@ async def test_scheduled_origin_allows_new_controls_children_and_reads(
 
 
 @pytest.mark.parametrize(
-    ("permission_mode", "scheduled_origin", "launch_args"),
+    ("permission_mode", "scheduled_origin", "running_run", "launch_args"),
     [
-        ("approve-for-me", True, PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]),
-        ("approve-for-me", False, None),
-        (None, True, None),
+        pytest.param(
+            "approve-for-me",
+            True,
+            True,
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="automation-run",
+        ),
+        # A fork keeps the origin label but isn't the run.
+        pytest.param("approve-for-me", True, False, None, id="fork"),
+        pytest.param("approve-for-me", False, True, None, id="no-origin"),
+        pytest.param(None, True, True, None, id="no-mode"),
     ],
 )
 async def test_scheduled_origin_workers_use_the_automation_permission_mode(
@@ -570,6 +578,7 @@ async def test_scheduled_origin_workers_use_the_automation_permission_mode(
     monkeypatch,
     permission_mode,
     scheduled_origin,
+    running_run,
     launch_args,
 ):
     from omnigent.server.routes.sessions import routes_core
@@ -608,6 +617,15 @@ async def test_scheduled_origin_workers_use_the_automation_permission_mode(
     conversations = SqlAlchemyConversationStore(db_uri)
     if scheduled_origin:
         conversations.set_labels(source["id"], {SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id})
+    if running_run:
+        schedules.create_run(
+            uuid4().hex,
+            task.id,
+            "running",
+            scheduled_at=1,
+            conversation_id=source["id"],
+            fired_at=1,
+        )
 
     async def launch(**kwargs):
         pass

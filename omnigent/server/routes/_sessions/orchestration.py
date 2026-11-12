@@ -12404,6 +12404,7 @@ async def _create_session_from_existing_agent(
         automation_launch_options = await automation_session_launch_options(
             getattr(request.app.state, "scheduled_task_store", None),
             created_by_scheduled_task_id,
+            source_session_id=created_by_session_id,
             user_id=user_id,
             harness=selected_harness,
         )

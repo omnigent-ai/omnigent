@@ -94,25 +94,48 @@ def permission_mode_launch_options(
     return list(args) or None, labels
 
 
+def _is_automation_run_session(
+    scheduled_task_store: Any, task: Any, source_session_id: str | None
+) -> bool:
+    """Whether *source_session_id* is where *task* runs now, not a fork or a finished run.
+
+    A continue task runs in its kept session. A new-session run's session counts only
+    while that run is running, which it is for the whole turn that starts workers.
+    """
+    if not source_session_id:
+        return False
+    if task.continues_session and task.session_id == source_session_id:
+        return True
+    run = scheduled_task_store.get_running_run_by_conversation(source_session_id)
+    return run is not None and run.scheduled_task_id == task.id
+
+
 async def automation_session_launch_options(
     scheduled_task_store: Any,
     scheduled_task_id: str | None,
     *,
+    source_session_id: str | None,
     user_id: str | None,
     harness: str | None,
 ) -> tuple[list[str] | None, dict[str, str]] | None:
     """The automation's permission mode for a session that one of its runs creates.
 
-    ``None`` keeps the new session's agent default: the creator is not an automation
-    run, the automation is gone, has no mode or belongs to another user, or the new
-    session's harness has no such mode.
+    ``None`` keeps the new session's agent default: the creator is not one of the
+    automation's runs (a fork keeps the origin label but not the run), the automation
+    is deleted, has no mode or belongs to another user, or the new session's harness
+    has no such mode.
     """
     if scheduled_task_store is None or not scheduled_task_id or harness is None:
         return None
     task = await asyncio.to_thread(scheduled_task_store.get, scheduled_task_id)
-    if task is None or task.permission_mode is None:
+    # ``get`` still returns soft-deleted rows, and deleting a task doesn't stop its run.
+    if task is None or task.state == "deleted" or task.permission_mode is None:
         return None
     if (task.user_id or RESERVED_USER_LOCAL) != (user_id or RESERVED_USER_LOCAL):
+        return None
+    if not await asyncio.to_thread(
+        _is_automation_run_session, scheduled_task_store, task, source_session_id
+    ):
         return None
     harness = canonicalize_harness(harness) or harness
     options = permission_mode_launch_options(harness, task.permission_mode)

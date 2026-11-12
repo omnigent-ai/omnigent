@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.errors import OmnigentError
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
+from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.scheduled.harness_settings import (
     automation_session_launch_options,
     validate_scheduled_permission_mode,
@@ -98,12 +99,39 @@ def test_unknown_mode_rejection_lists_every_vocabulary(mode: str) -> None:
     assert message.index(_NULL_HINT) < message.index("claude-sdk") < message.index("claude-native")
 
 
+_RUN_SESSION = "conv_run"
+_KEPT_SESSION = "conv_kept"
+
+
 class _TaskStore:
-    def __init__(self, permission_mode: str | None, user_id: str | None = "alice") -> None:
-        self._task = SimpleNamespace(id="task_1", user_id=user_id, permission_mode=permission_mode)
+    """One task, ``task_1``, whose run is running in ``conv_run``."""
+
+    def __init__(
+        self,
+        permission_mode: str | None,
+        user_id: str | None = "alice",
+        *,
+        state: str = "active",
+        kept_session_id: str | None = None,
+        running: dict[str, str] | None = None,
+    ) -> None:
+        self._task = SimpleNamespace(
+            id="task_1",
+            user_id=user_id,
+            permission_mode=permission_mode,
+            state=state,
+            session_id=kept_session_id,
+            continues_session=kept_session_id is not None,
+        )
+        # conversation id -> task id of the run running in it
+        self._running = {_RUN_SESSION: "task_1"} if running is None else running
 
     def get(self, scheduled_task_id: str) -> SimpleNamespace | None:
         return self._task if scheduled_task_id == self._task.id else None
+
+    def get_running_run_by_conversation(self, conversation_id: str) -> SimpleNamespace | None:
+        task_id = self._running.get(conversation_id)
+        return None if task_id is None else SimpleNamespace(scheduled_task_id=task_id)
 
 
 @pytest.mark.asyncio
@@ -124,40 +152,122 @@ async def test_session_started_by_an_automation_run_uses_its_mode(
     harness: str, mode: str, expected: tuple[list[str] | None, dict[str, str]]
 ) -> None:
     options = await automation_session_launch_options(
-        _TaskStore(mode), "task_1", user_id="alice", harness=harness
+        _TaskStore(mode),
+        "task_1",
+        source_session_id=_RUN_SESSION,
+        user_id="alice",
+        harness=harness,
     )
     assert options == expected
 
 
 @pytest.mark.asyncio
-async def test_single_user_automation_applies_to_the_local_user() -> None:
+async def test_continue_automation_kept_session_uses_its_mode() -> None:
+    """A continue task's run is finished once its prompt is delivered, so its kept
+    session counts without a running run."""
+    store = _TaskStore("auto", kept_session_id=_KEPT_SESSION, running={})
     options = await automation_session_launch_options(
-        _TaskStore("auto", user_id=None), "task_1", user_id=None, harness="claude-native"
+        store, "task_1", source_session_id=_KEPT_SESSION, user_id="alice", harness="claude-native"
+    )
+    assert options == (["--permission-mode", "auto"], {})
+
+
+@pytest.mark.asyncio
+async def test_single_user_automation_applies_to_the_local_user() -> None:
+    """Single-user automations are ownerless, and their callers are ``local``."""
+    options = await automation_session_launch_options(
+        _TaskStore("auto", user_id=None),
+        "task_1",
+        source_session_id=_RUN_SESSION,
+        user_id=RESERVED_USER_LOCAL,
+        harness="claude-native",
     )
     assert options == (["--permission-mode", "auto"], {})
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("store", "task_id", "user_id", "harness"),
+    ("store", "task_id", "source", "user_id", "harness"),
     [
-        pytest.param(None, "task_1", "alice", "codex-native", id="no-task-store"),
-        pytest.param(_TaskStore("approve-for-me"), None, "alice", "codex-native", id="not-a-run"),
-        pytest.param(_TaskStore("approve-for-me"), "gone", "alice", "codex-native", id="deleted"),
-        pytest.param(_TaskStore(None), "task_1", "alice", "codex-native", id="no-mode"),
+        pytest.param(None, "task_1", _RUN_SESSION, "alice", "codex-native", id="no-task-store"),
         pytest.param(
-            _TaskStore("approve-for-me"), "task_1", "bob", "codex-native", id="other-owner"
+            _TaskStore("approve-for-me"),
+            None,
+            _RUN_SESSION,
+            "alice",
+            "codex-native",
+            id="not-a-run",
         ),
         pytest.param(
-            _TaskStore("approve-for-me"), "task_1", "alice", "claude-native", id="unsupported"
+            _TaskStore("approve-for-me"),
+            "gone",
+            _RUN_SESSION,
+            "alice",
+            "codex-native",
+            id="unknown",
         ),
-        pytest.param(_TaskStore("approve-for-me"), "task_1", "alice", None, id="no-harness"),
+        pytest.param(
+            _TaskStore("approve-for-me", state="deleted"),
+            "task_1",
+            _RUN_SESSION,
+            "alice",
+            "codex-native",
+            id="soft-deleted",
+        ),
+        pytest.param(
+            _TaskStore("approve-for-me"), "task_1", "conv_fork", "alice", "codex-native", id="fork"
+        ),
+        pytest.param(
+            _TaskStore("approve-for-me", running={}),
+            "task_1",
+            _RUN_SESSION,
+            "alice",
+            "codex-native",
+            id="run-finished",
+        ),
+        pytest.param(
+            _TaskStore("approve-for-me", running={_RUN_SESSION: "task_2"}),
+            "task_1",
+            _RUN_SESSION,
+            "alice",
+            "codex-native",
+            id="another-task-run",
+        ),
+        pytest.param(
+            _TaskStore("approve-for-me"), "task_1", None, "alice", "codex-native", id="no-source"
+        ),
+        pytest.param(
+            _TaskStore(None), "task_1", _RUN_SESSION, "alice", "codex-native", id="no-mode"
+        ),
+        pytest.param(
+            _TaskStore("approve-for-me"),
+            "task_1",
+            _RUN_SESSION,
+            "bob",
+            "codex-native",
+            id="other-owner",
+        ),
+        pytest.param(
+            _TaskStore("approve-for-me"),
+            "task_1",
+            _RUN_SESSION,
+            "alice",
+            "claude-native",
+            id="unsupported",
+        ),
+        pytest.param(
+            _TaskStore("approve-for-me"), "task_1", _RUN_SESSION, "alice", None, id="no-harness"
+        ),
     ],
 )
 async def test_session_keeps_its_agent_default_without_an_applicable_mode(
-    store: _TaskStore | None, task_id: str | None, user_id: str, harness: str | None
+    store: _TaskStore | None,
+    task_id: str | None,
+    source: str | None,
+    user_id: str,
+    harness: str | None,
 ) -> None:
     options = await automation_session_launch_options(
-        store, task_id, user_id=user_id, harness=harness
+        store, task_id, source_session_id=source, user_id=user_id, harness=harness
     )
     assert options is None
