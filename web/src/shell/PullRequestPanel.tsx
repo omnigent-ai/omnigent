@@ -57,6 +57,7 @@ import {
 import { cn } from "@/lib/utils";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
+import { useLocalReviewNavigation } from "@/lib/localReviewContext";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -85,6 +86,7 @@ import {
   useWorkspaceAsleep,
   useWorkspaceServeable,
 } from "@/hooks/useWorkspaceChangedFiles";
+import { useSandboxStarting } from "@/hooks/useSessionReconnect";
 import {
   sessionPullRequestsKey,
   type StoredPullRequests,
@@ -185,7 +187,8 @@ function codeSpans(text: string): React.ReactNode {
  * resolves, the account is correct — surfacing the knob then would just invite a
  * misconfiguration, so it's absent from the header and the `no-pr` state. Renders
  * nothing with a single account (nothing to choose) or when the provider can't
- * switch accounts.
+ * switch accounts. The merge dialog has its own account picker, because an
+ * account that can read a PR may still be refused the merge.
  */
 function GithubAccountSelector({
   conversationId,
@@ -229,6 +232,13 @@ function GithubAccountSelector({
       )}
     </div>
   );
+}
+
+/** The accounts the merge dialog offers, when the host merges as the one it sends. */
+function mergeAccounts(info: NormalizedPullRequestInfo | undefined) {
+  return info?.capabilities.account_switching && info.capabilities.merge_as_account
+    ? info.auth
+    : undefined;
 }
 
 /** The one thing the panel should show, derived from the info query. Every
@@ -810,6 +820,7 @@ function PullRequestListRow({
   hostOffline: boolean;
   sandboxAsleep: boolean;
 }) {
+  const sandboxStarting = useSandboxStarting(conversationId);
   const info = usePullRequestInfo(conversationId, {
     poll: active ? "list" : false,
     prUrl: association.url,
@@ -893,11 +904,15 @@ function PullRequestListRow({
                 <TooltipTrigger asChild>
                   <span tabIndex={0} role="status" className="inline-flex items-center gap-1">
                     <ServerOffIcon aria-hidden className="size-3" />
-                    {sandboxAsleep ? "Sandbox asleep" : "Host offline"}
+                    {sandboxAsleep
+                      ? sandboxStarting
+                        ? "Sandbox starting"
+                        : "Sandbox asleep"
+                      : "Host offline"}
                   </span>
                 </TooltipTrigger>
                 <TooltipContent className="max-w-xs">
-                  {storedPullRequestHint(association, sandboxAsleep)}
+                  {storedPullRequestHint(association, sandboxAsleep, sandboxStarting)}
                 </TooltipContent>
               </Tooltip>
             </TooltipProvider>
@@ -929,6 +944,7 @@ function PullRequestListRow({
             conversationId={conversationId}
             prUrl={association.url}
             pr={cachedPr}
+            accounts={mergeAccounts(data)}
           />
         )}
       </div>
@@ -1030,6 +1046,11 @@ export function PullRequestPanel({
     [updateView],
   );
   const setActiveTab = (value: PullRequestSubtab) => updateView({ subtab: value });
+  const localReviewTarget = useLocalReviewNavigation(conversationId);
+  useEffect(() => {
+    const prUrl = localReviewTarget?.anchor_metadata?.pr_url;
+    if (prUrl) updateView({ selected: prUrl, showingDetails: true, subtab: "changes" });
+  }, [localReviewTarget, updateView]);
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
   const info = usePullRequestInfo(conversationId, {
@@ -1057,6 +1078,8 @@ export function PullRequestPanel({
           "github-review-threads",
           "github-changed-files",
           "github-pr-diff",
+          "github-pr-commits",
+          "github-pr-commit-diff",
           "session-pull-requests",
         ].map((key) => queryClient.invalidateQueries({ queryKey: [key, conversationId] })),
       );
@@ -1080,6 +1103,7 @@ export function PullRequestPanel({
   const stored = useSessionPullRequests(conversationId, info.data);
   const hostOffline = useHostOffline(conversationId, info);
   const sandboxAsleep = useWorkspaceAsleep(conversationId);
+  const sandboxStarting = useSandboxStarting(conversationId);
   // Linking verifies the PR with the host's provider account.
   const linkNeedsHost = storesPrs && hostOffline;
   const [knownAssociations, setKnownAssociations] = useState<{
@@ -1362,7 +1386,9 @@ export function PullRequestPanel({
                   {linkNeedsHost ? (
                     <p role="status" className="text-ui text-muted-foreground">
                       {sandboxAsleep
-                        ? "To link a PR, send a message to start the session’s sandbox."
+                        ? sandboxStarting
+                          ? "Starting the session’s sandbox. You can link a PR once it’s back online."
+                          : "To link a PR, send a message to start the session’s sandbox."
                         : "To link a PR, please reconnect the session’s host."}
                     </p>
                   ) : (
@@ -1397,14 +1423,20 @@ function useHostOffline(
   return serveable === false || sandboxAsleep || info.error instanceof RunnerOfflineError;
 }
 
-function storedPullRequestHint(pr: PullRequestAssociation, sandboxAsleep: boolean): string {
+function storedPullRequestHint(
+  pr: PullRequestAssociation,
+  sandboxAsleep: boolean,
+  sandboxStarting: boolean,
+): string {
   const lastSync = pr.state_checked_at
     ? `Last sync time: ${absoluteTime(pr.state_checked_at * 1000)}. `
     : "";
   return (
     lastSync +
     (sandboxAsleep
-      ? "To load the PR details, send a message to start the session’s sandbox."
+      ? sandboxStarting
+        ? "Starting the session’s sandbox. The PR details will load once it’s back online."
+        : "To load the PR details, send a message to start the session’s sandbox."
       : "To load the PR details, please reconnect the session’s host.")
   );
 }
@@ -1418,12 +1450,14 @@ function StoredPullRequestDetails({
   pr,
   copy,
   sandboxAsleep,
+  sandboxStarting,
   showHeading,
   refreshButton,
 }: {
   pr: PullRequestAssociation;
   copy: GitProviderCopy;
   sandboxAsleep: boolean;
+  sandboxStarting: boolean;
   showHeading: boolean;
   refreshButton?: React.ReactNode;
 }) {
@@ -1468,7 +1502,7 @@ function StoredPullRequestDetails({
           </div>
         </div>
         <p role="status" className="p-3 text-ui text-muted-foreground">
-          {storedPullRequestHint(pr, sandboxAsleep)}
+          {storedPullRequestHint(pr, sandboxAsleep, sandboxStarting)}
         </p>
       </div>
     </TooltipProvider>
@@ -1512,6 +1546,7 @@ function PullRequestPanelDetails({
   const changes = usePullRequestChangedFiles(conversationId, hasPr, prUrl, revision);
   const prDiff = usePullRequestDiff(conversationId, hasPr, prUrl, revision);
   const sandboxAsleep = useWorkspaceAsleep(conversationId);
+  const sandboxStarting = useSandboxStarting(conversationId);
   const canEdit = useCanEdit(conversationId);
 
   // Summary (checks + PR body), Comments, and Changes (the stacked diff).
@@ -1544,6 +1579,7 @@ function PullRequestPanelDetails({
         pr={storedPr}
         copy={gitProviderCopy(storedPr.provider, undefined, storedPr.provider_display)}
         sandboxAsleep={sandboxAsleep}
+        sandboxStarting={sandboxStarting}
         showHeading={showHeading}
         refreshButton={refreshButton}
       />
@@ -1553,7 +1589,9 @@ function PullRequestPanelDetails({
     return (
       <p role="status" className="p-3 text-ui text-muted-foreground">
         {sandboxAsleep
-          ? "This session’s PRs haven’t synced to the server yet. To load them, send a message to start the session’s sandbox."
+          ? sandboxStarting
+            ? "This session’s PRs haven’t synced to the server yet. Starting the session’s sandbox to load them."
+            : "This session’s PRs haven’t synced to the server yet. To load them, send a message to start the session’s sandbox."
           : "This session’s PRs haven’t synced to the server yet. To load them, please reconnect the session’s host."}
       </p>
     );
@@ -1586,7 +1624,11 @@ function PullRequestPanelDetails({
     case "sandbox-offline":
       return (
         <PanelMessage>
-          <p>The sandbox is offline. Send a message in the chat to start it again.</p>
+          <p>
+            {sandboxStarting
+              ? "Starting sandbox… Pull requests will load when it’s back online."
+              : "The sandbox is offline. Send a message in the chat to start it again."}
+          </p>
           {emptyStateAction}
         </PanelMessage>
       );
@@ -1625,21 +1667,25 @@ function PullRequestPanelDetails({
           hint={
             panelState.remoteHost ? (
               <>
-                The workspace’s remote is on{" "}
-                <span className="font-mono">{panelState.remoteHost}</span>, which isn’t a supported
-                git provider.
+                Omnigent couldn’t identify the git provider for{" "}
+                <span className="font-mono">{panelState.remoteHost}</span>.
               </>
             ) : (
-              "This workspace’s remote isn’t on a supported git provider."
+              "Omnigent couldn’t identify this workspace’s git provider."
             )
           }
-          // A GitHub Enterprise host the user never signed in to lands here.
           note={
             panelState.remoteHost && (
               <>
-                For a GitHub Enterprise host, run{" "}
+                On the execution host, run{" "}
+                <span className="font-mono">
+                  glab auth login --hostname {panelState.remoteHost}
+                </span>{" "}
+                for GitLab or{" "}
                 <span className="font-mono">gh auth login --hostname {panelState.remoteHost}</span>{" "}
-                on the host.
+                for GitHub Enterprise. For a GitHub SSH alias, run{" "}
+                <span className="font-mono">git config --local omnigent.gitprovider github</span> in
+                this checkout, then refresh for installation or sign-in help.
               </>
             )
           }
@@ -1818,6 +1864,7 @@ function PullRequestPanelDetails({
                   conversationId={conversationId}
                   prUrl={data.selected_pr_url}
                   pr={pr}
+                  accounts={mergeAccounts(data)}
                 />
               )
             }
@@ -1869,7 +1916,7 @@ function PullRequestPanelDetails({
           pr={pr}
           prUrl={prUrl}
           canEdit={canEdit}
-          selected={activeTab === "changes"}
+          selected={active && activeTab === "changes"}
           changes={changes}
           prDiff={prDiff}
           reviews={reviews}

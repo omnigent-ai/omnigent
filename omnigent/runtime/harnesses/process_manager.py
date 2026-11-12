@@ -41,7 +41,7 @@ from omnigent._platform import IS_WINDOWS
 from omnigent.debug_logging import debug_event
 from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
-from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
+from omnigent.inner._subprocess_lifecycle import await_cleanup_task, close_subprocess_transport
 from omnigent.inner.agent_env import strip_desktop_session_env
 from omnigent.native.owner_claim import owner_is_gone, read_owner_claim, write_owner_claim
 from omnigent.runner.identity import strip_runner_auth_secrets
@@ -57,6 +57,7 @@ from omnigent.runtime.harnesses.paths import (
 from omnigent.util.json_serialization import json_dumps_transport_safe
 
 _logger = logging.getLogger(__name__)
+_UNCONDITIONAL_RELEASE = object()
 
 
 class _HarnessHttpClient(httpx.AsyncClient):
@@ -1083,6 +1084,18 @@ class HarnessProcessManager:
         """
         return conversation_id in self._entries
 
+    def registered_client(self, conversation_id: str) -> httpx.AsyncClient | None:
+        """Snapshot the registered client without spawning or refreshing its lease.
+
+        Pass the result as ``release(expected_client=...)`` to retire only
+        this registration, even if another process replaces it while waiting.
+
+        :param conversation_id: Session whose current registration is needed.
+        :returns: The registered client, or ``None`` when no process is registered.
+        """
+        entry = self._entries.get(conversation_id)
+        return entry.client if entry is not None else None
+
     def has_active_turn(self, conversation_id: str) -> bool:
         """
         Check whether the given conversation has an in-flight
@@ -1144,7 +1157,12 @@ class HarnessProcessManager:
         self._in_flight_response_ids.pop(conversation_id, None)
 
     async def release(
-        self, conversation_id: str, *, only_if_idle_cutoff: float | None = None
+        self,
+        conversation_id: str,
+        *,
+        only_if_idle_cutoff: float | None = None,
+        expected_client: object = _UNCONDITIONAL_RELEASE,
+        can_release: Callable[[], bool] | None = None,
     ) -> None:
         """
         Terminate and unregister the subprocess for a conversation.
@@ -1186,10 +1204,21 @@ class HarnessProcessManager:
         spawn lock is acquired).
 
         :param conversation_id: AP-allocated conversation id.
+        :param expected_client: When supplied, release only the registration
+            captured by :meth:`registered_client`, checked under the spawn lock.
+        :param can_release: Optional synchronous, side-effect-free ownership
+            check, evaluated under the spawn lock immediately before unregistering.
         """
         spawn_lock = await self._get_spawn_lock(conversation_id)
         async with spawn_lock:
             async with self._registry_lock:
+                if can_release is not None and not can_release():
+                    return
+                if (
+                    expected_client is not _UNCONDITIONAL_RELEASE
+                    and self.registered_client(conversation_id) is not expected_client
+                ):
+                    return
                 if only_if_idle_cutoff is not None:
                     current = self._entries.get(conversation_id)
                     if (
@@ -1299,7 +1328,15 @@ class HarnessProcessManager:
             ``_SPAWN_READY_TIMEOUT_S``.
         """
         module_path = _resolve_module_path(harness)
-        self._ensure_instance_dir()
+        preparation = asyncio.create_task(asyncio.to_thread(self._ensure_instance_dir))
+        try:
+            await asyncio.shield(preparation)
+        except asyncio.CancelledError:
+            # Keep the spawn lock until disk writes finish so shutdown cannot
+            # remove the directory while the worker is still recreating it.
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await await_cleanup_task(preparation)
+            raise
         endpoint = _HarnessEndpoint.create(self._instance_dir, conversation_id)
         # Defensive: a stale socket file from a previous spawn
         # (released but not cleaned up because of an OS quirk)

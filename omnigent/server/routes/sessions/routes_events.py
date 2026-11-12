@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import itertools
 import secrets
@@ -39,7 +41,7 @@ from omnigent.entities import (
 from omnigent.entities.conversation import (
     parse_item_data,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.harness_plugins import NativeCodingAgent
 from omnigent.harnesses.codex_native.shell_input import shell_command_from_input
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
@@ -55,6 +57,7 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
+from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
@@ -66,6 +69,7 @@ from omnigent.runner.launch_failure import (
     diagnose_codex_compaction_model_failure,
     diagnose_codex_model_rejection,
     diagnose_codex_provider_auth_failure,
+    turn_error_display_message,
 )
 from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -80,6 +84,7 @@ from omnigent.runtime import (
     session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.runtime.content_resolver import _resolve_message_content
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server import presence
 from omnigent.server import session_pull_requests as server_prs
@@ -96,6 +101,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
+    effective_admin,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -114,6 +120,9 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
+)
+from omnigent.server.routes._auth_helpers import (
+    is_session_owner as _is_session_owner,
 )
 from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
@@ -269,6 +278,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _maybe_relaunch_managed_sandbox,
     _maybe_wake_stale_resumable_managed_sandbox,
     _native_pane_harness,
+    _opens_codex_side_chat,
     _persist_external_antigravity_subagent_start,
     _persist_external_codex_subagent_start,
     _persist_external_conversation_item,
@@ -497,8 +507,8 @@ async def _raise_if_runner_on_another_replica(
     :param app_state: ``request.app.state`` — supplies the host registry and
         the host store.
     :param conversation_store: Store used to resolve a sub-agent's ancestors.
-    :raises OmnigentError: ``WRONG_REPLICA`` when the routing host is live on
-        another replica.
+    :raises WrongReplicaError: When the routing host is live on another
+        replica.
     """
     host_registry = getattr(app_state, "host_registry", None)
     host_store = getattr(app_state, "host_store", None)
@@ -509,10 +519,7 @@ async def _raise_if_runner_on_another_replica(
         return
     host = await asyncio.to_thread(host_store.get_host, host_id)
     if host is not None and host_is_live(host):
-        raise OmnigentError(
-            "session runner is on another replica; retry",
-            code=ErrorCode.WRONG_REPLICA,
-        )
+        raise WrongReplicaError("session runner is on another replica", host_id=host_id)
 
 
 async def _raise_if_runner_re_tunnelled_to_another_replica(
@@ -539,8 +546,10 @@ async def _raise_if_runner_re_tunnelled_to_another_replica(
     :param session_id: Session/conversation identifier.
     :param runner_id: Runner id being classified (captured before the wait).
     :param conversation_store: Store used to re-read the fresh runner stamp.
-    :raises OmnigentError: ``WRONG_REPLICA`` when the bound runner's liveness
-        stamp is fresh evidence written by another replica.
+    :raises WrongReplicaError: When the bound runner's liveness stamp is fresh
+        evidence written by another replica, naming the session's routing host.
+    :raises OmnigentError: ``WRONG_REPLICA`` for the same miss when no host is
+        bound anywhere in the session's chain.
     """
     if runner_id is None:
         return
@@ -554,6 +563,11 @@ async def _raise_if_runner_re_tunnelled_to_another_replica(
     if _runner_live_on_another_replica_from_conversations(
         [fresh], runner_id, last_liveness_stamp(runner_id)
     ):
+        host_id = await asyncio.to_thread(routing_host_id, fresh, conversation_store)
+        if host_id is not None:
+            raise WrongReplicaError(
+                "session runner re-tunnelled to another replica", host_id=host_id
+            )
         raise OmnigentError(
             "session runner re-tunnelled to another replica; retry",
             code=ErrorCode.WRONG_REPLICA,
@@ -880,6 +894,60 @@ _RUNNER_EVENT_TYPES = frozenset(
 _TURN_STARTING_EVENT_TYPES = frozenset({"message", "session_message", _SLASH_COMMAND_TYPE})
 # Also given ``in_flight``: a claude-sdk ``/compact`` runs a harness turn.
 _IN_FLIGHT_EVENT_TYPES = _TURN_STARTING_EVENT_TYPES | {_COMPACT_TYPE}
+
+
+def _legacy_side_chat_attachment(
+    content: object,
+    session_id: str,
+    file_store: FileStore | None,
+    artifact_store: ArtifactStore | None,
+) -> bool:
+    """Old Codex executors interpret a lone text attachment as a slash command."""
+    from omnigent.harnesses.codex_native.side_chat import side_chat_question_from_text
+
+    if not isinstance(content, list):
+        return False
+    blocks = [block for block in content if isinstance(block, dict)]
+    if any(
+        block.get("type") == "input_image"
+        or (
+            block.get("type") in {"text", "input_text"}
+            and isinstance(block.get("text"), str)
+            and block["text"]
+        )
+        for block in blocks
+    ):
+        return False
+    if file_store is not None and artifact_store is not None:
+        try:
+            blocks = _resolve_message_content(
+                blocks,
+                file_store,
+                artifact_store,
+                session_id=session_id,
+                defer_filesystem_files=True,
+            )
+        except (ValueError, KeyError) as exc:
+            raise OmnigentError(
+                "Could not read the attachment", code=ErrorCode.INVALID_INPUT
+            ) from exc
+    texts = []
+    for block in blocks:
+        if block.get("type") != "input_file":
+            continue
+        data = block.get("file_data")
+        if not isinstance(data, str):
+            return False
+        try:
+            parsed = parse_data_uri(data)
+            if not parsed.mime_type.startswith("text/"):
+                return False
+            text = base64.b64decode(parsed.base64_payload).decode("utf-8", errors="replace")
+        except (ValueError, binascii.Error):
+            return False
+        if text:
+            texts.append(text)
+    return len(texts) == 1 and side_chat_question_from_text(texts[0]) is not None
 
 
 def register_events_routes(
@@ -1260,6 +1328,41 @@ def register_events_routes(
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
+        native_harness = (
+            await asyncio.to_thread(
+                _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+            )
+            if body.type == "message"
+            else None
+        )
+        opens_codex_side_chat = body.type == "message" and _opens_codex_side_chat(
+            native_harness, body
+        )
+        if (
+            body.type == "message"
+            and isinstance(request, Request)
+            and native_harness == "codex-native"
+            and not await asyncio.to_thread(
+                _is_session_owner,
+                user_id,
+                conv,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            )
+            and (
+                opens_codex_side_chat
+                or await asyncio.to_thread(
+                    _legacy_side_chat_attachment,
+                    body.data.get("content"),
+                    conv.id,
+                    file_store,
+                    artifact_store,
+                )
+            )
+        ):
+            raise OmnigentError(
+                "Only the session's owner can start a side chat", code=ErrorCode.FORBIDDEN
+            )
         start_fire_stage("input_validation", session_id=session_id)
         peer_message = body.type == "session_message"
         if peer_message:
@@ -1282,10 +1385,7 @@ def register_events_routes(
         if (
             body.type == "message"
             and shell_command_from_input(body.data.get("content")) is not None
-            and await asyncio.to_thread(
-                _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
-            )
-            == "codex-native"
+            and native_harness == "codex-native"
         ):
             # Direct native shell bypasses tool policies, like the environment shell route.
             await _require_access_and_level(
@@ -1554,15 +1654,21 @@ def register_events_routes(
             await validate_saved_selection(cast("Request", request), conv, conv.model_override)
 
         startup = getattr(request.app.state, "startup_inputs", None)
-        if (
+        may_wait_for_startup = (
             not isinstance(request, (StartupInputContext, _RunnerEventContext))
             and startup is not None
             and (
                 (body.type == "message" and body.data.get("role") == "user")
                 or (body.type == _SLASH_COMMAND_TYPE and body.data.get("kind") == "skill")
             )
-            and await startup.accepts(conv, request.app)
-        ):
+        )
+
+        async def wait_for_startup(current: Conversation) -> dict[str, Any] | None:
+            """Save this input behind *current*'s startup for its launch to deliver, if it has one."""
+            if not may_wait_for_startup or startup is None:
+                return None
+            if not await startup.accepts(current, request.app):
+                return None
             if peer_message:
                 await asyncio.to_thread(
                     require_orchestration_source,
@@ -1577,12 +1683,15 @@ def register_events_routes(
             saved = await startup.enqueue(
                 session_id, body, user_id=user_id, headers=request.headers, first=False
             )
-            if conv.host_id is not None:
-                startup.host_changed(request.app, conv.host_id)
+            if current.host_id is not None:
+                startup.host_changed(request.app, current.host_id)
             return {
                 "queued": True,
                 "pending_id": pending_inputs.make_pending_id(session_id, saved.id),
             }
+
+        if (held := await wait_for_startup(conv)) is not None:
+            return held
         # ── Policy evaluation (path-agnostic) ────────────────
         # Evaluate policies BEFORE persistence/runner forwarding so
         # enforcement fires on both paths. On DENY, persist the
@@ -1792,8 +1901,8 @@ def register_events_routes(
                 # the runner tunnel registers on the same replica as its host,
                 # so an absent tunnel here while the host is live elsewhere
                 # means the key routed to the wrong replica. Signal it (same as
-                # the message path) so the client re-addresses without the key,
-                # rather than getting a false "reconnect" 503 for a session that
+                # the message path) so the client re-addresses with the key it
+                # names, rather than getting a false "reconnect" 503 for a session that
                 # is actually wakeable on another replica.
                 _host_store = getattr(_app_state, "host_store", None)
                 if (
@@ -1803,9 +1912,8 @@ def register_events_routes(
                 ):
                     _elsewhere = await asyncio.to_thread(_host_store.get_host, wake_conv.host_id)
                     if _elsewhere is not None and host_is_live(_elsewhere):
-                        raise OmnigentError(
-                            "session runner is on another replica; retry",
-                            code=ErrorCode.WRONG_REPLICA,
+                        raise WrongReplicaError(
+                            "session runner is on another replica", host_id=wake_conv.host_id
                         )
                 _relaunched_runner_id: str | None = None
                 _host_conn = _host_reg.get(wake_conv.host_id) if _host_reg is not None else None
@@ -2585,7 +2693,7 @@ def register_events_routes(
                         classified_code = CODEX_COMPACTION_MODEL_FAILED
                 status_error = ErrorDetail(
                     code=classified_code,
-                    message=output.strip(),
+                    message=turn_error_display_message(classified_code, output.strip()),
                     title=diagnosis.title if diagnosis else None,
                     cause=diagnosis.cause if diagnosis else None,
                     remediation=diagnosis.remediation if diagnosis else None,
@@ -2933,6 +3041,14 @@ def register_events_routes(
                 conv,
                 body,
                 conversation_store,
+                allow_side_chat=_has_bound_runner_authority(request, conv)
+                or await asyncio.to_thread(
+                    _is_session_owner,
+                    user_id,
+                    conv,
+                    auth_provider=auth_provider,
+                    permission_store=permission_store,
+                ),
             )
             return {"queued": False, "child_session_id": child_id}
         if body.type == _EXTERNAL_DEVIN_SUBAGENT_START_TYPE:
@@ -3254,6 +3370,19 @@ def register_events_routes(
                         _host_reg,
                         _host_conn,
                     )
+                    from omnigent.server.managed_hosts import is_move_claim
+
+                    if is_move_claim(launch_attempt.runner_id):
+                        # A move claimed the session after this message was
+                        # checked against its startup: wait for the sandbox,
+                        # like a message sent once the move had started.
+                        moving = await asyncio.to_thread(
+                            conversation_store.get_conversation, session_id
+                        )
+                        if moving is None:
+                            raise _session_not_found()
+                        if (held := await wait_for_startup(moving)) is not None:
+                            return held
                     host_error_code = _classify_launch_refusal(
                         launch_attempt.error_code,
                         launch_attempt.error,
@@ -4012,7 +4141,7 @@ def register_events_routes(
         user_id = _require_user(request, auth_provider)
         if permission_store is not None and user_id is not None:
             is_admin = await asyncio.to_thread(permission_store.is_admin, user_id)
-            if not is_admin:
+            if not effective_admin(is_admin):
                 grant = await asyncio.to_thread(permission_store.get, user_id, session_id)
                 if grant is None or grant.level < LEVEL_OWNER:
                     if grant is not None:
@@ -4083,6 +4212,7 @@ def register_events_routes(
                 delete_branch=True,
                 host_registry=getattr(request.app.state, "host_registry", None),
                 reason="session-delete",
+                host_store=getattr(request.app.state, "host_store", None),
                 expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
                 conversation_store=conversation_store,
                 exclude_conversation_id=conv.id,
