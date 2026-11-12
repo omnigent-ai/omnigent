@@ -1507,7 +1507,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         unique_ids = list(set(conversation_ids))
         with self._conv_session("get_session_activity") as session:
             updated = session.execute(
-                select(SqlConversation.id, SqlConversation.updated_at).where(
+                select(
+                    SqlConversation.id, SqlConversation.updated_at, SqlConversation.archived
+                ).where(
                     SqlConversation.workspace_id == current_workspace_id(),
                     SqlConversation.id.in_(unique_ids),
                 )
@@ -1549,6 +1551,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 total_cost_usd=costs.get(row.id),
                 pending_elicitation_count=pending_counts.get(row.id),
                 runner_id=runner_ids.get(row.id),
+                archived=bool(row.archived),
             )
         return activity
 

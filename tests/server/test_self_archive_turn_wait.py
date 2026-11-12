@@ -19,16 +19,19 @@ class _Rows:
         self.reads = list(reads)
         self.count = 0
 
-    def get_conversation(self, session_id: str):
-        assert session_id == SESSION
+    def get_session_activity(self, session_ids: list[str]):
+        assert session_ids == [SESSION]
         read = self.reads[min(self.count, len(self.reads) - 1)]
         self.count += 1
         if isinstance(read, Exception):
             raise read
-        return read
+        return {} if read is None else {SESSION: read}
+
+    def get_conversation(self, _session_id: str):
+        raise AssertionError("the wait must not load the whole conversation, labels included")
 
 
-def _row(live_status: str | None, *, archived: bool = True):
+def _row(live_status: str | None, *, archived: bool | None = True):
     return SimpleNamespace(archived=archived, live_status=live_status)
 
 
@@ -54,6 +57,18 @@ async def test_a_failed_read_keeps_waiting_for_the_turn():
 async def test_an_undo_ends_the_wait_without_teardown():
     rows = _Rows(_row("running"), _row("running", archived=False))
     assert await orchestration._await_archived_turn_end(SESSION, rows) is False
+    assert rows.count == 2
+
+
+async def test_a_deleted_session_ends_the_wait_without_teardown():
+    rows = _Rows(_row("running"), None)
+    assert await orchestration._await_archived_turn_end(SESSION, rows) is False
+    assert rows.count == 2
+
+
+async def test_a_store_without_the_archived_flag_still_waits_for_the_turn():
+    rows = _Rows(_row("running", archived=None), _row("idle", archived=None))
+    assert await orchestration._await_archived_turn_end(SESSION, rows) is True
     assert rows.count == 2
 
 

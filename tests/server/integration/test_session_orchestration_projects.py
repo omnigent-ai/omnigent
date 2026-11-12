@@ -786,6 +786,22 @@ async def test_a_session_archives_itself_and_stops_once_its_turn_ends(
     monkeypatch.setattr(sessions_module, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0)
     monkeypatch.setattr(orchestration, "_SELF_ARCHIVE_TURN_POLL_S", 0.01)
     monkeypatch.setattr(sessions_module, "_best_effort_stop", record_teardown)
+    # The wait has seen the turn running twice, so it is looping rather than
+    # merely slow to start.
+    seen_running_twice = asyncio.Event()
+    running_reads = 0
+    real_status = orchestration._session_status_from_cache
+
+    def counted_status(session_id: str, *args):
+        nonlocal running_reads
+        status = real_status(session_id, *args)
+        if session_id == source["id"] and status == "running":
+            running_reads += 1
+            if running_reads >= 2:
+                seen_running_twice.set()
+        return status
+
+    monkeypatch.setattr(orchestration, "_session_status_from_cache", counted_status)
     # The tool call happens mid-turn.
     monkeypatch.setitem(sessions_common._session_status_cache, source["id"], "running")
     result = await _project_tool(
@@ -794,8 +810,7 @@ async def test_a_session_archives_itself_and_stops_once_its_turn_ends(
     assert result["status"] == "updated" and result["archived"] is True, result
     assert store.get_conversation(source["id"]).archived is True
 
-    # custom-lint: disable-next=sleep-then-assert -- checks that nothing happens mid-turn
-    await asyncio.sleep(0.2)
+    await asyncio.wait_for(seen_running_twice.wait(), 5)
     assert torn_down == [] and source["id"] in orchestration._pending_archive_stops
     if undone:
         # An Undo on another replica only clears the flag; the wait ends without

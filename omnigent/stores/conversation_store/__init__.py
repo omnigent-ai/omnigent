@@ -350,6 +350,8 @@ class SessionActivity:
     :param pending_elicitation_count: Current unresolved session approvals/questions;
         ``None`` when not reported.
     :param runner_id: Bound runner, or ``None`` for an in-process session.
+    :param archived: Whether the session is archived; ``None`` when the store
+        doesn't report it.
     """
 
     updated_at: int
@@ -357,6 +359,7 @@ class SessionActivity:
     total_cost_usd: float | None = None
     pending_elicitation_count: int | None = None
     runner_id: str | None = None
+    archived: bool | None = None
 
 
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel

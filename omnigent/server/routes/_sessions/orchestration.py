@@ -1078,7 +1078,8 @@ async def _await_archived_turn_end(session_id: str, conversation_store: Conversa
 
     The status comes from this replica's relay cache, falling back to the row's
     persisted live status, so the wait works on a replica without the tunnel.
-    A failed read says nothing about the turn, so the wait keeps polling.
+    Each poll reads only the session's activity, never its labels. A failed
+    read says nothing about the turn, so the wait keeps polling.
 
     :returns: ``False`` once the session is no longer archived (an Undo), so the
         caller skips the teardown; ``True`` otherwise.
@@ -1087,7 +1088,9 @@ async def _await_archived_turn_end(session_id: str, conversation_store: Conversa
     deadline = loop.time() + _SELF_ARCHIVE_TURN_WAIT_S
     while True:
         try:
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            activity = await asyncio.to_thread(
+                conversation_store.get_session_activity, [session_id]
+            )
         except Exception:  # noqa: BLE001
             _logger.debug(
                 "Self-archive turn check failed for %s; retrying",
@@ -1096,9 +1099,12 @@ async def _await_archived_turn_end(session_id: str, conversation_store: Conversa
                 extra={"session_id": session_id},
             )
         else:
-            if conv is None or not conv.archived:
+            row = activity.get(session_id)
+            # A missing row is a deleted session. A store that doesn't report
+            # the flag (None) keeps waiting; _archive_stop re-reads it anyway.
+            if row is None or row.archived is False:
                 return False
-            if _session_status_from_cache(session_id, conv.live_status) != "running":
+            if _session_status_from_cache(session_id, row.live_status) != "running":
                 return True
         if loop.time() >= deadline:
             _logger.warning(
