@@ -15,7 +15,8 @@ from filelock import FileLock
 
 from omnigent.debug_logging import debug_event
 from omnigent.entities import LoadedAgent
-from omnigent.spec import AgentSpec
+from omnigent.server.auth import local_single_user_enabled
+from omnigent.spec import AgentSpec, _reject_unregistered_spec_policy_handlers
 from omnigent.spec import load as load_spec
 from omnigent.stores.artifact_store import ArtifactStore
 
@@ -32,6 +33,11 @@ def _cleanup_staging_dir(path: Path) -> None:
         pass  # Successful publication moved this staging directory into the cache.
     except OSError as exc:
         _logger.warning("Could not clean agent cache staging directory %s: %s", path, exc)
+
+
+def _enforces_handler_allowlist(expand_env: bool) -> bool:
+    """Tenant bundles on a multi-user server must use registered handlers."""
+    return not expand_env and not local_single_user_enabled()
 
 
 def _published_location(workdir: Path) -> str | None:
@@ -57,6 +63,8 @@ class AgentCache:
 
     On cache miss the bundle is downloaded from the ArtifactStore,
     extracted to disk, parsed, validated, and stored in both tiers.
+    Tenant bundles are checked against the current handler registry on every
+    load, including bundles cached before that check existed.
 
     This is an **execution** load path, so it loads with
     ``prune_invalid_sub_agents=True``: a sub-agent that fails
@@ -81,6 +89,22 @@ class AgentCache:
         self._artifact_store = artifact_store
         self._cache_dir = cache_dir
         self._specs: dict[str, tuple[str, AgentSpec]] = {}  # agent_id → (location, spec)
+
+    def _load_spec(
+        self, source: Path | bytes, *, expand_env: bool, dest: Path | None = None
+    ) -> AgentSpec:
+        return load_spec(
+            source,
+            dest=dest,
+            expand_env=expand_env,
+            enforce_handler_allowlist=_enforces_handler_allowlist(expand_env),
+            prune_invalid_sub_agents=True,
+        )
+
+    def _check_cached_handlers(self, spec: AgentSpec, *, expand_env: bool) -> None:
+        """Check handlers outside the repair path, so a rejection is not treated as corruption."""
+        if _enforces_handler_allowlist(expand_env):
+            _reject_unregistered_spec_policy_handlers(spec)
 
     def _cache_path(self, agent_id: str) -> Path:
         """Return a direct child of the cache root for an agent id."""
@@ -143,6 +167,7 @@ class AgentCache:
         # changes for a given ``agent_id``.
         cached = self._specs.get(agent_id)
         if cached is not None and cached[0] == bundle_location:
+            self._check_cached_handlers(cached[1], expand_env=expand_env)
             return LoadedAgent(spec=cached[1], workdir=workdir)
 
         # Tier 2: rebuild stale, missing, or corrupt extracted specs from the stored bundle.
@@ -153,9 +178,9 @@ class AgentCache:
                 spec = load_spec(workdir, expand_env=expand_env, prune_invalid_sub_agents=True)
             except Exception:
                 return self._recover_disk_entry(agent_id, bundle_location, expand_env=expand_env)
-            else:
-                self._specs[agent_id] = (bundle_location, spec)
-                return LoadedAgent(spec=spec, workdir=workdir)
+            self._check_cached_handlers(spec, expand_env=expand_env)
+            self._specs[agent_id] = (bundle_location, spec)
+            return LoadedAgent(spec=spec, workdir=workdir)
 
         # Cache miss — validate privately before publishing the disk entry.
         bundle_bytes = self._artifact_store.get(bundle_location)
@@ -186,6 +211,7 @@ class AgentCache:
                     ),
                 )
             else:
+                self._check_cached_handlers(spec, expand_env=expand_env)
                 self._specs[agent_id] = (bundle_location, spec)
                 return LoadedAgent(spec=spec, workdir=workdir)
 
@@ -247,11 +273,10 @@ class AgentCache:
         """
         workdir = self._cache_path(agent_id)
         with self._staging_dir() as staging_dir:
-            spec = load_spec(
+            spec = self._load_spec(
                 bundle_bytes,
                 dest=staging_dir,
                 expand_env=expand_env,
-                prune_invalid_sub_agents=True,
             )
             (staging_dir / _LOCATION_MARKER).write_text(bundle_location, encoding="utf-8")
             workdir = self._cache_path(agent_id)
@@ -342,11 +367,10 @@ class AgentCache:
         :returns: A LoadedAgent with the parsed spec and workdir.
         """
         with self._staging_dir() as staging_dir:
-            spec = load_spec(
+            spec = self._load_spec(
                 bundle_bytes,
                 dest=staging_dir,
                 expand_env=expand_env,
-                prune_invalid_sub_agents=True,
             )
             (staging_dir / _LOCATION_MARKER).write_text(bundle_location, encoding="utf-8")
             workdir = self._cache_path(agent_id)
@@ -367,10 +391,9 @@ class AgentCache:
                         agent_id, bundle_location, expand_env=expand_env
                     )
                 # Another cold loader published first; use its complete bundle.
-                spec = load_spec(
+                spec = self._load_spec(
                     workdir,
                     expand_env=expand_env,
-                    prune_invalid_sub_agents=True,
                 )
         self._specs[agent_id] = (bundle_location, spec)
         return LoadedAgent(spec=spec, workdir=workdir)

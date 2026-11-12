@@ -1167,6 +1167,9 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
                 execPolicyAmendment.every((entry): entry is string => typeof entry === "string")
                   ? execPolicyAmendment
                   : null,
+              ...(typeof p.approval_request_fingerprint === "string"
+                ? { requestFingerprint: p.approval_request_fingerprint }
+                : {}),
             }
           : null,
       allowAllEdits,

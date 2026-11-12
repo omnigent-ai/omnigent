@@ -1537,7 +1537,12 @@ async def _spec_reasoning_effort(deps: FireDeps, task: ScheduledTask) -> str | N
         agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
         if agent is None or getattr(agent, "bundle_location", None) is None:
             return None
-        loaded = await asyncio.to_thread(deps.agent_cache.load, agent.id, agent.bundle_location)
+        loaded = await asyncio.to_thread(
+            deps.agent_cache.load,
+            agent.id,
+            agent.bundle_location,
+            expand_env=agent.operator_authored,
+        )
         executor = getattr(loaded.spec, "executor", None)
         return getattr(executor, "reasoning_effort", None) if executor else None
     except Exception:

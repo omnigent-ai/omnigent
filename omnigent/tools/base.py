@@ -53,12 +53,16 @@ class ToolContext:
         addressing). ``None`` when not available (older workflow
         paths, unit tests) — tools that require it should fail
         loud.
+    :param caller_user_id: Authenticated actor for the current turn.
+        ``None`` for system turns or dispatch paths without a trusted
+        actor; tools that search across sessions must fail closed.
     """
 
     task_id: str
     agent_id: str
     workspace: Path | None = None
     conversation_id: str | None = None
+    caller_user_id: str | None = None
 
 
 class Tool(abc.ABC):

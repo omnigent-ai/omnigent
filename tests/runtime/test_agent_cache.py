@@ -1019,3 +1019,102 @@ def test_cleanup_warning_preserves_original_validation_error(
     assert "Could not clean agent cache staging directory" in caplog.text
     assert "cleanup denied" in caplog.text
     assert not (cache_dir / "agent").exists()
+
+
+_UNREGISTERED_HANDLER_CONFIG = yaml.dump(
+    {
+        "spec_version": 1,
+        "name": "handler-agent",
+        "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+        "guardrails": {
+            "policies": {
+                "custom_gate": {
+                    "type": "function",
+                    "on": ["tool_call"],
+                    "function": {"path": "example_org.policies.custom_gate", "arguments": {}},
+                }
+            }
+        },
+    }
+)
+
+
+def test_load_rejects_unregistered_handler_in_tenant_bundle(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tenant bundle naming an unregistered policy handler fails to load."""
+    monkeypatch.setattr(agent_cache_module, "local_single_user_enabled", lambda: False)
+    loc = "handler-tenant/h1"
+    _store_bundle(artifact_store, loc, {"config.yaml": _UNREGISTERED_HANDLER_CONFIG})
+
+    with pytest.raises(OmnigentError, match="not a registered policy handler"):
+        agent_cache.load("handler-tenant", loc, expand_env=False)
+
+
+def test_memory_hit_revalidates_handler_for_tenant_load(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spec cached in memory is re-checked against the registry on each tenant load."""
+    monkeypatch.setattr(agent_cache_module, "local_single_user_enabled", lambda: False)
+    loc = "handler-warm/h1"
+    _store_bundle(artifact_store, loc, {"config.yaml": _UNREGISTERED_HANDLER_CONFIG})
+    agent_cache.load("handler-warm", loc, expand_env=True)
+
+    with pytest.raises(OmnigentError, match="not a registered policy handler"):
+        agent_cache.load("handler-warm", loc, expand_env=False)
+
+
+def test_operator_bundle_keeps_custom_handler(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+) -> None:
+    """Operator-authored bundles (``expand_env=True``) may use custom handlers."""
+    loc = "handler-operator/h1"
+    _store_bundle(artifact_store, loc, {"config.yaml": _UNREGISTERED_HANDLER_CONFIG})
+
+    loaded = agent_cache.load("handler-operator", loc, expand_env=True)
+
+    assert loaded.spec.name == "handler-agent"
+
+
+def test_local_single_user_keeps_custom_handler_for_tenant_load(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local single-user server keeps its operator's custom handlers."""
+    monkeypatch.setattr(agent_cache_module, "local_single_user_enabled", lambda: True)
+    loc = "handler-local/h1"
+    _store_bundle(artifact_store, loc, {"config.yaml": _UNREGISTERED_HANDLER_CONFIG})
+
+    loaded = agent_cache.load("handler-local", loc, expand_env=False)
+
+    assert loaded.spec.name == "handler-agent"
+
+
+def test_disk_hit_rejects_unregistered_handler_without_repairing_entry(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A published disk entry that a tenant may not use is rejected, not rebuilt."""
+    loc = "handler-disk/h1"
+    _store_bundle(artifact_store, loc, {"config.yaml": _UNREGISTERED_HANDLER_CONFIG})
+    AgentCache(artifact_store=artifact_store, cache_dir=cache_dir).load(
+        "handler-disk", loc, expand_env=True
+    )
+    monkeypatch.setattr(agent_cache_module, "local_single_user_enabled", lambda: False)
+    fresh_cache = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+
+    def fail_on_repair(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("policy rejection must not start cache repair")
+
+    monkeypatch.setattr(fresh_cache, "_recover_disk_entry", fail_on_repair)
+
+    with pytest.raises(OmnigentError, match="not a registered policy handler"):
+        fresh_cache.load("handler-disk", loc, expand_env=False)
+    assert (cache_dir / "handler-disk" / "config.yaml").is_file()

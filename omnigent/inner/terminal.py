@@ -49,6 +49,7 @@ from .git_ssh import GitSshBroker, apply_git_ssh_env, start_git_ssh_broker
 from .os_env import (
     OSEnvironment,
     _copy_tree,
+    build_helper_env,
     create_os_environment,
 )
 from .sandbox import (
@@ -749,6 +750,7 @@ def terminal_pane_environment(
     env: Mapping[str, str],
     env_unset: Iterable[str],
     launch_environment: Mapping[str, str] | None = None,
+    sandbox_policy: SandboxPolicy | None = None,
 ) -> dict[str, str]:
     """
     Build the environment a terminal pane's command starts with.
@@ -761,6 +763,8 @@ def terminal_pane_environment(
     :param env_unset: Names removed after the overrides, e.g. ``["ANTHROPIC_API_KEY"]``.
     :param launch_environment: This launch's lifecycle identity variables, or
         ``None`` when there are none.
+    :param sandbox_policy: Active sandbox whose env allowlist filters the inherited
+        environment, or ``None`` when the pane is not sandboxed.
     :returns: The pane environment, e.g. ``{"HOME": "/home/user", "LANG": "C.UTF-8"}``.
     """
     # Do NOT advertise the tmux control socket path to the
@@ -769,7 +773,12 @@ def terminal_pane_environment(
     # commands outside the sandbox. The host-side control plane
     # addresses the socket via the instance's ``socket_path`` and never
     # needs the env var; any inherited value is stripped below too.
-    result: dict[str, str] = os.environ.copy() if inherit_env else {}
+    if not inherit_env:
+        result: dict[str, str] = {}
+    elif sandbox_policy is not None and sandbox_policy.active:
+        result = build_helper_env(os.environ, sandbox_policy)
+    else:
+        result = os.environ.copy()
     result.pop("OMNIGENT_TMUX_SOCK", None)
     # Apply per-terminal env overrides (takes precedence over inherited env).
     result.update(env)
@@ -1655,6 +1664,7 @@ class TerminalInstance:
             env=self.env,
             env_unset=self.env_unset,
             launch_environment=launch_environment,
+            sandbox_policy=self.sandbox_policy,
         )
         if self._clipboard_bridge is not None:
             self._clipboard_bridge.prepare_environment(env)

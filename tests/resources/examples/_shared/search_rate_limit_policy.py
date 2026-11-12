@@ -46,3 +46,11 @@ def rate_limit_search(event: PolicyEvent) -> PolicyResponse:
             ),
         }
     return {"result": "ALLOW"}
+
+
+POLICY_REGISTRY = [
+    {
+        "handler": "tests.resources.examples._shared.search_rate_limit_policy.rate_limit_search",
+        "kind": "callable",
+    },
+]

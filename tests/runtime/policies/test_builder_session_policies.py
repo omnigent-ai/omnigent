@@ -12,6 +12,7 @@ Also covers DB-stored default policies (``session_id IS NULL``) and the
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from typing import Any
 
 import cachetools
@@ -20,6 +21,7 @@ import pytest
 from omnigent.entities import Policy as StoredPolicy
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.function import FunctionPolicy
+from omnigent.policies.registry import load_registry
 from omnigent.runtime.policies.builder import (
     _DEFAULT_POLICY_SPECS_CACHE,
     _DEFAULT_POLICY_SPECS_KEY,
@@ -42,6 +44,29 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+
+# Handlers attached by these fixtures. They are declared in this module's
+# POLICY_REGISTRY and loaded through the real registry, so attachment and
+# runtime validation both accept them.
+POLICY_REGISTRY = [
+    {"handler": handler}
+    for handler in (
+        "myorg.policies.allow_all",
+        "myorg.policies.deny_all",
+        "myorg.policies.rate_limit",
+        "myorg.policies.simple_check",
+        "tests.resources.examples._shared.tool_functions.block_division",
+        "tests.resources.examples._shared.tool_functions.block_long_sleep",
+    )
+]
+
+
+@pytest.fixture(autouse=True)
+def _register_fixture_policy_handlers() -> Iterator[None]:
+    load_registry(extra_modules=[__name__])
+    yield
+    load_registry()
+
 
 # ── _stored_policy_to_spec ──────────────────────────────────────────────────
 
@@ -72,6 +97,24 @@ def test_stored_python_policy_to_spec() -> None:
     assert spec.function is not None
     assert spec.function.path == "myorg.policies.rate_limit"
     assert spec.function.arguments == {"limit": 10}
+
+
+def test_stored_python_policy_with_unregistered_handler_is_rejected() -> None:
+    """A stored python policy naming an unregistered handler is never converted."""
+    stored = StoredPolicy(
+        id="5e1c0f3b9a7d4c2e8b6f1a0d9c3e7b25",
+        name="unregistered",
+        session_id="0099dc8be6d82871e2e450424d46d1b7",
+        scope="session",
+        created_at=1000,
+        type="python",
+        handler="example_org.policies.unregistered_gate",
+        factory_params=None,
+    )
+
+    with pytest.raises(OmnigentError, match="not a registered policy handler") as excinfo:
+        _stored_policy_to_spec(stored)
+    assert excinfo.value.code == ErrorCode.INVALID_INPUT
 
 
 def test_stored_python_policy_without_factory_params() -> None:
@@ -709,6 +752,36 @@ def test_load_default_policy_specs_skips_url_type(db_uri: str) -> None:
 
     assert len(specs) == 1
     assert specs[0].name == "python_default"
+
+
+def test_load_default_policy_specs_skips_unregistered_handler(db_uri: str) -> None:
+    """A default row whose handler is no longer registered is skipped, not raised.
+
+    Engine construction runs for every session, so one stale default row must not
+    break it.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    store = SqlAlchemyPolicyStore(db_uri)
+    store.create_default(
+        policy_id="3c9f1e7a0b2d4f86a1c5e9d7b3f0a2e4",
+        name="stale_default",
+        type="python",
+        handler="example_org.policies.removed_gate",
+        enabled=True,
+    )
+    store.create_default(
+        policy_id="7d2a6b4e9c1f48a0b5d3e8f2a6c9b1d7",
+        name="python_default",
+        type="python",
+        handler="myorg.policies.allow_all",
+        enabled=True,
+    )
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+
+    specs = _load_default_policy_specs(store)
+
+    assert [spec.name for spec in specs] == ["python_default"]
 
 
 def test_load_default_policy_specs_filters_disabled(db_uri: str) -> None:

@@ -516,10 +516,31 @@ def _resolve_grant_root(cwd: Path, root: str) -> Path:
             root,
         )
     expanded = os.path.expanduser(root)
-    path = Path(expanded)
-    if not path.is_absolute():
-        path = cwd / path
-    return path.resolve(strict=False)
+    if Path(expanded).is_absolute() or ".." in Path(root).parts:
+        return Path(os.path.realpath(os.path.join(cwd, expanded)))
+    return Path(_contained_relative_grant(cwd, root, expanded))
+
+
+def _check_relative_grant_containment(cwd: Path, root: str) -> None:
+    """Reject a relative grant whose resolved target leaves *cwd*.
+
+    Absolute, ``~``, and ``..`` grants are not checked here.
+    """
+    expanded = os.path.expanduser(root)
+    if Path(expanded).is_absolute() or ".." in Path(root).parts:
+        return
+    _contained_relative_grant(cwd, root, expanded)
+
+
+def _contained_relative_grant(cwd: Path, root: str, expanded: str) -> str:
+    """Return the real path of a relative grant under *cwd*, or raise when it escapes."""
+    base = os.path.realpath(cwd)
+    resolved = contained_realpath(os.path.join(base, expanded), containment_prefix(base))
+    if resolved is None:
+        raise ValueError(
+            f"relative sandbox grant resolves outside its working directory: {root!r}"
+        )
+    return resolved
 
 
 def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:

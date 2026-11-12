@@ -196,6 +196,19 @@ class PermissionStore(ABC):
         """
         ...
 
+    def can_list_default_policies(self, user_id: str | None) -> bool:  # noqa: ARG002 — default allows everyone
+        """Whether *user_id* may LIST server-wide default ("global") policies.
+
+        Backs the read-only ``GET /v1/policies`` list route's gate. Defaults to
+        allowing everyone — the single-tenant self-hosted assumption that
+        listing default policies is unrestricted. Override for multi-tenant
+        backends that restrict who may see global policies.
+
+        :param user_id: The authenticated user, or ``None`` if unauthenticated.
+        :returns: ``True`` if the user may list default policies.
+        """
+        return True
+
     @abstractmethod
     def set_admin(self, user_id: str, is_admin: bool) -> None:
         """Set the admin flag on an existing user row.

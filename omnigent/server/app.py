@@ -2451,6 +2451,7 @@ def create_app(
     app.state.harness_install = app_harness_install
     app.state.mcp_disabled_servers = app_mcp_disabled_servers
     app.state.automations = True if automations is None else automations
+    app.state.policy_modules = list(policy_modules or [])
 
     def automations_available() -> bool:
         return scheduled_task_store is not None and deployment_gate_enabled(

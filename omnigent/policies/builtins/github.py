@@ -67,11 +67,13 @@ YAML usage::
 
 from __future__ import annotations
 
+import logging
 import re
 import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from omnigent.policies.builtins._shell import (
     MAX_SHELL_NESTING,
@@ -86,6 +88,8 @@ from omnigent.policies.builtins._shell import (
 )
 from omnigent.policies.schema import PolicyEvent, PolicyResponse
 
+_log = logging.getLogger(__name__)
+
 # ── Shared constants ──────────────────────────────────────────────────────────
 
 # Tool-name prefixes stripped to obtain the canonical tool name. Longest-first
@@ -96,28 +100,18 @@ _DEFAULT_TOOL_PREFIXES: tuple[str, ...] = ("mcp__github__", "github__")
 # every harness's, since most ``git push`` runs on a native harness.
 _DEFAULT_SHELL_TOOLS: frozenset[str] = SHELL_TOOLS
 
-# Pulls ``owner/repo`` out of any GitHub URL (HTTPS, SSH, scp-style). The
-# ``[:/]+`` after the host matches both ``github.com/owner`` and the scp-style
-# ``github.com:owner``. A trailing ``.git`` and any path past the repo (``/pull/1``,
-# ``?tab=x``) are dropped. The ``(?<![A-Za-z0-9._-])`` guard anchors the host to a
-# DNS label boundary so a look-alike like ``notgithub.com`` / ``mygithub.com``
-# (alnum prefix) OR ``evil-github.com`` / ``evil_github.com`` (hyphen / underscore
-# prefix — both legal DNS-label characters) does NOT match and leak a foreign repo
-# into the allowlist check. The class MUST include ``-`` and ``_``: omitting them
-# let an attacker host whose name merely contains ``github.com`` after a label
-# separator be parsed as the real ``github.com`` and inherit an allowed repo's
-# verdict, so a ``git push`` to ``evil-github.com/<allowed-owner>/<allowed-repo>``
-# would exfiltrate to the attacker host while the policy returned ALLOW.
-_REPO_URL_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9._-])github\.com[:/]+([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+?)(?:\.git)?(?:[/?#]|$)"
-)
+# Owner/repo path after the URL authority has been validated. The authority is
+# checked separately, so a ``github.com`` segment inside another host's path is ignored.
+_REPO_PATH_PATTERN = re.compile(r"^([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+?)(?:\.git)?(?:/|$)")
+# scp-style ``[user@]github.com:owner/repo``.
+_REPO_SCP_PATTERN = re.compile(r"^(?:[^@/:]+@)?github\.com:(.+)$", re.IGNORECASE)
 
 # Bare ``owner/repo`` with nothing else around it (no scheme, no host, no extra
 # path). Used for allowlist entries and ``--repo owner/repo`` style args.
 _REPO_BARE_PATTERN = re.compile(r"^([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+?)(?:\.git)?$")
 
 # Pulls ``owner/repo`` out of a ``gh api`` REST path like ``repos/owner/repo/pulls``.
-_REPO_API_PATH_PATTERN = re.compile(r"(?:^|/)repos/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)")
+_REPO_API_PATH_PATTERN = re.compile(r"^repos/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)(?:/|$)")
 
 # Arg keys (MCP) that, combined, name the owning org of a repo.
 _OWNER_ARG_KEYS: tuple[str, ...] = ("owner", "org", "organization")
@@ -199,56 +193,81 @@ def _normalize_repo(value: str) -> str:
     """
     Reduce a repo reference to a bare lowercase ``owner/repo``.
 
-    :param value: A bare ``owner/repo``, or a GitHub URL, e.g.
-        ``"https://github.com/Octo/Repo/pull/1"`` or ``"git@github.com:Octo/Repo.git"``.
+    :param value: A bare ``owner/repo``, a scheme-less ``github.com/owner/repo``,
+        or a GitHub URL, e.g. ``"https://github.com/Octo/Repo/pull/1"``,
+        ``"git@github.com:Octo/Repo.git"``, or ``"github.com:Octo/Repo"``.
     :returns: The lowercased ``owner/repo`` (``"octo/repo"``), or empty string
         when no repo can be extracted.
     """
     value = value.strip()
     if not value:
         return ""
-    url_match = _REPO_URL_PATTERN.search(value)
-    if url_match:
-        return f"{url_match.group(1)}/{url_match.group(2)}".lower()
     bare_match = _REPO_BARE_PATTERN.match(value)
     if bare_match:
         return f"{bare_match.group(1)}/{bare_match.group(2)}".lower()
-    return ""
+    repo = _repo_from_url(value)
+    if repo or "://" in value or "@" in value:
+        return repo
+    # Without a scheme the URL parser sees no host; retry with one so the host check applies.
+    return _repo_from_url(f"https://{value}")
 
 
-def _repo_from_url(value: str) -> str:
+def _repo_from_url(value: str, *, allow_subpath: bool = True) -> str:
     """
     Extract ``owner/repo`` from a GitHub URL/SCP ref, host-checked.
 
     Unlike :func:`_normalize_repo`, this never falls back to treating a bare
-    ``a/b`` string as a repo — it matches only when the value actually
-    references the ``github.com`` host. Host validation is done by
-    ``_REPO_URL_PATTERN``'s negative lookbehind, which rejects look-alike
-    hosts such as ``evil-github.com`` (a plain ``"github.com" in value``
-    substring test would not). Use this when scanning arbitrary argument
-    values or command tokens, where a bare ``a/b`` could be unrelated text.
+    ``a/b`` string as a repo. The URL scheme and host must name ``github.com``
+    exactly, and percent-encoded or dot-segment paths are rejected.
 
     :param value: A value that may contain a GitHub URL, e.g.
         ``"https://github.com/Octo/Repo/pull/1"`` or
         ``"git@github.com:Octo/Repo.git"``.
+    :param allow_subpath: Accept paths after the repository, such as a PR URL.
+        Git push destinations set this to ``False``.
     :returns: Lowercased ``owner/repo``, or empty string if the value does
         not reference a ``github.com`` repo.
     """
-    url_match = _REPO_URL_PATTERN.search(value)
-    if url_match:
-        return f"{url_match.group(1)}/{url_match.group(2)}".lower()
-    return ""
+    value = value.strip()
+    scp_match = _REPO_SCP_PATTERN.fullmatch(value)
+    if scp_match:
+        path = scp_match.group(1)
+    else:
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return ""
+        if parsed.scheme.lower() not in {"http", "https", "ssh", "git"}:
+            return ""
+        if parsed.hostname != "github.com":
+            return ""
+        path = parsed.path.lstrip("/")
+    if "%" in path or any(segment in {".", ".."} for segment in path.split("/")):
+        return ""
+    match = _REPO_PATH_PATTERN.match(path) if allow_subpath else _REPO_BARE_PATTERN.fullmatch(path)
+    return f"{match.group(1)}/{match.group(2)}".lower() if match else ""
 
 
 def _normalize_repos(values: list[str] | None) -> set[str]:
     """
     Normalize a list of repo references to a set of lowercase ``owner/repo``.
 
-    :param values: Repo IDs and/or GitHub URLs. ``None`` → empty list.
-    :returns: Set of normalized ``owner/repo``, un-parseable / empty entries
-        dropped.
+    :param values: Configured repo IDs and/or GitHub URLs. ``None`` → empty list.
+    :returns: Set of normalized ``owner/repo``. Entries that cannot be parsed
+        are dropped and logged as warnings.
     """
-    return {repo for value in (values or []) if (repo := _normalize_repo(value))}
+    repos: set[str] = set()
+    for value in values or []:
+        repo = _normalize_repo(value)
+        if repo:
+            repos.add(repo)
+        else:
+            _log.warning(
+                "GitHub policy ignores configured repo %r: expected owner/repo or a "
+                "github.com URL.",
+                value,
+            )
+    return repos
 
 
 def _normalize_branch(value: str) -> str:
@@ -767,21 +786,245 @@ def _repo_from_tokens(tokens: list[str]) -> str | None:
     return None
 
 
-def _flag_value(tokens: list[str], names: frozenset[str]) -> str | None:
+def _gh_api_endpoint(rest: list[str]) -> str | None:
+    """Return the endpoint operand, excluding option values such as request fields."""
+    value_options = frozenset(
+        {
+            "-X",
+            "--method",
+            "-H",
+            "--header",
+            "-f",
+            "--field",
+            "-F",
+            "--raw-field",
+            "--input",
+            "-q",
+            "--jq",
+            "-t",
+            "--template",
+            "--hostname",
+            "-R",
+            "--repo",
+            "--cache",
+            "-p",
+            "--preview",
+        }
+    )
+    flag_only = frozenset({"--paginate", "--slurp", "--silent", "--verbose", "-i", "--include"})
+    i = 0
+    while i < len(rest):
+        token = rest[i]
+        if token == "--":
+            return rest[i + 1] if i + 1 < len(rest) else None
+        if token in value_options:
+            i += 2
+            continue
+        if token.startswith("-"):
+            if (
+                "=" not in token
+                and not token.startswith(("-f", "-F", "-H", "-X", "-q", "-t"))
+                and token not in flag_only
+            ):
+                return None
+            i += 1
+            continue
+        return token
+    return None
+
+
+def _repo_from_gh_api_endpoint(endpoint: str | None) -> str | None:
+    """Return the repository named by a REST endpoint on github.com, or ``None``."""
+    if endpoint is None:
+        return None
+    if "://" in endpoint:
+        try:
+            parsed = urlsplit(endpoint)
+        except ValueError:
+            return None
+        if parsed.scheme.lower() != "https" or parsed.hostname != "api.github.com":
+            return None
+        path = parsed.path.lstrip("/")
+    else:
+        path = endpoint.lstrip("/")
+    if "%" in path or any(segment in {".", ".."} for segment in path.split("/")):
+        return None
+    match = _REPO_API_PATH_PATTERN.match(path)
+    return f"{match.group(1)}/{match.group(2)}".lower() if match else None
+
+
+_GIT_PUSH_VALUE_OPTIONS = frozenset(
+    {"--repo", "--receive-pack", "--exec", "--push-option", "--recurse-submodules"}
+)
+_GIT_PUSH_BOOLEAN_OPTIONS = frozenset(
+    {
+        "--all",
+        "--branches",
+        "--mirror",
+        "--delete",
+        "--no-recurse-submodules",
+        "--tags",
+        "--dry-run",
+        "--porcelain",
+        "--force",
+        "--force-with-lease",
+        "--force-if-includes",
+        "--thin",
+        "--set-upstream",
+        "--progress",
+        "--prune",
+        "--follow-tags",
+        "--signed",
+        "--atomic",
+        "--verbose",
+        "--quiet",
+        "--verify",
+        "--ipv4",
+        "--ipv6",
+    }
+)
+_GIT_PUSH_SHORT_OPTIONS = frozenset({"v", "q", "d", "n", "f", "u", "4", "6"})
+
+
+def _parse_git_push_args(args: list[str]) -> tuple[str | None, list[str], set[str]] | None:
+    """Isolate the push remote and refspecs without treating option values as targets."""
+    positionals: list[str] = []
+    flags: set[str] = set()
+    repo_option: str | None = None
+    options_done = False
+    i = 0
+    while i < len(args):
+        token = args[i]
+        i += 1
+        if options_done or not token.startswith("-") or token == "-":
+            positionals.append(token)
+            continue
+        if token == "--":
+            options_done = True
+            continue
+        if token.startswith("--"):
+            name, equal, attached = token.partition("=")
+            if name in _GIT_PUSH_VALUE_OPTIONS:
+                if not equal:
+                    if i == len(args):
+                        return None
+                    attached = args[i]
+                    i += 1
+                if name == "--repo":
+                    if repo_option is not None:
+                        return None
+                    repo_option = attached
+                flags.add(name)
+            elif name in _GIT_PUSH_BOOLEAN_OPTIONS or (
+                name.startswith("--no-") and "--" + name[5:] in _GIT_PUSH_BOOLEAN_OPTIONS
+            ):
+                if equal and name not in {"--force-with-lease", "--signed"}:
+                    return None
+                flags.add(name)
+            else:
+                return None
+            continue
+        for offset, option in enumerate(token[1:]):
+            if option not in _GIT_PUSH_SHORT_OPTIONS and option != "o":
+                return None
+            flags.add("-" + option)
+            if option == "o":
+                if offset == len(token) - 2:
+                    if i == len(args):
+                        return None
+                    i += 1
+                break
+    if repo_option is not None:
+        # The interaction of --repo and positional arguments is ambiguous here.
+        if positionals:
+            return None
+        return repo_option, [], flags
+    return (positionals[0] if positionals else None), positionals[1:], flags
+
+
+def _unparsed_git_push(args: list[str]) -> _ShellOp:
+    """Preserve destructive push indicators when an option obscures the remote."""
+    is_force = any(
+        token in {"--force", "--force-with-lease", "--force-if-includes"}
+        or token.startswith(("--force-with-lease=", "--force-if-includes=", "+"))
+        or (token.startswith("-") and not token.startswith("--") and "f" in token[1:])
+        for token in args
+    )
+    is_destructive = any(
+        token in {"--delete", "--mirror", "--prune"}
+        or (token.startswith("-") and not token.startswith("--") and "d" in token[1:])
+        or token.startswith(":")
+        for token in args
+    )
+    tag_push = any(
+        token in {"--tags", "--follow-tags", "--mirror"}
+        or token.startswith("refs/tags/")
+        or ":refs/tags/" in token
+        for token in args
+    )
+    return _ShellOp(
+        kind="write",
+        repo=None,
+        branches=frozenset(),
+        branch_targeted=True,
+        detail="git push with unsupported options",
+        destructive=is_destructive,
+        tag_push=tag_push,
+        force_push=is_force or "--mirror" in args,
+    )
+
+
+def _flag_values(tokens: list[str], names: frozenset[str]) -> list[str]:
     """
-    Return the value of the first matching ``--flag value`` / ``--flag=value``.
+    Return every value given for a flag, in command-line order.
+
+    Accepts ``--flag value``, ``--flag=value``, and the attached short form
+    ``-Rvalue``. gh (cobra/pflag) keeps the last occurrence, so callers must
+    check the whole list for conflicts instead of trusting the first match.
 
     :param tokens: Argument tokens.
     :param names: Flag spellings to match, e.g. ``{"--repo", "-R"}``.
-    :returns: The flag's value, or ``None`` when the flag is absent.
+    :returns: The values in order; empty when the flag is absent.
     """
+    values: list[str] = []
     for i, token in enumerate(tokens):
         for name in names:
-            if token == name and i + 1 < len(tokens):
-                return tokens[i + 1]
-            if token.startswith(name + "="):
-                return token[len(name) + 1 :]
-    return None
+            if token == name:
+                if i + 1 < len(tokens):
+                    values.append(tokens[i + 1])
+            elif token.startswith(name + "="):
+                values.append(token[len(name) + 1 :])
+            elif len(name) == 2 and token.startswith(name) and len(token) > 2:
+                values.append(token[2:])
+    return values
+
+
+def _conflicting_values(values: list[str], normalize: Callable[[str], str]) -> bool:
+    """
+    Return whether repeated flag values name different targets.
+
+    :param values: Values from :func:`_flag_values`, e.g. ``["example/a", "example/b"]``.
+    :param normalize: Reduces a value to its target, e.g. :func:`_normalize_repo`.
+        Values that normalize to nothing are compared as written.
+    :returns: ``True`` when two or more distinct targets are present.
+    """
+    return len({normalize(value) or value for value in values}) > 1
+
+
+def _unparseable_op(detail: str) -> _ShellOp:
+    """
+    Build the op for a git/gh command whose target cannot be determined.
+
+    :param detail: Short reason, e.g. ``"conflicting gh repo selectors"``.
+    :returns: An ``unparseable`` :class:`_ShellOp`, which the policy sends to approval.
+    """
+    return _ShellOp(
+        kind="unparseable",
+        repo=None,
+        branches=frozenset(),
+        branch_targeted=False,
+        detail=detail,
+    )
 
 
 def _classify_git(tokens: list[str]) -> _ShellOp | None:
@@ -818,14 +1061,17 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
             detail=f"git {sub}",
         )
     if sub in _GIT_WRITE_SUBCMDS:
-        # ``git push [flags] [<remote>] [<refspec>...]`` — first non-flag token
-        # is the remote (a URL we can resolve, or an alias we cannot); the rest
-        # are refspecs whose right-hand side is the destination branch.
-        positionals = [t for t in args if not t.startswith("-")]
-        repo = _repo_from_tokens(args)
+        # ``git push [flags] [<remote>] [<refspec>...]`` — the remote is the first
+        # positional after option parsing (a URL we can resolve, or an alias we
+        # cannot); the rest are refspecs whose right-hand side is the destination.
+        parsed = _parse_git_push_args(args)
+        if parsed is None:
+            return _unparsed_git_push(args)
+        remote, refspecs, flags = parsed
+        repo = _repo_from_url(remote, allow_subpath=False) if remote else None
         branches: set[str] = set()
-        tag_push = any(t in ("--tags", "--follow-tags") for t in args)
-        for refspec in positionals[1:]:
+        tag_push = bool(flags & {"--tags", "--follow-tags", "--mirror"})
+        for refspec in refspecs:
             dest = refspec.split(":", 1)[1] if ":" in refspec else refspec
             dest = dest.lstrip("+")
             if dest.startswith("refs/tags/"):
@@ -836,18 +1082,16 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
                 branches.add(branch)
         # Detect delete semantics: ``--delete`` / ``-d`` flag, or a refspec
         # starting with ``:`` (empty left side = delete the remote branch).
-        is_destructive = any(t in ("--delete", "-d") for t in args) or any(
-            refspec.startswith(":") for refspec in positionals[1:]
+        is_destructive = bool(flags & {"--delete", "-d", "--mirror", "--prune"}) or any(
+            refspec.startswith(":") for refspec in refspecs
         )
-        # Detect force-push: long flags, ``=``-value forms, bundled short
-        # flags containing ``f`` (e.g. ``-uf``), and ``+refspec`` prefix.
-        _FORCE_LONG = {"--force", "-f", "--force-with-lease", "--force-if-includes"}
-        is_force = any(
-            t in _FORCE_LONG
-            or t.startswith(("--force-with-lease=", "--force-if-includes="))
-            or (t.startswith("-") and not t.startswith("--") and "f" in t)
-            for t in args
-        ) or any(rs.startswith("+") for rs in positionals[1:])
+        # Detect force-push from parsed flags and ``+refspec`` prefixes.
+        is_force = bool(
+            flags & {"--force", "-f", "--force-with-lease", "--force-if-includes", "--mirror"}
+        ) or any(refspec.startswith("+") for refspec in refspecs)
+        if flags & {"--all", "--branches", "--mirror", "--prune"}:
+            # These modes may affect refs beyond any explicit refspec.
+            branches.clear()
         return _ShellOp(
             kind="write",
             repo=repo,
@@ -870,23 +1114,63 @@ def _classify_gh(tokens: list[str]) -> _ShellOp | None:
     :returns: A :class:`_ShellOp`, or ``None`` for ignored gh groups (auth /
         config) and bare ``gh`` with no subcommand.
     """
-    if len(tokens) < 2:
+    i = 1
+    global_repos: list[str] = []
+    while i < len(tokens) and tokens[i].startswith("-"):
+        option = tokens[i]
+        if option in {"--help", "-h", "--version"}:
+            return None
+        if option in {"-R", "--repo"} and i + 1 < len(tokens):
+            global_repos.append(tokens[i + 1])
+            i += 2
+        elif option.startswith(("-R=", "--repo=")):
+            global_repos.append(option.split("=", 1)[1])
+            i += 1
+        else:
+            return _ShellOp(
+                kind="unparseable",
+                repo=None,
+                branches=frozenset(),
+                branch_targeted=False,
+                detail="unsupported gh global option",
+            )
+    if i >= len(tokens):
         return None
-    group = tokens[1]
+    group = tokens[i]
     if group in _GH_IGNORE_GROUPS:
         return None
-    rest = tokens[2:]
-
-    repo = _flag_value(rest, frozenset({"--repo", "-R"})) or _repo_from_tokens(rest)
-    repo = _normalize_repo(repo) if repo else None
-    # Only ``--base`` is a write destination; ``--head`` is the PR's source branch.
-    base = _flag_value(rest, frozenset({"--base", "-B"}))
-    branches = _normalize_branches([base] if base else None)
+    rest = tokens[i + 1 :]
 
     if group == "api":
-        return _classify_gh_api(rest, repo)
+        return _classify_gh_api(rest)
+
+    # The global -R and the subcommand -R both select the repo. Conflicting values
+    # cannot be resolved to one target, so they need approval.
+    repo_values = [*global_repos, *_flag_values(rest, frozenset({"--repo", "-R"}))]
+    if _conflicting_values(repo_values, _normalize_repo):
+        return _unparseable_op("conflicting gh repo selectors")
+    explicit_repo = repo_values[-1] if repo_values else None
+    repo = _normalize_repo(explicit_repo) if explicit_repo is not None else None
+    # Only ``--base`` is a write destination; ``--head`` is the PR's source branch.
+    base_values = _flag_values(rest, frozenset({"--base", "-B"}))
+    if _conflicting_values(base_values, _normalize_branch):
+        return _unparseable_op("conflicting gh base branches")
+    branches = _normalize_branches(base_values[-1:])
 
     action = rest[0] if rest and not rest[0].startswith("-") else ""
+    if explicit_repo is None and len(rest) > 1 and not rest[1].startswith("-"):
+        # Only the first positional operand can designate a target. Body text,
+        # file paths and other options may contain unrelated GitHub URLs.
+        if group == "repo" and action in {"create", "delete", "fork", "edit", "archive", "sync"}:
+            repo = _normalize_repo(rest[1]) or None
+        elif group in {"pr", "issue"} and action not in {"", "create"}:
+            repo = _repo_from_url(rest[1]) or None
+    if explicit_repo is not None and group in {"pr", "issue"} and action not in {"", "create"}:
+        # gh takes the target from a URL argument even when -R is also given, so any
+        # URL argument must name the explicit repo.
+        url_repos = {url_repo for token in rest if (url_repo := _repo_from_url(token))}
+        if any(url_repo != repo for url_repo in url_repos):
+            return _unparseable_op("gh URL argument names a different repo than -R")
     is_write = action in _GH_WRITE_ACTIONS.get(group, frozenset())
     detail = f"gh {group} {action}".strip()
     if is_write:
@@ -908,36 +1192,63 @@ def _classify_gh(tokens: list[str]) -> _ShellOp | None:
     )
 
 
-def _classify_gh_api(rest: list[str], repo: str | None) -> _ShellOp:
+def _classify_gh_api(rest: list[str]) -> _ShellOp:
     """
     Classify a ``gh api`` call (REST method decides read vs write).
 
-    ``gh api`` defaults to GET (read); an explicit write method
-    (``-X POST`` / ``--method PATCH`` / …) or the presence of field flags
-    (``-f`` / ``--field`` / ``--raw-field`` / ``--input``, which make gh default
-    to POST) marks it a write.
+    ``gh api`` defaults to GET (read). An explicit method (``-X POST`` /
+    ``--method PATCH`` / …) decides the call. Without a method, field flags
+    (``-f`` / ``--field`` / ``--raw-field`` / ``--input``) make gh default to
+    POST, so they mark it a write. The repository comes only from the endpoint operand.
 
     :param rest: Tokens after ``gh api``, e.g. ``["repos/o/r/pulls", "-X", "POST"]``.
-    :param repo: Repo already extracted from ``--repo`` / a URL, if any.
     :returns: A read or write :class:`_ShellOp` for the api call.
     """
-    method = _flag_value(rest, frozenset({"-X", "--method"}))
+    methods: list[str] = []
+    for i, token in enumerate(rest):
+        if token in {"-X", "--method"}:
+            methods.append(rest[i + 1].upper() if i + 1 < len(rest) else "")
+        elif token.startswith(("-X=", "--method=")):
+            methods.append(token.split("=", 1)[1].upper())
+        elif token.startswith("-X") and len(token) > 2:
+            methods.append(token[2:].upper())
+    if any(method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"} for method in methods):
+        return _ShellOp(
+            kind="unparseable",
+            repo=None,
+            branches=frozenset(),
+            branch_targeted=False,
+            detail="unsupported gh api method",
+        )
     has_fields = any(
         t in {"-f", "--field", "-F", "--raw-field", "--input"}
-        or t.startswith(("-f=", "--field=", "-F=", "--raw-field="))
+        or t.startswith(("--field=", "--raw-field=", "--input="))
+        or (t.startswith(("-f", "-F")) and "=" in t)
         for t in rest
     )
     write_methods = {"POST", "PUT", "PATCH", "DELETE"}
-    is_write = (method is not None and method.upper() in write_methods) or (
-        method is None and has_fields
+    # An explicit method overrides the POST that field flags imply. With several
+    # methods, any write among them makes the call a write.
+    if methods:
+        is_write = any(method in write_methods for method in methods)
+    else:
+        is_write = has_fields
+    hostname_values = _flag_values(rest, frozenset({"--hostname"}))
+    if _conflicting_values(hostname_values, str.lower):
+        return _unparseable_op("conflicting gh api hostnames")
+    hostname = hostname_values[-1] if hostname_values else None
+    api_repo = (
+        _repo_from_gh_api_endpoint(_gh_api_endpoint(rest))
+        if hostname is None or hostname.lower() in {"github.com", "api.github.com"}
+        else None
     )
-    api_repo = repo or _repo_from_tokens(rest)
     return _ShellOp(
         kind="write" if is_write else "read",
         repo=api_repo,
         branches=frozenset(),
         branch_targeted=False,
         detail="gh api",
+        destructive="DELETE" in methods,
     )
 
 

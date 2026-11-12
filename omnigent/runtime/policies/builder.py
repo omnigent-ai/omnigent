@@ -33,6 +33,7 @@ from omnigent.llms.context_window import fetch_model_pricing_with_provider
 from omnigent.policies.base import Policy
 from omnigent.policies.builtins.safety import SCHEDULED_TASK_APPROVAL_TOOLS
 from omnigent.policies.function import resolve_function_policy
+from omnigent.policies.registry import function_policy_handler_allowed
 from omnigent.policies.schema import (
     SESSION_COST_ASK_APPROVED_STATE_KEY,
     SESSION_COST_UNPRICED_APPROVED_KEY,
@@ -1759,6 +1760,16 @@ def _load_default_policy_specs(
                 policy.type,
             )
             continue
+        if not function_policy_handler_allowed(policy.handler, policy.factory_params):
+            # A row whose handler is no longer registered would fail engine construction
+            # for every session; skip it so one stale row cannot take the server down.
+            _logger.warning(
+                "Skipping default policy %r (id=%r): handler %r is not registered.",
+                policy.name,
+                policy.id,
+                policy.handler,
+            )
+            continue
         specs.append(_stored_policy_to_spec(policy))
     _DEFAULT_POLICY_SPECS_CACHE[_DEFAULT_POLICY_SPECS_KEY] = (specs, loaded_at)
     return specs
@@ -1894,6 +1905,12 @@ def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec:
         (e.g. ``type="url"``).
     """
     if policy.type == "python":
+        # Persisted rows can predate the API handler allowlist.
+        if not function_policy_handler_allowed(policy.handler, policy.factory_params):
+            raise OmnigentError(
+                f"Policy handler {policy.handler!r} is not a registered policy handler",
+                code=ErrorCode.INVALID_INPUT,
+            )
         return FunctionPolicySpec(
             name=policy.name,
             # Session policies self-select: on=None means the
