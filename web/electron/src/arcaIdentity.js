@@ -1,23 +1,13 @@
 "use strict";
 
-const { normalizeSavedServerUrl, databricksWorkspaceUiUrl } = require("./url");
+const { normalizeServerTarget } = require("./url");
 
 const IDENTITY_START = "__OMNIGENT_ARCA_IDENTITY_START__";
 const IDENTITY_END = "__OMNIGENT_ARCA_IDENTITY_END__";
 
 /** Canonical selected target, preserving mount and workspace selector. */
 function arcaTarget(raw) {
-  try {
-    const saved = normalizeSavedServerUrl(raw);
-    const url = new URL(databricksWorkspaceUiUrl(saved) ?? saved);
-    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) return null;
-    url.hash = "";
-    url.pathname = url.pathname.replace(/\/+$/, "") || "/";
-    url.searchParams.sort();
-    return url.href;
-  } catch {
-    return null;
-  }
+  return normalizeServerTarget(raw);
 }
 
 /** Read only the bounded, machine-readable status from the Arca connect run. */
