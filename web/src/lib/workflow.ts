@@ -5,18 +5,10 @@
 export const WORKFLOW_SKILL = "workflow";
 
 /**
- * Added to the workflow message when the user reviews the plan before work starts. The agent
- * explores first, so the plan the user approves is specific and rests on what it found.
+ * Added to the workflow message when the user reviews the plan before work starts. The
+ * workflow skill says how: the review comes right after the exploration every plan starts with.
  */
-export const REVIEW_PLAN_FIRST =
-  "Start the plan with two steps: first, exploring the work, without changing anything, " +
-  "deeply enough that the steps you add from it are reasonably specific, each a concrete " +
-  "piece of work such as one change or one PR rather than a broad phase like implementing " +
-  "everything; second, my review of the plan. Keep those two steps first in every version " +
-  "of the plan. Once you've explored, add the work as steps 3, 4, 5 and on, each depending " +
-  "on the review, and ask me to approve the plan before you start any of them. If I ask for " +
-  "changes, write `started` on the review, restart the exploration to look into what I " +
-  "asked, update the steps after the review, and ask me again.";
+export const REVIEW_PLAN_FIRST = "Let me review the plan before you start the work.";
 
 /** Whether a skill list offers the workflow skill, so the composer can offer "Run a workflow". */
 export function offersWorkflow(skills: readonly { name: string }[]): boolean {
@@ -28,7 +20,7 @@ export function offersWorkflow(skills: readonly { name: string }[]): boolean {
  *
  * @param skillPrefix The harness's skill prefix, `"/"` or `"$"` for Codex's own CLI.
  * @param description What the user wants done, e.g. `"Add a --json flag"`.
- * @param reviewPlanFirst Whether the agent explores, then waits for the user to approve its plan.
+ * @param reviewPlanFirst Whether the user reviews the plan before the work starts.
  * @returns e.g. `"/workflow Add a --json flag"`, plus {@link REVIEW_PLAN_FIRST} as its own
  *   paragraph when *reviewPlanFirst* is set.
  */
