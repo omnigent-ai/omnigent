@@ -1060,9 +1060,11 @@ async def test_the_run_after_an_unregistered_sandbox_starts_a_new_session(
         await asyncio.wait_for(first.fire(claimed.task, claimed.lease), 10)
         unstarted = store.get(claimed.task.id)
         next_tracker = tracker if same_server else ManagedLaunchTracker()
-        await asyncio.wait_for(
-            _unregistered_executor(store, conversations, next_tracker).fire(unstarted, second), 10
+        # Only the stalled first sandbox should reach the short registration timeout.
+        replacement_executor = _unregistered_executor(
+            store, conversations, next_tracker, registration_timeout_s=5
         )
+        await asyncio.wait_for(replacement_executor.fire(unstarted, second), 10)
     finally:
         await _drain_managed_launches()
 
@@ -1211,8 +1213,9 @@ def _unregistered_executor(
     store: SqlAlchemyScheduledTaskStore,
     conversations: SqlAlchemyConversationStore,
     tracker: ManagedLaunchTracker,
+    registration_timeout_s: float = 0.2,
 ) -> ClaimedRunExecutor:
-    """An executor that abandons a sandbox not registered within 0.2 seconds."""
+    """An executor that abandons a sandbox not registered within *registration_timeout_s*."""
     from omnigent.server.startup_inputs import ManagedStartupInputs
 
     return ClaimedRunExecutor(
@@ -1223,7 +1226,7 @@ def _unregistered_executor(
             managed_launches=tracker,
             startup_inputs=ManagedStartupInputs(conversations, None),
         ),
-        registration_timeout_s=0.2,
+        registration_timeout_s=registration_timeout_s,
     )
 
 
