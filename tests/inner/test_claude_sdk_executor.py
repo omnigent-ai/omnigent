@@ -5533,7 +5533,7 @@ async def test_sandboxed_sdk_exposes_bash_for_skill_expansion(
 
 
 @pytest.mark.parametrize("allow_network", [True, False], ids=["network-allowed", "network-denied"])
-@pytest.mark.parametrize("cwd_source", ["default", "spec_relative", "spec_absolute", "explicit_none", "explicit_dot", "explicit_relative", "explicit_conflict"])
+@pytest.mark.parametrize("cwd_source", ["default", "spec_relative", "spec_absolute", "explicit_none", "explicit_dot", "explicit_relative", "explicit_relative_root", "explicit_nested", "explicit_conflict"])
 def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
     monkeypatch, tmp_path: Path, allow_network: bool, cwd_source: str
 ) -> None:
@@ -5552,6 +5552,14 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
     elif cwd_source == "spec_relative":
         spec.cwd = "repo"
         expected_cwd = tmp_path / "repo"
+    elif cwd_source == "explicit_relative_root":
+        spec.cwd = "./project"
+        cwd = str(tmp_path)
+        expected_cwd = tmp_path / "project"
+    elif cwd_source == "explicit_nested":
+        spec.cwd = str(tmp_path)
+        expected_cwd = tmp_path / "project"
+        cwd = str(expected_cwd)
     elif cwd_source.startswith("explicit"):
         spec.cwd = {
             "explicit_none": None,
