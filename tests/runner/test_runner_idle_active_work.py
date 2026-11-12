@@ -26,16 +26,21 @@ from omnigent.runner.app import (
     register_timer,
     unregister_timer,
 )
+from tests._helpers.polling import poll_until_async
 from tests.runner.helpers import NullServerClient
 
 
 @pytest.fixture(autouse=True)
-def _clean_global_active_work_state() -> None:
+def _clean_global_active_work_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Reset module-global timer / approval registries between tests.
 
+    Also clears an ambient human-wait hold so the default applies.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
+    monkeypatch.delenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", raising=False)
     pending_approvals.reset_for_tests()
     for session_timers in list(_session_timers.values()):
         for task in list(session_timers.values()):
@@ -404,55 +409,129 @@ async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(status: s
         )
 
 
+_HUMAN_WAIT_HOLD_ENV = "OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S"
+
+
+def _publish_native_status(
+    app: FastAPI, conv_id: str, status: str, blocked_on: str | None
+) -> None:
+    """Publish one native watcher edge, as the claude-native pane watcher does.
+
+    :param app: Runner app under test.
+    :param conv_id: Session id, e.g. ``"conv_native"``.
+    :param status: Native status, e.g. ``"running"``.
+    :param blocked_on: Dialog the turn is parked on, e.g. ``"permission prompt"``.
+    :returns: None.
+    """
+    publish = app.state.session_resource_registry._session_status_publisher
+    assert publish is not None
+    publish(conv_id, status, blocked_on)
+
+
 @pytest.mark.asyncio
-async def test_native_waiting_hold_is_bounded_but_running_is_not(
+async def test_native_dialog_hold_is_bounded_but_running_is_not(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A terminal parked on user input stops holding the watchdog after the hold.
+    """A turn parked on a dialog stops holding the watchdog after the hold.
 
     An unanswered dialog is not agent work, so it must not pin the runner
-    forever; a ``running`` turn is real work and is never bounded.
+    forever; once the dialog is gone the running turn holds it again.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
     from tests.runner.conftest import _runner_client
 
-    monkeypatch.setenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", "0.05")
-    conv_id = "conv_native_waiting_bounded"
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0.05")
+    conv_id = "conv_native_dialog_bounded"
     app = await _native_app_with_session(conv_id)
     async with _runner_client(app) as client:
         created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
         assert created.status_code == 201, created.text
-        await _post_status(client, conv_id, "waiting")
+        _publish_native_status(app, conv_id, "running", "permission prompt")
         assert app.state.has_active_work() is True
-        await asyncio.sleep(0.1)
-        assert app.state.has_active_work() is False
+        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
 
-        await _post_status(client, conv_id, "running")
-        await asyncio.sleep(0.1)
+        _publish_native_status(app, conv_id, "running", None)
         assert app.state.has_active_work() is True
 
 
 @pytest.mark.asyncio
-async def test_native_waiting_hold_zero_keeps_it_unbounded(
+@pytest.mark.parametrize("status", ["running", "waiting"])
+async def test_native_work_status_is_not_bounded_by_the_human_wait_hold(
+    monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    """A running turn or background-work ``waiting`` edge is real work, never bounded.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param status: Native work status with no dialog reason.
+    :returns: None.
+    """
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0.01")
+    conv_id = "conv_native_work_unbounded"
+    app = await _native_app_with_session(conv_id)
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        await _post_status(client, conv_id, status)
+        assert app.state.has_active_work() is True
+        await asyncio.sleep(0.05)  # custom-lint: disable=sleep-then-assert -- outlast the hold
+        assert app.state.has_active_work() is True
+
+
+@pytest.mark.asyncio
+async def test_native_dialog_hold_zero_keeps_it_unbounded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``0`` restores the old behavior: ``waiting`` holds the watchdog until it settles.
+    """``0`` restores the old behavior: a dialog holds the watchdog until it settles.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
     from tests.runner.conftest import _runner_client
 
-    monkeypatch.setenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", "0")
-    conv_id = "conv_native_waiting_unbounded"
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0")
+    conv_id = "conv_native_dialog_unbounded"
     app = await _native_app_with_session(conv_id)
     async with _runner_client(app) as client:
         created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
         assert created.status_code == 201, created.text
-        await _post_status(client, conv_id, "waiting")
-        await asyncio.sleep(0.1)
+        _publish_native_status(app, conv_id, "running", "permission prompt")
+        assert app.state.has_active_work() is True
+        await asyncio.sleep(0.05)  # custom-lint: disable=sleep-then-assert -- no hold to outlast
+        assert app.state.has_active_work() is True
+
+
+@pytest.mark.asyncio
+async def test_new_dialog_after_running_gets_a_fresh_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """dialog (hold expires) -> running -> the same dialog again starts a fresh hold.
+
+    The watchdog does not poll while a turn runs, so the episode must end when
+    the status changes, not when a poll happens to see it.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0.05")
+    conv_id = "conv_native_dialog_episode"
+    app = await _native_app_with_session(conv_id)
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        _publish_native_status(app, conv_id, "running", "permission prompt")
+        assert app.state.has_active_work() is True
+        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
+
+        # The answered dialog resumes the turn, which then parks on another dialog;
+        # nothing polls the watchdog in between.
+        _publish_native_status(app, conv_id, "running", None)
+        _publish_native_status(app, conv_id, "running", "permission prompt")
         assert app.state.has_active_work() is True
 
 
@@ -463,23 +542,63 @@ async def test_claude_prompt_waiter_hold_is_bounded(monkeypatch: pytest.MonkeyPa
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    monkeypatch.setenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", "0.05")
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0.05")
     app = _scaffold_app()
     waiter = asyncio.create_task(asyncio.sleep(3600))
     app.state.claude_prompt_waiters["conv_unanswered_prompt"] = waiter
     try:
         assert app.state.has_active_work() is True
-        await asyncio.sleep(0.1)
-        assert app.state.has_active_work() is False
+        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
     finally:
         waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
             await waiter
 
 
+@pytest.mark.asyncio
+async def test_replaced_prompt_waiter_gets_a_fresh_hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A prompt waiter that drains and is later recreated starts a fresh hold.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0.05")
+    app = _scaffold_app()
+    sid = "conv_wait_episode_waiter"
+    tasks: list[asyncio.Task[None]] = []
+    try:
+        first = asyncio.create_task(asyncio.sleep(3600))
+        tasks.append(first)
+        app.state.claude_prompt_waiters[sid] = first
+        assert app.state.has_active_work() is True
+        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
+
+        app.state.claude_prompt_waiters.pop(sid)
+        first.cancel()
+        second = asyncio.create_task(asyncio.sleep(3600))
+        tasks.append(second)
+        app.state.claude_prompt_waiters[sid] = second
+        assert app.state.has_active_work() is True
+    finally:
+        for task in tasks:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [(None, 86400.0), ("", 86400.0), ("abc", 86400.0), ("-1", 86400.0), ("0", 0.0), ("30", 30.0)],
+    [
+        (None, 86400.0),
+        ("", 86400.0),
+        ("abc", 86400.0),
+        ("-1", 86400.0),
+        ("nan", 86400.0),
+        ("inf", 86400.0),
+        ("-inf", 86400.0),
+        ("0", 0.0),
+        ("30", 30.0),
+    ],
 )
 def test_resolve_human_wait_hold_s(
     monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: float
@@ -494,9 +613,9 @@ def test_resolve_human_wait_hold_s(
     from omnigent.runner.app import _resolve_human_wait_hold_s
 
     if raw is None:
-        monkeypatch.delenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", raising=False)
+        monkeypatch.delenv(_HUMAN_WAIT_HOLD_ENV, raising=False)
     else:
-        monkeypatch.setenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", raw)
+        monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, raw)
     assert _resolve_human_wait_hold_s() == expected
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import logging
 import threading
@@ -18,6 +19,7 @@ from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
+from omnigent.runner._entry import _run_inactivity_monitor
 from omnigent.scheduled_context import SCHEDULED_RUN_HEADER
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.debug_log_helpers import capture_debug_rows
@@ -73,6 +75,12 @@ async def _until(condition: Callable[[], bool]) -> None:
     async with asyncio.timeout(5):
         while not condition():
             await asyncio.sleep(0.01)
+
+
+@pytest.fixture(autouse=True)
+def _default_human_wait_hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear an ambient human-wait hold so the default applies."""
+    monkeypatch.delenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", raising=False)
 
 
 @pytest.fixture
@@ -445,3 +453,46 @@ async def test_buffered_turn_restores_its_own_occurrence(
             if item.get("type") == "message"
         ]
         assert texts[-2:] == ["second", "third"]
+
+
+@pytest.mark.asyncio
+async def test_unanswered_prompt_waiter_releases_runner_after_human_wait_hold(
+    monkeypatch: pytest.MonkeyPatch, pending_prompt: dict[str, bool]
+) -> None:
+    """An unanswered Claude prompt holds the idle watchdog only for the configured hold."""
+    monkeypatch.setenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", "0.05")
+    app, _harness = _build_app()
+    sid = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex})
+        buffered = await client.post(f"/v1/sessions/{sid}/events", json=_message("later"))
+        assert buffered.status_code == 202
+        assert buffered.json()["status"] == "buffered"
+        assert sid in app.state.claude_prompt_waiters
+        assert app.state.has_active_work() is True
+
+        loop = asyncio.get_running_loop()
+        shutdowns: list[str] = []
+        monitor = asyncio.create_task(
+            _run_inactivity_monitor(
+                idle_timeout_s=0.02,
+                get_last_activity=lambda: loop.time() - 1.0,
+                has_active_work=app.state.has_active_work,
+                request_shutdown=lambda: shutdowns.append("shutdown"),
+                poll_interval_s=0.005,
+            )
+        )
+        try:
+            await asyncio.wait_for(monitor, timeout=5)
+            assert shutdowns == ["shutdown"]
+            # The dialog is still unanswered: the hold expired, not the wait.
+            assert sid in app.state.claude_prompt_waiters
+        finally:
+            monitor.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await monitor
+            waiter = app.state.claude_prompt_waiters.get(sid)
+            if waiter is not None:
+                waiter.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await waiter

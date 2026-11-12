@@ -15,6 +15,7 @@ import functools
 import itertools
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -379,10 +380,10 @@ for _builder_name in (
 # Unknown versions also downgrade to "running" so old servers never return 500.
 _WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
 # Published statuses that mean a session's terminal is still working a turn.
-_IN_FLIGHT_SESSION_STATUSES = ("running",)
-# ``waiting`` is parked on user input. It holds the idle watchdog open like a
-# running turn, but only for a bounded time (see ``_resolve_human_wait_hold_s``).
-_HUMAN_WAIT_STATUS = "waiting"
+# ``waiting`` is parked on background work or sub-agents, so it keeps the
+# runner alive too. A ``running`` turn parked on a dialog is a human wait
+# instead, bounded by ``_resolve_human_wait_hold_s``.
+_IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
 _HUMAN_WAIT_HOLD_ENV = "OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S"
 # One day, matching the default ASK wait in ``pending_approvals``: a human gate
 # should outlive a user stepping away without pinning the runner forever.
@@ -393,8 +394,9 @@ def _resolve_human_wait_hold_s() -> float:
     """Resolve how long a session parked on a human holds the idle watchdog open.
 
     Honors :envvar:`OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S` (``0`` keeps the hold
-    unbounded); otherwise one day. An unparseable or negative value logs a
-    warning and falls back to the default so an env typo cannot fail runner boot.
+    unbounded); otherwise one day. An unparseable, negative or non-finite value
+    logs a warning and falls back to the default so an env typo cannot fail
+    runner boot or silently disable the hold.
 
     :returns: Hold in seconds, e.g. ``86400.0``; ``0.0`` means unbounded.
     """
@@ -405,9 +407,9 @@ def _resolve_human_wait_hold_s() -> float:
         value = float(raw)
     except ValueError:
         value = -1.0
-    if value < 0:
+    if not math.isfinite(value) or value < 0:
         _logger.warning(
-            "%s=%r is not a non-negative number; using default %ss",
+            "%s=%r is not a finite non-negative number; using default %ss",
             _HUMAN_WAIT_HOLD_ENV,
             raw,
             _DEFAULT_HUMAN_WAIT_HOLD_S,
@@ -1663,35 +1665,76 @@ def create_runner_app(
     _sessions_with_background_shell: set[str] = set()
 
     _human_wait_hold_s = _resolve_human_wait_hold_s()
-    # Monotonic time the idle watchdog first saw each session parked on a human.
-    _human_wait_since: dict[str, float] = {}
+    # Dialog each native turn is parked on, from its latest ``running`` edge's
+    # ``blocked_on`` reason, e.g. ``"permission prompt"``.
+    _native_dialog_waits: dict[str, str] = {}
+    # Monotonic time the idle watchdog first saw each human-wait episode: a
+    # prompt waiter, keyed by its task so a replacement waiter starts fresh, or
+    # a dialog, which the next status edge ends. Ending episodes on state
+    # changes rather than on watchdog polls keeps a new wait from inheriting an
+    # expired timer: the watchdog skips them while a turn runs or the session
+    # is inside its idle window.
+    _human_wait_since: dict[tuple[str, object], float] = {}
+    # Expired episodes already logged, so each expiry is logged once.
+    _human_wait_expired: set[tuple[str, object]] = set()
+
+    def _record_native_pane_status(
+        session_id: str, status: str, blocked_on: object = None
+    ) -> None:
+        """Record a native session's status edge, ending a dialog wait it leaves."""
+        _native_pane_status[session_id] = status
+        dialog = (
+            blocked_on
+            if status == "running" and isinstance(blocked_on, str) and blocked_on
+            else None
+        )
+        if _native_dialog_waits.get(session_id) == dialog:
+            return
+        _forget_dialog_wait(session_id)
+        if dialog is not None:
+            _native_dialog_waits[session_id] = dialog
+
+    def _forget_native_pane_status(session_id: str) -> None:
+        """Drop a native session's status record and any dialog wait."""
+        _native_pane_status.pop(session_id, None)
+        _forget_dialog_wait(session_id)
+
+    def _forget_dialog_wait(session_id: str) -> None:
+        if _native_dialog_waits.pop(session_id, None) is not None:
+            _human_wait_since.pop((session_id, "dialog"), None)
+            _human_wait_expired.discard((session_id, "dialog"))
 
     def _human_wait_holds(session_ids: set[str]) -> bool:
         """Whether a session parked on a human still holds the idle watchdog open.
 
-        A native dialog nobody answers (a queued-message prompt waiter, or a
-        terminal reporting ``waiting``) is not agent work, so it holds the
-        runner for at most ``_human_wait_hold_s`` from when the watchdog first
-        sees it. ``0`` keeps the old unbounded hold.
+        A native dialog nobody answers (a turn parked on it, or a queued-message
+        prompt waiter behind it) is not agent work, so it holds the runner for
+        at most ``_human_wait_hold_s`` from when the watchdog first sees that
+        wait. ``0`` keeps the old unbounded hold.
         """
-        waiting = {*_claude_prompt_waiters} | {
-            session_id for session_id in session_ids if _native_awaiting_human(session_id)
-        }
-        for session_id in _human_wait_since.keys() - waiting:
-            del _human_wait_since[session_id]
+        episodes: set[tuple[str, object]] = set(_claude_prompt_waiters.items())
+        episodes.update(
+            (session_id, "dialog")
+            for session_id in session_ids
+            if _native_awaiting_human(session_id)
+        )
+        for episode in _human_wait_since.keys() - episodes:
+            del _human_wait_since[episode]
+        _human_wait_expired.intersection_update(episodes)
         now = time.monotonic()
         held = False
-        for session_id in waiting:
-            since = _human_wait_since.setdefault(session_id, now)
-            if _human_wait_hold_s <= 0 or now - since < _human_wait_hold_s:
+        for episode in episodes:
+            waited_s = now - _human_wait_since.setdefault(episode, now)
+            if _human_wait_hold_s <= 0 or waited_s < _human_wait_hold_s:
                 held = True
-            else:
+            elif episode not in _human_wait_expired:
+                _human_wait_expired.add(episode)
                 _logger.info(
                     "session %s has waited on a human for %.0fs; no longer holding the "
                     "runner open",
-                    session_id,
-                    now - since,
-                    extra={"session_id": session_id},
+                    episode[0],
+                    waited_s,
+                    extra={"session_id": episode[0]},
                 )
         return held
 
@@ -1742,11 +1785,13 @@ def create_runner_app(
         """
         if _native_pane_status.get(session_id) not in _IN_FLIGHT_SESSION_STATUSES:
             return False
+        if session_id in _native_dialog_waits:
+            return False
         return is_native_harness(_session_harness_name(session_id))
 
     def _native_awaiting_human(session_id: str) -> bool:
-        """Whether a native terminal reports this session parked on user input."""
-        if _native_pane_status.get(session_id) != _HUMAN_WAIT_STATUS:
+        """Whether a native terminal reports this session's turn parked on a dialog."""
+        if session_id not in _native_dialog_waits:
             return False
         return is_native_harness(_session_harness_name(session_id))
 
@@ -1781,7 +1826,7 @@ def create_runner_app(
         if event_body.get("type") == "session.status":
             _status_value = event_body.get("status")
             if isinstance(_status_value, str):
-                _native_pane_status[session_id] = _status_value
+                _record_native_pane_status(session_id, _status_value, event_body.get("blocked_on"))
         _fan_out_child_delta_to_parent(session_id, event_body)
 
     def _child_preview_from_status(
@@ -1997,7 +2042,7 @@ def create_runner_app(
         if wire_status != status:
             # Only the server's copy is downgraded: the agent still works in
             # this pane, so the runner keeps counting the session as busy.
-            _native_pane_status[session_id] = status
+            _record_native_pane_status(session_id, status, blocked_on)
 
     resource_registry.set_session_status_publisher(
         _publish_session_status,
@@ -2269,7 +2314,7 @@ def create_runner_app(
         _background_tasks.add(_teardown_task)
 
         # A dead required terminal cannot still be working a turn.
-        _native_pane_status.pop(event.session_id, None)
+        _forget_native_pane_status(event.session_id)
 
         # A claude /exit or /quit prints this banner and exits 0. Printing it
         # can flip the idle memo back to "running" before pane death, so treat
@@ -3856,7 +3901,7 @@ def create_runner_app(
         _desynced_sessions.discard(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
         _clean_terminal_exit_responses.pop(session_id, None)
-        _native_pane_status.pop(session_id, None)
+        _forget_native_pane_status(session_id)
         _native_interrupt_runner.clear_pending_interrupt(session_id)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
@@ -7855,7 +7900,7 @@ def create_runner_app(
             if status in ("running", "waiting", "idle", "failed"):
                 # Forwarders report these edges straight to the server, so record
                 # them here too; the idle watchdog reads them for native turns.
-                _native_pane_status[conversation_id] = status
+                _record_native_pane_status(conversation_id, status)
                 resource_registry.note_external_session_status(conversation_id, status)
                 child_status = (
                     "idle" if terminal_status == "completed" else terminal_status or status
@@ -9034,7 +9079,7 @@ def create_runner_app(
                 conv_id,
                 extra={"session_id": conv_id},
             )
-            _native_pane_status[conv_id] = status
+            _record_native_pane_status(conv_id, status)
             resource_registry.note_external_session_status(conv_id, status)
             return False
 
