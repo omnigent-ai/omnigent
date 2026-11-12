@@ -134,7 +134,7 @@ function EmptyState({ hasAny }: { hasAny: boolean }) {
           <WorkflowIcon className="size-8 text-muted-foreground/50" />
           <p className="text-ui font-medium">No workflows yet</p>
           <p className="max-w-sm text-sm text-muted-foreground">
-            Create a workflow to run the same multi-step work whenever you need it.
+            Create a workflow to get started.
           </p>
         </div>
       )}
