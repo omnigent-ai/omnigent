@@ -150,8 +150,9 @@ run it in its own session:
   start the timer again while that session is still working.
 - When its plan finishes or it reports back, write `done` on the step if
   every task is done, or `failed` naming the tasks that failed. If it stopped
-  with tasks left, write `needs_input` saying so. If it's waiting for the
-  user, leave the step alone: the user answers in that session.
+  with tasks left, ask the user how to go on with `sys_workflow_request_input`
+  on the step, as for anything else you can't clear yourself. If it's waiting
+  for the user, leave the step alone: the user answers in that session.
 
 ## Measurable goals
 
