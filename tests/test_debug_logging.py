@@ -270,8 +270,6 @@ def _command_secret_sink(
     monkeypatch.setenv(dl.CLIENT_SECRET_COMMAND_ENV_VAR, "credential-helper")
     monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://workspace.example.com")
     monkeypatch.setenv(dl.ENDPOINT_ENV_VAR, _INSERT_URL)
-    config = dl.config_from_env()
-    assert config is not None
     inserted: list[str] = []
     command_calls: list[int] = []
 
@@ -292,14 +290,7 @@ def _command_secret_sink(
             return httpx.Response(status)
 
     monkeypatch.setattr(dl.subprocess, "run", run)
-    client = Client()
-    sink = object.__new__(dl.ZerobusLogHandler)
-    sink._config = config
-    sink._client = client  # type: ignore[assignment]
-    sink._tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
-    sink._delivered_any = False
-    sink._reset_held_rows()
-    return sink, inserted, command_calls
+    return _bare_zerobus_sink(Client()), inserted, command_calls
 
 
 def test_mint_failure_holds_rows_and_delivers_them_after_backoff(
@@ -345,6 +336,16 @@ def test_mint_failure_backoff_grows_and_held_rows_stay_bounded(
     # Failures double the backoff from its floor until the ceiling caps it.
     assert backoffs == [5.0, 10.0, 20.0, 40.0, 80.0, dl._MINT_RETRY_MAX_S]
     assert dl._MINT_RETRY_MAX_S == 120.0
+
+
+def test_held_rows_cap_keeps_the_newest_production_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    sink, _, _ = _command_secret_sink(monkeypatch, [1])
+    rows: list[dl.DebugLogRow] = [{"message": f"row-{index}"} for index in range(1_001)]
+
+    sink._post(rows)
+
+    assert dl._HELD_MAX_RECORDS == 1_000
+    assert list(sink._held_rows) == rows[1:]
 
 
 @pytest.mark.parametrize(
@@ -1042,12 +1043,16 @@ def test_emit_revives_closed_uploader(_configured_env: None) -> None:
         sink.close()
         assert sink._closed
         assert not first_thread.is_alive()
+        # Rows held by the old worker (or a fork's parent) must not carry over.
+        sink._held_rows = ({"message": "parent"},)
+        sink._mint_retry_at = sink._mint_backoff_s = 60.0
         # A subsequent record revives the worker (fresh thread) and enqueues.
         record = logging.LogRecord("omnigent.x", logging.INFO, __file__, 1, "hi", (), None)
         sink.emit(record)
         assert not sink._closed
         assert sink._thread is not first_thread
         assert sink._thread.is_alive()
+        assert (sink._held_rows, sink._mint_retry_at, sink._mint_backoff_s) == ((), 0.0, 0.0)
     finally:
         sink.close()
 
@@ -1823,7 +1828,7 @@ class _FakeZerobus:
         pass
 
 
-def _bare_zerobus_sink(client: _FakeZerobus) -> dl.ZerobusLogHandler:
+def _bare_zerobus_sink(client: object) -> dl.ZerobusLogHandler:
     config = dl.config_from_env()
     assert config is not None
     sink = object.__new__(dl.ZerobusLogHandler)
