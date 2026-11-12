@@ -32,6 +32,7 @@ from omnigent.runner import create_runner_app, native_controls
 from omnigent.runner.resource_registry import CLAUDE_NATIVE_TERMINAL_ROLE
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from tests._helpers.polling import poll_until_async
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
@@ -425,20 +426,20 @@ def _plant_live_claude_pane(
     registry: TerminalRegistry,
     conv_id: str,
     tmp_path: Path,
-    bridge_dir: Path,
+    bridge_dir: Path | None,
+    *,
+    label: str = "live",
 ) -> TerminalInstance:
-    """Register a live Claude pane advertising a socket that exists."""
-    sock = tmp_path / "omnigent-terminal-live" / "tmux.sock"
-    sock.parent.mkdir(parents=True, exist_ok=True)
-    sock.touch()
+    """Register a live Claude pane, advertising its socket in *bridge_dir* when given."""
+    sock = tmp_path / f"omnigent-terminal-{label}" / "tmux.sock"
     live = TerminalInstance(
         name="claude",
         session_key="main",
         socket_path=sock,
-        private_dir=tmp_path / "live_private",
+        private_dir=tmp_path / f"{label}_private",
     )
     live.running = True
-    (tmp_path / "live_private").mkdir(exist_ok=True)
+    (tmp_path / f"{label}_private").mkdir(exist_ok=True)
 
     async def _alive() -> bool:
         return True
@@ -447,7 +448,10 @@ def _plant_live_claude_pane(
     with registry._lock:
         registry._by_conversation[conv_id] = {("claude", "main"): live}
         registry._instance_locks[(conv_id, "claude", "main")] = threading.Lock()
-    write_tmux_target(bridge_dir, socket_path=sock, tmux_target="claude:0.0")
+    if bridge_dir is not None:
+        sock.parent.mkdir(parents=True, exist_ok=True)
+        sock.touch()
+        write_tmux_target(bridge_dir, socket_path=sock, tmux_target="claude:0.0")
     return live
 
 
@@ -784,27 +788,13 @@ def _plant_live_claude_native_pane(
     app: Any, registry: TerminalRegistry, conv_id: str, tmp_path: Path, label: str = "live"
 ) -> list[str]:
     """Register a running claude-native pane; returns the record of its closes."""
-    live = TerminalInstance(
-        name="claude",
-        session_key="main",
-        socket_path=tmp_path / f"{label}.sock",
-        private_dir=tmp_path / f"{label}_private",
-    )
-    live.running = True
-    (tmp_path / f"{label}_private").mkdir(exist_ok=True)
+    live = _plant_live_claude_pane(registry, conv_id, tmp_path, None, label=label)
     closes: list[str] = []
-
-    async def _alive() -> bool:
-        return True
 
     async def _close() -> None:
         closes.append(conv_id)
 
-    live.is_alive = _alive  # type: ignore[method-assign]
     live.close = _close  # type: ignore[method-assign]
-    with registry._lock:
-        registry._by_conversation[conv_id] = {("claude", "main"): live}
-        registry._instance_locks[(conv_id, "claude", "main")] = threading.Lock()
     resources = app.state.session_resource_registry
     with resources._lock:
         resources._terminal_roles[(conv_id, "terminal_claude_main")] = CLAUDE_NATIVE_TERMINAL_ROLE
@@ -912,6 +902,107 @@ async def test_mcp_reconnect_restarts_an_idle_claude_pane(
     # The relaunched pane started signed in, so it reports nothing it can't use.
     assert resp.json() == {"running": True, "partial": True, "servers": []}
     assert (closes, relaunched) == ([conv_id], [conv_id])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "linear_status", "status_code", "error"),
+    [
+        ("notion", "connected", 404, None),
+        ("linear", "sign_in_required", 200, "Sign in to linear first."),
+        ("github", "sign_in_required", 200, None),
+    ],
+    ids=["unknown-server", "still-signed-out", "connected-since-start"],
+)
+async def test_mcp_reconnect_restarts_only_for_a_server_signed_in_since_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    name: str,
+    linear_status: str,
+    status_code: int,
+    error: str | None,
+) -> None:
+    """A stale panel or a wrong name never restarts a pane that gains nothing from it."""
+    conv_id = "b2b2c3d4e5f60718293a4b5c6d7e8f90"
+    app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
+        monkeypatch, tmp_path, conv_id
+    )
+    statuses.update({"linear": linear_status, "github": "connected"})
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/live-mcp-servers/reconnect", json={"name": name}
+        )
+
+    assert resp.status_code == status_code, resp.text
+    if status_code == 404:
+        assert resp.json() == {"error": "mcp_server_unknown"}
+    else:
+        assert resp.json().get("reconnect_error") == error
+    assert (closes, relaunched) == ([], [])
+
+
+@pytest.mark.asyncio
+async def test_a_cli_launched_pane_keeps_the_sign_in_state_it_started_with(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A sign-in finished before /mcp is first opened still offers Reconnect.
+
+    ``omnigent claude`` creates the pane through the generic terminal route; a
+    second launch that finds the pane running leaves its record alone.
+    """
+    conv_id = "b3b2c3d4e5f60718293a4b5c6d7e8f90"
+    statuses = _claude_sign_in_state(monkeypatch)
+    statuses["linear"] = "sign_in_required"
+    app, registry = await _open_claude_native_session(
+        monkeypatch, conv_id=conv_id, auto_create_calls=[]
+    )
+    resources = app.state.session_resource_registry
+
+    async def _launch_cli_pane(**kwargs: Any) -> SessionResourceView:
+        if registry.get(conv_id, "claude", "main") is None:
+            _plant_live_claude_native_pane(app, registry, conv_id, tmp_path)
+        return SessionResourceView(
+            id="terminal_claude_main", type="terminal", session_id=conv_id, name="claude"
+        )
+
+    monkeypatch.setattr(resources, "launch_required_terminal", _launch_cli_pane)
+    launch = {"terminal": "claude", "session_key": "main", "bridge_inject_dir": True}
+
+    async with _runner_client(app) as client:
+        assert (
+            await client.post(f"/v1/sessions/{conv_id}/resources/terminals", json=launch)
+        ).is_success
+        statuses["linear"] = "connected"
+        assert (
+            await client.post(f"/v1/sessions/{conv_id}/resources/terminals", json=launch)
+        ).is_success
+        status = await client.get(f"/v1/sessions/{conv_id}/live-mcp-servers")
+
+    assert [server["name"] for server in status.json()["servers"]] == ["linear"], status.text
+
+
+@pytest.mark.asyncio
+async def test_a_transferred_pane_keeps_the_sign_in_state_it_started_with(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """/clear and fork move the pane to a successor session, and its record moves too."""
+    conv_id = "b4b2c3d4e5f60718293a4b5c6d7e8f90"
+    successor_id = "b5b2c3d4e5f60718293a4b5c6d7e8f90"
+    app, _closes, _relaunched, statuses = await _open_claude_native_session_before_sign_in(
+        monkeypatch, tmp_path, conv_id
+    )
+    statuses["linear"] = "connected"
+
+    async with _runner_client(app) as client:
+        moved = await client.post(
+            f"/v1/sessions/{conv_id}/resources/terminals/terminal_claude_main/transfer",
+            json={"target_session_id": successor_id},
+        )
+        assert moved.status_code == 200, moved.text
+        status = await client.get(f"/v1/sessions/{successor_id}/live-mcp-servers")
+
+    assert [server["name"] for server in status.json()["servers"]] == ["linear"], status.text
 
 
 _REFUSALS = {
@@ -1079,14 +1170,6 @@ async def test_a_relaunched_pane_keeps_what_needed_sign_in_as_it_relaunched(
     assert [server["name"] for server in reconnected.json()["servers"]] == ["notion"]
 
 
-async def _until(predicate: Callable[[], bool], what: str) -> None:
-    """Wait for *predicate*, failing the test after a few seconds."""
-    deadline = time.monotonic() + 5
-    while not predicate():
-        assert time.monotonic() < deadline, f"timed out waiting for {what}"
-        await asyncio.sleep(0.01)  # custom-lint: disable=sleep-then-assert -- polling a task
-
-
 @pytest.mark.asyncio
 async def test_a_message_waits_for_a_reconnect_and_reaches_the_relaunched_pane(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1109,9 +1192,10 @@ async def test_a_message_waits_for_a_reconnect_and_reaches_the_relaunched_pane(
         "omnigent.native.native_cost_popup._tmux_last_client_input_at", _held_attach_check
     )
     harness = _ScriptedHarnessClient([])
-    app, closes, relaunched, _statuses = await _open_claude_native_session_before_sign_in(
+    app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
         monkeypatch, tmp_path, conv_id, harness_client=harness
     )
+    statuses["linear"] = "connected"
 
     async with _runner_client(app) as client:
         reconnect = asyncio.create_task(
@@ -1119,7 +1203,7 @@ async def test_a_message_waits_for_a_reconnect_and_reaches_the_relaunched_pane(
                 f"/v1/sessions/{conv_id}/live-mcp-servers/reconnect", json={"name": "linear"}
             )
         )
-        await _until(checking.is_set, "Reconnect to check the pane")
+        await poll_until_async(checking.is_set, timeout_s=5)
         message = asyncio.create_task(client.post(f"/v1/sessions/{conv_id}/events", json=_MESSAGE))
         for _ in range(50):  # Give the message every chance to jump the line.
             await asyncio.sleep(0)  # custom-lint: disable=sleep-then-assert -- let it run
@@ -1127,7 +1211,7 @@ async def test_a_message_waits_for_a_reconnect_and_reaches_the_relaunched_pane(
         release.set()
         assert (await reconnect).status_code == 200
         assert (await message).status_code < 300
-        await _until(lambda: bool(harness.posted_bodies), "the message to be delivered")
+        await poll_until_async(lambda: bool(harness.posted_bodies), timeout_s=5)
 
     assert (closes, relaunched) == ([conv_id], [conv_id])
 
@@ -1148,9 +1232,10 @@ async def test_a_message_queued_behind_a_reconnect_is_answered_when_the_session_
     monkeypatch.setattr(
         "omnigent.native.native_cost_popup._tmux_last_client_input_at", _held_attach_check
     )
-    app, _closes, _relaunched, _statuses = await _open_claude_native_session_before_sign_in(
+    app, _closes, _relaunched, statuses = await _open_claude_native_session_before_sign_in(
         monkeypatch, tmp_path, conv_id
     )
+    statuses["linear"] = "connected"
 
     async with _runner_client(app) as client:
         reconnect = asyncio.create_task(
@@ -1158,7 +1243,7 @@ async def test_a_message_queued_behind_a_reconnect_is_answered_when_the_session_
                 f"/v1/sessions/{conv_id}/live-mcp-servers/reconnect", json={"name": "linear"}
             )
         )
-        await _until(checking.is_set, "Reconnect to check the pane")
+        await poll_until_async(checking.is_set, timeout_s=5)
         message = asyncio.create_task(client.post(f"/v1/sessions/{conv_id}/events", json=_MESSAGE))
         for _ in range(20):  # Let the message take its place in line.
             await asyncio.sleep(0)  # custom-lint: disable=sleep-then-assert -- let it queue
@@ -1187,7 +1272,7 @@ async def test_a_cancelled_reconnect_does_not_hold_up_later_messages(
 
     async with _runner_client(app) as client:
         first = asyncio.create_task(client.post(url, json={"name": "linear"}))
-        await _until(lambda: relaunched == [conv_id], "the relaunch to start")
+        await poll_until_async(lambda: relaunched == [conv_id], timeout_s=5)
         second = asyncio.create_task(client.post(url, json={"name": "linear"}))
         for _ in range(20):  # Let the second take its place in line, then drop it.
             await asyncio.sleep(0)  # custom-lint: disable=sleep-then-assert -- let it queue
@@ -1198,7 +1283,7 @@ async def test_a_cancelled_reconnect_does_not_hold_up_later_messages(
             client.post(f"/v1/sessions/{conv_id}/events", json=_MESSAGE), timeout=5
         )
         assert message.status_code < 300, message.text
-        await _until(lambda: bool(harness.posted_bodies), "the message to be delivered")
+        await poll_until_async(lambda: bool(harness.posted_bodies), timeout_s=5)
 
 
 @pytest.mark.asyncio
@@ -1238,7 +1323,7 @@ async def test_a_message_never_restarts_a_claude_pane_left_from_another_harness(
     async with _runner_client(app) as client:
         resp = await client.post(f"/v1/sessions/{conv_id}/events", json=_MESSAGE)
         assert resp.status_code < 300, resp.text
-        await _until(lambda: bool(harness.posted_bodies), "the message to be delivered")
+        await poll_until_async(lambda: bool(harness.posted_bodies), timeout_s=5)
 
     assert (closes, relaunched) == ([], [])
 

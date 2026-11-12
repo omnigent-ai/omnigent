@@ -4771,7 +4771,7 @@ describe("Composer MCP status command", () => {
           harness: "claude",
           transport: "http",
           scope: "user",
-          auth_status: "connected",
+          auth_status: "sign_in_required",
         },
       ],
       isLoading: false,
@@ -4808,12 +4808,13 @@ describe("Composer MCP status command", () => {
       "Failed: Signed in after Claude Code started.",
     );
     // A partial answer says nothing about the servers it leaves out.
-    expect(screen.getByTestId("mcp-server-row-mail")).toHaveTextContent("mailConnected");
+    expect(screen.getByTestId("mcp-server-row-mail")).toHaveTextContent("mailSign-in required");
+    expect(screen.getByTestId("mcp-server-row-mail")).not.toHaveTextContent("Not loaded");
     expect(screen.queryByTestId("mcp-live-status-mail")).toBeNull();
     fireEvent.click(screen.getByTestId("mcp-reconnect-wiki"));
     expect(reconnect).toHaveBeenCalledWith("wiki");
 
-    // A sign-in that completes while the panel is open is re-read from the session.
+    // Signing in to mail while the panel is open re-reads the session's live state.
     expect(refetch).not.toHaveBeenCalled();
     hostMcpQueryMock.mockReturnValue({
       data: [
@@ -4829,7 +4830,7 @@ describe("Composer MCP status command", () => {
           harness: "claude",
           transport: "http",
           scope: "user",
-          auth_status: "sign_in_required",
+          auth_status: "connected",
         },
       ],
       isLoading: false,

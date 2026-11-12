@@ -72,6 +72,7 @@ from omnigent.harness_plugins import (
     model_env_keys,
     spawn_env_builders,
 )
+from omnigent.inner.executor import LiveMcpServerUnknown
 from omnigent.llms.errors import detect_request_size_overflow
 from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
 from omnigent.native.input_diagnostics import input_attributes
@@ -152,7 +153,10 @@ from omnigent.runner.native import (
     _unwrap_resolved_spec,
 )
 from omnigent.runner.native import orchestration as _native_runtime
-from omnigent.runner.native.claude_mcp_sign_in import ClaudeMcpSignInTracker
+from omnigent.runner.native.claude_mcp_sign_in import (
+    ClaudeMcpSignInTracker,
+    claude_sign_in_by_live_name,
+)
 from omnigent.runner.native.interrupt import NativeInterruptRunner
 from omnigent.runner.native_controls import build_native_controls
 from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
@@ -1586,7 +1590,7 @@ def create_runner_app(
     # answers /mcp for one; set up with the pane reaper, which owns closing panes.
     _restart_claude_for_mcp_sign_in: Callable[[str], Awaitable[None]] | None = None
     _claude_native_live_mcp: Callable[[str], Awaitable[_JsonObject | None]] | None = None
-    _reconnect_claude_native_mcp: Callable[[str], Awaitable[_JsonObject | None]] | None = None
+    _reconnect_claude_native_mcp: Callable[[str, str], Awaitable[_JsonObject | None]] | None = None
     _antigravity_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _devin_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     app.state.antigravity_terminal_ensure_locks = _antigravity_terminal_ensure_locks
@@ -3594,24 +3598,35 @@ def create_runner_app(
                     session_id
                 )
 
-            _launch_result = await _launch_native_terminal(
-                harness_name,
-                _launch_ctx,
-                ensure_locks=_launch_locks,
-                pre_launch=_launch_pre,
-                build_context=_launch_build,
-                resolve_agent_spec=_launch_resolve_spec,
+            _claude_terminals = (
+                resource_registry.terminal_registry if harness_name == "claude-native" else None
             )
+            _claude_pane_before = (
+                _claude_terminals.get(session_id, "claude", "main")
+                if _claude_terminals is not None
+                else None
+            )
+            try:
+                _launch_result = await _launch_native_terminal(
+                    harness_name,
+                    _launch_ctx,
+                    ensure_locks=_launch_locks,
+                    pre_launch=_launch_pre,
+                    build_context=_launch_build,
+                    resolve_agent_spec=_launch_resolve_spec,
+                )
+            finally:
+                if harness_name == "claude-native":
+                    _claude_mcp_sign_in.note_launched(
+                        session_id,
+                        _claude_terminals.get(session_id, "claude", "main")
+                        if _claude_terminals is not None
+                        else None,
+                        previous=_claude_pane_before,
+                    )
             # Only claude reported terminal_ready in the create-session response.
             if harness_name == "claude-native":
                 terminal_ready = _launch_result
-                _claude_terminals = resource_registry.terminal_registry
-                _claude_mcp_sign_in.note_launched(
-                    session_id,
-                    _claude_terminals.get(session_id, "claude", "main")
-                    if _claude_terminals is not None
-                    else None,
-                )
 
                 # Start the loopback relay now instead of at the first
                 # web-dispatched turn: a prompt typed directly in the TUI
@@ -9565,12 +9580,17 @@ def create_runner_app(
                 )
             return await asyncio.to_thread(_claude_live_mcp_body, conv_id, instance)
 
-        async def _reconnect_claude_native_mcp_impl(conv_id: str) -> _JsonObject | None:
+        async def _reconnect_claude_native_mcp_impl(conv_id: str, name: str) -> _JsonObject | None:
             """Restart a claude-native session's Claude Code, which reconnects every MCP server.
 
+            Only while *name* is one Claude Code started without and is now signed in:
+            a stale panel must not restart a pane that already connects it.
+
+            :param name: The server to reconnect, as Claude Code names it, e.g. ``"linear"``.
             :returns: The live MCP state afterwards, with ``reconnect_error`` when the
                 pane was left running or did not start again; ``None`` when the session
                 has no running claude-native pane.
+            :raises LiveMcpServerUnknown: When the host has no Claude server named *name*.
             """
             if (
                 await _live_claude_native_pane(conv_id) is None
@@ -9583,6 +9603,19 @@ def create_runner_app(
                 if instance is None:
                     not_running = f"Claude Code isn't running. {_CLAUDE_START_IT}"
                     return {**_CLAUDE_NOT_RUNNING, "reconnect_error": not_running}
+                # Checked in line: a message or Reconnect ahead may have restarted it.
+                sign_in = await asyncio.to_thread(claude_sign_in_by_live_name)
+                # An empty report is a failed discovery, which says nothing about the name.
+                if sign_in and name not in sign_in:
+                    raise LiveMcpServerUnknown(name)
+                signed_in = await asyncio.to_thread(
+                    _claude_mcp_sign_in.signed_in_since_launch, conv_id, instance
+                )
+                if name not in signed_in:
+                    body = await asyncio.to_thread(_claude_live_mcp_body, conv_id, instance)
+                    if sign_in.get(name) == "sign_in_required":
+                        return {**body, "reconnect_error": f"Sign in to {name} first."}
+                    return body
                 refusal = await _restart_idle_claude_pane(conv_id, instance)
                 if refusal is not None:
                     body = await asyncio.to_thread(_claude_live_mcp_body, conv_id, instance)

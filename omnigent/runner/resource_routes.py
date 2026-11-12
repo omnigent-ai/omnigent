@@ -516,19 +516,28 @@ def register_resource_routes(
 
                 _ensure_build = _spec_or_none_ensure_build
 
-            _ensure_result = await _ensure_native_terminal(
-                terminal_name,
-                _ensure_ctx,
-                ensure_locks=_ensure_locks,
-                build_context=_ensure_build,
-                is_owned=_ensure_is_owned,
-                conflict_message=_ensure_conflict,
-                finalize=_ensure_finalize,
+            claude_pane_before = (
+                terminal_registry.get(session_id, "claude", "main")
+                if terminal_name == "claude" and terminal_registry is not None
+                else None
             )
-            if terminal_name == "claude" and terminal_registry is not None:
-                claude_mcp_sign_in.note_launched(
-                    session_id, terminal_registry.get(session_id, "claude", "main")
+            try:
+                _ensure_result = await _ensure_native_terminal(
+                    terminal_name,
+                    _ensure_ctx,
+                    ensure_locks=_ensure_locks,
+                    build_context=_ensure_build,
+                    is_owned=_ensure_is_owned,
+                    conflict_message=_ensure_conflict,
+                    finalize=_ensure_finalize,
                 )
+            finally:
+                if terminal_name == "claude" and terminal_registry is not None:
+                    claude_mcp_sign_in.note_launched(
+                        session_id,
+                        terminal_registry.get(session_id, "claude", "main"),
+                        previous=claude_pane_before,
+                    )
             if _ensure_result is not None:
                 return _ensure_result
 
@@ -611,7 +620,16 @@ def register_resource_routes(
             ):
                 launched_relay = relay_after.relay
 
+        # A CLI client's Claude pane: record which servers it starts without.
+        claude_launch = bridge_inject and terminal_name == "claude" and session_key == "main"
+        claude_pane_before = (
+            terminal_registry.get(session_id, "claude", "main")
+            if claude_launch and terminal_registry is not None
+            else None
+        )
         try:
+            if claude_launch:
+                await asyncio.to_thread(claude_mcp_sign_in.note_launching, session_id)
             launch_method = (
                 resource_registry.launch_required_terminal
                 if bridge_inject
@@ -639,6 +657,15 @@ def register_resource_routes(
                     }
                 },
             )
+        finally:
+            if claude_launch:
+                claude_mcp_sign_in.note_launched(
+                    session_id,
+                    terminal_registry.get(session_id, "claude", "main")
+                    if terminal_registry is not None
+                    else None,
+                    previous=claude_pane_before,
+                )
 
         if bridge_inject:
             _publish_tmux_target_for_bridge(
@@ -917,6 +944,8 @@ def register_resource_routes(
                     }
                 },
             )
+        if terminal_id == terminal_resource_id("claude", "main"):
+            claude_mcp_sign_in.transfer(session_id, target_session_id)
         return JSONResponse(
             status_code=200,
             content=session_resource_view_to_dict(resource),

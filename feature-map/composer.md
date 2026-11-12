@@ -797,7 +797,9 @@ Other connection providers alone do not enable the managed MCP picker.
   the terminal to restart into the same conversation with the server
   connected. While Claude works (also on a prompt typed in the terminal), runs
   background shells or agents, or is open in a terminal on the host, Reconnect
-  explains why it waits and nothing restarts. Covered by the claude-native
+  explains why it waits and nothing restarts; a stale Reconnect, for a server
+  the session already connects, restarts nothing either. This holds for a
+  session `omnigent claude` started and after `/clear`. Covered by the claude-native
   cases in `tests/runner/test_app_sessions_native_session_change_heal.py`,
   `tests/runner/test_claude_mcp_sign_in.py` and `ChatPage.composer.test.tsx`.
   Under an enterprise `managed-mcp.json` carrying the `omnigent` relay entry,
