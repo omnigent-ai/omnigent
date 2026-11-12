@@ -253,7 +253,11 @@ export function CreateScheduledTaskDialog({
   onCreated?: (task: ScheduledTask) => void;
 }) {
   const { data: agents } = useAvailableAgents({ enabled: open });
-  const { data: hosts, isPending: hostsPending } = useHosts({ enabled: open });
+  const {
+    data: hosts,
+    isPending: hostsPending,
+    isError: hostsFailed,
+  } = useHosts({ enabled: open });
   const info = useServerInfo();
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
   const subhourSupported = info !== "loading" && info.scheduled_task_subhour === true;
@@ -713,6 +717,15 @@ export function CreateScheduledTaskDialog({
   const hostOptions = hosts ?? [];
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
+  // Say so when no host can take the automation; a picked offline host has its own note,
+  // and a failed lookup proves nothing about the hosts. Wait for /v1/info too, which can
+  // still pick a sandbox instead.
+  const showNoHostOnline =
+    !sandboxMode &&
+    targetInputsLoaded &&
+    !hostsFailed &&
+    selectedHost?.status !== "offline" &&
+    !hostOptions.some((h) => h.status === "online");
   function handleWorkerSettingsChange(settings: TriggerWorkerSettings) {
     if (trigger !== null) {
       setSwitchedWorkerSettings(settings);
@@ -1503,6 +1516,16 @@ export function CreateScheduledTaskDialog({
                     {!sandboxMode && selectedHost?.status === "offline" && (
                       <p className="text-sm text-muted-foreground">
                         This host is offline. Runs fail until it reconnects.
+                      </p>
+                    )}
+                    {showNoHostOnline && (
+                      <p
+                        className="flex items-center gap-1.5 text-sm text-muted-foreground"
+                        data-testid="task-no-host-online"
+                        role="status"
+                      >
+                        <TriangleAlertIcon className="size-3.5 shrink-0" />
+                        No host is connected.
                       </p>
                     )}
                   </div>
