@@ -444,14 +444,19 @@ function pickerChecked(section: "model" | "effort"): string | null {
   return checked;
 }
 
-/** Whether a flyout section's rows are locked (an existing session owns them). */
-function pickerLocked(section: "model" | "effort"): boolean {
+/**
+ * Whether a flyout section's rows are all locked (an existing session owns them), all
+ * editable, or a mix, so `false` means no row is left locked.
+ */
+function pickerLocked(section: "model" | "effort"): boolean | "mixed" {
   const group = pickerSection(section);
   if (!group) throw new Error(`No ${section} section in the agent picker`);
-  const items = within(group).getAllByRole("menuitemcheckbox");
-  const locked = items.every((item) => item.hasAttribute("data-disabled"));
+  const disabled = within(group)
+    .getAllByRole("menuitemcheckbox")
+    .map((item) => item.hasAttribute("data-disabled"));
   closePickerConfig();
-  return locked;
+  if (disabled.every(Boolean)) return true;
+  return disabled.some(Boolean) ? "mixed" : false;
 }
 
 /** Whether model, effort (in the picker) and permission (in Advanced) are all locked or all editable. */
