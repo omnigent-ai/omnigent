@@ -31,13 +31,12 @@ import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/ses
 import * as host from "@/lib/host";
 import * as adminView from "@/lib/adminView";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
-import { UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
+import { UI_FONT_FAMILY_FALLBACK, UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
 import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
 import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
-import { UI_FONT_FAMILY_FALLBACK } from "@/lib/uiFontPreferences";
 import { resetFontLoaderForTests, setWebFontsEnabled } from "@/lib/webFontLoader";
 
 const mocks = vi.hoisted(() => ({
