@@ -623,6 +623,11 @@ class ToolManager:
             BrowserScreenshotTool,
         ):
             self._tools[_cls.name()] = _cls()
+        # The advanced browser tools, and click / type with their trusted-input options.
+        # Imported here: the tool classes build on this module's registry.
+        from omnigent.tools.builtins.browser_advanced import register_browser_agent_tools
+
+        register_browser_agent_tools(self._tools)
 
     def _register_os_env_tools(self, *, schema_only: bool = False) -> None:
         """

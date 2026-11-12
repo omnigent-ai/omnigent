@@ -1,3 +1,5 @@
+import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentTools/preferences";
+
 export const BACKGROUND_SESSION_TITLES_STORAGE_KEY = "omnigent:background-session-titles";
 export const BACKGROUND_SESSION_TITLES_HEADER = "X-Omnigent-Background-Session-Titles";
 
@@ -26,5 +28,9 @@ export function writeBackgroundSessionTitlesEnabled(enabled: boolean): void {
 }
 
 export function backgroundSessionTitlesRequestHeaders(): Record<string, string> {
-  return readBackgroundSessionTitlesEnabled() ? {} : { [BACKGROUND_SESSION_TITLES_HEADER]: "off" };
+  return {
+    ...(readBackgroundSessionTitlesEnabled() ? {} : { [BACKGROUND_SESSION_TITLES_HEADER]: "off" }),
+    // Session-start preferences ride along on the same requests.
+    ...browserAgentToolsRequestHeaders(),
+  };
 }

@@ -156,6 +156,34 @@ async def test_import_session_creates_normal_session_and_blocks_duplicate(
     assert [item["type"] for item in items.json()["data"]] == ["message", "message"]
 
 
+async def test_import_takes_the_browser_tools_mode_from_the_request_header(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An import from a desktop app is labeled like a create from it."""
+    _seed_claude_agent(db_uri)
+    user_message = {
+        "type": "message",
+        "response_id": "claude:turn-1",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    }
+    store = SqlAlchemyConversationStore(db_uri)
+    for external_id, header, expected in [
+        ("browser-on", "on", "on"),
+        ("browser-trusted", "trusted", "trusted"),
+        ("browser-none", None, None),
+    ]:
+        response = await client.post(
+            "/v1/imports",
+            json={"source": "claude", "external_session_id": external_id, "items": [user_message]},
+            headers={} if header is None else {"X-Omnigent-Browser-Agent-Tools": header},
+        )
+        assert response.status_code == 201, response.text
+        conversation = store.get_conversation(response.json()["session_id"])
+        assert conversation is not None
+        assert conversation.labels.get("omnigent.browser_agent_tools") == expected
+
+
 async def test_import_dedupes_against_native_session(
     client: httpx.AsyncClient,
     db_uri: str,

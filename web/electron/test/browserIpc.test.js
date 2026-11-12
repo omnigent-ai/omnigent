@@ -24,6 +24,7 @@ const {
   buildDesignModeScript,
   DESIGN_MODE_GESTURE_WINDOW_MS,
 } = require("../src/browserIpc");
+const { fakeRuntime } = require("./browserInputFakes");
 
 /** A fake ipcMain that records `handle(channel, fn)` registrations and lets a
  *  test invoke a channel with a synthetic event + args. */
@@ -45,6 +46,41 @@ function makeIpcMain() {
 const allowAgentNavigation = async () => ({ ok: true });
 
 describe("browser IPC pending navigation lifecycle", () => {
+  it("does nothing for a call that arrives past its deadline", async () => {
+    const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
+    const registry = createBrowserViewRegistry();
+    const generations = [];
+    const begin = registry.beginAgentNavigation;
+    registry.beginAgentNavigation = (id) => {
+      generations.push(id);
+      return begin(id);
+    };
+    registry.openOrNavigate = () => {
+      throw new Error("must not navigate");
+    };
+    registry.revokeAgentView = () => {
+      throw new Error("must not revoke");
+    };
+    const ipcMain = makeIpcMain();
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => registry,
+    });
+    const result = await ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      {},
+      {
+        conversationId: "conv",
+        url: "https://a.example/",
+        opts: { agent: true, deadlineAt: Date.now() - 1 },
+      },
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.error, /time ran out/);
+    assert.deepEqual(generations, [], "a pending navigation keeps its place");
+  });
+
   for (const action of [
     "supersede",
     "close",
@@ -452,6 +488,47 @@ function makeWebContents({
   };
 }
 
+/**
+ * Give a fake webContents a recording debugger and a page that answers the
+ * trusted-input scripts (locate, type_prepare). Returns the command log.
+ */
+function withFakeDebugger(wc) {
+  const commands = [];
+  let attached = false;
+  wc.debugger = {
+    isAttached: () => attached,
+    attach() {
+      attached = true;
+    },
+    detach() {
+      attached = false;
+    },
+    on() {},
+    removeListener() {},
+    sendCommand: async (method, params) => {
+      commands.push([method, params]);
+      return (await runtime(method, params)) ?? {};
+    },
+  };
+  const runtime = fakeRuntime((js) => wc.executeJavaScript(js)); // pinned targets
+  wc.executeJavaScript = async (js) => {
+    wc.scripts.push(js);
+    if (js.includes("input_type: el.tagName")) {
+      return JSON.stringify({
+        x: 4,
+        y: 8,
+        inView: true,
+        covered: null,
+        tag: "a",
+        input_type: null,
+      });
+    }
+    if (js.includes("mode: 'insert'")) return JSON.stringify({ mode: "insert" });
+    return "ok";
+  };
+  return commands;
+}
+
 /** Pull the per-enable design-mode nonce out of the injected script text.
  *  buildDesignModeScript bakes it into the marker prefix `__omni_<nonce>_element_select__`. */
 function nonceFromScripts(scripts) {
@@ -516,6 +593,8 @@ function setup({
   platform = "darwin",
   confirmCookieImport = async () => true,
   getWindowForEvent = () => null,
+  getAgentContextForEvent,
+  showsServerForEvent,
 } = {}) {
   const ipcMain = makeIpcMain();
   const wc = webContents ?? makeWebContents();
@@ -530,6 +609,8 @@ function setup({
     platform,
     confirmCookieImport,
     getWindowForEvent,
+    getAgentContextForEvent,
+    showsServerForEvent,
   });
   return { ipcMain, registry, wc, sent, event };
 }
@@ -1221,6 +1302,28 @@ describe("browserIpc — url live-tracking", () => {
   });
 });
 
+describe("browserIpc — foreign window", () => {
+  it("sends no url or nav-state pings once the window shows another origin", async () => {
+    let shows = true;
+    const { ipcMain, registry, sent, event } = setup({
+      conversationId: null,
+      showsServerForEvent: () => shows,
+    });
+    await ipcMain.invoke("omnigent:browser-open-or-navigate", event, {
+      conversationId: "conv_1",
+      url: "https://example.com",
+    });
+    const wc = registry.get("conv_1").view.webContents;
+    wc.emit("did-navigate", "https://example.com/a");
+    assert.ok(sent.length > 0, "a window showing its server still hears its views");
+    sent.length = 0;
+    shows = false;
+    wc.emit("did-navigate", "https://example.com/b");
+    wc.emit("page-title-updated", "Secret title");
+    assert.deepEqual(sent, []);
+  });
+});
+
 describe("browserIpc — design mode", () => {
   it("rejects an unpinned sender on all three design-mode channels", async () => {
     const { ipcMain, event } = setup({ pinned: false });
@@ -1390,6 +1493,52 @@ describe("browserIpc — design-mode gesture gate", () => {
     assert.equal(sent.length, 0, "only mouseDown / keyDown count as intent");
   });
 
+  it("does not take an agent's protocol input as the user's gesture", () => {
+    const sent = [];
+    const entry = { view: { webContents: { isDestroyed: () => false } } };
+    const gestureState = { lastGestureAt: 0 };
+    let agentInput = false;
+    const consoleHandler = makeDesignModeConsoleHandler(
+      "conv_1",
+      entry,
+      (channel, payload) => sent.push({ channel, payload }),
+      NONCE,
+      gestureState,
+    );
+    const inputHandler = makeDesignModeInputHandler(gestureState, () => agentInput);
+    // The user clicked; then an agent click lands while the stamp is fresh.
+    inputHandler({}, { type: "mouseDown" });
+    agentInput = true;
+    inputHandler({}, { type: "mouseDown" });
+    inputHandler({}, { type: "rawKeyDown" });
+    consoleHandler({}, "log", SUBMIT + JSON.stringify({ id: 7, prompt: "agent-driven" }));
+    assert.equal(sent.length, 0, "agent input neither stamps nor leaves the user's stamp usable");
+    agentInput = false;
+    inputHandler({}, { type: "keyDown" });
+    consoleHandler({}, "log", SUBMIT + JSON.stringify({ id: 8, prompt: "user again" }));
+    assert.equal(sent.length, 1, "the user's next press authorizes again");
+  });
+
+  it("voids the user's stamp on an agent mouse move, not just a press", () => {
+    const sent = [];
+    const entry = { view: { webContents: { isDestroyed: () => false } } };
+    const gestureState = { lastGestureAt: 0 };
+    let agentInput = false;
+    const consoleHandler = makeDesignModeConsoleHandler(
+      "conv_1",
+      entry,
+      (channel, payload) => sent.push({ channel, payload }),
+      NONCE,
+      gestureState,
+    );
+    const inputHandler = makeDesignModeInputHandler(gestureState, () => agentInput);
+    inputHandler({}, { type: "mouseDown" });
+    agentInput = true;
+    inputHandler({}, { type: "mouseMove" });
+    consoleHandler({}, "log", SUBMIT + JSON.stringify({ id: 9, prompt: "hover-driven" }));
+    assert.equal(sent.length, 0);
+  });
+
   it("still ignores a WRONG-nonce submit even with a fresh gesture", () => {
     const { sent, inputHandler, consoleHandler } = makeCtx();
     inputHandler({}, { type: "mouseDown" });
@@ -1437,16 +1586,30 @@ describe("browserIpc — navigation API helpers", () => {
 
 describe("browserIpc — typed actions", () => {
   it("accepts an older UI's action templates without executing arbitrary input", async () => {
-    const { ipcMain, event, wc } = setup();
-    for (const { script } of require("./fixtures/browserActions-v0.18.json").requests) {
+    const wc = makeWebContents();
+    const commands = withFakeDebugger(wc);
+    const { ipcMain, event } = setup({ webContents: wc });
+    const { requests } = require("./fixtures/browserActions-v0.18.json");
+    for (const { script } of requests) {
       // oxlint-disable-next-line no-await-in-loop -- Exercise each legacy request against the same view.
       const result = await ipcMain.invoke("omnigent:browser-execute", event, {
         conversationId: "conv_1",
         js: script,
       });
       assert.equal(result.ok, true, result.error);
-      assert.equal(wc.scripts.at(-1), script);
     }
+    // Snapshot runs today's script (the frozen one only names the action); click and type
+    // become trusted input.
+    const { buildBrowserActionScript } = await import("../src/browserActionScript.mjs");
+    assert.ok(wc.scripts.includes(buildBrowserActionScript("snapshot")));
+    const clicks = commands.filter(
+      ([m, p]) => m === "Input.dispatchMouseEvent" && p.type === "mouseReleased",
+    );
+    assert.equal(clicks.length, 3);
+    assert.deepEqual(
+      commands.filter(([m]) => m === "Input.insertText").map(([, p]) => p.text),
+      requests.filter((r) => r.action === "type").map((r) => r.args.text),
+    );
   });
 
   it("rejects raw scripts and malformed action arguments before execution", async () => {
@@ -1473,22 +1636,163 @@ describe("browserIpc — typed actions", () => {
     assert.equal(wc.scripts.length, 0);
   });
 
-  it("executes a fixed action without synthetic user activation", async () => {
+  it("runs page-script actions without synthetic user activation", async () => {
     const wc = makeWebContents();
     const calls = [];
     wc.executeJavaScript = async (...args) => {
       calls.push(args);
-      return "ok";
+      return JSON.stringify({ selected: ["b"] });
     };
     const { ipcMain, event } = setup({ webContents: wc });
     const result = await ipcMain.invoke("omnigent:browser-perform-action", event, {
       conversationId: "conv_1",
-      action: "click",
-      params: { selector: "button" },
+      action: "select_option",
+      params: { selector: "select", values: ["b"] },
     });
-    assert.deepEqual(result, { ok: true, result: "ok" });
+    assert.deepEqual(result, { ok: true, result: JSON.stringify({ selected: ["b"] }) });
     assert.equal(calls.length, 1);
     assert.equal(calls[0][1], false);
+  });
+
+  it("sends every click as trusted mouse input", async () => {
+    const wc = makeWebContents();
+    const commands = withFakeDebugger(wc);
+    const { ipcMain, event } = setup({ webContents: wc });
+    const perform = (params) =>
+      ipcMain.invoke("omnigent:browser-perform-action", event, {
+        conversationId: "conv_1",
+        action: "click",
+        params,
+      });
+    const released = () =>
+      commands
+        .filter(([m, p]) => m === "Input.dispatchMouseEvent" && p.type === "mouseReleased")
+        .map(([, p]) => p.button);
+    assert.deepEqual(await perform({ selector: "a" }), {
+      ok: true,
+      result: JSON.stringify({ ok: true }),
+    });
+    assert.deepEqual(await perform({ selector: "a", button: "left", double_click: false }), {
+      ok: true,
+      result: JSON.stringify({ ok: true }),
+    });
+    await perform({ selector: "a", button: "right" });
+    assert.deepEqual(released(), ["left", "left", "right"]);
+    assert.ok(!wc.scripts.some((js) => js.includes("el.click()")), "no script click");
+    assert.equal((await perform({ selector: "a", double_click: "yes" })).ok, false);
+  });
+
+  it("puts a tab the user opened under the issuing session's URL policy before agent input", async () => {
+    const wc = makeWebContents();
+    withFakeDebugger(wc);
+    const { ipcMain, event, registry } = setup({
+      webContents: wc,
+      getAgentContextForEvent: (_event, opts) => ({
+        sourceHostId: opts?.sourceHostId,
+        agentRequested: opts?.agent,
+      }),
+    });
+    // Opened from the address bar: no agent lock, so its navigations are permissive.
+    const entry = registry.get("conv_1");
+    for (const [action, params] of [
+      ["click", { selector: "a" }],
+      ["select_option", { selector: "select", values: ["b"] }],
+    ]) {
+      entry.navigationPolicyEnforced = false;
+      entry.agentContext = { agentRequested: false };
+      // oxlint-disable-next-line no-await-in-loop -- One action at a time.
+      const result = await ipcMain.invoke("omnigent:browser-perform-action", event, {
+        conversationId: "conv_1",
+        action,
+        params: { ...params, provenance: { sourceHostId: "remote-host" } },
+      });
+      // The host isn't an action argument (browserInput rejects unknown ones).
+      assert.equal(result.ok, true, `${action}: ${result.error}`);
+      assert.equal(entry.navigationPolicyEnforced, true, action);
+      assert.deepEqual(entry.agentContext, { sourceHostId: "remote-host", agentRequested: true });
+    }
+  });
+
+  it("keeps an agent navigation's context for input from a web bundle that sends no provenance", async () => {
+    const wc = makeWebContents();
+    withFakeDebugger(wc);
+    const { ipcMain, event, registry } = setup({
+      webContents: wc,
+      getAgentContextForEvent: (_event, opts) => ({
+        sourceHostId: opts?.sourceHostId,
+        agentRequested: opts?.agent,
+      }),
+    });
+    const entry = registry.get("conv_1");
+    const click = (params) =>
+      ipcMain.invoke("omnigent:browser-perform-action", event, {
+        conversationId: "conv_1",
+        action: "click",
+        params,
+      });
+    // The agent navigated here with its session's host (a localhost preview).
+    const navigated = { sourceHostId: "preview-host", agentRequested: true };
+    entry.navigationPolicyEnforced = true;
+    entry.agentContext = navigated;
+    assert.equal((await click({ selector: "a" })).ok, true);
+    assert.equal(entry.agentContext, navigated);
+    // A newer relay's provenance is the issuing session's, even when unknown.
+    await click({ selector: "a", provenance: { sourceHostId: null } });
+    assert.deepEqual(entry.agentContext, { sourceHostId: null, agentRequested: true });
+    // A tab the user opened still gets the agent policy, host-less.
+    entry.navigationPolicyEnforced = false;
+    entry.agentContext = null;
+    await click({ selector: "a" });
+    assert.equal(entry.navigationPolicyEnforced, true);
+    assert.deepEqual(entry.agentContext, { sourceHostId: null, agentRequested: true });
+  });
+
+  it("routes agent history actions through the registry's policy-checked navigation", async () => {
+    const wc = makeWebContents();
+    const contexts = [];
+    const { ipcMain, event, registry } = setup({
+      webContents: wc,
+      getAgentContextForEvent: (_event, opts) => ({
+        sourceHostId: opts?.sourceHostId,
+        agentRequested: opts?.agent,
+      }),
+    });
+    const history = [];
+    registry.agentNavigateHistory = async (id, action, opts) => {
+      history.push([id, action]);
+      contexts.push(opts.agentContext);
+      return action === "go_forward"
+        ? { ok: false, error: "no next page in this tab" }
+        : { ok: true, url: "https://example.com/a", title: "A" };
+    };
+    const perform = (action, params) =>
+      ipcMain.invoke("omnigent:browser-perform-action", event, {
+        conversationId: "conv_1",
+        action,
+        params,
+      });
+    assert.deepEqual(await perform("go_back"), {
+      ok: true,
+      result: JSON.stringify({ url: "https://example.com/a", title: "A" }),
+    });
+    assert.deepEqual(await perform("go_forward", {}), {
+      ok: false,
+      error: "no next page in this tab",
+    });
+    assert.equal((await perform("reload", { url: "http://10.0.0.5" })).ok, false);
+    // The issuing session's host, from the relay, makes the step's context.
+    await perform("reload", { provenance: { sourceHostId: "host-b" } });
+    assert.deepEqual(history, [
+      ["conv_1", "go_back"],
+      ["conv_1", "go_forward"],
+      ["conv_1", "reload"],
+    ]);
+    assert.deepEqual(contexts, [
+      { sourceHostId: null, agentRequested: true },
+      { sourceHostId: null, agentRequested: true },
+      { sourceHostId: "host-b", agentRequested: true },
+    ]);
+    assert.equal(wc.calls.filter((call) => /reload|goBack/.test(call)).length, 0);
   });
 });
 
@@ -1604,6 +1908,9 @@ describe("browser IPC sessions on this machine", () => {
     ]) {
       it(`${transport}: ${scenario.name} ${scenario.allowed ? "can" : "cannot"} read a privileged view`, async () => {
         const { navigate, ipcMain, registry, webContents } = localNavigation();
+        // Click and type send trusted input through the DevTools protocol.
+        const trustedInput = transport === "click" || transport === "type";
+        if (trustedInput) withFakeDebugger(webContents);
         await navigate("http://127.0.0.1:5173");
         const entry = registry.get("conv");
         const loads = [];
@@ -1615,9 +1922,10 @@ describe("browser IPC sessions on this machine", () => {
           reads++;
           return { toPNG: () => Buffer.from("fixture") };
         };
-        webContents.executeJavaScript = async () => {
+        const pageScript = webContents.executeJavaScript;
+        webContents.executeJavaScript = async (js) => {
           reads++;
-          return "{}";
+          return trustedInput ? pageScript(js) : "{}";
         };
         const channel =
           transport === "screenshot"
@@ -1645,13 +1953,38 @@ describe("browser IPC sessions on this machine", () => {
           },
         );
         assert.equal(result.ok, scenario.allowed);
-        assert.equal(reads, scenario.allowed ? 1 : 0);
+        // Trusted input locates its target with page scripts first.
+        if (trustedInput) assert.equal(reads > 0, scenario.allowed);
+        else assert.equal(reads, scenario.allowed ? 1 : 0);
         assert.equal(registry.get("conv"), entry, "a denial keeps the view");
         assert.deepEqual(loads, scenario.blank ? ["about:blank"] : []);
         assert.equal(entry.agentContext?.hostIsThisMachine === true, !scenario.blank);
       });
     }
   }
+
+  it("refuses a tab check from a different host without blanking its page", async () => {
+    const { navigate, ipcMain, registry, webContents } = localNavigation();
+    await navigate("http://127.0.0.1:5173");
+    const entry = registry.get("conv");
+    const loads = [];
+    webContents.loadURL = async (url) => {
+      loads.push(url);
+    };
+    const result = await ipcMain.invoke(
+      "omnigent:browser-perform-action",
+      {},
+      {
+        conversationId: "conv",
+        opts: { sessionHostProtocol: 1, sourceHostId: "remote" },
+        action: "check_page",
+      },
+    );
+    assert.equal(result.ok, false);
+    assert.equal(registry.get("conv"), entry);
+    assert.deepEqual(loads, [], "the page stays");
+    assert.equal(entry.agentContext?.hostIsThisMachine, true, "the view keeps its context");
+  });
 
   function readView(ipcMain, action, sourceHostId = "local") {
     return ipcMain.invoke(

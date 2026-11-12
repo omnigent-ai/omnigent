@@ -10,7 +10,8 @@ const legacy = require("./fixtures/browserActions-v0.18.json");
 it("translates the frozen v0.18 relay templates into validated actions", () => {
   for (const { action, args, script } of legacy.requests) {
     assert.deepEqual(decodeLegacyBrowserAction(script), { action, params: args });
-    assert.equal(buildBrowserActionScript(action, args), script);
+    // The snapshot has changed since v0.18; its frozen text is kept to recognize it.
+    if (action !== "snapshot") assert.equal(buildBrowserActionScript(action, args), script);
   }
 });
 

@@ -2008,6 +2008,25 @@ describe("approve", () => {
 });
 
 describe("importLocalSessions", () => {
+  it("sends the browser tools mode header on the import request", async () => {
+    const win = window as unknown as { omnigentDesktop?: unknown };
+    const before = win.omnigentDesktop;
+    win.omnigentDesktop = { browserTabs: () => undefined };
+    try {
+      fetchMock.mockResolvedValueOnce(
+        mockNdjsonResponse([
+          JSON.stringify({ event: "done", imported: 0, already_imported: 0, failed: 0 }),
+        ]),
+      );
+      await importLocalSessions("host_1", "all", 25);
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe("/v1/imports/local/stream");
+      expect(new Headers(init.headers).get("X-Omnigent-Browser-Agent-Tools")).toBe("trusted");
+    } finally {
+      win.omnigentDesktop = before;
+    }
+  });
+
   it("streams each session through onSession and returns the final tally", async () => {
     fetchMock.mockResolvedValueOnce(
       mockNdjsonResponse([

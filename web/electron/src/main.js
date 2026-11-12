@@ -77,6 +77,7 @@ const { registerServerAwayWatch, AWAY_BANNER_DELAY_MS } = require("./away_banner
 const { createReturnBanner } = require("./return_banner");
 const { createReconnectOverlay } = require("./reconnect_overlay");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
+const { registerBrowserTabsIpc } = require("./browserTabs");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
@@ -3140,7 +3141,11 @@ function newWindow() {
   const current = win?.webContents.getURL();
   // Cloning an ephemeral (multi-server) window keeps the clone
   // ephemeral, so Change Server… from it still won't touch saved settings.
-  createWindow(current, { ephemeral: win ? windows.get(win)?.ephemeral === true : false });
+  // The clone's server is its source's, not its /c/<id> URL (browserTabs.js keys tabs by it).
+  createWindow(current, {
+    ephemeral: win ? windows.get(win)?.ephemeral === true : false,
+    serverUrl: (win && windows.get(win)?.serverUrl) || undefined,
+  });
 }
 
 /**
@@ -5532,11 +5537,37 @@ function registerIpc() {
 
   // Embedded browser pane — the `omnigent:browser-*` surface lives in
   // browserIpc.js; the trust gate + per-window registry lookup are injected.
+  // Every window's view of each session's browser tabs, and the
+  // routing of a tab's calls to the one window with its page
+  // (browserTabs.js).
+  const windowShowsServer = (win) => {
+    const origin = windows.get(win)?.origin;
+    return !!origin && originOf(win.webContents.getURL()) === origin;
+  };
+  const browserTabs = registerBrowserTabsIpc({
+    ipcMain,
+    isPinnedOriginSender,
+    windows: () => windows,
+    windowForEvent: (event) => BrowserWindow.fromWebContents(event.sender),
+    // A window that navigated to a foreign page keeps its pinned origin.
+    showsServer: windowShowsServer,
+    // Tabs belong to a server, so two servers on one origin share none.
+    serverOf: (state) =>
+      (state.serverUrl && normalizeSavedServerUrl(state.serverUrl).replace(/\/+$/, "")) ||
+      state.origin,
+  });
   registerBrowserIpc({
     ipcMain,
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
     getWindowForEvent: (event) => BrowserWindow.fromWebContents(event.sender),
+    showsServerForEvent: (event) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      return !!win && windowShowsServer(win);
+    },
+    routeViewForEvent: browserTabs.route, // a tab's one page, in its window
+    whileOpeningView: browserTabs.whileOpening,
+    refuseCloseForEvent: browserTabs.refuseClose,
     getAgentContextForEvent: (event, opts) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       const sourceHostId = typeof opts?.sourceHostId === "string" ? opts.sourceHostId : null;

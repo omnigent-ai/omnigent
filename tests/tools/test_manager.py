@@ -27,6 +27,7 @@ from omnigent.spec.types import (
 )
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.browser_agent_tools import ADVANCED_BROWSER_TOOL_NAMES
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.manager import _UCFunctionSchemaTool
 from omnigent.tools.mcp import clear_discovery_cache
@@ -100,6 +101,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "browser_type",
         "browser_screenshot",
     }
+    | ADVANCED_BROWSER_TOOL_NAMES  # advanced browser tools
 )
 
 

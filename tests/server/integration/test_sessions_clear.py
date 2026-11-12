@@ -477,6 +477,28 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     assert new_id in live_runner.announced
 
 
+async def test_claude_sdk_clear_keeps_the_browser_tools_mode_without_the_header(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A headerless clear continues the session, so its browser-tool mode carries over."""
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(client, store)
+    store.set_labels(source_id, {"omnigent.browser_agent_tools": "on"})
+
+    resp = await client.post(
+        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+    )
+
+    assert resp.status_code == 202, resp.text
+    fork = store.get_conversation(resp.json()["session_id"])
+    assert fork is not None
+    assert fork.labels["omnigent.browser_agent_tools"] == "on"
+
+
 async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_session(
     client: httpx.AsyncClient,
     db_uri: str,

@@ -86,6 +86,7 @@ import { PaletteChip, PaletteSwatchPreview } from "@/components/theme/Appearance
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import { BrowserAgentToolsSettingsGroup } from "@/components/BrowserPane/agentTools/BrowserAgentToolsSettingsGroup";
 import {
   Select,
   SelectContent,
@@ -1998,6 +1999,7 @@ function GeneralSection() {
             <OpenLinksInAppControl />
           </SettingsGroup>
         )}
+        <BrowserAgentToolsSettingsGroup />
         {supportsGlobalShortcut() && (
           <SettingsGroup title="Desktop app" testId="settings-group-desktop-app">
             <GlobalShortcutControl />
