@@ -3246,8 +3246,6 @@ class ClaudeSDKExecutor(Executor):
             options=options,
             model=model,
         )
-        transcript = self._clients[session_key].transcript
-        compaction_generation = transcript.generation
 
         # ── LLM_REQUEST policy evaluation ────────────────────────
         # If the executor adapter installed a ``_policy_evaluator``
@@ -3278,6 +3276,9 @@ class ClaudeSDKExecutor(Executor):
                 _deny_reason = _req_verdict.reason or "no reason given"
                 yield ExecutorError(message=f"LLM call denied by policy: {_deny_reason}")
                 return
+
+        transcript = self._clients[session_key].transcript
+        compaction_generation = transcript.generation
 
         notice_messages = messages
         if resume_session:
