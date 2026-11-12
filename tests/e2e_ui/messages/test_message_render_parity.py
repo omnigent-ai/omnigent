@@ -45,7 +45,7 @@ from tests.e2e_ui.conftest import (
     set_fallback_mock_llm,
 )
 
-_COMPOSER = "Send a message…"
+_COMPOSER_LABEL = "Message the agent"
 _USER = '[data-testid="message-bubble"][data-role="user"]'
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING = '[data-testid="working-indicator"]'
@@ -62,7 +62,7 @@ def _send(page: Page, text: str) -> None:
     :param page: The Playwright page, on the session's chat surface.
     :param text: The message body to send.
     """
-    composer = page.get_by_placeholder(_COMPOSER)
+    composer = page.get_by_role("textbox", name=_COMPOSER_LABEL)
     expect(composer).to_be_visible(timeout=30_000)
     composer.fill(text)
     page.get_by_role("button", name="Send", exact=True).click()
