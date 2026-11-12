@@ -123,6 +123,7 @@ logger = logging.getLogger(__name__)
 # producer (Databricks Unity Gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
+_CLAUDE_CODE_ENABLE_CLAUDEAI_MCP_ENV = "ENABLE_CLAUDEAI_MCP_SERVERS"
 # Claude Code floors a thinking budget at this size and requires max_tokens above it.
 _CLAUDE_CODE_MIN_THINKING_BUDGET_TOKENS = 1024
 
@@ -1605,12 +1606,17 @@ def _init_mcp_server_names(data: Mapping[str, object]) -> tuple[str, ...]:
 
 
 def _claude_settings_payload(
-    api_key_helper: str | None, model_overrides: dict[str, str]
+    api_key_helper: str | None,
+    model_overrides: dict[str, str],
+    *,
+    disable_claude_ai_connectors: bool = False,
 ) -> str | None:
     """Serialize the invocation-local settings Claude Code launches with.
 
     :param api_key_helper: The gateway ``apiKeyHelper`` command, or ``None``.
     :param model_overrides: Canonical-to-served model id rewrites.
+    :param disable_claude_ai_connectors: Stop the CLI from auto-fetching the
+        logged-in account's claude.ai MCP connectors.
     :returns: Compact JSON for ``ClaudeAgentOptions.settings``, or ``None``
         when there is nothing to configure.
     """
@@ -1619,6 +1625,8 @@ def _claude_settings_payload(
         settings["apiKeyHelper"] = api_key_helper
     if model_overrides:
         settings["modelOverrides"] = model_overrides
+    if disable_claude_ai_connectors:
+        settings["disableClaudeAiConnectors"] = True
     return json.dumps(settings, separators=(",", ":")) if settings else None
 
 
@@ -3506,13 +3514,29 @@ class ClaudeSDKExecutor(Executor):
         # for the canonical ids the CLI names itself (the refusal-fallback).
         # No-op off the gateway transport.
         model_overrides = await self._apply_gateway_model_vocabulary(env, api_key_helper)
+        # Translate the spec's host-skill filter into the SDK
+        # options. Falls back to ``"all"`` semantics when the
+        # field is malformed (the parser already validates, so
+        # this is belt-and-suspenders).
+        resolved = _resolve_skills_option(self._skills_filter) or _ResolvedSkills(
+            skills="all", setting_sources=None
+        )
+        # With no setting sources the CLI never reads a project's
+        # ``disableClaudeAiConnectors`` opt-out and would still auto-fetch the
+        # account's connectors; carry the opt-out in the launch settings.
+        hermetic = resolved.setting_sources == []
         from omnigent.mcp_disabled_servers import apply_claude_settings
 
         settings_payload = apply_claude_settings(
-            _claude_settings_payload(api_key_helper, model_overrides),
+            _claude_settings_payload(
+                api_key_helper, model_overrides, disable_claude_ai_connectors=hermetic
+            ),
             executor="claude-sdk",
             active_harnesses=self._mcp_active_harnesses,
         )
+        if hermetic:
+            # Claude Code builds older than that setting honor only this knob.
+            env[_CLAUDE_CODE_ENABLE_CLAUDEAI_MCP_ENV] = "false"
 
         # Capture stderr from the CLI subprocess for diagnostics
         stderr_lines: list[str] = []
@@ -3553,13 +3577,6 @@ class ClaudeSDKExecutor(Executor):
         # SDK's native Bash/Read/Edit/Write. Keep Skill and ToolSearch in
         # the base set so MCP definitions can be discovered on demand.
         base_tools: list[str] = self._base_tools(sdk)
-        # Translate the spec's host-skill filter into the SDK
-        # options. Falls back to ``"all"`` semantics when the
-        # field is malformed (the parser already validates, so
-        # this is belt-and-suspenders).
-        resolved = _resolve_skills_option(self._skills_filter) or _ResolvedSkills(
-            skills="all", setting_sources=None
-        )
         # Bundle skills are exposed via the SDK's plugin mechanism.
         # The bundle's ``<bundle>/skills/<dir>/SKILL.md`` files are
         # discovered as plugin skills (no ``.claude/`` prefix needed
