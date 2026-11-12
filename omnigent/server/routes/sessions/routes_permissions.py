@@ -123,9 +123,9 @@ def register_permissions_routes(
         await _require_access(
             user_id, session_id, LEVEL_MANAGE, permission_store, conversation_store
         )
-        # Server-wide sharing policy (see SharingMode). Applies only to *new*
-        # grants. Runs off the event loop: a RESTRICTED_READ_ONLY check reads the
-        # session's workspace from the store.
+        # Server-wide sharing policy (see SharingMode), for new grants only. Runs off
+        # the event loop in every mode: the mode callable can read a file, and
+        # RESTRICTED_READ_ONLY also loads the session's workspace from the store.
         await asyncio.to_thread(
             require_sharing_mode_allows_grant,
             request.app.state,

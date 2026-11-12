@@ -36,6 +36,10 @@ def require_sharing_mode_allows_grant(
     ``RESTRICTED_READ_ONLY`` refuses a home or root workspace, even for read; read-only
     modes refuse any level outside :data:`READ_ONLY_MODE_LEVELS`.
 
+    An unknown workspace (``None``) is allowed under ``RESTRICTED_READ_ONLY``, matching
+    the session share route. Callers that must fail closed without a workspace, such as
+    automation runs, check that themselves.
+
     :param state: ``app.state``, which carries the live policy callables.
     :param level: The level to grant, e.g. ``LEVEL_READ``.
     :param load_workspace: Returns the session's working directory, or ``None`` when
