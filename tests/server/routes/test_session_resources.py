@@ -9077,6 +9077,62 @@ def test_undelivered_input_content_is_bounded_and_well_formed(
     assert orchestration._undelivered_input_content({"input_content": [block]}) is None
     for malformed in (None, [], "hi", [block, "hi"], [{"type": "input_text", "text": object()}]):
         assert orchestration._undelivered_input_content({"input_content": malformed}) is None
+    # Non-ASCII text counts as UTF-8 bytes, as the request limit does, not escaped.
+    wide = [{"type": "input_text", "text": "\u6f22\u5b57" * 4}]
+    wide_bytes = len(json.dumps(wide, separators=(",", ":"), ensure_ascii=False).encode())
+    assert wide_bytes < len(json.dumps(wide, separators=(",", ":")).encode())
+    monkeypatch.setattr(orchestration, "MAX_SESSION_EVENT_REQUEST_BYTES", wide_bytes)
+    assert orchestration._undelivered_input_content({"input_content": wide}) == wide
+    monkeypatch.setattr(orchestration, "MAX_SESSION_EVENT_REQUEST_BYTES", wide_bytes - 1)
+    assert orchestration._undelivered_input_content({"input_content": wide}) is None
+
+
+@pytest.mark.asyncio
+async def test_relay_records_each_contentless_input_only_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two input-only failures with no recoverable message each keep their own error.
+
+    Neither the server's queued copy nor the runner's content survives, so no
+    user message separates them; the errors are keyed by their own response
+    ids, not their text, so the second is still stored and shown.
+    """
+    from omnigent.runner.app import _prompt_wait_expired_failure
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    failures = []
+    for stable_id in ("7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d", "8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e"):
+        failure = _prompt_wait_expired_failure(
+            {"type": "message", "content": [], "input_stable_id": stable_id}
+        )
+        assert "input_content" not in failure
+        failures.append(failure)
+    failure_ids = [failure["response"]["id"] for failure in failures]  # type: ignore[index]
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        session_stream, "publish", lambda _session_id, event: published.append(event)
+    )
+    store = _ConversationStore()
+    store.list_pending_inputs = lambda _conversation_id: []  # type: ignore[attr-defined]
+    client = _ScriptedStreamingRunnerClient(
+        [*[_sse_frame(failure) for failure in failures], "data: [DONE]\n\n"]
+    )
+    try:
+        await _relay_runner_stream(session_id, client, store)  # type: ignore[arg-type]
+
+        assert [(item.type, item.response_id) for item in store.appended_items] == [
+            ("error", failure_id) for failure_id in failure_ids
+        ]
+        assert [
+            event["item"]["response_id"]
+            for event in published
+            if event.get("type") == "response.output_item.done"
+        ] == failure_ids
+    finally:
+        pending_inputs.reset_for_tests()
 
 
 @pytest.mark.asyncio

@@ -451,7 +451,8 @@ def _prompt_wait_expired_failure(body: Mapping[str, Any]) -> _JsonObject:
     content = body.get("content")
     if isinstance(content, list) and content:
         try:
-            encoded = json.dumps(content, separators=(",", ":")).encode()
+            # UTF-8 bytes, as the server's request limit counts them.
+            encoded = json.dumps(content, separators=(",", ":"), ensure_ascii=False).encode()
         except (TypeError, ValueError):
             encoded = None
         if encoded is not None and len(encoded) <= MAX_SESSION_EVENT_REQUEST_BYTES:
@@ -478,6 +479,9 @@ _server_version: str | None = None
 _server_accepts_inferred_status = False
 # Whether the current server supports input-only settlement; cleared on reconnect.
 _server_accepts_input_only_failures = False
+# Queued on a session's event stream to make an open stream deliver its held
+# input-only reports; never sent.
+_INPUT_REPORTS_READY: dict[str, object] = {"type": "runner.input_reports_ready"}
 
 
 def _acknowledge_settings_rollback(response: Response) -> JSONResponse:
@@ -1722,6 +1726,16 @@ def create_runner_app(
     # Start and logged expiry of each human-wait episode (see ``_human_wait_holds``).
     _human_wait_since: dict[tuple[str, object], float] = {}
     _human_wait_expired: set[tuple[str, object]] = set()
+    # Input-only reports per session not yet handed to the stream of a server that
+    # accepts them. They hold the idle watchdog, as their messages did.
+    _undelivered_input_reports: dict[str, list[_JsonObject]] = {}
+
+    def _wake_input_report_delivery() -> None:
+        """Make each open session stream deliver its held input-only reports."""
+        for session_id in list(_undelivered_input_reports):
+            queue = _session_event_queues.get(session_id)
+            if queue is not None:
+                queue.put_nowait(_INPUT_REPORTS_READY)
 
     def _record_native_pane_status(
         session_id: str, status: str, blocked_on: object = None, *, inferred: object = False
@@ -1766,7 +1780,9 @@ def create_runner_app(
         memory, so letting it idle out would lose them silently. Each one becomes an
         input-only undelivered ``response.failed`` (see
         :func:`_prompt_wait_expired_failure`), which the server records with the
-        message, so the person sees it was not sent and can send it again.
+        message, so the person sees it was not sent and can send it again. The
+        reports stay with the runner, holding the watchdog, until a session
+        stream of a server that accepts them takes them.
         """
         if _claude_prompt_waiters.get(session_id) is not waiter or session_id in _active_turns:
             return
@@ -1780,8 +1796,11 @@ def create_runner_app(
             len(queued),
             extra={"session_id": session_id},
         )
-        for body in queued:
-            _publish_event(session_id, _prompt_wait_expired_failure(body))
+        if queued:
+            _undelivered_input_reports.setdefault(session_id, []).extend(
+                _prompt_wait_expired_failure(body) for body in queued
+            )
+            _wake_input_report_delivery()
 
     def _human_wait_holds(session_ids: set[str], approval_waits: dict[str, list[str]]) -> bool:
         """Whether a session parked on a human still holds the idle watchdog open.
@@ -1855,6 +1874,8 @@ def create_runner_app(
 
     def _has_active_work(*, include_pane_activity: bool = True) -> bool:
         if _active_turns:
+            return True
+        if _undelivered_input_reports:
             return True
         if _has_live_async_tasks(_session_async_tasks):
             return True
@@ -2724,6 +2745,8 @@ def create_runner_app(
         _server_version = envelope.server_version
         _server_accepts_inferred_status = envelope.accepts_inferred_status
         _server_accepts_input_only_failures = envelope.accepts_input_only_failures
+        if _server_accepts_input_only_failures:
+            _wake_input_report_delivery()
         snapshot = envelope.snapshot
         _session_snapshot_cache[session_id] = _SessionSnapshot(
             ok=True,
@@ -3866,6 +3889,7 @@ def create_runner_app(
             _server_accepts_inferred_status = True
         if accepts_input_only_failures:
             _server_accepts_input_only_failures = True
+            _wake_input_report_delivery()
 
         async def _event_generator() -> AsyncIterator[bytes]:
             queue = _session_event_queues.get(session_id)
@@ -3875,6 +3899,20 @@ def create_runner_app(
             heartbeat_frame = b'data: {"type": "session.heartbeat"}\n\n'
             yield heartbeat_frame
             while True:
+                # Held input-only reports go only to a server that accepts them; one
+                # that does not leaves them held (and the watchdog with them).
+                while _server_accepts_input_only_failures and (
+                    reports := _undelivered_input_reports.get(session_id)
+                ):
+                    report = reports[0]
+                    try:
+                        yield ("data: " + json.dumps(report) + "\n\n").encode("utf-8")
+                    except (GeneratorExit, asyncio.CancelledError):
+                        return
+                    if reports and reports[0] is report:
+                        reports.pop(0)
+                    if not reports:
+                        _undelivered_input_reports.pop(session_id, None)
                 try:
                     event = await asyncio.wait_for(
                         queue.get(), timeout=_SESSION_STREAM_HEARTBEAT_S
@@ -3884,6 +3922,8 @@ def create_runner_app(
                     continue
                 if event is None:
                     break
+                if event is _INPUT_REPORTS_READY:
+                    continue
                 # Drop inferred edges queued before a reconnect until the new server accepts them.
                 if event.get("inferred") is True and not _server_accepts_inferred_status:
                     continue
@@ -3987,6 +4027,7 @@ def create_runner_app(
         resource_registry.note_terminal_control_request(session_id, "delete_session")
         _cancel_claude_prompt_waiter(session_id)
         _session_message_buffers.pop(session_id, None)
+        _undelivered_input_reports.pop(session_id, None)
         # Stop initialization before it can recreate resources during teardown.
         init_tasks = [
             task

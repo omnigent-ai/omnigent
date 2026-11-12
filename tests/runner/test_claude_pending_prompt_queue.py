@@ -24,6 +24,7 @@ from omnigent.runner import create_runner_app
 from omnigent.runner._entry import _run_inactivity_monitor
 from omnigent.scheduled_context import SCHEDULED_RUN_HEADER
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests._helpers.polling import poll_until_async
 from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.conftest import (
     _FakeProcessManager,
@@ -77,6 +78,22 @@ async def _until(condition: Callable[[], bool]) -> None:
     async with asyncio.timeout(5):
         while not condition():
             await asyncio.sleep(0.01)
+
+
+async def _stream_failures(
+    client: Any, sid: str, *, accepts_input_only_failures: bool
+) -> list[dict[str, Any]]:
+    """Open the session stream as the server would and return the failures it sends."""
+    runner_app._session_event_queues_ref[sid].put_nowait(None)
+    params = {"accepts_input_only_failures": "true"} if accepts_input_only_failures else None
+    response = await client.get(f"/v1/sessions/{sid}/stream", params=params)
+    assert response.status_code == 200
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+    ]
+    return [event for event in events if event.get("type") == "response.failed"]
 
 
 @pytest.fixture(autouse=True)
@@ -499,16 +516,15 @@ async def test_unanswered_prompt_reports_queued_messages_then_releases_runner(
             )
         )
         try:
+            await poll_until_async(lambda: sid not in app.state.claude_prompt_waiters, timeout_s=5)
+            assert not app.state.session_message_buffers.get(sid)
+            # No server is reading the stream: the reports hold the runner.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(monitor), timeout=0.2)
+            assert shutdowns == []
+            failures = await _stream_failures(client, sid, accepts_input_only_failures=True)
             await asyncio.wait_for(monitor, timeout=5)
             assert shutdowns == ["shutdown"]
-            assert sid not in app.state.claude_prompt_waiters
-            assert not app.state.session_message_buffers.get(sid)
-            events = runner_app._session_event_queues_ref[sid]
-            failures = [
-                event
-                for event in (events.get_nowait() for _ in range(events.qsize()))
-                if isinstance(event, dict) and event.get("type") == "response.failed"
-            ]
             assert [
                 (
                     failure["pending_id"],
@@ -573,16 +589,6 @@ async def test_prompt_waiter_outlives_the_hold_until_the_server_takes_input_only
         for body in queued:
             buffered = await client.post(f"/v1/sessions/{sid}/events", json=body)
             assert buffered.json()["status"] == "buffered"
-        events = runner_app._session_event_queues_ref[sid]
-
-        def failures_sent() -> list[dict[str, Any]]:
-            drained = [events.get_nowait() for _ in range(events.qsize())]
-            return [
-                event
-                for event in drained
-                if isinstance(event, dict) and event.get("type") == "response.failed"
-            ]
-
         loop = asyncio.get_running_loop()
         shutdowns: list[str] = []
         monitor = asyncio.create_task(
@@ -601,17 +607,16 @@ async def test_prompt_waiter_outlives_the_hold_until_the_server_takes_input_only
             assert shutdowns == []
             assert sid in app.state.claude_prompt_waiters
             assert len(app.state.session_message_buffers[sid]) == 2
-            assert failures_sent() == []
+            assert await _stream_failures(client, sid, accepts_input_only_failures=False) == []
 
-            # The server reopens the session stream and advertises the capability.
-            events.put_nowait(None)
-            reopened = await client.get(
-                f"/v1/sessions/{sid}/stream", params={"accepts_input_only_failures": "true"}
-            )
-            assert reopened.status_code == 200
+            # The server reopens the session stream and advertises the capability; the
+            # expiry goes ahead and the next stream it opens takes the reports.
+            assert await _stream_failures(client, sid, accepts_input_only_failures=True) == []
+            await poll_until_async(lambda: sid not in app.state.claude_prompt_waiters, timeout_s=5)
+            failures = await _stream_failures(client, sid, accepts_input_only_failures=True)
             await asyncio.wait_for(monitor, timeout=5)
             assert shutdowns == ["shutdown"]
-            assert [failure["pending_id"] for failure in failures_sent()] == [
+            assert [failure["pending_id"] for failure in failures] == [
                 body["pending_id"] for body in queued
             ]
         finally:
@@ -636,6 +641,16 @@ def test_prompt_wait_expired_failure_carries_content_only_within_the_limit(
     assert runner_app._prompt_wait_expired_failure(body)["input_content"] == content
     monkeypatch.setattr(runner_app, "MAX_SESSION_EVENT_REQUEST_BYTES", encoded_bytes - 1)
     assert "input_content" not in runner_app._prompt_wait_expired_failure(body)
+    # Non-ASCII text counts as UTF-8 bytes, as the server's request limit does,
+    # not as its longer escaped form.
+    wide = [{"type": "input_text", "text": "\u6f22\u5b57" * 4}]
+    wide_bytes = len(json.dumps(wide, separators=(",", ":"), ensure_ascii=False).encode())
+    assert wide_bytes < len(json.dumps(wide, separators=(",", ":")).encode())
+    monkeypatch.setattr(runner_app, "MAX_SESSION_EVENT_REQUEST_BYTES", wide_bytes)
+    wide_body = {**body, "content": wide}
+    assert runner_app._prompt_wait_expired_failure(wide_body)["input_content"] == wide
+    monkeypatch.setattr(runner_app, "MAX_SESSION_EVENT_REQUEST_BYTES", wide_bytes - 1)
+    assert "input_content" not in runner_app._prompt_wait_expired_failure(wide_body)
     for malformed in ("hi", [], [{"type": "input_text", "text": object()}]):
         failure = runner_app._prompt_wait_expired_failure({**body, "content": malformed})
         assert "input_content" not in failure

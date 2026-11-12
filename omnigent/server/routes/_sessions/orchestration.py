@@ -3592,7 +3592,8 @@ def _undelivered_input_content(event: Mapping[str, Any]) -> list[dict[str, Any]]
     if not isinstance(raw, list) or not raw or not all(isinstance(b, dict) for b in raw):
         return None
     try:
-        encoded = json.dumps(raw, separators=(",", ":")).encode()
+        # UTF-8 bytes, as the session event request limit counts them.
+        encoded = json.dumps(raw, separators=(",", ":"), ensure_ascii=False).encode()
     except (TypeError, ValueError):
         return None
     if len(encoded) > MAX_SESSION_EVENT_REQUEST_BYTES:
@@ -3635,15 +3636,28 @@ async def _settle_input_only_failure(
         fallback_content=_undelivered_input_content(event),
     )
     error_item = _error_item_from_sse(event, response_id=response_id)
-    if error_item is not None:
-        await _relay_persist_error_once(
-            conversation_store,
+    if error_item is None or conversation_store is None:
+        return
+    # Keyed by the failure's own response, so a relay retry appends nothing twice
+    # while a second input with the same error text is still recorded and shown.
+    error_item = error_item.model_copy(
+        update={
+            "stable_id": uuid.uuid5(
+                uuid.NAMESPACE_URL, f"omnigent-input-only-error:{session_id}:{response_id}"
+            ).hex
+        }
+    )
+    try:
+        persisted = await asyncio.to_thread(conversation_store.append, session_id, [error_item])
+    except Exception:  # noqa: BLE001 — the input's message, if any, is already recorded
+        _logger.exception(
+            "Relay: could not persist an input-only failure for session=%s",
             session_id,
-            error_item,
-            on_persisted=lambda persisted: _publish_external_conversation_item(
-                session_id, persisted
-            ),
+            extra={"session_id": session_id},
         )
+        return
+    if not persisted[0].deduplicated:
+        _publish_external_conversation_item(session_id, persisted[0])
 
 
 _NATIVE_INPUT_LIFECYCLE_STAGES: dict[str, pending_inputs.NativeInputDeliveryStage] = {

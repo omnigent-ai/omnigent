@@ -29,6 +29,7 @@ from omnigent.runner.app import (
     register_timer,
     unregister_timer,
 )
+from tests._helpers.polling import poll_until_async
 from tests.runner.helpers import NullServerClient
 
 _HUMAN_WAIT_HOLD_ENV = "OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S"
@@ -1115,7 +1116,9 @@ async def test_input_only_failure_support_is_scoped_to_the_server_connection(
     """Only a server whose init envelope advertises it gets input-only failures.
 
     An older server's envelope lacks the field, and a reconnect forgets it until
-    the new server says so again.
+    the new server says so again. A report queued for a capable server before
+    a reconnect to an older one is held, keeping the runner up, until a capable
+    server's stream takes it once.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
@@ -1143,6 +1146,20 @@ async def test_input_only_failure_support_is_scoped_to_the_server_connection(
             envelope.pop("accepts_input_only_failures")
         return payload
 
+    async def streamed_failures(session_id: str, *, capable: bool) -> list[dict[str, Any]]:
+        runner_app._session_event_queues_ref[session_id].put_nowait(None)
+        params = {"accepts_input_only_failures": "true"} if capable else None
+        response = await client.get(f"/v1/sessions/{session_id}/stream", params=params)
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        return [event for event in events if event.get("type") == "response.failed"]
+
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "60")
+    clock = _AdvanceableClock()
+    monkeypatch.setattr(runner_app, "time", clock)
     monkeypatch.setattr(runner_app, "_server_accepts_input_only_failures", False)
     app = await _native_app_with_session("conv_input_only_new_server")
     async with _runner_client(app) as client:
@@ -1156,8 +1173,39 @@ async def test_input_only_failure_support_is_scoped_to_the_server_connection(
         )
         assert created.status_code == 201, created.text
         assert runner_app._server_accepts_input_only_failures is True
+
+        # A message queued behind an unanswered prompt expires for the capable
+        # server while no stream is reading.
+        sid = "conv_input_only_new_server"
+        pending_id = f"pending_{'a' * 32}"
+        waiter = asyncio.create_task(asyncio.sleep(3600))
+        app.state.claude_prompt_waiters[sid] = waiter
+        app.state.session_message_buffers[sid] = [
+            {
+                "type": "message",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "pending_id": pending_id,
+            }
+        ]
+        assert app.state.has_active_work() is True
+        clock.advance(61)
+        assert app.state.has_active_work() is True
+        await poll_until_async(lambda: sid not in app.state.claude_prompt_waiters, timeout_s=5)
+        with contextlib.suppress(asyncio.CancelledError):
+            await waiter
+
+        # The runner reconnects to an older server: the report is held, not sent.
         await app.state.catch_up_scan()
         assert runner_app._server_accepts_input_only_failures is False
+        assert await streamed_failures(sid, capable=False) == []
+        assert app.state.has_active_work() is True
+
+        # A capable server's stream takes it, once, and the runner can idle.
+        assert [f["pending_id"] for f in await streamed_failures(sid, capable=True)] == [
+            pending_id
+        ]
+        assert await streamed_failures(sid, capable=True) == []
+        assert app.state.has_active_work() is False
 
 
 @pytest.mark.asyncio
