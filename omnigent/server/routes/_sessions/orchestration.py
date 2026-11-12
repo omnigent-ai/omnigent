@@ -7198,8 +7198,18 @@ async def _report_runner_turn_completed(
     """
     if not session_triggers.enabled():
         return
-    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-    if conv is None or is_native_harness(await asyncio.to_thread(_native_pane_harness, conv)):
+    try:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or is_native_harness(await asyncio.to_thread(_native_pane_harness, conv)):
+            return
+    except Exception:  # noqa: BLE001 — a read error must not kill the relay
+        # An automation hearing of the turn is optional; the relay must keep streaming.
+        _logger.warning(
+            "Could not report a finished turn of session=%s to session triggers",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
         return
     raw_id = response.get("id") if isinstance(response, dict) else None
     response_id = raw_id if isinstance(raw_id, str) and raw_id else None

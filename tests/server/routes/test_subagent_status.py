@@ -836,3 +836,32 @@ async def test_a_runner_driven_turn_reports_its_completion_once(
         route.store,
     )
     assert route.completed_turns(route.parent_id) == ["resp_sdk"]
+
+
+async def test_a_failed_turn_report_does_not_stop_the_relay(
+    status_route: _StatusRoute, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    def unavailable(*_args: Any, **_kwargs: Any) -> str:
+        raise RuntimeError("agent store unavailable")
+
+    route = status_route
+    monkeypatch.setattr(orchestration, "_native_pane_harness", unavailable)
+    release = asyncio.Event()
+    release.set()
+    await orchestration._relay_runner_stream_once(
+        route.parent_id,
+        _ScriptedRunnerClient(
+            release,
+            [
+                {"type": "response.in_progress", "response": {"id": "resp_sdk"}},
+                {"type": "response.completed", "response": {"id": "resp_sdk"}},
+                {"type": "session.status", "status": "idle"},
+            ],
+        ),
+        route.store,
+    )
+    assert route.completed_turns(route.parent_id) == []
+    # The events after the completion were still relayed.
+    assert common._session_status_cache[route.parent_id] == "idle"

@@ -324,7 +324,9 @@ the server's own session events: `session.created`, `session.renamed`,
 ```
 
 - The server queues each event where it happens; one background worker matches
-  it and records runs, so the request path does no extra database work. A run
+  it and records runs, so matching and recording happen off the request path
+  (only resolving a native session's harness and, for a deletion, who may hear
+  of it are read there). A run
   survives a replica restart once it is recorded; an event still queued when
   the replica stops is lost. A turn the runner drives ends at its
   `response.completed`. A native turn ends when its forwarder reports it
