@@ -876,6 +876,33 @@ def _hold_restart_attach_check(
     return checking, release
 
 
+def _note_line_waits(monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
+    """Return an event set once something starts waiting for its turn in a session's line."""
+    waiting = asyncio.Event()
+    condition_wait = asyncio.Condition.wait
+
+    async def _noted_wait(self: asyncio.Condition) -> bool:
+        waiting.set()
+        return await condition_wait(self)
+
+    monkeypatch.setattr(asyncio.Condition, "wait", _noted_wait)
+    return waiting
+
+
+def _note_launch_lock_waits(app: Any, conv_id: str) -> asyncio.Event:
+    """Return an event set once a caller waits on the session's Claude launch lock."""
+    waiting = asyncio.Event()
+
+    class _NotedLock(asyncio.Lock):
+        async def acquire(self) -> bool:
+            if self.locked():
+                waiting.set()
+            return await super().acquire()
+
+    app.state.native_terminal_ensure_locks["claude"][conv_id] = _NotedLock()
+    return waiting
+
+
 class _PaneAtDeliveryHarnessClient(_ScriptedHarnessClient):
     """Record the session's Claude pane at the moment each turn is forwarded."""
 
@@ -1021,6 +1048,58 @@ async def test_a_cli_launched_pane_keeps_the_sign_in_state_it_started_with(
         assert (
             await client.post(f"/v1/sessions/{conv_id}/resources/terminals", json=launch)
         ).is_success
+        status = await client.get(f"/v1/sessions/{conv_id}/live-mcp-servers")
+
+    assert [server["name"] for server in status.json()["servers"]] == ["linear"], status.text
+
+
+@pytest.mark.asyncio
+async def test_an_overlapping_cli_launch_keeps_the_starting_launch_sign_in_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A second ``omnigent claude`` attach sent while the pane starts keeps the first's record."""
+    conv_id = "b6b2c3d4e5f60718293a4b5c6d7e8f90"
+    statuses = _claude_sign_in_state(monkeypatch)
+    statuses["linear"] = "sign_in_required"
+    app, registry = await _open_claude_native_session(
+        monkeypatch, conv_id=conv_id, auto_create_calls=[]
+    )
+    resources = app.state.session_resource_registry
+    second_on_lock = _note_launch_lock_waits(app, conv_id)
+    starting, release, second_launching = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    started: asyncio.Future[None] | None = None
+
+    async def _launch_cli_pane(**kwargs: Any) -> SessionResourceView:
+        # Like the registry: the first launch starts the pane, an overlapping one gets it.
+        nonlocal started
+        if started is None:
+            started = asyncio.get_running_loop().create_future()
+            starting.set()
+            await release.wait()
+            _plant_live_claude_native_pane(app, registry, conv_id, tmp_path)
+            started.set_result(None)
+        else:
+            second_launching.set()
+            await started
+        return SessionResourceView(
+            id="terminal_claude_main", type="terminal", session_id=conv_id, name="claude"
+        )
+
+    monkeypatch.setattr(resources, "launch_required_terminal", _launch_cli_pane)
+    launch = {"terminal": "claude", "session_key": "main", "bridge_inject_dir": True}
+    url = f"/v1/sessions/{conv_id}/resources/terminals"
+
+    async with _runner_client(app) as client:
+        first = asyncio.create_task(client.post(url, json=launch))
+        await asyncio.wait_for(starting.wait(), timeout=5)
+        # Sign-in finishes while the first pane starts; the second launch overlaps it.
+        statuses["linear"] = "connected"
+        second = asyncio.create_task(client.post(url, json=launch))
+        await poll_until_async(
+            lambda: second_on_lock.is_set() or second_launching.is_set(), timeout_s=5
+        )
+        release.set()
+        assert (await first).is_success and (await second).is_success
         status = await client.get(f"/v1/sessions/{conv_id}/live-mcp-servers")
 
     assert [server["name"] for server in status.json()["servers"]] == ["linear"], status.text
@@ -1275,9 +1354,9 @@ async def test_a_message_waits_for_a_reconnect_and_reaches_the_relaunched_pane(
             )
         )
         await poll_until_async(checking.is_set, timeout_s=5)
+        in_line = _note_line_waits(monkeypatch)
         message = asyncio.create_task(client.post(f"/v1/sessions/{conv_id}/events", json=_MESSAGE))
-        for _ in range(50):  # Give the message every chance to jump the line.
-            await asyncio.sleep(0)  # custom-lint: disable=sleep-then-assert -- let it run
+        await asyncio.wait_for(in_line.wait(), timeout=5)
         assert harness.posted_bodies == [], "the message reached the pane being replaced"
         release.set()
         assert (await reconnect).status_code == 200
@@ -1309,9 +1388,9 @@ async def test_a_message_queued_behind_a_reconnect_is_answered_when_the_session_
             )
         )
         await poll_until_async(checking.is_set, timeout_s=5)
+        in_line = _note_line_waits(monkeypatch)
         message = asyncio.create_task(client.post(f"/v1/sessions/{conv_id}/events", json=_MESSAGE))
-        for _ in range(20):  # Let the message take its place in line.
-            await asyncio.sleep(0)  # custom-lint: disable=sleep-then-assert -- let it queue
+        await asyncio.wait_for(in_line.wait(), timeout=5)
         deleted = await client.delete(f"/v1/sessions/{conv_id}")
         assert deleted.status_code < 300, deleted.text
         answered = await asyncio.wait_for(message, timeout=5)
@@ -1378,15 +1457,7 @@ async def test_a_queued_drain_behind_a_reconnect_starts_no_turn_once_the_session
             )
         )
         await poll_until_async(checking.is_set, timeout_s=5)
-        # Note when the drain starts waiting for its turn behind Reconnect.
-        parked = asyncio.Event()
-        condition_wait = asyncio.Condition.wait
-
-        async def _noted_wait(self: asyncio.Condition) -> bool:
-            parked.set()
-            return await condition_wait(self)
-
-        monkeypatch.setattr(asyncio.Condition, "wait", _noted_wait)
+        parked = _note_line_waits(monkeypatch)
         drain = asyncio.create_task(app.state.check_and_start_next_turn(conv_id))
         await asyncio.wait_for(parked.wait(), timeout=5)
         deleted = await client.delete(f"/v1/sessions/{conv_id}")
@@ -1628,6 +1699,7 @@ async def test_a_cancelled_ensure_keeps_the_running_launch_sign_in_record(
     # linear makes the pane eligible; notion still needs sign-in as the relaunch starts.
     statuses.update({"linear": "connected", "notion": "sign_in_required"})
     ensure = {"terminal": "claude", "session_key": "main", "ensure_native_terminal": True}
+    on_lock = _note_launch_lock_waits(app, conv_id)
 
     async with _runner_client(app) as client:
         reconnect = asyncio.create_task(
@@ -1639,9 +1711,7 @@ async def test_a_cancelled_ensure_keeps_the_running_launch_sign_in_record(
         waiting = asyncio.create_task(
             client.post(f"/v1/sessions/{conv_id}/resources/terminals", json=ensure)
         )
-        await asyncio.sleep(
-            0.3
-        )  # custom-lint: disable=sleep-then-assert -- let it wait on the lock
+        await asyncio.wait_for(on_lock.wait(), timeout=5)
         waiting.cancel()
         with pytest.raises(asyncio.CancelledError):
             await waiting
@@ -1671,15 +1741,7 @@ async def test_a_cancelled_reconnect_does_not_hold_up_later_messages(
     async with _runner_client(app) as client:
         first = asyncio.create_task(client.post(url, json={"name": "linear"}))
         await poll_until_async(lambda: relaunched == [conv_id], timeout_s=5)
-        # Note when the second starts waiting for its turn in the session's line.
-        waiting = asyncio.Event()
-        condition_wait = asyncio.Condition.wait
-
-        async def _noted_wait(self: asyncio.Condition) -> bool:
-            waiting.set()
-            return await condition_wait(self)
-
-        monkeypatch.setattr(asyncio.Condition, "wait", _noted_wait)
+        waiting = _note_line_waits(monkeypatch)
         second = asyncio.create_task(client.post(url, json={"name": "linear"}))
         await asyncio.wait_for(waiting.wait(), timeout=5)
         second.cancel()
