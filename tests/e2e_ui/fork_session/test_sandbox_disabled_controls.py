@@ -1,7 +1,7 @@
 """Sandbox sessions fork to any destination, and switching their host stays disabled.
 
 The local server and transcript are real; only the managed source metadata is
-patched because the isolated test environment has no Databricks sandbox providers.
+patched because the isolated test environment has no managed sandbox providers.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ def _patch_sandbox(page: Page, session_id: str, provider: str) -> None:
             *body.get("hosts", []),
             {
                 "host_id": "host_sandbox",
-                "name": "Databricks Sandbox" if provider == "lakebox" else "Arclet",
+                "name": f"{provider.title()} Sandbox",
                 "owner": "local",
                 "status": "online",
                 "sandbox_provider": provider,
@@ -110,7 +110,7 @@ def _close_menu(page: Page) -> None:
 
 
 @pytest.mark.parametrize(
-    "sandbox_provider", ["arclet", "lakebox"], ids=["arclet", "databricks-sandbox"]
+    "sandbox_provider", ["example", "kubernetes"], ids=["example", "kubernetes"]
 )
 @pytest.mark.parametrize("viewport_width", [1280, 390], ids=["desktop", "mobile"])
 def test_sandbox_fork_enabled_and_switch_host_disabled(
@@ -177,25 +177,25 @@ def test_sandbox_fork_enabled_and_switch_host_disabled(
     assert writes == []
 
 
-def _offer_arclet_sandboxes(page: Page) -> None:
+def _offer_example_sandboxes(page: Page) -> None:
     def info(route: Route) -> None:
         response = fetch_with_retry(route)
         body = response.json()
         body["managed_sandboxes_enabled"] = True
-        body["sandbox_provider"] = "arclet"
-        body["sandbox_providers"] = ["arclet"]
+        body["sandbox_provider"] = "example"
+        body["sandbox_providers"] = ["example"]
         route.fulfill(response=response, body=json.dumps(body))
 
     page.route("**/v1/info", info)
 
 
-def test_arclet_session_forks_onto_connected_hosts_and_a_new_arclet(
+def test_sandbox_session_forks_onto_connected_hosts_and_a_new_sandbox(
     page: Page,
     seeded_session: tuple[str, str],
     mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
-    """Fork entry points are enabled, and the dialog offers connected hosts beside a new Arclet."""
+    """Fork controls offer connected hosts beside a fresh sandbox."""
     del mock_llm_server_url
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
@@ -204,8 +204,8 @@ def test_arclet_session_forks_onto_connected_hosts_and_a_new_arclet(
     assistant = page.locator(_ASSISTANT)
     expect(assistant).to_have_count(1, timeout=60_000)
 
-    _patch_sandbox(page, session_id, "arclet")
-    _offer_arclet_sandboxes(page)
+    _patch_sandbox(page, session_id, "example")
+    _offer_example_sandboxes(page)
     fork_bodies: list[dict[str, Any]] = []
 
     def handle_fork(route: Route) -> None:
@@ -240,12 +240,12 @@ def test_arclet_session_forks_onto_connected_hosts_and_a_new_arclet(
     expect(page.get_by_test_id("fork-session-unavailable")).to_have_count(0)
     host_select = page.get_by_test_id("fork-session-host-select")
     # A fork of a sandbox session defaults to a fresh sandbox from its provider.
-    expect(host_select).to_contain_text("Arclet Sandbox")
+    expect(host_select).to_contain_text("Example Sandbox")
     host_select.click()
     expect(page.get_by_test_id("fork-session-host-option-host_laptop")).to_be_visible()
     sandbox_row = page.get_by_test_id("fork-session-sandbox-option")
-    expect(sandbox_row).to_have_text("Arclet Sandbox")
-    page.screenshot(path=str(tmp_path / "arclet-fork-target.png"))
+    expect(sandbox_row).to_have_text("Example Sandbox")
+    page.screenshot(path=str(tmp_path / "example-fork-target.png"))
     sandbox_row.click()
     page.get_by_test_id("fork-session-submit").click()
 
@@ -255,5 +255,5 @@ def test_arclet_session_forks_onto_connected_hosts_and_a_new_arclet(
     expect(dialog).not_to_be_visible()
     assert len(fork_bodies) == 1, fork_bodies
     assert fork_bodies[0]["host_type"] == "managed", fork_bodies[0]
-    assert fork_bodies[0]["sandbox_provider"] == "arclet", fork_bodies[0]
+    assert fork_bodies[0]["sandbox_provider"] == "example", fork_bodies[0]
     assert fork_bodies[0]["workspaces"] == [], fork_bodies[0]

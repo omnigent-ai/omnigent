@@ -126,8 +126,8 @@ describe("RunnerStartingIndicator", () => {
         sandboxStatus: {
           stage: "action_required",
           error: null,
-          provider: "arclet",
-          details: "Refresh your dbcert on your laptop.",
+          provider: "example",
+          details: "Refresh your provider credentials.",
         },
       });
       renderWithContext(variant, makeCtx({ isTerminalFirst: false, terminalStartingUp: false }));

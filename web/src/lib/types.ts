@@ -603,7 +603,7 @@ export interface SandboxStatus {
   stage: SandboxLaunchStage;
   /** Failure detail when `stage === "failed"`; `null` otherwise. */
   error?: string | null;
-  /** Sandbox provider being launched, e.g. `"arclet"`; absent from older servers. */
+  /** Sandbox provider being launched, e.g. `"kubernetes"`; absent from older servers. */
   provider?: string | null;
   /** What the user needs to do when `stage === "action_required"`; `null` otherwise. */
   details?: string | null;

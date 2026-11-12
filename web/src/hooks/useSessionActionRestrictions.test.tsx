@@ -88,8 +88,8 @@ describe("useSessionActionRestrictions", () => {
   });
 
   it.each([
-    ["arclet", {}],
-    ["arclet", { "omnigent.host_type": "managed" }],
+    ["example", {}],
+    ["example", { "omnigent.host_type": "managed" }],
     ["lakebox", {}],
     ["lakebox", { "omnigent.host_type": "managed" }],
   ])("forks a %s source with labels %j to every destination", async (provider, labels) => {
@@ -140,7 +140,7 @@ describe("useSessionActionRestrictions", () => {
       }),
     );
 
-    act(() => resolveHosts(hostsResponse("arclet")));
+    act(() => resolveHosts(hostsResponse("example")));
 
     await waitFor(() => expect(result.current).toEqual(switchOnly));
   });

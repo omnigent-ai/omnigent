@@ -23,8 +23,8 @@ session is patched into the ``host_asleep`` shape via route interception:
 - ``WS /v1/sessions/updates`` → blocked so a stream push can't re-add the
   session to the sidebar or revert its liveness to the real (online) values.
 
-- ``GET /v1/hosts`` → adds an Arclet sandbox host record so the chip reads
-  "Arclet Sandbox".
+- ``GET /v1/hosts`` → adds an Example sandbox host record so the chip reads
+  "Example Sandbox".
 
 The same view also offers **Reconnect host**, which asks the real server to
 wake the host with a ``retry_session`` event instead of sending a message.
@@ -52,10 +52,10 @@ _COMPOSER_PLACEHOLDER = "Send a message…"
 _FAKE_HOST_ID = "host_test_managed"
 _FAKE_HOST = {
     "host_id": _FAKE_HOST_ID,
-    "name": "omnigent-arclet-1234",
+    "name": "omnigent-example-1234",
     "owner": "local",
     "status": "offline",
-    "sandbox_provider": "arclet",
+    "sandbox_provider": "example",
 }
 # Unix seconds well before now so the session is outside the startup grace
 # (STARTING_GRACE_S) — see useSessionLiveness row 2.
@@ -81,7 +81,7 @@ def _force_host_asleep(
         on every poll, so a test can bring the host online mid-journey.
         Defaults to always offline.
     :param sandbox_status: Wake stage to report in the snapshot, e.g.
-        ``{"stage": "provisioning", "provider": "arclet", "error": None}``.
+        ``{"stage": "provisioning", "provider": "example", "error": None}``.
     """
     liveness = host_online if host_online is not None else {"online": False}
 
@@ -334,11 +334,11 @@ def test_failed_wake_restores_dot_and_reports_error(
         status=502,
         content_type="application/json",
         body=json.dumps(
-            {"error": {"code": "runner_unavailable", "message": "Arclet sandbox didn't start."}}
+            {"error": {"code": "runner_unavailable", "message": "Example sandbox didn't start."}}
         ),
     )
     expect(
-        page.get_by_text("Couldn't reconnect the sandbox: Arclet sandbox didn't start.")
+        page.get_by_text("Couldn't reconnect the sandbox: Example sandbox didn't start.")
     ).to_be_visible(timeout=15_000)
     _expect_host_status(page, "offline", tooltip="Asleep — wakes on next message")
     # The failed wake isn't retried on its own; Reconnect host sends a new one.
@@ -371,7 +371,7 @@ def test_session_opened_mid_wake_spins_dot_through_server_stage(
         page,
         session_id,
         host_online=host_online,
-        sandbox_status={"stage": "provisioning", "provider": "arclet", "error": None},
+        sandbox_status={"stage": "provisioning", "provider": "example", "error": None},
     )
 
     page.goto(f"{base_url}/c/{session_id}")
@@ -395,7 +395,7 @@ def test_wake_stuck_on_stage_brings_reconnect_host_back(
     """A wake stuck on launch progress lets Reconnect host return, with no toast.
 
     The server keeps reporting ``provisioning`` and never answers the wake, as
-    when an Arclet box never dials in. The page clock jumps past the wake's
+    when an example sandbox never dials in. The page clock jumps past the wake's
     stage limit instead of waiting it out.
 
     :param request: Supplies the recorded ``page`` after server setup.
@@ -408,7 +408,7 @@ def test_wake_stuck_on_stage_brings_reconnect_host_back(
     _force_host_asleep(
         page,
         session_id,
-        sandbox_status={"stage": "provisioning", "provider": "arclet", "error": None},
+        sandbox_status={"stage": "provisioning", "provider": "example", "error": None},
     )
     held = _hold_wake_requests(page, session_id)
     toasts = page.locator("[data-sonner-toast]")

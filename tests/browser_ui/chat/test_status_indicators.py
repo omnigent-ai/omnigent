@@ -364,17 +364,17 @@ def test_action_banner_follows_the_launch(
         workspace=None,
         sandbox_status={
             "stage": "action_required",
-            "provider": "arclet",
-            "details": "Refresh your dbcert on your laptop.",
+            "provider": "example",
+            "details": "Refresh your provider credentials.",
         },
     )
     page.goto(chat.url)
     chat.wait_for_stream()
-    banner = page.get_by_role("status").filter(has_text="Refresh your dbcert on your laptop.")
+    banner = page.get_by_role("status").filter(has_text="Refresh your provider credentials.")
     expect(banner).to_be_visible(timeout=20_000)
 
     # The credential arrives. Like the server, update the snapshot as well as the stream.
-    chat.update_session(sandbox_status={"stage": "provisioning", "provider": "arclet"})
+    chat.update_session(sandbox_status={"stage": "provisioning", "provider": "example"})
     chat.emit(
         {
             "event": "session.sandbox_status",
@@ -382,7 +382,7 @@ def test_action_banner_follows_the_launch(
                 "type": "session.sandbox_status",
                 "conversation_id": chat.session_id,
                 "stage": "provisioning",
-                "provider": "arclet",
+                "provider": "example",
             },
         }
     )
@@ -405,7 +405,7 @@ def test_sandbox_failure_stays_in_transcript_above_composer(
     chat.update_session(
         host_id=None,
         workspace=None,
-        sandbox_status={"stage": "provisioning", "provider": "arclet"},
+        sandbox_status={"stage": "provisioning", "provider": "example"},
     )
     page.goto(chat.url)
     chat.wait_for_stream()
@@ -413,7 +413,7 @@ def test_sandbox_failure_stays_in_transcript_above_composer(
 
     # A queued turn can still be marked running when sandbox startup fails.
     chat.emit_busy("launching-turn")
-    status = {"stage": "failed", "provider": "arclet", "error": "Sandbox allocation failed."}
+    status = {"stage": "failed", "provider": "example", "error": "Sandbox allocation failed."}
     chat.update_session(sandbox_status=status)
     chat.emit(
         {

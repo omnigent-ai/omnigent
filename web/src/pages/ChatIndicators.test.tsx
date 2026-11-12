@@ -100,7 +100,7 @@ describe("McpStartupIndicator lifecycle", () => {
 });
 
 describe("SandboxActionBanner", () => {
-  const DETAILS = "Refresh your dbcert on your laptop.";
+  const DETAILS = "Refresh your provider credentials.";
 
   /** Put *id* on screen, seeded with *sandboxStatus* when given. */
   function showSession(id: string, sandboxStatus?: SandboxStatus | null) {
@@ -118,7 +118,7 @@ describe("SandboxActionBanner", () => {
           conversationId: id,
           stage,
           error: null,
-          provider: "arclet",
+          provider: "example",
           details: stage === "action_required" ? DETAILS : null,
         },
         id,

@@ -248,7 +248,7 @@ describe("SwitchHostDialog", () => {
 
   it.each([
     ["managed snapshot", null],
-    ["Arclet host", "arclet"],
+    ["Example host", "example"],
     ["Databricks Sandbox host", "lakebox"],
   ])("blocks a directly opened %s dialog before releasing its runner", async (source, provider) => {
     vi.mocked(useSession).mockReturnValue({

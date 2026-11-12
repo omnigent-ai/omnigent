@@ -4920,13 +4920,13 @@ describe("AppShell clone/fork action", () => {
     expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
   });
 
-  it("offers directory recovery for an Arclet session onto a connected host", () => {
-    mockConversations([{ id: "conv_arclet", permission_level: 4 }]);
+  it("offers directory recovery for an Example session onto a connected host", () => {
+    mockConversations([{ id: "conv_example", permission_level: 4 }]);
     useSessionMock.mockReturnValue({
       session: sessionSnapshot({
-        id: "conv_arclet",
+        id: "conv_example",
         workspace: "/missing/repo",
-        hostId: "host_arclet",
+        hostId: "host_example",
         labels: { "omnigent.host_type": "managed" },
       }),
       isLoading: false,
@@ -4934,11 +4934,11 @@ describe("AppShell clone/fork action", () => {
     });
     const hosts = [
       {
-        host_id: "host_arclet",
-        name: "Arclet",
+        host_id: "host_example",
+        name: "Example",
         owner: "owner",
         status: "online",
-        sandbox_provider: "arclet",
+        sandbox_provider: "example",
       },
       { host_id: "host_laptop", name: "Laptop", owner: "owner", status: "online" },
     ];
@@ -4953,8 +4953,8 @@ describe("AppShell clone/fork action", () => {
     render(
       sessionShellTree(
         client,
-        "/c/conv_arclet",
-        <ConversationScopeContext.Provider value="conv_arclet">
+        "/c/conv_example",
+        <ConversationScopeContext.Provider value="conv_example">
           <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
         </ConversationScopeContext.Provider>,
       ),
@@ -4970,7 +4970,7 @@ describe("AppShell clone/fork action", () => {
     fireEvent.click(hostSelect);
     // Recovery continues in an existing directory, so it offers connected hosts only.
     expect(screen.getByTestId("fork-session-host-option-host_laptop")).toBeInTheDocument();
-    expect(screen.queryByTestId("fork-session-host-option-host_arclet")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-host-option-host_example")).not.toBeInTheDocument();
     expect(screen.queryByTestId("fork-session-sandbox-option")).not.toBeInTheDocument();
     expect(forkSessionMock).not.toHaveBeenCalled();
   });
