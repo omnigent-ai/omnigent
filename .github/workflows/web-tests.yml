@@ -128,7 +128,7 @@ jobs:
           pnpm --dir examples/extensions/hello-page/web run build
           pnpm --dir web/electron run typecheck
           pnpm --dir web/electron run build:app
-          node --test web/electron/test/*.test.js
+          node --test web/electron/test/*.test.js web/electron/test/*.test.ts
 
       - name: Check formatting
         run: pnpm --filter web run format:check

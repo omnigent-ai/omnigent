@@ -506,6 +506,9 @@ importers:
         specifier: ^4.3.2
         version: 4.3.2
     devDependencies:
+      '@types/node':
+        specifier: ^24.12.2
+        version: 24.19.1
       electron:
         specifier: ^45.2.1
         version: 45.2.1(supports-color@10.2.2)

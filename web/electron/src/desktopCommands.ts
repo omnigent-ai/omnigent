@@ -1,5 +1,3 @@
-"use strict";
-
 // Native menu commands the SPA performs (see web/src/lib/desktopCommands.ts).
 // The menu owns their accelerators so they fire even while an embedded browser
 // view has focus, where the SPA's own key listeners never see the keystroke.
@@ -8,7 +6,7 @@
 // Close falls back to closing the window, and Quit quits without asking.
 
 /** Commands the SPA can report and receive. */
-const DESKTOP_COMMANDS = Object.freeze([
+export const DESKTOP_COMMANDS = Object.freeze([
   "close",
   "new-terminal",
   "new-browser-tab",
@@ -23,29 +21,40 @@ const DESKTOP_COMMANDS = Object.freeze([
   "previous-tab",
   "next-tab",
   "quit",
-]);
+] as const);
 
-/**
- * @typedef {object} DesktopCommandState
- * @property {Set<string>} commands Commands the SPA can act on right now.
- * @property {boolean} sessionPinned Whether the open session is pinned.
- * @property {boolean} sessionArchived Whether the open session is archived.
- */
+export type DesktopCommand = (typeof DESKTOP_COMMANDS)[number];
+
+export interface DesktopCommandState {
+  /** Commands the SPA can act on right now. */
+  commands: Set<DesktopCommand>;
+  /** Whether the open session is pinned. */
+  sessionPinned: boolean;
+  /** Whether the open session is archived. */
+  sessionArchived: boolean;
+}
+
+/** The part of Electron's WebContents that signals a replaced or dead page. */
+export interface DesktopCommandResetSource {
+  on: (event: "did-navigate" | "render-process-gone", listener: () => void) => unknown;
+}
 
 /**
  * Validate a renderer-reported command state. Unknown commands are dropped;
  * anything that isn't an object reports nothing.
- *
- * @param {unknown} raw
- * @returns {DesktopCommandState | null}
  */
-function sanitizeDesktopCommandState(raw) {
+export function sanitizeDesktopCommandState(raw: unknown): DesktopCommandState | null {
   if (!raw || typeof raw !== "object") return null;
-  const reported = Array.isArray(raw.commands) ? raw.commands : [];
+  const state = raw as Record<string, unknown>;
+  const reported: unknown[] = Array.isArray(state.commands) ? state.commands : [];
   return {
-    commands: new Set(reported.filter((command) => DESKTOP_COMMANDS.includes(command))),
-    sessionPinned: raw.sessionPinned === true,
-    sessionArchived: raw.sessionArchived === true,
+    commands: new Set(
+      reported.filter((command): command is DesktopCommand =>
+        (DESKTOP_COMMANDS as readonly unknown[]).includes(command),
+      ),
+    ),
+    sessionPinned: state.sessionPinned === true,
+    sessionArchived: state.sessionArchived === true,
   };
 }
 
@@ -54,17 +63,11 @@ function sanitizeDesktopCommandState(raw) {
  * reload, a sign-in redirect, another server) or its renderer dies, so the menu
  * never routes a command to a page that isn't listening. In-app routing stays
  * on the same document and keeps the state.
- *
- * @param {Pick<Electron.WebContents, "on">} webContents
- * @param {() => void} onReset
  */
-function registerDesktopCommandStateReset(webContents, onReset) {
+export function registerDesktopCommandStateReset(
+  webContents: DesktopCommandResetSource,
+  onReset: () => void,
+): void {
   webContents.on("did-navigate", onReset);
   webContents.on("render-process-gone", onReset);
 }
-
-module.exports = {
-  DESKTOP_COMMANDS,
-  registerDesktopCommandStateReset,
-  sanitizeDesktopCommandState,
-};

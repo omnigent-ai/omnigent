@@ -1,18 +1,17 @@
-// Bundles the Electron main process and preloads from src/ into app/.
+// Bundles the Electron main process, preloads and page scripts from src/ into app/.
 //
 //   node scripts/build.mjs           one build
 //   node scripts/build.mjs --watch   rebuild on change (restart Electron for main changes)
 //
-// Pages are not bundled; they load from their package-root directories.
+// Pages load from their package-root directories; only their shared scripts are bundled.
 
 import { readdir, rm } from "node:fs/promises";
 import { builtinModules } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { build } from "vite";
-import paths from "../src/paths.js";
+import { BUNDLE_DIR, PACKAGE_ROOT } from "../src/paths.ts";
 
-const { BUNDLE_DIR, PACKAGE_ROOT } = paths;
 const SRC_DIR = path.join(PACKAGE_ROOT, "src");
 
 // Preload bundles keep their src/ file names (paths.preloadPath). The .js
@@ -28,7 +27,10 @@ const PACKAGE_JSON = path.join(PACKAGE_ROOT, "package.json");
 
 // Electron 45 ships Node 22 and Chromium 142.
 const MAIN_TARGET = "node22";
-const PRELOAD_TARGET = "chrome142";
+const RENDERER_TARGET = "chrome142";
+
+// Classic script for setup/index.html that publishes window.omnigentUrl.
+const SETUP_PAGE_URL_FILE = "setupPageUrl.js";
 
 /** @param {string} id */
 function isExternal(id) {
@@ -96,8 +98,39 @@ export function bundlePreload({ fileName, outDir, watch = false }) {
     entry: path.join(SRC_DIR, fileName),
     outDir,
     fileName,
-    target: PRELOAD_TARGET,
+    target: RENDERER_TARGET,
     watch,
+  });
+}
+
+/**
+ * Bundle the setup page's URL helpers as one classic script.
+ *
+ * @param {{ outDir: string, watch?: boolean }} options
+ */
+export function bundleSetupPageUrl({ outDir, watch = false }) {
+  return build({
+    configFile: false,
+    root: PACKAGE_ROOT,
+    publicDir: false,
+    logLevel: watch ? "info" : "warn",
+    build: {
+      outDir,
+      emptyOutDir: false,
+      target: RENDERER_TARGET,
+      minify: false,
+      sourcemap: true,
+      reportCompressedSize: false,
+      watch: watch ? {} : null,
+      rolldownOptions: {
+        input: path.join(SRC_DIR, "setupPageUrl.ts"),
+        output: {
+          format: "iife",
+          entryFileNames: SETUP_PAGE_URL_FILE,
+          codeSplitting: false,
+        },
+      },
+    },
   });
 }
 
@@ -114,6 +147,7 @@ export async function buildApp({ watch = false } = {}) {
     // oxlint-disable-next-line no-await-in-loop -- Builds share one output directory.
     await bundlePreload({ fileName, outDir: BUNDLE_DIR, watch });
   }
+  await bundleSetupPageUrl({ outDir: BUNDLE_DIR, watch });
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {

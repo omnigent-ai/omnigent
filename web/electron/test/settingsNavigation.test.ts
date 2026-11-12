@@ -1,16 +1,16 @@
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
 
-const {
+import {
   SETTINGS_ACCELERATOR,
   SETTINGS_PATH,
   focusedConnectedWindow,
   aboutMenuItem,
   macApplicationMenu,
   settingsMenuItem,
-} = require("../src/settingsNavigation");
+} from "../src/settingsNavigation.ts";
 
-function fakeWindow(url, destroyed = false) {
+function fakeWindow(url: string, destroyed = false) {
   return {
     isDestroyed: () => destroyed,
     webContents: { getURL: () => url },

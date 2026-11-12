@@ -1,10 +1,21 @@
 "use strict";
 
-const { it } = require("node:test");
+const { after, before, it } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { JSDOM } = require("jsdom");
+
+// The page loads the URL helpers from this bundle (src/setupPageUrl.ts).
+let setupPageUrlScript;
+before(async () => {
+  const { bundleSetupPageUrl } = await import("../scripts/build.mjs");
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-setup-page-"));
+  after(() => fs.rmSync(outDir, { recursive: true, force: true }));
+  await bundleSetupPageUrl({ outDir });
+  setupPageUrlScript = fs.readFileSync(path.join(outDir, "setupPageUrl.js"), "utf8");
+});
 
 const SERVER = "https://workspace.cloud.databricks.com/omnigent?o=123";
 const tick = () =>
@@ -44,7 +55,11 @@ async function harness(
       return cancel(id);
     },
   };
-  dom.window.eval(fs.readFileSync(path.join(__dirname, "../src/url.js"), "utf8"));
+  assert.equal(
+    dom.window.document.querySelector("script[src]").getAttribute("src"),
+    "../app/setupPageUrl.js",
+  );
+  dom.window.eval(setupPageUrlScript);
   dom.window.eval(dom.window.document.querySelector("script:not([src])").textContent);
   await tick();
   const document = dom.window.document;

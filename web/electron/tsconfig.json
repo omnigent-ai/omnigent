@@ -2,9 +2,10 @@
   "compilerOptions": {
     "target": "es2024",
     "lib": ["es2024"],
-    "module": "nodenext",
-    "moduleResolution": "nodenext",
-    "types": [],
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "types": ["node"],
     "allowJs": true,
     "checkJs": false,
     "noEmit": true,

@@ -376,9 +376,9 @@ one `web` bundle works both in a browser and under Electron.
 ```
 electron/
   package.json             # Electron + electron-builder deps and build config
-  scripts/build.mjs        # bundles main + preloads into the generated app/
+  scripts/build.mjs        # bundles main, preloads and the setup page's URL helpers into app/
   src/main.js              # main process: window, settings, menu, IPC, badge, notify
-  src/paths.js             # page, preload and icon locations
+  src/paths.ts             # page, preload and icon locations
   src/preload.js           # contextBridge: window.omnigentDesktop + omnigentSetup
   src/about_window.js      # shell-owned About modal + guarded update IPC
   src/about_preload.js     # narrow contextBridge for the About modal
@@ -391,6 +391,8 @@ electron/
   src/loopback-oauth.js       # RFC 8252 loopback listener shared by browser sign-ins
   src/oidc-credentials.js     # OIDC loopback sign-in, refresh, and revoke
   src/oidc-auth.js            # OIDC window session lifecycle (cookie, renewal, sign-out)
+  src/url.ts               # URL rules shared by main, the setup page and the web selector
+  src/setupPageUrl.ts      # setup page entry publishing window.omnigentUrl
   setup/index.html         # the bundled "connect to server" setup page
   about/index.html         # bundled About UI opened from the macOS app menu
   find/index.html          # the bundled find-in-page bar (Cmd/Ctrl+F)
@@ -442,7 +444,7 @@ dismisses.
   `localStorage` — both exist only in a real, same-profile child window,
   so sending these popups to the external browser strands the code and the
   sign-in fails. A `window.open` is therefore allowed as a real child
-  window only when **all** of these hold (`src/popupPolicy.js`): it is
+  window only when **all** of these hold (`src/popupPolicy.ts`): it is
   popup-shaped (explicit width/height features), the opener window is
   pinned and currently _on_ its pinned origin, and the target is `https`
   on the pinned origin itself, a well-known OAuth authorization host
@@ -641,7 +643,7 @@ including the address bar, chat links, and agent actions, enforces this policy.
   new background Browser tab in the same session when the loaded UI declares
   support (`browser-open-tab`). Right-click offers "Open Link in Browser" /
   "Copy Link Address".
-- `src/browserUrlPolicy.js` — the browser navigation policy: http(s) only, and
+- `src/browserUrlPolicy.ts` — the browser navigation policy: http(s) only, and
   no private, link-local, metadata, or other non-public address in
   any literal form, except loopback names for eligible views. A
   hostname is resolved through the view's Chromium session and refused if it
@@ -915,7 +917,7 @@ Cmd/Ctrl+W closes what has focus: the focused workspace tab (a file confirms
 unsaved edits first), or the open session, which returns to the new-session
 page. On the new-session page it asks in an in-app dialog before closing the
 window. The page reports which menu commands it can act on (see
-`src/desktopCommands.js`); until it does, or while it is unresponsive, Cmd/Ctrl+W
+`src/desktopCommands.ts`); until it does, or while it is unresponsive, Cmd/Ctrl+W
 closes the window directly. Cmd/Ctrl+Shift+W always closes the window.
 
 Verify on each supported desktop OS with focus inside an embedded browser:
@@ -1286,7 +1288,7 @@ packaged installs, plus a runtime `app.setAsDefaultProtocolClient("omnigent")`
 call so `electron .` dev clicks route to the running dev instance.
 
 The decision logic (parse + window selection) is pure and unit-tested in
-`src/deepLink.js`; the orchestration lives in `src/main.js`.
+`src/deepLink.ts`; the orchestration lives in `src/main.js`.
 
 ## Implementation notes
 

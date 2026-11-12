@@ -121,6 +121,12 @@ runs:
         pnpm install --frozen-lockfile --filter web
         pnpm --filter web run build
 
+    - name: Build HEAD Electron shell bundle
+      # HEAD tests/e2e_ui/desktop load the setup page script from web/electron/app/.
+      # Vite resolves from web/node_modules, so Electron itself is not installed.
+      shell: bash
+      run: node web/electron/scripts/build.mjs
+
     - name: "Build pinned old server (Config A)"
       if: ${{ inputs.server_version != '' }}
       shell: bash

@@ -1,11 +1,11 @@
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 
-const {
+import {
   registerDesktopCommandStateReset,
   sanitizeDesktopCommandState,
-} = require("../src/desktopCommands");
+} from "../src/desktopCommands.ts";
 
 describe("sanitizeDesktopCommandState", () => {
   it("keeps known commands and strict booleans", () => {
@@ -14,6 +14,7 @@ describe("sanitizeDesktopCommandState", () => {
       sessionPinned: true,
       sessionArchived: "yes",
     });
+    assert.ok(state);
     assert.deepEqual([...state.commands], ["close", "new-browser-tab"]);
     assert.equal(state.sessionPinned, true);
     assert.equal(state.sessionArchived, false);
@@ -22,7 +23,7 @@ describe("sanitizeDesktopCommandState", () => {
   it("reports nothing for a non-object and no commands for a missing list", () => {
     assert.equal(sanitizeDesktopCommandState(null), null);
     assert.equal(sanitizeDesktopCommandState("close"), null);
-    assert.deepEqual([...sanitizeDesktopCommandState({}).commands], []);
+    assert.deepEqual([...sanitizeDesktopCommandState({})!.commands], []);
   });
 });
 

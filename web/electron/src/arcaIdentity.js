@@ -1,6 +1,6 @@
 "use strict";
 
-const { normalizeSavedServerUrl, databricksWorkspaceUiUrl } = require("./url");
+const { normalizeSavedServerUrl, databricksWorkspaceUiUrl } = require("./url.ts");
 
 const IDENTITY_START = "__OMNIGENT_ARCA_IDENTITY_START__";
 const IDENTITY_END = "__OMNIGENT_ARCA_IDENTITY_END__";

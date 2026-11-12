@@ -24,7 +24,7 @@ const os = require("os");
 const path = require("path");
 const yaml = require("js-yaml");
 
-const url = require("./url");
+const url = require("./url.ts");
 
 /** Default timeout for the short status commands. */
 const DEFAULT_TIMEOUT_MS = 10000;

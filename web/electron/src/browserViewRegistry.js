@@ -25,7 +25,7 @@ const {
   isLocalhostSubdomain,
   isProxyAddress,
   lookupHostAddresses,
-} = require("./browserUrlPolicy");
+} = require("./browserUrlPolicy.ts");
 
 const DEFAULT_CAP = 10;
 

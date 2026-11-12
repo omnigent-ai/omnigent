@@ -1,13 +1,18 @@
-// Tests for the window-open policy (src/popupPolicy.js), run with
+// Tests for the window-open policy (src/popupPolicy.ts), run with
 // `node --test`. Pure function — no Electron needed. Security property:
 // page content must NEVER get an arbitrary URL opened in a chromeless
 // Electron window — a child window is allowed only for the OAuth sign-in
 // shape; everything else keeps leaving the shell.
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
 
-const { decideWindowOpen, OAUTH_POPUP_ORIGINS, WEB_SCHEMES } = require("../src/popupPolicy");
+import {
+  decideWindowOpen,
+  OAUTH_POPUP_ORIGINS,
+  stripCrossOriginOpenerHeaders,
+  WEB_SCHEMES,
+} from "../src/popupPolicy.ts";
 
 const PINNED = "https://my-workspace.cloud.databricks.com";
 
@@ -169,8 +174,6 @@ describe("popupPolicy — everything else keeps leaving the shell", () => {
 });
 
 describe("popupPolicy — stripCrossOriginOpenerHeaders", () => {
-  const { stripCrossOriginOpenerHeaders } = require("../src/popupPolicy");
-
   it("strips COOP and its Report-Only variant, case-insensitively", () => {
     const stripped = stripCrossOriginOpenerHeaders({
       "Cross-Origin-Opener-Policy": ["same-origin"],

@@ -57,7 +57,7 @@ it("bundled main-process code applies test overrides only in an unpackaged app",
     entry,
     [
       `const { withTestOverrides } = require(${JSON.stringify(path.join(SRC_DIR, "testOverrides.js"))});`,
-      `module.exports = withTestOverrides("url", require(${JSON.stringify(path.join(SRC_DIR, "url.js"))}));`,
+      `module.exports = withTestOverrides("url", require(${JSON.stringify(path.join(SRC_DIR, "url.ts"))}));`,
     ].join("\n"),
   );
   await bundleMainProcess({ entry, outDir, fileName: "overrides.cjs" });

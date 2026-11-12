@@ -42,7 +42,7 @@ import {
 } from "@/pages/onboarding/primitives";
 import { cn } from "@/lib/utils";
 import { ownServerName } from "@/lib/serverNames";
-import "../../../electron/src/url.js";
+import { normalizeUrl } from "../../../electron/src/url.ts";
 
 const DEFAULT_LOCAL = "http://localhost:6767";
 const CREATE_SERVER_URL = "https://omnigent.ai/";
@@ -83,7 +83,7 @@ function serverTitle(url: string, managedName?: string | null, ownName?: string 
 /** Use the shell's URL rules for typed URLs on both onboarding screens. */
 export function normalizeServerUrl(raw: string): string | null {
   try {
-    return globalThis.omnigentUrl.normalizeUrl(raw);
+    return normalizeUrl(raw);
   } catch {
     return null;
   }

@@ -1,12 +1,10 @@
-"use strict";
+import assert from "node:assert/strict";
+import path from "node:path";
+import { it } from "node:test";
 
-const assert = require("node:assert/strict");
-const path = require("node:path");
-const { it } = require("node:test");
+import { pagePath, preloadPath } from "../src/paths.ts";
 
-const { pagePath, preloadPath } = require("../src/paths");
-
-const PACKAGE_ROOT = path.join(__dirname, "..");
+const PACKAGE_ROOT = path.join(import.meta.dirname, "..");
 
 it("resolves pages under the package root", () => {
   assert.equal(pagePath("setup"), path.join(PACKAGE_ROOT, "setup", "index.html"));

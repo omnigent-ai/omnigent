@@ -1,4 +1,4 @@
-// Unit tests for the deep-link decision logic (src/deepLink.js), run with
+// Unit tests for the deep-link decision logic (src/deepLink.ts), run with
 // `node --test` (no extra deps, no Electron). Two pure functions:
 //   - parseOmnigentDeepLink: scheme inference + path validation
 //   - chooseDeepLinkStrategy: the window-selection decision table
@@ -7,14 +7,14 @@
 // http, remote → https); the workspace-mount discovery and the actual
 // window/IPC wiring live in main.js and are covered by main.test.js guards.
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
 
-const {
+import {
   parseOmnigentDeepLink,
   chooseDeepLinkStrategy,
   acceptCliDeepLink,
-} = require("../src/deepLink");
+} from "../src/deepLink.ts";
 
 describe("parseOmnigentDeepLink", () => {
   it("parses a loopback host with a port as http", () => {
@@ -51,13 +51,14 @@ describe("parseOmnigentDeepLink", () => {
 
   it("accepts an optional trailing slash on the path", () => {
     assert.equal(
-      parseOmnigentDeepLink("omnigent://localhost:8000/c/conv_abc/").path,
+      parseOmnigentDeepLink("omnigent://localhost:8000/c/conv_abc/")?.path,
       "/c/conv_abc/",
     );
   });
 
   it("drops a query string and hash (v1 forwards only the path)", () => {
     const parsed = parseOmnigentDeepLink("omnigent://localhost:8000/c/conv_abc?reply=1#frag");
+    assert.ok(parsed);
     assert.equal(parsed.path, "/c/conv_abc");
     assert.equal(parsed.origin, "http://localhost:8000");
   });
@@ -104,7 +105,7 @@ describe("chooseDeepLinkStrategy", () => {
   const FOREIGN = "https://company.okta.com"; // a mid-auth IdP origin
 
   /** A window snapshot. */
-  function win(origin, currentOrigin = origin) {
+  function win(origin: string | null, currentOrigin: string | null = origin) {
     return { origin, currentOrigin };
   }
 
@@ -236,7 +237,7 @@ describe("CLI navigation acknowledgment", () => {
 
   for (const status of [204, 404, 410]) {
     it(`only accepts a live CLI acknowledgment (HTTP ${status})`, async (t) => {
-      t.mock.method(globalThis, "fetch", async (url, options) => {
+      t.mock.method(globalThis, "fetch", async (url: unknown, options: RequestInit) => {
         assert.equal(url, `http://127.0.0.1:1234/desktop-open/${token}`);
         assert.equal(options.method, "POST");
         assert.equal(options.redirect, "error");

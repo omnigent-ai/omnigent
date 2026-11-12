@@ -1,4 +1,4 @@
-// Tests for the agent-navigation URL allowlist (src/browserUrlPolicy.js),
+// Tests for the agent-navigation URL allowlist (src/browserUrlPolicy.ts),
 // run with `node --test`. Pure function — no Electron needed.
 //
 // The security property under test: a model-issued `browser_navigate` must not
@@ -6,10 +6,10 @@
 // or any non-http(s) scheme (else it screenshots the bytes back out = SSRF +
 // local-file read + exfil). Normal public https must still be allowed.
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
 
-const {
+import {
   checkAgentNavigation,
   isAgentConnectionAllowed,
   isAgentNavigationAllowed,
@@ -17,7 +17,8 @@ const {
   isLoopbackPreviewUrl,
   isProxyAddress,
   proxyHosts,
-} = require("../src/browserUrlPolicy");
+  type HostResolver,
+} from "../src/browserUrlPolicy.ts";
 
 describe("browserUrlPolicy — agent navigation allowlist", () => {
   it("allows canonical loopback and *.localhost destinations with loopback eligibility", () => {
@@ -230,9 +231,9 @@ describe("browserUrlPolicy — agent navigation allowlist", () => {
 });
 
 /** A resolver stub that records lookups and answers from a fixed table. */
-function fakeResolver(table) {
-  const lookups = [];
-  const resolveHost = async (hostname) => {
+function fakeResolver(table: Record<string, string[] | Error>) {
+  const lookups: string[] = [];
+  const resolveHost: HostResolver = async (hostname) => {
     lookups.push(hostname);
     const answer = table[hostname];
     if (answer instanceof Error) throw answer;
@@ -254,7 +255,7 @@ describe("browserUrlPolicy — DNS-aware agent navigation", () => {
     "missing.example": new Error("ENOTFOUND"),
   });
 
-  const verdictsFor = (hosts) =>
+  const verdictsFor = (hosts: string[]) =>
     Promise.all(hosts.map((host) => checkAgentNavigation(`http://${host}:8899/`, { resolveHost })));
 
   it("blocks a hostname if any resolved address is internal", async () => {
@@ -411,7 +412,8 @@ describe("browserUrlPolicy — proxy address matching", () => {
     assert.deepEqual(proxyHosts("DIRECT"), []);
   });
 
-  const resolveHost = async (hostname) => ({ "proxy.corp": ["10.0.0.2"] })[hostname] ?? [];
+  const proxyAddresses: Record<string, string[]> = { "proxy.corp": ["10.0.0.2"] };
+  const resolveHost: HostResolver = async (hostname) => proxyAddresses[hostname] ?? [];
 
   it("accepts an internal address only when it is a listed proxy's IP", async () => {
     const pac = "PROXY proxy.corp:3128; DIRECT";

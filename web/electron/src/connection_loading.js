@@ -1,6 +1,6 @@
 "use strict";
 
-const { pagePath, preloadPath } = require("./paths");
+const { pagePath, preloadPath } = require("./paths.ts");
 
 // Loads that finish sooner never show the indicator, so fast connects don't flash it.
 const SHOW_DELAY_MS = 300;

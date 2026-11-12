@@ -20,7 +20,7 @@ const {
   isTrustedDatabricksOrigin,
 } = require("./databricks-oauth");
 const { parseAccountFromToken, listRunningWorkspaces } = require("./databricks-account");
-const { isDatabricksOAuthServerUrl } = require("./url");
+const { isDatabricksOAuthServerUrl } = require("./url.ts");
 const {
   cookieMatchesOrigin,
   isTransientRenewalError,
