@@ -7,9 +7,13 @@ from dataclasses import replace
 import click
 import pytest
 
-from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
+from omnigent.onboarding.sandboxes.base import (
+    SandboxCapabilityError,
+    render_host_config_write_command,
+)
 from omnigent.server import managed_hosts
 from omnigent.server.managed_hosts import (
+    REQUESTED_HOST_ID_LABEL_KEY,
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
     launch_managed_host,
@@ -197,6 +201,25 @@ async def test_keeps_the_sandbox_when_the_walk_passes_the_session_cap(
     assert len(fake.stopped) == (1 if stops else 0)
 
 
+@pytest.mark.parametrize("full_page", ["side-chats", "children"])
+async def test_keeps_the_sandbox_when_a_walk_page_is_full(db_uri, monkeypatch, full_page):
+    # Two archived side chats or two sub-agents fill a page of two: the rest of
+    # that page's list is unknown, so the sandbox stays up.
+    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
+    for title in ("one", "two"):
+        if full_page == "side-chats":
+            side_chat = conversations.create_conversation(side_chat_parent_id=conv.id)
+            conversations.update_conversation(side_chat.id, archived=True)
+        else:
+            conversations.create_conversation(
+                kind="sub_agent", title=title, parent_conversation_id=conv.id
+            )
+    monkeypatch.setattr(managed_hosts, "_ARCHIVE_STOP_MAX_SESSIONS", 2)
+    assert await _stop(fake, host_store, conversations, conv) is False
+    monkeypatch.setattr(managed_hosts, "_ARCHIVE_STOP_MAX_SESSIONS", 4)
+    assert await _stop(fake, host_store, conversations, conv) is True
+
+
 async def test_archiving_the_last_side_chat_stops_its_sources_sandbox(db_uri):
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
     side_chat = conversations.create_conversation(
@@ -217,6 +240,9 @@ async def test_archiving_the_last_side_chat_stops_its_sources_sandbox(db_uri):
 async def test_a_sandbox_that_gains_a_user_while_stopping_is_resumed(db_uri, monkeypatch):
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
     sandbox_id = host_store.get_host(conv.host_id).sandbox_id
+    # A host the create asked for routes by its own id; the wake keeps that.
+    conversations.set_labels(conv.id, {REQUESTED_HOST_ID_LABEL_KEY: conv.host_id})
+    conv = conversations.get_conversation(conv.id)
     real_stop = fake.stop
 
     def stop_while_unarchived(stopped_id: str) -> None:
@@ -226,11 +252,16 @@ async def test_a_sandbox_that_gains_a_user_while_stopping_is_resumed(db_uri, mon
 
     monkeypatch.setattr(fake, "stop", stop_while_unarchived)
     starts_before = len(fake.host_starts)
+    commands_before = len(fake.commands)
     assert await _stop(fake, host_store, conversations, conv) is False
     assert fake.stopped == [sandbox_id]
     # Woken through the normal wake path: the sandbox and the host inside it.
     assert fake.resumed == [sandbox_id]
     assert len(fake.host_starts) == starts_before + 1
+    assert (
+        render_host_config_write_command({"host": {"slice_key_enabled": True}})
+        in fake.commands[commands_before:]
+    )
 
 
 async def test_keeps_a_sandbox_its_provider_cannot_resume(db_uri):
@@ -258,15 +289,29 @@ async def test_keeps_a_scheduled_task_runs_sandbox(db_uri, archived):
     assert fake.stopped == []
 
 
-@pytest.mark.parametrize("missing", ["host-listing", "archived-state"])
+@pytest.mark.parametrize(
+    "missing", ["host-listing", "archived-state", "activity-row", "activity-read"]
+)
 async def test_keeps_the_sandbox_when_the_store_cannot_list_the_hosts_sessions(
     db_uri, monkeypatch, missing
 ):
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
     # The host listing's base default (nothing), or a store that reports
     # activity without the archived flag: both read as unknown.
+    real_activity = conversations.get_session_activity
+
+    def activity_without_this_session(ids):
+        return {i: a for i, a in real_activity(ids).items() if i != conv.id}
+
+    def activity_read_fails(_ids):
+        raise RuntimeError("database unavailable")
+
     if missing == "host-listing":
         monkeypatch.setattr(conversations, "list_host_conversation_ids", lambda *a, **k: [])
+    elif missing == "activity-row":
+        monkeypatch.setattr(conversations, "get_session_activity", activity_without_this_session)
+    elif missing == "activity-read":
+        monkeypatch.setattr(conversations, "get_session_activity", activity_read_fails)
     else:
         real = conversations.get_session_activity
 

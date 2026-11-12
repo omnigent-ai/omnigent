@@ -5173,26 +5173,15 @@ async def stop_archived_session_sandbox(
     config: ManagedSandboxDeployment | None,
 ) -> bool:
     """
-    Stop an archived session's managed sandbox, keeping it resumable.
+    Best-effort stop of an opted-in archived session's sandbox, keeping it resumable.
 
-    Runs after the archive teardown. The sandbox is the one the session runs on:
-    its own host's, or for a side chat or sub-agent without a host binding, its
-    source's or parent's. The host's provider decides: its
-    :attr:`ManagedSandboxConfig.stop_on_archive` setting is passed to the
-    launcher's ``stop_when_archived`` hook, which returns it unless the provider
-    overrides it. The sandbox is only stopped, never deleted, and only when its
-    provider can resume it, so an unarchived session's next message wakes it
-    through :func:`resume_managed_host` (unless the reaper has terminated it
-    since). A sandbox another unarchived session uses keeps running, as does
-    this session's if it was unarchived meanwhile, and a scheduled task run's,
-    whose sandbox the task's own lifecycle manages. Best-effort: a failure
-    leaves the sandbox running.
-
-    Nothing holds new work off while the provider stops the sandbox, so a
-    session unarchived and messaged during that call can start a runner the
-    stop then ends. The check is repeated after the stop, and a sandbox that
-    gained a user meanwhile is woken at once through :func:`resume_managed_host`;
-    the interrupted turn still fails.
+    The sandbox is the session's own host's, or for a side chat or sub-agent its
+    source's or parent's. The provider's ``stop_on_archive`` setting, passed
+    through the launcher's ``stop_when_archived`` hook, decides; scheduled task
+    runs are skipped. :func:`_host_may_be_in_use` runs before the stop and again
+    after it, and a sandbox that gained a user meanwhile is woken at once (a turn
+    started during the stop call still fails). Any failure leaves the sandbox
+    running.
 
     :param conv: The archived session, as re-read by the teardown.
     :param host_store: Store holding the session's host row.
@@ -5234,7 +5223,16 @@ async def stop_archived_session_sandbox(
         # teardown.
         if await _host_may_be_in_use(host.host_id, owner.id, conversation_store):
             return False
-        await asyncio.to_thread(launcher.stop, host.sandbox_id)
+        try:
+            await asyncio.to_thread(launcher.stop, host.sandbox_id)
+        except SandboxCapabilityError:
+            _logger.debug(
+                "Managed sandbox provider cannot stop sandboxes; leaving archived "
+                "session %s's sandbox running",
+                conv.id,
+                extra={"session_id": conv.id},
+            )
+            return False
         if await _host_may_be_in_use(host.host_id, owner.id, conversation_store):
             _logger.info(
                 "Managed sandbox %s gained a user while stopping for archived session %s; "
@@ -5245,16 +5243,14 @@ async def stop_archived_session_sandbox(
             )
             # Forced: this server just stopped the sandbox, so the host row can
             # still look online. A wake also restarts the host inside it.
-            await resume_managed_host(host.host_id, host_store, config, force=True)
+            await resume_managed_host(
+                host.host_id,
+                host_store,
+                config,
+                force=True,
+                slice_key_enabled=host_slice_key_enabled(owner.labels, host.host_id),
+            )
             return False
-    except SandboxCapabilityError:
-        _logger.debug(
-            "Managed sandbox provider cannot stop sandboxes; leaving archived "
-            "session %s's sandbox running",
-            conv.id,
-            extra={"session_id": conv.id},
-        )
-        return False
     except Exception:
         _logger.warning(
             "Failed to stop or resume the managed sandbox of archived session %s",
