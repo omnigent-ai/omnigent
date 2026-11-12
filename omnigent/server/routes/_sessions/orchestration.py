@@ -12300,13 +12300,27 @@ async def _create_session_from_existing_agent(
         validate_create_harness_readiness,
     )
 
-    require_runtime_support(
+    runtime_host_id = body.host_id
+    if (
+        runtime_host_id is None
+        and inherited_runner_id
+        and _parent_for_routing is not None
+        and (tcp_egress_required or selected_registry_services)
+    ):
+        from omnigent.runner.routing import routing_host_id
+
+        runtime_host_id = await asyncio.to_thread(
+            routing_host_id, _parent_for_routing, conversation_store
+        )
+    await asyncio.to_thread(
+        require_runtime_support,
         selected_registry_services,
         tcp_egress_required=tcp_egress_required,
-        host_id=body.host_id,
+        host_id=runtime_host_id,
         runner_id=inherited_runner_id,
         host_registry=getattr(request.app.state, "host_registry", None),
         tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+        runner_router=runner_router,
     )
 
     selected_harness = (

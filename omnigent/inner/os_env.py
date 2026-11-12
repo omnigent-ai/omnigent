@@ -539,6 +539,8 @@ class _HelperProcessClient:
     def _ensure_started_locked(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
             return
+        if self._proc is not None:
+            self._stop_locked()
         self._start_locked()
 
     def _start_locked(self) -> None:

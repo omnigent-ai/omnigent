@@ -170,8 +170,15 @@ class _TcpHandler(socketserver.BaseRequestHandler):
                     _write_frame(client, b"D", str(exc).encode()[:1024])
                 else:
                     client.sendall(b"\x01" + str(exc).encode()[:1024])
-        except OSError:
-            logger.exception("TCP egress connection failed for route %s", route_name)
+        except OSError as exc:
+            expected = isinstance(exc, (TimeoutError, ConnectionRefusedError))
+            logger.log(
+                logging.INFO if expected else logging.ERROR,
+                "TCP egress connection failed for route %s: %s",
+                route_name,
+                exc,
+                exc_info=not expected,
+            )
             with contextlib.suppress(OSError):
                 if accepted:
                     _write_frame(client, b"D", b"TCP egress connection failed")

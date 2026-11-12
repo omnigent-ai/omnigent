@@ -64,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
             if len(request) > 2048:
                 raise OSError("TCP egress request is too large")
             sock.sendall(struct.pack("!I", len(request)) + request)
+            sock.settimeout(25)
             if read_exact(sock, 1) != b"\x00":
                 print(sock.recv(1024).decode(errors="replace"), file=sys.stderr)
                 return 1

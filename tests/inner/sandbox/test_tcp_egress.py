@@ -193,6 +193,8 @@ def test_tcp_route_parsers_and_runtime_reject_weak_backend(
         (["10.42.7.9"], (), "outside", True),
         (["fd42::9"], (), "outside", True),
         (["fec0::9"], (), "outside", True),
+        (["::ffff:10.42.7.9"], ("10.42.0.0/16",), "blocked", False),
+        (["fe80::1%eth0"], ("fe80::/10",), "blocked", False),
     ],
 )
 def test_tcp_dns_authorizes_every_answer(
@@ -1334,10 +1336,12 @@ def test_tcp_and_git_ssh_brokers_work_together(
         environment.close()
 
 
+@pytest.mark.parametrize("restart", [False, True])
 def test_tcp_helper_start_failure_closes_broker(
     tmp_path: Path,
     active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
     monkeypatch: pytest.MonkeyPatch,
+    restart: bool,
 ) -> None:
     route = TcpEgressRoute("database", "db.example.test", 5432)
     workspace = tmp_path / "workspace"
@@ -1356,19 +1360,32 @@ def test_tcp_helper_start_failure_closes_broker(
         return broker
 
     monkeypatch.setattr(os_env_module, "start_tcp_egress_broker", capture_start)
-    backend = os_env_module.get_backend(sandbox.type)
-    monkeypatch.setattr(
-        backend,
-        "wrap_launcher_argv",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("wrap failed")),
-    )
     try:
-        with pytest.raises(RuntimeError, match="wrap failed"):
-            run_async(environment.shell("true"))
-        assert brokers and brokers[0]._closed
-        assert not brokers[0].socket_path.exists()
+        if restart:
+            assert run_async(environment.shell("true"))["exit_code"] == 0
+            proc = environment._helper._proc
+            assert proc is not None
+            proc.kill()
+            proc.wait(timeout=5)
+            assert run_async(environment.shell("true"))["exit_code"] == 0
+            assert len(brokers) == 2
+            assert brokers[0]._closed and not brokers[0].socket_path.exists()
+        else:
+            backend = os_env_module.get_backend(sandbox.type)
+            monkeypatch.setattr(
+                backend,
+                "wrap_launcher_argv",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("wrap failed")),
+            )
+            with pytest.raises(RuntimeError, match="wrap failed"):
+                run_async(environment.shell("true"))
+            assert len(brokers) == 1
     finally:
         environment.close()
+    for broker in brokers:
+        assert broker._closed
+        assert not broker._thread.is_alive()
+        assert not broker.socket_path.parent.exists()
 
 
 @pytest.mark.parametrize("stage", ["bootstrap", "launcher", "tmux", "close", "os_env_close"])

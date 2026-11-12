@@ -1985,13 +1985,29 @@ def register_core_routes(
             uses_tcp_egress,
         )
 
-        require_runtime_support(
-            registry_services(spec),
-            tcp_egress_required=uses_tcp_egress(spec),
-            host_id=parsed_metadata.host_id,
+        services = registry_services(spec)
+        tcp_egress_required = uses_tcp_egress(spec)
+        runtime_host_id = parsed_metadata.host_id
+        if (
+            runtime_host_id is None
+            and inherited_runner_id
+            and parent_conv is not None
+            and (tcp_egress_required or services)
+        ):
+            from omnigent.runner.routing import routing_host_id
+
+            runtime_host_id = await asyncio.to_thread(
+                routing_host_id, parent_conv, conversation_store
+            )
+        await asyncio.to_thread(
+            require_runtime_support,
+            services,
+            tcp_egress_required=tcp_egress_required,
+            host_id=runtime_host_id,
             runner_id=inherited_runner_id,
             host_registry=getattr(request.app.state, "host_registry", None),
             tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+            runner_router=runner_router,
         )
 
         from omnigent.server.routes.sandbox_inference import prepare_create_inference

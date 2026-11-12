@@ -14,7 +14,7 @@ from omnigent.host.frames import CAP_MCP_REGISTRY, CAP_TCP_EGRESS
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime import get_agent_store, get_conversation_store
 from omnigent.server.auth import RESERVED_USER_LOCAL
-from tests.server.helpers import build_agent_bundle, create_test_session
+from tests.server.helpers import build_agent_bundle, create_test_session, echo_runner_client
 from tests.server.integration.test_mcp_registry import launch_registry as launch_registry
 from tests.server.integration.test_session_host_launch import app as app
 from tests.server.integration.test_session_worktree_create import _HOST_ID, _SOURCE_REPO
@@ -105,12 +105,98 @@ async def test_create_checks_runtime_support_before_side_effects(
         assert (
             "TCP egress support" if feature == "tcp" else "MCP registry support"
         ) in response.text
+        if feature == "mcp":
+            assert "tracker" in response.text
+            assert "restart the host and session runner" in response.text
         for create in creates:
             create.assert_not_called()
         assert not capture.create and not capture.launches
     else:
         assert response.status_code == 201, response.text
         assert len(capture.launches) == 1
+
+
+@pytest.mark.parametrize("upload", [False, True])
+@pytest.mark.parametrize("ancestor_host", [False, True])
+async def test_hostless_child_checks_inherited_runtime_before_persistence(
+    client, app, register_worktree_host, monkeypatch, upload, ancestor_host
+):
+    capture = register_worktree_host(capabilities=[CAP_MCP_REGISTRY, CAP_TCP_EGRESS])
+    source = await create_test_session(client, bundle=_tcp_bundle("root"))
+    store = get_conversation_store()
+    store.set_host_id(source["id"], _HOST_ID, _SOURCE_REPO)
+    store.replace_runner_id(source["id"], "parent-runner")
+    parent_id = source["id"]
+    if ancestor_host:
+        parent = store.create_conversation(
+            kind="sub_agent",
+            parent_conversation_id=parent_id,
+            agent_id=source["agent_id"],
+            runner_id="parent-runner",
+        )
+        parent_id = parent.id
+    creates = []
+    for method in ("create_session_with_agent", "create_conversation"):
+        create = Mock(wraps=getattr(store, method))
+        monkeypatch.setattr(store, method, create)
+        creates.append(create)
+
+    async def create_child():
+        metadata = {"parent_session_id": parent_id}
+        if upload:
+            return await client.post(
+                "/v1/sessions",
+                data={"metadata": json.dumps(metadata)},
+                files={"bundle": ("agent.tar.gz", _tcp_bundle("root"), "application/gzip")},
+            )
+        return await client.post("/v1/sessions", json={"agent_id": source["agent_id"], **metadata})
+
+    loop_thread = threading.get_ident()
+
+    def remote_host(host_id):
+        assert threading.get_ident() != loop_thread
+        return host_id == _HOST_ID
+
+    with monkeypatch.context() as remote:
+        remote.setattr(app.state.host_registry, "get", Mock(return_value=None))
+        ownership = Mock(side_effect=remote_host)
+        remote.setattr(app.state.runner_router, "host_is_on_another_replica", ownership)
+        response = await create_child()
+        assert response.status_code == 400, response.text
+        error = response.json()["error"]
+        assert error["code"] == ErrorCode.WRONG_REPLICA
+        assert error["slice_key"] == _HOST_ID
+        ownership.assert_called_once_with(_HOST_ID)
+        for create in creates:
+            create.assert_not_called()
+    connection = app.state.tunnel_registry.register(
+        "parent-runner",
+        Mock(),
+        HelloFrame(
+            runner_version="same-version",
+            frame_protocol_version=1,
+            capabilities=[CAP_MCP_REGISTRY],
+        ),
+        owner=RESERVED_USER_LOCAL,
+    )
+    try:
+        response = await create_child()
+        assert response.status_code == 503, response.text
+        assert response.json()["error"]["code"] == ErrorCode.RUNNER_CAPABILITY_MISMATCH
+        for create in creates:
+            create.assert_not_called()
+        async with echo_runner_client() as runner:
+            monkeypatch.setattr(app.state.runner_router, "_client_for_runner", lambda _: runner)
+            connection.hello.capabilities.append(CAP_TCP_EGRESS)
+            response = await create_child()
+        assert response.status_code == 201, response.text
+        child_id = response.json()["session_id" if upload else "id"]
+        child = store.get_conversation(child_id)
+        assert child.runner_id == "parent-runner"
+        assert child.host_id is None
+        assert not capture.create and not capture.launches
+    finally:
+        app.state.tunnel_registry.deregister("parent-runner", session=connection)
 
 
 @pytest.mark.parametrize(

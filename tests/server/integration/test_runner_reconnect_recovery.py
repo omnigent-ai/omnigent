@@ -555,10 +555,16 @@ async def test_unreadable_bundle_does_not_block_other_sessions_on_old_runner(
         for action in ("accept", [], {}):
             with pytest.raises(OmnigentError):
                 await _forward_approval_to_runner(failed.id, {"action": action}, router)
+        for event in (
+            {"type": "effort_change", "effort": "high"},
+            {"type": "model_change", "model": "example-model"},
+        ):
+            assert await _forward_session_change_to_runner_impl(failed.id, router, event) is None
+        for event_type in ("cost_approval_popup", "policy_blocked_notice"):
+            await _forward_session_change_to_runner_impl(failed.id, router, {"type": event_type})
+        assert controls[-2:] == ["cost_approval_popup", "policy_blocked_notice"]
         with pytest.raises(OmnigentError):
-            await _forward_session_change_to_runner_impl(
-                failed.id, router, {"type": "effort_change", "effort": "high"}
-            )
+            await _forward_session_change_to_runner_impl(failed.id, router, {"type": "compact"})
 
         async def relay_ready(_session_id, _runner_id, runner_client, *_args, **_kwargs):
             assert runner_client is not None
