@@ -3199,13 +3199,11 @@ def augment_claude_args(
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
     )
-    from omnigent.mcp_disabled_servers import apply_claude_settings
-
-    hook_settings = apply_claude_settings(
+    hook_settings = _apply_native_mcp_settings(
         hook_settings,
-        executor="claude-native",
         active_harnesses=active_harnesses,
         cwd=workspace,
+        env=None,
         discover_inherited=not defer_inherited_mcp_discovery,
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
@@ -3262,19 +3260,38 @@ def apply_claude_launch_mcp_policy(
     :param active_harnesses: Harnesses whose saved MCP disables apply to this launch.
     :raises McpStrictModeError: When strict mode cannot narrow the inherited settings.
     """
-    from omnigent.mcp_disabled_servers import apply_claude_settings
-
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    updated = apply_claude_settings(
+    updated = _apply_native_mcp_settings(
+        settings,
+        active_harnesses=active_harnesses,
+        cwd=cwd,
+        env=env,
+        discover_inherited=True,
+    )
+    if updated is not settings:
+        _write_json_file(settings_path, updated)
+
+
+def _apply_native_mcp_settings(
+    settings: dict[str, object],
+    *,
+    active_harnesses: Collection[str] | None,
+    cwd: Path | None,
+    env: Mapping[str, str] | None,
+    discover_inherited: bool,
+) -> dict[str, object]:
+    """The single claude-native MCP launch hook, shared by both settings passes."""
+    from omnigent.mcp_disabled_servers import apply_claude_settings
+
+    return apply_claude_settings(
         settings,
         executor="claude-native",
         active_harnesses=active_harnesses,
         cwd=cwd,
         env=env,
+        discover_inherited=discover_inherited,
     )
-    if updated is not settings:
-        _write_json_file(settings_path, updated)
 
 
 def _arg_value(args: tuple[str, ...], flag: str) -> str | None:

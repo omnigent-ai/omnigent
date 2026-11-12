@@ -18087,6 +18087,7 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved,
         "executor": "claude-native",
         "active_harnesses": active,
         "cwd": workspace,
+        "env": None,
         "discover_inherited": not deferred,
     }
     if deferred:
@@ -18095,6 +18096,7 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved,
             "active_harnesses": active,
             "cwd": launch_cwd,
             "env": launch_env,
+            "discover_inherited": True,
         }
     assert hook.call_count == 1 + deferred
     assert args == original_args
