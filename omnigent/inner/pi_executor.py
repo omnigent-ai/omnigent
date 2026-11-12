@@ -2279,6 +2279,27 @@ class PiExecutor(Executor):
         # does exponential backoff + Retry-After honoring; we just set
         # the budget.
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
+        self._databricks_host = self._gateway_host_override or ""
+        self._databricks_token = ""
+        if gateway:
+            if self._gateway_host_override is not None and gateway_auth_command is None:
+                raise OSError(
+                    "PiExecutor(gateway=True) with a gateway workspace host "
+                    "requires a gateway auth command."
+                )
+            if self._gateway_host_override is None and base_url_override:
+                parsed = _urlparse(base_url_override)
+                self._databricks_host = f"{parsed.scheme}://{parsed.netloc}"
+
+        # Profile-derived gateways use the Databricks default model; explicit
+        # gateways receive their concrete model from the producer.
+        self._gateway_uses_databricks_profile = bool(
+            gateway and self._gateway_host_override is None and base_url_override is None
+        )
+        self._gateway_workspace_url = (
+            self._gateway_model_service_workspace_url() if gateway else None
+        )
+
         # Allowlisted base env for the Pi subprocess — never the full
         # host environ. The spec's os_env.sandbox.env_passthrough is the
         # opt-in for anything beyond the base set (e.g. a provider API
@@ -2352,29 +2373,6 @@ class PiExecutor(Executor):
         # Set by Session._wire_sdk_executor().
         self._tool_executor: ToolExecutor | None = None
         self._form_elicitation_handler: FormElicitationHandler | None = None
-
-        self._databricks_host = self._gateway_host_override or ""
-        self._databricks_token = ""
-        if gateway:
-            if self._gateway_host_override is not None and gateway_auth_command is None:
-                raise OSError(
-                    "PiExecutor(gateway=True) with a gateway workspace host "
-                    "requires a gateway auth command."
-                )
-            if self._gateway_host_override is None and base_url_override:
-                parsed = _urlparse(base_url_override)
-                self._databricks_host = f"{parsed.scheme}://{parsed.netloc}"
-
-        # True when the gateway transport was derived from a ~/.databrickscfg
-        # profile (no gateway host or base URL supplied directly). Gates the
-        # Databricks default model in :meth:`_resolve_model`; on the ucode /
-        # generic-provider paths the producer resolves a concrete model.
-        self._gateway_uses_databricks_profile = bool(
-            gateway and self._gateway_host_override is None and base_url_override is None
-        )
-        self._gateway_workspace_url = (
-            self._gateway_model_service_workspace_url() if gateway else None
-        )
 
         self._session_states: dict[str, _PiSessionState] = {}
         self._tool_server: _ToolServer | None = None

@@ -1826,18 +1826,39 @@ class TestPiExecutorConstructor(unittest.TestCase):
         self.assertEqual(executor._databricks_token, "tok")
 
     def test_constructor_databricks_with_host_override_requires_auth_command(self):
-        with (
-            patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
-            patch("omnigent.inner.pi_executor._read_databrickscfg") as read_cfg,
-        ):
-            with self.assertRaisesRegex(OSError, "requires a gateway auth command"):
-                PiExecutor(
-                    gateway=True,
-                    databricks_profile="missing-profile",
-                    gateway_host="https://example.databricks.com/",
-                )
+        from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
-        read_cfg.assert_not_called()
+        for requested in (False, True):
+            with self.subTest(sandbox=requested), tempfile.TemporaryDirectory() as directory:
+                launcher = Path(directory) / "launcher"
+
+                def prepare_launcher(*args, launcher=launcher, **kwargs):
+                    launcher.touch()
+                    return SimpleNamespace(launch_path=str(launcher), sandboxed=True)
+
+                with (
+                    patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+                    patch("omnigent.inner.pi_executor._read_databrickscfg") as read_cfg,
+                    patch(
+                        "omnigent.inner.pi_executor._try_sandbox_pi", side_effect=prepare_launcher
+                    ) as prepare,
+                    patch(
+                        "omnigent.harnesses.pi_native.main.pi_version", return_value=(0, 80, 4)
+                    ) as probe,
+                ):
+                    with self.assertRaisesRegex(OSError, "requires a gateway auth command"):
+                        PiExecutor(
+                            gateway=True,
+                            databricks_profile="missing-profile",
+                            gateway_host="https://gateway.example.test/",
+                            os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
+                            if requested
+                            else None,
+                        )
+                read_cfg.assert_not_called()
+                prepare.assert_not_called()
+                probe.assert_not_called()
+                self.assertFalse(launcher.exists())
 
     def test_constructor_databricks_with_auth_command(self):
         with (
