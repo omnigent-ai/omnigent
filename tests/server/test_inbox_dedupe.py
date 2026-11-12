@@ -127,7 +127,6 @@ def _item(**overrides: Any) -> InboxItem:
         "user_id": "alice",
         "source_session_id": "2" * 32,
         "agent_id": "3" * 32,
-        "prompt_version": None,
         "kind": "info",
         "title": "t",
         "body_md": "b",
