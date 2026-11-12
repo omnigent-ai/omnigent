@@ -4828,6 +4828,47 @@ def _read_complete_jsonl_records(
     )
 
 
+# Launch-time files older than this are refreshed. Well inside macOS
+# ``dirhelper``'s 3-day window, so a refresh every few hours keeps every file
+# far from the cleaner's cutoff.
+BRIDGE_FILE_REFRESH_AGE_S = 12 * 60 * 60
+
+
+def refresh_launch_files(bridge_dir: Path, *, now: float | None = None) -> int:
+    """
+    Keep a live pane's launch-time files from aging out of the temp dir.
+
+    ``tmux.json``, ``bridge.json``, ``permission_hook.json`` and the terminal's
+    ``clipboard-bin`` helper are written once when the pane launches. On
+    macOS, ``dirhelper`` deletes them once they are 3 days old, even while
+    the pane is busy. Web messages then fail with "tmux target is not
+    advertised yet", and permission prompts stop reaching the web UI. This
+    bumps the times of stale regular files directly in *bridge_dir* and in
+    the terminal's private dir named by ``tmux.json``. The terminal dir is
+    refreshed only when its name has the ``omnigent-terminal-`` prefix, so a
+    socket kept directly in a shared temp dir never widens the scope.
+
+    :param bridge_dir: Per-session bridge directory, e.g.
+        ``/tmp/omnigent-501/claude-native/<digest>``.
+    :param now: Timestamp to set, e.g. ``time.time()``. ``None`` uses the
+        current time.
+    :returns: Number of files refreshed.
+    """
+    from omnigent.inner.terminal import _TERMINAL_DIR_PREFIX
+
+    refreshed = native_bridge_common.refresh_file_times(
+        bridge_dir, older_than_s=BRIDGE_FILE_REFRESH_AGE_S, now=now
+    )
+    socket_path = _read_json_file(bridge_dir / _TMUX_FILE).get("socket_path")
+    if isinstance(socket_path, str) and socket_path:
+        terminal_dir = Path(socket_path).parent
+        if terminal_dir.name.startswith(_TERMINAL_DIR_PREFIX):
+            refreshed += native_bridge_common.refresh_file_times(
+                terminal_dir, older_than_s=BRIDGE_FILE_REFRESH_AGE_S, max_depth=2, now=now
+            )
+    return refreshed
+
+
 def write_tmux_target(
     bridge_dir: Path,
     *,
