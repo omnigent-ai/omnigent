@@ -26,7 +26,6 @@ import { sendableQueuedHead, useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
-import { DbcertBanner } from "@/components/DbcertBanner";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { onFindOpened } from "@/lib/nativeBridge";
@@ -134,7 +133,6 @@ export function isNativeFindShortcut(
  * dialogs bail out via React's normal prop-equality check.
  */
 function TranscriptImpl({
-  hostId,
   setConversationEl,
   containerEl,
   scroller,
@@ -493,10 +491,9 @@ function TranscriptImpl({
           scroller={scroller}
           hasMoreHistory={display.hasMoreHistory}
         />
-        {/* Too-many-tabs, dbcert, and sandbox-launch warnings, siblings of Conversation. */}
+        {/* Too-many-tabs and sandbox-launch warnings, siblings of Conversation. */}
         <FloatingBannerStack>
           <StreamBudgetBanner />
-          <DbcertBanner conversationId={conversationId} hostId={hostId} />
           <SandboxActionBanner />
         </FloatingBannerStack>
         {/* Left-edge minimap: one tick per turn. Desktop-only. */}
