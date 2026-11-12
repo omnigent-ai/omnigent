@@ -3,9 +3,9 @@
  * "New workflow" button. Laid out like the Automations page.
  *
  * New workflow starts a session, from the new-session page's defaults, that asks
- * the agent to draft and save the workflow. Run opens the new-session page with
- * the run's request, so the user picks where and how it runs. Delete removes one;
- * Edit and Create automation aren't connected yet.
+ * the agent to draft and save the workflow. Run opens a dialog to pick where and
+ * how the workflow's session runs. Delete removes one; Create automation isn't
+ * connected yet.
  */
 
 import { useMemo, useState } from "react";
@@ -16,11 +16,16 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { showToast } from "@/components/ui/toast";
 import { NewWorkflowDialog } from "@/components/workflows/NewWorkflowDialog";
+import { RunWorkflowDialog } from "@/components/workflows/RunWorkflowDialog";
 import { WorkflowRow } from "@/components/workflows/WorkflowRow";
-import { useDeleteWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import {
+  type SavedWorkflow,
+  useDeleteWorkflow,
+  useSavedWorkflows,
+} from "@/hooks/useSavedWorkflows";
 import { newSessionLocation } from "@/lib/newSessionHandoff";
 import { useNavigate } from "@/lib/routing";
-import { createWorkflowPrompt, runSavedWorkflowPrompt } from "@/lib/workflow";
+import { createWorkflowPrompt } from "@/lib/workflow";
 
 export function WorkflowsPage() {
   const { workflows, isLoading, isError, refresh } = useSavedWorkflows();
@@ -28,6 +33,9 @@ export function WorkflowsPage() {
   const navigate = useNavigate();
   const [search, setSearch] = useState("");
   const [creating, setCreating] = useState(false);
+  // The workflow stays set while its Run dialog closes.
+  const [runTarget, setRunTarget] = useState<SavedWorkflow | null>(null);
+  const [runOpen, setRunOpen] = useState(false);
 
   const hasAnyWorkflows = workflows.length > 0;
   const filtered = useMemo(() => {
@@ -99,8 +107,10 @@ export function WorkflowsPage() {
             <WorkflowRow
               key={workflow.id}
               workflow={workflow}
-              onRun={() => navigate(newSessionLocation(runSavedWorkflowPrompt(workflow), []))}
-              onEdit={() => showToast("Editing workflows isn’t connected yet.")}
+              onRun={() => {
+                setRunTarget(workflow);
+                setRunOpen(true);
+              }}
               onCreateAutomation={() =>
                 showToast("Creating automations from workflows isn’t connected yet.")
               }
@@ -122,6 +132,7 @@ export function WorkflowsPage() {
         }
         takenNames={takenNames}
       />
+      <RunWorkflowDialog workflow={runTarget} open={runOpen} onOpenChange={setRunOpen} />
     </PageScroll>
   );
 }

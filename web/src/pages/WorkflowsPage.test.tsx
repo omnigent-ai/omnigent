@@ -9,13 +9,18 @@ import {
 } from "@/hooks/useSavedWorkflows";
 import { NEW_SESSION_HANDOFF_PARAM, peekNewSessionHandoff } from "@/lib/newSessionHandoff";
 import type * as RoutingModule from "@/lib/routing";
-import { createWorkflowPrompt, runSavedWorkflowPrompt } from "@/lib/workflow";
+import { createWorkflowPrompt } from "@/lib/workflow";
 
 import { WorkflowsPage } from "./WorkflowsPage";
 
 vi.mock("@/hooks/useSavedWorkflows", () => ({
   useSavedWorkflows: vi.fn(),
   useDeleteWorkflow: vi.fn(),
+}));
+// The dialog has its own tests; here it only shows which workflow it would run.
+vi.mock("@/components/workflows/RunWorkflowDialog", () => ({
+  RunWorkflowDialog: (props: { workflow: SavedWorkflow | null; open: boolean }) =>
+    props.open ? <div data-testid="run-workflow-dialog">{props.workflow?.name}</div> : null,
 }));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 const navigate = vi.fn();
@@ -87,28 +92,21 @@ describe("WorkflowsPage", () => {
     expect(showToast).toHaveBeenCalledWith("Couldn’t delete “Fix flaky tests”.");
   });
 
-  it("runs a workflow from the new-session page, where the user picks where it runs", () => {
+  it("opens the Run dialog for the workflow", () => {
     mockWorkflows({ workflows: WORKFLOWS });
     render(<WorkflowsPage />);
+    expect(screen.queryByTestId("run-workflow-dialog")).toBeNull();
 
-    openMenu(rows()[0]!);
+    openMenu(rows()[1]!);
     fireEvent.click(screen.getByTestId("workflow-run"));
 
-    const location = navigate.mock.calls[0]![0] as string;
-    const token = new URLSearchParams(location.split("?")[1]).get(NEW_SESSION_HANDOFF_PARAM);
-    expect(peekNewSessionHandoff(token)).toEqual({
-      text: runSavedWorkflowPrompt(WORKFLOWS[0]!),
-      files: [],
-    });
+    expect(screen.getByTestId("run-workflow-dialog")).toHaveTextContent("Release a new version");
+    expect(navigate).not.toHaveBeenCalled();
   });
 
-  it("says Edit and Create automation aren't connected yet", () => {
+  it("says Create automation isn't connected yet", () => {
     mockWorkflows({ workflows: WORKFLOWS });
     render(<WorkflowsPage />);
-
-    openMenu(rows()[0]!);
-    fireEvent.click(screen.getByTestId("workflow-edit"));
-    expect(showToast).toHaveBeenLastCalledWith("Editing workflows isn’t connected yet.");
 
     openMenu(rows()[0]!);
     fireEvent.click(screen.getByTestId("workflow-create-automation"));

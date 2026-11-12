@@ -334,6 +334,38 @@ describe("createSession", () => {
     });
   });
 
+  it("forwards the host, directory, labels and launch settings for a host start", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_run",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await createSession("agent_xyz", [], {
+      hostId: "host_1",
+      workspace: "/home/you/project",
+      labels: { "omnigent.ui": "terminal" },
+      terminalLaunchArgs: ["--permission-mode", "plan"],
+      modelOverride: "claude-opus-4-7",
+      reasoningEffort: "high",
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      agent_id: "agent_xyz",
+      initial_items: [],
+      host_id: "host_1",
+      workspace: "/home/you/project",
+      labels: { "omnigent.ui": "terminal" },
+      terminal_launch_args: ["--permission-mode", "plan"],
+      model_override: "claude-opus-4-7",
+      reasoning_effort: "high",
+    });
+  });
+
   it("omits the optional fields entirely when no options are passed", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({

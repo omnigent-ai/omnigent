@@ -1,5 +1,5 @@
 import type { ComponentType, ReactNode } from "react";
-import { ClockIcon, MoreHorizontalIcon, PencilIcon, PlayIcon, Trash2Icon } from "lucide-react";
+import { ClockIcon, MoreHorizontalIcon, PlayIcon, Trash2Icon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -21,23 +21,16 @@ import { cn } from "@/lib/utils";
 export interface WorkflowRowProps {
   workflow: SavedWorkflow;
   onRun: (workflow: SavedWorkflow) => void;
-  onEdit: (workflow: SavedWorkflow) => void;
   onCreateAutomation: (workflow: SavedWorkflow) => void;
   onDelete: (workflow: SavedWorkflow) => void;
 }
 
 /**
- * One saved workflow: its name and description, with Run, Edit, Create
- * automation and Delete in a ⋯ menu and on right-click, like an automation's row.
+ * One saved workflow: its name and description, with Run, Create automation and
+ * Delete in a ⋯ menu and on right-click, like an automation's row.
  */
-export function WorkflowRow({
-  workflow,
-  onRun,
-  onEdit,
-  onCreateAutomation,
-  onDelete,
-}: WorkflowRowProps) {
-  const actions = { workflow, onRun, onEdit, onCreateAutomation, onDelete };
+export function WorkflowRow({ workflow, onRun, onCreateAutomation, onDelete }: WorkflowRowProps) {
+  const actions = { workflow, onRun, onCreateAutomation, onDelete };
 
   return (
     <ContextMenu>
@@ -96,14 +89,12 @@ function WorkflowMenuItems({
   Item,
   workflow,
   onRun,
-  onEdit,
   onCreateAutomation,
   onDelete,
 }: {
   Item: ComponentType<MenuItemProps>;
   workflow: SavedWorkflow;
   onRun: (workflow: SavedWorkflow) => void;
-  onEdit: (workflow: SavedWorkflow) => void;
   onCreateAutomation: (workflow: SavedWorkflow) => void;
   onDelete: (workflow: SavedWorkflow) => void;
 }) {
@@ -119,16 +110,6 @@ function WorkflowMenuItems({
       >
         <PlayIcon className="size-4" />
         Run
-      </Item>
-      <Item
-        onSelect={() => {
-          trackClick("workflows.row.edit", "button");
-          onEdit(workflow);
-        }}
-        data-testid="workflow-edit"
-      >
-        <PencilIcon className="size-4" />
-        Edit
       </Item>
       <Item
         onSelect={() => {

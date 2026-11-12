@@ -169,7 +169,7 @@ function sandboxRepositoryHint(count: number): string {
  * Compact host label for the Select item — mirrors NewChatDialog's
  * HostOption (which is private to that module).
  */
-function HostLabel({ host }: { host: Host }) {
+export function HostLabel({ host }: { host: Host }) {
   const isOnline = host.status === "online";
   return (
     <span className="flex items-center gap-2">
@@ -272,7 +272,8 @@ export interface ForkRunConfigValue {
  * permission/approval/mode pickers seed from the source only on a same-AGENT
  * fork (`sameAgentAsSource`); otherwise each seeds the target's default. See
  * the parent for how those two flags are derived from the backend's
- * `copy_model_settings` / `copy_terminal_launch_args` gates.
+ * `copy_model_settings` / `copy_terminal_launch_args` gates. The Run workflow
+ * dialog passes no source, so every picker starts on its default there.
  *
  * Emission is opt-in per control: a field is sent ONLY when the user actually
  * changed that control (see `touched`). An untouched control omits its field,
@@ -295,7 +296,7 @@ export interface ForkRunConfigValue {
  *   leaves it on Default until a host is chosen.
  * @param onChange - Reports the ready-to-send value on every change.
  */
-function ForkRunConfig({
+export function ForkRunConfig({
   targetHarness,
   targetAgent,
   sourceSession,
