@@ -27,7 +27,37 @@ import { useChangesViewState } from "./useChangesViewState";
 const toast = vi.hoisted(() =>
   Object.assign(vi.fn(), { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() }),
 );
-const mocks = vi.hoisted(() => ({ copyText: vi.fn(async () => {}), mobile: false }));
+const mocks = vi.hoisted(() => ({
+  copyText: vi.fn(async () => {}),
+  mobile: false,
+  /** The commit list the Commits view reads. */
+  commitList: { object: "list", has_more: false, data: [] as unknown[] },
+  /** Each commit's patch by sha, as the commit-diff query returns it. */
+  commitPatches: new Map<string, string>(),
+  /** The PR's changes after each commit, up to the head, by sha. */
+  sincePatches: new Map<string, string>(),
+  /** Each commit-diff read's commit and until-head sha, in order. */
+  commitDiffReads: [] as [string | null, string | null][],
+  /** The commit-diff query's error, when a test wants a failed read. */
+  commitDiffError: null as Error | null,
+  /** The commit list's query cannot run here, so it has no data. */
+  commitsUnavailable: false,
+  /** The commit list's error, when a test wants a failed read. */
+  commitsError: null as Error | null,
+  /** The commit list's refetch, to see a retry. */
+  commitsRefetch: vi.fn(),
+  /** The PR's server lacks the commit routes. */
+  commitsUnsupported: false,
+  /** A saved review draft, anchored to one file's line, as the composer hook reports it. */
+  draftAnchor: null as null | {
+    path: string;
+    side: "LEFT" | "RIGHT";
+    line: number;
+    start_line: null;
+    head_sha: string;
+    base_sha: string;
+  },
+}));
 vi.mock("sonner", async (importOriginal) => ({
   ...(await importOriginal<typeof SonnerModule>()),
   toast,
@@ -40,12 +70,42 @@ vi.mock("@/lib/clipboard", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
   ...(await importOriginal<typeof UsePullRequestsModule>()),
-  usePullRequestReviewThreadComposer: () => ({
-    draft: { pending: false, anchor: null },
+  // The saved draft belongs to one file, so the anchor is returned for that path only.
+  usePullRequestReviewThreadComposer: (_conversationId: string, _prUrl: string, path: string) => ({
+    draft: {
+      body: "",
+      pending: false,
+      error: null,
+      anchor: mocks.draftAnchor?.path === path ? mocks.draftAnchor : undefined,
+    },
     stale: false,
     selectLines: vi.fn(),
     cancel: vi.fn(),
+    setBody: vi.fn(),
+    post: vi.fn(),
   }),
+  // A disabled query has no data, as when the workspace cannot be served.
+  usePullRequestCommits: () => ({
+    data: mocks.commitsUnavailable || mocks.commitsError ? undefined : mocks.commitList,
+    isLoading: false,
+    error: mocks.commitsError,
+    refetch: mocks.commitsRefetch,
+  }),
+  usePullRequestCommitsUnsupported: () => mocks.commitsUnsupported,
+  usePullRequestCommitDiff: (
+    _conversationId: string,
+    _prUrl: string,
+    sha: string | null,
+    untilHeadSha: string | null = null,
+  ) => {
+    mocks.commitDiffReads.push([sha, untilHeadSha]);
+    const patches = untilHeadSha ? mocks.sincePatches : mocks.commitPatches;
+    return {
+      data: sha ? { object: "session.github.pr_diff", patch: patches.get(sha) } : undefined,
+      isLoading: false,
+      error: mocks.commitDiffError,
+    };
+  },
 }));
 vi.mock("@/components/theme/useResolvedThemeMode", () => ({
   useResolvedThemeMode: () => "light",
@@ -121,13 +181,19 @@ function renderTab({
   patch = PATCH,
   threads = [],
   listing = {},
+  commitHistory = false,
+  headRepositoryUrl,
 }: {
   conversationId: string;
   files?: PullRequestChangedFile[];
   patch?: string;
   threads?: ReviewThread[];
-  /** Changed-file list fields beyond the file array, such as truncation. */
-  listing?: { has_more?: boolean; total_count?: number | null };
+  /** Changed-file list fields beyond the file array, such as truncation or the pinned head. */
+  listing?: { has_more?: boolean; total_count?: number | null; head_sha?: string | null };
+  /** The provider lists commits, so the Changes toolbar offers the Commits view. */
+  commitHistory?: boolean;
+  /** A GitHub head repository, so files can be opened on GitHub. */
+  headRepositoryUrl?: string;
 }) {
   const prUrl = prUrlFor(conversationId);
   const tabProps = (current: string) =>
@@ -135,10 +201,17 @@ function renderTab({
       conversationId,
       data: {
         selected_pr_url: prUrl,
-        capabilities: {},
+        capabilities: commitHistory ? { commit_history: true } : {},
         auth: { selected_account: null },
+        ...(headRepositoryUrl ? { provider: "github" } : {}),
       },
-      pr: { url: prUrl, head_sha: "head", base_sha: "base", state: "OPEN" },
+      pr: {
+        url: prUrl,
+        head_sha: "head",
+        base_sha: "base",
+        state: "OPEN",
+        head_repository_url: headRepositoryUrl,
+      },
       prUrl,
       canEdit: false,
       selected: true,
@@ -524,6 +597,7 @@ function viewedTab({
   diffHead = head,
   listHead = head,
   patch,
+  commitHistory = false,
 }: {
   conversationId: string;
   head?: string;
@@ -537,13 +611,14 @@ function viewedTab({
   listHead?: string | null;
   /** The whole-PR patch the diff reports. Without one, every file is unverified. */
   patch?: string;
+  commitHistory?: boolean;
 }) {
   const props = {
     conversationId,
     data: {
       selected_pr_url: PR_URL,
       base_ref: "main",
-      capabilities: {},
+      capabilities: commitHistory ? { commit_history: true } : {},
       auth: { selected_account: null },
     },
     pr: { url: PR_URL, number: 1, head_sha: head, base_sha: "base", state: "OPEN" },
@@ -597,6 +672,19 @@ function isListed(path: string): boolean {
 
 const viewedBox = (path: string) => screen.getByRole("checkbox", { name: `Viewed ${path}` });
 
+/**
+ * Stores marks as another tab would: the entry changes in storage, and this tab hears only the
+ * `storage` event.
+ */
+function markInOtherTab(marks: Record<string, string[]>) {
+  const key = viewedStorageKey(window.location.origin, "alice", IDENTITY);
+  const newValue = JSON.stringify({ v: 2, marks, updatedAt: Date.now() });
+  localStorage.setItem(key, newValue);
+  act(() => {
+    window.dispatchEvent(new StorageEvent("storage", { key, newValue, storageArea: localStorage }));
+  });
+}
+
 describe("PullRequestChangesTab viewed files", () => {
   beforeEach(() => {
     localStorage.clear();
@@ -639,6 +727,66 @@ describe("PullRequestChangesTab viewed files", () => {
     expect(screen.getByText("0 / 2 files viewed")).toBeInTheDocument();
   });
 
+  it("collapses a file that another tab marks viewed", () => {
+    render(viewedTab({ conversationId: "viewed-remote" }));
+    expect(isCollapsed("a.ts")).toBe(false);
+
+    markInOtherTab({ "a.ts": [unverifiedPatchHash("head1")] });
+
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+  });
+
+  it("keeps a file the reader expanded after another tab marked it viewed", () => {
+    render(viewedTab({ conversationId: "viewed-remote-expand" }));
+    markInOtherTab({ "a.ts": [unverifiedPatchHash("head1")] });
+    fireEvent.click(fileSection("a.ts").querySelector("button")!);
+    expect(isCollapsed("a.ts")).toBe(false);
+
+    // Another mark from the other tab re-reads storage without a new mark on a.ts.
+    markInOtherTab({
+      "a.ts": [unverifiedPatchHash("head1")],
+      "b.ts": [unverifiedPatchHash("head1")],
+    });
+
+    expect(isCollapsed("a.ts")).toBe(false);
+    expect(isCollapsed("b.ts")).toBe(true);
+
+    // Another tab unmarks a.ts: it stays open. Marking it again collapses it.
+    markInOtherTab({ "b.ts": [unverifiedPatchHash("head1")] });
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(false);
+    markInOtherTab({
+      "a.ts": [unverifiedPatchHash("head1")],
+      "b.ts": [unverifiedPatchHash("head1")],
+    });
+    expect(isCollapsed("a.ts")).toBe(true);
+  });
+
+  it("keeps a file the reader expanded when viewed state drops out and returns on the same head", () => {
+    const { rerender } = render(viewedTab({ conversationId: "viewed-remote-reload" }));
+    markInOtherTab({ "a.ts": [unverifiedPatchHash("head1")] });
+    fireEvent.click(fileSection("a.ts").querySelector("button")!);
+    expect(isCollapsed("a.ts")).toBe(false);
+
+    rerender(viewedTab({ conversationId: "viewed-remote-reload", identity: null }));
+    rerender(viewedTab({ conversationId: "viewed-remote-reload" }));
+
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(false);
+  });
+
+  it("expands a file that another tab's mark collapsed once the head moves", () => {
+    const { rerender } = render(viewedTab({ conversationId: "viewed-remote-head", head: "head1" }));
+    markInOtherTab({ "a.ts": [unverifiedPatchHash("head1")] });
+    expect(isCollapsed("a.ts")).toBe(true);
+
+    rerender(viewedTab({ conversationId: "viewed-remote-head", head: "head2" }));
+
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(false);
+  });
+
   it("hides viewed files together with the path filter", () => {
     const store = renderHook(() => useChangesViewState("viewed-hide", PR_URL));
     const files = [changed("src/a.ts"), changed("src/b.ts"), changed("docs/a.md")];
@@ -667,6 +815,30 @@ describe("PullRequestChangesTab viewed files", () => {
 
     expect(screen.getByRole("checkbox", { name: "Hide viewed" })).not.toBeChecked();
     expect(isListed("a.ts")).toBe(true);
+  });
+
+  it("moves focus to the next shown file's Viewed box when Hide viewed removes the file just marked", () => {
+    render(viewedTab({ conversationId: "viewed-focus-next" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Hide viewed" }));
+
+    // The reader's click focuses the box before the file it marks disappears.
+    viewedBox("a.ts").focus();
+    fireEvent.click(viewedBox("a.ts"));
+
+    expect(isListed("a.ts")).toBe(false);
+    expect(viewedBox("b.ts")).toHaveFocus();
+  });
+
+  it("moves focus to Hide viewed when the file just marked was the last one shown", () => {
+    render(viewedTab({ conversationId: "viewed-focus-last" }));
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Hide viewed" }));
+
+    viewedBox("b.ts").focus();
+    fireEvent.click(viewedBox("b.ts"));
+
+    expect(screen.getByText("All 2 files viewed")).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Hide viewed" })).toHaveFocus();
   });
 
   it("resets a changed file's mark on a new head and shows a dismissible notice", () => {
@@ -1382,5 +1554,393 @@ describe("PullRequestChangesTab file actions and filter", () => {
     expect(container.querySelector('[data-review-thread="t-b"]')).toBeNull();
     expect(container.querySelector('[data-review-thread="t-a"]')).not.toBeNull();
     expect(screen.queryByText("Earlier conversations and unavailable diffs")).toBeNull();
+  });
+});
+
+describe("PullRequestChangesTab commits", () => {
+  const SHA_A = "a".repeat(40);
+  const SHA_B = "b".repeat(40);
+  const commit = (sha: string, title: string) => ({
+    object: "session.github.commit",
+    sha,
+    title,
+    author: "Ada",
+    date: "2026-11-01T10:00:00Z",
+  });
+
+  beforeEach(() => {
+    // Viewed marks are keyed by identity and head, so one test's marks would leak into the next.
+    localStorage.clear();
+    mocks.commitList = {
+      object: "list",
+      has_more: false,
+      data: [commit(SHA_A, "Add a.ts"), commit(SHA_B, "Add b.ts")],
+    };
+    mocks.commitPatches.clear();
+    mocks.commitPatches.set(SHA_A, A);
+    mocks.commitPatches.set(SHA_B, B);
+    mocks.sincePatches.clear();
+    mocks.commitDiffReads = [];
+    mocks.commitDiffError = null;
+    mocks.commitsError = null;
+    mocks.commitsRefetch.mockClear();
+    mocks.draftAnchor = null;
+    mocks.commitsUnsupported = false;
+  });
+
+  it("lists commits, opens one with its own files, and steps between commits", () => {
+    renderTab({
+      conversationId: "commits-open",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+    expect(isListed("a.ts")).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Add b\.ts/ }));
+
+    expect(isListed("b.ts")).toBe(true);
+    expect(isListed("a.ts")).toBe(false);
+    expect(screen.getByRole("button", { name: "Next commit" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Previous commit" }));
+    expect(isListed("a.ts")).toBe(true);
+    expect(isListed("b.ts")).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Back to commits" }));
+    expect(screen.getByRole("button", { name: /Add a\.ts/ })).toBeInTheDocument();
+  });
+
+  it("shows only the changes since a picked commit, without review controls, then all again", () => {
+    mocks.commitList = {
+      object: "list",
+      has_more: false,
+      data: [
+        { ...commit(SHA_A, "Parent work"), head_of: [{ number: 41, url: null, state: "OPEN" }] },
+        commit(SHA_B, "Own work"),
+      ],
+    };
+    mocks.sincePatches.set(SHA_A, B);
+    renderTab({
+      conversationId: "changes-since",
+      commitHistory: true,
+      listing: { head_sha: SHA_B },
+      headRepositoryUrl: "https://github.com/fork/app",
+    });
+    expect(isListed("a.ts")).toBe(true);
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Changes since" }));
+    // Nothing comes after the head, so it isn't offered.
+    expect(screen.queryByRole("option", { name: /Own work/ })).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: /Head of #41.*Parent work/ }));
+
+    expect(mocks.commitDiffReads.at(-1)).toEqual([SHA_A, SHA_B]);
+    expect(isListed("b.ts")).toBe(true);
+    expect(isListed("a.ts")).toBe(false);
+    expect(screen.queryByRole("checkbox", { name: "Hide viewed" })).toBeNull();
+    // The narrowed patch ends at the head, so its files open there.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for b.ts" }), {
+      button: 0,
+    });
+    expect(screen.getByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute(
+      "href",
+      `https://github.com/fork/app/blob/${SHA_B}/b.ts`,
+    );
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Changes since" }));
+    fireEvent.click(screen.getByRole("option", { name: "PR base (all changes)" }));
+    expect(isListed("a.ts")).toBe(true);
+  });
+
+  it("offers the newest listed commit when GitHub capped the list before the head", () => {
+    mocks.commitList = {
+      object: "list",
+      has_more: true,
+      data: [commit(SHA_A, "Early work"), commit(SHA_B, "Last listed work")],
+    };
+    renderTab({
+      conversationId: "changes-since-capped",
+      commitHistory: true,
+      listing: { head_sha: "c".repeat(40) },
+    });
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Changes since" }));
+    expect(screen.getByRole("option", { name: /Last listed work/ })).toBeInTheDocument();
+    expect(screen.getByText(/Only the first \d+ commits are listed/)).toBeInTheDocument();
+  });
+
+  it("says why the commits failed to load and retries when the picker opens again", () => {
+    mocks.commitsError = new Error("GitHub could not load the PR's commits.");
+    renderTab({
+      conversationId: "changes-since-failed",
+      commitHistory: true,
+      listing: { head_sha: SHA_B },
+    });
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Changes since" }));
+    expect(screen.getByRole("alert")).toHaveTextContent(/could not load the PR's commits/);
+    expect(mocks.commitsRefetch).toHaveBeenCalled();
+  });
+
+  it("hides the viewed controls and marks in a commit view, and keeps the marks for Changes", () => {
+    render(viewedTab({ conversationId: "commits-viewed", commitHistory: true }));
+    fireEvent.click(viewedBox("a.ts"));
+    expect(screen.getAllByText(/^Viewed,/).length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Add a\.ts/ }));
+    expect(screen.queryByRole("checkbox", { name: "Hide viewed" })).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: /^Viewed / })).toBeNull();
+    expect(screen.queryAllByText(/^Viewed,/)).toHaveLength(0);
+    expect(isCollapsed("a.ts")).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+  });
+
+  it("keeps the PR's Hide viewed when Find shows a commit file the path filter hides", () => {
+    render(viewedTab({ conversationId: "commits-hide-viewed", commitHistory: true }));
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Hide viewed" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Add a\.ts/ }));
+    fireEvent.change(screen.getByRole("searchbox", { name: "Filter changed files" }), {
+      target: { value: "nothing-matches" },
+    });
+    openFind("a.ts");
+    fireEvent.click(screen.getByRole("button", { name: "Show" }));
+    expect(isListed("a.ts")).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+    expect(screen.getByRole("checkbox", { name: "Hide viewed" })).toBeChecked();
+  });
+
+  it("keeps the PR's collapse and reveal state through commit toggles, and resets it on a new head", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "commits-isolated", commitHistory: true }),
+    );
+    fireEvent.click(viewedBox("a.ts"));
+    expect(isCollapsed("a.ts")).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Add a\.ts/ }));
+    expect(isCollapsed("a.ts")).toBe(false);
+    // The commit's own collapse toggles, then a sidebar jump reveals the collapsed file, in the commit only.
+    fireEvent.click(fileSection("a.ts").querySelector("button")!);
+    expect(isCollapsed("a.ts")).toBe(true);
+    fireEvent.click(document.querySelector<HTMLButtonElement>('button[title="a.ts"]')!);
+    expect(isCollapsed("a.ts")).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+
+    rerender(viewedTab({ conversationId: "commits-isolated", commitHistory: true, head: "head2" }));
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(false);
+  });
+
+  it("keeps a saved PR draft in Changes, leaves it out of a commit view, and returns it unchanged", () => {
+    mocks.draftAnchor = {
+      path: "a.ts",
+      side: "RIGHT",
+      line: 2,
+      start_line: null,
+      head_sha: "head",
+      base_sha: "base",
+    };
+    renderTab({
+      conversationId: "commits-draft",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+    expect(screen.getByRole("region", { name: "New review conversation" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Add a\.ts/ }));
+    expect(isListed("a.ts")).toBe(true);
+    expect(screen.queryByRole("region", { name: "New review conversation" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+    expect(screen.getByRole("region", { name: "New review conversation" })).toBeInTheDocument();
+  });
+
+  it("returns a saved commit view to Changes and hides the switch when the server lacks the routes", () => {
+    const { rerender } = renderTab({
+      conversationId: "commits-unsupported",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    expect(screen.getByText("2 commits")).toBeInTheDocument();
+
+    // A capable host behind an older server: the 404 from the commit routes marks the PR.
+    mocks.commitsUnsupported = true;
+    rerender(PATCH);
+
+    expect(screen.queryByRole("button", { name: "Commits" })).toBeNull();
+    expect(screen.queryByText("2 commits")).toBeNull();
+    expect(isListed("a.ts")).toBe(true);
+    expect(toast).toHaveBeenCalledWith(
+      "Commits need an updated Omnigent server.",
+      expect.objectContaining({ id: "pr-commits-unsupported" }),
+    );
+
+    // The saved commit view did not survive: once the server has the routes, Changes is shown.
+    mocks.commitsUnsupported = false;
+    rerender(PATCH);
+    expect(screen.getByRole("button", { name: "Commits" })).toBeInTheDocument();
+    expect(screen.queryByText("2 commits")).toBeNull();
+  });
+
+  it("keeps the commit search while the reader moves between the list and a commit", () => {
+    renderTab({
+      conversationId: "commits-query",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search commits" }), {
+      target: { value: "add b" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Add b\.ts/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to commits" }));
+
+    expect(screen.getByRole("searchbox", { name: "Search commits" })).toHaveValue("add b");
+    expect(screen.queryByRole("button", { name: /Add a\.ts/ })).toBeNull();
+  });
+
+  it("shows no file-filter toggle on the narrow commit list, where its input is not shown", () => {
+    mocks.mobile = true;
+    try {
+      renderTab({
+        conversationId: "commits-narrow",
+        commitHistory: true,
+        listing: { head_sha: "head" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+
+      expect(screen.queryByRole("button", { name: "Show file filter" })).toBeNull();
+      expect(screen.getByRole("searchbox", { name: "Search commits" })).toBeInTheDocument();
+    } finally {
+      mocks.mobile = false;
+    }
+  });
+
+  it("says the history is unavailable, not empty, when the commit query cannot run here", () => {
+    mocks.commitsUnavailable = true;
+    try {
+      renderTab({
+        conversationId: "commits-offline",
+        commitHistory: true,
+        listing: { head_sha: "head" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+
+      expect(screen.getByText("Commits are unavailable.")).toBeInTheDocument();
+    } finally {
+      mocks.commitsUnavailable = false;
+    }
+  });
+
+  it("offers no Commits view when the provider does not list commits", () => {
+    renderTab({ conversationId: "commits-absent", listing: { head_sha: "head" } });
+
+    expect(screen.queryByRole("button", { name: "Commits" })).toBeNull();
+  });
+
+  it("offers no Commits view while the file list is not pinned to a head", () => {
+    renderTab({ conversationId: "commits-unpinned", commitHistory: true });
+
+    expect(screen.queryByRole("button", { name: "Commits" })).toBeNull();
+    expect(isListed("a.ts")).toBe(true);
+  });
+
+  it("leaves Ctrl+F to the browser on the commit list, which has no find bar", () => {
+    renderTab({
+      conversationId: "commits-find",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+
+    const search = screen.getByRole("searchbox", { name: "Search commits" });
+    expect(fireEvent.keyDown(search, { key: "f", ctrlKey: true })).toBe(true);
+    expect(screen.queryByRole("textbox", { name: "Find in changes" })).toBeNull();
+  });
+
+  it("returns to the commit list when the open commit leaves the loaded list", () => {
+    const { rerender } = renderTab({
+      conversationId: "commits-gone",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Add b\.ts/ }));
+
+    mocks.commitList = { object: "list", has_more: false, data: [commit(SHA_A, "Add a.ts")] };
+    rerender(B);
+
+    expect(screen.getByRole("button", { name: /Add a\.ts/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Back to commits" })).toBeNull();
+  });
+
+  it("shows a failed commit-diff read in place of the commit's files", () => {
+    mocks.commitDiffError = new Error("Commit diff unavailable");
+    renderTab({
+      conversationId: "commits-error",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Add b\.ts/ }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Commit diff unavailable");
+  });
+
+  it("says a commit with no file changes has none, rather than the PR's list", () => {
+    const shaEmpty = "e".repeat(40);
+    mocks.commitList = {
+      object: "list",
+      has_more: false,
+      data: [commit(shaEmpty, "Empty commit")],
+    };
+    mocks.commitPatches.set(shaEmpty, "");
+    renderTab({
+      conversationId: "commits-empty",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Empty commit/ }));
+
+    expect(screen.getAllByText("This commit has no file changes.").length).toBeGreaterThan(0);
+    expect(screen.queryByText("No changes vs base.")).toBeNull();
+  });
+
+  it("disables a deleted file's Open in a commit view, since the commit has no page for it", () => {
+    const deletedPatch =
+      "diff --git a/gone.ts b/gone.ts\ndeleted file mode 100644\n--- a/gone.ts\n+++ /dev/null\n" +
+      "@@ -1 +0,0 @@\n-bye\n";
+    const shaC = "c".repeat(40);
+    mocks.commitList = { object: "list", has_more: false, data: [commit(shaC, "Remove gone.ts")] };
+    mocks.commitPatches.set(shaC, deletedPatch);
+    renderTab({
+      conversationId: "commits-deleted",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Remove gone\.ts/ }));
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for gone.ts" }), {
+      button: 0,
+    });
+
+    expect(screen.getByText("Deleted in this commit")).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /Open in/ })).toHaveAttribute("data-disabled");
+    expect(screen.queryByRole("link", { name: /Open in/ })).toBeNull();
   });
 });

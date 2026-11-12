@@ -805,6 +805,40 @@ async def test_edit_grant_allows_post_but_blocks_permission_management(
     )
 
 
+async def test_move_to_managed_sandbox_requires_owner_access(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Moving a session onto a new sandbox is owner-only, like binding a
+    runner: an editor or a manager gets 403 and a user without access 404,
+    and none of them changes the session.
+    """
+    agent = await create_test_agent(auth_client, user="bryan")
+    session_id = (await _create_session_as(auth_client, agent["id"], "user-a"))["id"]
+    for target_user, level in (("user-b", LEVEL_EDIT), ("user-d", LEVEL_MANAGE)):
+        resp = await _grant_permission(
+            auth_client,
+            session_id,
+            granter="user-a",
+            target_user=target_user,
+            level=level,
+        )
+        assert resp.status_code == 200
+    owner = {"X-Forwarded-Email": "user-a"}
+    before = (await auth_client.get(f"/v1/sessions/{session_id}", headers=owner)).json()
+
+    for caller, expected_status in (("user-b", 403), ("user-d", 403), ("user-c", 404)):
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/managed-host",
+            json={},
+            headers={"X-Forwarded-Email": caller},
+        )
+        assert resp.status_code == expected_status, (caller, resp.text)
+
+    after = (await auth_client.get(f"/v1/sessions/{session_id}", headers=owner)).json()
+    for field in ("host_id", "workspace", "runner_id", "labels"):
+        assert after[field] == before[field], field
+
+
 async def test_archive_requires_owner_access(
     auth_client: httpx.AsyncClient,
 ) -> None:
@@ -2611,12 +2645,13 @@ async def test_w5_01_parent_session_id_allowed_with_access(
     assert grant_resp.status_code == 200
 
     # Bob can now create a child session referencing Alice's session.
-    # Use Alice's session-scoped agent (Bob has read access to Alice's
-    # owning session, so the agent access check passes).
+    # Use an agent Bob owns so this case isolates read access to the parent;
+    # managed separately requires edit on an agent's owning session.
+    bob_agent = await create_test_agent(auth_client, user="bob")
     resp = await auth_client.post(
         "/v1/sessions",
         json={
-            "agent_id": alice_session["agent_id"],
+            "agent_id": bob_agent["id"],
             "parent_session_id": alice_session_id,
         },
         headers={"X-Forwarded-Email": "bob"},
@@ -2728,7 +2763,7 @@ async def test_w7_2_session_scoped_agent_requires_access(
 async def test_w7_2_session_scoped_agent_allowed_with_access(
     auth_client: httpx.AsyncClient,
 ) -> None:
-    """Positive path: when Alice grants Bob read access to
+    """Positive path: when Alice grants Bob edit access to
     the owning session, Bob can use the session-scoped agent.
     """
     alice_session = await _create_bundled_session_as(
@@ -2737,13 +2772,13 @@ async def test_w7_2_session_scoped_agent_allowed_with_access(
     alice_agent_id = alice_session["agent_id"]
     alice_session_id = alice_session["id"]
 
-    # Alice grants Bob read access to the owning session.
+    # Alice grants Bob edit access to the owning session.
     grant_resp = await _grant_permission(
         auth_client,
         alice_session_id,
         granter="alice",
         target_user="bob",
-        level=LEVEL_READ,
+        level=LEVEL_EDIT,
     )
     assert grant_resp.status_code == 200
 
@@ -2754,7 +2789,7 @@ async def test_w7_2_session_scoped_agent_allowed_with_access(
         headers={"X-Forwarded-Email": "bob"},
     )
     assert resp.status_code == 201, (
-        f"Expected 201 when Bob has read access to Alice's owning session, "
+        f"Expected 201 when Bob has edit access to Alice's owning session, "
         f"got {resp.status_code}: {resp.text}"
     )
 
@@ -3502,10 +3537,12 @@ async def test_leave_rejects_a_sub_agent_session(
     await _grant_permission(
         auth_client, parent["id"], granter="bryan", target_user="carol", level=LEVEL_READ
     )
-    # Carol has read on the parent, so she may parent a child off it.
+    # Carol has read on the parent, so she may parent a child off it with
+    # an agent she owns; the leave behavior is the contract under test.
+    carol_agent = await create_test_agent(auth_client, user="carol")
     child_resp = await auth_client.post(
         "/v1/sessions",
-        json={"agent_id": parent["agent_id"], "parent_session_id": parent["id"]},
+        json={"agent_id": carol_agent["id"], "parent_session_id": parent["id"]},
         headers={"X-Forwarded-Email": "carol"},
     )
     assert child_resp.status_code == 201, f"child create failed: {child_resp.text}"
@@ -3566,10 +3603,11 @@ async def test_shared_parent_readiness_remains_private(
             headers={"X-Forwarded-Email": "bob"},
         )
     else:
+        bob_agent = await create_test_agent(auth_client, user="bob")
         response = await auth_client.post(
             "/v1/sessions",
             json={
-                "agent_id": parent["agent_id"],
+                "agent_id": bob_agent["id"],
                 "parent_session_id": parent["id"],
                 "harness_override": "jcode",
             },

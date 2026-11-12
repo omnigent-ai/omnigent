@@ -347,8 +347,7 @@ def test_mark_launch_default_preserves_a_hidden_configured_default() -> None:
 
     Hidden configured models are explicitly supported: crowning a different
     visible model would let a Default launch pin a model the configuration
-    never selected. With no Sol row, an unpinned launch falls back to Codex's
-    own first default.
+    never selected. An unpinned launch keeps Codex's own first default.
     """
     from omnigent.harnesses.codex_native.app_server import mark_launch_default
 
@@ -361,8 +360,8 @@ def test_mark_launch_default_preserves_a_hidden_configured_default() -> None:
     assert [row.get("isDefault") for row in pinned] == [None, True]
 
 
-def test_mark_launch_default_prefers_omnigent_default_over_codex_default() -> None:
-    """An unpinned catalog prefers Sol over Codex's current catalog default."""
+def test_mark_launch_default_keeps_codex_default_without_a_pin() -> None:
+    """An unpinned catalog keeps Codex's own default, even over an older Sol row."""
     from omnigent.harnesses.codex_native.app_server import mark_launch_default
 
     rows = [
@@ -371,8 +370,8 @@ def test_mark_launch_default_prefers_omnigent_default_over_codex_default() -> No
     ]
 
     assert mark_launch_default(rows, None) == [
-        {"id": "gpt-6-astra"},
-        {"id": "system.ai.gpt-5-6-sol", "isDefault": True},
+        {"id": "gpt-6-astra", "isDefault": True},
+        {"id": "system.ai.gpt-5-6-sol"},
     ]
     assert mark_launch_default(rows, "gpt-6-astra") == [
         {"id": "gpt-6-astra", "isDefault": True},

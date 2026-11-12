@@ -7,12 +7,9 @@
  * ``/login`` / ``/register`` / ``/members`` routes and whether to
  * render the ``AccountMenu``.
  *
- * This is the single gate for accounts UI in the SPA. When the
- * internal hosted product (header / OIDC) syncs from this repo
- * and serves this bundle, ``/v1/info`` returns
- * ``accounts_enabled: false`` and none of the accounts routes
- * are reachable — the bundle behaves identically to a pre-PR-2008
- * build for those deploys.
+ * This is the single gate for accounts UI in the SPA. Deployments that use
+ * header or OIDC auth get ``accounts_enabled: false`` from ``/v1/info``, so
+ * none of the accounts routes are reachable.
  *
  * Mirrors the ``identity.ts`` resolve-once-then-cache pattern.
  * Unauthed by design — must work before any cookie is present.
@@ -71,6 +68,7 @@ export type FeatureKey =
   | "grid_sessions_display_ui"
   | "automations_v2"
   | "splittable_terminal_view_ui"
+  | "sidebar_windowed_rows"
   | "session_orchestration";
 
 /** Deployment-wide release-feature values advertised by the server. */
@@ -109,11 +107,9 @@ export interface ServerInfo {
    */
   needs_setup: boolean;
   /**
-   * True on Databricks/internal deployments (the server's internal lakebox
-   * CLI is present). Gates Databricks-only UI hints — the "Databricks Lakebox"
-   * connect tab in the CLI command snippets. False
-   * on the OSS build, where those modules are excluded from the export, so the
-   * SPA shows the clean, provider-agnostic hints.
+   * True when the server has the lakebox CLI. Gates the Lakebox-specific UI
+   * hints, such as the connect tab in the CLI command snippets. False in
+   * builds that exclude those modules, which show provider-agnostic hints.
    */
   databricks_features: boolean;
   /**
@@ -151,6 +147,8 @@ export interface ServerInfo {
     string,
     {
       multi_repo?: boolean;
+      /** Whether a session can move onto a new sandbox of this provider (Switch host). */
+      accepts_session_move?: boolean;
       inference_models?: boolean;
       default_models?: boolean;
       repo_catalog?: { name: string; url: string }[];
@@ -236,6 +234,14 @@ export interface ServerInfo {
    * hidden there. Fails to ``false``.
    */
   archive_worktree_cleanup?: boolean;
+  /**
+   * True when the automations feature (recurring scheduled tasks) is enabled
+   * for the caller. When false the SPA hides the sidebar Automations tab and
+   * every automation entry point (the ``/v1/scheduled-tasks`` API 404s, so
+   * linking to it would be a dead page). Absent ⇒ true: servers from before
+   * the gate always offered automations.
+   */
+  automations_enabled?: boolean;
   /** True when scheduled tasks accept the optional random-worktree base ref. */
   scheduled_task_worktrees?: boolean;
   /**
@@ -250,6 +256,12 @@ export interface ServerInfo {
    * Session control there. Fails to ``false``.
    */
   scheduled_task_session_modes?: boolean;
+  /**
+   * True when a scheduled task can start every run from a copy of an existing
+   * session (``source_session_id``). Gates the session menu's "Create
+   * automation…" item. Fails to ``false``.
+   */
+  scheduled_task_source_sessions?: boolean;
   /** Connected hosts and continued sandboxes accept ten-minute schedules. */
   scheduled_task_subhour?: boolean;
   /** Server default for new trigger templates, from 10 to 240 minutes. */
@@ -264,6 +276,13 @@ export interface ServerInfo {
   request_managed_sandbox_host_id?: boolean;
   /** True when sandbox forks accept an explicit `workspaces` list; absent on older servers. */
   session_fork_workspaces?: boolean;
+  /**
+   * True when ``POST /v1/sessions/{id}/managed-host`` can move a session onto
+   * a new sandbox. Gates Switch host's sandbox rows: an older server lacks the
+   * route, and the switch releases the runner before calling it. Fails to
+   * ``false``.
+   */
+  move_to_managed_sandbox?: boolean;
   /**
    * True when the server stores user agents (``omnigent agent add``,
    * ``GET /v1/agents?scope=user``). Gates the picker's "my agents" source
@@ -287,6 +306,11 @@ export interface ServerInfo {
    */
   session_pull_requests?: boolean;
   /**
+   * True when the server stores each user's session title instructions
+   * (``/v1/settings/session-title-instructions``); absent on older servers (off).
+   */
+  session_title_instructions?: boolean;
+  /**
    * Which uploads Claude Code and Codex sessions receive as files. Null on
    * older servers, whose policy is the default extension list.
    */
@@ -297,6 +321,8 @@ export interface ServerInfo {
   scheduled_task_inbox?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
   scheduled_task_harness_settings?: boolean;
+  /** Automations accept modes that skip approval; older servers may reject them. */
+  scheduled_task_approval_skipping_modes?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
   /**
@@ -433,12 +459,15 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   dictation_available: false,
   scheduled_task_worktrees: false,
   archive_worktree_cleanup: false,
+  automations_enabled: true,
   session_search_scope: false,
   scheduled_task_session_modes: false,
+  scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
   scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
   session_fork_workspaces: false,
+  move_to_managed_sandbox: false,
   branding: null,
   picker: UNRESTRICTED_PICKER,
 };
@@ -599,8 +628,10 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           dictation_available: data.dictation_available === true,
           scheduled_task_worktrees: data.scheduled_task_worktrees === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
+          automations_enabled: data.automations_enabled !== false,
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
+          scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
           automation_trigger_poll_minutes:
             typeof data.automation_trigger_poll_minutes === "number" &&
@@ -612,6 +643,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_sandbox_workspaces: data.scheduled_task_sandbox_workspaces === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           session_fork_workspaces: data.session_fork_workspaces === true,
+          move_to_managed_sandbox: data.move_to_managed_sandbox === true,
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,
           agent_config_edit: data.agent_config_edit === true,
@@ -620,10 +652,13 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : [],
           session_claude_sdk_clear: data.session_claude_sdk_clear === true,
           session_pull_requests: data.session_pull_requests === true,
+          session_title_instructions: data.session_title_instructions === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
+          scheduled_task_approval_skipping_modes:
+            data.scheduled_task_approval_skipping_modes === true,
           branding: parseBranding(data.branding),
           picker: parsePicker(data.picker),
         };

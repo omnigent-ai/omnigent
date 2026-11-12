@@ -13,10 +13,11 @@ import shlex
 import urllib.error
 import urllib.request
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import httpx
 
@@ -69,6 +70,7 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -272,6 +274,9 @@ _CHILD_DELIVERY_CONCURRENCY = 8
 _CHILD_DELIVERY_LAG_WARNING_SECONDS = 30.0
 # Upper bound on draining queued child events at forwarder shutdown.
 _CHILD_DELIVERY_DRAIN_TIMEOUT_SECONDS = 10.0
+# Bounds the inline Codex reads that link an unregistered thread to the parent.
+_CODEX_THREAD_LINEAGE_READ_TIMEOUT_SECONDS = 5.0
+_CODEX_THREAD_LINEAGE_MAX_DEPTH = 4
 _PLAN_IMPLEMENTATION_QUESTION_ID = "plan_implementation"
 _PLAN_IMPLEMENTATION_TITLE = "Implement this plan?"
 _PLAN_IMPLEMENTATION_YES = "Yes, implement this plan"
@@ -606,6 +611,9 @@ class _CodexForwarderState:
         non-retryable error this connection (guards against re-replay
         or a repeated doomed attempt if the same collab item is observed
         multiple times).
+    :param lineage_checked_threads: Unregistered Codex thread ids already
+        checked for descent from the forwarder's thread this connection, so
+        each costs at most one lineage lookup.
     :param synced_item_keys: Stable item keys already posted to Omnigent this
         connection, e.g. ``{"thread_c:turn_c:item-1"}``. In-memory only;
         guards replay-vs-live overlap within one forwarder lifetime.
@@ -722,6 +730,7 @@ class _CodexForwarderState:
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
+    lineage_checked_threads: set[str] = field(default_factory=set)
     child_streams: dict[str, _CodexChildStream] = field(default_factory=dict)
     child_delivery_slots: asyncio.Semaphore = field(
         default_factory=lambda: asyncio.Semaphore(_CHILD_DELIVERY_CONCURRENCY)
@@ -1025,6 +1034,7 @@ class _CodexForwarderState:
         """
         self.parent_session_id = session_id
         self.pending_child_threads.clear()
+        self.lineage_checked_threads.clear()
         # The new thread has its own goal and terminals, read when it is
         # subscribed. Its sidebar flag is unknown until that sync posts it, and
         # a read still in flight for the old thread must not land on the new one.
@@ -2830,11 +2840,14 @@ async def _drive_side_chat_requests(
     """
     while True:
         try:
-            parent_thread_id = target.thread_id
-            # Only claim once the parent thread exists — a request read before
-            # then can't fork, and consuming it would lose the question (#3).
-            if parent_thread_id is not None:
-                for request in side_chat.peek_side_chat_requests(bridge_dir):
+            # Leave requests pending until a parent thread can accept them.
+            if target.thread_id is not None:
+                requests = await asyncio.to_thread(side_chat.peek_side_chat_requests, bridge_dir)
+                for request in requests:
+                    # The parent may change while filesystem I/O is in progress.
+                    parent_thread_id = target.thread_id
+                    if parent_thread_id is None:
+                        break
                     try:
                         child_thread_id = await side_chat.open_side_chat_on_client(
                             codex_client,
@@ -2851,10 +2864,15 @@ async def _drive_side_chat_requests(
                         await _post_side_chat_failed_notice(
                             ap_client, target.session_id, request.path.stem
                         )
-                    # Remove whether it forked or failed: a forked request is
-                    # done, and a failed one has surfaced a notice — keeping it
-                    # would retry the same failure forever.
-                    side_chat.discard_side_chat_request(request.path)
+                    # Finish acknowledging handled requests before a replacement
+                    # forwarder can pick them up, including during cancellation.
+                    discard = asyncio.create_task(
+                        asyncio.to_thread(side_chat.discard_side_chat_request, request.path)
+                    )
+                    try:
+                        await asyncio.shield(discard)
+                    finally:
+                        await discard
         except Exception:  # keep the drain loop alive.
             _logger.warning("Codex /side drain iteration failed", exc_info=True)
         await _sleep(_SIDE_CHAT_POLL_SECONDS)
@@ -3466,6 +3484,7 @@ async def _replay_resume_response(
             thread_id=thread_id,
             turns=turns,
             forwarder_state=forwarder_state,
+            replay_from_turn_id=replay_from_turn_id,
         )
 
 
@@ -3491,6 +3510,7 @@ async def _post_resume_turn_status(
     thread_id: str | None,
     turns: list[object],
     forwarder_state: _CodexForwarderState | None = None,
+    replay_from_turn_id: str | None = None,
 ) -> None:
     """
     Publish a missed lifecycle edge from explicit ``thread/resume`` turn state.
@@ -3508,11 +3528,14 @@ async def _post_resume_turn_status(
     :param turns: Raw Codex resume turn list.
     :param forwarder_state: Mutable forwarder state holding the turns whose
         failure was already posted, or ``None``.
+    :param replay_from_turn_id: Persisted turn this subscription is recovering.
     :returns: None.
     """
     if thread_id is None:
         return
-    edge = _resume_turn_status_edge_for_latest_turn(bridge_dir, thread_id, turns)
+    edge = _resume_turn_status_edge_for_latest_turn(
+        bridge_dir, thread_id, turns, replay_from_turn_id=replay_from_turn_id
+    )
     if (
         edge is not None
         and _turn_failure_already_posted(forwarder_state, edge.turn_id)
@@ -3530,6 +3553,8 @@ def _resume_turn_status_edge_for_latest_turn(
     bridge_dir: Path,
     thread_id: str,
     turns: list[object],
+    *,
+    replay_from_turn_id: str | None = None,
 ) -> _CodexTurnStatusEdge | None:
     """
     Return the Omnigent status represented by the latest resume turn.
@@ -3538,6 +3563,7 @@ def _resume_turn_status_edge_for_latest_turn(
     :param thread_id: Codex thread id from the resume payload, e.g.
         ``"thread_123"``.
     :param turns: Raw Codex resume turn list.
+    :param replay_from_turn_id: Persisted turn eligible for terminal idle backfill.
     :returns: Status edge when the latest turn has explicit lifecycle state and
         belongs to the bridge's current thread; otherwise ``None``.
     """
@@ -3554,6 +3580,10 @@ def _resume_turn_status_edge_for_latest_turn(
             return None
         status = _omnigent_status_from_resume_turn(turn)
         if status is None:
+            return None
+        # Fresh resume snapshots can report a just-started turn as terminal.
+        # Only the matching recovery turn can settle through idle backfill.
+        if status == "idle" and turn_id != replay_from_turn_id:
             return None
         update_active_turn_id(bridge_dir, turn_id if status == "running" else None)
         # Parity with the live path — surface ``turn.error`` (if any) that
@@ -3704,6 +3734,13 @@ async def _handle_event(
         and not usage_frame_recorded
     ):
         forwarder_state.note_usage_frame(params, expected_thread_id)
+    await _reattach_descendant_thread(
+        client,
+        params,
+        expected_thread_id=expected_thread_id,
+        codex_client=codex_client,
+        forwarder_state=forwarder_state,
+    )
     # Resolve routing: parent thread, known child thread, or stale/ignored.
     route_session_id, is_child = _resolve_event_session(
         params, method, expected_thread_id, forwarder_state, fallback_session_id=session_id
@@ -5190,37 +5227,62 @@ async def _handle_terminal_turn_boundary_inner(
         params,
         forwarder_state=forwarder_state,
     )
-    if delta_coalescer is not None:
-        await delta_coalescer.flush()
-    # Safety net: if a compaction was reported in progress but Codex never
-    # emitted a completion signal we recognize (e.g. a protocol-spelling
-    # drift), force the spinner closed at the turn boundary so it can't hang.
-    if forwarder_state is not None and forwarder_state.compaction_status_posted == "in_progress":
-        await _post_compaction_status(
-            client, session_id, "completed", forwarder_state=forwarder_state
-        )
-    await _maybe_persist_interrupted_partial_text(
-        client,
-        session_id=session_id,
-        method=method,
-        params=params,
-        forwarder_state=forwarder_state,
+    prepared_bridge = (
+        read_bridge_state(bridge_dir)
+        if bridge_dir is not None and terminal.edge is not None
+        else None
     )
-    await _flush_turn_diff(
-        client,
-        session_id=session_id,
-        params=params,
-        forwarder_state=forwarder_state,
-    )
+    preparation_error: Exception | None = None
+    try:
+        with _turn_status_publication_scope(session_id, terminal.edge, phase="before_status"):
+            if delta_coalescer is not None:
+                await delta_coalescer.flush()
+            # Safety net: if a compaction was reported in progress but Codex never
+            # emitted a completion signal we recognize (e.g. a protocol-spelling
+            # drift), force the spinner closed at the turn boundary so it can't hang.
+            if (
+                forwarder_state is not None
+                and forwarder_state.compaction_status_posted == "in_progress"
+            ):
+                await _post_compaction_status(
+                    client, session_id, "completed", forwarder_state=forwarder_state
+                )
+            await _maybe_persist_interrupted_partial_text(
+                client,
+                session_id=session_id,
+                method=method,
+                params=params,
+                forwarder_state=forwarder_state,
+            )
+            await _flush_turn_diff(
+                client,
+                session_id=session_id,
+                params=params,
+                forwarder_state=forwarder_state,
+            )
+    except Exception as exc:  # noqa: BLE001 -- re-raised after publishing the native outcome.
+        preparation_error = exc
+    if preparation_error is not None and bridge_dir is not None:
+        if prepared_bridge is None or read_bridge_state(bridge_dir) != prepared_bridge:
+            raise preparation_error
     terminal_turn_id = _terminal_turn_id_from_params(params)
     if forwarder_state is not None and terminal_turn_id is not None:
         forwarder_state.forget_user_message_copies(terminal_turn_id)
     handled = terminal.handled
-    if terminal.edge is not None:
-        await _post_turn_status_edge(client, session_id, terminal.edge)
-        if forwarder_state is not None and terminal.edge.status == "failed":
-            forwarder_state.turn_failure_surfaced = True
-            await forwarder_state.forget_posted_terminals()
+    # A failed output flush must not discard the native turn's known outcome.
+    # Keep this post in the current handler, preserving native event order.
+    try:
+        if terminal.edge is not None:
+            await _post_turn_status_edge(client, session_id, terminal.edge)
+            if forwarder_state is not None and terminal.edge.status == "failed":
+                forwarder_state.turn_failure_surfaced = True
+                await forwarder_state.forget_posted_terminals()
+    except Exception:
+        if preparation_error is not None:
+            raise preparation_error from preparation_error.__cause__
+        raise
+    if preparation_error is not None:
+        raise preparation_error
     terminal_thread_id = _thread_id_from_params(params)
     if (
         handled
@@ -6952,6 +7014,162 @@ def _extract_child_session_id(
     return child_session_id
 
 
+async def _reattach_descendant_thread(
+    client: httpx.AsyncClient,
+    params: _JsonObject,
+    *,
+    expected_thread_id: str | None,
+    codex_client: CodexAppServerClient | None,
+    forwarder_state: _CodexForwarderState | None,
+) -> None:
+    """
+    Register a sub-agent of this thread whose spawn this connection never saw.
+
+    Child routing lives in memory, so after a runner relaunch every sub-agent
+    spawned earlier is unknown, and when the parent sends one of them new work
+    no spawn item names it again. Codex records each thread's spawn parent, so
+    an unregistered thread descending from this forwarder's thread is
+    registered; the server returns the existing child session for a known
+    thread id.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param params: Codex notification params from the unregistered thread.
+    :param expected_thread_id: This forwarder's Codex thread id, e.g.
+        ``"thread_parent"``.
+    :param codex_client: Connected Codex app-server client, or ``None`` to use
+        the one on ``forwarder_state``.
+    :param forwarder_state: Mutable state holding the child-thread mappings.
+    :returns: None. The thread is mapped to a child session when it descends
+        from ``expected_thread_id``.
+    """
+    if forwarder_state is None or expected_thread_id is None:
+        return
+    codex_client = codex_client or forwarder_state.codex_client
+    parent_session_id = forwarder_state.parent_session_id
+    thread_id = _thread_id_from_params(params)
+    if (
+        codex_client is None
+        or parent_session_id is None
+        or thread_id is None
+        or thread_id == expected_thread_id
+        or forwarder_state.session_for_child_thread(thread_id) is not None
+        or thread_id in forwarder_state.lineage_checked_threads
+    ):
+        return
+    forwarder_state.lineage_checked_threads.add(thread_id)
+    thread = await _read_codex_thread(codex_client, thread_id)
+    if thread is None or not await _thread_descends_from(
+        codex_client, thread, expected_thread_id, forwarder_state
+    ):
+        return
+    response = await _post_session_event(
+        client,
+        parent_session_id,
+        event_type=_EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+        data=_codex_child_name_data(thread_id, thread),
+    )
+    child_session_id = (
+        _extract_child_session_id(response, thread_id)
+        if response is not None and response.status_code < 400
+        else None
+    )
+    if child_session_id is None:
+        _log_failed_session_event_post(_EXTERNAL_CODEX_SUBAGENT_START_TYPE, response)
+        # Its next event retries, rather than dropping the sub-agent for the connection.
+        forwarder_state.lineage_checked_threads.discard(thread_id)
+        return
+    # A thread announced on this connection is a fresh spawn whose own
+    # registration still replays its history; an earlier forwarder already
+    # mirrored any other thread's, and replaying it inline would stall the parent.
+    announced = thread_id in forwarder_state.pending_child_threads
+    forwarder_state.note_child_thread(thread_id, child_session_id)
+    if not announced:
+        forwarder_state.note_child_thread_subscribed(thread_id)
+    _logger.warning(
+        "Codex forwarder re-attached sub-agent thread %s to child session %s",
+        thread_id,
+        child_session_id,
+        extra=debug_event(
+            "codex_subagent_reattached",
+            session_id=parent_session_id,
+            child_session_id=child_session_id,
+            thread_id=thread_id,
+            announced=announced,
+        ),
+    )
+
+
+async def _read_codex_thread(
+    codex_client: CodexAppServerClient, thread_id: str
+) -> _JsonObject | None:
+    """
+    Read one Codex thread's metadata without its turns.
+
+    :param codex_client: Connected Codex app-server client.
+    :param thread_id: Codex thread id, e.g. ``"thread_child"``.
+    :returns: The ``Thread`` object, or ``None`` when Codex cannot read it.
+    """
+    try:
+        async with asyncio.timeout(_CODEX_THREAD_LINEAGE_READ_TIMEOUT_SECONDS):
+            response = await codex_client.request(
+                "thread/read", {"threadId": thread_id, "includeTurns": False}
+            )
+    except (RuntimeError, OSError, TimeoutError) as exc:
+        _logger.info(
+            "Codex forwarder could not read thread %s: %s: %s", thread_id, type(exc).__name__, exc
+        )
+        return None
+    result = response.get("result")
+    thread = result.get("thread") if isinstance(result, dict) else None
+    return thread if isinstance(thread, dict) else None
+
+
+async def _thread_descends_from(
+    codex_client: CodexAppServerClient,
+    thread: _JsonObject,
+    ancestor_thread_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> bool:
+    """
+    Whether a Codex thread was spawned, directly or through sub-agents, by another.
+
+    :param codex_client: Connected Codex app-server client, used to read
+        intermediate spawn parents.
+    :param thread: Codex ``Thread`` object to classify.
+    :param ancestor_thread_id: Thread the spawn chain must reach, e.g.
+        ``"thread_parent"``.
+    :param forwarder_state: State whose registered children count as
+        descendants of ``ancestor_thread_id``.
+    :returns: ``True`` when the spawn chain reaches ``ancestor_thread_id`` or
+        a registered child within :data:`_CODEX_THREAD_LINEAGE_MAX_DEPTH` hops.
+    """
+    current: _JsonObject | None = thread
+    for _ in range(_CODEX_THREAD_LINEAGE_MAX_DEPTH):
+        spawn_parent = _codex_thread_spawn_parent(current) if current is not None else None
+        if spawn_parent is None:
+            return False
+        if (
+            spawn_parent == ancestor_thread_id
+            or forwarder_state.session_for_child_thread(spawn_parent) is not None
+        ):
+            return True
+        current = await _read_codex_thread(codex_client, spawn_parent)
+    return False
+
+
+def _codex_thread_spawn_parent(thread: _JsonObject) -> str | None:
+    """
+    Return the thread that spawned a Codex sub-agent thread.
+
+    :param thread: Codex ``Thread`` object, e.g. from ``thread/read``.
+    :returns: Spawning thread id from the ``source.subAgent.thread_spawn``
+        metadata, or ``None`` for a thread that is not a spawned sub-agent.
+    """
+    source = _thread_spawn_source(thread)
+    parent_thread_id = source.get("parent_thread_id") if source is not None else None
+    return parent_thread_id if isinstance(parent_thread_id, str) and parent_thread_id else None
+
+
 async def _backfill_child_thread(
     client: httpx.AsyncClient,
     codex_client: CodexAppServerClient,
@@ -8374,16 +8592,49 @@ async def _post_turn_status_edge(
             output = f"{output}\n\n{_CODEX_REAUTH_HINT}"
         elif output == _CODEX_OUTPUT_LIMIT_ERROR:
             output = f"{output}\n\n{_CODEX_OUTPUT_LIMIT_HINT}"
-    await _post_status(
-        client,
-        session_id,
-        edge.status,
-        response_id=response_id,
-        output=output,
-        reauth_required=reauth_required,
-        compaction_model=edge.compaction_model,
-        selected_model=edge.selected_model,
-    )
+    with _turn_status_publication_scope(session_id, edge, phase="status_post"):
+        await _post_status(
+            client,
+            session_id,
+            edge.status,
+            response_id=response_id,
+            output=output,
+            reauth_required=reauth_required,
+            compaction_model=edge.compaction_model,
+            selected_model=edge.selected_model,
+        )
+
+
+@contextlib.contextmanager
+def _turn_status_publication_scope(
+    session_id: str,
+    edge: _CodexTurnStatusEdge | None,
+    *,
+    phase: Literal["before_status", "status_post"],
+) -> Iterator[None]:
+    """Record exceptions before or during a derived turn status publication."""
+    try:
+        yield
+    except Exception as exc:
+        if edge is not None:
+            _logger.warning(
+                "Codex turn status publication failed: status=%s phase=%s",
+                edge.status,
+                phase,
+                extra=debug_event(
+                    "codex_turn_status_publication_failed",
+                    session_id=session_id,
+                    turn_id=edge.turn_id,
+                    intended_status=edge.status,
+                    protocol_source=edge.source[:128],
+                    delivery_phase=phase,
+                    exception_type=type(exc).__name__,
+                    exception_cause_type=(
+                        type(exc.__cause__).__name__ if exc.__cause__ is not None else None
+                    ),
+                ),
+            )
+        raise
 
 
 async def _post_external_elicitation_resolved(
@@ -9253,41 +9504,71 @@ async def _post_session_event(
     :returns: The final HTTP response, or ``None`` (see
         :func:`_post_session_event_inner`).
     """
-    result = await _post_session_event_inner(
-        client,
-        session_id,
-        event_type=event_type,
-        data=data,
-        max_attempts=max_attempts,
-        timeout=timeout,
-    )
+    try:
+        result = await _post_session_event_inner(
+            client,
+            session_id,
+            event_type=event_type,
+            data=data,
+            max_attempts=max_attempts,
+            timeout=timeout,
+        )
+    except DatabricksAuthError as exc:
+        # An earlier retry may have reached the server before credentials failed.
+        if event_type in _DEAD_LETTER_EVENT_TYPES:
+            _record_failed_session_event(
+                session_id,
+                event_type=event_type,
+                data=data,
+                result=_PostResult(
+                    response=None,
+                    delivered_ambiguous=True,
+                    transport_error=type(exc).__name__,
+                ),
+                reason="credential resolution failed before acknowledgement",
+            )
+        raise
     response = result.response
     if response is not None and response.status_code < 400:
         _note_forward_success()
     else:
-        _note_forward_failure(event_type, result, session_id)
-        dl_dir = _dead_letter_dir.get()
-        if event_type in _DEAD_LETTER_EVENT_TYPES and dl_dir is not None:
-            http_status = response.status_code if response is not None else None
-            if result.rejection_reason is not None:
-                reason = result.rejection_reason
-            elif response is not None:
-                reason = f"http {response.status_code}"
-            elif result.delivered_ambiguous:
-                reason = "ambiguous transport failure (may already be committed)"
-            else:
-                reason = "proven-undelivered transport failure after retries"
-            append_dead_letter(
-                dl_dir,
-                session_id=session_id,
-                event_type=event_type,
-                payload=data,
-                reason=reason,
-                delivered_ambiguous=result.delivered_ambiguous,
-                http_status=http_status,
-                transport_error=result.transport_error,
-            )
+        _record_failed_session_event(session_id, event_type=event_type, data=data, result=result)
     return response
+
+
+def _record_failed_session_event(
+    session_id: str,
+    *,
+    event_type: str,
+    data: _JsonObject,
+    result: _PostResult,
+    reason: str | None = None,
+) -> None:
+    """Track failed mirroring and retain durable payloads for conservative replay."""
+    _note_forward_failure(event_type, result, session_id)
+    dl_dir = _dead_letter_dir.get()
+    if event_type not in _DEAD_LETTER_EVENT_TYPES or dl_dir is None:
+        return
+    response = result.response
+    if reason is None:
+        if result.rejection_reason is not None:
+            reason = result.rejection_reason
+        elif response is not None:
+            reason = f"http {response.status_code}"
+        elif result.delivered_ambiguous:
+            reason = "ambiguous transport failure (may already be committed)"
+        else:
+            reason = "proven-undelivered transport failure after retries"
+    append_dead_letter(
+        dl_dir,
+        session_id=session_id,
+        event_type=event_type,
+        payload=data,
+        reason=reason,
+        delivered_ambiguous=result.delivered_ambiguous,
+        http_status=response.status_code if response is not None else None,
+        transport_error=result.transport_error,
+    )
 
 
 async def _post_session_event_inner(
@@ -9625,11 +9906,7 @@ def _parent_thread_id_from_started_event(event: CodexMessage) -> str | None:
     thread = params.get("thread")
     if not isinstance(thread, dict):
         return None
-    source = _thread_spawn_source(thread)
-    if source is None:
-        return None
-    parent_thread_id = source.get("parent_thread_id")
-    return parent_thread_id if isinstance(parent_thread_id, str) and parent_thread_id else None
+    return _codex_thread_spawn_parent(thread)
 
 
 def _thread_started_is_subagent(event: CodexMessage) -> bool:
