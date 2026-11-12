@@ -320,6 +320,9 @@ class ServerInfoResponse(BaseModel):
     # A multipart create's metadata accepts ``model_override``; older servers
     # reject it.
     session_bundle_model_override: bool = True
+    # POST /v1/sessions/{id}/managed-host moves a session onto a new sandbox;
+    # absent on older servers, which clients treat as unsupported.
+    move_to_managed_sandbox: bool = False
     # User agents (`omnigent agent add`, GET /v1/agents?scope=user); absent on
     # older servers, which clients treat as unsupported.
     agent_install: bool = False
@@ -3755,6 +3758,7 @@ def create_app(
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
                 "session_bundle_model_override": True,
+                "move_to_managed_sandbox": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
                 "agent_config_edit": agent_store.supports_config_edit

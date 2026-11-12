@@ -4611,6 +4611,7 @@ async def _run_managed_launch(
     agent_id: str | None = None,
     host_id: str | None = None,
     sandbox_profiles: Any = None,
+    held_runner_id: str | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -4676,6 +4677,9 @@ async def _run_managed_launch(
         classifier, or ``None`` to leave it unstamped.
     :param host_id: Host id a managed create asked for, or
         ``None`` to mint one. Ignored on a relaunch.
+    :param held_runner_id: The claim a move holds on the session's runner
+        while it provisions, or ``None``. The sandbox binds only while that
+        claim stands, and any failure releases it.
     """
     from omnigent.server.managed_hosts import (
         deployment_with_inference_snapshot,
@@ -4781,7 +4785,15 @@ async def _run_managed_launch(
             relaunch_host=relaunch_host,
             sandbox_profiles=sandbox_profiles,
             sandbox_profile=profile,
+            held_runner_id=held_runner_id,
         )
+
+
+class _SessionReboundDuringProvision(Exception):
+    """The session gained a host or runner while its sandbox provisioned."""
+
+
+_SESSION_REBOUND_REASON = "session was bound to another host while its sandbox was provisioning"
 
 
 async def _bind_and_launch_managed_runner(
@@ -4797,6 +4809,7 @@ async def _bind_and_launch_managed_runner(
     relaunch_host: Host | None = None,
     sandbox_profiles: Any = None,
     sandbox_profile: dict[str, Any] | None = None,
+    held_runner_id: str | None = None,
 ) -> None:
     """
     Bind a provisioned managed host to its session and launch a runner.
@@ -4829,6 +4842,12 @@ async def _bind_and_launch_managed_runner(
     :param relaunch_host: Existing managed host row being relaunched, or
         ``None`` for a first launch (a fresh host identity was just
         minted for ``managed.host_id``).
+    :param held_runner_id: The claim a move holds on the session's runner,
+        or ``None``. The sandbox binds only while it stands; if the claim was
+        released and another host took the session, that binding wins, the
+        fresh sandbox is torn down, and the launch settles without failing the
+        session. :func:`_start_managed_launch_task` releases the claim when the
+        launch fails.
     """
     from omnigent.server.managed_hosts import terminate_managed_host
 
@@ -4838,7 +4857,17 @@ async def _bind_and_launch_managed_runner(
             if sandbox_profiles is not None
             else None
         )
-        if snapshot is None:
+        if snapshot is None and held_runner_id is not None:
+            try:
+                conv = conversation_store.set_host_id(
+                    session_id,
+                    managed.host_id,
+                    managed.workspace,
+                    expected_runner_id=held_runner_id,
+                )
+            except ValueError as exc:
+                raise _SessionReboundDuringProvision from exc
+        elif snapshot is None:
             conv = conversation_store.set_host_id(session_id, managed.host_id, managed.workspace)
         else:
             conversation_store.bind_profiled_host(
@@ -4873,12 +4902,16 @@ async def _bind_and_launch_managed_runner(
             await terminate_managed_host(host, host_store, sandbox_config, keep_if_bound=True)
 
     reason: str | None = None
+    superseded = False
     cancelled = False
     try:
         try:
             conv = await asyncio.shield(bind)
         except ConversationNotFoundError:
             reason = "session was deleted while its sandbox was provisioning"
+            return
+        except _SessionReboundDuringProvision:
+            reason, superseded = _SESSION_REBOUND_REASON, True
             return
         except Exception:  # noqa: BLE001 — settle the tracker and release the fresh sandbox
             _logger.exception("Failed to bind managed host", extra={"session_id": session_id})
@@ -4887,13 +4920,21 @@ async def _bind_and_launch_managed_runner(
         if (launch_task := asyncio.current_task()) is not None:
             _unbound_managed_launch_tasks.discard(launch_task)
         if (launch := tracker.get(session_id)) is not None:
+            launch.host_id = managed.host_id
             launch.bound.set()
         if relaunch_host is not None:
             await _note_workspace_reset_on_recreate(session_id, conversation_store)
         _publish_sandbox_status(session_id, "connecting")
         runner_id: str | None = None
+        host_conn = host_registry.get(managed.host_id) if host_registry is not None else None
+        if host_conn is None and held_runner_id is not None:
+            # The host's replica starts the runner, and only once none is bound,
+            # so hand the session over without the move's claim on it.
+            with contextlib.suppress(ConversationNotFoundError, ValueError):
+                await asyncio.to_thread(
+                    conversation_store.clear_runner_id, session_id, expected_binding=conv
+                )
         if host_registry is not None:
-            host_conn = host_registry.get(managed.host_id)
             if host_conn is not None:
                 try:
                     launch_attempt = await _launch_runner_on_host(
@@ -4901,6 +4942,8 @@ async def _bind_and_launch_managed_runner(
                         conversation_store,
                         host_registry,
                         host_conn,
+                        # Only a move's launch replaces its own claim.
+                        **({"replace_move_claim": True} if held_runner_id is not None else {}),
                     )
                     runner_id = launch_attempt.runner_id
                     reason = (
@@ -4908,6 +4951,9 @@ async def _bind_and_launch_managed_runner(
                         if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
                         else None
                     )
+                    if launch_attempt.error_code == "session_binding_changed":
+                        # Taken after the move's claim was released.
+                        reason, superseded = _SESSION_REBOUND_REASON, True
                 except OmnigentError as exc:
                     reason = str(exc)
                 except Exception as exc:  # noqa: BLE001 — admission can fail after provisioning
@@ -4944,24 +4990,34 @@ async def _bind_and_launch_managed_runner(
         if reason is not None or cancelled:
 
             async def settle_failure() -> None:
-                nonlocal reason
+                nonlocal reason, superseded
                 # A cancelled thread can still commit the binding before raising.
                 try:
                     await bind
                 except ConversationNotFoundError:
                     reason = "session was deleted while its sandbox was provisioning"
+                except _SessionReboundDuringProvision:
+                    reason, superseded = _SESSION_REBOUND_REASON, True
                 except Exception:  # noqa: BLE001 — drain the transaction before compensating
                     reason = "failed to bind managed host"
                 if reason is None:
                     # The binding committed; the host's replica can finish startup.
                     if (launch := tracker.get(session_id)) is not None:
+                        launch.host_id = managed.host_id
                         launch.bound.set()
                     return
                 try:
                     await rollback_fresh_host()
                 finally:
-                    tracker.fail(session_id, reason)
-                    _publish_sandbox_status(session_id, "failed", reason)
+                    if superseded:
+                        # The session runs on the host that took it; nothing failed.
+                        if (launch := tracker.get(session_id)) is not None:
+                            launch.superseded = True
+                        tracker.finish(session_id)
+                        _publish_sandbox_status(session_id, "ready")
+                    else:
+                        tracker.fail(session_id, reason)
+                        _publish_sandbox_status(session_id, "failed", reason)
 
             cleanup = asyncio.create_task(settle_failure())
             cleanup_cancelled = False
