@@ -5887,7 +5887,7 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
     wire_output: str | None,
 ) -> None:
     """
-    Native idle prefers the hook reply, falling back to persisted text when absent.
+    A confirmed native idle keeps the hook reply; otherwise persisted text fills it.
 
     The native forwarder posts transcript items to Omnigent server, then posts
     ``external_session_status: idle``. The runner's sub-agent registry
@@ -5954,7 +5954,9 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
         forwarded.clear()
         status_data: dict[str, Any] = {"status": "idle"}
         if wire_output is not None:
+            # The Claude ``Stop`` edge carries its reply with ``turn_completed``.
             status_data["output"] = wire_output
+            status_data["turn_completed"] = True
         status_resp = await client.post(
             f"/v1/sessions/{child['id']}/events",
             json={"type": "external_session_status", "data": status_data},
@@ -5966,10 +5968,11 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
             "path": f"/v1/sessions/{child['id']}/events",
             "body": {
                 "type": "external_session_status",
-                "data": {
-                    "status": "idle",
-                    "output": wire_output if wire_output is not None else "AP_NATIVE_DONE",
-                },
+                "data": (
+                    {"status": "idle", "output": "AP_NATIVE_DONE"}
+                    if wire_output is None
+                    else {"status": "idle", "output": wire_output, "turn_completed": True}
+                ),
                 "model_override": None,
                 "tools": None,
                 "created_by": None,
