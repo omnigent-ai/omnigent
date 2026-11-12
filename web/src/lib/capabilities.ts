@@ -286,8 +286,8 @@ export interface ServerInfo {
   scheduled_task_sandbox_workspaces?: boolean;
   /**
    * True when a managed create accepts ``host_id`` naming its new sandbox
-   * host. Older servers reject it, so the create omits it there. Fails to
-   * ``false``.
+   * host. Web JSON creates, forks and moves send a minted id without reading
+   * this flag; it is parsed but gates no send path. Fails to ``false``.
    */
   request_managed_sandbox_host_id?: boolean;
   /** True when sandbox forks accept an explicit `workspaces` list; absent on older servers. */

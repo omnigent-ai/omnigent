@@ -1894,7 +1894,7 @@ describe("ForkSessionDialog", () => {
             upToResponseId,
             sandbox: {
               provider: "agent_sandbox",
-              hostId: expect.any(String),
+              hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
               profileId: "large",
               profileRevision: "other-revision",
               workspaces: [],
@@ -2152,7 +2152,7 @@ describe("ForkSessionDialog", () => {
         config: {},
         sandbox: {
           provider: "modal",
-          hostId: expect.any(String),
+          hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
           workspaces: ["https://github.com/org/repo#release-1.2"],
         },
       });
@@ -2227,7 +2227,7 @@ describe("ForkSessionDialog", () => {
           sandbox: provider
             ? {
                 provider,
-                hostId: expect.any(String),
+                hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
                 workspaces: ["https://github.com/example-org/monorepo"],
               }
             : undefined,
@@ -2472,7 +2472,10 @@ describe("ForkSessionDialog", () => {
           ]);
         } else {
           expect(fetchSessionRepositoryBranchesMock).not.toHaveBeenCalled();
-          expect(call?.sandbox).toEqual({ provider: "agent_sandbox", hostId: expect.any(String) });
+          expect(call?.sandbox).toEqual({
+            provider: "agent_sandbox",
+            hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
+          });
         }
       },
     );
@@ -2523,7 +2526,7 @@ describe("ForkSessionDialog", () => {
       fireEvent.click(submit);
       await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
       expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
-        hostId: expect.any(String),
+        hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
         provider: "agent_sandbox",
         workspace: "https://github.com/org/api#main",
       });
@@ -2675,7 +2678,7 @@ describe("ForkSessionDialog", () => {
         fireEvent.click(screen.getByTestId("fork-session-submit"));
         await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
         expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
-          hostId: expect.any(String),
+          hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
           provider: "modal",
           workspace: "https://github.com/org/api#main",
         });
@@ -2952,7 +2955,7 @@ describe("ForkSessionDialog", () => {
 
         await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
         expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
-          hostId: expect.any(String),
+          hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
           provider: null,
           ...(acceptsWorkspaces ? { workspaces: [] } : { workspace: null }),
         });
