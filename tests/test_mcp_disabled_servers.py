@@ -415,6 +415,22 @@ def test_claude_strict_refuses_url_entries_matching_allowlisted_servers(
     assert result["deniedMcpServers"] == [other]
 
 
+def test_claude_strict_logs_unreadable_server_configs(claude_project, caplog):
+    """An unreadable ``.mcp.json`` hides allowlisted transports, so it is logged."""
+    write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
+    (claude_project / ".mcp.json").write_text("{not json", encoding="utf-8")
+    entry = {"serverUrl": "https://mcp.example.com/kept"}
+    _write_json(claude_project / ".claude/settings.json", {"allowedMcpServers": [entry]})
+    result = apply_claude_settings(
+        {}, executor="claude-native", active_harnesses=None, cwd=claude_project
+    )
+    assert result["deniedMcpServers"] == [entry]
+    assert (
+        f"mcp_strict_claude_config_read_failed path={claude_project / '.mcp.json'} "
+        "reason=JSONDecodeError"
+    ) in caplog.text
+
+
 def test_claude_strict_reads_settings_for_the_launch_environment(tmp_path, claude_project):
     """A relative config directory resolves against the launch cwd, not this process's."""
     write_mcp_inheritance({"inherit": False, "allow": ["kept"]})

@@ -281,9 +281,15 @@ def _claude_allowlisted_servers(
         return servers if isinstance(servers, Mapping) else {}
 
     def read(path: Path) -> Mapping[str, object]:
+        # Unreadable configs hide allowlisted transports, so a matching entry is denied.
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, ValueError, RecursionError):
+        except FileNotFoundError:
+            return {}
+        except (OSError, UnicodeError, ValueError, RecursionError) as error:
+            _log_read_failure(
+                path, type(error).__name__, event="mcp_strict_claude_config_read_failed"
+            )
             return {}
         return payload if isinstance(payload, dict) else {}
 
