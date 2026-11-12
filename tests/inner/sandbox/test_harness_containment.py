@@ -85,7 +85,7 @@ def _prepared_launch(
 
 
 @pytest.mark.parametrize("harness", _HARNESSES)
-@pytest.mark.parametrize("fault", ["resolve", "backend", "launcher", "inactive"])
+@pytest.mark.parametrize("fault", ["resolve", "unsupported", "backend", "launcher", "inactive"])
 def test_requested_sandbox_never_falls_back_to_bare_worker(
     harness: str, fault: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -104,7 +104,13 @@ def test_requested_sandbox_never_falls_back_to_bare_worker(
         allow_network=True,
     )
     resolve = Mock(return_value=policy)
-    launcher = Mock(side_effect=OSError("launcher unavailable"))
+    launcher = Mock(
+        side_effect=(
+            OSError("launcher unavailable")
+            if fault == "launcher"
+            else sandbox.create_exec_launcher
+        )
+    )
     implementation = Mock()
     implementation.prepare_launcher_policy.side_effect = lambda policy: policy
     implementation.wrap_launcher_argv.side_effect = lambda argv, *args, **kwargs: [
@@ -116,18 +122,20 @@ def test_requested_sandbox_never_falls_back_to_bare_worker(
         backend.side_effect = NotImplementedError("backend unavailable")
     if fault == "resolve":
         resolve.side_effect = OSError("sandbox unavailable")
+    elif fault == "unsupported":
+        resolve.side_effect = NotImplementedError("sandbox unavailable")
     monkeypatch.setattr(sandbox, "resolve_sandbox", resolve)
     monkeypatch.setattr(claude_sdk_executor, "resolve_sandbox", resolve)
     monkeypatch.setattr(codex_worker, "resolve_sandbox", resolve)
-    if fault == "launcher":
-        monkeypatch.setattr(sandbox, "create_exec_launcher", launcher)
-        monkeypatch.setattr(claude_sdk_executor, "create_exec_launcher", launcher)
-        monkeypatch.setattr(codex_worker, "create_exec_launcher", launcher)
+    monkeypatch.setattr(sandbox, "create_exec_launcher", launcher)
+    monkeypatch.setattr(claude_sdk_executor, "create_exec_launcher", launcher)
+    monkeypatch.setattr(codex_worker, "create_exec_launcher", launcher)
     monkeypatch.setattr(sandbox, "get_backend", backend)
     monkeypatch.setattr(claude_sdk_executor, "get_backend", backend)
     monkeypatch.setattr(codex_worker, "get_backend", backend)
     spec = OSEnvSpec(cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
-    with pytest.raises((OSError, NotImplementedError)):
+    expected_error = NotImplementedError if fault in ("unsupported", "backend") else OSError
+    with pytest.raises(expected_error):
         with _prepared_launch(harness, executable, workspace, spec):
             pytest.fail(f"{harness} accepted an unavailable requested sandbox")
     if fault == "launcher":
@@ -135,6 +143,7 @@ def test_requested_sandbox_never_falls_back_to_bare_worker(
     elif fault == "backend":
         backend.assert_called_once()
     else:
+        launcher.assert_not_called()
         resolve.assert_called_once()
 
 
@@ -446,30 +455,3 @@ def test_installed_codex_native_commands_remain_inside_outer_sandbox(
                 assert not output.exists()
             finally:
                 terminate_process(process)
-
-
-@pytest.mark.parametrize("spec_cwd", [None, "."])
-def test_claude_sdk_uses_executor_workspace_for_implicit_policy_cwd(
-    spec_cwd: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    policy = sandbox.SandboxPolicy(
-        backend_type="linux_bwrap",
-        active=True,
-        read_roots=[],
-        write_roots=[],
-        write_files=[],
-        allow_network=True,
-    )
-    resolve = Mock(return_value=policy)
-    backend = Mock()
-    backend.wrap_launcher_argv.return_value = ["bwrap", "python"]
-    monkeypatch.setattr(claude_sdk_executor, "resolve_sandbox", resolve)
-    monkeypatch.setattr(claude_sdk_executor, "get_backend", lambda name: backend)
-    monkeypatch.setattr(
-        claude_sdk_executor, "create_exec_launcher", Mock(return_value="/tmp/launcher")
-    )
-    monkeypatch.setattr(claude_sdk_executor, "_claude_internal_write_roots", list)
-    spec = OSEnvSpec(cwd=spec_cwd, sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
-    prepared = claude_sdk_executor.prepare_claude_cli_path("/bin/agent", spec, cwd=str(tmp_path))
-    resolve.assert_called_once_with(spec, tmp_path.resolve())
-    assert prepared.cwd == str(tmp_path.resolve())

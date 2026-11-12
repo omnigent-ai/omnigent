@@ -264,14 +264,6 @@ def test_executor_factory_decodes_os_env_json(
     assert os_env_value.sandbox.read_paths == ["/srv/data"]
 
 
-def test_executor_factory_rejects_malformed_os_env_json(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HARNESS_CLAUDE_SDK_OS_ENV", "{not-json")
-    with patch("omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__") as constructor:
-        with pytest.raises(ValueError, match="HARNESS_CLAUDE_SDK_OS_ENV"):
-            claude_sdk_harness._build_claude_sdk_executor()
-    constructor.assert_not_called()
-
-
 @pytest.mark.parametrize(
     "raw_value,expected",
     [

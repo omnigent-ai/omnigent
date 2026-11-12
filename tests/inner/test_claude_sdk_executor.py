@@ -4970,37 +4970,27 @@ def _active_policy():
     )
 
 
-def test_prepare_claude_cli_path_rejects_sandbox_resolution_failure(monkeypatch) -> None:
-    from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
-
-    with (
-        patch(
-            "omnigent.inner.claude_sdk_executor.resolve_sandbox",
-            side_effect=OSError("sandbox unavailable"),
-        ),
-        patch("omnigent.inner.claude_sdk_executor.create_exec_launcher") as launcher,
-        pytest.raises(OSError, match="sandbox unavailable"),
-    ):
-        prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
-    launcher.assert_not_called()
-
-
-def test_prepare_claude_cli_path_rejects_failed_wrap_probe(monkeypatch) -> None:
+@pytest.mark.parametrize("noop", [False, True])
+def test_prepare_claude_cli_path_rejects_failed_wrap_probe(noop: bool) -> None:
     from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
 
     backend = Mock()
-    backend.wrap_launcher_argv.side_effect = OSError("cannot wrap CLI")
+    backend.wrap_launcher_argv.side_effect = (
+        (lambda argv, *args, **kwargs: argv) if noop else OSError("cannot wrap CLI")
+    )
     with (
         patch("omnigent.inner.claude_sdk_executor.resolve_sandbox", return_value=_active_policy()),
         patch("omnigent.inner.claude_sdk_executor.get_backend", return_value=backend),
         patch("omnigent.inner.claude_sdk_executor.create_exec_launcher") as launcher,
-        pytest.raises(OSError, match="cannot wrap CLI"),
+        pytest.raises(OSError, match="cannot contain" if noop else "cannot wrap CLI"),
     ):
         prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
     launcher.assert_not_called()
 
 
-@pytest.mark.parametrize("cwd_source", ["default", "spec_relative", "spec_absolute", "explicit"])
+@pytest.mark.parametrize(
+    "cwd_source", ["default", "spec_relative", "spec_absolute", "explicit_none", "explicit_dot"]
+)
 def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
     monkeypatch, tmp_path: Path, cwd_source: str
 ) -> None:
@@ -5021,17 +5011,15 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
     elif cwd_source == "spec_relative":
         spec.cwd = "repo"
         expected_cwd = tmp_path / "repo"
-    elif cwd_source == "explicit":
-        spec.cwd = "."
+    elif cwd_source.startswith("explicit"):
+        spec.cwd = None if cwd_source == "explicit_none" else "."
         expected_cwd = tmp_path / "repo"
         cwd = str(expected_cwd)
     else:
         expected_cwd = Path(spec.cwd).resolve()
 
-    monkeypatch.setattr(
-        "omnigent.inner.claude_sdk_executor.resolve_sandbox",
-        lambda *a, **k: _active_policy(),
-    )
+    resolve = Mock(return_value=_active_policy())
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor.resolve_sandbox", resolve)
 
     seen: dict[str, object] = {}
 
@@ -5054,6 +5042,7 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
 
     assert prepared.cli_path == "/tmp/launcher"
     assert prepared.enable_native_tools is True
+    resolve.assert_called_once_with(spec, expected_cwd)
     assert prepared.cwd == str(expected_cwd)
     assert seen["cwd"] == expected_cwd
     assert seen["target"] == "/usr/bin/claude", (

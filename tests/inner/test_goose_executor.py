@@ -1256,24 +1256,6 @@ def test_sandbox_launch_path_wraps_active_policy(monkeypatch, tmp_path) -> None:
     assert "GOOSE_PROVIDER" in policy.spawn_env_allowlist
 
 
-def test_sandbox_launch_path_rejects_unavailable_backend(monkeypatch, tmp_path) -> None:
-    """An unavailable requested sandbox must prevent startup."""
-    from omnigent.inner import sandbox as sandbox_mod
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-
-    def _boom(_os_env, _cwd) -> None:
-        raise NotImplementedError("no bwrap here")
-
-    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _boom)
-    executor = GooseExecutor(
-        cwd=str(tmp_path),
-        goose_path="/usr/bin/goose",
-        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
-    )
-    with pytest.raises(NotImplementedError, match="no bwrap"):
-        executor._sandbox_launch_path(["PATH"])
-
-
 @pytest.mark.asyncio
 async def test_start_process_resets_handshake_state(monkeypatch) -> None:
     """A (re)start clears the one-way handshake latch and spawns goose acp."""
@@ -1521,14 +1503,6 @@ def test_resolve_os_env_from_json(monkeypatch) -> None:
     assert spec.cwd == "/w"
     assert spec.sandbox is not None and spec.sandbox.type == "linux_bwrap"
     assert spec.fork is True
-
-
-def test_resolve_os_env_rejects_malformed_json(monkeypatch) -> None:
-    from omnigent.inner import goose_harness
-
-    monkeypatch.setenv("HARNESS_GOOSE_OS_ENV", "{not valid json")
-    with pytest.raises(ValueError, match="HARNESS_GOOSE_OS_ENV"):
-        goose_harness._resolve_os_env()
 
 
 def test_build_goose_executor_reads_env(monkeypatch) -> None:

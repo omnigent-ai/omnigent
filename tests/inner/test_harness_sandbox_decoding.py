@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -205,6 +207,31 @@ def test_harness_rejects_malformed_os_policy(
     monkeypatch.setenv(harness._ENV_OS_ENV, '{"sandbox": {"allow_netwrok": false}}')
     with pytest.raises(ValueError):
         harness._resolve_os_env()
+
+
+@pytest.mark.parametrize(
+    "harness_name,executor_name",
+    [
+        ("claude_sdk", "ClaudeSDKExecutor"),
+        ("codex", "CodexExecutor"),
+        ("cursor", "CursorExecutor"),
+        ("kimi", "KimiExecutor"),
+        ("pi", "PiExecutor"),
+        ("goose", "GooseExecutor"),
+    ],
+)
+def test_harness_factory_rejects_malformed_policy_before_construction(
+    harness_name: str, executor_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = importlib.import_module(f"omnigent.inner.{harness_name}_harness")
+    for name in list(os.environ):
+        if name.startswith(f"HARNESS_{harness_name.upper()}_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv(harness._ENV_OS_ENV, "{not-json")
+    with patch.object(getattr(harness, executor_name), "__init__") as constructor:
+        with pytest.raises(ValueError, match=harness._ENV_OS_ENV):
+            getattr(harness, f"_build_{harness_name}_executor")()
+    constructor.assert_not_called()
 
 
 @pytest.mark.parametrize("harness_name", _HARNESSES)

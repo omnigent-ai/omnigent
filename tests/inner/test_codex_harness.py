@@ -481,14 +481,6 @@ def test_executor_factory_decodes_os_env_json(
     assert binding.inject_env == ["OMNIGENT_CODEX_GATEWAY_TOKEN"]
 
 
-def test_executor_factory_rejects_malformed_os_env_json(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HARNESS_CODEX_OS_ENV", "{not-json")
-    with patch("omnigent.inner.codex_harness.CodexExecutor.__init__") as constructor:
-        with pytest.raises(ValueError, match="HARNESS_CODEX_OS_ENV"):
-            codex_harness._build_codex_executor()
-    constructor.assert_not_called()
-
-
 @pytest.mark.parametrize(
     "raw_value,expected",
     [

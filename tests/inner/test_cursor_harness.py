@@ -112,11 +112,3 @@ def test_executor_factory_decodes_os_env_and_skills(monkeypatch: pytest.MonkeyPa
     assert captured["os_env"].cwd == "/srv/app"
     assert captured["skills_filter"] == ["a", "b"]
     assert captured["bundle_dir"] == Path("/tmp/bundle")
-
-
-def test_executor_factory_rejects_malformed_os_env_json(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HARNESS_CURSOR_OS_ENV", "{not-json")
-    with patch("omnigent.inner.cursor_harness.CursorExecutor.__init__") as constructor:
-        with pytest.raises(ValueError, match="HARNESS_CURSOR_OS_ENV"):
-            cursor_harness._build_cursor_executor()
-    constructor.assert_not_called()

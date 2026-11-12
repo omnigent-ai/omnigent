@@ -166,14 +166,6 @@ def test_executor_factory_falls_back_to_runner_workspace_cwd(
     assert captured["cwd"] == "/tmp/explicit"
 
 
-def test_executor_factory_rejects_malformed_os_env_json(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HARNESS_KIMI_OS_ENV", "{not-json")
-    with patch("omnigent.inner.kimi_harness.KimiExecutor.__init__") as constructor:
-        with pytest.raises(ValueError, match="HARNESS_KIMI_OS_ENV"):
-            kimi_harness._build_kimi_executor()
-    constructor.assert_not_called()
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
