@@ -11,7 +11,6 @@ import {
   planName,
   planSteps,
   planTally,
-  sessionNotes,
   sessionTaskList,
   stepProgress,
   stepsWithoutPlan,
@@ -78,31 +77,17 @@ describe("stepProgress", () => {
     status(8, "c", "done"),
   ];
 
-  it("gives each step its newest status, its attempt's start and its newest note", () => {
+  it("gives each step its newest status and its attempt's start, passing over notes", () => {
     const idle = stepProgress(steps, entries, false);
     // d has no dependencies, so it can start.
     expect(idle.map((item) => item.state)).toEqual(["done", "stopped", "done", "ready"]);
     expect(idle[0].startedAt).toBe(entries[0].created_at);
-    expect(idle[1].note?.payload.body).toBe("second note");
+    // b's notes came after its start, which stays its newest status.
+    expect(idle[1].status?.position).toBe(3);
     // c's newest attempt wrote no start (an earlier one failed), so it has no duration.
     expect(idle[2].startedAt).toBeNull();
     expect(idle[3].status).toBeNull();
     expect(stepProgress(steps, entries, true)[1].state).toBe("running");
-  });
-
-  it("shows only the current attempt's note once a step starts again", () => {
-    const one = planSteps(plan(0, ["a"]));
-    const note = (position: number, body: string) =>
-      journalEntry(position, { step: "a", payload: { body } });
-    const firstTry = [note(1, "Deploying the swap"), status(2, "a", "started")];
-    // Before a second start, a note written just ahead of the first one counts.
-    expect(stepProgress(one, firstTry, true)[0].note?.payload.body).toBe("Deploying the swap");
-    const stopped = [...firstTry, status(3, "a", "failed"), note(4, "Stopped on request")];
-    expect(stepProgress(one, stopped, false)[0].note?.payload.body).toBe("Stopped on request");
-    const again = [...stopped, status(5, "a", "started")];
-    expect(stepProgress(one, again, true)[0].note).toBeNull();
-    const later = [...again, note(6, "Redeploying")];
-    expect(stepProgress(one, later, true)[0].note?.payload.body).toBe("Redeploying");
   });
 
   it("marks a start after an earlier one as a restart", () => {
@@ -228,18 +213,6 @@ describe("pausedLabel", () => {
   it("says nothing once only tasks waiting for the user are left", () => {
     expect(label([chain, status(1, "a", "done"), status(2, "b", "needs_input")])).toBeNull();
     expect(label([chain, status(1, "a", "done"), status(2, "b", "done")])).toBeNull();
-  });
-});
-
-describe("sessionNotes", () => {
-  it("keeps notes that aren't about one step, newest first", () => {
-    const notes = sessionNotes([
-      journalEntry(0),
-      journalEntry(1, { step: "a" }),
-      journalEntry(2, { scheduled_task_run_id: RUN }),
-      journalEntry(3),
-    ]);
-    expect(notes.map((entry) => entry.position)).toEqual([3, 2, 0]);
   });
 });
 

@@ -61,6 +61,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { RunningDot } from "@/components/RunningDot";
+import { formatMessageTimestamp } from "@/lib/relativeTime";
 import { cn } from "@/lib/utils";
 import { readableSentText, replaceSentMentions } from "@/lib/composerMentions";
 import { mentionPillMarkdown } from "@/lib/mentionPills";
@@ -778,21 +779,7 @@ function CompactionLoadingIndicator({ createdAtS }: { createdAtS?: number }) {
 
 function formatBubbleTimestamp(epochSeconds: number | undefined): string | null {
   if (epochSeconds === undefined || epochSeconds === 0) return null;
-  const d = new Date(epochSeconds * 1000);
-  const now = new Date();
-  const time = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-  if (
-    d.getFullYear() === now.getFullYear() &&
-    d.getMonth() === now.getMonth() &&
-    d.getDate() === now.getDate()
-  ) {
-    return time;
-  }
-  const date = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-  if (d.getFullYear() !== now.getFullYear()) {
-    return `${d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}, ${time}`;
-  }
-  return `${date}, ${time}`;
+  return formatMessageTimestamp(epochSeconds);
 }
 
 // Memoized so a streaming delta (which rebuilds the whole bubble array) only

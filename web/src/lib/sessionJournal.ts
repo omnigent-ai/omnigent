@@ -111,10 +111,6 @@ export function stepStatusLabel(
   return { done: "Done", needs_input: WAITING_FOR_YOU, failed: "Failed" }[status];
 }
 
-export function noteBody(entry: JournalEntry): string {
-  return typeof entry.payload.body === "string" ? entry.payload.body : "";
-}
-
 /** The newest plan among the entries, which are in position order. */
 export function currentPlan(entries: readonly JournalEntry[]): JournalEntry | null {
   return entries.findLast((entry) => entry.kind === "plan") ?? null;
@@ -137,8 +133,6 @@ export interface StepProgress {
   status: JournalEntry | null;
   /** When the step's current attempt started, in epoch seconds, if it wrote a start. */
   startedAt: number | null;
-  /** The newest note of the step's current attempt, so a restarted step drops older ones. */
-  note: JournalEntry | null;
   /** True for an item of the agent's own task list, which has no history. */
   native: boolean;
   /** What the agent says it's doing while an item of its own list is in progress. */
@@ -154,20 +148,6 @@ function attemptStart(statuses: readonly JournalEntry[]): JournalEntry | null {
     if (index < statuses.length - 1 && (status === "done" || status === "failed")) return null;
   }
   return null;
-}
-
-/**
- * The newest note of a step's current attempt. Once a step has started again,
- * notes from before that start belong to an earlier attempt; before a second
- * start, a note written just ahead of the first one counts.
- */
-function currentAttemptNote(
-  statuses: readonly JournalEntry[],
-  notes: readonly JournalEntry[],
-): JournalEntry | null {
-  const starts = statuses.filter((entry) => statusOf(entry) === "started");
-  const restartedAt = starts.length > 1 ? (starts.at(-1)?.position ?? null) : null;
-  return notes.findLast((note) => restartedAt === null || note.position > restartedAt) ?? null;
 }
 
 /**
@@ -195,15 +175,11 @@ export function stepProgress(
   awaitingUser = false,
 ): StepProgress[] {
   const statuses = new Map<string, JournalEntry[]>();
-  const notes = new Map<string, JournalEntry[]>();
   for (const entry of entries) {
-    if (!entry.step) continue;
-    const byStep =
-      entry.kind === "note" ? notes : entry.kind === "status" && statusOf(entry) ? statuses : null;
-    if (!byStep) continue;
-    const list = byStep.get(entry.step);
+    if (!entry.step || entry.kind !== "status" || !statusOf(entry)) continue;
+    const list = statuses.get(entry.step);
     if (list) list.push(entry);
-    else byStep.set(entry.step, [entry]);
+    else statuses.set(entry.step, [entry]);
   }
   const progress: StepProgress[] = steps.map((step) => {
     const history = statuses.get(step.id) ?? [];
@@ -218,7 +194,6 @@ export function stepProgress(
       state,
       status,
       startedAt: attemptStart(history)?.created_at ?? null,
-      note: currentAttemptNote(history, notes.get(step.id) ?? []),
       native: false,
       activeForm: null,
     };
@@ -285,11 +260,6 @@ export function finishedTaskCount(progress: readonly StepProgress[]): number {
   return progress.filter((item) => item.state === "done" || item.state === "failed").length;
 }
 
-/** Notes that aren't about one step, newest first. */
-export function sessionNotes(entries: readonly JournalEntry[]): JournalEntry[] {
-  return entries.filter((entry) => entry.kind === "note" && !entry.step).reverse();
-}
-
 /** One item of the agent's own task list, as its harness reports it (e.g. Claude's tasks). */
 export interface NativeTask {
   content: string;
@@ -317,7 +287,6 @@ export function nativeTaskProgress(
       state,
       status: null,
       startedAt: null,
-      note: null,
       native: true,
       activeForm:
         task.status === "in_progress" && task.activeForm && task.activeForm !== task.content

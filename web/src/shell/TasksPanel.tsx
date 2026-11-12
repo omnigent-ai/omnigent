@@ -1,10 +1,7 @@
-// The Tasks tab: where the session's tasks stand, one row each, then the
-// agent's notes. Tasks are a plan's steps, or the agent's own task list when
-// the session has no plan.
+// The Tasks tab: where the session's tasks stand, one row each. Tasks are a
+// plan's steps, or the agent's own task list when the session has no plan.
 
 import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import {
   CheckIcon,
   ListChecksIcon,
@@ -12,19 +9,21 @@ import {
   MessageCircleQuestionMarkIcon,
   XIcon,
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useNow } from "@/hooks/useNow";
 import { useSessionTasks } from "@/hooks/useSessionTasks";
-import { absoluteTime, formatDuration, relativeTime } from "@/lib/relativeTime";
+import {
+  absoluteTime,
+  formatDuration,
+  formatMessageTimestamp,
+  relativeTime,
+} from "@/lib/relativeTime";
 import {
   finishedTaskCount,
   isRestart,
   linkedToPrevious,
-  noteBody,
   planName,
   planTally,
-  sessionNotes,
   statusOf,
   stepStatusLabel,
   textOf,
@@ -34,13 +33,12 @@ import {
   type PausedLabel,
   type StepProgress,
   type StepState,
+  type StepStatus,
 } from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
 
 const NO_ENTRIES: JournalEntry[] = [];
-
-const SECTION_HEADING = "text-xs font-medium tracking-wide text-muted-foreground uppercase";
 
 const STATE_LABELS: Record<StepState, string> = {
   waiting: "Not started",
@@ -62,21 +60,8 @@ const SEGMENT_COLORS: Record<StepState, string> = {
   failed: "bg-destructive",
 };
 
-// Notes are short Markdown; style it at the panel's own sizes.
-const NOTE_MARKDOWN = cn(
-  "break-words [&_a]:text-link [&_a]:underline [&_code]:rounded [&_code]:bg-muted",
-  "[&_code]:px-1 [&_code]:font-mono [&_code]:text-[0.92em] [&_h1,&_h2,&_h3,&_h4]:font-medium",
-  "[&_h1,&_h2,&_h3,&_h4]:text-foreground [&_li]:my-0.5 [&_ol]:list-decimal [&_ol]:pl-5",
-  "[&_p+p]:mt-1.5 [&_strong]:font-medium [&_strong]:text-foreground [&_table]:my-1",
-  "[&_td]:pr-3 [&_th]:pr-3 [&_th]:text-left [&_ul]:list-disc [&_ul]:pl-5",
-);
-
 function clock(seconds: number): string {
   return new Date(seconds * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-}
-
-function firstLine(markdown: string): string {
-  return (markdown.trim().split("\n")[0] ?? "").replace(/^#+\s*/, "");
 }
 
 /** "3m ago", kept fresh by the shared clock. */
@@ -196,12 +181,28 @@ function stepDetail(item: StepProgress): ReactNode {
   }
 }
 
+/** A running task's time so far, or when a finished one ended, stamped like a chat message. */
 function StepMeta({ item }: { item: StepProgress }) {
   const { startedAt, status } = item;
-  if (startedAt === null || !status) return null;
+  if (!status) return null;
+  if (item.state === "done" || item.state === "failed") {
+    const endedAt = status.created_at;
+    return (
+      <time
+        dateTime={new Date(endedAt * 1000).toISOString()}
+        title={
+          startedAt === null
+            ? absoluteTime(endedAt * 1000)
+            : `${clock(startedAt)} – ${clock(endedAt)}`
+        }
+      >
+        {formatMessageTimestamp(endedAt)}
+      </time>
+    );
+  }
   if (
-    item.state === "running" ||
-    (item.state === "needs_input" && statusOf(status) === "started")
+    startedAt !== null &&
+    (item.state === "running" || (item.state === "needs_input" && statusOf(status) === "started"))
   ) {
     return (
       <span
@@ -212,46 +213,22 @@ function StepMeta({ item }: { item: StepProgress }) {
       </span>
     );
   }
-  if (item.state === "done" || item.state === "failed") {
-    return (
-      <span title={`${clock(startedAt)} – ${clock(status.created_at)}`}>
-        {formatDuration(status.created_at - startedAt)}
-      </span>
-    );
-  }
   return null;
 }
 
-/** A small dot for one recorded status or note, in the status's color. */
-function EntryDot({ entry, className }: { entry: JournalEntry; className?: string }) {
-  const status = statusOf(entry);
-  const color =
-    status === "done"
-      ? "bg-success"
-      : status === "failed"
-        ? "bg-destructive"
-        : status === "needs_input"
-          ? "bg-brand-accent"
-          : status === "started"
-            ? "bg-session-active"
-            : "bg-foreground-tertiary";
-  return <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", color, className)} />;
-}
+const ENTRY_LABELS: Record<StepStatus, string> = {
+  started: "Started",
+  done: "Done",
+  needs_input: WAITING_FOR_YOU,
+  failed: "Failed",
+};
 
-function entryLabel(entry: JournalEntry): string {
-  const status = statusOf(entry);
-  if (!status) return "Note";
-  return {
-    started: "Started",
-    done: "Done",
-    needs_input: WAITING_FOR_YOU,
-    failed: "Failed",
-  }[status];
-}
-
-function entryText(entry: JournalEntry): string | null {
-  return entry.kind === "note" ? firstLine(noteBody(entry)) || null : textOf(entry);
-}
+const ENTRY_DOT_COLORS: Record<StepStatus, string> = {
+  started: "bg-session-active",
+  done: "bg-success",
+  needs_input: "bg-brand-accent",
+  failed: "bg-destructive",
+};
 
 /** "A", "A and B", "A, B and C". */
 function listNames(names: readonly string[]): string {
@@ -261,7 +238,7 @@ function listNames(names: readonly string[]): string {
 }
 
 /**
- * Everything recorded for one task, oldest first, after what it waits on and its
+ * Each status a task recorded, oldest first, after what it waits on and its
  * goal. A line marks where each later attempt begins.
  */
 function StepHistory({
@@ -276,9 +253,11 @@ function StepHistory({
   /** False when the step's row already shows its goal. */
   showGoal: boolean;
 }) {
-  const history = entries.filter(
-    (entry) => entry.step === step.id && (entry.kind === "status" || entry.kind === "note"),
-  );
+  const history = entries.flatMap((entry) => {
+    const status = entry.step === step.id && entry.kind === "status" ? statusOf(entry) : null;
+    return status ? [{ entry, status }] : [];
+  });
+  const recorded = history.map(({ entry }) => entry);
   return (
     <div className="mt-1 mb-1.5 flex flex-col gap-2 rounded-lg bg-muted/70 px-3 py-2.5 text-sm">
       {step.depends_on.length > 0 && (
@@ -294,11 +273,11 @@ function StepHistory({
         <p className="text-muted-foreground">Nothing recorded yet.</p>
       ) : (
         <ol className="flex flex-col gap-1" aria-label={`${step.name} history`}>
-          {history.map((entry, index) => {
-            const text = entryText(entry);
+          {history.map(({ entry, status }, index) => {
+            const text = textOf(entry);
             return (
               <Fragment key={entry.id}>
-                {isRestart(entry, history.slice(0, index)) && (
+                {isRestart(entry, recorded.slice(0, index)) && (
                   <li
                     className="flex items-center gap-2 py-0.5 text-xs text-muted-foreground"
                     data-testid="tasks-history-restart"
@@ -309,9 +288,15 @@ function StepHistory({
                   </li>
                 )}
                 <li className="flex items-start gap-2">
-                  <EntryDot entry={entry} className="mt-[7px]" />
+                  <span
+                    aria-hidden
+                    className={cn(
+                      "mt-[7px] size-1.5 shrink-0 rounded-full",
+                      ENTRY_DOT_COLORS[status],
+                    )}
+                  />
                   <span className="min-w-0 flex-1 break-words text-muted-foreground">
-                    <span className="text-foreground">{entryLabel(entry)}</span>
+                    <span className="text-foreground">{ENTRY_LABELS[status]}</span>
                     {text && ` · ${text}`}
                   </span>
                   <time
@@ -326,48 +311,6 @@ function StepHistory({
             );
           })}
         </ol>
-      )}
-    </div>
-  );
-}
-
-/** A note's title (its first line, when that line heads the rest) and body. */
-function splitNote(markdown: string): { title: string | null; body: string } {
-  const [first, ...rest] = markdown.trim().split("\n");
-  const body = rest.join("\n").trim();
-  if (/^#+\s/.test(first) || (body && first.length <= 100)) {
-    return { title: first.replace(/^#+\s*/, ""), body };
-  }
-  return { title: null, body: markdown.trim() };
-}
-
-/** A note the agent wrote: a title line, then Markdown shortened until opened when long. */
-function NoteBlock({ entry, className }: { entry: JournalEntry; className?: string }) {
-  const { title, body } = splitNote(noteBody(entry));
-  const [open, setOpen] = useState(false);
-  const long = body.length > 160 || body.split("\n").length > 2;
-  return (
-    <div
-      className={cn("rounded-lg bg-muted/70 px-3 py-2 text-sm text-muted-foreground", className)}
-      data-testid="tasks-note"
-    >
-      {title && <p className="break-words font-medium text-foreground">{title}</p>}
-      {body && (
-        <div className={cn(NOTE_MARKDOWN, title && "mt-0.5", long && !open && "line-clamp-2")}>
-          <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>
-            {body}
-          </ReactMarkdown>
-        </div>
-      )}
-      {long && (
-        <button
-          type="button"
-          className="mt-1 cursor-pointer font-medium text-muted-foreground hover:text-foreground"
-          aria-expanded={open}
-          onClick={() => setOpen((value) => !value)}
-        >
-          {open ? "Show less" : "Show more"}
-        </button>
       )}
     </div>
   );
@@ -460,18 +403,14 @@ function StepRow({
       ) : (
         <div className={rowClassName}>{content}</div>
       )}
-      {(item.note || open) && (
+      {open && (
         <div className="pr-2 pl-[38px]">
-          {open ? (
-            <StepHistory
-              step={item.step}
-              entries={entries}
-              names={names}
-              showGoal={item.state !== "waiting" && item.state !== "ready"}
-            />
-          ) : (
-            item.note && <NoteBlock entry={item.note} className="mt-1 mb-1.5" />
-          )}
+          <StepHistory
+            step={item.step}
+            entries={entries}
+            names={names}
+            showGoal={item.state !== "waiting" && item.state !== "ready"}
+          />
         </div>
       )}
     </li>
@@ -484,10 +423,10 @@ const STATUS_LINE_COLORS: Partial<Record<StepState, string>> = {
   failed: "text-destructive",
 };
 
-/** Where a task stands in a few words, e.g. "Done in 14s" or "Waiting on Run the tests". */
+/** Where a task stands in a few words, e.g. "Done · 8:56 PM" or "Waiting on Run the tests". */
 function statusLine(item: StepProgress, pending: readonly string[]): ReactNode {
   const { startedAt, status } = item;
-  const took = startedAt !== null && status ? formatDuration(status.created_at - startedAt) : null;
+  const ended = status ? formatMessageTimestamp(status.created_at) : null;
   switch (item.state) {
     case "waiting":
       return pending.length > 0 ? `Waiting on ${listNames(pending)}` : "Not started";
@@ -506,9 +445,9 @@ function statusLine(item: StepProgress, pending: readonly string[]): ReactNode {
         ? `Stopped · ${stepStatusLabel("started", status.created_at, false).toLowerCase()}`
         : "Stopped";
     case "done":
-      return took ? `Done in ${took}` : "Done";
+      return ended ? `Done · ${ended}` : "Done";
     case "failed":
-      return took ? `Failed after ${took}` : "Failed";
+      return ended ? `Failed · ${ended}` : "Failed";
     case "needs_input":
       return WAITING_FOR_YOU;
   }
@@ -789,27 +728,9 @@ function TaskList({
   );
 }
 
-function NotesSection({ notes }: { notes: readonly JournalEntry[] }) {
-  return (
-    <section aria-label="Notes" className="flex flex-col gap-2 px-2">
-      <h3 className={SECTION_HEADING}>Notes</h3>
-      <ol className="flex flex-col gap-2">
-        {notes.map((note) => (
-          <li key={note.id} className="flex flex-col gap-1">
-            <NoteBlock entry={note} />
-            <span className="px-1 text-sm text-muted-foreground">
-              <Ago seconds={note.created_at} />
-            </span>
-          </li>
-        ))}
-      </ol>
-    </section>
-  );
-}
-
 /**
- * The session's Tasks tab: where its tasks stand, one row each, and the
- * agent's notes.
+ * The session's Tasks tab: where its tasks stand, one row each. The agent's
+ * notes aren't shown.
  *
  * @param onStartWorkflow - Runs before the empty state's "run a workflow" link
  *   starts one, e.g. to close the drawer it sits in on a phone.
@@ -827,9 +748,8 @@ export function TasksPanel({
   const { journal, plan, progress } = tasks;
   const startWorkflow = useSessionTasksActions((state) => state.startWorkflow[conversationId]);
   const entries = tasks.journalSupported ? journal.entries : NO_ENTRIES;
-  const notes = sessionNotes(entries);
   const names = new Map(progress.map((item) => [item.step.id, item.step.name]));
-  const empty = progress.length === 0 && notes.length === 0;
+  const empty = progress.length === 0;
   const showPlan = !tasks.loading && !journal.error && progress.length > 0;
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -904,36 +824,14 @@ export function TasksPanel({
           </div>
         ) : (
           <>
-            {showPlan && (
-              <>
-                <TasksHeader
-                  plan={plan}
-                  progress={progress}
-                  paused={tasks.paused}
-                  stuck={stuck}
-                  onSelect={jumpToStep}
-                />
-                <TaskList
-                  progress={progress}
-                  entries={entries}
-                  names={names}
-                  flashStep={flashStep}
-                />
-              </>
-            )}
-            {notes.length > 0 && <NotesSection notes={notes} />}
-            {journal.hasOlder && (
-              <div className="flex justify-center">
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={journal.loadingOlder}
-                  onClick={journal.loadOlder}
-                >
-                  {journal.loadingOlder ? "Loading…" : "Show older notes"}
-                </Button>
-              </div>
-            )}
+            <TasksHeader
+              plan={plan}
+              progress={progress}
+              paused={tasks.paused}
+              stuck={stuck}
+              onSelect={jumpToStep}
+            />
+            <TaskList progress={progress} entries={entries} names={names} flashStep={flashStep} />
           </>
         )}
       </div>
