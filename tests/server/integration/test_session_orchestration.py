@@ -1854,6 +1854,32 @@ async def test_family_project_removal_precedes_archive(auth_client, peers, db_ur
     for session_id in (source["id"], sibling_id):
         snapshot = (await auth_client.get(f"/v1/sessions/{session_id}")).json()
         assert snapshot["family"]["pinned_at"] == "1" * 256
+    # A legacy personal pin must not divert the representative's family action.
+    from omnigent.stores.conversation_store import pinned_label_key
+
+    cleared = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"labels": {"omnigent.pinned": ""}}
+    )
+    assert cleared.status_code == 200, cleared.text
+    store.set_labels(source["id"], {pinned_label_key("alice"): "old-pin"})
+    repinned = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"labels": {"omnigent.pinned": "42"}}
+    )
+    assert repinned.status_code == 200, repinned.text
+    assert repinned.json()["family"]["pinned_at"] == "42"
+    unpinned = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"labels": {"omnigent.pinned": ""}}
+    )
+    assert unpinned.status_code == 200, unpinned.text
+    assert not unpinned.json()["family"]["pinned"]
+    assert "omnigent.pinned" not in unpinned.json()["labels"]
+    assert pinned_label_key("alice") not in store.get_conversation(source["id"]).labels
+    pins = (await auth_client.get("/v1/sessions", params={"pinned": True})).json()["data"]
+    assert source["id"] not in {row["id"] for row in pins}
+    repinned = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"labels": {"omnigent.pinned": "42"}}
+    )
+    assert repinned.status_code == 200, repinned.text
     store.set_conversation_project(source["id"], "a" * 32)
     refused = await auth_client.patch(
         f"/v1/sessions/{source['id']}",

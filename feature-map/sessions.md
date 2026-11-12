@@ -15,21 +15,25 @@ the header menu), and each place is a separate entry point.
   managed hosts, preselected. Siblings have one
   indentation level with curved connectors and are absent from the Agents panel.
   Archive/delete promotes the oldest active member; compute survives while any
-  session remains bound. The representative pins/moves the family; individual
-  pins appear only in Pinned and return to their nest when unpinned. Existing
+  session remains bound. The representative pins/moves the entire family; nested members have no pin
+  action, and legacy individual pins keep their place inside the nest.
+  Opening Add nested agent shows a draft row in the family until creation
+  replaces it; leaving the composer without submitting removes the draft. Existing
   sessions cannot join a family; ordinary forks remain standalone and may reuse the source host.
 
 - `session-grid`: behind `grid_sessions_display_ui`, drag sidebar sessions into a
   conversation to split left/right or top/bottom with a hover preview. Up to four
   independent chats fit in two rows and two columns. Grids live at `/grid/<id>`
   and are saved only in this browser, scoped to server and user.
-- `pin`: pinned sessions move to their own section and back.
+- `pin`: standalone sessions and family representatives move to Pinned and back;
+  pinning a representative moves its whole family.
 - `pin-undo`: unpinning shows an Undo toast that re-pins the session into its
   old Pinned slot. Dragging a pinned row into a folder unpins it without one.
 - `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned
   order, which persists across reloads; dropping an unpinned row onto a pinned
   row pins it above or below that row, by the half it's released over, and
-  releasing it just below the last pin pins it at the bottom.
+  releasing it just below the last pin pins it at the bottom. Only standalone
+  sessions and family representatives can be pinned or reordered this way.
 - `custom-order`: with `sidebar_grouping_ui` (on by default), drop one of your sessions onto
   another row of the same list, project or group (or use Move up/down) to switch
   Ordering to Custom. Positions are saved on this device and new sessions appear
@@ -56,7 +60,8 @@ the header menu), and each place is a separate entry point.
 - `row-quick-actions`: sidebar rows show hover Pin and Archive buttons beside the
   "…" menu. Settings → Appearance → Sidebar → Show Pin and Archive buttons on
   session rows (on by default) turns them off, leaving both actions in the row
-  menu and right-click menu.
+  menu and right-click menu. Pin controls, including the session header menu,
+  are available only for standalone sessions and family representatives.
 - `stop`: Stop session on a hosted parent ends its runner, including side chats
   and sub-agents sharing that runner. Conversation histories are kept.
 - `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
@@ -344,7 +349,8 @@ still opens that folder.
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
 that slot: the line marks whether it lands above or below the row. Release it
-just below the last pin to pin it at the bottom.
+just below the last pin to pin it at the bottom. Only standalone sessions and
+family representatives can be dragged to pin or reorder a pin.
 
 **Custom order:** with `sidebar_grouping_ui` on (the default), drag one of your sessions onto
 another row in the same list, project or group and release it; a line like the
@@ -358,7 +364,7 @@ automations run from names those automations and deletes them first.
 
 **Session header menu:** open a session and use the menu next to its title for
 pin, fork, export, rename, mark as unread, create automation, add to project,
-archive or unarchive, and delete. Clicking the title also renames, and the title's folder
+archive or unarchive, and delete. Pin is hidden on nested members. Clicking the title also renames, and the title's folder
 tag also moves the session into a project. Sub-agent sessions hide owner-only
 actions. On phones, the sidebar toggle has a circular glass surface; host,
 harness/model, background tasks, and session actions share the top-right glass
@@ -419,7 +425,8 @@ Cancel and Archive; Archive continues to the worktree prompt when that applies.
 **Row quick actions setting:** Settings → Appearance → Sidebar → Show Pin and
 Archive buttons on session rows. Turning it off removes the hover buttons from
 every sidebar row; the session header never had them. On desktop the row menu's
-Pin item is shown only while the setting is off (mobile always shows it).
+Pin item is shown only while the setting is off (mobile always shows it), and
+only for standalone sessions and family representatives.
 
 **Archived view:** choose Display → Archived sessions in the sidebar filter
 menu, then filter by project.
@@ -1305,7 +1312,7 @@ model. It covers desktop kebab/right-click/header and mobile long-press/header
 composer navigation, shared/fresh compute, pin/project/fork actions, archive/undo,
 and survivor messaging after representative deletion. It also checks that expanded
 family rows hide actions when not hovered, deletion keeps peers nested before the
-server responds, and personal pins appear only once. Set `OMNIGENT_DEMO_DIR`
+server responds, and only the representative offers family-wide pin actions. Set `OMNIGENT_DEMO_DIR`
 outside the checkout to retain recordings.
 The component tests in `web/src/shell/HeaderConversationMenu.test.tsx` and
 `web/src/components/KeyboardShortcutsDialog.test.tsx` cover Cmd/Ctrl+Alt+A and
