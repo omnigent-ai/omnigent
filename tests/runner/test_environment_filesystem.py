@@ -1892,6 +1892,41 @@ async def test_diff_endpoint_returns_null_before_for_new_file(
 
 
 @pytest.mark.asyncio
+async def test_intent_to_add_file_is_listed_and_diffed_as_created(tmp_path: Path) -> None:
+    """A ``git add -N`` file has no HEAD version, so Changes and diff must treat it as added."""
+    env = _git_env()
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    (ws / "README.md").write_text("# repo\n")
+    subprocess.run(["git", "add", "README.md"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    content = "".join(f"CASE_{index} = {index}\n" for index in range(5))
+    (ws / "suite").mkdir()
+    (ws / "suite" / "new_suite.py").write_text(content)
+    subprocess.run(
+        ["git", "add", "-N", "suite/new_suite.py"],
+        cwd=ws,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    base = f"/v1/sessions/conv_ita/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_ita") as client:
+        changes = (await client.get(f"{base}/changes")).json()["data"]
+        diff = (await client.get(f"{base}/diff/suite/new_suite.py")).json()
+
+    statuses = {entry["path"]: entry["status"] for entry in changes}
+    assert statuses.get("suite/new_suite.py") == "created", changes
+    assert diff["before"] is None, diff
+    assert diff["after"] == content, diff
+    assert "baseline_state" not in diff, diff
+
+
+@pytest.mark.asyncio
 async def test_diff_endpoint_returns_null_after_for_deleted_file(
     client_with_registry: httpx.AsyncClient,
 ) -> None:
@@ -2115,6 +2150,58 @@ async def test_content_search_live_workspace(
         assert (match["match_start"], match["match_end"]) == (3, 9)
     assert result["truncated"] is False
     assert not (workspace / "injected").exists()
+
+
+# The web panel's Whole word cases, shared with its unit test, run through real ripgrep.
+_WHOLE_WORD_FIXTURE = json.loads(
+    (
+        Path(__file__).resolve().parents[2]
+        / "web/src/lib/__fixtures__/contentSearchWholeWord.json"
+    ).read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    _WHOLE_WORD_FIXTURE["cases"],
+    ids=[case["name"] for case in _WHOLE_WORD_FIXTURE["cases"]],
+)
+async def test_content_search_whole_word_patterns(
+    client: httpx.AsyncClient, workspace: Path, case: dict[str, Any]
+) -> None:
+    (workspace / "words.txt").write_text(
+        "\n".join(_WHOLE_WORD_FIXTURE["corpus"]) + "\n", encoding="utf-8"
+    )
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/content-search",
+        params={
+            "q": case["pattern"],
+            "regex": str(case["sentRegex"]).lower(),
+            "case_sensitive": str(case["caseSensitive"]).lower(),
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert [match["line"] for match in response.json()["matches"]] == case["lines"]
+
+
+@pytest.mark.asyncio
+async def test_content_search_whole_word_reports_the_word_itself(
+    client: httpx.AsyncClient, workspace: Path
+) -> None:
+    (workspace / "words.txt").write_text("x(needle)y\ncafe\u0301 au lait\n", encoding="utf-8")
+    endpoint = "/v1/sessions/conv_test/resources/environments/default/content-search"
+    response = await client.get(endpoint, params={"q": r"\bneedle\b", "regex": "true"})
+    match = response.json()["matches"][0]
+    assert (match["match_start"], match["match_end"]) == (2, 8)
+    # The panel's own pattern classifies the accent in ripgrep; it must consume only the accent.
+    decomposed = next(
+        case for case in _WHOLE_WORD_FIXTURE["cases"] if case["name"] == "decomposed accent"
+    )
+    response = await client.get(endpoint, params={"q": decomposed["pattern"], "regex": "true"})
+    match = response.json()["matches"][0]
+    # Offsets are UTF-16 units: the combining accent is one more unit after "cafe".
+    assert (match["match_start"], match["match_end"]) == (0, 5)
 
 
 @pytest.mark.asyncio

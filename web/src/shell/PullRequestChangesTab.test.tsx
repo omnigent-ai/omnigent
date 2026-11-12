@@ -34,10 +34,18 @@ const mocks = vi.hoisted(() => ({
   commitList: { object: "list", has_more: false, data: [] as unknown[] },
   /** Each commit's patch by sha, as the commit-diff query returns it. */
   commitPatches: new Map<string, string>(),
+  /** The PR's changes after each commit, up to the head, by sha. */
+  sincePatches: new Map<string, string>(),
+  /** Each commit-diff read's commit and until-head sha, in order. */
+  commitDiffReads: [] as [string | null, string | null][],
   /** The commit-diff query's error, when a test wants a failed read. */
   commitDiffError: null as Error | null,
   /** The commit list's query cannot run here, so it has no data. */
   commitsUnavailable: false,
+  /** The commit list's error, when a test wants a failed read. */
+  commitsError: null as Error | null,
+  /** The commit list's refetch, to see a retry. */
+  commitsRefetch: vi.fn(),
   /** The PR's server lacks the commit routes. */
   commitsUnsupported: false,
   /** A saved review draft, anchored to one file's line, as the composer hook reports it. */
@@ -78,18 +86,26 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
   }),
   // A disabled query has no data, as when the workspace cannot be served.
   usePullRequestCommits: () => ({
-    data: mocks.commitsUnavailable ? undefined : mocks.commitList,
+    data: mocks.commitsUnavailable || mocks.commitsError ? undefined : mocks.commitList,
     isLoading: false,
-    error: null,
+    error: mocks.commitsError,
+    refetch: mocks.commitsRefetch,
   }),
   usePullRequestCommitsUnsupported: () => mocks.commitsUnsupported,
-  usePullRequestCommitDiff: (_conversationId: string, _prUrl: string, sha: string | null) => ({
-    data: sha
-      ? { object: "session.github.pr_diff", patch: mocks.commitPatches.get(sha) }
-      : undefined,
-    isLoading: false,
-    error: mocks.commitDiffError,
-  }),
+  usePullRequestCommitDiff: (
+    _conversationId: string,
+    _prUrl: string,
+    sha: string | null,
+    untilHeadSha: string | null = null,
+  ) => {
+    mocks.commitDiffReads.push([sha, untilHeadSha]);
+    const patches = untilHeadSha ? mocks.sincePatches : mocks.commitPatches;
+    return {
+      data: sha ? { object: "session.github.pr_diff", patch: patches.get(sha) } : undefined,
+      isLoading: false,
+      error: mocks.commitDiffError,
+    };
+  },
 }));
 vi.mock("@/components/theme/useResolvedThemeMode", () => ({
   useResolvedThemeMode: () => "light",
@@ -166,6 +182,7 @@ function renderTab({
   threads = [],
   listing = {},
   commitHistory = false,
+  headRepositoryUrl,
 }: {
   conversationId: string;
   files?: PullRequestChangedFile[];
@@ -175,6 +192,8 @@ function renderTab({
   listing?: { has_more?: boolean; total_count?: number | null; head_sha?: string | null };
   /** The provider lists commits, so the Changes toolbar offers the Commits view. */
   commitHistory?: boolean;
+  /** A GitHub head repository, so files can be opened on GitHub. */
+  headRepositoryUrl?: string;
 }) {
   const prUrl = prUrlFor(conversationId);
   const tabProps = (current: string) =>
@@ -184,8 +203,15 @@ function renderTab({
         selected_pr_url: prUrl,
         capabilities: commitHistory ? { commit_history: true } : {},
         auth: { selected_account: null },
+        ...(headRepositoryUrl ? { provider: "github" } : {}),
       },
-      pr: { url: prUrl, head_sha: "head", base_sha: "base", state: "OPEN" },
+      pr: {
+        url: prUrl,
+        head_sha: "head",
+        base_sha: "base",
+        state: "OPEN",
+        head_repository_url: headRepositoryUrl,
+      },
       prUrl,
       canEdit: false,
       selected: true,
@@ -1553,7 +1579,11 @@ describe("PullRequestChangesTab commits", () => {
     mocks.commitPatches.clear();
     mocks.commitPatches.set(SHA_A, A);
     mocks.commitPatches.set(SHA_B, B);
+    mocks.sincePatches.clear();
+    mocks.commitDiffReads = [];
     mocks.commitDiffError = null;
+    mocks.commitsError = null;
+    mocks.commitsRefetch.mockClear();
     mocks.draftAnchor = null;
     mocks.commitsUnsupported = false;
   });
@@ -1578,6 +1608,78 @@ describe("PullRequestChangesTab commits", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Back to commits" }));
     expect(screen.getByRole("button", { name: /Add a\.ts/ })).toBeInTheDocument();
+  });
+
+  it("shows only the changes since a picked commit, without review controls, then all again", () => {
+    mocks.commitList = {
+      object: "list",
+      has_more: false,
+      data: [
+        { ...commit(SHA_A, "Parent work"), head_of: [{ number: 41, url: null, state: "OPEN" }] },
+        commit(SHA_B, "Own work"),
+      ],
+    };
+    mocks.sincePatches.set(SHA_A, B);
+    renderTab({
+      conversationId: "changes-since",
+      commitHistory: true,
+      listing: { head_sha: SHA_B },
+      headRepositoryUrl: "https://github.com/fork/app",
+    });
+    expect(isListed("a.ts")).toBe(true);
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Changes since" }));
+    // Nothing comes after the head, so it isn't offered.
+    expect(screen.queryByRole("option", { name: /Own work/ })).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: /Head of #41.*Parent work/ }));
+
+    expect(mocks.commitDiffReads.at(-1)).toEqual([SHA_A, SHA_B]);
+    expect(isListed("b.ts")).toBe(true);
+    expect(isListed("a.ts")).toBe(false);
+    expect(screen.queryByRole("checkbox", { name: "Hide viewed" })).toBeNull();
+    // The narrowed patch ends at the head, so its files open there.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for b.ts" }), {
+      button: 0,
+    });
+    expect(screen.getByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute(
+      "href",
+      `https://github.com/fork/app/blob/${SHA_B}/b.ts`,
+    );
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Changes since" }));
+    fireEvent.click(screen.getByRole("option", { name: "PR base (all changes)" }));
+    expect(isListed("a.ts")).toBe(true);
+  });
+
+  it("offers the newest listed commit when GitHub capped the list before the head", () => {
+    mocks.commitList = {
+      object: "list",
+      has_more: true,
+      data: [commit(SHA_A, "Early work"), commit(SHA_B, "Last listed work")],
+    };
+    renderTab({
+      conversationId: "changes-since-capped",
+      commitHistory: true,
+      listing: { head_sha: "c".repeat(40) },
+    });
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Changes since" }));
+    expect(screen.getByRole("option", { name: /Last listed work/ })).toBeInTheDocument();
+    expect(screen.getByText(/Only the first \d+ commits are listed/)).toBeInTheDocument();
+  });
+
+  it("says why the commits failed to load and retries when the picker opens again", () => {
+    mocks.commitsError = new Error("GitHub could not load the PR's commits.");
+    renderTab({
+      conversationId: "changes-since-failed",
+      commitHistory: true,
+      listing: { head_sha: SHA_B },
+    });
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Changes since" }));
+    expect(screen.getByRole("alert")).toHaveTextContent(/could not load the PR's commits/);
+    expect(mocks.commitsRefetch).toHaveBeenCalled();
   });
 
   it("hides the viewed controls and marks in a commit view, and keeps the marks for Changes", () => {
