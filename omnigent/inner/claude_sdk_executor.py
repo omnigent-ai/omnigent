@@ -2743,6 +2743,7 @@ class ClaudeSDKExecutor(Executor):
                     raise OSError("Sandboxed Claude requires a system or SDK-bundled CLI")
         self._real_cli_path = self._cli_path
         self._cli_sandbox: SandboxPolicy | None = None
+        self._cli_sandbox_cwd: str | None = None
         if self._cli_path:
             if self._os_env_spec is not None:
                 effective_cwd = _resolve_sandbox_cwd(self._cwd or self._os_env_spec.cwd)
@@ -2760,7 +2761,8 @@ class ClaudeSDKExecutor(Executor):
                     }
                 prepared = prepare_claude_cli_path(
                     self._cli_path,
-                    replace(self._os_env_spec, cwd=str(effective_cwd)),
+                    self._os_env_spec,
+                    cwd=self._cwd,
                     worker_env=self._extra_env,
                     bundle_dir=self._bundle_dir,
                     agent_name=self._agent_name,
@@ -2781,7 +2783,8 @@ class ClaudeSDKExecutor(Executor):
                 )
                 self._prepared_cli = prepared
                 self._cli_sandbox = prepared.sandbox
-                self._cwd = str(effective_cwd)
+                self._cli_sandbox_cwd = prepared.cwd
+                self._cwd = prepared.cwd if prepared.cwd is not None else str(effective_cwd)
                 self._os_env = prepared.enable_native_tools
                 if prepared.cli_path != self._cli_path:
                     self._cli_wrapper_path = prepared.cli_path
