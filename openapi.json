@@ -6512,6 +6512,11 @@
           "branding": {
             "$ref": "#/components/schemas/BrandingInfo"
           },
+          "codex_nonblocking_decline": {
+            "default": false,
+            "title": "Codex Nonblocking Decline",
+            "type": "boolean"
+          },
           "databricks_features": {
             "title": "Databricks Features",
             "type": "boolean"

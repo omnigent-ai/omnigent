@@ -72,6 +72,7 @@ import {
   ELICITATION_RESPONSE_PREFIX,
   hasPendingOwnElicitation,
   imagePreview,
+  isPendingBlockingElicitation,
   isTextBlock,
   keyedAttachments,
 } from "@/lib/blocks";
@@ -99,6 +100,7 @@ import { EditSentMessageContext } from "@/components/chat/editSentMessage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
 import { copyMarkdown } from "@/lib/copyMarkdown";
+import { codexAsyncQuestionReplyText } from "@/lib/codexAsyncQuestionReply";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
@@ -122,7 +124,7 @@ export const SessionSharedContext = createContext(false);
 /** A user message's raw text, minus runtime context and any sender prefix. */
 function userMessageBody(content: MessageContentBlock[]): string {
   const text = stripAutomationContext(joinTextBlocks(content));
-  return splitSessionMessageOrigin(text)?.body ?? text;
+  return codexAsyncQuestionReplyText(splitSessionMessageOrigin(text)?.body ?? text);
 }
 
 /** A user message's text for reading and copying: mention markers become ``@name``. */
@@ -527,9 +529,9 @@ function useAgentTurnActive(): boolean {
   return computeIsTurnActive(sessionStatus, localSending);
 }
 
-/** Whether any elicitation card is still awaiting the user's answer. */
+/** Whether any elicitation card still parks the turn on the user's answer. */
 function hasPendingElicitationBlock(blocks: readonly AnyBlock[]): boolean {
-  return blocks.some((b) => b.type === "elicitation" && b.status === "pending");
+  return blocks.some(isPendingBlockingElicitation);
 }
 
 /**
@@ -1319,7 +1321,7 @@ function AssistantBubble({
   const rootSessionStatus = useChatStore((s) => s.sessionStatus);
   const rootHasPendingElicitation = useChatStore((s) => hasPendingElicitationBlock(s.blocks));
   const sessionStatus = scopedConversationId ? scopedState.sessionStatus : rootSessionStatus;
-  // A pending elicitation means the turn is parked awaiting the user — still in
+  // A pending blocking elicitation means the turn is parked awaiting the user — still in
   // flight even when its lifecycle or the session status reads settled.
   const hasPendingElicitation = scopedConversationId
     ? hasPendingElicitationBlock(scopedState.blocks)
@@ -1357,7 +1359,7 @@ function AssistantBubble({
           current.sessionStatus === "running" ||
           current.sessionStatus === "waiting" ||
           current.pendingUserMessages.length > 0 ||
-          current.blocks.some((block) => block.type === "elicitation" && block.status === "pending")
+          current.blocks.some(isPendingBlockingElicitation)
         ) {
           throw new Error("Wait for the current turn to finish before retrying");
         }
