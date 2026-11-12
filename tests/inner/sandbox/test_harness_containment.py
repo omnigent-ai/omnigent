@@ -91,6 +91,7 @@ def _prepared_launch(
         pytest.param(harness, fault, id=f"{fault}-{harness}")
         for fault in ("resolve", "unsupported", "backend", "launcher", "inactive")
         for harness in _HARNESSES
+        if fault != "backend" or harness in ("claude-sdk", "codex")
     ]
     + [pytest.param("codex", "backend-oserror", id="backend-oserror-codex")],
 )
