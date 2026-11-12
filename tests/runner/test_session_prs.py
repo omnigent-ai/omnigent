@@ -1573,6 +1573,16 @@ def test_shell_continuation_respects_quoting(quote: str, created: bool) -> None:
     assert was_created is created
 
 
+def test_an_array_literal_is_not_a_command_for_pr_attribution() -> None:
+    refs, was_created = extract_prs(
+        "Bash",
+        {"command": "cmd=(gh pr create --fill)\necho https://github.com/example/one/pull/41"},
+        "https://github.com/example/one/pull/41\n",
+    )
+    assert refs == []
+    assert was_created is False
+
+
 def test_redirect_ampersand_stays_in_its_word_and_the_pipeline_still_splits() -> None:
     segments = _shell_segments("gh pr create --title x 2>&1 | tail -2")
     assert [segment.invocation_tokens for segment in segments] == [
@@ -1785,6 +1795,14 @@ def test_quoted_operator_characters_do_not_split_a_simple_command(
             {},
             ["/repo/d0"],
             id="chained-or-cd-stays-linear",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "if false; then exit 1; fi; cd /w/a; git pp"},
+            "/repo",
+            {},
+            ["/w/a"],
+            id="exit-in-an-unexecuted-branch-does-not-end-tracking",
         ),
         pytest.param(
             "Bash",

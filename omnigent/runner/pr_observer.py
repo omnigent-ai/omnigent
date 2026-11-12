@@ -332,6 +332,29 @@ def _shell_steps(
     ]
 
 
+def _array_literal_end(command: str, start: int) -> int | None:
+    """Return the index just past the ``)`` closing the ``(`` at *start*, or None."""
+    depth = 0
+    quote: str | None = None
+    index = start
+    while index < len(command):
+        char = command[index]
+        if quote is not None:
+            quote = None if char == quote else quote
+        elif char == "\\":
+            index += 1
+        elif char in "'\"":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return None
+
+
 def _shell_items(command: str) -> list[list[str] | str] | None:
     """Split *command* at unquoted operators, returning each simple command's words.
 
@@ -360,6 +383,13 @@ def _shell_items(command: str) -> list[list[str] | str] | None:
                 quote = char
                 chunk.append(char)
                 index += 1
+            elif char == "(" and chunk and chunk[-1][-1:] == "=":
+                # An array literal ``name=(...)`` is one word, not a subshell.
+                end = _array_literal_end(command, index)
+                if end is None:
+                    raise ValueError("unterminated array literal")
+                chunk.append(command[index:end])
+                index = end
             else:
                 # The ``&`` of ``>&``, ``<&`` and ``&>`` is part of a redirection, not a separator.
                 redirect_ampersand = char == "&" and (
@@ -653,7 +683,9 @@ class _CheckoutWalker:
 
     Each command maps the directories it may start in to the directories it may
     leave with, as a success state and a failure state. A ``cd`` is assumed to
-    succeed. ``exit`` and ``return`` leave no state. A pipeline stage or a
+    succeed. ``exit`` and ``return`` are not modeled, so a later command is still
+    reported where they ran; that over-reports, but never drops a reachable command.
+    A pipeline stage or a
     subshell runs in a child shell, so its directory changes do not reach the
     parent. A background job (``&``) does the same.
     """
@@ -739,8 +771,6 @@ class _CheckoutWalker:
             target = tokens[1] if len(tokens) > 1 else "~"
             resolved = [_resolve_directory(directory, target) for directory in directories]
             return _merge_directories(tuple(resolved)), ()
-        if tokens[0] in {"exit", "return"}:
-            return (), ()
         if os.path.basename(tokens[0]) == "git":
             for directory in directories:
                 git_directory = directory
