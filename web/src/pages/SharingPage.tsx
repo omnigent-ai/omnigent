@@ -24,6 +24,7 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { type SharingMode, isSingleUserMode } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { cn } from "@/lib/utils";
 import { type DefaultPublicSessions, useSetSharing, useSharing } from "@/hooks/useSharing";
@@ -92,6 +93,7 @@ function BlockedBy({ reason, children }: { reason: string | null; children: Reac
 
 export function SharingPage() {
   const info = useServerInfo();
+  const capabilitiesLoading = info === "loading" || isBootFallbackInfo(info);
   // Plain header/single-user mode: no auth endpoints exist. The nav + route
   // already hide Sharing here; this stays as a fallback for a direct hit.
   const isSingleUser = isSingleUserMode(info);
@@ -106,13 +108,13 @@ export function SharingPage() {
   // Admin probe via the mode-agnostic `/v1/me` identity (works under OIDC
   // too). Skipped in single-user mode where no auth endpoints exist.
   useEffect(() => {
-    if (isSingleUser) return;
+    if (isSingleUser || capabilitiesLoading) return;
     void (async () => {
       const userId = await resolveIdentity();
       if (userId === null) return;
       setMeIsAdmin(getCurrentIsAdmin());
     })();
-  }, [isSingleUser]);
+  }, [isSingleUser, capabilitiesLoading]);
 
   if (!isSingleUser && meIsAdmin === null) {
     return (
@@ -398,6 +400,44 @@ export function SharingPage() {
                   </BlockedBy>
                 </div>
               </SettingsGroup>
+              {state?.peer_session_messaging_enabled !== undefined && (
+                <SettingsGroup title="Agent messaging" testId="settings-group-agent-messaging">
+                  <div className="flex items-center justify-between gap-4">
+                    <SettingsLabel
+                      label="Message other sessions"
+                      labelId="peer-messaging-label"
+                      descriptionId="peer-messaging-description"
+                      descriptionClassName="max-md:block"
+                      className="flex-1"
+                      description={
+                        <>
+                          Let agents send messages to other sessions owned by the same user. Changes
+                          apply immediately; child-session messaging is unchanged.
+                          {!state.peer_session_messaging_editable && (
+                            <span className="mt-1 block">
+                              Disabled by this deployment and can&apos;t be changed here.
+                            </span>
+                          )}
+                        </>
+                      }
+                    />
+                    <Switch
+                      checked={state.peer_session_messaging_enabled}
+                      onCheckedChange={(enabled) => {
+                        setError(null);
+                        setMode.mutate(
+                          { peer_session_messaging: enabled },
+                          { onError: (err) => setError(err.message) },
+                        );
+                      }}
+                      disabled={!state.peer_session_messaging_editable || setMode.isPending}
+                      aria-labelledby="peer-messaging-label"
+                      aria-describedby="peer-messaging-description"
+                      componentId="settings.sharing.peer_session_messaging"
+                    />
+                  </div>
+                </SettingsGroup>
+              )}
             </div>
             {error && <p className="mt-3 text-ui text-destructive">{error}</p>}
           </>

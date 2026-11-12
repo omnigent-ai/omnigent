@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -12,10 +13,11 @@ import shlex
 import urllib.error
 import urllib.request
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Collection
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import httpx
 
@@ -68,6 +70,7 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -260,6 +263,20 @@ _CODEX_COLLAB_RUNNING_STATUSES = frozenset({"pendingInit", "running"})
 _CODEX_COLLAB_FAILED_STATUSES = frozenset({"errored", "notFound"})
 # Omnigent control event type sent when a Codex child thread is discovered.
 _EXTERNAL_CODEX_SUBAGENT_START_TYPE = "external_codex_subagent_start"
+# Items that register child threads stay on the ordered parent path so a
+# child's lane only ever starts after its Omnigent session exists.
+_CODEX_CHILD_REGISTRATION_ITEM_TYPES = frozenset(
+    {_CODEX_COLLAB_AGENT_ITEM_TYPE, _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE}
+)
+# Child events handled at once across all sub-agent lanes.
+_CHILD_DELIVERY_CONCURRENCY = 8
+# A child event older than this when delivered means its lane is backlogged.
+_CHILD_DELIVERY_LAG_WARNING_SECONDS = 30.0
+# Upper bound on draining queued child events at forwarder shutdown.
+_CHILD_DELIVERY_DRAIN_TIMEOUT_SECONDS = 10.0
+# Bounds the inline Codex reads that link an unregistered thread to the parent.
+_CODEX_THREAD_LINEAGE_READ_TIMEOUT_SECONDS = 5.0
+_CODEX_THREAD_LINEAGE_MAX_DEPTH = 4
 _PLAN_IMPLEMENTATION_QUESTION_ID = "plan_implementation"
 _PLAN_IMPLEMENTATION_TITLE = "Implement this plan?"
 _PLAN_IMPLEMENTATION_YES = "Yes, implement this plan"
@@ -272,6 +289,13 @@ _PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX = (
     "user intent, re-read files as needed, and carry the work through "
     "implementation and verification."
 )
+# Default-mode ``request_user_input_async`` questions ride on an ``agentMessage``
+# item; the Codex TUI answers them with a tagged user message.
+_CODEX_ASYNC_QUESTION_TOOL = "request_user_input_async"
+_CODEX_ASYNC_QUESTION_REQUEST_PREFIX = "async_question:"
+_CODEX_ASYNC_QUESTION_REPLY_TAG = "send_user_message_question_reply"
+_CODEX_ASYNC_QUESTION_REPLY_OPEN_PATTERN = re.compile(rf"<{_CODEX_ASYNC_QUESTION_REPLY_TAG}>\s*")
+_CODEX_ASYNC_QUESTION_REPLY_CLOSE_PATTERN = re.compile(rf"\s*</{_CODEX_ASYNC_QUESTION_REPLY_TAG}>")
 _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
     {
         _CODEX_MCP_ELICITATION_REQUEST_METHOD,
@@ -365,6 +389,14 @@ class _ForwarderTarget:
     elicitation_tracker: _CodexElicitationTaskTracker
 
 
+@dataclass(frozen=True)
+class _QueuedChildEvent:
+    """One child-thread notification waiting on its lane."""
+
+    deliver: Callable[[], Awaitable[None]]
+    enqueued_at: float
+
+
 @dataclass
 class _CodexChildStream:
     """Child output and turn identity, independent of the parent's disk bridge."""
@@ -373,6 +405,68 @@ class _CodexChildStream:
     delta_coalescer: _OutputTextDeltaCoalescer
     active_turn_id: str | None = None
     terminal_turn_ids: set[str] = field(default_factory=set)
+    # Ordered lane so a busy child never blocks the parent's notifications.
+    delivery_queue: asyncio.Queue[_QueuedChildEvent | None] = field(default_factory=asyncio.Queue)
+    delivery_worker: asyncio.Task[None] | None = None
+    last_lag_warning_at: float | None = None
+
+    def enqueue(self, queued: _QueuedChildEvent, slots: asyncio.Semaphore) -> None:
+        """Queue one child event and start the lane's worker if needed."""
+        self.delivery_queue.put_nowait(queued)
+        if self.delivery_worker is None or self.delivery_worker.done():
+            self.delivery_worker = asyncio.create_task(
+                self._deliver(slots), name="codex-native-child-delivery"
+            )
+
+    async def _deliver(self, slots: asyncio.Semaphore) -> None:
+        """Deliver this child's events in order, sharing the global post budget."""
+        loop = asyncio.get_running_loop()
+        while (queued := await self.delivery_queue.get()) is not None:
+            waited = loop.time() - queued.enqueued_at
+            if waited >= _CHILD_DELIVERY_LAG_WARNING_SECONDS and (
+                self.last_lag_warning_at is None
+                or loop.time() - self.last_lag_warning_at >= _CHILD_DELIVERY_LAG_WARNING_SECONDS
+            ):
+                self.last_lag_warning_at = loop.time()
+                _logger.warning(
+                    "Codex child delivery is backlogged: waited=%.1fs queued=%d",
+                    waited,
+                    self.delivery_queue.qsize(),
+                )
+            async with slots:
+                try:
+                    await queued.deliver()
+                except Exception:  # keep the lane alive, as the parent loop does.
+                    _logger.warning("Codex child event handling failed", exc_info=True)
+
+    async def drain(self, timeout: float | None = _CHILD_DELIVERY_DRAIN_TIMEOUT_SECONDS) -> None:
+        """Deliver queued events, then stop the worker; ``None`` waits without a bound."""
+        worker = self.delivery_worker
+        if worker is None or worker.done():
+            return
+        self.delivery_queue.put_nowait(None)
+        try:
+            async with asyncio.timeout(timeout):
+                await asyncio.shield(worker)
+        except TimeoutError:
+            # The unread sentinel offsets the dequeued event the cancel drops.
+            _logger.warning(
+                "Codex child delivery drain timed out: dropped=%d",
+                self.delivery_queue.qsize(),
+            )
+            await self._stop_worker(worker)
+        except asyncio.CancelledError:
+            # The shield keeps a timeout from killing delivery mid-post; a
+            # cancelled shutdown must still stop the worker before resources close.
+            await self._stop_worker(worker)
+            raise
+
+    @staticmethod
+    async def _stop_worker(worker: asyncio.Task[None]) -> None:
+        """Cancel the lane worker and wait until it has finished."""
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
 
     def accepts_event(self, method: str, params: _JsonObject) -> bool:
         turn_id = _terminal_turn_id_from_params(params) or _turn_id_from_payload(params)
@@ -524,6 +618,9 @@ class _CodexForwarderState:
         non-retryable error this connection (guards against re-replay
         or a repeated doomed attempt if the same collab item is observed
         multiple times).
+    :param lineage_checked_threads: Unregistered Codex thread ids already
+        checked for descent from the forwarder's thread this connection, so
+        each costs at most one lineage lookup.
     :param synced_item_keys: Stable item keys already posted to Omnigent this
         connection, e.g. ``{"thread_c:turn_c:item-1"}``. In-memory only;
         guards replay-vs-live overlap within one forwarder lifetime.
@@ -640,7 +737,11 @@ class _CodexForwarderState:
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
+    lineage_checked_threads: set[str] = field(default_factory=set)
     child_streams: dict[str, _CodexChildStream] = field(default_factory=dict)
+    child_delivery_slots: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(_CHILD_DELIVERY_CONCURRENCY)
+    )
     synced_item_keys: set[str] = field(default_factory=set)
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
     posted_user_turns: set[str] = field(default_factory=set)
@@ -877,12 +978,58 @@ class _CodexForwarderState:
             self.child_streams[thread_id] = stream
         return stream
 
+    def enqueue_child_event(
+        self,
+        client: httpx.AsyncClient,
+        event: CodexMessage,
+        deliver: Callable[[], Awaitable[None]],
+        parent_thread_id: str | None,
+    ) -> bool:
+        """
+        Hand a registered child's notification to that child's ordered lane.
+
+        Usage frames are recorded here, in connection order, because a child's
+        inherited baseline depends on frames other lanes have not delivered yet.
+
+        :param client: HTTP client the child's coalescer posts through.
+        :param event: Codex app-server notification envelope.
+        :param deliver: Handles ``event`` with its usage frame already recorded.
+        :param parent_thread_id: Current parent Codex thread id.
+        :returns: ``True`` when queued; ``False`` when the caller must handle
+            it inline (parent, unregistered, or child-registration events).
+        """
+        method = event.get("method")
+        params = event.get("params")
+        if method == "thread/started" or not isinstance(params, dict):
+            return False
+        item = params.get("item")
+        if isinstance(item, dict) and item.get("type") in _CODEX_CHILD_REGISTRATION_ITEM_TYPES:
+            return False
+        thread_id = _thread_id_from_params(params)
+        session_id = self.session_for_child_thread(thread_id) if thread_id is not None else None
+        if thread_id is None or session_id is None:
+            return False
+        if method == "thread/tokenUsage/updated":
+            self.note_usage_frame(params, parent_thread_id)
+        queued = _QueuedChildEvent(deliver=deliver, enqueued_at=asyncio.get_running_loop().time())
+        self.child_stream(client, thread_id, session_id).enqueue(queued, self.child_delivery_slots)
+        return True
+
+    async def settle_child_lanes(self) -> None:
+        """Deliver every queued child event before the parent's resources are replaced."""
+        await asyncio.gather(
+            *(stream.drain(timeout=None) for stream in self.child_streams.values())
+        )
+
     async def close_child_streams(self) -> None:
         """Drain child output while the forwarder's HTTP client is still open."""
-        await asyncio.gather(
-            *(stream.delta_coalescer.close() for stream in self.child_streams.values())
-        )
-        self.child_streams.clear()
+        try:
+            await asyncio.gather(*(stream.drain() for stream in self.child_streams.values()))
+        finally:
+            await asyncio.gather(
+                *(stream.delta_coalescer.close() for stream in self.child_streams.values())
+            )
+            self.child_streams.clear()
 
     def note_parent_rotation(self, session_id: str) -> None:
         """
@@ -894,6 +1041,7 @@ class _CodexForwarderState:
         """
         self.parent_session_id = session_id
         self.pending_child_threads.clear()
+        self.lineage_checked_threads.clear()
         # The new thread has its own goal and terminals, read when it is
         # subscribed. Its sidebar flag is unknown until that sync posts it, and
         # a read still in flight for the old thread must not land on the new one.
@@ -2180,6 +2328,10 @@ class _CodexElicitationTaskTracker:
         """
         self._pending: dict[asyncio.Task[None], _PendingCodexElicitation] = {}
         self._posted_resolutions: set[str] = set()
+        self._started_async_questions: set[str] = set()
+        self._unanswered_async_questions: dict[str, asyncio.Task[None]] = {}
+        # Whether ``GET /v1/info`` advertised async question cards; ``None`` until read.
+        self._server_shows_async_question_cards: bool | None = None
 
     def start(
         self,
@@ -2226,6 +2378,100 @@ class _CodexElicitationTaskTracker:
             ),
         )
         task.add_done_callback(self._discard_done)
+
+    def start_async_question(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        params: _JsonObject,
+    ) -> None:
+        """
+        Publish one card per Codex async question and send each answer as a user message.
+
+        The cards mirror the Codex TUI's queued questions: each is answered on
+        its own, and the answer goes through the session's ordinary message
+        path in the TUI's reply format.
+
+        :param client: HTTP client for Omnigent hook and event posts.
+        :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+        :param params: Codex ``item/completed`` params for an ``agentMessage``.
+        :returns: None.
+        """
+        for question in _codex_async_questions(params):
+            if question.key in self._started_async_questions:
+                continue
+            self._started_async_questions.add(question.key)
+            task = asyncio.create_task(
+                self._run_async_question(client, session_id=session_id, question=question),
+                name="codex-native-async-question",
+            )
+            self._pending[task] = _PendingCodexElicitation(
+                thread_id=question.thread_id,
+                turn_id=question.turn_id,
+                request_id=question.request_id,
+                elicitation_id=codex_elicitation_id(
+                    session_id,
+                    _CODEX_TOOL_REQUEST_USER_INPUT_METHOD,
+                    question.request_id,
+                ),
+            )
+            self._unanswered_async_questions[question.key] = task
+            task.add_done_callback(self._discard_done)
+
+    async def close_async_questions_for_user_message(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        params: _JsonObject,
+    ) -> None:
+        """
+        Close the async question cards a Codex user message clears.
+
+        Like the Codex TUI queue: a tagged reply (from the TUI picker or a
+        card) clears the questions it names, and any other user message,
+        typed in the TUI or the web, clears every open question on the thread.
+
+        :param client: HTTP client for Omnigent event posts.
+        :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+        :param params: Codex ``item/completed`` params.
+        :returns: None.
+        """
+        item = params.get("item")
+        if not isinstance(item, dict) or item.get("type") != "userMessage":
+            return
+        thread_id = _thread_id_from_params(params)
+        keys = _async_question_reply_keys(_user_message_text(item), self._started_async_questions)
+        if not keys:
+            keys = [
+                key
+                for key, task in self._unanswered_async_questions.items()
+                if (pending := self._pending.get(task)) is not None
+                and (thread_id is None or pending.thread_id == thread_id)
+            ]
+        for key in keys:
+            await self._close_async_question(client, session_id, key)
+
+    async def _close_async_question(
+        self, client: httpx.AsyncClient, session_id: str, key: str
+    ) -> None:
+        """
+        Close one async question card without sending an answer.
+
+        :param client: HTTP client for Omnigent event posts.
+        :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+        :param key: Question key, e.g. ``"call_abc:0"``.
+        :returns: None.
+        """
+        task = self._unanswered_async_questions.pop(key, None)
+        pending = self._pending.get(task) if task is not None else None
+        if task is None or pending is None:
+            return
+        # Resolve before dropping the hook wait: a dropped wait alone keeps the
+        # card up for the server's re-park grace.
+        await self._post_resolved_once(client, session_id, pending)
+        task.cancel()
 
     async def resolve_by_server_notification(
         self,
@@ -2279,6 +2525,13 @@ class _CodexElicitationTaskTracker:
         """
         thread_id = _thread_id_from_params(params)
         turn_id = _turn_id_from_payload(params.get("turn")) or _turn_id_from_payload(params)
+        # The Codex TUI drops its queued questions when their turn ends.
+        for key, task in list(self._unanswered_async_questions.items()):
+            pending = self._pending.get(task)
+            if pending is not None and _pending_elicitation_matches_terminal_turn(
+                pending, thread_id=thread_id, turn_id=turn_id
+            ):
+                await self._close_async_question(client, session_id, key)
         for _task, pending in list(self._pending.items()):
             if _pending_elicitation_matches_terminal_turn(
                 pending,
@@ -2304,14 +2557,14 @@ class _CodexElicitationTaskTracker:
 
         :returns: None after all background hook tasks have finished.
         """
-        if not self._pending:
-            return
         tasks = list(self._pending)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._pending.clear()
         self._posted_resolutions.clear()
+        self._started_async_questions.clear()
+        self._unanswered_async_questions.clear()
 
     async def _run_one(
         self,
@@ -2345,6 +2598,73 @@ class _CodexElicitationTaskTracker:
                 event.get("method"),
                 exc_info=True,
             )
+
+    async def _run_async_question(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        question: _CodexAsyncQuestion,
+    ) -> None:
+        """
+        Wait for the Omnigent answer to one async question and send it on.
+
+        :param client: HTTP client for Omnigent hook and event posts.
+        :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+        :param question: Parsed Codex async question.
+        :returns: None.
+        """
+        key = question.key
+        try:
+            if not await self._async_question_cards_supported(client):
+                return
+            result = await _codex_elicitation_hook_result(
+                client, session_id, event=_async_question_request_event(question)
+            )
+            # Absent once a user message or the turn's end cleared it.
+            if self._unanswered_async_questions.pop(key, None) is None:
+                return
+            reply = _async_question_reply_text(question, result)
+            if reply is not None:
+                await _send_async_question_reply(client, session_id, question, reply)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # keep the long-lived forwarder alive.
+            _logger.warning(
+                "Codex forwarder async question task failed: question=%s",
+                key,
+                exc_info=True,
+            )
+        finally:
+            self._unanswered_async_questions.pop(key, None)
+
+    async def _async_question_cards_supported(self, client: httpx.AsyncClient) -> bool:
+        """
+        Report whether the Omnigent server can show async question cards.
+
+        Older servers treat a declined card as an interrupt, so the question
+        stays terminal-only there.
+        An unreadable ``/v1/info`` counts as unsupported and is read again later.
+
+        :param client: HTTP client pointed at the Omnigent server.
+        :returns: ``True`` when ``GET /v1/info`` reports
+            ``codex_nonblocking_decline: true``.
+        """
+        if self._server_shows_async_question_cards is None:
+            try:
+                info = await client.get("/v1/info")
+                info.raise_for_status()
+                payload = info.json()
+            except (httpx.HTTPError, ValueError):
+                _logger.warning(
+                    "Codex forwarder could not read server info; question stays in the terminal",
+                    exc_info=True,
+                )
+                return False
+            self._server_shows_async_question_cards = (
+                isinstance(payload, dict) and payload.get("codex_nonblocking_decline") is True
+            )
+        return self._server_shows_async_question_cards
 
     def _discard_done(self, task: asyncio.Task[None]) -> None:
         """
@@ -2558,6 +2878,7 @@ async def supervise_forwarder(
                         bridge_dir=bridge_dir,
                         app_server_url=app_server_url,
                         event=event,
+                        forwarder_state=forwarder_state,
                     )
                     if rotated:
                         await _clear_superseded_background_work(
@@ -2601,7 +2922,8 @@ async def supervise_forwarder(
                         parent_thread_id=target.thread_id,
                         event=event,
                     )
-                    await _handle_event(
+                    handle = functools.partial(
+                        _handle_event,
                         ap_client,
                         session_id=target.session_id,
                         bridge_dir=bridge_dir,
@@ -2613,6 +2935,14 @@ async def supervise_forwarder(
                         codex_client=client,
                         forwarder_state=forwarder_state,
                     )
+                    # Sub-agents share this socket; their posts must not delay the parent.
+                    if not forwarder_state.enqueue_child_event(
+                        ap_client,
+                        event,
+                        functools.partial(handle, usage_frame_recorded=True),
+                        parent_thread_id=target.thread_id,
+                    ):
+                        await handle()
                 except Exception:  # keep the long-lived mirror alive.
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
         except BaseException as exc:
@@ -2634,11 +2964,12 @@ async def supervise_forwarder(
                 if isinstance(result, BaseException)
                 and not isinstance(result, asyncio.CancelledError)
             ]
+            # Child lanes run first: their queued handlers use the shared tracker.
             for close in (
+                forwarder_state.close_child_streams,
                 target.delta_coalescer.close,
                 target.usage_coalescer.close,
                 target.elicitation_tracker.close,
-                forwarder_state.close_child_streams,
                 client.close,
             ):
                 try:
@@ -2688,11 +3019,14 @@ async def _drive_side_chat_requests(
     """
     while True:
         try:
-            parent_thread_id = target.thread_id
-            # Only claim once the parent thread exists — a request read before
-            # then can't fork, and consuming it would lose the question (#3).
-            if parent_thread_id is not None:
-                for request in side_chat.peek_side_chat_requests(bridge_dir):
+            # Leave requests pending until a parent thread can accept them.
+            if target.thread_id is not None:
+                requests = await asyncio.to_thread(side_chat.peek_side_chat_requests, bridge_dir)
+                for request in requests:
+                    # The parent may change while filesystem I/O is in progress.
+                    parent_thread_id = target.thread_id
+                    if parent_thread_id is None:
+                        break
                     try:
                         child_thread_id = await side_chat.open_side_chat_on_client(
                             codex_client,
@@ -2709,10 +3043,15 @@ async def _drive_side_chat_requests(
                         await _post_side_chat_failed_notice(
                             ap_client, target.session_id, request.path.stem
                         )
-                    # Remove whether it forked or failed: a forked request is
-                    # done, and a failed one has surfaced a notice — keeping it
-                    # would retry the same failure forever.
-                    side_chat.discard_side_chat_request(request.path)
+                    # Finish acknowledging handled requests before a replacement
+                    # forwarder can pick them up, including during cancellation.
+                    discard = asyncio.create_task(
+                        asyncio.to_thread(side_chat.discard_side_chat_request, request.path)
+                    )
+                    try:
+                        await asyncio.shield(discard)
+                    finally:
+                        await discard
         except Exception:  # keep the drain loop alive.
             _logger.warning("Codex /side drain iteration failed", exc_info=True)
         await _sleep(_SIDE_CHAT_POLL_SECONDS)
@@ -2733,7 +3072,27 @@ async def _post_side_chat_failed_notice(
     :param request_key: Stable per-request id for idempotency.
     :returns: None.
     """
-    marker = f"side-chat-error-{request_key}"
+    await _post_assistant_notice(
+        client,
+        session_id,
+        marker=f"side-chat-error-{request_key}",
+        text="Couldn't open a side chat for that /side request. Try again.",
+    )
+
+
+async def _post_assistant_notice(
+    client: httpx.AsyncClient, session_id: str, *, marker: str, text: str
+) -> None:
+    """
+    Post a best-effort assistant notice to an Omnigent session.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param marker: Stable response and source id that makes the notice
+        idempotent, e.g. ``"side-chat-error-req_1"``.
+    :param text: Notice text shown to the user.
+    :returns: None.
+    """
     try:
         await _post_external_item(
             client,
@@ -2742,18 +3101,13 @@ async def _post_side_chat_failed_notice(
             item_data={
                 "role": "assistant",
                 "agent": _AGENT_NAME,
-                "content": [
-                    {
-                        "type": "output_text",
-                        "text": "Couldn't open a side chat for that /side request. Try again.",
-                    }
-                ],
+                "content": [{"type": "output_text", "text": text}],
             },
             response_id=marker,
             source_id=marker,
         )
     except Exception:  # the notice is best-effort.
-        _logger.warning("Codex /side failure notice could not be posted", exc_info=True)
+        _logger.warning("Codex forwarder notice could not be posted: %s", marker, exc_info=True)
 
 
 async def _maybe_rotate_session_on_thread_started(
@@ -2763,6 +3117,7 @@ async def _maybe_rotate_session_on_thread_started(
     bridge_dir: Path,
     app_server_url: str,
     event: CodexMessage,
+    forwarder_state: _CodexForwarderState | None = None,
 ) -> bool:
     """
     Rotate Omnigent ownership when Codex starts a new native thread.
@@ -2780,6 +3135,8 @@ async def _maybe_rotate_session_on_thread_started(
         ``"ws://127.0.0.1:9876"``. Persisted to bridge state for the
         replacement session.
     :param event: Codex app-server notification envelope.
+    :param forwarder_state: Connection state whose child lanes still hold
+        handlers bound to the target's current coalescers and tracker.
     :returns: ``True`` when rotation occurred.
     """
     new_thread_id = _thread_id_from_started_event(event)
@@ -2797,6 +3154,10 @@ async def _maybe_rotate_session_on_thread_started(
     # strands the real turn's output as stale. Ignore all ephemeral threads.
     if _thread_started_is_ephemeral(event):
         return False
+    # Queued child handlers captured this target's tracker and coalescers;
+    # deliver them before those are closed, as the serial loop used to.
+    if forwarder_state is not None:
+        await forwarder_state.settle_child_lanes()
     old_delta_coalescer = target.delta_coalescer
     await old_delta_coalescer.flush()
     old_usage_coalescer = target.usage_coalescer
@@ -2997,6 +3358,9 @@ async def _subscribe_until_ready(
     reconnects keep it so no live turn replaces the bridge's recovery cursor
     before the replay lands.
 
+    If Codex cannot list turns, retry without history so live notifications
+    can still be mirrored. Items preceding that subscription remain unreplayed.
+
     :param client: Codex app-server client.
     :param ap_client: Omnigent HTTP client used for replayed items.
     :param session_id: Omnigent conversation id.
@@ -3026,6 +3390,7 @@ async def _subscribe_until_ready(
         and bridge_state.pending_shell_command_id is not None
     )
     saw_not_ready = False
+    history_unavailable = False
     resume_timeout = _SUBSCRIBE_RESUME_TIMEOUT_SECONDS
     replay_owed = replay_from_turn_id is not None or shell_pending
     async with (
@@ -3035,7 +3400,9 @@ async def _subscribe_until_ready(
             async with _conversation_item_delivery_scope(session_id):
                 received_live_items = client.is_subscribed_to_thread(thread_id)
                 params: _JsonObject = {"threadId": thread_id}
-                if not saw_not_ready and replay_from_turn_id is None and not shell_pending:
+                if history_unavailable or (
+                    not saw_not_ready and replay_from_turn_id is None and not shell_pending
+                ):
                     params["excludeTurns"] = True
                 timed_out = False
                 try:
@@ -3050,6 +3417,19 @@ async def _subscribe_until_ready(
                     raise
                 # App-server error envelopes are surfaced as RuntimeError.
                 except Exception as exc:
+                    if (
+                        not params.get("excludeTurns")
+                        and isinstance(exc, CodexAppServerResponseError)
+                        and exc.code == -32601
+                        and exc.message == "list_turns is not supported yet"
+                    ):
+                        history_unavailable = True
+                        _logger.warning(
+                            "Codex cannot list turns for thread %s; subscribing without history. "
+                            "Items before this subscription cannot be replayed.",
+                            thread_id,
+                        )
+                        continue
                     if not _is_thread_not_ready_error(exc):
                         _logger.warning(
                             "failed to subscribe to Codex thread %s", thread_id, exc_info=True
@@ -3070,6 +3450,7 @@ async def _subscribe_until_ready(
                         forwarder_state=forwarder_state,
                         received_live_items=received_live_items,
                         replay_from_turn_id=replay_from_turn_id,
+                        replay_history=not history_unavailable,
                     )
                     return
             if timed_out:
@@ -3112,6 +3493,7 @@ async def _finish_subscription(
     forwarder_state: _CodexForwarderState | None,
     received_live_items: bool,
     replay_from_turn_id: str | None,
+    replay_history: bool,
 ) -> None:
     """
     Sync thread metadata from a successful resume and replay its snapshot.
@@ -3132,6 +3514,7 @@ async def _finish_subscription(
     :param received_live_items: Whether this connection was already
         subscribed (and so received live items) before the resume.
     :param replay_from_turn_id: Interrupted turn to replay from, if any.
+    :param replay_history: Whether Codex returned history for reconciliation.
     :returns: None.
     """
     if forwarder_state is not None:
@@ -3168,6 +3551,10 @@ async def _finish_subscription(
             thread_id=thread_id,
             forwarder_state=forwarder_state,
         )
+    # An excluded history is not evidence that a saved turn or shell finished.
+    # Keep its recovery cursor until an authoritative lifecycle event arrives.
+    if not replay_history:
+        return
     if forwarder_state is not None and received_live_items:
         forwarder_state.resume_echo_thread_ids.add(thread_id)
     try:
@@ -3317,6 +3704,7 @@ async def _replay_resume_response(
             thread_id=thread_id,
             turns=turns,
             forwarder_state=forwarder_state,
+            replay_from_turn_id=replay_from_turn_id,
         )
 
 
@@ -3342,6 +3730,7 @@ async def _post_resume_turn_status(
     thread_id: str | None,
     turns: list[object],
     forwarder_state: _CodexForwarderState | None = None,
+    replay_from_turn_id: str | None = None,
 ) -> None:
     """
     Publish a missed lifecycle edge from explicit ``thread/resume`` turn state.
@@ -3359,11 +3748,14 @@ async def _post_resume_turn_status(
     :param turns: Raw Codex resume turn list.
     :param forwarder_state: Mutable forwarder state holding the turns whose
         failure was already posted, or ``None``.
+    :param replay_from_turn_id: Persisted turn this subscription is recovering.
     :returns: None.
     """
     if thread_id is None:
         return
-    edge = _resume_turn_status_edge_for_latest_turn(bridge_dir, thread_id, turns)
+    edge = _resume_turn_status_edge_for_latest_turn(
+        bridge_dir, thread_id, turns, replay_from_turn_id=replay_from_turn_id
+    )
     if (
         edge is not None
         and _turn_failure_already_posted(forwarder_state, edge.turn_id)
@@ -3381,6 +3773,8 @@ def _resume_turn_status_edge_for_latest_turn(
     bridge_dir: Path,
     thread_id: str,
     turns: list[object],
+    *,
+    replay_from_turn_id: str | None = None,
 ) -> _CodexTurnStatusEdge | None:
     """
     Return the Omnigent status represented by the latest resume turn.
@@ -3389,6 +3783,7 @@ def _resume_turn_status_edge_for_latest_turn(
     :param thread_id: Codex thread id from the resume payload, e.g.
         ``"thread_123"``.
     :param turns: Raw Codex resume turn list.
+    :param replay_from_turn_id: Persisted turn eligible for terminal idle backfill.
     :returns: Status edge when the latest turn has explicit lifecycle state and
         belongs to the bridge's current thread; otherwise ``None``.
     """
@@ -3405,6 +3800,10 @@ def _resume_turn_status_edge_for_latest_turn(
             return None
         status = _omnigent_status_from_resume_turn(turn)
         if status is None:
+            return None
+        # Fresh resume snapshots can report a just-started turn as terminal.
+        # Only the matching recovery turn can settle through idle backfill.
+        if status == "idle" and turn_id != replay_from_turn_id:
             return None
         update_active_turn_id(bridge_dir, turn_id if status == "running" else None)
         # Parity with the live path — surface ``turn.error`` (if any) that
@@ -3460,6 +3859,7 @@ async def _handle_event(
     expected_thread_id: str | None = None,
     codex_client: CodexAppServerClient | None = None,
     forwarder_state: _CodexForwarderState | None = None,
+    usage_frame_recorded: bool = False,
 ) -> None:
     """
     Forward one Codex app-server notification.
@@ -3480,6 +3880,8 @@ async def _handle_event(
         JSON-RPC response.
     :param forwarder_state: Optional mutable state for Plan-mode prompt
         synthesis and thread setting tracking.
+    :param usage_frame_recorded: Whether a usage frame was already recorded in
+        connection order before the event was queued on a child lane.
     :returns: None.
     """
     method = event.get("method")
@@ -3546,8 +3948,19 @@ async def _handle_event(
         await _settle_mcp_startup(
             client, session_id=session_id, bridge_dir=bridge_dir, reason="thread went idle"
         )
-    if method == "thread/tokenUsage/updated" and forwarder_state is not None:
+    if (
+        method == "thread/tokenUsage/updated"
+        and forwarder_state is not None
+        and not usage_frame_recorded
+    ):
         forwarder_state.note_usage_frame(params, expected_thread_id)
+    await _reattach_descendant_thread(
+        client,
+        params,
+        expected_thread_id=expected_thread_id,
+        codex_client=codex_client,
+        forwarder_state=forwarder_state,
+    )
     # Resolve routing: parent thread, known child thread, or stale/ignored.
     route_session_id, is_child = _resolve_event_session(
         params, method, expected_thread_id, forwarder_state, fallback_session_id=session_id
@@ -3696,6 +4109,13 @@ async def _handle_event(
             bridge_dir=event_bridge_dir,
             file_observer_bridge_dir=bridge_dir,
         )
+        if codex_client is not None:
+            elicitation_tracker.start_async_question(
+                client, session_id=route_session_id, params=params
+            )
+            await elicitation_tracker.close_async_questions_for_user_message(
+                client, session_id=route_session_id, params=params
+            )
 
 
 def _resolve_event_session(
@@ -5034,37 +5454,62 @@ async def _handle_terminal_turn_boundary_inner(
         params,
         forwarder_state=forwarder_state,
     )
-    if delta_coalescer is not None:
-        await delta_coalescer.flush()
-    # Safety net: if a compaction was reported in progress but Codex never
-    # emitted a completion signal we recognize (e.g. a protocol-spelling
-    # drift), force the spinner closed at the turn boundary so it can't hang.
-    if forwarder_state is not None and forwarder_state.compaction_status_posted == "in_progress":
-        await _post_compaction_status(
-            client, session_id, "completed", forwarder_state=forwarder_state
-        )
-    await _maybe_persist_interrupted_partial_text(
-        client,
-        session_id=session_id,
-        method=method,
-        params=params,
-        forwarder_state=forwarder_state,
+    prepared_bridge = (
+        read_bridge_state(bridge_dir)
+        if bridge_dir is not None and terminal.edge is not None
+        else None
     )
-    await _flush_turn_diff(
-        client,
-        session_id=session_id,
-        params=params,
-        forwarder_state=forwarder_state,
-    )
+    preparation_error: Exception | None = None
+    try:
+        with _turn_status_publication_scope(session_id, terminal.edge, phase="before_status"):
+            if delta_coalescer is not None:
+                await delta_coalescer.flush()
+            # Safety net: if a compaction was reported in progress but Codex never
+            # emitted a completion signal we recognize (e.g. a protocol-spelling
+            # drift), force the spinner closed at the turn boundary so it can't hang.
+            if (
+                forwarder_state is not None
+                and forwarder_state.compaction_status_posted == "in_progress"
+            ):
+                await _post_compaction_status(
+                    client, session_id, "completed", forwarder_state=forwarder_state
+                )
+            await _maybe_persist_interrupted_partial_text(
+                client,
+                session_id=session_id,
+                method=method,
+                params=params,
+                forwarder_state=forwarder_state,
+            )
+            await _flush_turn_diff(
+                client,
+                session_id=session_id,
+                params=params,
+                forwarder_state=forwarder_state,
+            )
+    except Exception as exc:  # noqa: BLE001 -- re-raised after publishing the native outcome.
+        preparation_error = exc
+    if preparation_error is not None and bridge_dir is not None:
+        if prepared_bridge is None or read_bridge_state(bridge_dir) != prepared_bridge:
+            raise preparation_error
     terminal_turn_id = _terminal_turn_id_from_params(params)
     if forwarder_state is not None and terminal_turn_id is not None:
         forwarder_state.forget_user_message_copies(terminal_turn_id)
     handled = terminal.handled
-    if terminal.edge is not None:
-        await _post_turn_status_edge(client, session_id, terminal.edge)
-        if forwarder_state is not None and terminal.edge.status == "failed":
-            forwarder_state.turn_failure_surfaced = True
-            await forwarder_state.forget_posted_terminals()
+    # A failed output flush must not discard the native turn's known outcome.
+    # Keep this post in the current handler, preserving native event order.
+    try:
+        if terminal.edge is not None:
+            await _post_turn_status_edge(client, session_id, terminal.edge)
+            if forwarder_state is not None and terminal.edge.status == "failed":
+                forwarder_state.turn_failure_surfaced = True
+                await forwarder_state.forget_posted_terminals()
+    except Exception:
+        if preparation_error is not None:
+            raise preparation_error from preparation_error.__cause__
+        raise
+    if preparation_error is not None:
+        raise preparation_error
     terminal_thread_id = _thread_id_from_params(params)
     if (
         handled
@@ -6007,6 +6452,315 @@ def _default_collaboration_mode(
     }
 
 
+@dataclass(frozen=True)
+class _CodexAsyncQuestion:
+    """
+    One question from a Codex ``request_user_input_async`` call.
+
+    The Codex TUI answers each question of a call on its own, so each gets
+    its own card.
+
+    :param item_id: Codex ``agentMessage`` item id, e.g. ``"call_abc"``.
+    :param index: Position of the question in the call, e.g. ``0``. Codex
+        identifies an answer by item id and index.
+    :param title: Question text, e.g. ``"Pick one"``.
+    :param options: Option labels, e.g. ``("Alpha", "Beta")``.
+    :param thread_id: Asking Codex thread id, e.g. ``"thread_abc"``.
+    :param turn_id: Asking Codex turn id, e.g. ``"turn_abc"``, or ``None``.
+    """
+
+    item_id: str
+    index: int
+    title: str
+    options: tuple[str, ...]
+    thread_id: str
+    turn_id: str | None
+
+    @property
+    def key(self) -> str:
+        """
+        Identify the question within the session.
+
+        :returns: Key, e.g. ``"call_abc:0"``.
+        """
+        return _async_question_key(self.item_id, self.index)
+
+    @property
+    def request_id(self) -> str:
+        """
+        Synthetic ``requestUserInput`` request id for the question card.
+
+        :returns: Request id, e.g. ``"async_question:call_abc:0"``.
+        """
+        return f"{_CODEX_ASYNC_QUESTION_REQUEST_PREFIX}{self.key}"
+
+
+def _async_question_key(item_id: str, index: int) -> str:
+    """
+    Build the key of one async question.
+
+    :param item_id: Codex ``agentMessage`` item id, e.g. ``"call_abc"``.
+    :param index: Position of the question in the call, e.g. ``0``.
+    :returns: Key, e.g. ``"call_abc:0"``.
+    """
+    return f"{item_id}:{index}"
+
+
+def _codex_async_questions(params: _JsonObject) -> list[_CodexAsyncQuestion]:
+    """
+    Parse the questions of a Codex async question from ``item/completed`` params.
+
+    :param params: Codex ``item/completed`` params whose ``agentMessage``
+        item carries ``delivery: "async"`` and ``questions``, e.g.
+        ``[{"title": "Pick one", "options": ["Alpha", "Beta"]}]``.
+    :returns: Parsed questions in asking order; empty for any other item.
+    """
+    item = params.get("item")
+    if not isinstance(item, dict) or item.get("type") != "agentMessage":
+        return []
+    item_id = item.get("id")
+    thread_id = params.get("threadId")
+    turn_id = params.get("turnId")
+    raw_questions = item.get("questions")
+    if item.get("delivery") != "async" or not isinstance(raw_questions, list):
+        return []
+    if not isinstance(item_id, str) or not item_id:
+        return []
+    if not isinstance(thread_id, str) or not thread_id:
+        return []
+    questions: list[_CodexAsyncQuestion] = []
+    for index, raw_question in enumerate(raw_questions):
+        if not isinstance(raw_question, dict):
+            continue
+        title = raw_question.get("title")
+        options = raw_question.get("options")
+        if not isinstance(title, str) or not title:
+            continue
+        labels = tuple(
+            option
+            for option in (options if isinstance(options, list) else [])
+            if isinstance(option, str) and option
+        )
+        questions.append(
+            _CodexAsyncQuestion(
+                item_id=item_id,
+                index=index,
+                title=title,
+                options=labels,
+                thread_id=thread_id,
+                turn_id=turn_id if isinstance(turn_id, str) and turn_id else None,
+            )
+        )
+    return questions
+
+
+def _async_question_request_event(question: _CodexAsyncQuestion) -> CodexMessage:
+    """
+    Build the ``requestUserInput`` request that shows an async question card.
+
+    :param question: Parsed Codex async question.
+    :returns: Codex JSON-RPC request envelope.
+    """
+    # Like the Codex TUI picker: the options, then a free-text "Other" row.
+    params: _JsonObject = {
+        "threadId": question.thread_id,
+        "turnId": question.turn_id,
+        "itemId": question.item_id,
+        "isBlocking": False,
+        "questions": [
+            {
+                "id": str(question.index),
+                "question": question.title,
+                "isOther": True,
+                "isSecret": False,
+                "options": [{"label": label} for label in question.options],
+            }
+        ],
+    }
+    return {
+        "id": question.request_id,
+        "method": _CODEX_TOOL_REQUEST_USER_INPUT_METHOD,
+        "params": params,
+    }
+
+
+def _async_question_reply_text(
+    question: _CodexAsyncQuestion,
+    result: _JsonObject | None,
+) -> str | None:
+    """
+    Format Omnigent answers as the Codex TUI's async question reply message.
+
+    :param question: Parsed Codex async question.
+    :param result: Codex ``requestUserInput`` result, e.g.
+        ``{"answers": {"0": {"answers": ["Alpha"]}}}``.
+    :returns: Tagged user message text with one entry, as the TUI sends for
+        each answered question, or ``None`` when nothing was answered.
+    """
+    answers = result.get("answers") if result is not None else None
+    answer = answers.get(str(question.index)) if isinstance(answers, dict) else None
+    values = answer.get("answers") if isinstance(answer, dict) else None
+    texts = [
+        value
+        for value in (values if isinstance(values, list) else [])
+        if isinstance(value, str) and value
+    ]
+    if not texts:
+        return None
+    question_item_id = [_CODEX_ASYNC_QUESTION_TOOL, question.item_id, question.index]
+    entry = {
+        "answer": ", ".join(texts),
+        "question": question.title,
+        "questionItemId": json.dumps(question_item_id, separators=(",", ":")),
+    }
+    body = json.dumps([entry], ensure_ascii=False, separators=(",", ":"))
+    tag = _CODEX_ASYNC_QUESTION_REPLY_TAG
+    return f"<{tag}>\n{body}\n</{tag}>"
+
+
+def _async_question_replies(
+    text: str, question_keys: Collection[str]
+) -> Iterator[tuple[int, int, list[_JsonObject]]]:
+    """
+    Find the tagged replies to known async questions in a Codex user message.
+
+    A tagged block counts only when every entry names one of
+    ``question_keys`` and some entry has answer text, so a quoted,
+    partial, empty or malformed example stays ordinary text.
+
+    :param text: Codex ``userMessage`` text.
+    :param question_keys: Keys of the async questions Codex asked,
+        e.g. ``{"call_abc:0"}``.
+    :returns: Iterator of ``(start, end, entries)`` for each reply, where
+        ``text[start:end]`` spans its tags.
+    """
+    decoder = json.JSONDecoder()
+    position = 0
+    while opening := _CODEX_ASYNC_QUESTION_REPLY_OPEN_PATTERN.search(text, position):
+        position = opening.end()
+        # Decode before finding the closing tag, which an answer string may contain.
+        try:
+            entries, end = decoder.raw_decode(text, position)
+        except ValueError:
+            continue
+        closing = _CODEX_ASYNC_QUESTION_REPLY_CLOSE_PATTERN.match(text, end)
+        if closing is None or not isinstance(entries, list):
+            continue
+        position = closing.end()
+        keys = [_async_question_reply_entry_key(entry) for entry in entries]
+        if (
+            keys
+            and all(key is not None and key in question_keys for key in keys)
+            and _async_question_reply_answers(entries)
+        ):
+            yield opening.start(), closing.end(), entries
+
+
+def _async_question_reply_answers(entries: list[_JsonObject]) -> list[str]:
+    """
+    Return the answer texts of a tagged async question reply.
+
+    :param entries: Decoded reply entries, each naming an asked question.
+    :returns: Nonempty ``answer`` strings, e.g. ``["Alpha"]``.
+    """
+    answers = [entry.get("answer") for entry in entries]
+    return [answer for answer in answers if isinstance(answer, str) and answer]
+
+
+def _async_question_reply_entry_key(entry: object) -> str | None:
+    """
+    Return the key of the async question one reply entry answers.
+
+    :param entry: Decoded reply entry whose ``questionItemId`` is a JSON
+        string, e.g. ``'["request_user_input_async","call_abc",0]'``.
+    :returns: The question key, e.g. ``"call_abc:0"``, or ``None`` when the
+        entry does not name an async question.
+    """
+    question_item_id = entry.get("questionItemId") if isinstance(entry, dict) else None
+    try:
+        parts = json.loads(question_item_id) if isinstance(question_item_id, str) else None
+    except ValueError:
+        return None
+    if (
+        isinstance(parts, list)
+        and len(parts) == 3
+        and parts[0] == _CODEX_ASYNC_QUESTION_TOOL
+        and isinstance(parts[1], str)
+        and parts[1]
+        and type(parts[2]) is int
+    ):
+        return _async_question_key(parts[1], parts[2])
+    return None
+
+
+def _async_question_reply_keys(text: str, question_keys: Collection[str]) -> list[str]:
+    """
+    Return the keys of the async questions a Codex user message answers.
+
+    Only a message that is wholly one tagged reply answers questions, as the
+    TUI picker and the cards send it; a reply quoted inside other text is an
+    ordinary message.
+
+    :param text: Codex ``userMessage`` text.
+    :param question_keys: Keys of the async questions Codex asked.
+    :returns: Answered question keys, e.g. ``["call_abc:0"]``, or ``[]``.
+    """
+    replies = list(_async_question_replies(text, question_keys))
+    if len(replies) != 1:
+        return []
+    start, end, entries = replies[0]
+    if text[:start].strip() or text[end:].strip():
+        return []
+    keys: list[str] = []
+    for entry in entries:
+        key = _async_question_reply_entry_key(entry)
+        if key is not None and key not in keys:
+            keys.append(key)
+    return keys
+
+
+async def _send_async_question_reply(
+    client: httpx.AsyncClient,
+    session_id: str,
+    question: _CodexAsyncQuestion,
+    reply: str,
+) -> None:
+    """
+    Send an async question answer as an ordinary user message on the session.
+
+    The server delivers it like composer input, steering the running turn or
+    starting one, as the Codex TUI does with its own reply.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param question: Answered Codex async question.
+    :param reply: Tagged reply from :func:`_async_question_reply_text`.
+    :returns: None.
+    """
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": reply}]},
+            },
+        )
+        response.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Codex async question answer could not be sent: question=%s",
+            question.key,
+            exc_info=True,
+        )
+        await _post_assistant_notice(
+            client,
+            session_id,
+            marker=f"async-question-undelivered-{question.item_id}-{question.index}",
+            text=f'Couldn\'t send your answer to "{question.title}" to Codex. '
+            "Answer it again in the terminal.",
+        )
+
+
 async def _handle_turn_started(
     client: httpx.AsyncClient,
     session_id: str,
@@ -6794,6 +7548,162 @@ def _extract_child_session_id(
         )
         return None
     return child_session_id
+
+
+async def _reattach_descendant_thread(
+    client: httpx.AsyncClient,
+    params: _JsonObject,
+    *,
+    expected_thread_id: str | None,
+    codex_client: CodexAppServerClient | None,
+    forwarder_state: _CodexForwarderState | None,
+) -> None:
+    """
+    Register a sub-agent of this thread whose spawn this connection never saw.
+
+    Child routing lives in memory, so after a runner relaunch every sub-agent
+    spawned earlier is unknown, and when the parent sends one of them new work
+    no spawn item names it again. Codex records each thread's spawn parent, so
+    an unregistered thread descending from this forwarder's thread is
+    registered; the server returns the existing child session for a known
+    thread id.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param params: Codex notification params from the unregistered thread.
+    :param expected_thread_id: This forwarder's Codex thread id, e.g.
+        ``"thread_parent"``.
+    :param codex_client: Connected Codex app-server client, or ``None`` to use
+        the one on ``forwarder_state``.
+    :param forwarder_state: Mutable state holding the child-thread mappings.
+    :returns: None. The thread is mapped to a child session when it descends
+        from ``expected_thread_id``.
+    """
+    if forwarder_state is None or expected_thread_id is None:
+        return
+    codex_client = codex_client or forwarder_state.codex_client
+    parent_session_id = forwarder_state.parent_session_id
+    thread_id = _thread_id_from_params(params)
+    if (
+        codex_client is None
+        or parent_session_id is None
+        or thread_id is None
+        or thread_id == expected_thread_id
+        or forwarder_state.session_for_child_thread(thread_id) is not None
+        or thread_id in forwarder_state.lineage_checked_threads
+    ):
+        return
+    forwarder_state.lineage_checked_threads.add(thread_id)
+    thread = await _read_codex_thread(codex_client, thread_id)
+    if thread is None or not await _thread_descends_from(
+        codex_client, thread, expected_thread_id, forwarder_state
+    ):
+        return
+    response = await _post_session_event(
+        client,
+        parent_session_id,
+        event_type=_EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+        data=_codex_child_name_data(thread_id, thread),
+    )
+    child_session_id = (
+        _extract_child_session_id(response, thread_id)
+        if response is not None and response.status_code < 400
+        else None
+    )
+    if child_session_id is None:
+        _log_failed_session_event_post(_EXTERNAL_CODEX_SUBAGENT_START_TYPE, response)
+        # Its next event retries, rather than dropping the sub-agent for the connection.
+        forwarder_state.lineage_checked_threads.discard(thread_id)
+        return
+    # A thread announced on this connection is a fresh spawn whose own
+    # registration still replays its history; an earlier forwarder already
+    # mirrored any other thread's, and replaying it inline would stall the parent.
+    announced = thread_id in forwarder_state.pending_child_threads
+    forwarder_state.note_child_thread(thread_id, child_session_id)
+    if not announced:
+        forwarder_state.note_child_thread_subscribed(thread_id)
+    _logger.warning(
+        "Codex forwarder re-attached sub-agent thread %s to child session %s",
+        thread_id,
+        child_session_id,
+        extra=debug_event(
+            "codex_subagent_reattached",
+            session_id=parent_session_id,
+            child_session_id=child_session_id,
+            thread_id=thread_id,
+            announced=announced,
+        ),
+    )
+
+
+async def _read_codex_thread(
+    codex_client: CodexAppServerClient, thread_id: str
+) -> _JsonObject | None:
+    """
+    Read one Codex thread's metadata without its turns.
+
+    :param codex_client: Connected Codex app-server client.
+    :param thread_id: Codex thread id, e.g. ``"thread_child"``.
+    :returns: The ``Thread`` object, or ``None`` when Codex cannot read it.
+    """
+    try:
+        async with asyncio.timeout(_CODEX_THREAD_LINEAGE_READ_TIMEOUT_SECONDS):
+            response = await codex_client.request(
+                "thread/read", {"threadId": thread_id, "includeTurns": False}
+            )
+    except (RuntimeError, OSError, TimeoutError) as exc:
+        _logger.info(
+            "Codex forwarder could not read thread %s: %s: %s", thread_id, type(exc).__name__, exc
+        )
+        return None
+    result = response.get("result")
+    thread = result.get("thread") if isinstance(result, dict) else None
+    return thread if isinstance(thread, dict) else None
+
+
+async def _thread_descends_from(
+    codex_client: CodexAppServerClient,
+    thread: _JsonObject,
+    ancestor_thread_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> bool:
+    """
+    Whether a Codex thread was spawned, directly or through sub-agents, by another.
+
+    :param codex_client: Connected Codex app-server client, used to read
+        intermediate spawn parents.
+    :param thread: Codex ``Thread`` object to classify.
+    :param ancestor_thread_id: Thread the spawn chain must reach, e.g.
+        ``"thread_parent"``.
+    :param forwarder_state: State whose registered children count as
+        descendants of ``ancestor_thread_id``.
+    :returns: ``True`` when the spawn chain reaches ``ancestor_thread_id`` or
+        a registered child within :data:`_CODEX_THREAD_LINEAGE_MAX_DEPTH` hops.
+    """
+    current: _JsonObject | None = thread
+    for _ in range(_CODEX_THREAD_LINEAGE_MAX_DEPTH):
+        spawn_parent = _codex_thread_spawn_parent(current) if current is not None else None
+        if spawn_parent is None:
+            return False
+        if (
+            spawn_parent == ancestor_thread_id
+            or forwarder_state.session_for_child_thread(spawn_parent) is not None
+        ):
+            return True
+        current = await _read_codex_thread(codex_client, spawn_parent)
+    return False
+
+
+def _codex_thread_spawn_parent(thread: _JsonObject) -> str | None:
+    """
+    Return the thread that spawned a Codex sub-agent thread.
+
+    :param thread: Codex ``Thread`` object, e.g. from ``thread/read``.
+    :returns: Spawning thread id from the ``source.subAgent.thread_spawn``
+        metadata, or ``None`` for a thread that is not a spawned sub-agent.
+    """
+    source = _thread_spawn_source(thread)
+    parent_thread_id = source.get("parent_thread_id") if source is not None else None
+    return parent_thread_id if isinstance(parent_thread_id, str) and parent_thread_id else None
 
 
 async def _backfill_child_thread(
@@ -7770,12 +8680,12 @@ def _codex_tool_call_from_item(item: _JsonObject) -> _CodexToolCall | None:
 # guidance so a top-level session degrades with direction instead of an opaque
 # failure. The codex
 # ``--approval-mode`` presets do NOT disable this sandbox — only the "Full
-# access" preset's ``danger-full-access`` (or a config ``sandbox_mode``) does.
+# Access" preset's ``danger-full-access`` (or a config ``sandbox_mode``) does.
 _CODEX_SANDBOX_NAMESPACE_ERROR_MARKER = "No permissions to create new namespace"
 _CODEX_SANDBOX_BYPASS_GUIDANCE = (
     "Omnigent: Codex's command sandbox could not start because this container "
     "disallows unprivileged user namespaces, so the command did not run. To run "
-    'shell commands here, start a new Codex session with the "Full access" '
+    'shell commands here, start a new Codex session with the "Full Access" '
     "approval preset (New chat → permissions dropdown), or set "
     'sandbox_mode = "danger-full-access" in ~/.codex/config.toml on the runner.'
 )
@@ -8218,16 +9128,49 @@ async def _post_turn_status_edge(
             output = f"{output}\n\n{_CODEX_REAUTH_HINT}"
         elif output == _CODEX_OUTPUT_LIMIT_ERROR:
             output = f"{output}\n\n{_CODEX_OUTPUT_LIMIT_HINT}"
-    await _post_status(
-        client,
-        session_id,
-        edge.status,
-        response_id=response_id,
-        output=output,
-        reauth_required=reauth_required,
-        compaction_model=edge.compaction_model,
-        selected_model=edge.selected_model,
-    )
+    with _turn_status_publication_scope(session_id, edge, phase="status_post"):
+        await _post_status(
+            client,
+            session_id,
+            edge.status,
+            response_id=response_id,
+            output=output,
+            reauth_required=reauth_required,
+            compaction_model=edge.compaction_model,
+            selected_model=edge.selected_model,
+        )
+
+
+@contextlib.contextmanager
+def _turn_status_publication_scope(
+    session_id: str,
+    edge: _CodexTurnStatusEdge | None,
+    *,
+    phase: Literal["before_status", "status_post"],
+) -> Iterator[None]:
+    """Record exceptions before or during a derived turn status publication."""
+    try:
+        yield
+    except Exception as exc:
+        if edge is not None:
+            _logger.warning(
+                "Codex turn status publication failed: status=%s phase=%s",
+                edge.status,
+                phase,
+                extra=debug_event(
+                    "codex_turn_status_publication_failed",
+                    session_id=session_id,
+                    turn_id=edge.turn_id,
+                    intended_status=edge.status,
+                    protocol_source=edge.source[:128],
+                    delivery_phase=phase,
+                    exception_type=type(exc).__name__,
+                    exception_cause_type=(
+                        type(exc.__cause__).__name__ if exc.__cause__ is not None else None
+                    ),
+                ),
+            )
+        raise
 
 
 async def _post_external_elicitation_resolved(
@@ -9097,41 +10040,71 @@ async def _post_session_event(
     :returns: The final HTTP response, or ``None`` (see
         :func:`_post_session_event_inner`).
     """
-    result = await _post_session_event_inner(
-        client,
-        session_id,
-        event_type=event_type,
-        data=data,
-        max_attempts=max_attempts,
-        timeout=timeout,
-    )
+    try:
+        result = await _post_session_event_inner(
+            client,
+            session_id,
+            event_type=event_type,
+            data=data,
+            max_attempts=max_attempts,
+            timeout=timeout,
+        )
+    except DatabricksAuthError as exc:
+        # An earlier retry may have reached the server before credentials failed.
+        if event_type in _DEAD_LETTER_EVENT_TYPES:
+            _record_failed_session_event(
+                session_id,
+                event_type=event_type,
+                data=data,
+                result=_PostResult(
+                    response=None,
+                    delivered_ambiguous=True,
+                    transport_error=type(exc).__name__,
+                ),
+                reason="credential resolution failed before acknowledgement",
+            )
+        raise
     response = result.response
     if response is not None and response.status_code < 400:
         _note_forward_success()
     else:
-        _note_forward_failure(event_type, result, session_id)
-        dl_dir = _dead_letter_dir.get()
-        if event_type in _DEAD_LETTER_EVENT_TYPES and dl_dir is not None:
-            http_status = response.status_code if response is not None else None
-            if result.rejection_reason is not None:
-                reason = result.rejection_reason
-            elif response is not None:
-                reason = f"http {response.status_code}"
-            elif result.delivered_ambiguous:
-                reason = "ambiguous transport failure (may already be committed)"
-            else:
-                reason = "proven-undelivered transport failure after retries"
-            append_dead_letter(
-                dl_dir,
-                session_id=session_id,
-                event_type=event_type,
-                payload=data,
-                reason=reason,
-                delivered_ambiguous=result.delivered_ambiguous,
-                http_status=http_status,
-                transport_error=result.transport_error,
-            )
+        _record_failed_session_event(session_id, event_type=event_type, data=data, result=result)
     return response
+
+
+def _record_failed_session_event(
+    session_id: str,
+    *,
+    event_type: str,
+    data: _JsonObject,
+    result: _PostResult,
+    reason: str | None = None,
+) -> None:
+    """Track failed mirroring and retain durable payloads for conservative replay."""
+    _note_forward_failure(event_type, result, session_id)
+    dl_dir = _dead_letter_dir.get()
+    if event_type not in _DEAD_LETTER_EVENT_TYPES or dl_dir is None:
+        return
+    response = result.response
+    if reason is None:
+        if result.rejection_reason is not None:
+            reason = result.rejection_reason
+        elif response is not None:
+            reason = f"http {response.status_code}"
+        elif result.delivered_ambiguous:
+            reason = "ambiguous transport failure (may already be committed)"
+        else:
+            reason = "proven-undelivered transport failure after retries"
+    append_dead_letter(
+        dl_dir,
+        session_id=session_id,
+        event_type=event_type,
+        payload=data,
+        reason=reason,
+        delivered_ambiguous=result.delivered_ambiguous,
+        http_status=response.status_code if response is not None else None,
+        transport_error=result.transport_error,
+    )
 
 
 async def _post_session_event_inner(
@@ -9469,11 +10442,7 @@ def _parent_thread_id_from_started_event(event: CodexMessage) -> str | None:
     thread = params.get("thread")
     if not isinstance(thread, dict):
         return None
-    source = _thread_spawn_source(thread)
-    if source is None:
-        return None
-    parent_thread_id = source.get("parent_thread_id")
-    return parent_thread_id if isinstance(parent_thread_id, str) and parent_thread_id else None
+    return _codex_thread_spawn_parent(thread)
 
 
 def _thread_started_is_subagent(event: CodexMessage) -> bool:

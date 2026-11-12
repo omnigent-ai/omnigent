@@ -39,6 +39,10 @@ from fastapi import FastAPI
 from fastapi.routing import APIRoute
 
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
+from omnigent.native.elicitation_reattach import (
+    HELD_POLL_READ_TIMEOUT_S,
+    PRE_RESOLVED_ELICITATION_TTL_S,
+)
 from omnigent.runtime import session_stream
 from omnigent.server._elicitation_registry import (
     _harness_pre_resolved_elicitations,
@@ -2158,6 +2162,12 @@ async def test_pre_resolved_elicitation_tombstone_expires_before_hook_registrati
     live forever or resolve a much later prompt that reuses the same
     deterministic id.
     """
+    # The server's effective retention must be the one the hook times against,
+    # and outlast a silently dead poll's read timeout plus a reconnect.
+    assert sessions_route._HARNESS_PRE_RESOLVED_ELICITATION_TTL_S == (
+        PRE_RESOLVED_ELICITATION_TTL_S
+    )
+    assert sessions_route._HARNESS_PRE_RESOLVED_ELICITATION_TTL_S > HELD_POLL_READ_TIMEOUT_S + 30.0
     now = sessions_route.time.time()
     monkeypatch.setattr(
         sessions_route,
@@ -2927,6 +2937,74 @@ async def test_codex_request_user_input_hook_returns_id_keyed_answers(
     resp = await hook_task
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"answers": {"framework": {"answers": ["React"]}}}
+
+
+@pytest.mark.parametrize(
+    ("is_blocking", "expected_forwards"),
+    [(None, [{"type": "interrupt"}]), (True, [{"type": "interrupt"}]), (False, [])],
+    ids=["unspecified", "blocking", "non_blocking"],
+)
+async def test_codex_request_user_input_decline_interrupts_only_blocking_questions(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    is_blocking: bool | None,
+    expected_forwards: list[dict[str, Any]],
+) -> None:
+    """
+    Declining a blocking Codex question interrupts its turn; a non-blocking one does not.
+
+    An async question card has no Codex turn waiting on it, so dismissing it
+    must not stop the work Codex continued with, and its card must not lock
+    the web composer.
+    """
+    forwarded: list[dict[str, Any]] = []
+
+    async def record_forward(
+        _session_id: str, _router: object, event: dict[str, Any], **_kwargs: object
+    ) -> None:
+        forwarded.append(event)
+
+    monkeypatch.setattr(sessions_route, "_forward_session_change_to_runner", record_forward)
+    agent = await create_test_agent(client, "test-codex-question-decline")
+    session_id = await _create_session(client, agent["id"])
+    params: dict[str, Any] = {
+        "threadId": "thread_123",
+        "turnId": "turn_123",
+        "itemId": "call_123",
+        "questions": [
+            {
+                "id": "0",
+                "question": "Which option do you want?",
+                "options": [{"label": "Alpha"}, {"label": "Beta"}],
+                "isOther": True,
+                "isSecret": False,
+            }
+        ],
+    }
+    if is_blocking is not None:
+        params["isBlocking"] = is_blocking
+    payload = {"id": "req_question", "method": "item/tool/requestUserInput", "params": params}
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], "decline")
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"answers": {}}
+    assert forwarded == expected_forwards
+    assert event["params"].get("is_blocking", "unset") == (
+        False if is_blocking is False else "unset"
+    )
 
 
 async def test_codex_plan_mode_final_prompt_round_trip(

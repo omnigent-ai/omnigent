@@ -33,7 +33,10 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorWait,
     InjectionDeliveryAmbiguous,
+    LiveMcpHarnessNotRunning,
+    LiveMcpServerStatus,
     Message,
     ReasoningChunk,
     SubAgentCompleted,
@@ -86,7 +89,6 @@ _MCP_TOOL_NAME_PREFIX = "mcp__"
 # starving the reap (subprocess-backed executors terminate only in close/close_session).
 # _INTERRUPT_SLICE_S must exceed _PiRpcSession.close()'s inner 2.0s process.wait() so the
 # slice never fires first and inject a CancelledError that bypasses the SIGKILL fallback.
-INTERRUPT_TIMEOUT_S = 3.0
 _INTERRUPT_SLICE_S = 3.0
 
 # Interrupting an executor abandoned by an abnormal exit usually fails because the
@@ -248,6 +250,7 @@ class ExecutorAdapter(HarnessApp):
             request.input,
             include_tool_history=executor.replays_tool_history(),
             preserve_content_blocks=executor.preserves_message_content_blocks(),
+            preserve_empty_initiating_message=executor.preserves_empty_initiating_message(),
         )
         # Stamp session_key on every message so the inner executor keys its client consistently,
         # matching the key used by enqueue_session_message (steering delivery depends on this).
@@ -670,7 +673,7 @@ class ExecutorAdapter(HarnessApp):
             return closed
 
         try:
-            return await asyncio.wait_for(_reap(), timeout=INTERRUPT_TIMEOUT_S)
+            return await asyncio.wait_for(_reap(), timeout=executor.close_timeout())
         except Exception:
             _logger.exception("abandoned executor teardown failed or timed out")
             return False
@@ -716,7 +719,7 @@ class ExecutorAdapter(HarnessApp):
                         await exc.close()
 
                 with contextlib.suppress(Exception):
-                    await asyncio.wait_for(_close(), timeout=INTERRUPT_TIMEOUT_S)
+                    await asyncio.wait_for(_close(), timeout=executor.close_timeout())
         finally:
             self._resyncing = False
 
@@ -1063,6 +1066,26 @@ class ExecutorAdapter(HarnessApp):
         evaluation_id = f"poleval_{secrets.token_hex(16)}"
         return await ctx.evaluate_policy(evaluation_id, phase, data)
 
+    def supports_live_mcp_control(self) -> bool:
+        """Whether the inner executor reports its MCP connections.
+
+        Before the first turn builds the executor, nothing is connected yet, so
+        the harness answers as not running rather than unsupported.
+        """
+        return self._executor is None or self._executor.supports_live_mcp_control()
+
+    async def live_mcp_statuses(self) -> list[LiveMcpServerStatus] | None:
+        """The inner executor's MCP connections for this conversation."""
+        if self._executor is None:
+            return None
+        return await self._executor.live_mcp_statuses(self._session_key)
+
+    async def reconnect_live_mcp_server(self, name: str) -> None:
+        """Reconnect one of the inner executor's MCP servers for this conversation."""
+        if self._executor is None:
+            raise LiveMcpHarnessNotRunning
+        await self._executor.reconnect_live_mcp_server(self._session_key, name)
+
     def _ensure_executor(self) -> Executor:
         """
         Construct the inner executor on first use; return cached
@@ -1076,7 +1099,10 @@ class ExecutorAdapter(HarnessApp):
 
     def _translate_event(self, event: ExecutorEvent, ctx: TurnContext) -> None:
         """Translate one inner ExecutorEvent into Omnigent SSE events via ``ctx.emit``."""
-        if isinstance(event, TextChunk):
+        if isinstance(event, ExecutorWait):
+            if ctx._hold_idle_watchdog is not None:
+                ctx._hold_idle_watchdog()
+        elif isinstance(event, TextChunk):
             ctx.emit(
                 OutputTextDeltaEvent(
                     type="response.output_text.delta",
@@ -1572,6 +1598,7 @@ def _translate_input_to_messages(
     *,
     include_tool_history: bool = False,
     preserve_content_blocks: bool = False,
+    preserve_empty_initiating_message: bool = False,
 ) -> list[Message]:
     """Convert a CreateResponseRequest input to inner Message list.
 
@@ -1586,6 +1613,7 @@ def _translate_input_to_messages(
         input_value,
         include_tool_history=include_tool_history,
         preserve_content_blocks=preserve_content_blocks,
+        preserve_empty_initiating_message=preserve_empty_initiating_message,
     )
     if history_messages:
         return history_messages
@@ -1601,6 +1629,7 @@ def _extract_role_keyed_messages(
     *,
     include_tool_history: bool,
     preserve_content_blocks: bool,
+    preserve_empty_initiating_message: bool,
 ) -> list[Message]:
     """Extract role-keyed messages from an Omnigent input list.
 
@@ -1635,9 +1664,16 @@ def _extract_role_keyed_messages(
         content = _normalize_message_content(
             item.get("content"), preserve_content_blocks=preserve_content_blocks
         )
-        if not content:
+        is_initiating_user = role == "user" and item is input_value[-1]
+        # Opted-in executors need the empty item's identity and position.
+        if not content and not (is_initiating_user and preserve_empty_initiating_message):
             continue
-        messages.append({"role": role, "content": content})
+        message: Message = {"role": role, "content": content}
+        # Only the final input item can identify this turn. Filtered tool history
+        # must not make an older user message look like the initiating item.
+        if is_initiating_user:
+            message["input_item_id"] = item.get("id")
+        messages.append(message)
     return messages
 
 

@@ -71,6 +71,7 @@ class ScheduledTaskStore(ABC):
         max_cost_usd: float | None = None,
         session_mode: str = "new",
         session_id: str | None = None,
+        source_session_id: str | None = None,
         workspace: str | None = None,
         base_branch: str | None = None,
         host_id: str | None = None,
@@ -100,6 +101,8 @@ class ScheduledTaskStore(ABC):
             firing; ``"continue"`` sends each firing's prompt into one session.
         :param session_id: The existing session a ``"continue"`` task sends
             its prompt to; ``None`` lets its first firing create one.
+        :param source_session_id: The session each firing's new session starts
+            as a copy of, or ``None`` for runs that start empty.
         :param workspace: Runner start path (source repo / working dir).
         :param host_id: The connected host to pin the run to.
         :param project_id: First-class project each fired session is filed
@@ -261,6 +264,23 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
+    def release_session(self, scheduled_task_id: str, session_id: str) -> bool:
+        """
+        Forget the session a ``"continue"`` task continues, if it is still *session_id*.
+
+        Used when that session was deleted, so the next firing starts a new one
+        and records it with :meth:`adopt_session`. Does not touch ``updated_at``:
+        this is housekeeping, and a firing compares that field with its own read
+        of the task before it records the session it created.
+
+        :param scheduled_task_id: Opaque task identifier.
+        :param session_id: The session the caller found missing.
+        :returns: ``True`` if the task held *session_id* and no longer does;
+            ``False`` if the task is gone or already holds another session.
+        """
+        ...
+
+    @abstractmethod
     def delete(self, scheduled_task_id: str) -> bool:
         """
         Delete a scheduled task. Idempotent.
@@ -400,6 +420,22 @@ class ScheduledTaskStore(ABC):
         :returns: The matching ``running`` :class:`ScheduledTaskRun`, or
             ``None`` if the conversation has no run, or its run is already
             terminal.
+        """
+        ...
+
+    @abstractmethod
+    def has_starting_run_for_conversation(self, conversation_id: str) -> bool:
+        """
+        Whether a run that recorded this conversation is still ``starting``.
+
+        A run keeps that status until it settles its launch, including the
+        teardown of a sandbox that never registered, so a fire on any replica
+        can tell the session's launch is still owned. Workspace-scoped like
+        every other store read; backed by
+        ``ix_scheduled_task_runs_conversation_status``.
+
+        :param conversation_id: The session to look up.
+        :returns: ``True`` if any ``starting`` run records the session.
         """
         ...
 

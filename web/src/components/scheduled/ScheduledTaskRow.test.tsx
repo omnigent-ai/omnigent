@@ -221,3 +221,30 @@ it.each(["continue", "new"] as const)(
     }
   },
 );
+
+describe("right-click context menu", () => {
+  it("opens the same actions on right-click and dispatches the selection", () => {
+    const onDelete = vi.fn();
+    const t = task();
+    renderRow(t, { onDelete });
+    fireEvent.contextMenu(screen.getByTestId("scheduled-task-row"));
+    expect(screen.getByTestId("task-run-now")).toBeInTheDocument();
+    expect(screen.getByTestId("task-edit")).toBeInTheDocument();
+    expect(screen.getByTestId("task-pause-toggle").textContent).toBe("Pause");
+    fireEvent.click(screen.getByTestId("task-delete"));
+    expect(onDelete).toHaveBeenCalledWith(t);
+  });
+
+  it("opens on the clickable card body without navigating", () => {
+    renderRow(task({ id: "st_42" }), {}, { detailPage: true });
+    fireEvent.contextMenu(screen.getByTestId("task-row-open"));
+    expect(screen.getByTestId("task-edit")).toBeInTheDocument();
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("does not open while the row is busy", () => {
+    renderRow(task(), { busy: true });
+    fireEvent.contextMenu(screen.getByTestId("scheduled-task-row"));
+    expect(screen.queryByTestId("task-run-now")).toBeNull();
+  });
+});

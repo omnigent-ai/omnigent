@@ -414,6 +414,12 @@ missing executor values.
 Register commands in `~/.omnigent/config.yaml` under `acp.agents`; the slug is
 derived from the agent name.
 
+Every ACP `session/prompt`, including Goose and Qwen prompts, carries
+`params._meta["ai.omnigent/inputItemId"]`. Its value is the persisted user item
+ID, already readable via `GET /v1/sessions/{id}/items` when the prompt arrives.
+A `null` value means a synthetic or tool-recovery prompt without an initiating
+persisted user item. A missing key indicates an older Omnigent version.
+
 OpenClaw's Gateway ACP bridge is one such server. It rejects per-session
 `mcpServers`, so disable Omnigent's MCP relay for that entry and let OpenClaw
 use its own tools, routing, memory, and channels:
@@ -653,15 +659,91 @@ os_env:
     type: linux_bwrap
     egress_rules:
       - "* pypi.org/**"                              # your other egress needs
-      - "* dbc-adb7b1a3-9097.cloud.databricks.com/**"  # the proxied workspace
+      - "* dbc-87654321-dcba.cloud.databricks.com/**"  # the proxied workspace
     credential_proxy:
       - type: databricks_cli
-        profiles: [dbc-adb7b1a3-9097, oss]
-        default: dbc-adb7b1a3-9097   # optional; sets DATABRICKS_CONFIG_PROFILE
+        profiles: [dbc-87654321-dcba, oss]
+        default: dbc-87654321-dcba   # optional; sets DATABRICKS_CONFIG_PROFILE
 ```
 
-Inside the sandbox, `databricks --profile dbc-adb7b1a3-9097 current-user me`
+Inside the sandbox, `databricks --profile dbc-87654321-dcba current-user me`
 works; the sandbox holds only `oa_cred_*` placeholders, never a live token.
+
+A sandboxed `codex` executor can use an HTTPS gateway through the same proxy.
+Bind the gateway host with `https_bearer`, set `env` to
+`OMNIGENT_CODEX_GATEWAY_TOKEN`, and allow the gateway's exact Responses route.
+The runner replaces the provider's auth command with a fixed command that
+prints only the placeholder. The trusted parent reads the protected source and
+renews its token; Codex receives a private home without host auth or provider
+configuration. A locked profile requires an explicit `broker_gateway: true`;
+missing or mismatched bindings prevent launch. Other gateway profiles retain
+their existing authentication.
+
+```yaml
+executor:
+  model: gpt-daybreak-blue-latest
+  auth:
+    type: provider
+    name: locked-model
+  config:
+    harness: codex
+    broker_gateway: true
+    web_search: false
+    disable_native_tools: true
+os_env:
+  type: caller_process
+  sandbox:
+    type: darwin_seatbelt # or linux_bwrap
+    egress_rules:
+      - "POST model.example.com/cyber/v1/responses"
+    credential_proxy:
+      - type: https_bearer
+        target: model.example.com
+        env: OMNIGENT_CODEX_GATEWAY_TOKEN
+        source:
+          unix_socket: /private/model-token.sock
+          refresh_interval_seconds: 300
+```
+
+Configure this provider in the host's `~/.omnigent/config.yaml`:
+
+```yaml
+providers:
+  locked-model:
+    kind: gateway
+    openai:
+      base_url: https://model.example.com/cyber/v1
+      wire_api: responses
+      auth_command: "false" # required by the provider schema; locked mode replaces it
+      models:
+        default: gpt-daybreak-blue-latest
+```
+
+Before a release includes gateway broker support, the minimum runner build is
+[8ee1f8558f](https://github.com/omnigent-ai/omnigent/commit/8ee1f8558fc8f5e86244e8ac9bbcb1189eb6e375)
+or a later build containing that implementation. Upgrade every runner that can
+launch the profile before enabling it. Older runners
+ignore `broker_gateway` and retain legacy authentication behavior. Keep the
+provider's `auth_command: "false"` exactly as shown: an older runner then fails
+authentication instead of running a real token command. The setting alone
+does not protect an older runner. Verify a real turn and a resumed turn on
+the upgraded runner before rollout.
+
+The locked profile replaces `false` with the brokered placeholder command
+before Codex starts. Other uses of this provider run `false` and fail
+authentication.
+
+The reserved gateway binding requires a placeholder-bearing HTTPS request on
+port 443 in both the Codex relay and the Omnigent OS-tool proxy. A bare request
+or plaintext HTTP request receives no bearer.
+
+The socket path must be absolute and outside sandbox read/write grants. A
+separate trusted issuer must serve `GET /token` and refresh the bearer; Omnigent
+does not start that issuer. Keep its code, dependencies, configuration, and
+credential storage outside sandbox write grants. Locked Codex profiles must set
+`web_search: false` and `disable_native_tools: true` so their shell and file
+operations use Omnigent tools and policies. Missing or unsafe settings prevent
+launch.
 
 ### Git over SSH from a sandbox
 
@@ -988,6 +1070,7 @@ tool_groups:
   comments: false         # list_comments / update_comment
   policies: false         # sys_add_policy / sys_policy_registry
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
+  projects: false         # sys_project_* / sys_session_update
 ```
 
 Every group defaults to `true`, so omitting the block changes nothing. Values

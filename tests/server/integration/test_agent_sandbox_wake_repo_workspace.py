@@ -118,6 +118,7 @@ class _AgentSandboxFake(FakeSandboxLauncher):
         self.resume_count = 0
         # Every launch result the fake host answered, in arrival order.
         self.launch_results: list[HostLaunchRunnerResultFrame] = []
+        self.launch_frames: list[HostLaunchRunnerFrame] = []
 
     def start_host(
         self,
@@ -212,6 +213,7 @@ async def _serve_agent_sandbox_host(
             # Runner-encoded ping frames share the socket; skip them.
             continue
         if isinstance(frame, HostLaunchRunnerFrame):
+            fake.launch_frames.append(frame)
             # Mirror the real host: a launch into a missing workspace is
             # refused with workspace_missing.
             if frame.workspace in fake.live_dirs:
@@ -274,6 +276,7 @@ async def _wait_for_binding(
         ),
     ],
 )
+@pytest.mark.parametrize("mcp_gate", ["on", "off"])
 async def test_agent_sandbox_wake_reconstructs_repo_workspaces(
     runtime_init: None,
     db_uri: str,
@@ -283,6 +286,7 @@ async def test_agent_sandbox_wake_reconstructs_repo_workspaces(
     multi_repo: bool,
     expected_workspace: str,
     expected_clone_dirs: set[str],
+    mcp_gate: str,
 ) -> None:
     """Waking a resumable agent_sandbox host must rebuild its repo workspaces.
 
@@ -313,7 +317,13 @@ async def test_agent_sandbox_wake_reconstructs_repo_workspaces(
             provider="agent_sandbox",
         )
     )
+    from omnigent.server.feature_flags import Feature, FeatureFlags
+
     app = create_app(
+        mcp_disabled_servers=mcp_gate == "on",
+        feature_flags=FeatureFlags(
+            frozenset({Feature.MCP_DISABLED_SERVERS_CLAUDE, Feature.MCP_DISABLED_SERVERS_CODEX})
+        ),
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
         conversation_store=conv_store,
@@ -437,6 +447,9 @@ async def test_agent_sandbox_wake_reconstructs_repo_workspaces(
         assert len(fake.launch_results) == 2, (
             f"expected the create launch and the wake launch; got {fake.launch_results!r}"
         )
+        assert [frame.mcp_disabled_servers_active_harnesses for frame in fake.launch_frames] == [
+            ["claude", "codex"] if mcp_gate == "on" else None
+        ] * 2
         wake_launch = fake.launch_results[-1]
 
         # Missing restoration is surfaced as workspace_missing.

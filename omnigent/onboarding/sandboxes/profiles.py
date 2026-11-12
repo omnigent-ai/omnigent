@@ -8,6 +8,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.onboarding.sandboxes.types import SandboxError
 
+PROFILE_ID_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,63}$"
+
 
 class ProviderSandboxProfile(BaseModel):
     """Public metadata for an authorized provider profile at an exact revision.
@@ -20,7 +22,7 @@ class ProviderSandboxProfile(BaseModel):
         extra="forbid", strict=True, frozen=True, revalidate_instances="always"
     )
 
-    id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    id: str = Field(pattern=PROFILE_ID_PATTERN)
     name: str = Field(min_length=1, max_length=100)
     description: str = Field(default="", max_length=500)
     revision: str = Field(min_length=1, max_length=64)
