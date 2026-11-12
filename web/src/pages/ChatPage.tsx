@@ -3714,7 +3714,7 @@ function ComposerImpl(
       hasRegistryServers && registryCatalog.error
         ? "Couldn’t check MCP service connections."
         : undefined,
-      sessionHarness === "claude-sdk"
+      sessionHarness === "claude-sdk" || sessionHarness === "claude-native"
         ? liveMcpStatusNote(liveMcpQuery.data, liveMcpQuery.isError)
         : undefined,
     ]

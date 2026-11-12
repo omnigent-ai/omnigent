@@ -1519,6 +1519,81 @@ async def test_a_reconnect_past_its_deadline_frees_the_line_and_starts_nothing_l
 
 
 @pytest.mark.asyncio
+async def test_a_reconnect_waiting_in_line_is_bounded_by_its_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A Reconnect queued behind a stalled one answers in time, and the line frees up."""
+    conv_id = "aeb2c3d4e5f60718293a4b5c6d7e8f90"
+    monkeypatch.setattr(runner_app, "_CLAUDE_RECONNECT_DEADLINE_S", 1.0)
+    checking, release = _hold_restart_attach_check(monkeypatch)
+    harness = _ScriptedHarnessClient([])
+    app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
+        monkeypatch, tmp_path, conv_id, harness_client=harness
+    )
+    statuses["linear"] = "connected"
+    url = f"/v1/sessions/{conv_id}/live-mcp-servers/reconnect"
+
+    async with _runner_client(app) as client:
+        # The first stalls in its checks while holding the line; the second waits behind it.
+        first = asyncio.create_task(client.post(url, json={"name": "linear"}))
+        await poll_until_async(checking.is_set, timeout_s=5)
+        second = asyncio.create_task(client.post(url, json={"name": "linear"}))
+        # Within its own deadline of being sent, waiting in line included.
+        queued = await asyncio.wait_for(second, timeout=1.6)
+        answers = [await asyncio.wait_for(first, timeout=5), queued]
+        release.set()
+        # The later message needs no restart of its own, so any restart came from Reconnect.
+        statuses["linear"] = "sign_in_required"
+        message = await asyncio.wait_for(
+            client.post(f"/v1/sessions/{conv_id}/events", json=_MESSAGE), timeout=5
+        )
+        assert message.status_code < 300, message.text
+        await poll_until_async(lambda: bool(harness.posted_bodies), timeout_s=5)
+
+    assert [answer.json()["reconnect_error"] for answer in answers] == [
+        "Reconnect took too long. Try again."
+    ] * 2
+    assert (closes, relaunched) == ([], [])
+
+
+@pytest.mark.asyncio
+async def test_a_message_is_admitted_when_its_restart_check_stalls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A hung pane probe can't hold a message's place in line past the restart deadline."""
+    conv_id = "afb2c3d4e5f60718293a4b5c6d7e8f90"
+    monkeypatch.setattr(runner_app, "_CLAUDE_AUTO_RESTART_DEADLINE_S", 0.5)
+    app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
+        monkeypatch, tmp_path, conv_id
+    )
+    statuses["linear"] = "connected"
+    pane = app.state.session_resource_registry.terminal_registry.get(conv_id, "claude", "main")
+    hung = asyncio.Event()
+
+    async def _hung_probe() -> bool:
+        await hung.wait()
+        return True
+
+    pane.is_alive = _hung_probe  # type: ignore[method-assign]
+
+    async with _runner_client(app) as client:
+        try:
+            first = await asyncio.wait_for(
+                client.post(f"/v1/sessions/{conv_id}/events", json=_MESSAGE), timeout=5
+            )
+            # The line is free: a later message is admitted too.
+            later = await asyncio.wait_for(
+                client.post(f"/v1/sessions/{conv_id}/events", json=_MESSAGE), timeout=5
+            )
+        finally:
+            hung.set()
+
+    assert first.status_code < 300, first.text
+    assert later.status_code < 300, later.text
+    assert (closes, relaunched) == ([], [])
+
+
+@pytest.mark.asyncio
 async def test_a_cancelled_reconnect_does_not_hold_up_later_messages(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
