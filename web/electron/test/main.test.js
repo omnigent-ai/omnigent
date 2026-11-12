@@ -145,7 +145,6 @@ function loadNavigationHarness({
   realBrowserRegistry = false,
   arcaPath = null,
   arcaResult = { ok: true, alreadyRunning: false },
-  arcaExtendResult = { ok: true, shutdownAt: null },
   dbcertRefreshResult = { ok: true },
   dbcertSyncResult = { ok: true },
   dbcertPreflightResult = { ok: true, valid: true },
@@ -189,7 +188,6 @@ function loadNavigationHarness({
     loading: [],
     reloads: 0,
     arcaConnects: [],
-    arcaExtends: [],
     dbcertRefreshes: 0,
     dbcertSyncs: 0,
     dbcertPreflights: 0,
@@ -495,10 +493,6 @@ function loadNavigationHarness({
       ...require("../src/arca"),
       resolveArcaPath: () => arcaPath,
       resolveArcaPathAsync: async () => arcaPath,
-      runArcaExtend: async (mode) => {
-        calls.arcaExtends.push(mode);
-        return typeof arcaExtendResult === "function" ? arcaExtendResult(mode) : arcaExtendResult;
-      },
       runDbcertRefresh: async (options) => {
         calls.dbcertRefreshes += 1;
         return typeof dbcertRefreshResult === "function"
@@ -779,87 +773,6 @@ function loadNavigationHarness({
     },
   };
 }
-
-describe("Arca extend IPC", () => {
-  it("rejects a second extension until the first finishes", async (t) => {
-    let finish;
-    const pending = new Promise((resolve) => {
-      finish = resolve;
-    });
-    const serverUrl = "https://workspace.cloud.databricks.com/omnigent";
-    const h = loadNavigationHarness({
-      serverUrl,
-      internalFeatures: true,
-      arcaExtendResult: () => pending,
-    });
-    t.after(h.cleanup);
-    h.api.registerIpc();
-    const extend = h.ipc.get("omnigent:arca-extend");
-    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
-    const first = extend(event, "overnight");
-    assert.match((await extend(event, "workweek")).error, /already in progress/);
-    assert.deepEqual(h.calls.arcaExtends, ["overnight"]);
-    finish({ ok: true, shutdownAt: null });
-    assert.equal((await first).ok, true);
-    assert.equal((await extend(event, "workweek")).ok, true);
-    assert.deepEqual(h.calls.arcaExtends, ["overnight", "workweek"]);
-  });
-  it("accepts only the connected page's pinned origin and managed server", async (t) => {
-    const serverUrl = "https://workspace.cloud.databricks.com/omnigent";
-    const h = loadNavigationHarness({ serverUrl, internalFeatures: true });
-    t.after(h.cleanup);
-    h.api.registerIpc();
-    const extend = h.ipc.get("omnigent:arca-extend");
-    const features = h.ipc.get("omnigent:get-desktop-features");
-    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
-    assert.deepEqual(
-      { ...features(event) },
-      {
-        databricksInternalFeatures: true,
-        canExtendArca: true,
-        canRefreshDbcert: true,
-        arcaPreviewRecovery: true,
-        // Managed-feature fixtures simulate macOS on every test host.
-        chromeCookieImport: true,
-      },
-    );
-    assert.deepEqual(await extend(event, "overnight"), { ok: true, shutdownAt: null });
-    assert.deepEqual(h.calls.arcaExtends, ["overnight"]);
-    assert.equal((await extend(event, "default")).ok, false);
-    assert.equal((await extend(event, ["overnight"])).ok, false);
-    await assert.rejects(
-      extend({ ...event, senderFrame: { url: "https://evil.example" } }, "workweek"),
-      /connected server page/,
-    );
-    assert.equal(features({ ...event, senderFrame: { url: "https://evil.example" } }), null);
-    h.setUrl("https://evil.example");
-    await assert.rejects(extend(event, "workweek"), /connected server page/);
-    assert.deepEqual(h.calls.arcaExtends, ["overnight"]);
-  });
-
-  it("rejects Arca extension when the desktop feature is disabled", async (t) => {
-    const h = loadNavigationHarness({
-      serverUrl: "https://workspace.cloud.databricks.com/omnigent",
-    });
-    t.after(h.cleanup);
-    h.api.registerIpc();
-    const event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
-    assert.equal(h.ipc.get("omnigent:get-desktop-features")(event).canExtendArca, false);
-    const result = await h.ipc.get("omnigent:arca-extend")(event, "overnight");
-    assert.equal(result.ok, false);
-    assert.deepEqual(h.calls.arcaExtends, []);
-  });
-
-  it("rejects Arca extension on a local server even with managed features", async (t) => {
-    const h = loadNavigationHarness({ serverUrl: "http://localhost:6767", internalFeatures: true });
-    t.after(h.cleanup);
-    h.api.registerIpc();
-    const event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
-    assert.equal(h.ipc.get("omnigent:get-desktop-features")(event).canExtendArca, false);
-    assert.equal((await h.ipc.get("omnigent:arca-extend")(event, "overnight")).ok, false);
-    assert.deepEqual(h.calls.arcaExtends, []);
-  });
-});
 
 describe("dbcert refresh IPC", () => {
   const serverUrl = "https://workspace.cloud.databricks.com/omnigent";
@@ -4520,7 +4433,6 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       ),
       {
         databricksInternalFeatures: true,
-        canExtendArca: true,
         canRefreshDbcert: true,
         arcaPreviewRecovery: true,
         // Managed-feature fixtures simulate macOS on every test host.

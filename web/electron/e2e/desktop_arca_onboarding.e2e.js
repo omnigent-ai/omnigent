@@ -146,13 +146,6 @@ function fixturePolicy({ appRoot, arcaPath, serverUrl }) {
       timeoutMs: 30_000,
       killGraceMs: 250,
     });
-  const readStatus = arca.readArcaStatus;
-  arca.readArcaStatus = (deps = {}) =>
-    readStatus({
-      ...deps,
-      resolveArcaPath: () => arcaPath,
-      timeoutMs: 2000,
-    });
   const onboarding = require(path.join(src, "arca_onboarding"));
   const startSetup = onboarding.startArcaSetup;
   onboarding.startArcaSetup = (url, deps = {}) =>
