@@ -143,10 +143,6 @@ function loadNavigationHarness({
   normalizeServer = (url) => url,
   expandWorkspace = async (url) => url,
   realBrowserRegistry = false,
-  arcaPath = null,
-  arcaResult = { ok: true, alreadyRunning: false },
-  arcaLoginResult = { ok: true },
-  arcaConsentResult,
   loadServer = async () => {},
   loadURL = null,
   managedServers = [],
@@ -183,12 +179,8 @@ function loadNavigationHarness({
     progress: [],
     loading: [],
     reloads: 0,
-    arcaConnects: [],
-    arcaConsentRuns: [],
     cookiesSet: [],
     oidc: { refresh: 0, signIn: 0, signOut: 0 },
-    arcaLogins: [],
-    arcaLoginCancels: 0,
     sshConnects: [],
     hostConnects: [],
   };
@@ -480,27 +472,6 @@ function loadNavigationHarness({
       chooseDeepLinkStrategy: () => null,
     },
     "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
-    // Never probe for or spawn a real arca from tests.
-    "./arca": {
-      ...require("../src/arca"),
-      resolveArcaPath: () => arcaPath,
-      startArcaConnect: (url) => {
-        calls.arcaConnects.push(url);
-        const result = typeof arcaResult === "function" ? arcaResult(url) : arcaResult;
-        return { command: "arca ssh", promise: Promise.resolve(result), cancel: () => {} };
-      },
-      startArcaLogin: (url) => {
-        calls.arcaLogins.push(url);
-        const result =
-          typeof arcaLoginResult === "function" ? arcaLoginResult(url) : arcaLoginResult;
-        return {
-          promise: Promise.resolve(result),
-          cancel: () => {
-            calls.arcaLoginCancels += 1;
-          },
-        };
-      },
-    },
     "./databricks-session": {
       ensureDatabricksSession: (...args) => {
         calls.auth.push(args);
@@ -639,28 +610,11 @@ function loadNavigationHarness({
     },
   };
 
-  if (arcaConsentResult !== undefined) {
-    localRequires["./arca_connect_window"] = {
-      createArcaConnectFlow: (deps) => ({
-        run: async (_parentWin, consentServerUrl, options) => {
-          calls.arcaConsentRuns.push({ serverUrl: consentServerUrl, options });
-          const consent =
-            typeof arcaConsentResult === "function"
-              ? await arcaConsentResult(consentServerUrl, options)
-              : arcaConsentResult;
-          if (consent?.ok !== true) return consent;
-          const connect = deps.startConnect(consentServerUrl, () => {});
-          return { ...(await connect.promise), shownInConsole: true };
-        },
-      }),
-    };
-  }
-
   const mainPath = path.join(__dirname, "../src/main.js");
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
+    "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -736,66 +690,6 @@ function loadNavigationHarness({
     },
   };
 }
-
-describe("manual host connect wiring", () => {
-  const workspace = "https://workspace.cloud.databricks.com/omnigent";
-  const arcaPath = "/usr/local/bin/arca";
-  const tick = () =>
-    new Promise((resolve) => {
-      setImmediate(resolve);
-    });
-
-  it("connects from an existing server without running onboarding setup", async (t) => {
-    const h = loadNavigationHarness({
-      serverUrl: workspace,
-      databricksMode: "browser",
-      internalFeatures: true,
-      arcaPath,
-      arcaConsentResult: { ok: true },
-      arcaResult: { ok: true, alreadyRunning: false },
-    });
-    t.after(h.cleanup);
-    h.api.registerIpc();
-    const result = await h.ipc.get("omnigent:arca-connect")({
-      sender: h.webContents,
-      senderFrame: { url: workspace },
-    });
-    assert.equal(result.ok, true);
-    assert.equal(result.alreadyRunning, false);
-    assert.deepEqual(h.calls.arcaConnects, [workspace]);
-  });
-
-  describe("manual connect target validation", () => {
-    function harness(t, options = {}) {
-      const h = loadNavigationHarness({
-        serverUrl: workspace,
-        arcaPath,
-        internalFeatures: true,
-        ...options,
-      });
-      t.after(h.cleanup);
-      h.api.registerIpc();
-      return h;
-    }
-    it("keeps the manual connect on Databricks servers, even through a hand-edited label", async (t) => {
-      const h = harness(t);
-      fs.writeFileSync(
-        h.settingsPath,
-        JSON.stringify({
-          server_labels: { [new URL(workspace).origin]: "https://evil.example/" },
-        }),
-      );
-      await h.api.loadServerUrl(h.win, workspace);
-      await tick();
-      const result = await h.ipc.get("omnigent:arca-connect")({
-        sender: h.webContents,
-        senderFrame: { url: workspace },
-      });
-      assert.match(result.error, /Databricks-managed servers/);
-      assert.deepEqual(h.calls.arcaConnects, []);
-    });
-  });
-});
 
 describe("Databricks auth mode wiring", () => {
   const workspace = "https://workspace.cloud.databricks.com/omnigent";
