@@ -1948,23 +1948,25 @@ async def test_runner_stream_spawn_failed_reaches_subscribers_with_detail(
     :returns: None.
     """
 
-    async def _none_spec_resolver(
-        agent_id: str, session_id: str | None = None
-    ) -> AgentSpec | None:
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """
-        Resolve no spec, so the harness named in the body is used as-is.
+        Resolve the test harness so dispatch reaches the failing spawn.
 
         :param agent_id: Agent id requested by the runner.
         :param session_id: Session id (unused).
-        :returns: Always ``None``.
+        :returns: A minimal spec naming the test harness.
         """
         del agent_id, session_id
-        return None
+        return AgentSpec(
+            spec_version=1,
+            name="spawn-failing-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": _TEST_HARNESS_NAME}),
+        )
 
     conv = "conv_stream_spawn_failed"
     app = create_runner_app(
         process_manager=cast(HarnessProcessManager, _SpawnFailingProcessManager()),
-        spec_resolver=_none_spec_resolver,
+        spec_resolver=_spec_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
     async with _runner_test_client(app) as http:
@@ -2009,9 +2011,7 @@ async def test_runner_background_spawn_failed_reaches_subscribers_with_detail(
     :func:`test_runner_stream_spawn_failed_reaches_subscribers_with_detail`:
     both turn paths inspect the harness error response through the same
     helper, so a 202 background turn must surface the identical message.
-    The resolver returns a spec here (rather than ``None``) because the
-    background path takes its harness from the resolved spec, not from the
-    request body.
+    Both resolvers select the test harness before the spawn fails.
 
     :param pinned_runner_log: The log path the detail must name.
     :returns: None.
