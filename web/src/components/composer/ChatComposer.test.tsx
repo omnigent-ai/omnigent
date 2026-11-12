@@ -596,8 +596,10 @@ describe("ChatComposer label collapse", () => {
   it("re-measures after crossing the mobile breakpoint without a row resize", () => {
     let mobile = false;
     const listeners = new Set<() => void>();
-    vi.stubGlobal("matchMedia", () => ({
-      matches: mobile,
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      get matches() {
+        return query === "(min-width: 768px)" ? !mobile : mobile;
+      },
       addEventListener: (_event: string, listener: () => void) => listeners.add(listener),
       removeEventListener: (_event: string, listener: () => void) => listeners.delete(listener),
     }));
