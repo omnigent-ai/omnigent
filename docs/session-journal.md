@@ -97,6 +97,14 @@ first only if the description is ambiguous. You can steer or stop it in chat at
 any time. An agent's own skill named `workflow` takes precedence over
 Omnigent's.
 
+A workflow can run another workflow as one of its steps, such as getting each
+PR in a stack ready to merge. The agent starts the other workflow in its own
+session on the same host, with the workflow skill running. That session
+reports back with `sys_session_message` when its plan finishes, and the agent
+also checks on it periodically with a background timer of its own. With the
+`sibling_sessions` feature on, these sessions are grouped with the session that
+started them.
+
 ## Automations
 
 An automation's prompt asks the agent to read its journal first, write a plan if
