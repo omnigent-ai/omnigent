@@ -1129,8 +1129,7 @@ def _prune_environ_to_spawn_allowlist(sandbox: SandboxPolicy) -> None:
 
     :param sandbox: The decoded launcher policy. No-op when its
         ``spawn_env_allowlist`` is ``None``. The internal launcher
-        markers (:data:`_LAUNCHER_WRAPPED_ENV`,
-        :data:`_SANDBOX_STRACE_ENV`,
+        markers (:data:`_SANDBOX_STRACE_ENV`,
         :data:`_LAUNCHER_PRIVATE_TMPDIR_ENV`) are always retained —
         dropping the tmpdir marker would make the in-wrap pass mint a
         second scratch dir the profile never granted.
@@ -1138,7 +1137,6 @@ def _prune_environ_to_spawn_allowlist(sandbox: SandboxPolicy) -> None:
     if sandbox.spawn_env_allowlist is None:
         return
     allowed = set(sandbox.spawn_env_allowlist) | {
-        _LAUNCHER_WRAPPED_ENV,
         _SANDBOX_STRACE_ENV,
         _LAUNCHER_PRIVATE_TMPDIR_ENV,
     }

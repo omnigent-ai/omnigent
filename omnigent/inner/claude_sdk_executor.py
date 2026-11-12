@@ -47,7 +47,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import ExitStack, contextmanager, suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
 
@@ -1883,16 +1883,15 @@ def prepare_claude_cli_path(
     if spec is None:
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
     resolved_cwd = _resolve_sandbox_cwd(cwd if cwd is not None else spec.cwd)
-    validation_spec = spec
     # Named relative roots use the runner base; "." follows the selected session cwd.
-    if spec.cwd and pathlib.Path(spec.cwd) != pathlib.Path("."):
-        declared_cwd = _resolve_sandbox_cwd(spec.cwd)
-        if not pathlib.Path(spec.cwd).is_absolute() and resolved_cwd == _resolve_sandbox_cwd(None):
-            resolved_cwd = declared_cwd
-        validation_spec = replace(spec, cwd=str(declared_cwd))
-    validate_harness_sandbox(
-        validation_spec, "Claude SDK", cwd=resolved_cwd if cwd is not None else None
-    )
+    if (
+        spec.cwd
+        and pathlib.Path(spec.cwd) != pathlib.Path(".")
+        and not pathlib.Path(spec.cwd).is_absolute()
+        and resolved_cwd == _resolve_sandbox_cwd(None)
+    ):
+        resolved_cwd = _resolve_sandbox_cwd(spec.cwd)
+    validate_harness_sandbox(spec, "Claude SDK", cwd=resolved_cwd if cwd is not None else None)
     sandbox_spec = spec.sandbox or OSEnvSandboxSpec()
     if sandbox_spec.type == "none":
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=True)
@@ -2297,6 +2296,7 @@ class ClaudeSDKExecutor(Executor):
                     self._cwd = prepared.cwd
             if self._os_env_spec is not None and self._cwd is None:
                 self._cwd = self._os_env_spec.cwd
+        if self._cli_path:
             logger.info("Using system claude CLI: %s", self._cli_path)
         else:
             logger.info("No system claude found; SDK will use bundled CLI")

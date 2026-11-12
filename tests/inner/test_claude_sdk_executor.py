@@ -5016,6 +5016,8 @@ def test_prepare_claude_cli_path_rejects_failed_wrap_probe(noop: bool) -> None:
         "explicit_dot",
         "explicit_relative",
         "explicit_relative_root",
+        "explicit_relative_sibling",
+        "explicit_relative_outside",
         "explicit_nested",
         "explicit_conflict",
     ],
@@ -5044,6 +5046,11 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
         spec.cwd = "./project"
         cwd = str(tmp_path)
         expected_cwd = tmp_path / "project"
+    elif cwd_source in ("explicit_relative_sibling", "explicit_relative_outside"):
+        spec.cwd = "./project" if cwd_source == "explicit_relative_sibling" else "repo"
+        selected_root = tmp_path if cwd_source == "explicit_relative_sibling" else tmp_path.parent
+        expected_cwd = selected_root / "session"
+        cwd = str(expected_cwd)
     elif cwd_source == "explicit_nested":
         spec.cwd = str(tmp_path)
         expected_cwd = tmp_path / "project"
@@ -5053,7 +5060,7 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
             "explicit_none": None,
             "explicit_dot": ".",
             "explicit_relative": "repo",
-            "explicit_conflict": "other",
+            "explicit_conflict": str(tmp_path / "other"),
         }[cwd_source]
         expected_cwd = tmp_path / "repo"
         cwd = str(expected_cwd)
