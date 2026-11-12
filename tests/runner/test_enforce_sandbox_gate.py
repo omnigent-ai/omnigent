@@ -12,6 +12,7 @@ as ``test_app_sessions_native.py``.  The process manager captures the
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 from collections.abc import AsyncIterator
@@ -29,6 +30,9 @@ from omnigent.spec.types import (
     FunctionRef,
     GuardrailsSpec,
 )
+from tests.runner.conftest import _drain_session_event_queue
+from tests.runner.conftest import _FakeProcessManager as _TurnProcessManager
+from tests.runner.conftest import _ScriptedHarnessClient as _TurnHarnessClient
 from tests.runner.helpers import NullServerClient
 
 # ── Stubs ────────────────────────────────────────────────────────────────
@@ -251,6 +255,194 @@ async def test_enforce_sandbox_overrides_spawn_env() -> None:
     assert sandbox["write_paths"] == ["."], (
         f"Expected write_paths=['.'] (forced by policy), got {sandbox['write_paths']!r}."
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stream", "caller_spawn_env"),
+    [(True, False), (True, True), (False, False)],
+    ids=["stream", "stream-with-caller-env", "background"],
+)
+@pytest.mark.parametrize("create_session", [True, False], ids=["created", "first-turn"])
+async def test_enforce_sandbox_survives_agent_revision(
+    *, stream: bool, caller_spawn_env: bool, create_session: bool
+) -> None:
+    """Freshly resolved specs must pass the start gate before every spawn."""
+    resolved_specs: list[AgentSpec] = []
+    enforced_write_paths = ["."]
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        spec = _spec_with_enforce_sandbox(write_paths=enforced_write_paths)
+        resolved_specs.append(spec)
+        return spec
+
+    harness_client = _TurnHarnessClient(
+        [
+            'data: {"type":"response.created","response":{"id":"resp_sandbox"}}\n\n',
+            'data: {"type":"response.completed","response":{"id":"resp_sandbox"}}\n\n',
+        ]
+    )
+    manager = _TurnProcessManager(harness_client)
+    app = create_runner_app(
+        process_manager=manager,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    session_id = f"conv_sandbox_revision_{stream}_{create_session}"
+    expected_sandbox = {
+        "type": "linux_bwrap",
+        "allow_network": False,
+        "write_paths": ["."],
+    }
+
+    async with _runner_client(app) as client:
+        if create_session:
+            response = await client.post(
+                "/v1/sessions", json={"session_id": session_id, "agent_id": "ag_test"}
+            )
+            assert response.status_code == 201, response.text
+            assert len(manager.get_client_calls) == 1
+            initial_env = manager.get_client_calls[0][2]
+            assert initial_env is not None
+            initial_sandbox = json.loads(initial_env["HARNESS_CLAUDE_SDK_OS_ENV"])["sandbox"]
+            assert {key: initial_sandbox[key] for key in expected_sandbox} == expected_sandbox
+
+        for turn_index, revision in enumerate(("initial", "updated"), start=1):
+            if revision == "updated":
+                enforced_write_paths = []
+                expected_sandbox["write_paths"] = []
+            resolve_count = len(resolved_specs)
+            spawn_count = len(manager.get_client_calls)
+            response = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                params={"stream": "true"} if stream else {},
+                json={
+                    "type": "message",
+                    "role": "user",
+                    **({} if create_session and caller_spawn_env else {"agent_id": "ag_test"}),
+                    "agent_revision": revision,
+                    "content": [{"type": "input_text", "text": "Check sandbox policy."}],
+                    **(
+                        {
+                            "harness": "claude-sdk",
+                            "spawn_env": {
+                                "HARNESS_CLAUDE_SDK_OS_ENV": '{"sandbox":{"type":"none"}}'
+                            },
+                        }
+                        if caller_spawn_env
+                        else {}
+                    ),
+                },
+            )
+            assert response.status_code == (200 if stream else 202), response.text
+            if not stream:
+                turn_task = app.state.active_turns.get(session_id)
+                if turn_task is not None:
+                    await asyncio.wait_for(turn_task, timeout=5)
+
+            assert len(resolved_specs) > resolve_count, "revision must resolve a fresh spec"
+            assert len({id(spec) for spec in resolved_specs}) == len(resolved_specs)
+            assert len(harness_client.posted_bodies) == turn_index
+            assert len(manager.get_client_calls) > spawn_count
+            for conversation_id, harness, env in manager.get_client_calls[spawn_count:]:
+                assert conversation_id == session_id
+                assert harness == "claude-sdk"
+                assert env is not None
+                sandbox = json.loads(env["HARNESS_CLAUDE_SDK_OS_ENV"])["sandbox"]
+                assert {key: sandbox[key] for key in expected_sandbox} == expected_sandbox, (
+                    f"revision {revision!r} discarded the enforced sandbox"
+                )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stream", "caller_spawn_env"),
+    [(True, False), (True, True), (False, False)],
+    ids=["stream", "stream-with-caller-env", "background"],
+)
+async def test_agent_revision_with_unevaluable_start_policy_blocks_dispatch(
+    stream: bool, caller_spawn_env: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A policy broken by a revision must stop dispatch to the existing worker."""
+    resolve_count = 0
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        nonlocal resolve_count
+        del agent_id, session_id
+        resolve_count += 1
+        spec = _spec_with_enforce_sandbox()
+        if resolve_count > 1:
+            assert spec.guardrails is not None
+            spec.guardrails.policies.append(
+                FunctionPolicySpec(
+                    name="broken_start_policy",
+                    on=None,
+                    function=FunctionRef(path="omnigent.policies.builtins.does_not_exist"),
+                )
+            )
+        return spec
+
+    harness_client = _TurnHarnessClient([])
+    manager = _TurnProcessManager(harness_client)
+    app = create_runner_app(
+        process_manager=manager,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    session_id = f"conv_broken_start_policy_{stream}"
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": "ag_test"}
+        )
+        assert response.status_code == 201, response.text
+        assert len(manager.get_client_calls) == 1
+        _drain_session_event_queue(app.state.session_event_queues.get(session_id))
+
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            params={"stream": "true"} if stream else {},
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_test",
+                "agent_revision": "broken",
+                "content": [{"type": "input_text", "text": "Check sandbox policy."}],
+                **(
+                    {
+                        "harness": "claude-sdk",
+                        "spawn_env": {"HARNESS_CLAUDE_SDK_OS_ENV": '{"sandbox":{"type":"none"}}'},
+                    }
+                    if caller_spawn_env
+                    else {}
+                ),
+            },
+        )
+        assert response.status_code == (503 if stream else 202), response.text
+        if stream:
+            assert response.json()["error"] == "spec_resolver_failed"
+            assert "AgentStartPolicyError" in response.json()["detail"]
+        else:
+            turn_task = app.state.active_turns.get(session_id)
+            if turn_task is not None:
+                await asyncio.wait_for(turn_task, timeout=5)
+
+        events = _drain_session_event_queue(app.state.session_event_queues.get(session_id))
+        failures = [
+            event
+            for event in events
+            if event.get("type") == "session.status" and event.get("status") == "failed"
+        ]
+        assert len(failures) == 1
+        assert ("AgentStartPolicyError" if stream else "broken_start_policy") in failures[0][
+            "error"
+        ]["message"]
+        assert "broken_start_policy" in caplog.text
+        assert resolve_count > 1
+        assert len(manager.get_client_calls) == 1, "broken policy must not spawn a replacement"
+        assert not harness_client.posted_bodies, "broken policy must not reach the existing worker"
+        assert session_id not in app.state.active_turns
 
 
 @pytest.mark.asyncio
@@ -583,3 +775,121 @@ async def test_reinit_after_model_switch_seeds_fresh_override() -> None:
         "re-init after a /model switch must seed the fresh override, not a "
         f"stale cached one; got {pm.get_client_calls[1][2].get('HARNESS_CLAUDE_SDK_MODEL')!r}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "background"])
+async def test_cached_start_policy_tracks_harness_override_changes(
+    stream: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Target changes reapply launch policy to the declared sandbox without accumulation."""
+    from omnigent.policies import FunctionPolicy
+
+    start_harnesses: list[str] = []
+
+    def _target_sandbox(event: dict[str, Any]) -> dict[str, Any]:
+        data = event["data"]
+        arguments = data["arguments"]
+        harness = arguments["harness"]
+        start_harnesses.append(harness)
+        sandbox = arguments["sandbox"]
+        sandbox["read_paths"].append(f"/tmp/{harness}-read")
+        return {
+            "result": "ALLOW",
+            "data": {
+                **data,
+                "arguments": {
+                    **arguments,
+                    "sandbox": {
+                        **sandbox,
+                        "type": "linux_bwrap" if harness == "kimi" else "none",
+                        "allow_network": harness != "kimi",
+                    },
+                },
+            },
+        }
+
+    def _resolve_policy(policy_spec: FunctionPolicySpec) -> FunctionPolicy:
+        return FunctionPolicy(policy_spec, _target_sandbox)
+
+    monkeypatch.setattr("omnigent.runner.policy.resolve_function_policy", _resolve_policy)
+    declared_spec = _spec_with_enforce_sandbox()
+    assert declared_spec.os_env is not None
+    assert declared_spec.os_env.sandbox is not None
+    declared_spec.os_env.sandbox.read_paths = ["."]
+    resolve_count = 0
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        nonlocal resolve_count
+        assert agent_id == "ag_test"
+        resolve_count += 1
+        return declared_spec
+
+    harness_client = _TurnHarnessClient(
+        [
+            'data: {"type":"response.created","response":{"id":"resp_target"}}\n\n',
+            'data: {"type":"response.completed","response":{"id":"resp_target",'
+            '"status":"completed"}}\n\n',
+        ]
+    )
+    manager = _TurnProcessManager(harness_client)
+    app = create_runner_app(
+        process_manager=manager,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    session_id = f"conv_start_policy_target_{stream}"
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": "ag_test"}
+        )
+        assert response.status_code == 201, response.text
+        initial_env = manager.get_client_calls[0][2]
+        assert initial_env is not None
+        previous_policy = json.loads(initial_env["HARNESS_CLAUDE_SDK_OS_ENV"])
+        previous_harness = "claude-sdk"
+
+        targets = (None, None, "kimi", "kimi", "claude-sdk")
+        for turn_index, harness_override in enumerate(targets, start=1):
+            harness = harness_override or "claude-sdk"
+            probe_count = len(start_harnesses)
+            response = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                params={"stream": "true"} if stream else {},
+                json={
+                    "type": "message",
+                    "role": "user",
+                    **({"harness_override": harness_override} if harness_override else {}),
+                    "content": [{"type": "input_text", "text": "Check target sandbox policy."}],
+                },
+            )
+            assert response.status_code == (200 if stream else 202), response.text
+            if not stream:
+                turn_task = app.state.active_turns.get(session_id)
+                if turn_task is not None:
+                    await asyncio.wait_for(turn_task, timeout=5)
+            if turn_index in (1, 2) or (not stream and turn_index == 4):
+                assert len(start_harnesses) == probe_count
+
+            assert session_id not in app.state.active_turns
+            assert len(harness_client.posted_bodies) == turn_index
+            conversation_id, actual_harness, env = manager.get_client_calls[-1]
+            assert conversation_id == session_id
+            assert actual_harness == harness
+            assert env is not None
+            env_key = f"HARNESS_{harness.upper().replace('-', '_')}_OS_ENV"
+            policy = json.loads(env[env_key])
+            sandbox = policy["sandbox"]
+            assert sandbox["type"] == ("linux_bwrap" if harness == "kimi" else "none")
+            assert sandbox["allow_network"] is (harness != "kimi")
+            assert sandbox["read_paths"] == [".", f"/tmp/{harness}-read"]
+            if harness == previous_harness:
+                assert policy == previous_policy
+            previous_harness, previous_policy = harness, policy
+
+    assert "kimi" in start_harnesses
+    if not stream:
+        assert resolve_count == 3
+    assert declared_spec.os_env.sandbox.type == "none"
+    assert declared_spec.os_env.sandbox.read_paths == ["."]
