@@ -11484,15 +11484,71 @@ def test_github_commit_ops_are_served_on_host(
     assert patch.payload == {"object": "session.github.pr_diff", "patch": "commit-patch"}
 
 
+def _host_with_tracked_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gh: Callable[..., tuple[int, str, str]]
+) -> tuple[HostProcess, str]:
+    """A host whose session tracks one PR, with every ``gh`` call going to ``gh``."""
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    url = "https://github.com/example/one/pull/42"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    return _make_host_process(), url
+
+
+def test_github_merge_on_host_runs_as_the_confirmed_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tunneled merge-as runs with the confirmed account's own token."""
+    from omnigent.host.frames import HostFsWriteFrame
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    calls: list[tuple[list[str], object]] = []
+
+    def gh(argv: list[str], **kwargs: object) -> tuple[int, str, str]:
+        calls.append((argv, kwargs.get("token")))
+        if argv[:2] == ["auth", "token"]:
+            return 0, f"token-{argv[3]}", ""
+        return 0, "", ""
+
+    host, url = _host_with_tracked_pr(tmp_path, monkeypatch, gh)
+    try:
+        merged = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="merge",
+                op="github_merge_as",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={
+                    "pr_url": url,
+                    "merge_method": "rebase",
+                    "expected_head": "a" * 40,
+                    "account": "personal",
+                },
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert merged.status == "ok", merged
+    argv, token = calls[-1]
+    assert argv[:2] == ["pr", "merge"]
+    assert argv[-3:] == ["--rebase", "--match-head-commit", "a" * 40]
+    assert token == "token-personal"
+
+
 def test_github_merge_ops_are_served_on_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The host reads merge options and merges a tracked PR when the runner is offline."""
     from omnigent.host.frames import HostFsRequestFrame, HostFsWriteFrame
     from omnigent.runner import github_resource
-    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 
-    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
     calls: list[list[str]] = []
 
@@ -11506,12 +11562,7 @@ def test_github_merge_ops_are_served_on_host(
             )
         return 0, "", ""
 
-    monkeypatch.setattr(github_resource, "_gh", gh)
-    url = "https://github.com/example/one/pull/42"
-    SessionPrRegistry("session").record(
-        [PullRequestRef.from_url(url)], relationship="created", source="test"
-    )
-    host = _make_host_process()
+    host, url = _host_with_tracked_pr(tmp_path, monkeypatch, gh)
     try:
         options = host._handle_fs_request(
             HostFsRequestFrame(
