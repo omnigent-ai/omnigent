@@ -144,7 +144,7 @@ def test_share_file_grants_read_access_and_opens_fullscreen(
     multi_user_info = {**server_info.json(), "single_user": False}
 
     with (
-        user_page(browser, headers={}) as owner,
+        user_page(browser, headers={}, viewport={"width": 1440, "height": 1000}) as owner,
         user_page(browser, headers=recipient_headers) as recipient,
     ):
 
@@ -157,10 +157,8 @@ def test_share_file_grants_read_access_and_opens_fullscreen(
         owner.goto(f"{public_url}/c/{session_id}?{urlencode({'file': absolute_file_path})}")
         file_viewer = owner.locator('[data-testid="file-viewer"]:visible')
         expect(file_viewer.get_by_text(_FILE_BODY).first).to_be_visible(timeout=20_000)
+        owner.get_by_role("button", name="Full screen", exact=True).click()
         share = file_viewer.get_by_role("button", name="Share file", exact=True)
-        if not share.is_visible():
-            file_viewer.get_by_role("button", name="More actions", exact=True).click()
-            share = owner.get_by_role("menuitem", name="Share file", exact=True)
         expect(share).to_be_enabled(timeout=20_000)
         share.click()
 

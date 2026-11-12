@@ -891,30 +891,34 @@ describe("PermissionsModal", () => {
       },
     );
 
-    it("keeps existing user and public grants revocable for blocked workspaces", async () => {
-      listMock.mockResolvedValue([
-        { conversation_id: "conv_abc", user_id: "alice", level: 4 },
-        { conversation_id: "conv_abc", user_id: "bob", level: 2 },
-        { conversation_id: "conv_abc", user_id: "__public__", level: 1 },
-      ]);
-      revokeMock.mockResolvedValue(undefined);
-      render(
-        <PermissionsModal
-          sessionId="conv_abc"
-          workspace="/home/alice"
-          open
-          onOpenChange={() => {}}
-        />,
-        {
-          wrapper: createSharingWrapper("restricted_read_only"),
-        },
-      );
-      fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
-      await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "bob"));
-      await chooseGeneralAccess("No access");
-      await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "__public__"));
-      expect(grantMock).not.toHaveBeenCalled();
-    });
+    it.each([undefined, "report.html"])(
+      "keeps existing user and public grants revocable for blocked workspaces (file: %s)",
+      async (filePath) => {
+        listMock.mockResolvedValue([
+          { conversation_id: "conv_abc", user_id: "alice", level: 4 },
+          { conversation_id: "conv_abc", user_id: "bob", level: 2 },
+          { conversation_id: "conv_abc", user_id: "__public__", level: 1 },
+        ]);
+        revokeMock.mockResolvedValue(undefined);
+        render(
+          <PermissionsModal
+            sessionId="conv_abc"
+            workspace="/home/alice"
+            filePath={filePath}
+            open
+            onOpenChange={() => {}}
+          />,
+          {
+            wrapper: createSharingWrapper("restricted_read_only"),
+          },
+        );
+        fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+        await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "bob"));
+        await chooseGeneralAccess("No access");
+        await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "__public__"));
+        expect(grantMock).not.toHaveBeenCalled();
+      },
+    );
   });
 
   describe("public access", () => {
@@ -1190,34 +1194,62 @@ describe("PermissionsModal", () => {
         expect(writeText).toHaveBeenCalled();
         expect(await screen.findByText("Workspace sharing failed")).toBeInTheDocument();
         expect(screen.queryByRole("button", { name: "Copied!" })).toBeNull();
+        await waitFor(() =>
+          expect(warn).toHaveBeenCalledWith("Failed to prepare file share", expect.any(Error)),
+        );
+        expect(warn).not.toHaveBeenCalledWith(
+          "Failed to copy link to clipboard",
+          expect.anything(),
+        );
       } finally {
         warn.mockRestore();
       }
     });
 
-    it("enables workspace files before displaying the mobile QR code", async () => {
-      listMock.mockResolvedValue([]);
-      useSessionMock.mockReturnValue({
-        session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: false }),
-        isLoading: false,
-        error: null,
-      });
-      render(
-        <PermissionsModal
-          sessionId="conv_abc"
-          filePath="report.html"
-          open
-          onOpenChange={() => {}}
-        />,
-        {
-          wrapper: createWrapper(),
-        },
-      );
-      fireEvent.click(screen.getByRole("button", { name: "Open in mobile app" }));
+    it.each([true, false])(
+      "shows the mobile QR code only after workspace preparation succeeds (success: %s)",
+      async (succeeds) => {
+        listMock.mockResolvedValue([]);
+        useSessionMock.mockReturnValue({
+          session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: false }),
+          isLoading: false,
+          error: null,
+        });
+        let finishPreparation!: () => void;
+        updateSessionMock.mockReturnValue(
+          new Promise<Session>((resolve, reject) => {
+            finishPreparation = () => {
+              if (succeeds) resolve(sessionWith({ workspace: "/repo", shareWorkspaceFiles: true }));
+              else reject(new Error("Workspace sharing failed"));
+            };
+          }),
+        );
+        render(
+          <PermissionsModal
+            sessionId="conv_abc"
+            filePath="report.html"
+            open
+            onOpenChange={() => {}}
+          />,
+          {
+            wrapper: createWrapper(),
+          },
+        );
+        fireEvent.click(screen.getByRole("button", { name: "Open in mobile app" }));
 
-      await screen.findByTestId("share-qr-code");
-      expect(updateSessionMock).toHaveBeenCalledWith("conv_abc", { shareWorkspaceFiles: true });
-    });
+        await waitFor(() =>
+          expect(updateSessionMock).toHaveBeenCalledWith("conv_abc", { shareWorkspaceFiles: true }),
+        );
+        expect(screen.queryByTestId("share-qr-code")).toBeNull();
+        finishPreparation();
+        if (succeeds) {
+          expect(await screen.findByTestId("share-qr-code")).toBeInTheDocument();
+        } else {
+          expect(await screen.findByText("Workspace sharing failed")).toBeInTheDocument();
+          expect(screen.queryByTestId("share-qr-code")).toBeNull();
+        }
+      },
+    );
 
     it("enables workspace files when granting general Read access from a file share", async () => {
       listMock.mockResolvedValue([]);
@@ -1321,11 +1353,11 @@ describe("PermissionsModal", () => {
           target: { value: "alice@example.com" },
         });
         fireEvent.click(screen.getByRole("button", { name: "Grant" }));
-        expect(grantMock).not.toHaveBeenCalled();
-        expect(revokeMock).not.toHaveBeenCalled();
         await waitFor(() =>
           expect(screen.getByPlaceholderText("alice@example.com")).toHaveValue(""),
         );
+        expect(grantMock).not.toHaveBeenCalled();
+        expect(revokeMock).not.toHaveBeenCalled();
       },
     );
 

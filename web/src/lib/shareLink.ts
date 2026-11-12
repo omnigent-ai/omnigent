@@ -1,9 +1,13 @@
 import { withBasePath } from "@/lib/basePath";
 import { getOmnigentTransformShareLink } from "@/lib/host";
 
+function fileShareParams(filePath: string): URLSearchParams {
+  return new URLSearchParams({ file: filePath, fullscreen: "1" });
+}
+
 export function getSessionSharePath(sessionId: string, filePath?: string): string {
   const path = `/c/${sessionId}`;
-  return filePath ? `${path}?${new URLSearchParams({ file: filePath, fullscreen: "1" })}` : path;
+  return filePath ? `${path}?${fileShareParams(filePath)}` : path;
 }
 
 /**
@@ -25,13 +29,18 @@ export function getShareableSessionLink(
 ): string {
   const path = rebasePath(getSessionSharePath(sessionId));
   const transform = getOmnigentTransformShareLink();
-  const link = transform ? transform(path) : `${window.location.origin}${withBasePath(path)}`;
+  const fallbackLink = `${window.location.origin}${withBasePath(path)}`;
+  const link = transform ? transform(path) : fallbackLink;
   if (!filePath) return link;
 
-  const url = new URL(link);
+  let url: URL;
+  try {
+    url = new URL(link);
+  } catch {
+    url = new URL(fallbackLink);
+  }
   const target = url.hash.startsWith("#/") ? new URL(url.hash.slice(1), url.origin) : url;
-  target.searchParams.set("file", filePath);
-  target.searchParams.set("fullscreen", "1");
+  for (const [key, value] of fileShareParams(filePath)) target.searchParams.set(key, value);
   if (target !== url) url.hash = `${target.pathname}${target.search}${target.hash}`;
   return url.toString();
 }

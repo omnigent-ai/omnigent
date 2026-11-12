@@ -1445,10 +1445,22 @@ function AppShellImpl() {
   const urlFilePath = searchParams.get("file") || null;
   const urlFileFullscreen = searchParams.get("fullscreen") === "1";
   const fullscreenRestoreRef = useRef<typeof restoredWorkspace>(null);
+  const localFileUrlRef = useRef<URLSearchParams | null>(null);
   // Honor incoming links even when the current session is already open.
   useEffect(() => {
     const sessionJustRestored = fullscreenRestoreRef.current !== restoredWorkspace;
     fullscreenRestoreRef.current = restoredWorkspace;
+    const localFileUrl = localFileUrlRef.current;
+    localFileUrlRef.current = null;
+    // Local actions already established the rail selection and visibility motion.
+    if (
+      !sessionJustRestored &&
+      localFileUrl &&
+      (localFileUrl.get("file") || null) === urlFilePath &&
+      (localFileUrl.get("fullscreen") === "1") === urlFileFullscreen
+    ) {
+      return;
+    }
     if (conversationId && urlFilePath) {
       setSelectedFilePath(urlFilePath);
       setSelectedTerminalKey(null);
@@ -1621,6 +1633,7 @@ function AppShellImpl() {
           const next = new URLSearchParams(prev);
           next.set("file", path);
           if (rightPanelMaximized) next.set("fullscreen", "1");
+          else next.delete("fullscreen");
           next.delete("comment"); // stale comment belongs to the previous file
           // A citation's cited line rides along so the viewer can land on it;
           // a plain open clears any previous citation's line.
@@ -1630,6 +1643,7 @@ function AppShellImpl() {
           else next.delete("column");
           if (position?.endLine != null) next.set("endLine", String(position.endLine));
           else next.delete("endLine");
+          localFileUrlRef.current = next;
           return next;
         },
         { replace: true },
@@ -1701,6 +1715,7 @@ function AppShellImpl() {
         next.delete("column");
         next.delete("endLine");
         next.delete("fullscreen");
+        localFileUrlRef.current = next;
         return next;
       },
       { replace: true },
@@ -1712,11 +1727,14 @@ function AppShellImpl() {
       (prev) => {
         const params = new URLSearchParams(prev);
         params.set("file", selectedFilePath);
+        if (rightPanelMaximized) params.set("fullscreen", "1");
+        else params.delete("fullscreen");
+        localFileUrlRef.current = params;
         return params;
       },
       { replace: true },
     );
-  }, [selectedFilePath, setSearchParams]);
+  }, [selectedFilePath, rightPanelMaximized, setSearchParams]);
 
   // Toggle the right (Workspace) sidebar — shared by the header's collapse
   // button and the ⌘⌥]/Ctrl+Alt+] hotkey so they can't drift. Beyond flipping the
@@ -1941,6 +1959,7 @@ function AppShellImpl() {
           next.set("file", selectedFilePath);
           if (rightPanelMaximized) next.delete("fullscreen");
           else next.set("fullscreen", "1");
+          localFileUrlRef.current = next;
           return next;
         },
         { replace: true },
@@ -2016,6 +2035,10 @@ function AppShellImpl() {
     setSelectedFilePath(null);
     setFileViewerCommentsOpen(false);
     clearFileViewerUrl();
+    if (rightPanelMaximized) {
+      setRightPanelMaximized(false);
+      restoreSidebarAfterMaximize();
+    }
     if (contentSearchFileRef.current === `${conversationId}\n${selectedFilePath}`) {
       setContentSearchPanelOpen(true);
     } else {
@@ -2044,6 +2067,13 @@ function AppShellImpl() {
       return null;
     });
   }, [clearFileViewerUrl]);
+  const closeFileViewerToScope = useCallback(() => {
+    showScopeView();
+    if (rightPanelMaximized) {
+      setRightPanelMaximized(false);
+      restoreSidebarAfterMaximize();
+    }
+  }, [showScopeView, rightPanelMaximized, restoreSidebarAfterMaximize]);
 
   // Close a single file tab. If the closed tab was the active one, activate
   // its neighbor (prefer the previous tab, else the next); when no tabs
@@ -2060,6 +2090,10 @@ function AppShellImpl() {
           if (next.length === 0) {
             setFileViewerCommentsOpen(false);
             clearFileViewerUrl();
+            if (rightPanelMaximized) {
+              setRightPanelMaximized(false);
+              restoreSidebarAfterMaximize();
+            }
             return null;
           }
           const neighbor = next[idx - 1] ?? next[idx] ?? next[0];
@@ -2071,6 +2105,7 @@ function AppShellImpl() {
               params.delete("line"); // stale citation belongs to the closed file
               params.delete("column");
               params.delete("endLine");
+              localFileUrlRef.current = params;
               return params;
             },
             { replace: true },
@@ -2080,7 +2115,7 @@ function AppShellImpl() {
         return next;
       });
     },
-    [clearFileViewerUrl, setSearchParams],
+    [clearFileViewerUrl, setSearchParams, rightPanelMaximized, restoreSidebarAfterMaximize],
   );
 
   // Switch the workspace rail's tab. The side effect (closing any open
@@ -2583,13 +2618,16 @@ function AppShellImpl() {
     !relativeFilePath.split(/[/\\]/).includes("..")
       ? relativeFilePath
       : null;
-  const shareFile =
-    canShare && shareableFilePath
-      ? () => {
-          setSharedFilePath(shareableFilePath);
-          setShareOpen(true);
-        }
-      : undefined;
+  const shareFile = useMemo(
+    () =>
+      canShare && shareableFilePath
+        ? () => {
+            setSharedFilePath(shareableFilePath);
+            setShareOpen(true);
+          }
+        : undefined,
+    [canShare, shareableFilePath],
+  );
   const fileViewerContextValue = useMemo(
     () => ({
       openFile: openFileViewer,
@@ -3089,7 +3127,7 @@ function AppShellImpl() {
                     openFiles={openFiles}
                     openFileViewer={openFileViewer}
                     onCloseFile={closeFile}
-                    onShowScopeView={showScopeView}
+                    onShowScopeView={closeFileViewerToScope}
                     onCommentsOpenChange={setFileViewerCommentsOpen}
                     onShareFile={shareFile}
                     shareDisabledReason={shareDisabledReason}

@@ -115,7 +115,8 @@ export function PermissionsModal({
   const queryClient = useQueryClient();
   const shareWorkspace = useMutation({
     mutationFn: (next: boolean) => updateSession(sessionId, { shareWorkspaceFiles: next }),
-    onSuccess: () => {
+    onSuccess: (updated) => {
+      queryClient.setQueryData(["session", sessionId], updated);
       void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
     },
     onError: (err: Error) => setError(err.message),
@@ -129,7 +130,11 @@ export function PermissionsModal({
 
   async function prepareFileShare() {
     if (!filePath) return;
-    if (fileShareUnavailable) throw new Error("Workspace files are unavailable for sharing.");
+    if (fileShareUnavailable) {
+      const message = "Workspace files are unavailable for sharing.";
+      setError(message);
+      throw new Error(message);
+    }
     if (!workspaceShared) await shareWorkspace.mutateAsync(true);
   }
 
@@ -283,7 +288,9 @@ export function PermissionsModal({
               value={String(publicLevel)}
               onValueChange={handlePublicLevel}
               disabled={
-                isLoading || shareBusy || fileShareUnavailable || (workspaceBlocked && !publicGrant)
+                isLoading ||
+                shareBusy ||
+                ((workspaceBlocked || fileShareUnavailable) && !publicGrant)
               }
               componentId="diagnostics.permissions.public_level"
               valueHasNoPii
@@ -293,13 +300,21 @@ export function PermissionsModal({
               </SelectTrigger>
               <SelectContent position="popper" align="start">
                 <SelectItem value="0">No access</SelectItem>
-                <SelectItem value="1" disabled={workspaceBlocked || !publicSharingEnabled}>
+                <SelectItem
+                  value="1"
+                  disabled={workspaceBlocked || fileShareUnavailable || !publicSharingEnabled}
+                >
                   Read
                 </SelectItem>
                 {publicMaxLevel === 2 && (
                   <SelectItem
                     value="2"
-                    disabled={sharingReadOnly || workspaceBlocked || !publicSharingEnabled}
+                    disabled={
+                      sharingReadOnly ||
+                      workspaceBlocked ||
+                      fileShareUnavailable ||
+                      !publicSharingEnabled
+                    }
                   >
                     Edit
                   </SelectItem>
@@ -651,7 +666,8 @@ function AddUserCombobox({ value, onChange, disabled }: AddUserFieldProps) {
  * URL `getShareableSessionLink` resolves — so standalone and embedded (host-transformed)
  * origins agree on the same server the desktop shell's deep-link handler keys
  * off of (see `electron/src/deepLink.js`). The path is always basename-less
- * `/c/<id>`; the workspace mount is server-determined and intentionally absent.
+ * `/c/<id>` with optional `file` and `fullscreen` query parameters; the workspace
+ * mount is server-determined and intentionally absent.
  */
 function getDeepLink(
   sessionId: string,
@@ -692,12 +708,20 @@ function CopyLinkButton({
   const handleCopy = useCallback(async () => {
     const url = getShareableSessionLink(sessionId, rebasePath, filePath);
     setCopied(false);
+    const prepared = beforeCopy?.().then(
+      () => true,
+      (err) => {
+        console.warn("Failed to prepare file share", err);
+        return false;
+      },
+    );
     try {
-      await Promise.all([copyText(url), beforeCopy?.()]);
-      setCopied(true);
+      await copyText(url);
     } catch (err) {
       console.warn("Failed to copy link to clipboard", err);
+      return;
     }
+    if ((await prepared) ?? true) setCopied(true);
   }, [sessionId, rebasePath, filePath, beforeCopy]);
 
   return (

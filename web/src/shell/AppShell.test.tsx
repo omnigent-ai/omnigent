@@ -2132,12 +2132,17 @@ describe("Chat-mode terminal panel layout", () => {
 });
 
 describe("Workspace rail maximize", () => {
-  it("toggles the rail between docked and full-screen, collapsing the sidebar on maximize", () => {
+  it("toggles the rail between docked and full-screen, collapsing the sidebar on maximize", async () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
     mockConversations([{ id: "conv_abc", permission_level: null }]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "main", session: "s1", running: true }],
+      isLoading: false,
+      error: null,
+    });
 
     renderShell("/c/conv_abc");
 
@@ -2148,6 +2153,7 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     expect(rail().className).toContain("md:shrink-0");
     expect(rail().className).not.toContain("md:absolute");
+    fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
 
     // Maximize → the rail breaks out to cover the content region, and the left
     // sidebar collapses so the maximized rail owns the full content width.
@@ -2156,6 +2162,21 @@ describe("Workspace rail maximize", () => {
     expect(rail().className).toContain("md:inset-0");
     // Still keeps the docked flush/bordered styling — only the width changes.
     expect(rail().className).toContain("md:border-l");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    fireEvent.click(screen.getByTitle("main · s1"));
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_main");
+    expect(rail()).toHaveClass("md:absolute");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    expect(screen.getByTestId("url-params")).toHaveTextContent(/^$/);
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Files" }));
+    expect(screen.getByTestId("files-panel")).toBeInTheDocument();
+    expect(rail()).toHaveClass("md:absolute");
+    fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Changes/i }));
+    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
+    expect(rail()).toHaveClass("md:absolute");
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
 
     // Minimize → back to the docked flex child, and the sidebar is restored to
@@ -4013,7 +4034,7 @@ describe("Right workspace card visibility", () => {
     }
   });
 
-  it("keeps an active file and its URL when the last background browser closes", async () => {
+  it("restores Browser after closing a file and retains the file when its background browser closes", async () => {
     vi.stubGlobal("omnigentDesktop", {
       kind: "electron",
       browserOpenOrNavigate: vi.fn(),
@@ -4049,6 +4070,18 @@ describe("Right workspace card visibility", () => {
       fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
       expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
       expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
+
+      fireEvent.click(
+        within(screen.getByTestId("file-viewer-inline")).getByRole("button", {
+          name: "file-viewer: close",
+        }),
+      );
+      expect(screen.getByRole("tab", { name: "Browser 1" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
 
       fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
 
@@ -4289,6 +4322,8 @@ describe("AppShell URL sync — file param", () => {
     expect(screen.queryByTestId("file-viewer")).toBeNull();
     expect(pushPanel).toHaveAttribute("data-state", "open");
     expect(pushPanel).toHaveAttribute("data-path", "README.md");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).not.toHaveClass("md:absolute");
+    expect(screen.getByRole("button", { name: "Full screen" })).toBeInTheDocument();
     // The linked file is merged into the remembered tabs and saved on mount.
     expect(readSessionWorkspaceState("conv_abc")).toMatchObject({
       openFiles: ["a.ts", "README.md"],
@@ -4427,6 +4462,10 @@ describe("AppShell URL sync — file param", () => {
     expect(afterReopen).toContain("file=README.md");
     expect(afterReopen).not.toContain("diff=");
     expect(afterReopen).not.toContain("comment=");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveAttribute(
+      "data-animate-visibility",
+      "true",
+    );
   });
 });
 
@@ -4451,14 +4490,6 @@ describe("AppShell fullscreen file links", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveClass("md:absolute");
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
     expect(screen.getByRole("button", { name: "Exit full screen" })).toBeInTheDocument();
-  });
-
-  it("keeps ordinary file links docked", () => {
-    renderShell("/c/conv_abc?file=README.md");
-
-    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
-    expect(screen.getByRole("complementary", { name: "Workspace" })).not.toHaveClass("md:absolute");
-    expect(screen.getByRole("button", { name: "Full screen" })).toBeInTheDocument();
   });
 
   it("maximizes a remembered file from a bare session URL and keeps it selected on exit", () => {
@@ -4600,9 +4631,13 @@ describe("AppShell fullscreen file links", () => {
   });
 
   it("ignores fullscreen without a file target", () => {
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
     renderShell("/c/conv_abc?fullscreen=1");
 
     expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+    expect(screen.getByRole("complementary", { name: "Workspace" })).not.toHaveClass("md:absolute");
+    fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
+    expect(screen.getByTestId("url-params")).toHaveTextContent(/^file=README.md$/);
     expect(screen.getByRole("complementary", { name: "Workspace" })).not.toHaveClass("md:absolute");
   });
 });

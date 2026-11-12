@@ -43,6 +43,23 @@ describe("getShareableSessionLink", () => {
     ]);
   });
 
+  it.each(["not a URL", "/c/conv_1"])(
+    "falls back to the deployment URL when the host returns %s",
+    (link) => {
+      window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+      vi.mocked(host.getOmnigentTransformShareLink).mockReturnValue(() => link);
+
+      const url = new URL(getShareableSessionLink("conv_1", embedded, "report #1.html"));
+
+      expect(url.origin).toBe(window.location.origin);
+      expect(url.pathname).toBe("/proxy/6767/ml/omnigent-embed/c/conv_1");
+      expect([...url.searchParams]).toEqual([
+        ["file", "report #1.html"],
+        ["fullscreen", "1"],
+      ]);
+    },
+  );
+
   it("preserves hash-router queries and outer host queries for file links", () => {
     vi.mocked(host.getOmnigentTransformShareLink).mockReturnValue(
       (path: string) => `https://host.example.com/embed?host=1#${path}?o=42`,

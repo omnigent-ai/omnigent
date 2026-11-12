@@ -207,14 +207,15 @@ extension AppRootView {
     guard let deepLink = DeepLink.parse(url) else {
       #if DEBUG
         if ProcessInfo.processInfo.environment["OMNIGENT_DEEPLINK_TRACE"] != nil {
-          NSLog("[DeepLink] REJECTED \(url.absoluteString)")
+          NSLog("[DeepLink] REJECTED")
         }
       #endif
       return
     }
     #if DEBUG
       if ProcessInfo.processInfo.environment["OMNIGENT_DEEPLINK_TRACE"] != nil {
-        NSLog("[DeepLink] ACCEPTED origin=\(deepLink.origin) path=\(deepLink.path)")
+        let route = deepLink.path.split(separator: "?", maxSplits: 1).first ?? ""
+        NSLog("[DeepLink] ACCEPTED origin=\(deepLink.origin) path=\(route)")
       }
     #endif
     let targetOrigin = deepLink.origin
