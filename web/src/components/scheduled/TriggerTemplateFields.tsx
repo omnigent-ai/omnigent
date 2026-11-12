@@ -448,7 +448,7 @@ export function TriggerTemplateFields({
           rows={3}
           placeholder={
             instructionsAreDetails
-              ? "Anything specific to each run"
+              ? "Optional. Instructions to customize the workflow."
               : template.instructionsPlaceholder
           }
           data-testid="task-trigger-instructions"

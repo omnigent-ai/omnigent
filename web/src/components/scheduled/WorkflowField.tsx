@@ -15,8 +15,8 @@ import { pickerTriggerClass } from "./pickerStyles";
 
 /**
  * New automation's optional Workflow field: one of the user's saved workflows
- * for each run to follow. Laid out like the dialog's Project field; the
- * description shows three lines, and its tooltip has the rest.
+ * for each run to follow. Its menu is as wide as the field, so a long
+ * description is cut off as in the composer's Run a workflow list.
  */
 export function WorkflowField({
   workflows,
@@ -45,18 +45,15 @@ export function WorkflowField({
           <Button
             type="button"
             variant="outline"
-            className={cn(
-              "w-full justify-start gap-2 border-0 shadow-none text-muted-foreground",
-              pickerTriggerClass,
-            )}
+            className={cn("w-full justify-start gap-2 text-muted-foreground", pickerTriggerClass)}
             data-testid="task-workflow-trigger"
           >
             {value && <WorkflowIcon className="size-3.5 shrink-0" />}
-            <span className="flex-1 truncate text-left">{value?.name ?? "Choose a workflow"}</span>
+            <span className="flex-1 truncate text-left">{value?.name ?? "No workflow"}</span>
             <ChevronDownIcon className="size-4 text-muted-foreground" />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="min-w-56">
+        <DropdownMenuContent align="start" className="w-[var(--radix-dropdown-menu-trigger-width)]">
           <WorkflowPicker
             workflows={workflows}
             heading={null}
@@ -66,15 +63,6 @@ export function WorkflowField({
           />
         </DropdownMenuContent>
       </DropdownMenu>
-      {value?.description && (
-        <p
-          className="line-clamp-3 whitespace-pre-line text-sm text-muted-foreground"
-          title={value.description}
-          data-testid="task-workflow-description"
-        >
-          {value.description}
-        </p>
-      )}
     </div>
   );
 }
