@@ -4989,6 +4989,7 @@ def test_prepare_claude_cli_path_rejects_failed_wrap_probe(noop: bool) -> None:
         "default",
         "spec_relative",
         "spec_absolute",
+        "network_denied",
         "explicit_none",
         "explicit_dot",
         "explicit_relative",
@@ -5012,6 +5013,10 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
 
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
     spec = _wrap_probe_spec()
+    policy = _active_policy()
+    if cwd_source == "network_denied":
+        spec.sandbox.allow_network = False
+        policy.allow_network = False
     cwd = None
     if cwd_source == "default":
         spec.cwd = None
@@ -5044,7 +5049,7 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
     else:
         expected_cwd = Path(spec.cwd).resolve()
 
-    resolve = Mock(return_value=_active_policy())
+    resolve = Mock(return_value=policy)
     monkeypatch.setattr("omnigent.inner.claude_sdk_executor.resolve_sandbox", resolve)
 
     seen: dict[str, object] = {}
@@ -5053,6 +5058,7 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
         def wrap_launcher_argv(self, argv, policy, cwd, chdir=None, target=None):
             seen["target"] = target
             seen["cwd"] = cwd
+            seen["allow_network"] = policy.allow_network
             return ["bwrap", "--", *argv]
 
     monkeypatch.setattr(
@@ -5077,6 +5083,7 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
     resolve.assert_called_once_with(spec, expected_cwd)
     assert prepared.cwd == str(expected_cwd)
     assert seen["cwd"] == expected_cwd
+    assert seen["allow_network"] == spec.sandbox.allow_network
     assert seen["target"] == "/usr/bin/claude", (
         "The probe must exercise the target lane run_launcher will use."
     )
