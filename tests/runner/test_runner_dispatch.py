@@ -2351,6 +2351,118 @@ async def test_runner_background_turn_emits_failed_when_spawn_env_build_raises(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["error", "cancelled"])
+@pytest.mark.parametrize("replacement", ["unchanged", "starting", "running", "finished"])
+async def test_background_setup_failure_preserves_replacement_turn(
+    outcome: str,
+    replacement: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A setup callback may settle only the turn that started its lookup."""
+    from tests.runner.conftest import _drain_session_event_queue
+
+    session_id = "conv_setup_ownership"
+    lookup_started = asyncio.Event()
+    release_lookup = asyncio.Event()
+
+    async def resolve_spec(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        lookup_started.set()
+        await release_lookup.wait()
+        if outcome == "cancelled":
+            raise asyncio.CancelledError("retired setup cancelled")
+        raise ValueError("synthetic setup lookup failure")
+
+    manager = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=manager,  # type: ignore[arg-type]
+        spec_resolver=resolve_spec,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    successor = asyncio.create_task(asyncio.Event().wait())
+    original: asyncio.Task[None] | None = None
+    try:
+        async with _runner_test_client(app) as http:
+            response = await http.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "agent_setup",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "original input"}],
+                    "stable_id": "a" * 32,
+                    "pending_id": "pending_" + "b" * 32,
+                },
+            )
+            assert response.status_code == 202, response.text
+            await asyncio.wait_for(lookup_started.wait(), timeout=5)
+            original = app.state.active_turns[session_id]
+            assert isinstance(original, asyncio.Task)
+            original_epoch = app.state.turn_bind_epoch[session_id]
+            _drain_session_event_queue(app.state.session_event_queues.get(session_id))
+
+            if replacement != "unchanged":
+                app.state.begin_turn_slot(session_id, {"pending_id": "new-pending"})
+                if replacement == "running":
+                    app.state.active_turns[session_id] = successor
+                    app.state.live_response_id[session_id] = "new-response"
+                    manager.mark_in_flight(session_id, "new-response")
+                elif replacement == "finished":
+                    app.state.active_turns.pop(session_id)
+                app.state.interrupted_sessions.add(session_id)
+            expected_active = dict(app.state.active_turns)
+            expected_responses = dict(app.state.live_response_id)
+            expected_clears = list(manager.cleared_in_flight)
+            expected_epoch = app.state.turn_bind_epoch[session_id]
+
+            with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+                release_lookup.set()
+                if outcome == "cancelled":
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(original, timeout=5)
+                else:
+                    await asyncio.wait_for(original, timeout=5)
+            events = _drain_session_event_queue(app.state.session_event_queues.get(session_id))
+
+            if replacement == "unchanged":
+                assert session_id not in app.state.active_turns
+                assert session_id in manager.cleared_in_flight
+                failures = [event for event in events if event.get("status") == "failed"]
+                assert len(failures) == 1
+                assert "turn setup failed" in failures[0]["error"]["message"]
+                if outcome == "error":
+                    refused = [event for event in events if event["type"] == "response.failed"]
+                    assert len(refused) == 1
+                    assert refused[0]["input_stable_id"] == "a" * 32
+                    assert refused[0]["pending_id"] == "pending_" + "b" * 32
+            else:
+                assert expected_epoch != original_epoch
+                assert app.state.active_turns == expected_active
+                assert app.state.live_response_id == expected_responses
+                assert manager.cleared_in_flight == expected_clears
+                assert session_id in app.state.interrupted_sessions
+                assert not events
+                diagnostic_level = logging.ERROR if outcome == "cancelled" else logging.WARNING
+                diagnostic_message = (
+                    "turn cancelled" if outcome == "cancelled" else "turn setup failed"
+                )
+                assert any(
+                    record.levelno == diagnostic_level
+                    and diagnostic_message in record.message
+                    and record.exc_info is not None
+                    for record in caplog.records
+                )
+    finally:
+        release_lookup.set()
+        for task in (original, successor):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        app.state.active_turns.pop(session_id, None)
+
+
+@pytest.mark.asyncio
 async def test_runner_failed_status_carries_setup_error_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
