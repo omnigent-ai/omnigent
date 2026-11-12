@@ -7,7 +7,8 @@ import org.junit.Test
 class WorkspaceChromeScriptTest {
     /**
      * The rule must key on Omnigent's own embed root, not on the monolith-owned
-     * workspace nav markup, and must win over it (fixed + full-inset + top layer).
+     * workspace nav markup, and must win over it (fixed + full-inset + top layer)
+     * even when a workspace ancestor would trap a fixed descendant.
      */
     @Test
     fun `css promotes the embed root to a full-viewport overlay`() {
@@ -17,6 +18,27 @@ class WorkspaceChromeScriptTest {
               position: fixed !important;
               inset: 0 !important;
               z-index: 2147483647 !important;
+            }
+            :has(.omnigent-app) {
+              transform: none !important;
+              translate: none !important;
+              rotate: none !important;
+              scale: none !important;
+              perspective: none !important;
+              transform-style: flat !important;
+              filter: none !important;
+              backdrop-filter: none !important;
+              -webkit-backdrop-filter: none !important;
+              contain: none !important;
+              container-type: normal !important;
+              content-visibility: visible !important;
+              will-change: auto !important;
+              clip-path: none !important;
+              mask: none !important;
+              z-index: auto !important;
+              isolation: auto !important;
+              opacity: 1 !important;
+              mix-blend-mode: normal !important;
             }
             """.trimIndent(),
             WorkspaceChromeScript.css,

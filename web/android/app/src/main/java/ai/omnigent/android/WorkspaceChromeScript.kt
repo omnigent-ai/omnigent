@@ -22,7 +22,15 @@ object WorkspaceChromeScript {
      * Omnigent's wrapper (defined in THIS repo) rather than the monolith-owned,
      * unstable workspace nav markup keeps this from silently breaking when
      * Databricks reshuffles its chrome; on a standalone (non-embed) build there is
-     * no `.omnigent-app`, so the rule is a harmless no-op.
+     * no `.omnigent-app`, so the rules are a harmless no-op.
+     *
+     * `position: fixed` only escapes to the viewport if no ancestor is a containing
+     * block or stacking context for it. A transform, filter, `contain`, or z-index on
+     * a workspace wrapper traps the overlay inside the page card: the header stays
+     * visible, and the full-viewport app shell gets pushed below the screen by the
+     * header's height, so the composer is cut off (OMNI-14862). The second rule
+     * clears those properties on every ancestor of `.omnigent-app`. It still keys only
+     * on Omnigent's wrapper, so it doesn't depend on the workspace's markup.
      */
     val css: String =
         """
@@ -30,6 +38,27 @@ object WorkspaceChromeScript {
           position: fixed !important;
           inset: 0 !important;
           z-index: 2147483647 !important;
+        }
+        :has(.omnigent-app) {
+          transform: none !important;
+          translate: none !important;
+          rotate: none !important;
+          scale: none !important;
+          perspective: none !important;
+          transform-style: flat !important;
+          filter: none !important;
+          backdrop-filter: none !important;
+          -webkit-backdrop-filter: none !important;
+          contain: none !important;
+          container-type: normal !important;
+          content-visibility: visible !important;
+          will-change: auto !important;
+          clip-path: none !important;
+          mask: none !important;
+          z-index: auto !important;
+          isolation: auto !important;
+          opacity: 1 !important;
+          mix-blend-mode: normal !important;
         }
         """.trimIndent()
 
