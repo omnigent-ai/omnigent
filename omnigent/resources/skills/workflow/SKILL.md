@@ -15,6 +15,15 @@ You need the `sys_journal_*` tools and `sys_workflow_request_input`, and
 `sys_workflow_load` for a saved workflow. If you don't have them, tell the user
 this agent can't run workflows and stop.
 
+## When another workflow started you
+
+Check this first. If your first message says another session started this
+workflow, that session is waiting on you. When your plan finishes, with every
+step done or failed, message that session with `sys_session_message`, saying
+how it went and what's left. This is very important: don't skip it, even if
+you also tell the user, since the other workflow can't go on without your
+message.
+
 ## Plan
 
 1. Read your journal first with `sys_journal_read`. If the session's plan has
@@ -98,8 +107,9 @@ When the user asks to review the plan before the work starts:
 - Write `done` when the step achieved its goal. Only `done` lets later steps
   start.
 - Keep going while any step is ready or started. Don't end your turn until
-  everything left is done, failed, waiting for the user, or waits on one of
-  those, unless the user or your instructions say to stop sooner.
+  everything left is done, failed, waiting for the user, running in another
+  session, or waits on one of those, unless the user or your instructions say
+  to stop sooner.
 - When a step needs the user (an approval or a decision), first finish the
   ready steps that don't depend on the answer, since asking pauses your turn.
   Then ask with `sys_workflow_request_input`: the step, and everything you need
@@ -125,8 +135,8 @@ When the user asks to review the plan before the work starts:
 - If the user stops you, leave the step you were on `started`; the Tasks tab
   shows it as stopped while you're idle. A stop isn't the step failing, so
   don't write `failed` for it. Write a note if it helps to say what's left.
-- When you resume, check your `needs_input` steps first, and write a new status
-  for any that can go ahead.
+- When you resume, check your `needs_input` steps and the steps running in
+  other sessions first, and write a new status for any that can go ahead.
 - Replan with `sys_journal_write_plan` whenever the goal grows or changes. Keep
   step IDs stable across replans, so finished steps keep their status; give a
   step a new ID only when its work changes. Keep the plan's name while the
@@ -138,6 +148,31 @@ When the user asks to review the plan before the work starts:
   approved, or `failed` if rejected.
 - Keep entries short, and point to files, PRs and sessions instead of pasting
   them.
+
+## Running another workflow as a step
+
+When a step is a workflow of its own, such as getting one PR ready to merge,
+run it in its own session:
+
+- Write `started` on the step, then start a session for it with
+  `sys_session_create`, using your own agent and `placement: same_host`.
+  `sys_session_get_info` with no arguments gives your session ID, and
+  `sys_agent_get` on that session gives your agent's ID. The first message
+  must:
+  - tell it to load the `workflow` skill and run the workflow
+  - give it everything it needs, since it doesn't see this conversation
+  - say that this session (give its ID) started it for the step (give the
+    step ID), and that it must report back when its plan finishes
+- If you can't start one, do the step's work in this session instead.
+- Check on it periodically. Start a background timer with your own tools,
+  such as a background shell that sleeps 5 minutes. Each time it fires, read
+  the other session's journal with `sys_journal_read`, update the step, and
+  start the timer again while that session is still working.
+- When its plan finishes or it reports back, write `done` on the step if
+  every task is done, or `failed` naming the tasks that failed. If it stopped
+  with tasks left, ask the user how to go on with `sys_workflow_request_input`
+  on the step, as for anything else you can't clear yourself. If it's waiting
+  for the user, leave the step alone: the user answers in that session.
 
 ## Measurable goals
 
@@ -156,7 +191,9 @@ For a goal you can measure, such as "cut p95 latency by 20%":
 
 Before your final reply, write a status for every step you worked on. In the
 reply, lead with anything the user needs to decide, then summarize what was
-done and what is left.
+done and what is left. If another session started this workflow and your plan
+is finished, report back to it now (see "When another workflow started
+you").
 
 To reuse a workflow later, the user can save it: the save-workflow skill does
 that, and so does Save as workflow in the Tasks tab's ⋯ menu.
