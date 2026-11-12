@@ -10,37 +10,30 @@ import {
 
 describe("nativePermissionOptions", () => {
   it.each([
-    ["claude-native", ["default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"]],
+    [
+      "claude-native",
+      ["default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"],
+      "default",
+    ],
     [
       "codex-native",
       ["default", "ask-for-approval", "approve-for-me", "full-access", "read-only", "bypass"],
+      "default",
     ],
-    ["cursor-native", ["default", "auto-review", "plan", "ask", "yolo"]],
-    ["antigravity-native", ["default", "skip"]],
-    ["devin-native", ["normal", "accept-edits", "smart", "dangerous"]],
-    ["unknown-harness", []],
-    [null, []],
-    [undefined, []],
-  ] as const)("returns the create-time permission vocabulary for %s", (harness, values) => {
-    const options = nativePermissionOptions(harness);
-    expect(options.map((option) => option.value).sort()).toEqual([...values].sort());
-  });
-});
-
-describe("nativeDefaultPermissionMode", () => {
-  it.each([
-    ["claude-native", "default"],
-    ["codex-native", "default"],
-    ["cursor-native", "default"],
-    ["antigravity-native", "default"],
-    ["devin-native", "normal"],
-    ["unknown-harness", null],
-    [null, null],
-  ] as const)("names %s's default mode from its own vocabulary", (harness, mode) => {
-    expect(nativeDefaultPermissionMode(harness)).toBe(mode);
-    if (mode !== null)
-      expect(nativePermissionOptions(harness).map((option) => option.value)).toContain(mode);
-  });
+    ["cursor-native", ["default", "auto-review", "plan", "ask", "yolo"], "default"],
+    ["antigravity-native", ["default", "skip"], "default"],
+    ["devin-native", ["normal", "accept-edits", "smart", "dangerous"], "normal"],
+    ["unknown-harness", [], null],
+    [null, [], null],
+    [undefined, [], null],
+  ] as const)(
+    "returns the create-time permission vocabulary and default for %s",
+    (harness, values, defaultMode) => {
+      const options = nativePermissionOptions(harness);
+      expect(options.map((option) => option.value).sort()).toEqual([...values].sort());
+      expect(nativeDefaultPermissionMode(harness)).toBe(defaultMode);
+    },
+  );
 });
 
 describe("permissionModeConcept", () => {

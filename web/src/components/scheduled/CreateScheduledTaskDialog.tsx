@@ -1037,7 +1037,7 @@ export function CreateScheduledTaskDialog({
     inheritsPollingPermission(
       workerHarnessSettings,
       sessionPermissionModesSupported,
-      effectivePermission,
+      displayedPermission,
     )
   )
     workerLabels.push(INHERITED_PERMISSION_LABEL);
@@ -1343,7 +1343,7 @@ export function CreateScheduledTaskDialog({
       value={workerSettings}
       settings={workerHarnessSettings}
       permissionModesSupported={sessionPermissionModesSupported}
-      pollingPermissionMode={effectivePermission}
+      pollingPermissionMode={displayedPermission}
       taskSession={sendsToTaskSession}
       creating={creatingTriggerWorkers}
       followsPolling={creatingTriggerWorkers && newTriggerWorkerSettings === null}

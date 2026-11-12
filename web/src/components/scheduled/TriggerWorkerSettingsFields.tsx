@@ -126,12 +126,11 @@ export function TriggerWorkerSettingsFields({
     permissionModesSupported,
     pollingPermissionMode,
   );
-  // An omitted mode would inherit the polling session's, so Default names the harness's own.
+  // An omitted mode follows the polling session's, so a chosen Default names the harness's own.
   const defaultMode = nativeDefaultPermissionMode(settings.harness);
-  const chosenDefault =
-    pollingInherited && permissions.some((option) => option.value === defaultMode)
-      ? (defaultMode ?? "")
-      : "";
+  const chosenDefault = permissions.some((option) => option.value === defaultMode)
+    ? (defaultMode ?? "")
+    : "";
   const unappliedLabel =
     settings.permissions.find((option) => option.value === unappliedMode)?.label ?? unappliedMode;
   return (

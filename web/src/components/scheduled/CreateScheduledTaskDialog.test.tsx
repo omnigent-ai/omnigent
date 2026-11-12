@@ -4373,6 +4373,31 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     },
   );
 
+  it("keeps a worker Default chosen before the polling mode changes", async () => {
+    vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
+      data: [testAgent("selected-agent", "codex-native-ui", { harness: "codex-native" })],
+    } as ReturnType<typeof agentsHook.useAvailableAgents>);
+    renderTrigger("jira", {
+      scheduled_task_harness_settings: true,
+      session_create_permission_modes: true,
+      scheduled_task_approval_skipping_modes: true,
+    });
+    const select = async (id: string, name: string) => {
+      fireEvent.keyDown(screen.getByTestId(id), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name }));
+    };
+    await select("task-permission-trigger", "Default");
+    await select("task-worker-permission-trigger", "Approve for me");
+    await select("task-worker-permission-trigger", "Default");
+    await select("task-permission-trigger", "Full Access");
+    expect(screen.getByTestId("task-worker-permission-trigger")).toHaveTextContent("Default");
+    type("task-trigger-scope", "ES");
+    type("task-trigger-instructions", "Triage it.");
+    const prompt = await submittedPrompt();
+    expect(mutateAsync.mock.calls[0][0].permissionMode).toBe("full-access");
+    expect(readTriggerWorkerSettings(prompt)?.permissionMode).toBe("default");
+  });
+
   it("separates the rendered system and user prompts on Edit as prompt", async () => {
     renderTrigger("github");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Issue opened");
@@ -4512,6 +4537,52 @@ describe("editing template prompts", () => {
       });
     },
   );
+
+  it("bases worker inheritance on the polling mode a reused session keeps", async () => {
+    const saved = updateTriggerWorkerSettings(original, {
+      agentId: "ag_claude_native",
+      model: "",
+      effort: "",
+      permissionMode: "default",
+    })!;
+    const task = scheduledTask({
+      prompt: saved,
+      agentId: "ag_claude_native",
+      permissionMode: "bypassPermissions",
+      sessionMode: "continue",
+      sessionId: "poller",
+    });
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />, {
+      info: {
+        scheduled_task_session_modes: true,
+        session_create_permission_modes: true,
+        scheduled_task_approval_skipping_modes: true,
+      },
+    });
+    const select = async (id: string, name: string) => {
+      fireEvent.keyDown(screen.getByTestId(id), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name }));
+    };
+    // A polling change discarded by unchecking leaves the poller in bypass.
+    fireEvent.click(screen.getByTestId("task-start-new-session"));
+    await select("task-permission-trigger", "Default");
+    fireEvent.click(screen.getByTestId("task-start-new-session"));
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Bypass permissions");
+    expect(screen.getByTestId("task-worker-permission-trigger")).toHaveTextContent("Manual");
+    await select("task-worker-permission-trigger", "Same as polling session");
+    expect(screen.getByRole("button", { name: "Advanced" })).toHaveTextContent(
+      "Same as polling session",
+    );
+    fireEvent.keyDown(screen.getByTestId("task-worker-permission-trigger"), { key: "Enter" });
+    await screen.findByRole("option", { name: "Manual" });
+    expect(screen.queryByRole("option", { name: "Default" })).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: "Manual" }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    expect(input).not.toHaveProperty("sessionId");
+    expect(readTriggerWorkerSettings(input.prompt)?.permissionMode).toBe("default");
+  });
 
   it("changes the polling session's settings on edit only for a new polling session", async () => {
     const saved = updateTriggerWorkerSettings(original, {
