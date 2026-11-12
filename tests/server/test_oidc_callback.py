@@ -871,6 +871,7 @@ def test_device_approval_reauthenticates_before_consent(
         if cookie.name == "ap_session":
             session = jwt.decode(cookie.value, _TEST_SECRET, algorithms=["HS256"])
             session["iat"] -= 3600
+            session["auth_time"] -= 3600
             cookie.value = jwt.encode(session, _TEST_SECRET, algorithm="HS256")
     user_code = client.post("/oauth/device/authorize", json={"client_id": "slack"}).json()[
         "user_code"

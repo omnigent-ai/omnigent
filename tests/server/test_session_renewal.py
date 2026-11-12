@@ -519,6 +519,11 @@ def _oidc_client(
         return httpx.Response(200, json={"id_token": "stub"})
 
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+    monkeypatch.setattr(
+        oidc_routes,
+        "_validate_id_token",
+        lambda _token_json, _config: {"email": _USER, "email_verified": True},
+    )
     monkeypatch.setattr(oidc_routes, "_resolve_oidc_email", lambda token_json, config: _USER)
     admins = tmp_path / "admins"
     admins.write_text("")
