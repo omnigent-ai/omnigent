@@ -3847,7 +3847,30 @@ async def test_github_merge_relays_the_runner_refusal(client: httpx.AsyncClient)
     assert resp.json()["detail"] == detail
     assert timeouts == [routes_resources._PR_EDIT_PROXY_TIMEOUT_S]
     # Only the known fields are forwarded.
-    assert fake_runner.post_json_calls == [(path, {**body, "account": None})]
+    assert fake_runner.post_json_calls == [(path, body)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("account", [None, "", " ", 7])
+async def test_github_merge_as_requires_an_account(
+    client: httpx.AsyncClient, account: object
+) -> None:
+    """Without an account to bind, merge-as is refused, never sent as a plain merge."""
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/merge-as"
+    fake_runner = _FakeRunnerClient(payload={"object": "session.github.pr_merge"})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    body = {
+        "pr_url": "https://github.com/acme/widgets/pull/17",
+        "merge_method": "merge",
+        "expected_head": "a" * 40,
+        "account": account,
+    }
+
+    resp = await client.post(path, json=body)
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "Expected an account to merge as"
+    assert fake_runner.post_json_calls == []
 
 
 @pytest.mark.asyncio
@@ -10959,12 +10982,12 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
             "/merge",
             {"merge_method": "squash", "expected_head": "a" * 40},
             "github_merge",
-            {"merge_method": "squash", "expected_head": "a" * 40, "account": None},
+            {"merge_method": "squash", "expected_head": "a" * 40},
         ),
         (
-            "/merge",
+            "/merge-as",
             {"merge_method": "squash", "expected_head": "a" * 40, "account": "personal"},
-            "github_merge",
+            "github_merge_as",
             {"merge_method": "squash", "expected_head": "a" * 40, "account": "personal"},
         ),
         ("/disable-auto-merge", {"extra": True}, "github_disable_auto_merge", {}),

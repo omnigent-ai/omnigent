@@ -295,13 +295,15 @@ def test_a_merge_past_its_deadline_reports_an_unknown_outcome(
     assert [command[:3] for command in commands] == [first]
 
 
-@pytest.mark.parametrize("operation", ["merge", "disable auto-merge"])
+@pytest.mark.parametrize("operation", ["merge", "disable auto-merge", "merge as"])
 def test_a_selected_account_without_a_token_never_runs_as_another(
     monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
-    """A saved account that gh can't sign in as stops the merge, not falls back."""
+    """An account that gh can't sign in as stops the merge, not falls back."""
     monkeypatch.setattr(github, "_in_sandbox", lambda: False)
-    monkeypatch.setattr(github._config, "github_account_preference", lambda _repo: "work")
+    # A confirmed account must not fall back to the saved one, which has a token.
+    saved = "personal" if operation == "merge as" else "work"
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _repo: saved)
     calls: list[GhCall] = []
     monkeypatch.setattr(
         github,
@@ -313,6 +315,14 @@ def test_a_selected_account_without_a_token_never_runs_as_another(
     with pytest.raises(ValueError, match="account work isn't signed in on the host"):
         if operation == "merge":
             github._merge_pr("/workspace", reference, merge_method="merge", expected_head=HEAD_SHA)
+        elif operation == "merge as":
+            github._merge_pr(
+                "/workspace",
+                reference,
+                merge_method="merge",
+                expected_head=HEAD_SHA,
+                account="work",
+            )
         else:
             github._disable_auto_merge("/workspace", reference)
 
@@ -355,8 +365,6 @@ def tracked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
         ({"expected_head": None}, "Expected expected_head"),
         ({"expected_head": HEAD_SHA[:7]}, "Expected expected_head"),
         ({"expected_head": f"--{HEAD_SHA[2:]}"}, "Expected expected_head"),
-        ({"account": ""}, "Expected account"),
-        ({"account": ["personal"]}, "Expected account"),
         ({"pr_url": None}, "Select a pull request to merge"),
         ({"pr_url": PR_URL.replace("17", "18")}, "not associated"),
         ({"pr_url": GITLAB_MR_URL}, "Merging a GitLab merge request is not supported"),
@@ -402,8 +410,8 @@ def account_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
     return str(tmp_path)
 
 
-def _merge_as(root: str, account: str) -> None:
-    pr_resource.merge_pr(
+def _merge_as(root: str, account: object) -> None:
+    pr_resource.merge_pr_as(
         root,
         session_id="session",
         pr_url=PR_URL,
@@ -440,6 +448,50 @@ def test_a_merge_as_the_confirmed_account_saves_it_then_runs_as_it(
             "token-work",
         ),
     ]
+
+
+@pytest.mark.parametrize("account", [None, "", "  ", ["personal"]])
+def test_a_merge_as_needs_an_account(
+    account_workspace: str, monkeypatch: pytest.MonkeyPatch, account: object
+) -> None:
+    calls: list[GhCall] = []
+    monkeypatch.setattr(github, "_gh", _account_gh(calls))
+
+    with pytest.raises(ValueError, match="Expected account"):
+        _merge_as(account_workspace, account)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_the_runner_merge_as_route_runs_as_the_account(
+    account_workspace: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[GhCall] = []
+    monkeypatch.setattr(github, "_gh", _account_gh(calls))
+    app = create_runner_app(
+        runner_workspace=Path(account_workspace),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    body = {"pr_url": PR_URL, "merge_method": "merge", "expected_head": HEAD_SHA}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        merged = await client.post(
+            "/v1/sessions/session/resources/github/merge-as", json={**body, "account": "work"}
+        )
+        missing = await client.post("/v1/sessions/session/resources/github/merge-as", json=body)
+        # The plain route ignores an account rather than appearing to honor it.
+        plain = await client.post(
+            "/v1/sessions/session/resources/github/merge", json={**body, "account": "personal"}
+        )
+
+    assert merged.status_code == 200, merged.text
+    assert missing.status_code == 400
+    assert "Expected account" in missing.json()["detail"]
+    assert plain.status_code == 200, plain.text
+    merges = [token for argv, token in calls if argv[:2] == ["pr", "merge"]]
+    # The plain merge runs as the PR's saved account, which merge-as set to `work`.
+    assert merges == ["token-work", "token-work"]
 
 
 def test_concurrent_merges_each_run_as_their_confirmed_account(

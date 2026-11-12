@@ -11512,7 +11512,7 @@ def test_github_merge_on_host_runs_as_the_confirmed_account(
         merged = host._handle_fs_write(
             HostFsWriteFrame(
                 request_id="merge",
-                op="github_merge",
+                op="github_merge_as",
                 workspace=str(tmp_path),
                 session_id="session",
                 params={

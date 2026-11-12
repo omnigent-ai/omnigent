@@ -10,6 +10,7 @@ import { mergeButtonState, PullRequestMerge, type MergeAccounts } from "./PullRe
 
 const PR_URL = "https://github.com/acme/app/pull/7";
 const MERGE_PATH = "/v1/sessions/conv_1/resources/github/merge";
+const MERGE_AS_PATH = "/v1/sessions/conv_1/resources/github/merge-as";
 const DISABLE_PATH = "/v1/sessions/conv_1/resources/github/disable-auto-merge";
 const OPTIONS_PATH = "/v1/sessions/conv_1/resources/github/merge-options";
 const PREFERENCES_PATH = "/v1/sessions/conv_1/resources/github/preferences";
@@ -319,7 +320,7 @@ describe("merging as another account", () => {
     const dialog = screen.getByRole("dialog");
     fireEvent.click(within(dialog).getByRole("button", { name: "Squash and merge" }));
     await waitFor(() => expect(posts).toHaveLength(1));
-    expect(posts[0].body).toMatchObject({ account: "work" });
+    expect(posts[0]).toMatchObject({ path: MERGE_AS_PATH, body: { account: "work" } });
     const refusal = "The GitHub account on the host cannot merge this pull request.";
     await act(async () => {
       posts[0].respond(json({ detail: refusal }, 400));
@@ -355,7 +356,7 @@ describe("merging as another account", () => {
     fireEvent.click(confirm);
     await waitFor(() => expect(posts).toHaveLength(3));
     expect(posts[2]).toMatchObject({
-      path: MERGE_PATH,
+      path: MERGE_AS_PATH,
       body: { pr_url: PR_URL, merge_method: "rebase", expected_head: HEAD, account: "personal" },
     });
   });
@@ -474,7 +475,7 @@ describe("merging as another account", () => {
       }
       await waitFor(() => expect(confirm).toBeEnabled());
       fireEvent.click(confirm);
-      await waitFor(() => expect(posts.at(-1)?.path).toBe(MERGE_PATH));
+      await waitFor(() => expect(posts.at(-1)?.path).toBe(MERGE_AS_PATH));
       expect(posts.at(-1)?.body).toMatchObject({ account: "personal" });
     },
   );
@@ -493,7 +494,34 @@ describe("merging as another account", () => {
     );
     await waitFor(() => expect(posts).toHaveLength(1));
     // Nothing to choose, so the host keeps its own account.
+    expect(posts[0].path).toBe(MERGE_PATH);
     expect(posts[0].body).not.toHaveProperty("account");
+  });
+
+  it.each([
+    ["server or runner", json({ detail: "Not Found" }, 404)],
+    ["host", json({ detail: "unknown fs write op: 'github_merge_as'" }, 400)],
+  ])("refuses, never merging as the saved account, behind an older %s", async (_peer, reply) => {
+    const { posts } = stubFetch(allMethods);
+    renderMerge(pullRequest(), false, twoAccounts);
+
+    await openDialog();
+    const dialog = screen.getByRole("dialog");
+    // The switch saves; another tab could save a different account after it.
+    fireEvent.click(within(dialog).getByRole("combobox", { name: "Merge as" }));
+    fireEvent.click(screen.getByRole("option", { name: "personal" }));
+    await waitFor(() => expect(posts).toHaveLength(1));
+    await act(async () => posts[0].respond(json({ object: "session.github.info" })));
+    const confirm = within(dialog).getByRole("button", { name: "Squash and merge" });
+    await waitFor(() => expect(confirm).toBeEnabled());
+    fireEvent.click(confirm);
+    await waitFor(() => expect(posts).toHaveLength(2));
+    await act(async () => posts[1].respond(reply));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "can’t merge as a chosen account. Update them, or merge on GitHub.",
+    );
+    expect(posts.map((post) => post.path)).toEqual([PREFERENCES_PATH, MERGE_AS_PATH]);
   });
 });
 

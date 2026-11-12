@@ -4576,6 +4576,14 @@ class HostProcess:
                 pr_url=cast("str | None", params.get("pr_url")),
                 merge_method=params.get("merge_method"),
                 expected_head=params.get("expected_head"),
+            )
+        if op == "github_merge_as":
+            return pr_resource.merge_pr_as(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                merge_method=params.get("merge_method"),
+                expected_head=params.get("expected_head"),
                 account=params.get("account"),
             )
         if op == "github_disable_auto_merge":

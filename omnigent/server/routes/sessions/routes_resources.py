@@ -1085,7 +1085,8 @@ def register_resources_routes(
         :param op: Host-side write op — ``"github_set_preference"``,
             ``"github_prs_update"``, ``"github_labels_update"``,
             ``"github_reviewers_update"``, ``"github_details_update"``,
-            ``"github_comment_create"``, ``"github_attachment_upload"``, ``"github_merge"``, or
+            ``"github_comment_create"``, ``"github_attachment_upload"``, ``"github_merge"``,
+            ``"github_merge_as"``, or
             ``"github_disable_auto_merge"``.
         :param host_params: Op-specific args for the host writer.
         :param timeout: Seconds to wait for the host; the tunnel's default when ``None``.
@@ -3980,8 +3981,7 @@ def register_resources_routes(
         the runner when it's online, else by the host over its tunnel.
 
         :param request: JSON body with ``pr_url``, ``merge_method`` (``merge``,
-            ``squash``, or ``rebase``), ``expected_head``, a full commit SHA, and
-            an optional ``account``, the login the merge dialog showed.
+            ``squash``, or ``rebase``), and ``expected_head``, a full commit SHA.
         :param session_id: Session/conversation identifier.
         :returns: A ``session.github.pr_merge``.
         """
@@ -3998,7 +3998,44 @@ def register_resources_routes(
                 "pr_url": body["pr_url"],
                 "merge_method": body.get("merge_method"),
                 "expected_head": body.get("expected_head"),
-                "account": body.get("account"),
+            },
+            failure_detail="Cannot merge the pull request",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/merge-as",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def merge_session_github_pr_as(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Merge the selected PR as the account the merge dialog showed.
+
+        A route apart from ``/merge``, so a server, runner, or host that can't
+        bind the account refuses the request instead of merging as the saved one.
+
+        :param request: JSON body with the ``/merge`` fields and ``account``, the
+            login the merge runs as.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_merge``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        account = body.get("account")
+        if not isinstance(account, str) or not account.strip():
+            raise HTTPException(status_code=400, detail="Expected an account to merge as")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/merge-as",
+            host_op="github_merge_as",
+            params={
+                "pr_url": body["pr_url"],
+                "merge_method": body.get("merge_method"),
+                "expected_head": body.get("expected_head"),
+                "account": account,
             },
             failure_detail="Cannot merge the pull request",
         )

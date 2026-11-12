@@ -161,12 +161,7 @@ function MergeMethodPicker({
 /** The accounts a merge can run as, from the PR's info; omit when the provider can't switch. */
 export type MergeAccounts = Pick<PullRequestAuth, "accounts" | "selected_account">;
 
-/**
- * Picks the signed-in account the merge runs as, saved as the PR's account.
- * An account that can read a PR may still be refused the merge (an Enterprise
- * Managed User on a public repository), so the choice is offered here even
- * though the panel hides its account selector once the repository resolves.
- */
+/** Offers a merge-specific account choice, because read access doesn't imply merge permission. */
 function MergeAccountPicker({
   options,
   selected,

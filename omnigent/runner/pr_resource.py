@@ -802,7 +802,37 @@ def pr_merge_options(
     return facet.merge_options(root, reference)
 
 
+def _merge_request(merge_method: object, expected_head: object) -> tuple[str, str]:
+    """Validate a merge's method and head, which must reach the provider unchanged."""
+    if not isinstance(merge_method, str) or merge_method not in _MERGE_METHODS:
+        raise ValueError("Expected merge_method to be merge, squash, or rebase")
+    if not isinstance(expected_head, str) or not _COMMIT_SHA.fullmatch(expected_head):
+        raise ValueError("Expected expected_head to be the pull request's head commit SHA")
+    return merge_method, expected_head
+
+
 def merge_pr(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    merge_method: object = None,
+    expected_head: object = None,
+) -> dict[str, Any]:
+    """Merge the selected PR, only while its head is still ``expected_head``.
+
+    :param merge_method: ``merge``, ``squash``, or ``rebase``.
+    :param expected_head: The full head commit SHA the user reviewed.
+    :returns: A ``session.github.pr_merge``.
+    :raises ValueError: On an unknown method or malformed SHA, without a
+        selected tracked PR, or when the provider refuses the merge.
+    """
+    method, head = _merge_request(merge_method, expected_head)
+    facet, reference = _merge_target(session_id, pr_url)
+    return facet.merge(root, reference, merge_method=method, expected_head=head)
+
+
+def merge_pr_as(
     root: str,
     *,
     session_id: str | None = None,
@@ -811,38 +841,28 @@ def merge_pr(
     expected_head: object = None,
     account: object = None,
 ) -> dict[str, Any]:
-    """Merge the selected PR, only while its head is still ``expected_head``.
+    """Merge like :func:`merge_pr`, as ``account``, the account the user confirmed.
 
-    :param merge_method: ``merge``, ``squash``, or ``rebase``.
-    :param expected_head: The full head commit SHA the user reviewed.
-    :param account: The account the user confirmed the merge as. The merge runs
-        as it even when the panel's view of the saved account is stale, and it
-        becomes the PR's account for later requests. ``None`` merges as the saved
-        account.
-    :returns: A ``session.github.pr_merge``.
-    :raises ValueError: On an unknown method, malformed SHA or account, without a
-        selected tracked PR, or when the provider refuses the merge.
+    The merge runs as ``account`` even when the panel's view of the saved account
+    is stale, and ``account`` becomes the PR's account for later requests.
+
+    :raises ValueError: Also on a missing account, or when the provider can't
+        merge as a chosen account. It never merges as the saved account instead.
     """
-    if not isinstance(merge_method, str) or merge_method not in _MERGE_METHODS:
-        raise ValueError("Expected merge_method to be merge, squash, or rebase")
-    if not isinstance(expected_head, str) or not _COMMIT_SHA.fullmatch(expected_head):
-        raise ValueError("Expected expected_head to be the pull request's head commit SHA")
-    if account is not None and (not isinstance(account, str) or not account.strip()):
+    method, head = _merge_request(merge_method, expected_head)
+    if not isinstance(account, str) or not account.strip():
         raise ValueError("Expected account to be an account login")
     facet, reference = _merge_target(session_id, pr_url)
-    if not isinstance(account, str):
-        return facet.merge(root, reference, merge_method=merge_method, expected_head=expected_head)
     capabilities = facet.capabilities
     if not (
         capabilities.account_switching
         and capabilities.merge_as_account
         and isinstance(facet, AccountMergeFacet)
     ):
-        # Merging as the saved account instead could act as one the user didn't confirm.
         raise ValueError("This provider can't merge as a chosen account.")
     facet.set_preference(root, reference, account=account, remote=None)
     return facet.merge_as(
-        root, reference, merge_method=merge_method, expected_head=expected_head, account=account
+        root, reference, merge_method=method, expected_head=head, account=account
     )
 
 
