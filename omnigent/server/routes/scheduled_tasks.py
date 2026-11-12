@@ -663,6 +663,24 @@ def create_scheduled_tasks_router(
             f"cannot continue this session: {reason}", code=ErrorCode.INVALID_INPUT
         )
 
+    def _require_mcp_services_fit_session(
+        request: Request, session: Conversation, services: tuple[str, ...]
+    ) -> None:
+        """Reject saved *services* the continued *session* does not run.
+
+        Continuing reuses the session as it is, so a run could not add them. An
+        empty selection asks for nothing beyond what the session already has.
+        """
+        if not services:
+            return
+        running = session_mcp_selection(request.app.state).selected_services(session.labels)
+        if set(services) != set(running):
+            raise OmnigentError(
+                "The picked session runs different MCP services. Select the ones it "
+                "runs, or start a new session on every run.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
     async def _require_source_session(source_id: str, owner: str) -> tuple[Conversation, str]:
         """A session *owner* can start an automation from, hiding one they can't see.
 
@@ -941,6 +959,7 @@ def create_scheduled_tasks_router(
                     session_id=body.session_id,
                 ),
             )
+            _require_mcp_services_fit_session(request, picked, mcp_services)
             # The session cannot move, so the task routes every run to its host.
             if host_id is None and body.execution_target != "managed_sandbox":
                 host_id = picked.host_id
@@ -1439,6 +1458,9 @@ def create_scheduled_tasks_router(
         )
         if fields.get("session_id") is not None:
             picked = await _require_continuable(request, continuing)
+            _require_mcp_services_fit_session(
+                request, picked, fields.get("mcp_services", existing.mcp_services)
+            )
             # The session cannot move, so the task routes every run to its host.
             if (
                 fields.get("host_id", existing.host_id) is None

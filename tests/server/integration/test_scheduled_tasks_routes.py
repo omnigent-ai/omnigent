@@ -3218,6 +3218,58 @@ async def test_create_can_continue_a_session_the_owner_picked(
             assert "which skips approval" in picked.json()["error"]["message"]
 
 
+async def test_a_picked_session_must_run_the_saved_mcp_services(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    # Continuing reuses the session as it is, so a run could not add services to it.
+    _mcp_registry(auth_app)
+    plain = _owned_session(db_uri)
+    with_github = _owned_session(db_uri, labels={"omnigent.mcp_service.github": "1"})
+    for session_id, services, status in (
+        (plain, ["github"], 400),
+        (with_github, ["github", "linear"], 400),
+        (with_github, ["github"], 200),
+        (plain, [], 200),
+        (with_github, [], 200),
+    ):
+        resp = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(
+                session_mode="continue", session_id=session_id, mcp_services=services
+            ),
+            headers=_headers(),
+        )
+        assert resp.status_code == status, (session_id, services, resp.text)
+        if status == 400:
+            assert "runs different MCP services" in resp.json()["error"]["message"]
+
+    task = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(
+                session_mode="continue", session_id=with_github, mcp_services=["github"]
+            ),
+            headers=_headers(),
+        )
+    ).json()
+    url = f"/v1/scheduled-tasks/{task['id']}"
+    # Naming a session alongside new services skips the reset that drops a stale one.
+    for edit in (
+        {"session_id": plain},
+        {"session_id": with_github, "mcp_services": ["linear"]},
+    ):
+        rejected = await auth_client.patch(url, json=edit, headers=_headers())
+        assert rejected.status_code == 400, (edit, rejected.text)
+        kept = (await auth_client.get(url, headers=_headers())).json()
+        assert (kept["session_id"], kept["mcp_services"]) == (with_github, ["github"])
+
+    moved = await auth_client.patch(
+        url, json={"session_id": plain, "mcp_services": []}, headers=_headers()
+    )
+    assert moved.status_code == 200, moved.text
+    assert (moved.json()["session_id"], moved.json()["mcp_services"]) == (plain, [])
+
+
 async def test_a_picked_session_must_be_the_owners_and_fit_the_task(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
