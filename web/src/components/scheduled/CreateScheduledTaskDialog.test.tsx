@@ -1114,6 +1114,8 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
     >);
     const view = renderWithSandboxes();
     expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Pick a host");
+    // An unloaded list says nothing yet about which hosts are connected.
+    expect(screen.queryByTestId("task-no-host-online")).not.toBeInTheDocument();
     hosts.mockReturnValue({
       data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "online" }],
       isPending: false,
