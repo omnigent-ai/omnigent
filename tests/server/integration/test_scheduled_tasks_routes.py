@@ -262,7 +262,7 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     with capture_debug_rows("server") as rows:
         resp = await auth_client.post(
             "/v1/scheduled-tasks",
-            json=_create_body(name="private-name", prompt="private-prompt"),
+            json=_create_body(name="private-name", prompt="private-prompt", max_cost_usd=2.5),
             headers=headers,
         )
     assert resp.status_code == 200, resp.text
@@ -279,6 +279,7 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     assert created["owner_user_id"] == "alice@example.com"
     assert created["workspace"] == "/repo"
     assert created["host_id"] == "4b653f6031f35d168cc0b37caa1306d1"
+    assert created["max_cost_usd"] == 2.5
     assert created["base_branch"] is None
     assert created["execution_target"] == "connected_host"
     task_id = created["id"]
@@ -291,6 +292,7 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 200
     assert got.json()["id"] == task_id
+    assert got.json()["max_cost_usd"] == 2.5
 
 
 @pytest.mark.parametrize(
