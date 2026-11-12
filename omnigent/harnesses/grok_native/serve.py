@@ -9,7 +9,6 @@ resource a ``native-server`` harness manages. See docs/GROK_NATIVE_DESIGN.md.
 from __future__ import annotations
 
 import secrets
-import socket
 from dataclasses import dataclass
 
 _DEFAULT_BIND_HOST = "127.0.0.1"
@@ -29,13 +28,6 @@ class GrokServeEndpoint:
     port: int
     secret: str
     ws_url: str
-
-
-def allocate_grok_port() -> int:
-    """Return an ephemeral loopback port for a new serve process."""
-    with socket.socket() as sock:
-        sock.bind((_DEFAULT_BIND_HOST, 0))
-        return sock.getsockname()[1]
 
 
 def mint_grok_secret() -> str:
@@ -85,6 +77,8 @@ def build_grok_serve_endpoint(
     secret: str | None = None,
 ) -> GrokServeEndpoint:
     """Allocate an endpoint (port + secret + URL) for a new serve process."""
+    from omnigent.harnesses.grok_native.probe import allocate_grok_port
+
     port = allocate_grok_port() if port is None else port
     secret = mint_grok_secret() if secret is None else secret
     return GrokServeEndpoint(
@@ -97,7 +91,6 @@ def build_grok_serve_endpoint(
 
 __all__ = [
     "GrokServeEndpoint",
-    "allocate_grok_port",
     "build_grok_serve_endpoint",
     "grok_serve_argv",
     "grok_ws_url",

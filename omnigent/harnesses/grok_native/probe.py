@@ -7,8 +7,16 @@ credential handling and the network probe never share a module.
 from __future__ import annotations
 
 import asyncio
+import socket
 
 _BIND_HOST = "127.0.0.1"
+
+
+def allocate_grok_port() -> int:
+    """Return an ephemeral loopback port for a new serve process."""
+    with socket.socket() as sock:
+        sock.bind((_BIND_HOST, 0))
+        return sock.getsockname()[1]
 
 
 async def wait_for_grok_serve(
@@ -38,4 +46,4 @@ async def wait_for_grok_serve(
     raise TimeoutError(f"grok agent serve did not bind {port} within {timeout_s}s")
 
 
-__all__ = ["wait_for_grok_serve"]
+__all__ = ["allocate_grok_port", "wait_for_grok_serve"]

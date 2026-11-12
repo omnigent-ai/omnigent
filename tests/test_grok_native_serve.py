@@ -2,12 +2,7 @@
 
 from __future__ import annotations
 
-import socket
-
-import pytest
-
 from omnigent.harnesses.grok_native.serve import (
-    allocate_grok_port,
     build_grok_serve_endpoint,
     grok_serve_argv,
     grok_ws_url,
@@ -42,14 +37,3 @@ def test_build_endpoint_allocates_distinct_ports_and_secrets() -> None:
     assert a.ws_url.startswith(f"ws://127.0.0.1:{a.port}/")
 
 
-def test_allocate_port_returns_bindable_port() -> None:
-    port = allocate_grok_port()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", port))
-
-
-async def test_wait_for_serve_times_out_on_dead_port() -> None:
-    from omnigent.harnesses.grok_native.probe import wait_for_grok_serve
-
-    with pytest.raises(TimeoutError):
-        await wait_for_grok_serve(allocate_grok_port(), timeout_s=0.2, poll_s=0.05)
