@@ -678,7 +678,10 @@ class BenchEnvironment:
         # counting). In runner mode it additionally routes the server-side
         # policy-classifier LLM at the mock, mirroring live_server — without
         # that the classifier's client defaults to api.openai.com and errors.
-        server_config: dict[str, object] = {"debug_router_modules": [_DEBUG_ROUTER_MODULE]}
+        server_config: dict[str, object] = {
+            "debug_router_modules": [_DEBUG_ROUTER_MODULE],
+            "policy_modules": ["dev.benchmarks.omnigent.journeys"],
+        }
         if self.with_runner:
             server_config["llm"] = {
                 "model": _POLICY_LLM_KEY,

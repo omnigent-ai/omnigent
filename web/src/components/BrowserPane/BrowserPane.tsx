@@ -18,12 +18,48 @@
 import {
   ChevronLeftIcon,
   ChevronRightIcon,
+  CookieIcon,
   RotateCwIcon,
   SquareDashedMousePointerIcon,
   WrenchIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { supportsBrowser } from "@/lib/nativeBridge";
+import { toast } from "sonner";
+import {
+  ADDRESS_BAR_KEYS,
+  MOD_KEY,
+  RELOAD_KEYS,
+  shortcutText,
+} from "@/components/KeyboardShortcut";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+
+import { useDesktopCommand } from "@/lib/desktopCommands";
+import {
+  getDesktopFeatures,
+  navigationHostOptions,
+  supportsBrowser,
+  supportsDesktopCommands,
+  type BrowserHostOptions,
+  type ChromeCookieImportResult,
+  type ChromeCookiePreviewResult,
+} from "@/lib/nativeBridge";
+import { browserViewOwnerId } from "@/lib/browserTabs";
+import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
 import { cn } from "@/lib/utils";
 
@@ -49,7 +85,10 @@ interface NavResult {
  *  component doesn't depend on the full nativeBridge type; every method is
  *  optional (an older shell may predate the browser feature). */
 interface BrowserPaneBridge {
-  browserSetActive?: (conversationId: string | null) => Promise<{ ok: boolean; error?: string }>;
+  browserSetActive?: (
+    conversationId: string | null,
+    options?: { focus?: boolean },
+  ) => Promise<{ ok: boolean; error?: string }>;
   browserResize?: (
     conversationId: string,
     bounds: Bounds,
@@ -58,12 +97,19 @@ interface BrowserPaneBridge {
     conversationId: string,
     url: string,
     bounds: Bounds | undefined,
-    opts: { force?: boolean } | undefined,
+    opts: (BrowserHostOptions & { force?: boolean }) | undefined,
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   browserGoBack?: (conversationId: string) => Promise<NavResult>;
   browserGoForward?: (conversationId: string) => Promise<NavResult>;
   browserReload?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   openBrowserDevTools?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Local Chrome profiles holding cookies for the current site (metadata only). */
+  browserChromeCookiePreview?: (conversationId: string) => Promise<ChromeCookiePreviewResult>;
+  /** Copy the current site's Chrome cookies into this conversation's session. */
+  browserChromeCookieImport?: (
+    conversationId: string,
+    args: { profileId: string; expectedHost: string; scope?: string },
+  ) => Promise<ChromeCookieImportResult>;
   browserEnableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   browserDisableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   onBrowserViewCreated?: (callback: (payload: { conversationId: string }) => void) => () => void;
@@ -94,6 +140,24 @@ function getBridge(): BrowserPaneBridge | null {
   return w.omnigentDesktop ?? null;
 }
 
+/**
+ * Scopes the user may target for one Chrome profile: the page's host first,
+ * then only the parent domains that profile actually holds a domain cookie for
+ * (main-derived; the shell rejects anything else).
+ */
+function cookieScopeOptions(
+  preview: ChromeCookiePreviewResult | null,
+  profileId: string,
+): string[] {
+  const profile =
+    preview?.profiles?.find((candidate) => candidate.id === profileId) ?? preview?.profiles?.[0];
+  if (profile?.scopes && profile.scopes.length > 0) {
+    return profile.scopes.map((entry) => entry.host);
+  }
+  if (preview?.scopes && preview.scopes.length > 0) return preview.scopes;
+  return preview?.host ? [preview.host] : [];
+}
+
 export interface BrowserPaneProps {
   /** Native view key: the session ID or a session-scoped browser tab ID. */
   conversationId: string;
@@ -102,6 +166,9 @@ export interface BrowserPaneProps {
   active?: boolean;
   /** Extra classes for the measuring placeholder wrapper. */
   className?: string;
+  /** Take keyboard focus once, in the address bar or the page, then call `onFocused`. */
+  focus?: "address" | "page" | null;
+  onFocused?: () => void;
 }
 
 /**
@@ -113,8 +180,12 @@ export function BrowserPane({
   className,
   agentBrowser = true,
   active = true,
+  focus = null,
+  onFocused,
 }: BrowserPaneProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const toolbarRef = useRef<HTMLDivElement | null>(null);
+  const addressBarRef = useRef<HTMLInputElement | null>(null);
   const lastBoundsRef = useRef<Bounds | null>(null);
   const browserSupported = supportsBrowser();
   // A detached view still exists; only `active` controls its attachment.
@@ -128,12 +199,34 @@ export function BrowserPane({
   // Ref (not state): read synchronously in the url-changed listener; a
   // stale-closure state read would race.
   const urlEditingRef = useRef(false);
+  const submitSequenceRef = useRef(0);
+  useEffect(
+    () => () => {
+      submitSequenceRef.current++;
+    },
+    [conversationId],
+  );
   const [canGoBack, setCanGoBack] = useState(false);
   const [canGoForward, setCanGoForward] = useState(false);
   // Design-mode toggle: on, the main process injects the in-page picker; submit
   // routing lives in AppShell. This flag only drives the button + enable/disable IPC.
   const [designMode, setDesignMode] = useState(false);
   const designModeRef = useRef(false);
+  // "Import cookies from Chrome" needs BOTH an optional bridge method (older
+  // shells predate it) and the shell's desktop feature flag (macOS only).
+  const [cookieImportSupported, setCookieImportSupported] = useState(false);
+  const [cookiePreview, setCookiePreview] = useState<ChromeCookiePreviewResult | null>(null);
+  const [cookieProfileId, setCookieProfileId] = useState("");
+  const [cookieScope, setCookieScope] = useState("");
+  const [cookieBusy, setCookieBusy] = useState(false);
+
+  // Switching profiles can drop the scope the previous one offered; keep the
+  // state (and therefore the import request) on a scope that is still offered.
+  useEffect(() => {
+    if (!cookiePreview) return;
+    const offered = cookieScopeOptions(cookiePreview, cookieProfileId);
+    if (offered.length > 0 && !offered.includes(cookieScope)) setCookieScope(offered[0]);
+  }, [cookiePreview, cookieProfileId, cookieScope]);
 
   // Track existence through create/close events and a remount probe.
   // Host attach/detach events do not change whether the retained page exists.
@@ -208,13 +301,23 @@ export function BrowserPane({
     if (!raw) return;
     const navUrl = normalizeTypedUrl(raw);
     setNavigationError(null);
-    void bridge
-      .browserOpenOrNavigate(conversationId, navUrl, undefined, { force: true })
+    const sequence = ++submitSequenceRef.current;
+    void fetchSessionHostId(browserViewOwnerId(conversationId))
+      .then((hostId) => {
+        if (sequence !== submitSequenceRef.current) return null;
+        return bridge.browserOpenOrNavigate!(conversationId, navUrl, undefined, {
+          force: true,
+          ...navigationHostOptions(hostId),
+        });
+      })
       .then((result) => {
+        if (!result || sequence !== submitSequenceRef.current) return;
         if (result.ok) setCurrentUrl(navUrl);
         else setNavigationError(result.error ?? "Unable to open this page.");
       })
-      .catch(() => setNavigationError("Unable to open this page."));
+      .catch(() => {
+        if (sequence === submitSequenceRef.current) setNavigationError("Unable to open this page.");
+      });
   }, [conversationId, currentUrl]);
 
   const handleBack = useCallback(() => {
@@ -242,6 +345,32 @@ export function BrowserPane({
     void bridge?.browserReload?.(conversationId);
   }, [conversationId]);
 
+  // Desktop Reload (⌘R) from this toolbar reloads the page rather than the app;
+  // Focus Address Bar (⌘L) selects the address. (A focused page reloads itself in the shell.)
+  useDesktopCommand(
+    "reload",
+    active
+      ? () => {
+          if (!toolbarRef.current?.contains(document.activeElement)) return false;
+          handleReload();
+          return true;
+        }
+      : null,
+    { priority: 10 },
+  );
+  useDesktopCommand(
+    "focus-address-bar",
+    active
+      ? () => {
+          addressBarRef.current?.focus();
+          addressBarRef.current?.select();
+        }
+      : null,
+  );
+  // Chords in the toolbar's native titles; DOM tooltips here could sit under the page.
+  const chord = (label: string, keys: readonly string[]) =>
+    supportsDesktopCommands() ? `${label} (${shortcutText(keys)})` : label;
+
   const handleDevTools = useCallback(() => {
     const bridge = getBridge();
     void bridge?.openBrowserDevTools?.(conversationId);
@@ -260,6 +389,96 @@ export function BrowserPane({
       setDesignMode(true);
     }
   }, [conversationId, designMode]);
+
+  // Probe the shell's feature gate once: the bridge method alone doesn't mean
+  // the machine can decrypt Chrome's cookies (Windows/Linux report false).
+  useEffect(() => {
+    if (!browserSupported) return;
+    const bridge = getBridge();
+    if (!bridge?.browserChromeCookiePreview || !bridge.browserChromeCookieImport) return;
+    let cancelled = false;
+    void getDesktopFeatures().then((features) => {
+      if (!cancelled) setCookieImportSupported(features?.chromeCookieImport === true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [browserSupported]);
+
+  // Step 1: ask main what Chrome holds for THIS site (metadata only — the
+  // Keychain prompt belongs to the import, not to opening the dialog).
+  const handlePreviewChromeCookies = useCallback(async () => {
+    const bridge = getBridge();
+    if (!bridge?.browserChromeCookiePreview) return;
+    setCookieBusy(true);
+    try {
+      const preview = await bridge.browserChromeCookiePreview(conversationId);
+      if (!preview?.ok) {
+        toast.error(preview?.error || "Couldn't look for Chrome cookies.");
+        return;
+      }
+      const profiles = preview.profiles ?? [];
+      if (!preview.host || profiles.length === 0) {
+        toast.info(`No Chrome cookies found for ${preview.host ?? "this site"}.`);
+        return;
+      }
+      // Prefer a profile that actually holds cookies for this page.
+      const preferred = profiles.find((profile) => (profile.cookieCount ?? 0) > 0) ?? profiles[0];
+      setCookieProfileId(preferred.id);
+      setCookieScope(preview.host);
+      setCookiePreview({ ...preview, profiles });
+    } catch {
+      toast.error("Couldn't look for Chrome cookies.");
+    } finally {
+      setCookieBusy(false);
+    }
+  }, [conversationId]);
+
+  // Step 2: the user confirmed in the dialog — copy and reload so the site
+  // picks the session up immediately.
+  const handleImportChromeCookies = useCallback(async () => {
+    const bridge = getBridge();
+    const preview = cookiePreview;
+    if (!bridge?.browserChromeCookieImport || !preview?.host || !cookieProfileId) return;
+    const scope = cookieScopeOptions(preview, cookieProfileId).includes(cookieScope)
+      ? cookieScope
+      : preview.host;
+    setCookieBusy(true);
+    try {
+      const result = await bridge.browserChromeCookieImport(conversationId, {
+        profileId: cookieProfileId,
+        expectedHost: preview.host,
+        scope,
+      });
+      if (!result?.ok) {
+        // Declining the shell's own confirmation is not an error.
+        if (result?.cancelled) return;
+        toast.error(result?.error || "Couldn't import cookies from Chrome.");
+        return;
+      }
+      const imported = result.imported ?? 0;
+      const unusable = (result.skipped ?? 0) + (result.failed ?? 0);
+      if (imported === 0) {
+        // Keep the dialog open — another Chrome profile may hold the session.
+        toast.error(
+          (result.failed ?? 0) > 0
+            ? `Chrome's cookies for ${scope} couldn't be saved in this browser session.`
+            : `Chrome had no usable cookies for ${scope}.`,
+        );
+        return;
+      }
+      setCookiePreview(null);
+      const suffix = imported === 1 ? "cookie" : "cookies";
+      toast.success(
+        `Imported ${imported} ${suffix} from Chrome${unusable > 0 ? ` (${unusable} couldn't be used)` : ""}.`,
+      );
+      void bridge.browserReload?.(conversationId);
+    } catch {
+      toast.error("Couldn't import cookies from Chrome.");
+    } finally {
+      setCookieBusy(false);
+    }
+  }, [conversationId, cookiePreview, cookieProfileId, cookieScope]);
 
   // If the view goes away (closed) while design mode is on, drop the pressed
   // state so the button doesn't lie — the injected picker died with the view.
@@ -339,6 +558,19 @@ export function BrowserPane({
     };
   }, [conversationId, browserSupported, hasView, active, syncBounds]);
 
+  // A tab just opened takes focus in its address bar, as in a browser; one the
+  // user returns to gets it back where it was. The page needs its view attached.
+  useEffect(() => {
+    if (focus === "address") {
+      addressBarRef.current?.focus();
+    } else if (focus === "page" && hasView && active) {
+      void getBridge()?.browserSetActive?.(conversationId, { focus: true });
+    } else {
+      return;
+    }
+    onFocused?.();
+  }, [focus, hasView, active, conversationId, onFocused]);
+
   // Reconcile bounds every frame while shown (cheap: same-rect setBounds is a
   // no-op + we dedupe via lastBoundsRef). Catches position-only shifts that
   // ResizeObserver misses (it only fires on size). try/catch so a throw during
@@ -404,18 +636,30 @@ export function BrowserPane({
   //     canGoBack/canGoForward (both false with no view); reload + DevTools are
   //     explicitly disabled (nothing to reload / no devtools target yet). The
   //     URL bar stays editable so the user can open the first page.
+  const cookieProfiles = cookiePreview?.profiles ?? [];
+  const selectedCookieProfile =
+    cookieProfiles.find((profile) => profile.id === cookieProfileId) ?? cookieProfiles[0];
+  const cookieScopes = cookieScopeOptions(cookiePreview, cookieProfileId);
+  const activeCookieScope = cookieScope || cookieScopes[0] || "";
+  /** Cookies the selected profile holds for one scope. */
+  const countForScope = (scope: string) =>
+    selectedCookieProfile?.scopes?.find((entry) => entry.host === scope)?.cookieCount ??
+    (scope === cookiePreview?.host ? (selectedCookieProfile?.cookieCount ?? 0) : 0);
   return (
     <div
       className={cn("flex min-h-0 min-w-0 flex-col", className)}
       data-browser-pane-conversation={conversationId}
     >
-      <div className="flex shrink-0 items-center gap-1 border-border border-b bg-card px-2 py-1.5">
+      <div
+        ref={toolbarRef}
+        className="flex shrink-0 items-center gap-1 border-border border-b bg-card px-2 py-1.5"
+      >
         <button
           type="button"
           onClick={handleBack}
           disabled={!canGoBack}
           aria-label="Go back"
-          title="Back"
+          title={chord("Back", [MOD_KEY, "["])}
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
         >
           <ChevronLeftIcon className="size-4" />
@@ -425,7 +669,7 @@ export function BrowserPane({
           onClick={handleForward}
           disabled={!canGoForward}
           aria-label="Go forward"
-          title="Forward"
+          title={chord("Forward", [MOD_KEY, "]"])}
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
         >
           <ChevronRightIcon className="size-4" />
@@ -435,7 +679,7 @@ export function BrowserPane({
           onClick={handleReload}
           disabled={!hasView}
           aria-label="Reload"
-          title="Reload"
+          title={chord("Reload", RELOAD_KEYS)}
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
         >
           <RotateCwIcon className="size-4" />
@@ -446,8 +690,10 @@ export function BrowserPane({
           spellCheck={false}
           autoCorrect="off"
           autoCapitalize="off"
+          ref={addressBarRef}
           placeholder="Enter a URL"
           aria-label="Address bar"
+          title={chord("Address bar", ADDRESS_BAR_KEYS)}
           onChange={(e) => setCurrentUrl(e.target.value)}
           onFocus={() => {
             urlEditingRef.current = true;
@@ -462,7 +708,7 @@ export function BrowserPane({
               e.currentTarget.blur();
             }
           }}
-          className="h-6 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 text-foreground text-sm outline-none placeholder:text-muted-foreground focus-visible:border-ring dark:bg-input/30"
+          className="h-6 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 text-foreground text-sm outline-none placeholder:text-muted-foreground focus-visible:border-ring dark:bg-input"
         />
         <button
           type="button"
@@ -474,6 +720,18 @@ export function BrowserPane({
         >
           <WrenchIcon className="size-4" />
         </button>
+        {cookieImportSupported && (
+          <button
+            type="button"
+            onClick={handlePreviewChromeCookies}
+            disabled={!hasView || cookieBusy}
+            aria-label="Import cookies from Chrome"
+            title="Import this site's cookies from Chrome so you're signed in here too"
+            className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
+          >
+            <CookieIcon className="size-4" />
+          </button>
+        )}
         <button
           type="button"
           onClick={handleToggleDesignMode}
@@ -516,6 +774,97 @@ export function BrowserPane({
           {agentBrowser ? " — the agent will open pages here too." : "."}
         </div>
       )}
+      {/* DialogContent mounts SuppressBrowserView, hiding the native view. */}
+      <Dialog
+        open={cookiePreview !== null}
+        onOpenChange={(open) => {
+          if (!open && !cookieBusy) setCookiePreview(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Import cookies from Chrome</DialogTitle>
+            <DialogDescription>
+              Copies {activeCookieScope}'s cookies into this conversation's browser, so the site
+              reuses the sign-in you already have in Chrome. Nothing is written back to Chrome, and
+              the copy disappears when Omnigent quits.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-col gap-1">
+              <span className="text-muted-foreground text-xs">Site</span>
+              {cookieScopes.length > 1 ? (
+                <Select value={activeCookieScope} onValueChange={setCookieScope}>
+                  <SelectTrigger aria-label="Site scope" className="w-full">
+                    <SelectValue>{activeCookieScope}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {cookieScopes.map((scope) => (
+                      <SelectItem key={scope} value={scope}>
+                        {scope} ({countForScope(scope)})
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <span className="break-all font-medium text-sm">{cookiePreview?.host}</span>
+              )}
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-muted-foreground text-xs">Chrome profile</span>
+              {cookieProfiles.length > 1 ? (
+                <Select value={cookieProfileId} onValueChange={setCookieProfileId}>
+                  <SelectTrigger aria-label="Chrome profile" className="w-full">
+                    <SelectValue>{selectedCookieProfile?.name}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {cookieProfiles.map((profile) => (
+                      <SelectItem key={profile.id} value={profile.id}>
+                        {profile.name} (
+                        {profile.scopes?.find((entry) => entry.host === activeCookieScope)
+                          ?.cookieCount ?? profile.cookieCount}
+                        )
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <span className="font-medium text-sm">{selectedCookieProfile?.name}</span>
+              )}
+            </div>
+            <p className="text-muted-foreground text-xs">
+              {countForScope(activeCookieScope)}{" "}
+              {countForScope(activeCookieScope) === 1 ? "cookie" : "cookies"} for{" "}
+              {activeCookieScope} and its subdomains. Other sites' cookies stay out of Omnigent
+              entirely.
+            </p>
+            {activeCookieScope !== cookiePreview?.host && (
+              <p className="text-muted-foreground text-xs">
+                Cookies from other subdomains stay bound to their own host, so they only apply once
+                the tab visits them.
+              </p>
+            )}
+            <p className="text-muted-foreground text-xs">
+              macOS asks for permission to read Chrome's key from your login Keychain. Choose Allow,
+              not Always Allow: Always Allow lets any local process read the key.
+            </p>
+            <p className="text-destructive text-xs">
+              {/* Agent and user tabs share one jar per conversation: the agent can
+                  act as you on this site whether or not it drives this tab. */}
+              This conversation's tabs share one cookie jar, including any tab the agent controls,
+              so the agent can act as you on this site while these cookies are loaded.
+            </p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCookiePreview(null)} disabled={cookieBusy}>
+              Cancel
+            </Button>
+            <Button onClick={handleImportChromeCookies} disabled={cookieBusy}>
+              {cookieBusy ? "Importing…" : "Import cookies"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

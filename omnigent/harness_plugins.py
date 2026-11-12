@@ -369,6 +369,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
         instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
+        workspace_file_mentions=True,
     ),
     "codex-native": _C(
         _IM.NATIVE_TUI,
@@ -384,6 +385,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_name="shell",
         shell_tool_prompt=_SHELL_PROMPT,
         instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
+        workspace_file_mentions=True,
     ),
     # streaming is declared True unless a live bench run proves a harness does
     # NOT emit token-level deltas. Only kiro-native is so proven (0 deltas over
@@ -404,7 +406,8 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
-        instruction_delivery=_ID.NOT_DELIVERED,
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
+        workspace_file_mentions=True,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "cursor-native": _C(
@@ -421,6 +424,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         # No shell-tool provocation: cursor-native was intentionally absent from
         # the bench's table (its tool probe is skipped), so leave shell_tool_* None.
         instruction_delivery=_ID.NOT_DELIVERED,
+        workspace_file_mentions=True,
     ),
     # kiro_native_permissions.py: "TUI ACP recorder -> web elicitation".
     # streaming=False is LIVE-VERIFIED: a full SSE capture recorded 0 text
@@ -439,6 +443,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_name="shell",
         shell_tool_prompt=_SHELL_PROMPT,
         instruction_delivery=_ID.NOT_DELIVERED,
+        workspace_file_mentions=True,
     ),
     "antigravity-native": _C(
         _IM.NATIVE_TUI,
@@ -454,6 +459,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_name="run_command",
         shell_tool_prompt=_SHELL_PROMPT,
         instruction_delivery=_ID.NOT_DELIVERED,
+        workspace_file_mentions=True,
     ),
     "goose-native": _C(
         _IM.NATIVE_TUI,
@@ -469,6 +475,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_name="developer__shell",
         shell_tool_prompt=_SHELL_PROMPT,
         instruction_delivery=_ID.NOT_DELIVERED,
+        workspace_file_mentions=True,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "qwen-native": _C(
@@ -485,6 +492,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_name="run_shell_command",
         shell_tool_prompt=_SHELL_PROMPT,
         instruction_delivery=_ID.NOT_DELIVERED,
+        workspace_file_mentions=True,
     ),
     "kimi-native": _C(
         _IM.NATIVE_TUI,
@@ -500,7 +508,11 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
         instruction_delivery=_ID.NOT_DELIVERED,
+        workspace_file_mentions=True,
     ),
+    # OpenCode 2.x: streaming is backed by session.text.delta /
+    # session.reasoning.delta events (see tests/fixtures/opencode_v2/events.ndjson).
+    # Prompts carry delivery "steer" or "queue"; files carry images; /compact is native.
     "opencode-native": _C(
         _IM.NATIVE_SERVER,
         _EL.SSE_PERMISSION,
@@ -511,10 +523,16 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=True,
+        steering=True,
+        live_queue=True,
+        images=True,
+        compaction=True,
         fork_history=_FH.PREAMBLE,
         # NATIVE_SERVER, not driven by the bench's native-tui tool probe, so
         # shell_tool_* stay None.
-        instruction_delivery=_ID.COMPOSED_PER_TURN,
+        # The composed prompt is written once per launch to the per-session AGENTS.md.
+        instruction_delivery=_ID.COMPOSED_SESSION_SNAPSHOT,
+        workspace_file_mentions=True,
     ),
     # devin-native wraps the resident `devin` TUI. Every axis below was
     # live-verified against devin 3000.10.21:
@@ -562,6 +580,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         # Windsurf rule in the workspace (Devin's only per-turn system-prompt
         # channel; it has no --append-system-prompt). See write_devin_agent_rule.
         instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
+        workspace_file_mentions=True,
     ),
     "hermes-native": _C(
         _IM.NATIVE_TUI,
@@ -577,6 +596,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_name="terminal",
         shell_tool_prompt=_SHELL_PROMPT,
         instruction_delivery=_ID.NOT_DELIVERED,
+        workspace_file_mentions=True,
     ),
     # SDK / subprocess harnesses (run the vendor model directly). The first four
     # are bench-verified interrupt=streaming=True.
@@ -591,6 +611,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
         instruction_delivery=_ID.COMPOSED_SESSION_SNAPSHOT,
+        workspace_file_mentions=True,
     ),
     "codex": _C(
         _IM.CLI_SUBPROCESS,
@@ -1105,7 +1126,7 @@ def plugin_state() -> HarnessPluginState:
             if error is not None:
                 raise ValueError(error)
             contributions.append(contribution)
-        except Exception as exc:  # noqa: BLE001 - broken plugins must not break core startup.
+        except Exception as exc:  # broken plugins must not break core startup.
             load_errors[entry_point.name] = str(exc)
             _logger.warning(
                 "could not load harness plugin entry point %s (%s)",
@@ -1260,7 +1281,7 @@ def harness_catalog() -> list[dict[str, object]]:
     # importable without pulling in the onboarding/config stack at module load.
     try:
         from omnigent.onboarding.harness_install import ui_setup_steps
-    except Exception:  # noqa: BLE001 — a broken onboarding import must not break the catalog
+    except Exception:  # a broken onboarding import must not break the catalog
         _logger.debug("setup-step metadata unavailable", exc_info=True)
         ui_setup_steps = None  # type: ignore[assignment]
     rows: list[dict[str, object]] = []
@@ -1289,7 +1310,7 @@ def harness_catalog() -> list[dict[str, object]]:
             if acp_capability is not None:
                 acp_row["capabilities"] = acp_capability.as_dict()
             rows.append(acp_row)
-    except Exception:  # noqa: BLE001 — a malformed acp: block must never break the catalog
+    except Exception:  # a malformed acp: block must never break the catalog
         _logger.debug("acp catalog rows skipped", exc_info=True)
     return rows
 
@@ -1310,7 +1331,7 @@ def harness_setup_steps_by_spelling() -> dict[str, list[dict[str, str | None]]]:
     """
     try:
         from omnigent.onboarding.harness_install import ui_installable_harnesses, ui_setup_steps
-    except Exception:  # noqa: BLE001 — a broken onboarding import must not break the catalog
+    except Exception:  # a broken onboarding import must not break the catalog
         _logger.debug("setup-step metadata unavailable", exc_info=True)
         return {}
     # Cover the picker ids (catalog rows) plus every installable spelling

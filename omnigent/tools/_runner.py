@@ -14,7 +14,9 @@ is not available), the ``_AP_RESPONSE_MODE=stdout`` env var
 switches to a stdout-based protocol with a ``__AP_RESPONSE__:``
 prefix.
 
-Request format (stdin)::
+Request format (stdin):
+
+.. code-block:: json
 
     {
         "module_path": "/abs/path/to/tool.py",
@@ -22,7 +24,9 @@ Request format (stdin)::
         "arguments": {"text": "..."}
     }
 
-Response format (fd 3 or stdout)::
+Response format (fd 3 or stdout):
+
+.. code-block:: json
 
     {"result": "tool output as JSON-serialized string"}
     {"error": "TypeError: missing required argument"}

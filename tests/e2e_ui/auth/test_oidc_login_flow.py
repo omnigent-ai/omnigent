@@ -27,7 +27,14 @@ from tests.e2e_ui.auth._oidc_server import OIDCServer, spawn_oidc_server
 
 
 @pytest.fixture(
-    scope="module", params=[False, True], ids=["discovery-confidential", "explicit-public-ps256"]
+    scope="module",
+    params=[
+        {},
+        {"public_client": True},
+        # Some IdPs (e.g. Cloudflare Access) never issue auth_time; the operator opts out.
+        {"include_auth_time": False, "extra_env": {"OMNIGENT_OIDC_REQUIRE_REAUTH": "0"}},
+    ],
+    ids=["discovery-confidential", "explicit-public-ps256", "no-auth-time-reauth-opt-out"],
 )
 def oidc_server(
     built_spa: None,
@@ -37,7 +44,7 @@ def oidc_server(
 ) -> Iterator[OIDCServer]:
     """A dedicated OIDC-mode server wired to a fake IdP."""
     server_tmp = tmp_path_factory.mktemp("e2e_ui_oidc_login")
-    yield from spawn_oidc_server(mock_llm_server_url, server_tmp, public_client=request.param)
+    yield from spawn_oidc_server(mock_llm_server_url, server_tmp, **request.param)
 
 
 def test_oidc_login_redirects_through_idp_to_authenticated_app(

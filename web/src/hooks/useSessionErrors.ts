@@ -96,7 +96,9 @@ function liveError(conversation: ErrorConversation): LatestSessionError | null |
     return undefined;
   }
   if (state.status === "streaming" || state.terminalPending) return null;
-  return latestActivityErrorState(state.blocks, conversation.host_online) ?? null;
+  return (
+    latestActivityErrorState(state.blocks, conversation.host_online, state.sessionStatus) ?? null
+  );
 }
 
 /** Reuse live transcripts; unopened rows share a cached, bounded tail read. */

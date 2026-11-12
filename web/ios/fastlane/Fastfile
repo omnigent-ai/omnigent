@@ -2,6 +2,7 @@ require "fileutils"
 require "net/http"
 require "socket"
 require "tmpdir"
+require File.expand_path("simulator", __dir__)
 
 def omnigent_available_port
   loop do
@@ -61,6 +62,15 @@ rescue Errno::ESRCH
   nil
 end
 
+def omnigent_default_simulator
+  output = `xcrun simctl list devices available --json`
+  UI.user_error!("xcrun simctl failed; open Xcode once to install its simulator components") unless $?.success?
+
+  simulator = OmnigentSimulator.default_iphone(output)
+  UI.user_error!("No iPhone simulator available; install one with: xcodebuild -downloadPlatform iOS") unless simulator
+  simulator
+end
+
 def omnigent_wait_for_http(url, timeout_seconds:, log_path:)
   uri = URI(url)
   deadline = Time.now + timeout_seconds
@@ -106,7 +116,16 @@ platform :ios do
 
   desc "Build and run the Omnigent app in the iOS Simulator"
   lane :simulator do |options|
-    device = options[:device] || ENV.fetch("OMNIGENT_IOS_SIMULATOR", "iPhone 17 Pro")
+    name = OmnigentSimulator.requested_name(options[:device], ENV["OMNIGENT_IOS_SIMULATOR"])
+    if name
+      device = name
+      destination = "name=#{name}"
+    else
+      simulator = omnigent_default_simulator
+      device = simulator["udid"]
+      name = simulator["name"]
+      destination = "id=#{device}"
+    end
     build_dir = File.expand_path("build", __dir__)
 
     # Build the .app for simulator
@@ -114,7 +133,7 @@ platform :ios do
       project: "Omnigent.xcodeproj",
       scheme: "Omnigent",
       configuration: "Debug",
-      destination: "platform=iOS Simulator,name=#{device}",
+      destination: "platform=iOS Simulator,#{destination}",
       derivedDataPath: build_dir,
       build_settings: {
         "CODE_SIGNING_ALLOWED" => "NO",
@@ -128,7 +147,7 @@ platform :ios do
     sh("xcrun simctl install '#{device}' '#{app_path}'")
     sh("xcrun simctl launch '#{device}' ai.omnigent.ios")
 
-    UI.success("Launched on #{device}")
+    UI.success("Launched on #{name}")
   end
 
   desc "Generate App Store screenshots with fastlane snapshot"
