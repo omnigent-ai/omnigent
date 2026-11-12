@@ -7,12 +7,17 @@ const reply = (entries: unknown) =>
   `<send_user_message_question_reply>\n${JSON.stringify(entries)}\n</send_user_message_question_reply>`;
 
 describe("codexAsyncQuestionReplyText", () => {
-  it("shows only the answers of a reply", () => {
+  it("shows a reply as the Codex TUI does", () => {
+    const text = reply([{ answer: "Blue", question: "Color?", questionItemId: item(0) }]);
+    expect(codexAsyncQuestionReplyText(text)).toBe("↪ Re: Color?\nBlue");
+  });
+
+  it("shows each answered question of a reply", () => {
     const text = reply([
       { answer: "Blue", question: "Color?", questionItemId: item(0) },
-      { answer: "Large", question: "Size?", questionItemId: item(1) },
+      { answer: "Large", questionItemId: item(1) },
     ]);
-    expect(codexAsyncQuestionReplyText(text)).toBe("Blue\nLarge");
+    expect(codexAsyncQuestionReplyText(text)).toBe("↪ Re: Color?\nBlue\n\nLarge");
   });
 
   it.each([

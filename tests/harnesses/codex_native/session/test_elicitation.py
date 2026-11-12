@@ -15,6 +15,7 @@ from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
 from tests.harnesses.codex_native.session._support import (
     _agent_message_event,
+    _completed_event,
     _elicitation_tracker,
     _expected_delta_data,
     _FakeCodexAppServerClient,
@@ -753,18 +754,37 @@ def test_forwarder_leaves_codex_elicitation_pending_on_empty_hook_body(
     assert fake_client.responses == []
 
 
-_ASYNC_QUESTION_ELICITATION_ID = codex_elicitation_id(
-    "conv_123",
-    "item/tool/requestUserInput",
-    "async_question:call-async-1",
-)
-# Reply text the Codex 0.158 TUI sends after the user picks "Alpha".
-_TUI_ASYNC_QUESTION_REPLY = (
-    "<send_user_message_question_reply>\n"
-    '[{"answer":"Alpha","question":"Which option do you choose?",'
-    '"questionItemId":"[\\"request_user_input_async\\",\\"call-async-1\\",0]"}]\n'
-    "</send_user_message_question_reply>"
-)
+def _async_question_elicitation_id(index: int) -> str:
+    """
+    Return the Omnigent elicitation id of one async question card.
+
+    :param index: Position of the question in the call, e.g. ``0``.
+    :returns: Elicitation id for the session ``conv_123``.
+    """
+    return codex_elicitation_id(
+        "conv_123",
+        "item/tool/requestUserInput",
+        f"async_question:call-async-1:{index}",
+    )
+
+
+def _async_question_reply(index: int, question: str, answer: str) -> str:
+    """
+    Build the reply text the Codex TUI picker sends for one question.
+
+    :param index: Position of the answered question, e.g. ``0``.
+    :param question: Question text, e.g. ``"Which option do you choose?"``.
+    :param answer: Chosen or typed answer, e.g. ``"Alpha"``.
+    :returns: Tagged user message text.
+    """
+    question_item_id = json.dumps(
+        ["request_user_input_async", "call-async-1", index], separators=(",", ":")
+    )
+    entry = {"answer": answer, "question": question, "questionItemId": question_item_id}
+    body = json.dumps([entry], ensure_ascii=False, separators=(",", ":"))
+    return f"<send_user_message_question_reply>\n{body}\n</send_user_message_question_reply>"
+
+
 # ``GET /v1/info`` body of a server that shows non-blocking async question cards.
 _ASYNC_QUESTION_CARD_SERVER_INFO: dict[str, Any] = {"codex_nonblocking_decline": True}
 
@@ -800,7 +820,7 @@ def _async_question_event() -> dict[str, Any]:
     """
     Build the ``item/completed`` notification for a Codex async question.
 
-    :returns: App-server event payload in the Codex 0.158 shape, with one
+    :returns: App-server event payload in the Codex 0.167 shape, with one
         option question and one free-text question.
     """
     event = _agent_message_event(
@@ -821,12 +841,12 @@ def _async_question_event() -> dict[str, Any]:
     return event
 
 
-def _tui_reply_event(reply_text: str) -> dict[str, Any]:
+def _user_message_event(text: str) -> dict[str, Any]:
     """
-    Build the ``item/completed`` notification for a Codex TUI question reply.
+    Build the ``item/completed`` notification for a Codex user message.
 
-    :param reply_text: Tagged reply text the Codex TUI sends.
-    :returns: App-server event payload for the reply ``userMessage``.
+    :param text: Message text, e.g. a tagged reply or ``"Use Blue"``.
+    :returns: App-server event payload for the ``userMessage``.
     """
     return {
         "method": "item/completed",
@@ -836,7 +856,7 @@ def _tui_reply_event(reply_text: str) -> dict[str, Any]:
             "item": {
                 "type": "userMessage",
                 "id": "item_reply",
-                "content": [{"type": "text", "text": reply_text, "text_elements": []}],
+                "content": [{"type": "text", "text": text, "text_elements": []}],
             },
         },
     }
@@ -850,11 +870,11 @@ def _answer_async_question(
     server_info: dict[str, Any] = _ASYNC_QUESTION_CARD_SERVER_INFO,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], _FakeCodexAppServerClient]:
     """
-    Drive one async question whose Omnigent hook returns ``hook_response``.
+    Drive one async question call whose card hooks all return ``hook_response``.
 
     :param bridge_dir: Native Codex bridge directory.
-    :param hook_response: Omnigent hook response, or ``None`` when the card
-        must not be shown.
+    :param hook_response: Omnigent hook response, or ``None`` when no card
+        may be shown.
     :param message_status: Status for the forwarder's ``message`` event posts.
     :param server_info: ``GET /v1/info`` response body.
     :returns: Elicitation hook bodies, the session events posted, and the
@@ -866,7 +886,7 @@ def _answer_async_question(
 
     def handler(request: httpx.Request) -> httpx.Response:
         """
-        Answer the question card and capture session event posts.
+        Answer the question cards and capture session event posts.
 
         :param request: HTTP request sent by the forwarder.
         :returns: Omnigent hook or event response.
@@ -882,7 +902,7 @@ def _answer_async_question(
 
     async def run() -> None:
         """
-        Handle the question and wait for its answer to be sent.
+        Handle the question and wait for its answers to be sent.
 
         :returns: None.
         """
@@ -900,6 +920,7 @@ def _answer_async_question(
             await asyncio.wait_for(context["elicitation_tracker"].drain(), timeout=30.0)
 
     asyncio.run(run())
+    hook_bodies.sort(key=lambda body: body["id"])
     return hook_bodies, posted_events, fake_client
 
 
@@ -908,26 +929,26 @@ def _user_messages(posted_events: list[dict[str, Any]]) -> list[str]:
     Select the ordinary user messages the forwarder sent on the session.
 
     :param posted_events: Session events the forwarder posted.
-    :returns: Text of each ``message`` event, in post order.
+    :returns: Text of each ``message`` event, sorted.
     """
-    return [
+    return sorted(
         block["text"]
         for event in posted_events
         if event["type"] == "message"
         for block in event["data"]["content"]
-    ]
+    )
 
 
-def test_forwarder_sends_codex_async_question_answer_as_user_message(
+def test_forwarder_sends_each_codex_async_question_answer_as_a_user_message(
     tmp_path: Path,
 ) -> None:
     """
-    An async question gets a non-blocking card, and its answer becomes a user message.
+    Each async question gets its own non-blocking card, answered on its own.
 
     Codex reports ``request_user_input_async`` only as an ``agentMessage``
-    with ``delivery: "async"`` after the tool has returned. The answer goes
-    out in the Codex TUI's reply format through the session's ordinary
-    message path, so the forwarder itself sends nothing to Codex.
+    with ``delivery: "async"`` after the tool has returned. Like the Codex
+    TUI picker, each answer goes out as its own tagged reply through the
+    session's ordinary message path, so the forwarder sends nothing to Codex.
     """
     _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
 
@@ -941,7 +962,7 @@ def test_forwarder_sends_codex_async_question_answer_as_user_message(
 
     assert hook_bodies == [
         {
-            "id": "async_question:call-async-1",
+            "id": f"async_question:call-async-1:{index}",
             "method": "item/tool/requestUserInput",
             "params": {
                 "threadId": "thread_123",
@@ -950,30 +971,23 @@ def test_forwarder_sends_codex_async_question_answer_as_user_message(
                 "isBlocking": False,
                 "questions": [
                     {
-                        "id": "0",
-                        "question": "Which option do you choose?",
+                        "id": str(index),
+                        "question": question,
                         "isOther": True,
                         "isSecret": False,
-                        "options": [{"label": "Alpha"}, {"label": "Beta"}],
-                    },
-                    {
-                        "id": "1",
-                        "question": "Anything else?",
-                        "isOther": True,
-                        "isSecret": False,
-                        "options": [],
-                    },
+                        "options": options,
+                    }
                 ],
             },
         }
+        for index, question, options in [
+            (0, "Which option do you choose?", [{"label": "Alpha"}, {"label": "Beta"}]),
+            (1, "Anything else?", []),
+        ]
     ]
     assert _user_messages(posted_events) == [
-        "<send_user_message_question_reply>\n"
-        '[{"answer":"Alpha","question":"Which option do you choose?",'
-        '"questionItemId":"[\\"request_user_input_async\\",\\"call-async-1\\",0]"},'
-        '{"answer":"Ship it — today","question":"Anything else?",'
-        '"questionItemId":"[\\"request_user_input_async\\",\\"call-async-1\\",1]"}]\n'
-        "</send_user_message_question_reply>"
+        _async_question_reply(0, "Which option do you choose?", "Alpha"),
+        _async_question_reply(1, "Anything else?", "Ship it — today"),
     ]
     assert fake_client.requests == []
 
@@ -981,14 +995,14 @@ def test_forwarder_sends_codex_async_question_answer_as_user_message(
 @pytest.mark.parametrize(
     "hook_response",
     [httpx.Response(200, json={"answers": {}}), httpx.Response(200)],
-    ids=["declined", "timed_out"],
+    ids=["skipped", "closed"],
 )
 def test_forwarder_sends_nothing_for_unanswered_codex_async_question(
     tmp_path: Path,
     hook_response: httpx.Response,
 ) -> None:
     """
-    A declined or expired async question card sends no answer.
+    A skipped or closed async question card sends nothing, like the TUI's skip.
 
     :param hook_response: Omnigent hook response with no answers.
     """
@@ -996,7 +1010,10 @@ def test_forwarder_sends_nothing_for_unanswered_codex_async_question(
 
     hook_bodies, posted_events, fake_client = _answer_async_question(tmp_path, hook_response)
 
-    assert [body["id"] for body in hook_bodies] == ["async_question:call-async-1"]
+    assert [body["id"] for body in hook_bodies] == [
+        "async_question:call-async-1:0",
+        "async_question:call-async-1:1",
+    ]
     assert _user_messages(posted_events) == []
     assert fake_client.requests == []
 
@@ -1038,64 +1055,82 @@ def test_forwarder_posts_notice_when_codex_async_question_answer_cannot_be_sent(
         event["data"]["source_id"]
         for event in posted_events
         if str(event["data"].get("source_id", "")).startswith("async-question-undelivered-")
-    ] == ["async-question-undelivered-call-async-1"]
+    ] == ["async-question-undelivered-call-async-1-0"]
 
 
 @pytest.mark.parametrize(
-    "reply_text",
+    ("clearing_events", "closed_indexes"),
     [
-        _TUI_ASYNC_QUESTION_REPLY,
-        "<send_user_message_question_reply>\n"
-        '[{"answer":"</send_user_message_question_reply>",'
-        '"question":"Which option do you choose?",'
-        '"questionItemId":"[\\"request_user_input_async\\",\\"call-async-1\\",0]"}]\n'
-        "</send_user_message_question_reply>",
+        (
+            [
+                _user_message_event(
+                    _async_question_reply(0, "Which option do you choose?", "Alpha")
+                )
+            ],
+            [0],
+        ),
+        (
+            [
+                _user_message_event(
+                    _async_question_reply(
+                        0, "Which option do you choose?", "</send_user_message_question_reply>"
+                    )
+                )
+            ],
+            [0],
+        ),
+        ([_user_message_event("What is 2 plus 2?")], [0, 1]),
+        ([_completed_event("turn_123", thread_id="thread_123")], [0, 1]),
     ],
-    ids=["option", "answer_contains_closing_tag"],
+    ids=["tagged_reply", "reply_contains_closing_tag", "any_other_message", "turn_end"],
 )
-def test_forwarder_closes_codex_async_question_answered_in_native_tui(
+def test_forwarder_closes_codex_async_questions_the_tui_queue_clears(
     tmp_path: Path,
-    reply_text: str,
+    clearing_events: list[dict[str, Any]],
+    closed_indexes: list[int],
 ) -> None:
     """
-    A Codex TUI answer closes the Omnigent card without sending a second answer.
+    Cards close exactly when the Codex TUI clears its queued questions.
 
-    The TUI answers with a tagged ``userMessage``. The forwarder must resolve
-    the card and abandon its hook wait, and a repeated ``item/completed`` for
-    the question must not publish a second card. The reply is mirrored as
-    sent; the web shows only its answers.
+    A tagged reply (from the TUI picker or a card) clears the questions it
+    names; any other user message, typed in the TUI or the web, clears every
+    open question; the turn's end clears them too. A closed card sends no
+    answer, and a repeated ``item/completed`` must not publish it again.
 
-    :param reply_text: Tagged reply text the Codex TUI sends.
+    :param clearing_events: Codex events delivered after the question.
+    :param closed_indexes: Questions whose cards those events close.
     """
     _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     fake_client = _FakeCodexAppServerClient()
-    hook_calls: list[dict[str, Any]] = []
+    hook_ids: list[str] = []
+    cancelled_ids: list[str] = []
+    cancelled_before_teardown: list[str] = []
     posted_events: list[dict[str, Any]] = []
-    hook_started = asyncio.Event()
-    hook_cancelled = asyncio.Event()
+    both_hooks_started = asyncio.Event()
 
     async def handler(request: httpx.Request) -> httpx.Response:
         """
-        Hold the question card open and capture other Omnigent posts.
+        Hold the question cards open and capture other Omnigent posts.
 
         :param request: HTTP request sent by the forwarder.
         :returns: Omnigent event response for non-hook posts.
         """
         body = json.loads(request.content)
         if request.url.path.endswith("/hooks/codex-elicitation-request"):
-            hook_calls.append(body)
-            hook_started.set()
+            hook_ids.append(body["id"])
+            if len(hook_ids) == 2:
+                both_hooks_started.set()
             try:
                 await asyncio.Future()
             except asyncio.CancelledError:
-                hook_cancelled.set()
+                cancelled_ids.append(body["id"])
                 raise
         posted_events.append(body)
         return httpx.Response(202, json={"queued": False})
 
     async def run() -> None:
         """
-        Ask twice for the same item, then answer in the native TUI.
+        Ask twice for the same call, then deliver the clearing events.
 
         :returns: None.
         """
@@ -1104,37 +1139,36 @@ def test_forwarder_closes_codex_async_question_answered_in_native_tui(
             transport=_serve_with_server_info(handler),
         ) as client:
             context = _forwarder_context(client, tmp_path)
-            for event in (
-                _async_question_event(),
-                _async_question_event(),
-                _tui_reply_event(reply_text),
-            ):
+            for event in (_async_question_event(), _async_question_event()):
                 await codex_native_forwarder._handle_event(
                     client,
                     **context,
                     event=event,
                     codex_client=fake_client,  # type: ignore[arg-type]
                 )
-                await asyncio.wait_for(hook_started.wait(), timeout=1.0)
-            await asyncio.wait_for(hook_cancelled.wait(), timeout=1.0)
-            await context["elicitation_tracker"].drain()
+            await asyncio.wait_for(both_hooks_started.wait(), timeout=1.0)
+            for event in clearing_events:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    **context,
+                    event=event,
+                    codex_client=fake_client,  # type: ignore[arg-type]
+                )
+            for _ in range(5):
+                await asyncio.sleep(0)
+            cancelled_before_teardown.extend(sorted(cancelled_ids))
+            await context["elicitation_tracker"].close()
 
     asyncio.run(run())
 
-    assert len(hook_calls) == 1
-    assert [
-        event for event in posted_events if event["type"] == "external_elicitation_resolved"
-    ] == [
-        {
-            "type": "external_elicitation_resolved",
-            "data": {"elicitation_id": _ASYNC_QUESTION_ELICITATION_ID},
-        }
-    ]
-    assert [
-        event["data"]["item_data"]["content"]
+    assert sorted(hook_ids) == ["async_question:call-async-1:0", "async_question:call-async-1:1"]
+    assert sorted(
+        event["data"]["elicitation_id"]
         for event in posted_events
-        if event["type"] == "external_conversation_item"
-        and event["data"]["item_data"].get("role") == "user"
-    ] == [[{"type": "input_text", "text": reply_text}]]
+        if event["type"] == "external_elicitation_resolved"
+    ) == sorted(_async_question_elicitation_id(index) for index in closed_indexes)
+    assert cancelled_before_teardown == [
+        f"async_question:call-async-1:{index}" for index in closed_indexes
+    ]
     assert _user_messages(posted_events) == []
     assert fake_client.requests == []

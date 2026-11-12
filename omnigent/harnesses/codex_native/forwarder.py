@@ -2387,40 +2387,39 @@ class _CodexElicitationTaskTracker:
         params: _JsonObject,
     ) -> None:
         """
-        Publish a Codex async question and send its answer back as a user message.
+        Publish one card per Codex async question and send each answer as a user message.
 
-        The tool returns before the user answers, so the card stays open after
-        its turn ends. The answer goes through the session's ordinary message
-        path, like a reply typed in the Codex TUI.
+        The cards mirror the Codex TUI's queued questions: each is answered on
+        its own, and the answer goes through the session's ordinary message
+        path in the TUI's reply format.
 
         :param client: HTTP client for Omnigent hook and event posts.
         :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
         :param params: Codex ``item/completed`` params for an ``agentMessage``.
         :returns: None.
         """
-        question = _codex_async_question(params)
-        if question is None or question.item_id in self._started_async_questions:
-            return
-        self._started_async_questions.add(question.item_id)
-        task = asyncio.create_task(
-            self._run_async_question(client, session_id=session_id, question=question),
-            name="codex-native-async-question",
-        )
-        # No thread or turn scope, so a finished turn leaves the question open.
-        self._pending[task] = _PendingCodexElicitation(
-            thread_id=None,
-            turn_id=None,
-            request_id=question.request_id,
-            elicitation_id=codex_elicitation_id(
-                session_id,
-                _CODEX_TOOL_REQUEST_USER_INPUT_METHOD,
-                question.request_id,
-            ),
-        )
-        self._unanswered_async_questions[question.item_id] = task
-        task.add_done_callback(self._discard_done)
+        for question in _codex_async_questions(params):
+            if question.key in self._started_async_questions:
+                continue
+            self._started_async_questions.add(question.key)
+            task = asyncio.create_task(
+                self._run_async_question(client, session_id=session_id, question=question),
+                name="codex-native-async-question",
+            )
+            self._pending[task] = _PendingCodexElicitation(
+                thread_id=question.thread_id,
+                turn_id=question.turn_id,
+                request_id=question.request_id,
+                elicitation_id=codex_elicitation_id(
+                    session_id,
+                    _CODEX_TOOL_REQUEST_USER_INPUT_METHOD,
+                    question.request_id,
+                ),
+            )
+            self._unanswered_async_questions[question.key] = task
+            task.add_done_callback(self._discard_done)
 
-    async def resolve_async_questions_answered_natively(
+    async def close_async_questions_for_user_message(
         self,
         client: httpx.AsyncClient,
         *,
@@ -2428,10 +2427,11 @@ class _CodexElicitationTaskTracker:
         params: _JsonObject,
     ) -> None:
         """
-        Close async question cards that a Codex user message already answered.
+        Close the async question cards a Codex user message clears.
 
-        Covers both a reply typed in the Codex TUI and the echo of an answer
-        sent from the card.
+        Like the Codex TUI queue: a tagged reply (from the TUI picker or a
+        card) clears the questions it names, and any other user message,
+        typed in the TUI or the web, clears every open question on the thread.
 
         :param client: HTTP client for Omnigent event posts.
         :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -2441,15 +2441,35 @@ class _CodexElicitationTaskTracker:
         item = params.get("item")
         if not isinstance(item, dict) or item.get("type") != "userMessage":
             return
-        for item_id in _async_question_reply_item_ids(
-            _user_message_text(item), self._started_async_questions
-        ):
-            task = self._unanswered_async_questions.pop(item_id, None)
-            pending = self._pending.get(task) if task is not None else None
-            if task is None or pending is None:
-                continue
-            await self._post_resolved_once(client, session_id, pending)
-            task.cancel()
+        thread_id = _thread_id_from_params(params)
+        keys = _async_question_reply_keys(_user_message_text(item), self._started_async_questions)
+        if not keys:
+            keys = [
+                key
+                for key, task in self._unanswered_async_questions.items()
+                if (pending := self._pending.get(task)) is not None
+                and (thread_id is None or pending.thread_id == thread_id)
+            ]
+        for key in keys:
+            await self._close_async_question(client, session_id, key)
+
+    async def _close_async_question(
+        self, client: httpx.AsyncClient, session_id: str, key: str
+    ) -> None:
+        """
+        Close one async question card without sending an answer.
+
+        :param client: HTTP client for Omnigent event posts.
+        :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+        :param key: Question key, e.g. ``"call_abc:0"``.
+        :returns: None.
+        """
+        task = self._unanswered_async_questions.pop(key, None)
+        pending = self._pending.get(task) if task is not None else None
+        if task is None or pending is None:
+            return
+        task.cancel()
+        await self._post_resolved_once(client, session_id, pending)
 
     async def resolve_by_server_notification(
         self,
@@ -2503,6 +2523,13 @@ class _CodexElicitationTaskTracker:
         """
         thread_id = _thread_id_from_params(params)
         turn_id = _turn_id_from_payload(params.get("turn")) or _turn_id_from_payload(params)
+        # The Codex TUI drops its queued questions when their turn ends.
+        for key, task in list(self._unanswered_async_questions.items()):
+            pending = self._pending.get(task)
+            if pending is not None and _pending_elicitation_matches_terminal_turn(
+                pending, thread_id=thread_id, turn_id=turn_id
+            ):
+                await self._close_async_question(client, session_id, key)
         for _task, pending in list(self._pending.items()):
             if _pending_elicitation_matches_terminal_turn(
                 pending,
@@ -2585,15 +2612,15 @@ class _CodexElicitationTaskTracker:
         :param question: Parsed Codex async question.
         :returns: None.
         """
-        item_id = question.item_id
+        key = question.key
         try:
             if not await self._async_question_cards_supported(client):
                 return
             result = await _codex_elicitation_hook_result(
                 client, session_id, event=_async_question_request_event(question)
             )
-            # Absent once a Codex user message answered it (TUI reply or our echo).
-            if self._unanswered_async_questions.pop(item_id, None) is None:
+            # Absent once a user message or the turn's end cleared it.
+            if self._unanswered_async_questions.pop(key, None) is None:
                 return
             reply = _async_question_reply_text(question, result)
             if reply is not None:
@@ -2602,12 +2629,12 @@ class _CodexElicitationTaskTracker:
             raise
         except Exception:  # keep the long-lived forwarder alive.
             _logger.warning(
-                "Codex forwarder async question task failed: item=%s",
-                item_id,
+                "Codex forwarder async question task failed: question=%s",
+                key,
                 exc_info=True,
             )
         finally:
-            self._unanswered_async_questions.pop(item_id, None)
+            self._unanswered_async_questions.pop(key, None)
 
     async def _async_question_cards_supported(self, client: httpx.AsyncClient) -> bool:
         """
@@ -4046,7 +4073,7 @@ async def _handle_event(
             elicitation_tracker.start_async_question(
                 client, session_id=route_session_id, params=params
             )
-            await elicitation_tracker.resolve_async_questions_answered_natively(
+            await elicitation_tracker.close_async_questions_for_user_message(
                 client, session_id=route_session_id, params=params
             )
 
@@ -6367,53 +6394,80 @@ def _default_collaboration_mode(
 @dataclass(frozen=True)
 class _CodexAsyncQuestion:
     """
-    Questions from one Codex ``request_user_input_async`` call.
+    One question from a Codex ``request_user_input_async`` call.
+
+    The Codex TUI answers each question of a call on its own, so each gets
+    its own card.
 
     :param item_id: Codex ``agentMessage`` item id, e.g. ``"call_abc"``.
+    :param index: Position of the question in the call, e.g. ``0``. Codex
+        identifies an answer by item id and index.
+    :param title: Question text, e.g. ``"Pick one"``.
+    :param options: Option labels, e.g. ``("Alpha", "Beta")``.
     :param thread_id: Asking Codex thread id, e.g. ``"thread_abc"``.
     :param turn_id: Asking Codex turn id, e.g. ``"turn_abc"``, or ``None``.
-    :param questions: ``(index, title, option labels)`` per question. Codex
-        identifies each answer by the question's index.
     """
 
     item_id: str
+    index: int
+    title: str
+    options: tuple[str, ...]
     thread_id: str
     turn_id: str | None
-    questions: tuple[tuple[int, str, tuple[str, ...]], ...]
+
+    @property
+    def key(self) -> str:
+        """
+        Identify the question within the session.
+
+        :returns: Key, e.g. ``"call_abc:0"``.
+        """
+        return _async_question_key(self.item_id, self.index)
 
     @property
     def request_id(self) -> str:
         """
         Synthetic ``requestUserInput`` request id for the question card.
 
-        :returns: Request id, e.g. ``"async_question:call_abc"``.
+        :returns: Request id, e.g. ``"async_question:call_abc:0"``.
         """
-        return f"{_CODEX_ASYNC_QUESTION_REQUEST_PREFIX}{self.item_id}"
+        return f"{_CODEX_ASYNC_QUESTION_REQUEST_PREFIX}{self.key}"
 
 
-def _codex_async_question(params: _JsonObject) -> _CodexAsyncQuestion | None:
+def _async_question_key(item_id: str, index: int) -> str:
     """
-    Parse a Codex async question from ``item/completed`` params.
+    Build the key of one async question.
+
+    :param item_id: Codex ``agentMessage`` item id, e.g. ``"call_abc"``.
+    :param index: Position of the question in the call, e.g. ``0``.
+    :returns: Key, e.g. ``"call_abc:0"``.
+    """
+    return f"{item_id}:{index}"
+
+
+def _codex_async_questions(params: _JsonObject) -> list[_CodexAsyncQuestion]:
+    """
+    Parse the questions of a Codex async question from ``item/completed`` params.
 
     :param params: Codex ``item/completed`` params whose ``agentMessage``
         item carries ``delivery: "async"`` and ``questions``, e.g.
         ``[{"title": "Pick one", "options": ["Alpha", "Beta"]}]``.
-    :returns: Parsed questions, or ``None`` for any other item.
+    :returns: Parsed questions in asking order; empty for any other item.
     """
     item = params.get("item")
     if not isinstance(item, dict) or item.get("type") != "agentMessage":
-        return None
+        return []
     item_id = item.get("id")
     thread_id = params.get("threadId")
     turn_id = params.get("turnId")
     raw_questions = item.get("questions")
     if item.get("delivery") != "async" or not isinstance(raw_questions, list):
-        return None
+        return []
     if not isinstance(item_id, str) or not item_id:
-        return None
+        return []
     if not isinstance(thread_id, str) or not thread_id:
-        return None
-    questions: list[tuple[int, str, tuple[str, ...]]] = []
+        return []
+    questions: list[_CodexAsyncQuestion] = []
     for index, raw_question in enumerate(raw_questions):
         if not isinstance(raw_question, dict):
             continue
@@ -6426,15 +6480,17 @@ def _codex_async_question(params: _JsonObject) -> _CodexAsyncQuestion | None:
             for option in (options if isinstance(options, list) else [])
             if isinstance(option, str) and option
         )
-        questions.append((index, title, labels))
-    if not questions:
-        return None
-    return _CodexAsyncQuestion(
-        item_id=item_id,
-        thread_id=thread_id,
-        turn_id=turn_id if isinstance(turn_id, str) and turn_id else None,
-        questions=tuple(questions),
-    )
+        questions.append(
+            _CodexAsyncQuestion(
+                item_id=item_id,
+                index=index,
+                title=title,
+                options=labels,
+                thread_id=thread_id,
+                turn_id=turn_id if isinstance(turn_id, str) and turn_id else None,
+            )
+        )
+    return questions
 
 
 def _async_question_request_event(question: _CodexAsyncQuestion) -> CodexMessage:
@@ -6444,6 +6500,7 @@ def _async_question_request_event(question: _CodexAsyncQuestion) -> CodexMessage
     :param question: Parsed Codex async question.
     :returns: Codex JSON-RPC request envelope.
     """
+    # Like the Codex TUI picker: the options, then a free-text "Other" row.
     params: _JsonObject = {
         "threadId": question.thread_id,
         "turnId": question.turn_id,
@@ -6451,13 +6508,12 @@ def _async_question_request_event(question: _CodexAsyncQuestion) -> CodexMessage
         "isBlocking": False,
         "questions": [
             {
-                "id": str(index),
-                "question": title,
+                "id": str(question.index),
+                "question": question.title,
                 "isOther": True,
                 "isSecret": False,
-                "options": [{"label": label} for label in labels],
+                "options": [{"label": label} for label in question.options],
             }
-            for index, title, labels in question.questions
         ],
     }
     return {
@@ -6477,50 +6533,43 @@ def _async_question_reply_text(
     :param question: Parsed Codex async question.
     :param result: Codex ``requestUserInput`` result, e.g.
         ``{"answers": {"0": {"answers": ["Alpha"]}}}``.
-    :returns: Tagged user message text, or ``None`` when nothing was answered.
+    :returns: Tagged user message text with one entry, as the TUI sends for
+        each answered question, or ``None`` when nothing was answered.
     """
     answers = result.get("answers") if result is not None else None
-    if not isinstance(answers, dict):
+    answer = answers.get(str(question.index)) if isinstance(answers, dict) else None
+    values = answer.get("answers") if isinstance(answer, dict) else None
+    texts = [
+        value
+        for value in (values if isinstance(values, list) else [])
+        if isinstance(value, str) and value
+    ]
+    if not texts:
         return None
-    entries: list[_JsonObject] = []
-    for index, title, _labels in question.questions:
-        answer = answers.get(str(index))
-        values = answer.get("answers") if isinstance(answer, dict) else None
-        texts = [
-            value
-            for value in (values if isinstance(values, list) else [])
-            if isinstance(value, str) and value
-        ]
-        if not texts:
-            continue
-        question_item_id = [_CODEX_ASYNC_QUESTION_TOOL, question.item_id, index]
-        entries.append(
-            {
-                "answer": ", ".join(texts),
-                "question": title,
-                "questionItemId": json.dumps(question_item_id, separators=(",", ":")),
-            }
-        )
-    if not entries:
-        return None
-    body = json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
+    question_item_id = [_CODEX_ASYNC_QUESTION_TOOL, question.item_id, question.index]
+    entry = {
+        "answer": ", ".join(texts),
+        "question": question.title,
+        "questionItemId": json.dumps(question_item_id, separators=(",", ":")),
+    }
+    body = json.dumps([entry], ensure_ascii=False, separators=(",", ":"))
     tag = _CODEX_ASYNC_QUESTION_REPLY_TAG
     return f"<{tag}>\n{body}\n</{tag}>"
 
 
 def _async_question_replies(
-    text: str, question_item_ids: Collection[str]
+    text: str, question_keys: Collection[str]
 ) -> Iterator[tuple[int, int, list[_JsonObject]]]:
     """
     Find the tagged replies to known async questions in a Codex user message.
 
     A tagged block counts only when every entry names one of
-    ``question_item_ids`` and some entry has answer text, so a quoted,
+    ``question_keys`` and some entry has answer text, so a quoted,
     partial, empty or malformed example stays ordinary text.
 
     :param text: Codex ``userMessage`` text.
-    :param question_item_ids: Item ids of the async questions Codex asked,
-        e.g. ``{"call_abc"}``.
+    :param question_keys: Keys of the async questions Codex asked,
+        e.g. ``{"call_abc:0"}``.
     :returns: Iterator of ``(start, end, entries)`` for each reply, where
         ``text[start:end]`` spans its tags.
     """
@@ -6537,10 +6586,10 @@ def _async_question_replies(
         if closing is None or not isinstance(entries, list):
             continue
         position = closing.end()
-        item_ids = [_async_question_reply_entry_item_id(entry) for entry in entries]
+        keys = [_async_question_reply_entry_key(entry) for entry in entries]
         if (
-            item_ids
-            and all(item_id is not None and item_id in question_item_ids for item_id in item_ids)
+            keys
+            and all(key is not None and key in question_keys for key in keys)
             and _async_question_reply_answers(entries)
         ):
             yield opening.start(), closing.end(), entries
@@ -6557,14 +6606,14 @@ def _async_question_reply_answers(entries: list[_JsonObject]) -> list[str]:
     return [answer for answer in answers if isinstance(answer, str) and answer]
 
 
-def _async_question_reply_entry_item_id(entry: object) -> str | None:
+def _async_question_reply_entry_key(entry: object) -> str | None:
     """
-    Return the async question item one reply entry answers.
+    Return the key of the async question one reply entry answers.
 
     :param entry: Decoded reply entry whose ``questionItemId`` is a JSON
         string, e.g. ``'["request_user_input_async","call_abc",0]'``.
-    :returns: The ``agentMessage`` item id, e.g. ``"call_abc"``, or ``None``
-        when the entry does not name an async question.
+    :returns: The question key, e.g. ``"call_abc:0"``, or ``None`` when the
+        entry does not name an async question.
     """
     question_item_id = entry.get("questionItemId") if isinstance(entry, dict) else None
     try:
@@ -6579,25 +6628,25 @@ def _async_question_reply_entry_item_id(entry: object) -> str | None:
         and parts[1]
         and type(parts[2]) is int
     ):
-        return parts[1]
+        return _async_question_key(parts[1], parts[2])
     return None
 
 
-def _async_question_reply_item_ids(text: str, question_item_ids: Collection[str]) -> list[str]:
+def _async_question_reply_keys(text: str, question_keys: Collection[str]) -> list[str]:
     """
-    Return the async question items a Codex user message answers.
+    Return the keys of the async questions a Codex user message answers.
 
     :param text: Codex ``userMessage`` text.
-    :param question_item_ids: Item ids of the async questions Codex asked.
-    :returns: Answered ``agentMessage`` item ids, e.g. ``["call_abc"]``.
+    :param question_keys: Keys of the async questions Codex asked.
+    :returns: Answered question keys, e.g. ``["call_abc:0"]``.
     """
-    item_ids: list[str] = []
-    for _start, _end, entries in _async_question_replies(text, question_item_ids):
+    keys: list[str] = []
+    for _start, _end, entries in _async_question_replies(text, question_keys):
         for entry in entries:
-            item_id = _async_question_reply_entry_item_id(entry)
-            if item_id is not None and item_id not in item_ids:
-                item_ids.append(item_id)
-    return item_ids
+            key = _async_question_reply_entry_key(entry)
+            if key is not None and key not in keys:
+                keys.append(key)
+    return keys
 
 
 async def _send_async_question_reply(
@@ -6629,16 +6678,15 @@ async def _send_async_question_reply(
         response.raise_for_status()
     except httpx.HTTPError:
         _logger.warning(
-            "Codex async question answer could not be sent: item=%s",
-            question.item_id,
+            "Codex async question answer could not be sent: question=%s",
+            question.key,
             exc_info=True,
         )
-        title = question.questions[0][1]
         await _post_assistant_notice(
             client,
             session_id,
-            marker=f"async-question-undelivered-{question.item_id}",
-            text=f'Couldn\'t send your answer to "{title}" to Codex. '
+            marker=f"async-question-undelivered-{question.item_id}-{question.index}",
+            text=f'Couldn\'t send your answer to "{question.title}" to Codex. '
             "Answer it again in the terminal.",
         )
 

@@ -146,11 +146,13 @@ implements them separately, so a fix for one harness does not reach the others.
 - `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups,
   including those sent while it works, stay in that thread, and closing it
   leaves the parent usable.
-- `codex-async-questions`: a Codex `request_user_input_async` question shows a
-  card in Chat and Inbox that leaves the composer usable. The answer reaches
-  Codex's current or next turn; a terminal answer closes the card, and Cancel
-  dismisses it without stopping Codex. A server whose `/v1/info` lacks
-  `codex_nonblocking_decline` shows no card, so answer in the terminal.
+- `codex-async-questions`: each Codex `request_user_input_async` question shows
+  a card in Chat and Inbox that leaves the composer usable, like the Codex TUI's
+  queued-question picker. A card closes when the question is answered from the
+  card or the TUI picker, when the user sends any other message, when Cancel is
+  pressed (Codex keeps working), or when the turn ends. A server whose
+  `/v1/info` lacks `codex_nonblocking_decline` shows no card, so answer in the
+  terminal.
 - `codex-plan-mode`: Codex starts in, or switches to, its own Plan mode from the
   composer's Plan row; see `plan-mode` in [composer.md](./composer.md).
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
@@ -368,13 +370,18 @@ follow-up in the side pane, then close its tab. The parent conversation stays
 separate. See [sessions](./sessions.md) for all side-chat entry points.
 
 **Codex async question:** in Default mode, ask Codex to call
-`request_user_input_async`. The question card stays open after the turn ends
-and leaves the composer usable. Answer it in Chat or Inbox: the answer is sent
-as an ordinary message in the Codex TUI's reply format, so it steers Codex's
-current turn or starts the next one, and the transcript shows only the answer.
-Cancel dismisses the card without stopping Codex. Answering in the terminal
-closes the card. If the answer can't be sent, a notice asks the user to answer
-in the terminal. An open question is not restored after the forwarder reconnects.
+`request_user_input_async` and keep working. The cards follow the Codex TUI's
+queued questions (shift+← in the terminal): one card per question, its options
+plus a free-text "Other" row, and the composer stays usable. Answer a card in
+Chat or Inbox: the answer is sent as an ordinary message in the TUI picker's
+reply format, which steers Codex's current turn, and the transcript shows it as
+the TUI does (`↪ Re: <question>` above the answer). So does an answer picked
+in the TUI. A card closes when its question is answered there or in the card,
+when any other user message is sent from either side, on Cancel (Codex keeps
+working, like the TUI's skip), or when the turn ends. Cancel does not clear the
+question in the terminal. If the answer can't be sent, a notice asks the user
+to answer in the terminal. An open question is not restored after the
+forwarder reconnects.
 
 **Matrix.** "Mock" means the verification instance can drive the harness with
 the mock model; the others need their real CLI and vendor credentials. Test
@@ -620,12 +627,13 @@ Cross-harness journeys:
 - **`codex-async-questions`:**
   `tests/harnesses/codex_native/session/test_elicitation.py` (the
   `*codex_async_question*` tests) drives the forwarder with a fake app-server
-  client: the card, the answer sent as a user message, a declined or expired
-  card, an older server, a terminal answer, and the notice when the answer
-  can't be sent.
+  client: one card per question, each answer sent as its own user message, a
+  skipped or closed card, an older server, the notice when the answer can't be
+  sent, and the cards closing on a tagged reply, any other user message, and
+  the turn's end.
   `tests/server/integration/test_sessions_permission_request_hook.py::test_codex_request_user_input_decline_interrupts_only_blocking_questions`
   covers Cancel on the server. `web/src/lib/codexAsyncQuestionReply.test.ts`
-  covers the answer-only transcript, `web/src/lib/blockStream.test.ts` and
+  covers the `↪ Re:` transcript, `web/src/lib/blockStream.test.ts` and
   `web/src/lib/blocks.test.ts` the non-blocking card,
   `web/src/pages/ChatPage.composer.test.tsx` the composer,
   `web/src/pages/ChatPage.indicators.test.tsx` the working indicator's terminal
