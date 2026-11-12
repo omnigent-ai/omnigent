@@ -192,8 +192,19 @@ def test_scheduled_task_shares_columns(db_engine: Engine) -> None:
     assert all(column["nullable"] is False for column in columns.values())
     assert all(column["default"] is None for column in columns.values())
     assert columns["user_id"]["type"].length == 128
-    # SMALLINT on SQLite, MySQL, PostgreSQL; INT2 may be reported by CockroachDB.
-    assert str(columns["level"]["type"]).upper().startswith(("SMALLINT", "INT2"))
+    if db_engine.dialect.name == "cockroachdb":
+        # CockroachDB reflects INT2 as INTEGER and drops the width, so read the stored type.
+        with db_engine.connect() as conn:
+            stored_type = conn.execute(
+                sa.text(
+                    "SELECT data_type FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = 'scheduled_task_shares' AND column_name = 'level'"
+                )
+            ).scalar_one()
+        assert stored_type == "smallint"
+    else:
+        assert str(columns["level"]["type"]).upper().startswith(("SMALLINT", "INT2"))
 
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
