@@ -90,6 +90,11 @@ def _open_view_submenu(page: Page, submenu_test_id: str) -> None:
     page.get_by_test_id(submenu_test_id).click()
 
 
+def _assert_inside_viewport(items: Locator, width: int) -> None:
+    for box in (item.bounding_box() for item in items.all()):
+        assert box and box["x"] >= 0 and box["x"] + box["width"] <= width, box
+
+
 def _section_header(page: Page, title: str) -> Locator:
     return page.get_by_role("button", name=title, exact=True)
 
@@ -106,7 +111,10 @@ def test_harness_grouping_persists_across_reload(
     if width < 768:
         page.get_by_role("button", name="Open sidebar", exact=True).click()
     _open_view_submenu(page, "session-grouping-menu")
-    page.get_by_role("menuitemradio", name="Harness", exact=True).click()
+    harness = page.get_by_role("menuitemradio", name="Harness", exact=True)
+    expect(harness).to_be_visible()
+    _assert_inside_viewport(page.get_by_role("menuitemradio"), width)
+    harness.click()
     page.keyboard.press("Escape")
     claude = page.locator("section").filter(has=_section_header(page, "Claude Code"))
     codex = page.locator("section").filter(has=_section_header(page, "Codex"))

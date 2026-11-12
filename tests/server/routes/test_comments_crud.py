@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest_asyncio
 
+from omnigent.db.db_models import SqlComment, current_workspace_id
 from omnigent.db.utils import generate_agent_id
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -192,3 +195,58 @@ async def test_send_comments_not_found(client: httpx.AsyncClient, session_id: st
         json={"comment_ids": ["nonexistent_id"]},
     )
     assert resp.status_code == 404
+
+
+async def test_legacy_file_workflow_preserves_pr_rows(
+    client: httpx.AsyncClient, session_id: str, db_uri: str
+) -> None:
+    """A reader-only application safely handles rows written by the PR feature."""
+    anchor = {
+        "pr_url": "https://github.com/acme/app/pull/1",
+        "side": "LEFT",
+        "line": 9,
+        "start_line": 7,
+        "head_sha": "a" * 40,
+        "base_sha": "b" * 40,
+    }
+    store = SqlAlchemyCommentStore(db_uri)
+    pr_comment = store.add(session_id, "src/App.tsx", "PR feedback", 0, 0)
+    # Seed the compressed row format produced by the feature, without enabling its writer.
+    with store._engine.begin() as connection:
+        connection.execute(
+            SqlComment.__table__.update()
+            .where(
+                SqlComment.workspace_id == current_workspace_id(),
+                SqlComment.conversation_id == session_id,
+                SqlComment.id == pr_comment.id,
+            )
+            .values(anchor_metadata=json.dumps(anchor))
+        )
+    file_response = await client.post(
+        f"/v1/sessions/{session_id}/comments", json=_comment_payload()
+    )
+    assert file_response.status_code == 200
+    file_id = file_response.json()["id"]
+    for params in ({}, {"path": "src/App.tsx"}):
+        listed = await client.get(f"/v1/sessions/{session_id}/comments", params=params)
+        assert listed.status_code == 200
+        assert [item["id"] for item in listed.json()] == [file_id]
+    for ids in ([pr_comment.id], [file_id, pr_comment.id]):
+        rejected = await client.post(
+            f"/v1/sessions/{session_id}/comments/send", json={"comment_ids": ids}
+        )
+        assert rejected.status_code == 400
+        assert store.get(pr_comment.id, session_id).status == "draft"
+        assert store.get(file_id, session_id).status == "draft"
+    sent = await client.post(
+        f"/v1/sessions/{session_id}/comments/send", json={"comment_ids": [file_id]}
+    )
+    assert sent.status_code == 200
+    assert sent.json()["sent_comment_ids"] == [file_id]
+    edited = await client.patch(
+        f"/v1/sessions/{session_id}/comments/{pr_comment.id}", json={"body": "Updated feedback"}
+    )
+    assert edited.status_code == 200
+    assert edited.json()["anchor_metadata"] == anchor
+    assert edited.json()["body"] == "Updated feedback"
+    assert edited.json()["status"] == "draft"

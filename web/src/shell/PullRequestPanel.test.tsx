@@ -130,6 +130,9 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
       error: state.diffError,
       isFetching: false,
     }),
+    usePullRequestCommits: () => ({ data: undefined, isLoading: false, error: null }),
+    usePullRequestCommitDiff: () => ({ data: undefined, isLoading: false, error: null }),
+    usePullRequestCommitsUnsupported: () => false,
     fetchPullRequestFileContents: async () => ({ before: "old", after: "new" }),
     // The account selector (shown in the repo-unresolved empty state) calls this;
     // stub the mutation shape it reads.
@@ -167,6 +170,8 @@ vi.mock("@/hooks/useSessionPullRequests", async (importOriginal) => {
   };
 });
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => state.canEdit }));
+let sandboxStarting = false;
+vi.mock("@/hooks/useSessionReconnect", () => ({ useSandboxStarting: () => sandboxStarting }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   ...(await importOriginal<typeof UseWorkspaceChangedFilesModule>()),
   useWorkspaceAsleep: () => state.sandboxAsleep,
@@ -1514,7 +1519,7 @@ describe("PullRequestPanel", () => {
     renderChanges();
 
     fireEvent.click(await screen.findByRole("checkbox", { name: "Viewed hello.py" }));
-    const key = viewedStorageKey(window.location.origin, "alice", selected, "head");
+    const key = viewedStorageKey(window.location.origin, "alice", selected);
     expect(localStorage.getItem(key)).toContain("hello.py");
   });
 
@@ -1836,30 +1841,40 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByText("GitHub")).toBeNull();
   });
 
-  it("tells a GitHub Enterprise user to sign in to the remote's host", () => {
-    state.info = {
-      data: {
-        object: "session.github.info",
-        available: false,
-        reason: "unsupported_remote",
-        remote_host: "git.example.com",
-        provider: null,
-      },
-      isLoading: false,
-      error: null,
-      isFetching: false,
-    };
-    renderPanel();
-    // A second line under the sentence about the host; the command is set as code.
-    const hint = screen.getByText(/which isn’t a supported/);
-    const note = screen.getByText(/For a GitHub Enterprise host, run/);
-    expect(note).not.toBe(hint);
-    expect(hint.compareDocumentPosition(note) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(note).toHaveTextContent(
-      "For a GitHub Enterprise host, run gh auth login --hostname git.example.com on the host.",
-    );
-    expect(screen.getByText("gh auth login --hostname git.example.com")).toHaveClass("font-mono");
-  });
+  it.each(["git.example.com", "github.com-work"])(
+    "shows provider setup for unrecognized host %s",
+    (remoteHost) => {
+      state.info = {
+        data: {
+          object: "session.github.info",
+          available: false,
+          reason: "unsupported_remote",
+          remote_host: remoteHost,
+          provider: null,
+        },
+        isLoading: false,
+        error: null,
+        isFetching: false,
+      };
+      renderPanel();
+      // A second line under the sentence about the host; commands are set as code.
+      const hint = screen.getByText(/couldn’t identify the git provider/);
+      const note = screen.getByText(/On the execution host, run/);
+      expect(note).not.toBe(hint);
+      expect(hint.compareDocumentPosition(note) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(note).toHaveTextContent(
+        `On the execution host, run glab auth login --hostname ${remoteHost} for GitLab or gh auth login --hostname ${remoteHost} for GitHub Enterprise.`,
+      );
+      expect(screen.getByText(`glab auth login --hostname ${remoteHost}`)).toHaveClass("font-mono");
+      expect(screen.getByText(`gh auth login --hostname ${remoteHost}`)).toHaveClass("font-mono");
+      expect(note).toHaveTextContent(
+        "For a GitHub SSH alias, run git config --local omnigent.gitprovider github in this checkout, then refresh for installation or sign-in help.",
+      );
+      expect(screen.getByText("git config --local omnigent.gitprovider github")).toHaveClass(
+        "font-mono",
+      );
+    },
+  );
 
   it("leaves out the sign-in line when the remote's host is unknown", () => {
     state.info = {
@@ -1875,10 +1890,11 @@ describe("PullRequestPanel", () => {
     };
     renderPanel();
     expect(
-      screen.getByText("This workspace’s remote isn’t on a supported git provider."),
+      screen.getByText("Omnigent couldn’t identify this workspace’s git provider."),
     ).toBeInTheDocument();
     expect(screen.queryByText(/GitHub Enterprise/)).toBeNull();
     expect(screen.queryByText(/gh auth login/)).toBeNull();
+    expect(screen.queryByText(/glab auth login/)).toBeNull();
   });
 
   describe("header when no provider is known", () => {
@@ -2078,6 +2094,30 @@ describe("PullRequestPanel", () => {
       expect(screen.getByText("glab")).toHaveClass("font-mono");
       expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
       expect(screen.queryByText(/GitHub/)).toBeNull();
+    });
+
+    it("shows a GitLab merge request authenticated by a token without a CLI", () => {
+      const { repo, pr } = state.info!.data!;
+      state.info!.data = {
+        ...gitlab({ cli: null }),
+        repo,
+        pr: { ...pr!, url: "https://git.example.com/acme/app/-/merge_requests/6000" },
+      };
+      renderPanel();
+      expect(screen.getByText("chore: dummy PR")).toBeInTheDocument();
+      expect(screen.queryByText(/CLI not found/)).toBeNull();
+    });
+
+    it("shows the GitLab token error without asking to install a CLI", () => {
+      state.info!.data = gitlab({
+        authenticated: false,
+        cli: null,
+        hint: "Check `GITLAB_TOKEN` on the execution host.",
+      });
+      renderPanel();
+      expect(screen.getByText("Can’t reach the upstream repo")).toBeInTheDocument();
+      expect(screen.getByText("GITLAB_TOKEN")).toHaveClass("font-mono");
+      expect(screen.queryByText(/CLI not found/)).toBeNull();
     });
 
     it("shows the host's sign-in hint when the repo can't be reached", () => {
@@ -2428,6 +2468,8 @@ describe("PullRequestPanel", () => {
       "github-review-threads",
       "github-changed-files",
       "github-pr-diff",
+      "github-pr-commits",
+      "github-pr-commit-diff",
       "session-pull-requests",
     ]);
   });
@@ -3318,6 +3360,36 @@ describe("session PR selection", () => {
         /^To load the PR details, send a message to start the session’s sandbox\.$/,
       ),
     );
+  });
+
+  it("says the sandbox is starting while it wakes", async () => {
+    const url = "https://github.com/acme/app/pull/6001";
+    state.sandboxAsleep = true;
+    sandboxStarting = true;
+    try {
+      state.info = { isLoading: false, error: null, isFetching: false };
+      state.stored.conv_1 = [
+        {
+          url,
+          host: "github.com",
+          repository: "acme/app",
+          number: 6001,
+          title: "Waking PR",
+          relationship: "created",
+          state: "OPEN",
+          is_draft: false,
+          state_checked_at: null,
+        },
+      ];
+      renderPanel();
+      await waitFor(() =>
+        expect(
+          within(screen.getByTestId("github-stored-pr")).getByRole("status"),
+        ).toHaveTextContent(/^Starting the session’s sandbox\. The PR details will load/),
+      );
+    } finally {
+      sandboxStarting = false;
+    }
   });
 
   it.each([undefined, null, "", "   "])(

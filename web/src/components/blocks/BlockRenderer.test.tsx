@@ -14,7 +14,7 @@ import type { RenderItem } from "@/lib/renderItems";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
-import { BlockRenderer, rendersOnlyWorkedFold } from "./BlockRenderer";
+import { BlockRenderer, mayDefineReferenceLink, rendersOnlyWorkedFold } from "./BlockRenderer";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
 afterEach(cleanup);
@@ -392,6 +392,120 @@ describe("BlockRenderer dispatch", () => {
 
     expect(screen.getByText("*settled")).toBeInTheDocument();
     expect(container.querySelector("em")).toBeNull();
+  });
+
+  it("keeps a settled streamed reply's markdown as it rendered while streaming", () => {
+    // Streaming mode closes unclosed syntax; a streamed reply keeps that once it settles.
+    const { container } = render(
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <BlockRenderer
+          items={[
+            { kind: "text", itemId: "t1", text: "*settled", final: true, streamKey: "text#0" },
+          ]}
+          sessionStatus="idle"
+        />
+      </FileViewerContext.Provider>,
+    );
+
+    expect(container.querySelector("em")).toHaveTextContent("settled");
+  });
+
+  it.each([
+    ["at the top level", "See [the docs][docs].\n\n[docs]: https://example.com/docs"],
+    ["in a blockquote", "See [the docs][docs].\n\n> [docs]: https://example.com/docs"],
+    [
+      "in a blockquote inside a list item",
+      "See [the docs][docs].\n\n10. q\n\n    > [docs]: https://example.com/docs",
+    ],
+    [
+      "after CR line endings",
+      "See [the docs][docs].\n\nNotes.\r\r[docs]: https://example.com/docs",
+    ],
+    ["with a caret-only label", "See [the docs][^].\n\n[^]: https://example.com/docs"],
+  ])("resolves a settled streamed reply's reference link defined %s", (_where, text) => {
+    // Streamed text stays in streaming mode, which renders each block alone, so a
+    // reply with a link definition in another block settles into static mode.
+    render(
+      <TestProviders queryClient={new QueryClient()} fileViewerContext={FILE_VIEWER_NOOP}>
+        <BlockRenderer
+          items={[
+            {
+              kind: "text",
+              itemId: "t1",
+              text,
+              final: true,
+              streamKey: "text#0",
+            },
+          ]}
+          sessionStatus="idle"
+        />
+      </TestProviders>,
+    );
+
+    expect(screen.getByRole("link", { name: "the docs" })).toHaveAttribute(
+      "href",
+      "https://example.com/docs",
+    );
+  });
+
+  it("keeps a streamed reply's footnotes mounted as it settles", () => {
+    // Streamdown keeps a message with footnotes in one block, so they need no static switch.
+    const queryClient = new QueryClient();
+    const view = (sessionStatus: "running" | "idle") => (
+      <TestProviders queryClient={queryClient} fileViewerContext={FILE_VIEWER_NOOP}>
+        <BlockRenderer
+          items={[
+            {
+              kind: "text",
+              itemId: "t1",
+              text: "Claim.[^1]\n\n[^1]: A note.",
+              final: sessionStatus === "idle",
+              streamKey: "text#0",
+            },
+          ]}
+          sessionStatus={sessionStatus}
+        />
+      </TestProviders>
+    );
+    const { container, rerender } = render(view("running"));
+    const footnotes = container.querySelector("[data-footnotes]");
+    expect(footnotes).toHaveTextContent("A note.");
+
+    rerender(view("idle"));
+    expect(container.querySelector("[data-footnotes]")).toBe(footnotes);
+    expect(container.querySelector("[data-footnote-ref]")).toHaveTextContent("1");
+  });
+
+  it.each([
+    ["a definition", "See [a][docs].\n\n[docs]: https://example.com", true],
+    ["no space after the colon", "[docs]:/docs", true],
+    ["an escaped bracket in the label", String.raw`[foo\]]: /url`, true],
+    ["a definition in a list item", "- [docs]: https://example.com", true],
+    ["a definition on a list item's continuation", "10. See [docs][].\n\n    [docs]: /url", true],
+    ["a blockquote in a list item's continuation", "See [x][a].\n\n10. q\n\n    > [a]: /url", true],
+    ["a label split across lines", "See [foo bar][].\n\n[foo\nbar]: /url", true],
+    ["a label split across blockquote lines", "> [foo\n> bar]: /url", true],
+    ["a split label whose first line ends in a backslash", "[foo\\\nbar]: /url", true],
+    ["CR line endings", "See [docs][].\r\r[docs]: /docs", true],
+    // Code isn't parsed: matching there only keeps the static rendering.
+    ["a definition-like line in code", "```ini\n[docs]: x\n```", true],
+    ["an unescaped bracket in the label", "[foo[bar]: text", false],
+    ["a split label broken by a blank line", "[foo\n\nbar]: /url", false],
+    ["a footnote definition", "[^1]: A note.", false],
+    ["a caret-only label", "See [docs][^].\n\n[^]: https://example.com/docs", true],
+    ["plain prose", "Done. There are two names in the file.", false],
+  ])("mayDefineReferenceLink: %s", (_case, text, expected) => {
+    expect(mayDefineReferenceLink(text)).toBe(expected);
+  });
+
+  it("scans long pathological text in linear time", () => {
+    const started = performance.now();
+    expect(mayDefineReferenceLink("`".repeat(64_000))).toBe(false);
+    expect(mayDefineReferenceLink("[" + "a".repeat(64_000))).toBe(false);
+    expect(mayDefineReferenceLink("[a\n".repeat(20_000))).toBe(false);
+    expect(mayDefineReferenceLink(" ".repeat(64_000) + "x")).toBe(false);
+    expect(mayDefineReferenceLink("[" + "\\".repeat(64_000) + "]")).toBe(false);
+    expect(performance.now() - started).toBeLessThan(250);
   });
 
   it("uses streaming markdown mode only for the live trailing text item", () => {
@@ -2282,6 +2396,30 @@ describe("BlockRenderer dispatch", () => {
         vi.advanceTimersByTime(100);
       });
       expect(container.textContent).toContain("CHARLIE");
+    });
+
+    it("keeps a Mermaid fence's source while the shown text trails the turn's end", () => {
+      const open = "Flow:\n\n```mermaid\nflowchart LR\n  Alpha --> Beta\n";
+      const view = (text: string, sessionStatus: "running" | "idle") => (
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer
+            items={[{ kind: "text", itemId: null, text, final: false, streamKey: "text#0" }]}
+            sessionStatus={sessionStatus}
+          />
+        </FileViewerContext.Provider>
+      );
+      const { rerender, container } = render(view("Flow:", "running"));
+      act(() => rerender(view(open, "running")));
+      // The turn ends within the throttle window, before the fence's close is shown.
+      act(() => rerender(view(`${open}\`\`\`\n\nDone.`, "idle")));
+      expect(container.querySelector('[data-streamdown="code-block"]')).toHaveTextContent(
+        "Alpha --> Beta",
+      );
+      expect(container.querySelector(".chat-mermaid")).toBeNull();
+
+      act(() => vi.advanceTimersByTime(100));
+      expect(container).toHaveTextContent("Done.");
+      expect(container.querySelector(".chat-mermaid")).not.toBeNull();
     });
   });
 
