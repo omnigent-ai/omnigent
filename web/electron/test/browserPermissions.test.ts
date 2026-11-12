@@ -1,26 +1,31 @@
-"use strict";
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
-const {
-  registerBrowserPermissions,
+import {
   createBrowserPermissionStore,
-} = require("../src/browserPermissions");
+  registerBrowserPermissions,
+  type BrowserPermissionStore,
+  type PermissionCheckHandler,
+  type PermissionDetails,
+  type PermissionPromptRequest,
+  type PermissionRequestHandler,
+  type PermissionSession,
+} from "../src/browserPermissions.ts";
 
 const ORIGIN = "https://login.example.com";
 const NETWORK_PERMISSIONS = ["local-network-access", "local-network", "loopback-network"];
 const tick = () =>
-  new Promise((resolve) => {
+  new Promise<void>((resolve) => {
     setImmediate(resolve);
   });
 
-function storage(initial = {}) {
+function storage(initial: Record<string, unknown> = {}) {
   let settings = structuredClone(initial);
-  const writes = [];
+  const writes: Record<string, unknown>[] = [];
   const deps = {
     loadSettings: () => structuredClone(settings),
-    saveSettings: (value) => {
+    saveSettings: (value: Record<string, unknown>) => {
       settings = structuredClone(value);
       writes.push(value);
     },
@@ -32,15 +37,51 @@ function storage(initial = {}) {
   };
 }
 
-function permissionSession() {
-  return {
-    setPermissionRequestHandler(handler) {
-      this.requestHandler = handler;
-    },
-    setPermissionCheckHandler(handler) {
-      this.checkHandler = handler;
-    },
+/** A session that keeps the handlers the policy installs. */
+class FakePermissionSession implements PermissionSession {
+  requestHandler: PermissionRequestHandler = () => {
+    throw new Error("no request handler");
   };
+  checkHandler: PermissionCheckHandler = () => {
+    throw new Error("no check handler");
+  };
+  setPermissionRequestHandler(handler: PermissionRequestHandler) {
+    this.requestHandler = handler;
+  }
+  setPermissionCheckHandler(handler: PermissionCheckHandler) {
+    this.checkHandler = handler;
+  }
+}
+
+function permissionSession() {
+  return new FakePermissionSession();
+}
+
+class FakeWebContents extends EventEmitter {
+  reloads = 0;
+  destroyed = false;
+  currentUrl: string;
+  constructor(url: string) {
+    super();
+    this.currentUrl = url;
+  }
+  isDestroyed() {
+    return this.destroyed;
+  }
+  getURL() {
+    return this.currentUrl;
+  }
+  reload() {
+    this.reloads++;
+    this.emit("did-start-navigation", {}, this.currentUrl, false, true);
+  }
+}
+
+interface HarnessOptions {
+  url?: string;
+  visible?: boolean;
+  saved?: { store: BrowserPermissionStore; writes?: Record<string, unknown>[] };
+  session?: FakePermissionSession;
 }
 
 function harness({
@@ -48,26 +89,22 @@ function harness({
   visible = true,
   saved = storage(),
   session = permissionSession(),
-} = {}) {
-  let currentUrl = url;
+}: HarnessOptions = {}) {
   let isVisible = visible;
-  let destroyed = false;
-  const dialogs = [];
-  const responses = [];
-  const wc = new EventEmitter();
-  wc.isDestroyed = () => destroyed;
-  wc.getURL = () => currentUrl;
-  wc.reloads = 0;
-  wc.reload = () => {
-    wc.reloads++;
-    wc.emit("did-start-navigation", {}, currentUrl, false, true);
+  const dialogs: PermissionPromptRequest[] = [];
+  const responses: { resolve: (choice: string) => void; reject: (error: Error) => void }[] = [];
+  const wc = new FakeWebContents(url);
+  const nextResponse = () => {
+    const response = responses.shift();
+    assert.ok(response, "no pending prompt");
+    return response;
   };
   const policy = registerBrowserPermissions(session, {
     canPrompt: () => isVisible,
     store: saved.store,
     showPrompt: (options) => {
       dialogs.push(options);
-      return new Promise((resolve, reject) => {
+      return new Promise<string>((resolve, reject) => {
         options.signal.addEventListener("abort", () => resolve("dismiss"), { once: true });
         responses.push({ resolve, reject });
       });
@@ -78,34 +115,44 @@ function harness({
     wc,
     policy,
     dialogs,
-    saved,
-    respond: (choice) => responses.shift().resolve(choice),
-    fail: () => responses.shift().reject(new Error("Window closed")),
-    check: (permission = "loopback-network", origin = ORIGIN, details = {}, sender = wc) =>
-      session.checkHandler(sender, permission, origin, { isMainFrame: true, ...details }),
-    request: (permission = "loopback-network", details = {}, sender = wc) =>
-      new Promise((resolve) => {
+    saved: { writes: [], ...saved },
+    respond: (choice: string) => nextResponse().resolve(choice),
+    fail: () => nextResponse().reject(new Error("Window closed")),
+    check: (
+      permission = "loopback-network",
+      origin = ORIGIN,
+      details: PermissionDetails = {},
+      sender: unknown = wc,
+    ) => session.checkHandler(sender, permission, origin, { isMainFrame: true, ...details }),
+    request: (
+      permission = "loopback-network",
+      details: PermissionDetails = {},
+      sender: unknown = wc,
+    ) =>
+      new Promise<boolean>((resolve) => {
         session.requestHandler(sender, permission, resolve, {
-          requestingUrl: currentUrl,
+          requestingUrl: wc.currentUrl,
           isMainFrame: true,
           ...details,
         });
       }),
-    setVisible: (value) => (isVisible = value),
-    navigate(next = currentUrl) {
+    setVisible: (value: boolean) => (isVisible = value),
+    navigate(next = wc.currentUrl) {
       wc.emit("did-start-navigation", {}, next, false, true);
-      currentUrl = next;
+      wc.currentUrl = next;
       wc.emit("did-navigate", {}, next);
     },
     crash() {
       wc.emit("render-process-gone", {}, { reason: "crashed" });
     },
     destroy() {
-      destroyed = true;
+      wc.destroyed = true;
       wc.emit("destroyed");
     },
   };
 }
+
+type Harness = ReturnType<typeof harness>;
 
 describe("browser local network permissions", () => {
   it("rejects reattaching a policy without disrupting the original tab", async () => {
@@ -220,6 +267,7 @@ describe("browser local network permissions", () => {
       await tick();
       assert.equal(h.dialogs.length, 1);
       const dialog = h.dialogs[0];
+      assert.ok(dialog);
       assert.equal(dialog.origin, ORIGIN);
       assert.equal(dialog.reload, false);
       assert.equal(dialog.signal.aborted, false);
@@ -236,7 +284,7 @@ describe("browser local network permissions", () => {
     for (const name of NETWORK_PERMISSIONS) assert.equal(h.check(name), false);
     await tick();
     assert.equal(h.dialogs.length, 1, "coalesce query aliases into one dialog");
-    assert.equal(h.dialogs[0].reload, true);
+    assert.equal(h.dialogs[0]?.reload, true);
     assert.equal(h.wc.reloads, 0);
     h.respond("allow-once");
     await tick();
@@ -363,13 +411,13 @@ describe("browser local network permissions", () => {
   });
 
   for (const invalidate of [
-    (h) => h.navigate(),
-    (h) => {
+    (h: Harness) => h.navigate(),
+    (h: Harness) => {
       h.navigate("https://other.example");
       h.navigate(`${ORIGIN}/signin`);
     },
-    (h) => h.destroy(),
-    (h) => h.setVisible(false),
+    (h: Harness) => h.destroy(),
+    (h: Harness) => h.setVisible(false),
   ]) {
     it("discards approval after navigation, teardown, or hiding the requesting pane", async () => {
       const h = harness();
@@ -436,8 +484,8 @@ describe("browser local network permissions", () => {
     a.destroy();
     const reopened = harness({ saved: { store: saved.reopen() } });
     assert.equal(reopened.check(), true);
-    assert.equal(saved.writes[0].server_url, "https://server.example");
-    assert.deepEqual(saved.writes[0].browser_local_network_permissions, { [ORIGIN]: true });
+    assert.equal(saved.writes[0]?.server_url, "https://server.example");
+    assert.deepEqual(saved.writes[0]?.browser_local_network_permissions, { [ORIGIN]: true });
     b.navigate("https://different.example");
     b.setVisible(false);
     assert.equal(b.check("local-network", "https://different.example"), false);
@@ -479,7 +527,7 @@ describe("browser local network permissions", () => {
       stale.respond("allow-once");
       assert.equal(await staleResult, false, "the stale prompt must be invalidated");
       assert.equal(saved.writes.length, 1, "Allow once must not rewrite persistent settings");
-      assert.deepEqual(saved.writes[0].browser_local_network_permissions, {
+      assert.deepEqual(saved.writes[0]?.browser_local_network_permissions, {
         [ORIGIN]: savedChoice === "always-allow",
       });
 
@@ -557,7 +605,7 @@ describe("browser local network permissions", () => {
 
     h.crash();
     assert.equal(h.wc.isDestroyed(), false, "Electron can retain WebContents after a crash");
-    assert.equal(h.dialogs[0].signal.aborted, true);
+    assert.equal(h.dialogs[0]?.signal.aborted, true);
     h.respond("always-allow");
 
     assert.equal(await result, false);
@@ -568,12 +616,12 @@ describe("browser local network permissions", () => {
 
   it("aborts the prompt as soon as its document navigates or is destroyed", async () => {
     await Promise.all(
-      [(h) => h.navigate(), (h) => h.destroy()].map(async (invalidate) => {
+      [(h: Harness) => h.navigate(), (h: Harness) => h.destroy()].map(async (invalidate) => {
         const h = harness();
         const result = h.request();
         await tick();
         invalidate(h);
-        assert.equal(h.dialogs[0].signal.aborted, true);
+        assert.equal(h.dialogs[0]?.signal.aborted, true);
         assert.equal(await result, false);
         assert.equal(h.saved.writes.length, 0);
       }),

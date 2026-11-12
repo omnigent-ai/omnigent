@@ -384,10 +384,10 @@ electron/
   src/about_preload.js     # narrow contextBridge for the About modal
   src/managed_preferences.js # read/validate macOS MDM server choices
   src/find_preload.js      # contextBridge for the find bar: window.omnigentFind
-  src/browserViewRegistry.js  # per-conversation WebContentsView registry (browser pane)
-  src/browserViewBounds.js    # CSS-px → window-DIP bounds conversion (browser pane)
+  src/browserViewRegistry.ts  # per-conversation WebContentsView registry (browser pane)
+  src/browserViewBounds.ts    # CSS-px → window-DIP bounds conversion (browser pane)
   src/browserIpc.js           # omnigent:browser-* IPC handlers (extracted from main.js)
-  src/chromeCookieStore.js    # per-site Chrome cookie import for the browser pane
+  src/chromeCookieStore.ts    # per-site Chrome cookie import for the browser pane
   src/loopback-oauth.js       # RFC 8252 loopback listener shared by browser sign-ins
   src/oidc-credentials.js     # OIDC loopback sign-in, refresh, and revoke
   src/oidc-auth.js            # OIDC window session lifecycle (cookie, renewal, sign-out)
@@ -631,7 +631,7 @@ including the address bar, chat links, and agent actions, enforces this policy.
 
 **Pieces:**
 
-- `src/browserViewRegistry.js` — a per-**conversation** `Map` of
+- `src/browserViewRegistry.ts` — a per-**conversation** `Map` of
   `WebContentsView`s (cap 10). `setActive` attaches one view to the host window
   and **detaches (does not destroy)** the previous one, so a background
   conversation's page keeps running when the user switches away; views are
@@ -689,7 +689,7 @@ including the address bar, chat links, and agent actions, enforces this policy.
   successful local destination DNS for every named host,
   so proxy-only DNS configurations are not supported. Classification conservatively excludes all of `2001::/23`,
   including the global exceptions recognized by the Python policy.
-- `src/browserViewBounds.js` — converts the placeholder's renderer CSS pixels to
+- `src/browserViewBounds.ts` — converts the placeholder's renderer CSS pixels to
   window device-independent pixels (they diverge after `Cmd+/Cmd-` zoom).
 - `src/main.js` — instantiates one registry **per shell window** and injects it
   (plus the `isPinnedOriginSender` trust gate) into `registerBrowserIpc(...)`.
@@ -708,7 +708,7 @@ including the address bar, chat links, and agent actions, enforces this policy.
   listeners that push `browser-url-changed` + `browser-nav-state` to the renderer
   so the toolbar's URL bar live-tracks the real URL (redirects, in-page link
   clicks, agent navigation) instead of going stale.
-- `src/chromeCookieStore.js` — reads the current site's cookies out of a local
+- `src/chromeCookieStore.ts` — reads the current site's cookies out of a local
   Chrome profile for the toolbar's **Import cookies from Chrome** action (below).
   Electron-free, so it is unit-tested with a stub session and a synthetic
   `Cookies` DB.

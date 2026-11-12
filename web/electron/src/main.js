@@ -51,8 +51,8 @@ const { isLoopbackPreviewUrl } = require("./browserUrlPolicy.ts");
 const {
   registerBrowserPermissions,
   createBrowserPermissionStore,
-} = require("./browserPermissions");
-const { createBrowserPermissionPrompt } = require("./browserPermissionPrompt");
+} = require("./browserPermissions.ts");
+const { createBrowserPermissionPrompt } = require("./browserPermissionPrompt.ts");
 const {
   normalizeUrl,
   normalizeRecentServers,
@@ -84,9 +84,9 @@ const { createReturnBanner } = require("./return_banner.ts");
 const { createReconnectOverlay } = require("./reconnect_overlay.ts");
 const { createBrowserViewRegistry } = withTestOverrides(
   "browserViewRegistry",
-  require("./browserViewRegistry"),
+  require("./browserViewRegistry.ts"),
 );
-const { createBrowserViewBoundsController } = require("./browserViewBounds");
+const { createBrowserViewBoundsController } = require("./browserViewBounds.ts");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity");

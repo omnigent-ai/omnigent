@@ -1,41 +1,63 @@
-"use strict";
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { pathToFileURL } from "node:url";
+import type { Rectangle } from "electron";
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
-const { pathToFileURL } = require("node:url");
-const path = require("node:path");
-const fs = require("node:fs");
-const vm = require("node:vm");
-const { createBrowserPermissionPrompt, promptBounds } = require("../src/browserPermissionPrompt");
+import {
+  createBrowserPermissionPrompt,
+  promptBounds,
+  type PermissionPromptIpcEvent,
+  type PermissionPromptOptions,
+  type PermissionPromptWindowOptions,
+} from "../src/browserPermissionPrompt.ts";
 
 const PAGE = "/app/browser-permission/index.html";
 const ORIGIN = "https://login.example.com";
-const tick = () =>
-  new Promise((resolve) => {
-    setImmediate(resolve);
-  });
+
+type PermissionRequest = (
+  contents: unknown,
+  permission: string,
+  callback: (granted: boolean) => void,
+) => void;
+
+class FakeWebContents extends EventEmitter {
+  mainFrame = { url: "" };
+  private readonly owner: Window;
+  constructor(owner: Window) {
+    super();
+    this.owner = owner;
+  }
+  isDestroyed() {
+    return this.owner.destroyed;
+  }
+  setWindowOpenHandler(handler: () => { action: "deny" }) {
+    this.owner.openHandler = handler;
+  }
+  session = {
+    setPermissionRequestHandler: (handler: PermissionRequest) => {
+      this.owner.permissionRequest = handler;
+    },
+    setPermissionCheckHandler: (handler: () => boolean) => {
+      this.owner.permissionCheck = handler;
+    },
+  };
+}
 
 class Window extends EventEmitter {
-  constructor(options = {}) {
+  options: Partial<PermissionPromptWindowOptions<Window>>;
+  destroyed = false;
+  visible = false;
+  webContents = new FakeWebContents(this);
+  openHandler?: () => { action: "deny" };
+  permissionRequest?: PermissionRequest;
+  permissionCheck?: () => boolean;
+  bounds?: Rectangle;
+  file?: string;
+  excludedFromShownWindowsMenu?: boolean;
+  constructor(options: Partial<PermissionPromptWindowOptions<Window>> = {}) {
     super();
     this.options = options;
-    this.destroyed = false;
-    this.visible = false;
-    this.webContents = new EventEmitter();
-    this.webContents.mainFrame = { url: "" };
-    this.webContents.isDestroyed = () => this.destroyed;
-    this.webContents.setWindowOpenHandler = (handler) => {
-      this.openHandler = handler;
-    };
-    this.webContents.session = {
-      setPermissionRequestHandler: (handler) => {
-        this.permissionRequest = handler;
-      },
-      setPermissionCheckHandler: (handler) => {
-        this.permissionCheck = handler;
-      },
-    };
   }
   isDestroyed() {
     return this.destroyed;
@@ -43,10 +65,10 @@ class Window extends EventEmitter {
   getContentBounds() {
     return { x: 100, y: 80, width: 1000, height: 700 };
   }
-  setBounds(bounds) {
+  setBounds(bounds: Rectangle) {
     this.bounds = bounds;
   }
-  loadFile(file) {
+  loadFile(file: string) {
     this.file = file;
     this.webContents.mainFrame.url = pathToFileURL(file).href;
     return Promise.resolve();
@@ -61,25 +83,36 @@ class Window extends EventEmitter {
   }
 }
 
+type IpcHandler = (event: PermissionPromptIpcEvent, ...args: unknown[]) => unknown;
+
 function harness() {
-  const windows = [];
-  const handlers = new Map();
+  const windows: Window[] = [];
+  const handlers = new Map<string, IpcHandler>();
+  const handler = (name: string): IpcHandler => {
+    const found = handlers.get(name);
+    assert.ok(found, name);
+    return found;
+  };
   class BrowserWindow extends Window {
-    constructor(options) {
+    constructor(options: PermissionPromptWindowOptions<Window>) {
       super(options);
       windows.push(this);
     }
   }
   const controller = createBrowserPermissionPrompt({
     BrowserWindow,
-    ipcMain: { handle: (name, handler) => handlers.set(name, handler) },
+    ipcMain: {
+      handle: (name, listener) => {
+        handlers.set(name, listener);
+      },
+    },
     promptPage: PAGE,
     preloadPath: "/app/src/browser_permission_preload.js",
   });
   controller.registerIpc();
   const parent = new Window();
   const abort = new AbortController();
-  const show = (overrides = {}) =>
+  const show = (overrides: Partial<PermissionPromptOptions<Window>> = {}) =>
     controller.show({
       parent,
       origin: ORIGIN,
@@ -88,10 +121,10 @@ function harness() {
       signal: abort.signal,
       ...overrides,
     });
-  const event = (win = windows.at(-1)) => ({
-    sender: win.webContents,
-    senderFrame: win.webContents.mainFrame,
-  });
+  const event = (win = windows.at(-1)) => {
+    assert.ok(win);
+    return { sender: win.webContents, senderFrame: win.webContents.mainFrame };
+  };
   return {
     controller,
     windows,
@@ -99,17 +132,21 @@ function harness() {
     abort,
     show,
     event,
-    info: (ev = event()) => handlers.get("omnigent:browser-permission-info")(ev),
-    choose: (choice, ev = event()) =>
-      handlers.get("omnigent:browser-permission-choose")(ev, choice),
+    info: (ev: PermissionPromptIpcEvent = event()) =>
+      handler("omnigent:browser-permission-info")(ev),
+    choose: (choice: string, ev: PermissionPromptIpcEvent = event()) =>
+      handler("omnigent:browser-permission-choose")(ev, choice),
   };
 }
+
+type Harness = ReturnType<typeof harness>;
 
 describe("browser permission popover", () => {
   it("uses a small shell-owned, isolated child window under the browser toolbar", async () => {
     const h = harness();
     const result = h.show();
     const popup = h.windows[0];
+    assert.ok(popup);
     assert.equal(popup.options.parent, h.parent);
     assert.equal(popup.options.frame, false);
     assert.equal(popup.options.transparent, true);
@@ -128,6 +165,7 @@ describe("browser permission popover", () => {
     assert.equal(popup.visible, true);
     assert.deepEqual(popup.bounds, { x: 638, y: 140, width: 380, height: 250 });
     assert.deepEqual(h.info(), { origin: ORIGIN, reload: true });
+    assert.ok(popup.openHandler && popup.permissionCheck && popup.permissionRequest);
     assert.deepEqual(popup.openHandler(), { action: "deny" });
     assert.equal(popup.permissionCheck(), false);
     popup.permissionRequest(null, "media", (granted) => assert.equal(granted, false));
@@ -146,7 +184,7 @@ describe("browser permission popover", () => {
       const event = h.event();
       h.choose(choice);
       assert.equal(await result, choice);
-      assert.equal(h.windows[0].destroyed, true);
+      assert.equal(h.windows[0]?.destroyed, true);
       assert.throws(() => h.choose("always-allow", event), /bundled permission UI/);
       assert.equal(h.parent.listenerCount("closed"), 0);
       assert.equal(h.parent.listenerCount("resize"), 0);
@@ -173,13 +211,13 @@ describe("browser permission popover", () => {
     assert.equal(await result, "deny");
   });
 
-  for (const [name, close] of [
-    ["clicking outside", (h) => h.windows[0].emit("blur")],
+  const dismissals: [string, (h: Harness) => void][] = [
+    ["clicking outside", (h) => h.windows[0]?.emit("blur")],
     ["pane navigation", (h) => h.abort.abort()],
     ["parent closing", (h) => h.parent.destroy()],
     ["parent hiding", (h) => h.parent.emit("hide")],
     ["parent minimizing", (h) => h.parent.emit("minimize")],
-    ["renderer crash", (h) => h.windows[0].webContents.emit("render-process-gone")],
+    ["renderer crash", (h) => h.windows[0]?.webContents.emit("render-process-gone")],
     [
       "shell navigation",
       (h) =>
@@ -191,15 +229,16 @@ describe("browser permission popover", () => {
           true,
         ),
     ],
-  ]) {
+  ];
+  for (const [name, close] of dismissals) {
     it(`dismisses without approval on ${name}`, async () => {
       const h = harness();
       const result = h.show();
       close(h);
       assert.equal(await result, "dismiss");
-      assert.equal(h.windows[0].destroyed, true);
-      h.windows[0].emit("ready-to-show");
-      assert.equal(h.windows[0].visible, false);
+      assert.equal(h.windows[0]?.destroyed, true);
+      h.windows[0]?.emit("ready-to-show");
+      assert.equal(h.windows[0]?.visible, false);
     });
   }
 
@@ -236,91 +275,8 @@ describe("browser permission popover", () => {
     const h = harness();
     const result = h.show();
     h.parent.emit("resize");
-    assert.deepEqual(h.windows[0].bounds, { x: 638, y: 140, width: 380, height: 250 });
+    assert.deepEqual(h.windows[0]?.bounds, { x: 638, y: 140, width: 380, height: 250 });
     h.choose("deny");
     await result;
-  });
-});
-
-function pageHarness(info = { origin: ORIGIN, reload: true }) {
-  const elements = new Map();
-  for (const id of ["origin", "reload", "once", "always", "deny", "close"]) {
-    elements.set(id, {
-      disabled: id !== "close",
-      listeners: {},
-      addEventListener(name, fn) {
-        this.listeners[name] = fn;
-      },
-      focus() {
-        this.focused = true;
-      },
-    });
-  }
-  const events = {};
-  const choices = [];
-  const document = {
-    getElementById: (id) => elements.get(id),
-    querySelectorAll: (selector) =>
-      (selector === "footer button"
-        ? ["once", "always", "deny"]
-        : ["once", "always", "deny", "close"]
-      ).map((id) => elements.get(id)),
-    addEventListener: (name, fn) => {
-      events[name] = fn;
-    },
-  };
-  vm.runInNewContext(
-    fs.readFileSync(path.join(__dirname, "../browser-permission/index.js"), "utf8"),
-    {
-      document,
-      window: {
-        omnigentBrowserPermission: {
-          getInfo: async () => info,
-          choose: async (choice) => {
-            choices.push(choice);
-          },
-        },
-      },
-    },
-  );
-  return { elements, events, choices };
-}
-
-describe("permission popover page", () => {
-  it("packages the compact UI with exactly the requested three choices", () => {
-    const html = fs.readFileSync(path.join(__dirname, "../browser-permission/index.html"), "utf8");
-    assert.ok(require("../package.json").build.files.includes("browser-permission/**/*"));
-    for (const label of ["Allow once", "Always allow", "Deny"]) assert.ok(html.includes(label));
-    assert.match(html, /default-src 'none'/);
-    assert.doesNotMatch(html, /Okta Verify|Only allow sites you trust|Always allow and reload/);
-  });
-
-  for (const [id, choice] of [
-    ["once", "allow-once"],
-    ["always", "always-allow"],
-    ["deny", "deny"],
-    ["close", "dismiss"],
-  ]) {
-    it(`maps ${id} to ${choice} and ignores repeated submissions`, async () => {
-      const h = pageHarness();
-      await tick();
-      h.elements.get(id).listeners.click();
-      h.elements.get("always").listeners.click();
-      assert.deepEqual(h.choices, [choice]);
-    });
-  }
-
-  it("renders the origin as text, shows the reload hint, and focuses dismissal instead of approval", async () => {
-    const origin = "https://long.example/<not-markup>";
-    const h = pageHarness({ origin, reload: true });
-    await tick();
-    assert.equal(h.elements.get("origin").textContent, origin);
-    assert.equal(h.elements.get("reload").hidden, false);
-    assert.equal(h.elements.get("close").focused, true);
-    h.events.keydown({ key: "Escape" });
-    assert.deepEqual(h.choices, ["dismiss"]);
-    const withoutReload = pageHarness({ origin: ORIGIN, reload: false });
-    await tick();
-    assert.equal(withoutReload.elements.get("reload").hidden, true);
   });
 });

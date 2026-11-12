@@ -2,7 +2,7 @@ const assert = require("node:assert/strict");
 const { describe, it } = require("node:test");
 const { JSDOM, VirtualConsole } = require("jsdom");
 
-const { buildDesignModeScript } = require("../src/designModeScript");
+const { buildDesignModeScript } = require("../src/designModeScript.ts");
 
 const NONCE = "dialog-picker-test";
 const FIELDS = `<label for="period">Period</label><input id="period" value="W41">

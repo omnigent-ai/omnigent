@@ -7,8 +7,8 @@ const os = require("node:os");
 const path = require("node:path");
 const { it } = require("node:test");
 
-const { buildDesignModeScript } = require("../src/designModeScript");
-const { buildBrowserActionScript } = require("../src/browserActionScript.mjs");
+const { buildDesignModeScript } = require("../src/designModeScript.ts");
+const { buildBrowserActionScript } = require("../src/browserActionScript.ts");
 
 const SRC_DIR = path.join(__dirname, "..", "src");
 
@@ -25,8 +25,8 @@ it("bundled injected-script builders emit the same scripts as source", async (t)
   fs.writeFileSync(
     entry,
     [
-      `const { buildDesignModeScript } = require(${JSON.stringify(path.join(SRC_DIR, "designModeScript.js"))});`,
-      `const { buildBrowserActionScript } = require(${JSON.stringify(path.join(SRC_DIR, "browserActionScript.mjs"))});`,
+      `const { buildDesignModeScript } = require(${JSON.stringify(path.join(SRC_DIR, "designModeScript.ts"))});`,
+      `const { buildBrowserActionScript } = require(${JSON.stringify(path.join(SRC_DIR, "browserActionScript.ts"))});`,
       "module.exports = { buildDesignModeScript, buildBrowserActionScript };",
     ].join("\n"),
   );

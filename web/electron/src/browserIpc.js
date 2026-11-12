@@ -8,10 +8,10 @@
 "use strict";
 
 const crypto = require("node:crypto");
-const { buildBrowserActionScript } = require("./browserActionScript.mjs");
-const chromeCookieStoreModule = require("./chromeCookieStore");
-const { decodeLegacyBrowserAction } = require("./browserLegacyAction");
-const { buildDesignModeScript } = require("./designModeScript");
+const { buildBrowserActionScript } = require("./browserActionScript.ts");
+const chromeCookieStoreModule = require("./chromeCookieStore.ts");
+const { decodeLegacyBrowserAction } = require("./browserLegacyAction.ts");
+const { buildDesignModeScript } = require("./designModeScript.ts");
 
 const { SESSION_HOST_PROTOCOL } = require("./hostIdentity");
 
@@ -345,7 +345,7 @@ function makeDesignModeInputHandler(gestureState) {
  * @param {(event: Electron.IpcMainInvokeEvent) => boolean} deps.isPinnedOriginSender
  *        The privileged-origin trust gate. Load-bearing — applied to every handler.
  * @param {(event: Electron.IpcMainInvokeEvent) =>
- *          (import('./browserViewRegistry').Registry | null)} deps.getRegistryForEvent
+ *          (import('./browserViewRegistry.ts').Registry | null)} deps.getRegistryForEvent
  *        Resolves the sender window's own browser-view registry.
  * @param {(event: Electron.IpcMainInvokeEvent) => (object | null)} [deps.getWindowForEvent]
  *        The shell window that owns the sender, used to parent native dialogs.

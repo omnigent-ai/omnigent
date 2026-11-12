@@ -459,7 +459,7 @@ function loadNavigationHarness({
       isLocalhostUrl: require("../src/localhost_cors.ts").isLocalhostUrl,
       registerLocalhostCors: () => {},
     },
-    "./browserPermissionPrompt": {
+    "./browserPermissionPrompt.ts": {
       createBrowserPermissionPrompt: () => ({
         show: async (options) => {
           permissionPromptCalls.show.push(options);
@@ -624,8 +624,8 @@ function loadNavigationHarness({
         };
       },
     },
-    "./browserViewRegistry": realBrowserRegistry
-      ? require("../src/browserViewRegistry")
+    "./browserViewRegistry.ts": realBrowserRegistry
+      ? require("../src/browserViewRegistry.ts")
       : {
           createBrowserViewRegistry: (deps) => {
             browserRegistryDeps = deps;
@@ -639,8 +639,8 @@ function loadNavigationHarness({
             };
           },
         },
-    "./browserViewBounds": realBrowserRegistry
-      ? require("../src/browserViewBounds")
+    "./browserViewBounds.ts": realBrowserRegistry
+      ? require("../src/browserViewBounds.ts")
       : {
           createBrowserViewBoundsController: () => ({ attach: () => {}, detach: () => {} }),
         },

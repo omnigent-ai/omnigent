@@ -9,7 +9,7 @@
  *  desktop build that predates the `browser*` bridge is treated as unsupported,
  *  so the relay never claims an action it couldn't fulfill. */
 import { useEffect } from "react";
-import { buildBrowserActionScript } from "../../electron/src/browserActionScript.mjs";
+import { buildBrowserActionScript } from "../../electron/src/browserActionScript.ts";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import {

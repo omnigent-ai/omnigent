@@ -1,12 +1,12 @@
 /** Safely interpolate a string into a browser action JS payload — always
  *  `JSON.stringify` (handles the full escape table); never hand-roll. */
-function jsString(s) {
+function jsString(s: string): string {
   return JSON.stringify(s);
 }
 
 /** Same for numbers — stringify at the interpolation site so a caller that
  *  skips the shape guard still emits a valid in-page literal. */
-function jsNumber(n) {
+function jsNumber(n: number): string {
   return JSON.stringify(n);
 }
 
@@ -134,7 +134,7 @@ const SNAPSHOT_JS = `(() => {
  *  matches `window.__omni_snapshot_id__` BEFORE looking up the ref — gives the
  *  agent a precise "snapshot superseded" error instead of a generic "ref is
  *  stale". */
-function findElJs(args) {
+function findElJs(args: Record<string, unknown>): string {
   const ref = typeof args.ref === "number" ? args.ref : undefined;
   const snapshotId = typeof args.snapshot_id === "string" ? args.snapshot_id : undefined;
   const selector = typeof args.selector === "string" ? args.selector : "";
@@ -158,50 +158,50 @@ function findElJs(args) {
   );
 }
 
-export function buildBrowserActionScript(action, args = {}) {
+const ACTIONS: readonly unknown[] = ["snapshot", "click", "type"];
+
+/** In-page JS for one browser action. `action` and `args` are relay input, validated here. */
+export function buildBrowserActionScript(action: unknown, args: unknown = {}): string {
   if (!args || typeof args !== "object" || Array.isArray(args)) {
     throw new Error("Browser action arguments must be an object");
   }
-  if (!["snapshot", "click", "type"].includes(action)) {
+  if (!ACTIONS.includes(action)) {
     throw new Error("Unsupported browser action");
   }
-  const allowed = action === "snapshot" ? [] : ["ref", "snapshot_id", "selector"];
+  const allowed: string[] = action === "snapshot" ? [] : ["ref", "snapshot_id", "selector"];
   if (action === "type") allowed.push("text");
   if (Object.keys(args).some((key) => !allowed.includes(key))) {
     throw new Error("Unsupported browser action argument");
   }
   if (action === "snapshot") return SNAPSHOT_JS;
-  if (args.ref !== undefined && (!Number.isSafeInteger(args.ref) || args.ref <= 0)) {
+  const fields = args as Record<string, unknown>;
+  const { ref, selector, snapshot_id: snapshotId } = fields;
+  if (ref !== undefined && (typeof ref !== "number" || !Number.isSafeInteger(ref) || ref <= 0)) {
     throw new Error("ref must be a positive integer");
   }
-  if (args.ref === undefined && (typeof args.selector !== "string" || !args.selector)) {
+  if (ref === undefined && (typeof selector !== "string" || !selector)) {
     throw new Error("A ref or selector is required");
   }
-  if (
-    args.selector !== undefined &&
-    (typeof args.selector !== "string" || args.selector.length > 4096)
-  ) {
+  if (selector !== undefined && (typeof selector !== "string" || selector.length > 4096)) {
     throw new Error("selector must be a string of at most 4096 characters");
   }
-  if (
-    args.snapshot_id !== undefined &&
-    (typeof args.snapshot_id !== "string" || args.snapshot_id.length > 128)
-  ) {
+  if (snapshotId !== undefined && (typeof snapshotId !== "string" || snapshotId.length > 128)) {
     throw new Error("snapshot_id must be a string of at most 128 characters");
-  }
-  if (action === "type" && (typeof args.text !== "string" || args.text.length > 100000)) {
-    throw new Error("text must be a string of at most 100000 characters");
   }
   if (action === "click") {
     return (
-      `(() => { ${findElJs(args)} ` +
+      `(() => { ${findElJs(fields)} ` +
       `el.scrollIntoView({ block: 'center', inline: 'center' }); ` +
       `el.click(); return 'ok'; })()`
     );
   }
-  const text = args.text;
+  // Only "type" reaches here.
+  const text = fields.text;
+  if (typeof text !== "string" || text.length > 100000) {
+    throw new Error("text must be a string of at most 100000 characters");
+  }
   return (
-    `(() => { ${findElJs(args)} ` +
+    `(() => { ${findElJs(fields)} ` +
     `el.focus(); ` +
     `const setter = Object.getOwnPropertyDescriptor(el.constructor.prototype, 'value')?.set; ` +
     `if (setter) setter.call(el, ${jsString(text)}); else el.value = ${jsString(text)}; ` +
