@@ -80,7 +80,6 @@ def test_plan_keeps_its_name_and_graph_and_defaults_dependencies() -> None:
     assert payload == {
         "name": "Cut GET /orders p95 by 20%",
         "source": "agent",
-        "workflow": None,
         "steps": [
             {"id": "baseline", "name": "Baseline", "goal": None, "depends_on": []},
             {"id": "profile", "name": "Profile", "goal": None, "depends_on": ["baseline"]},

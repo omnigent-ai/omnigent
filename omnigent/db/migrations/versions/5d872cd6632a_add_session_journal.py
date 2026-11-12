@@ -15,12 +15,12 @@ and every index ends with ``position, created_at``. Keeping ``created_at`` in
 the primary key, with no unique key that leaves it out, lets a deployment
 partition the table by time with pure DDL. So the heads lock, not the
 database, keeps positions and idempotency keys unique, as the conversation
-lock does for conversation items. The payload is an envelope private to the
-journal store; a CHECK caps it at 16,383 stored bytes. ``kind`` has no CHECK,
-so adding a kind needs no migration. The tables have no database defaults:
-writes name the workspace. ``workflow_id`` is nullable and unindexed, and
-nothing writes it yet; it ships with the table so the phase that gives
-workflows IDs needs no migration.
+lock does for conversation items. The payload is the entry's compressed
+JSON, which the journal store keeps under 16,384 stored bytes. ``kind`` has
+no CHECK, so adding a kind needs no migration. The tables have no database
+defaults: writes name the workspace. ``workflow_id`` is nullable and
+unindexed, and nothing writes it yet; it ships with the table so the phase
+that gives workflows IDs needs no migration.
 
 Deployment: apply this migration before a server that uses the tables.
 Servers that migrate at startup do so on their own. Processes already running
@@ -45,9 +45,6 @@ revision: str = "5d872cd6632a"
 down_revision: str | None = "a7d4c2e9f610"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
-
-# Mirrors omnigent.db.db_models.JOURNAL_PAYLOAD_MAX_STORED_BYTES at this revision.
-_PAYLOAD_MAX_STORED_BYTES = 16_383
 
 _ENTRIES = "session_journal_entries"
 _HEADS = "session_journal_heads"
@@ -87,10 +84,6 @@ def upgrade() -> None:
         sa.Column("idempotency_key", sa.String(128), nullable=False),
         sa.Column("payload", sa.LargeBinary(), nullable=False),
         sa.PrimaryKeyConstraint("workspace_id", "conversation_id", "position", "created_at"),
-        sa.CheckConstraint(
-            f"length(payload) <= {_PAYLOAD_MAX_STORED_BYTES}",
-            name="ck_session_journal_entries_payload_size",
-        ),
     )
     for name, columns in _INDEXES.items():
         op.create_index(name, _ENTRIES, [*columns, "position", "created_at"])

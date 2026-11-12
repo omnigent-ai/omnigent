@@ -406,7 +406,9 @@ def test_a_fork_carries_the_plan_and_its_agent_reads_it(
         _open_tasks_tab(page)
         expect(page.get_by_test_id("tasks-plan-name")).to_have_text(_PLAN_NAME, timeout=30_000)
         expect(_row(page, "Deploy the swap")).to_have_attribute("data-state", "done")
-        expect(_row(page, "Verify routing")).to_contain_text("Check the traffic-id header")
+        expect(_row(page, "Verify routing")).to_have_attribute("data-state", "ready")
+        # The copied note is the agent's, so the tab shows the task without it.
+        expect(_row(page, "Verify routing")).not_to_contain_text("Check the traffic-id header")
         # The parent's journal is its own: the fork's turn added nothing to it.
         assert len(_journal(base_url, source_id)) == 4
     finally:

@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { type SessionJournalView, useSessionJournal } from "@/hooks/useSessionJournal";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { formatMessageTimestamp } from "@/lib/relativeTime";
 import type { JournalEntry } from "@/lib/sessionJournal";
 import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
@@ -478,42 +479,70 @@ describe("TasksPanel", () => {
     ).toEqual([expect.stringMatching(/^Started/), expect.stringMatching(/^Failed · Reverted/)]);
   });
 
-  it("shows a task's newest note under it, shortened until opened", () => {
-    const body = `## The pool didn't move p95\n${"Cold connects are the slowest requests. ".repeat(6)}**Next**: pre-warm it.`;
-    showJournal([journalPlan(0, ["pool"]), journalEntry(1, { step: "pool", payload: { body } })]);
+  it("shows when a finished task ended, stamped the way chat messages are", async () => {
+    const done = status(2, "build", "done");
+    const failed = status(4, "deploy", "failed", "Reverted");
+    const doneWithoutStart = status(5, "docs", "done");
+    showJournal([
+      journalPlan(0, ["build"], ["deploy", ["build"]], ["docs"]),
+      status(1, "build", "started"),
+      done,
+      status(3, "deploy", "started"),
+      failed,
+      doneWithoutStart,
+    ]);
     renderPanel();
-    const note = screen.getByTestId("tasks-note");
-    expect(within(note).getByText("The pool didn't move p95")).toBeTruthy();
-    expect(within(note).getByText("Next").tagName).toBe("STRONG");
-    const more = within(note).getByRole("button", { name: "Show more" });
-    fireEvent.click(more);
-    expect(more.textContent).toBe("Show less");
+    // ICU may put a narrow no-break space before AM/PM; queries collapse it.
+    const ended = (entry: JournalEntry) =>
+      formatMessageTimestamp(entry.created_at).replace(/\s/g, " ");
+    const [build, deploy, docs] = screen.getAllByTestId("tasks-row");
+    // The end time replaces how long the task ran, a minute here.
+    expect(within(build).getByText(ended(done)).tagName).toBe("TIME");
+    expect(within(build).queryByText("1m")).toBeNull();
+    expect(within(deploy).getByText(ended(failed))).toBeTruthy();
+    expect(within(docs).getByText(ended(doneWithoutStart))).toBeTruthy();
+    fireEvent.focus(screen.getAllByTestId("tasks-progress-segment")[0]);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(`Done · ${ended(done)}`);
   });
 
-  it("lists notes that aren't about one task, newest first, with no Runs section", () => {
+  it("leaves out the agent's notes, under a task, in its history and on their own", () => {
+    showJournal([
+      journalPlan(0, ["pool"]),
+      status(1, "pool", "started"),
+      journalEntry(2, { step: "pool", payload: { body: "Cold connects are the slowest" } }),
+      journalEntry(3, { payload: { body: "Measure first" } }),
+    ]);
+    renderPanel();
+    fireEvent.click(within(screen.getByTestId("tasks-row")).getByTestId("tasks-row-history"));
+    const history = screen.getByRole("list", { name: "pool history" });
+    expect(
+      within(history)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual([expect.stringMatching(/^Started/)]);
+    expect(screen.queryByText(/Cold connects|Measure first/)).toBeNull();
+    expect(screen.queryByRole("region", { name: "Notes" })).toBeNull();
+  });
+
+  it("has no tasks yet when the agent wrote only notes, and no Runs section", () => {
     showJournal([
       journalEntry(0, { payload: { body: "Measure first" } }),
       journalEntry(1, { scheduled_task_run_id: RUN, payload: { body: "Stopped at the try cap" } }),
     ]);
     renderPanel();
-    const notes = screen.getByRole("region", { name: "Notes" });
-    expect(
-      within(notes)
-        .getAllByTestId("tasks-note")
-        .map((note) => note.textContent),
-    ).toEqual(["Stopped at the try cap", "Measure first"]);
+    expect(screen.getByText("No tasks yet")).toBeTruthy();
+    expect(screen.queryByText(/Measure first|try cap/)).toBeNull();
     expect(screen.queryByRole("region", { name: "Runs" })).toBeNull();
   });
 
-  it("loads older entries on request, and names no workers", () => {
+  it("offers no older entries, and names no workers", () => {
     // Busy sub-agents show in the Agents tab; the Tasks tab lists only tasks.
     vi.mocked(useChildSessions).mockReturnValue({
       children: [{ id: "c1", busy: true, task_summary: "fix-3", title: "codex:fix-3" }],
     } as never);
-    const view = showJournal([journalEntry(5)], { hasOlder: true });
+    showJournal([journalPlan(0, ["a"])], { hasOlder: true });
     renderPanel();
     expect(screen.queryByText(/workers? running/)).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Show older notes" }));
-    expect(view.loadOlder).toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: /older/ })).toBeNull();
   });
 });
