@@ -48,6 +48,13 @@ async def test_waits_on_the_persisted_status_until_the_turn_ends():
     assert rows.count == 3
 
 
+async def test_an_unknown_status_keeps_waiting_for_the_turn():
+    # No relay status on this replica and none persisted yet.
+    rows = _Rows(_row(None), _row("idle"))
+    assert await orchestration._await_archived_turn_end(SESSION, rows) is True
+    assert rows.count == 2
+
+
 async def test_a_failed_read_keeps_waiting_for_the_turn():
     rows = _Rows(RuntimeError("database unavailable"), _row("running"), _row("idle"))
     assert await orchestration._await_archived_turn_end(SESSION, rows) is True

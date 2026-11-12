@@ -1104,7 +1104,10 @@ async def _await_archived_turn_end(session_id: str, conversation_store: Conversa
             # the flag (None) keeps waiting; _archive_stop re-reads it anyway.
             if row is None or row.archived is False:
                 return False
-            if _session_status_from_cache(session_id, row.live_status) != "running":
+            # No relay status here and none persisted says nothing about the
+            # turn (the first status write may have failed), so keep waiting.
+            known = session_id in _session_status_cache or row.live_status is not None
+            if known and _session_status_from_cache(session_id, row.live_status) != "running":
                 return True
         if loop.time() >= deadline:
             _logger.warning(
