@@ -83,9 +83,11 @@ export function nestedSessionSidebarKey(id: string): string {
 export function withNestedSessionDrafts(
   rows: readonly Conversation[],
   drafts: readonly NestedSessionDraft[],
+  unavailableIds: ReadonlySet<string> = new Set(),
 ): Conversation[] {
   const byId = new Map(rows.map((row) => [row.id, row]));
   for (const draft of drafts) {
+    if (unavailableIds.has(draft.id)) continue;
     const source = byId.get(draft.source.id) ?? draft.source;
     const family = source.family ?? {
       id: source.id,
@@ -93,7 +95,8 @@ export function withNestedSessionDrafts(
       pinned: source.labels?.[PINNED_LABEL_KEY] !== undefined,
       pinned_at: source.labels?.[PINNED_LABEL_KEY],
     };
-    byId.set(source.id, { ...source, family });
+    if (!unavailableIds.has(source.id)) byId.set(source.id, { ...source, family });
+    else if (!draft.created) continue;
     if (draft.id !== draft.key) byId.delete(draft.key);
     // Keep one row if the push arrives before the create response.
     if (!draft.created) {
@@ -112,12 +115,11 @@ export function withNestedSessionDrafts(
       created_at: existing?.created_at ?? draft.createdAt,
       // Opening the composer must not move the family above unrelated sessions.
       updated_at: existing?.updated_at ?? source.updated_at,
-      labels: {
-        ...(source.labels[PROJECT_LABEL_KEY]
+      labels: existing
+        ? existing.labels
+        : source.labels[PROJECT_LABEL_KEY]
           ? { [PROJECT_LABEL_KEY]: source.labels[PROJECT_LABEL_KEY] }
-          : {}),
-        ...existing?.labels,
-      },
+          : {},
       permission_level: existing ? existing.permission_level : source.permission_level,
       project_id: existing ? existing.project_id : source.project_id,
       family: existing?.family ?? family,

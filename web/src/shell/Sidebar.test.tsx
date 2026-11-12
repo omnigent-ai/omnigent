@@ -1750,7 +1750,7 @@ describe("Sidebar failed session indicator", () => {
       );
     };
     const result = render(tree());
-    return { ...result, queryClient: qc, refresh: () => result.rerender(tree()) };
+    return { ...result, refresh: () => result.rerender(tree()) };
   }
 
   it("keeps rows memoized across grid renames and updates changed members", async () => {
@@ -2099,12 +2099,13 @@ describe("Sidebar sections", () => {
       const members = [
         conv("conv_parent", "Claude Code", { family, labels }),
         conv("conv_peer", "Codex", { family, labels }),
+        ...(scope === "source-off-page" ? [conv("conv_other", "Codex", { family, labels })] : []),
       ];
       const load = (rows: Conversation[]) => {
         mockConversations(rows);
         if (scope === "pinned-shared") useConvMock.mockReturnValue(conversationPage([]));
       };
-      load(members);
+      load(members.filter((row) => scope !== "source-off-page" || row.id !== "conv_peer"));
       const { queryClient, refresh } = renderSidebar();
       if (scope === "pinned-shared") showSharedTab();
       if (scope === "project")
@@ -2120,11 +2121,17 @@ describe("Sidebar sections", () => {
         permissionLevel: null,
         family,
       } as Session;
+      if (scope === "source-off-page") {
+        const fetch = vi
+          .spyOn(identity, "authenticatedFetch")
+          .mockImplementation(async () => new Response(JSON.stringify(members[1])));
+        onTestFinished(() => fetch.mockRestore());
+      }
       act(() => addNestedSessionDraft(queryClient, "temp:nested", source));
       const placeholder = await screen.findByText("New nested agent");
       expect(placeholder.closest("li")).toHaveAttribute("data-sibling-session", "true");
       expect(placeholder.closest("a")).toHaveAttribute("href", `/?sibling=${source.id}`);
-      expect(screen.getByText("conv_peer")).toBeInTheDocument();
+      expect(await screen.findByText("conv_peer")).toBeInTheDocument();
       const rowNode = placeholder.closest("li");
       expect(rowNode).toHaveClass("ml-9");
       if (scope.endsWith("backfill")) {
@@ -2187,30 +2194,49 @@ describe("Sidebar sections", () => {
     },
   );
 
-  it("retires a created draft deleted before a list refresh", async () => {
-    const parent = conv("conv_parent", "Codex", {
-      family: { id: "family", representative_id: "conv_parent", pinned: false },
-    });
-    mockConversations([parent]);
-    const fetch = vi
-      .spyOn(identity, "authenticatedFetch")
-      .mockResolvedValue(new Response(null, { status: 404 }));
-    onTestFinished(() => fetch.mockRestore());
-    const { queryClient } = renderSidebar();
-    act(() =>
-      addNestedSessionDraft(queryClient, "temp:deleted", {
-        id: parent.id,
-        createdAt: 1,
-        labels: {},
-        family: parent.family,
-      } as Session),
-    );
-    await screen.findByText("New nested agent");
-    act(() => updateNestedSessionDraft(queryClient, "temp:deleted", "deleted"));
-    await waitFor(() => expect(queryClient.getQueryData(["nested-session-drafts"])).toEqual([]));
-    expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/v1/sessions/deleted?"));
-    expect(screen.queryByText("New nested agent")).toBeNull();
-  });
+  it.each(["deleted", "archived", "not-owned", "source-deleted"])(
+    "retires a draft confirmed %s before a list refresh",
+    async (reason) => {
+      const parent = conv("conv_parent", "Codex", {
+        family: { id: "family", representative_id: "conv_parent", pinned: false },
+      });
+      mockConversations([parent]);
+      const fetch = vi.spyOn(identity, "authenticatedFetch").mockImplementation(async () =>
+        reason === "deleted" || reason === "source-deleted"
+          ? new Response(null, { status: 404 })
+          : new Response(
+              JSON.stringify(
+                conv("deleted", "Codex", {
+                  family: parent.family,
+                  archived: reason === "archived",
+                  permission_level: reason === "not-owned" ? 1 : 4,
+                  owner: null,
+                }),
+              ),
+            ),
+      );
+      onTestFinished(() => fetch.mockRestore());
+      const { queryClient } = renderSidebar();
+      act(() =>
+        addNestedSessionDraft(queryClient, "temp:deleted", {
+          id: reason === "source-deleted" ? "missing-source" : parent.id,
+          createdAt: 1,
+          labels: {},
+          family: parent.family,
+        } as Session),
+      );
+      expect(queryClient.getQueryData(["nested-session-drafts"])).toHaveLength(1);
+      if (reason !== "source-deleted")
+        act(() => updateNestedSessionDraft(queryClient, "temp:deleted", "deleted"));
+      await waitFor(() => expect(queryClient.getQueryData(["nested-session-drafts"])).toEqual([]));
+      expect(fetch).toHaveBeenCalledWith(
+        expect.stringContaining(
+          `/v1/sessions/${reason === "source-deleted" ? "missing-source" : "deleted"}?`,
+        ),
+      );
+      expect(screen.queryByText("New nested agent")).toBeNull();
+    },
+  );
 
   it.each([
     { inProject: false, legacyRepresentative: false },

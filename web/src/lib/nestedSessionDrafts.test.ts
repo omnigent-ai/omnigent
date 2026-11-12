@@ -77,7 +77,7 @@ describe("nested draft sidebar rows", () => {
       project_id: null,
     };
     const rows = withNestedSessionDrafts(
-      [row, { ...row, id: "temp:nested" }, pushed],
+      [{ ...row, labels: { omni_project: "Old project" } }, { ...row, id: "temp:nested" }, pushed],
       drafts(client),
     );
     expect(rows.map((item) => item.id)).toEqual(["parent", "created"]);
@@ -88,6 +88,7 @@ describe("nested draft sidebar rows", () => {
       updated_at: 20,
       permission_level: 4,
       project_id: null,
+      labels: {},
     });
     expect(nestedSessionSidebarKey("created")).toBe("temp:nested");
     removeNestedSessionDraft(client, "temp:nested");
@@ -102,6 +103,12 @@ describe("nested draft sidebar rows", () => {
     const rows = withNestedSessionDrafts([], drafts(client));
     expect(rows).toHaveLength(2);
     expect(rows[1]).toMatchObject({ family, project_id: "project" });
+    expect(withNestedSessionDrafts([], drafts(client), new Set([source.id]))).toEqual([]);
+    updateNestedSessionDraft(client, "temp:other", "created-off-page");
+    expect(
+      withNestedSessionDrafts([], drafts(client), new Set([source.id])).map((item) => item.id),
+    ).toEqual(["created-off-page"]);
+    expect(withNestedSessionDrafts([], drafts(client), new Set(["created-off-page"]))).toEqual([]);
     removeNestedSessionDraft(client, "temp:other");
     expect(withNestedSessionDrafts([], drafts(client))).toEqual([]);
     client.clear();

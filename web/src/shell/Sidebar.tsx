@@ -2199,6 +2199,7 @@ function ConversationList({
   const missingDraftRows = [
     ...new Set(
       nestedDrafts.flatMap((draft) => [
+        draft.source.id,
         draft.source.family?.representative_id,
         ...(draft.created ? [draft.id] : []),
       ]),
@@ -2239,9 +2240,19 @@ function ConversationList({
       ]),
     [pagedConversations, pinnedConversations, openSessionRow, draftRows],
   );
+  const unavailableDraftRows = useMemo(
+    () =>
+      new Set([
+        ...draftBackfills.flatMap(({ id, row }) =>
+          !row || row.archived || (!row.owner && !isOwnerLevel(row.permission_level)) ? [id] : [],
+        ),
+        ...authoritativeRows.filter((row) => row.archived).map((row) => row.id),
+      ]),
+    [draftBackfills, authoritativeRows],
+  );
   const allConversations = useMemo(
-    () => withNestedSessionDrafts(authoritativeRows, nestedDrafts),
-    [authoritativeRows, nestedDrafts],
+    () => withNestedSessionDrafts(authoritativeRows, nestedDrafts, unavailableDraftRows),
+    [authoritativeRows, nestedDrafts, unavailableDraftRows],
   );
   useEffect(() => {
     const knownRows = [
@@ -2252,9 +2263,9 @@ function ConversationList({
     ];
     for (const draft of nestedDrafts) {
       if (
-        draft.created &&
-        (knownRows.some((row) => row.id === draft.id && row.family) ||
-          draftBackfills.some(({ id, row }) => id === draft.id && (row === null || row?.archived)))
+        unavailableDraftRows.has(draft.id) ||
+        (!draft.creating && unavailableDraftRows.has(draft.source.id)) ||
+        (draft.created && knownRows.some((row) => row.id === draft.id && row.family))
       ) {
         removeNestedSessionDraft(draftQueryClient, draft.key);
       }
@@ -2265,7 +2276,7 @@ function ConversationList({
     pinnedConversations,
     openSessionRow,
     loadedRows,
-    draftBackfills,
+    unavailableDraftRows,
     draftQueryClient,
   ]);
   const groupOrder = useMemo<readonly string[]>(
