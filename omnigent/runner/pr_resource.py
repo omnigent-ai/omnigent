@@ -39,7 +39,9 @@ from omnigent.git_providers import (
 from omnigent.runner import pr_reports
 from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
+    CommitCompareFacet,
     CommitsFacet,
+    PinnedRevisionFacet,
     ProviderCapabilities,
     PullRequestFacet,
     ReviewerRef,
@@ -1191,16 +1193,16 @@ def pr_changed_files(
 ) -> dict[str, Any]:
     """List the selected PR's changed files; empty when no provider serves it.
 
-    Providers without :class:`ReviewThreadsFacet` (GitLab, Azure DevOps) ignore
-    ``head_sha``/``base_sha`` and list the current revision.
+    With ``head_sha``/``base_sha``, a provider with :class:`PinnedRevisionFacet` lists
+    that revision, echoing it only when verified; other providers list the current revision.
     """
     reference = _default_pr(session_id, pr_url)
     facet = _serving_facet(root, reference)
     if facet is None:
         return {"object": "list", "data": [], "has_more": False}
-    if reference and (head_sha or base_sha) and isinstance(facet, ReviewThreadsFacet):
+    if reference and (head_sha or base_sha) and isinstance(facet, PinnedRevisionFacet):
         head, base = _full_revision(head_sha, base_sha)
-        return facet.review_changed_files(root, reference, head_sha=head, base_sha=base)
+        return facet.pinned_changed_files(root, reference, head_sha=head, base_sha=base)
     return facet.changed_files(root, reference)
 
 
@@ -1217,9 +1219,9 @@ def pr_diff(
     facet = _serving_facet(root, reference)
     if facet is None:
         return {"object": PR_DIFF_OBJECT, "patch": ""}
-    if reference and (head_sha or base_sha) and isinstance(facet, ReviewThreadsFacet):
+    if reference and (head_sha or base_sha) and isinstance(facet, PinnedRevisionFacet):
         head, base = _full_revision(head_sha, base_sha)
-        return facet.review_diff(root, reference, head_sha=head, base_sha=base)
+        return facet.pinned_diff(root, reference, head_sha=head, base_sha=base)
     return facet.pr_diff(root, reference)
 
 
@@ -1276,6 +1278,30 @@ def pr_commit_diff(
     """
     facet, reference = _commits_target(session_id, pr_url)
     return facet.commit_diff(root, reference, commit_sha=_commit_sha(commit_sha, "commit_sha"))
+
+
+def pr_compare_diff(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    head_sha: object = None,
+    from_sha: object = None,
+) -> dict[str, Any]:
+    """Return the selected PR's changes after one of its commits, up to its head.
+
+    :raises ValueError: Without a selected tracked PR, when its provider cannot list
+        commits, or when either commit is not a full commit id.
+    """
+    facet, reference = _commits_target(session_id, pr_url)
+    if not isinstance(facet, CommitCompareFacet):
+        raise ValueError("This provider does not show changes since a commit")
+    return facet.compare_diff(
+        root,
+        reference,
+        head_sha=_commit_sha(head_sha, "head_sha"),
+        from_sha=_commit_sha(from_sha, "from_sha"),
+    )
 
 
 def pr_file_diff(

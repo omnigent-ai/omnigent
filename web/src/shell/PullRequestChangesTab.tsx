@@ -55,6 +55,7 @@ import {
 import { PullRequestCommitBar } from "./PullRequestCommitBar";
 import { PullRequestCommitsList } from "./PullRequestCommitsList";
 import { PullRequestChangesModeSwitch } from "./PullRequestChangesModeSwitch";
+import { PullRequestChangesSince } from "./PullRequestChangesSince";
 import { PullRequestFileActions } from "./PullRequestFileActions";
 import { PullRequestFindBar } from "./PullRequestFindBar";
 import { PullRequestPathFilter } from "./PullRequestPathFilter";
@@ -432,8 +433,13 @@ function readErrorText(error: Error): string {
 }
 
 /** What an empty file list says: an unreadable commit, a commit without changes, or a PR without any. */
-function emptyChangesText(commitView: boolean, commitUnavailable: boolean): string {
+function emptyChangesText(
+  commitView: boolean,
+  sinceView: boolean,
+  commitUnavailable: boolean,
+): string {
   if (commitUnavailable) return "This commit's diff can't be read here.";
+  if (sinceView) return "No changes since that commit.";
   if (commitView) return "This commit has no file changes.";
   return "No changes vs base.";
 }
@@ -507,21 +513,28 @@ export function PullRequestChangesTab({
   const mode = commitsSupported ? view.mode : "changes";
   const commitsView = mode === "commits";
   const commitView = mode === "commit";
+  // In Changes, a picked PR commit narrows the view to the changes after it, up to the head.
+  const sinceSha = mode === "changes" && commitsSupported ? view.sinceSha : null;
+  const sinceView = !!sinceSha;
+  // An open commit's patch, or the changes since a commit, stand in for the PR patch.
+  const patchView = commitView || sinceView;
+  // The Changes since picker loads the commit list once it is first opened.
+  const [commitsWanted, setCommitsWanted] = useState(false);
   const commits = usePullRequestCommits(
     conversationId,
     prUrl,
     renderedHeadSha,
-    commitsSupported && mode !== "changes",
+    commitsSupported && (mode !== "changes" || commitsWanted || sinceView),
   );
-  // An open commit's patch replaces the PR patch everywhere the diff is read.
   const commitDiff = usePullRequestCommitDiff(
     conversationId,
     prUrl,
-    commitView ? view.commitSha : null,
+    commitView ? view.commitSha : sinceSha,
+    sinceView ? renderedHeadSha : null,
   );
-  const shownDiff = commitView ? commitDiff : prDiff;
+  const shownDiff = patchView ? commitDiff : prDiff;
   // The list is oldest first, so the previous commit is the older one and the next is newer.
-  const commitList = commits.data?.data ?? [];
+  const commitList = useMemo(() => commits.data?.data ?? [], [commits.data]);
   const commitIndex = commitList.findIndex((commit) => commit.sha === view.commitSha);
   const selectedCommit = commitIndex >= 0 ? commitList[commitIndex] : undefined;
   const previousCommit = commitIndex > 0 ? commitList[commitIndex - 1] : null;
@@ -532,6 +545,13 @@ export function PullRequestChangesTab({
   useEffect(() => {
     if (commitView && commits.data && commitIndex < 0) setMode("commits");
   }, [commitView, commits.data, commitIndex, setMode]);
+  // A picked start that left the loaded list (the head moved) falls back to the PR base.
+  const { setSinceSha } = view;
+  useEffect(() => {
+    if (sinceSha && commits.data && !commitList.some((commit) => commit.sha === sinceSha)) {
+      setSinceSha(null);
+    }
+  }, [sinceSha, commits.data, commitList, setSinceSha]);
   // A server without the commit routes leaves Changes as the only view, so a saved commit view ends.
   useEffect(() => {
     if (!commitsUnsupported || view.mode === "changes") return;
@@ -549,7 +569,7 @@ export function PullRequestChangesTab({
   useEffect(() => {
     setFindTarget(null);
     setPendingReveal(null);
-  }, [mode, view.commitSha]);
+  }, [mode, view.commitSha, sinceSha]);
   // The head the shown patch was fetched for. Viewed state needs both the list and the diff
   // pinned to the same head; unpinned providers (GitLab, Azure) can't prove it, so marks are withheld.
   const pinnedHead = changes.data?.head_sha ?? null;
@@ -579,13 +599,13 @@ export function PullRequestChangesTab({
 
   // The shown patch: the whole PR's parse in Changes, or one commit's.
   const { filesByPath, parseError } = useMemo(
-    () => (commitView ? parsePatchByPath(shownDiff.data?.patch, COMMIT_PARSE_ERROR) : prParse),
-    [commitView, shownDiff.data, prParse],
+    () => (patchView ? parsePatchByPath(shownDiff.data?.patch, COMMIT_PARSE_ERROR) : prParse),
+    [patchView, shownDiff.data, prParse],
   );
   // A commit's list is the files its patch changes; the PR's list is the provider's.
   const commitFiles = useMemo(
-    () => (commitView ? changedFilesFromPatch(filesByPath) : []),
-    [commitView, filesByPath],
+    () => (patchView ? changedFilesFromPatch(filesByPath) : []),
+    [patchView, filesByPath],
   );
   const listing = useMemo<{
     data?: PullRequestChangedFilesResult;
@@ -593,18 +613,19 @@ export function PullRequestChangesTab({
     error: Error | null;
   }>(
     () =>
-      commitView
+      patchView
         ? {
             data: { available: true, data: commitFiles, has_more: false },
             isLoading: commitDiff.isLoading,
             error: commitDiff.error,
           }
         : changes,
-    [commitView, commitFiles, commitDiff.isLoading, commitDiff.error, changes],
+    [patchView, commitFiles, commitDiff.isLoading, commitDiff.error, changes],
   );
   const files = useMemo<PullRequestChangedFile[]>(() => listing.data?.data ?? [], [listing.data]);
-  // Review features (threads, drafts, viewed controls, marks and progress) apply only in Changes.
-  const reviewing = mode === "changes";
+  // Review features (threads, drafts, viewed controls, marks and progress) belong to the whole
+  // PR diff, so they apply only in Changes from the PR base.
+  const reviewing = mode === "changes" && !sinceView;
   // One filtered list drives the tree, sections, threads and collapse all so they never disagree.
   const hiddenPaths = view.hideViewed && reviewing ? viewedFiles.viewed : NO_HIDDEN_PATHS;
   const visibleFiles = useMemo(
@@ -633,7 +654,9 @@ export function PullRequestChangesTab({
   const [collapsedPaths, setCollapsedPaths] = useState<ReadonlySet<string>>(() => new Set());
   // Each view reads and writes only its own collapse and reveal state. A commit's is created
   // fresh for that commit, so nothing a commit does reaches the PR's Changes view.
-  const commitState = useCommitViewState(view.commitSha);
+  const commitState = useCommitViewState(
+    commitView ? view.commitSha : sinceSha ? `since:${sinceSha}` : null,
+  );
   const changesState = useMemo(
     () => ({
       collapsedPaths,
@@ -644,7 +667,7 @@ export function PullRequestChangesTab({
     }),
     [collapsedPaths, revealedPaths, reveal, clearReveal],
   );
-  const pane = commitView ? commitState : changesState;
+  const pane = patchView ? commitState : changesState;
   const {
     setCollapsedPaths: setPaneCollapsed,
     clearReveal: clearPaneReveal,
@@ -679,20 +702,57 @@ export function PullRequestChangesTab({
       return { ...prev, owned };
     });
   }, []);
-  // Marking a file collapses it; unmarking leaves its current state alone.
-  const toggleViewed = useCallback(
+  // A file marked viewed collapses; the collapse belongs to the mark until the reader toggles it.
+  const collapseMarked = useCallback(
     (path: string) => {
-      const markViewed = !viewedFiles.viewed.has(path);
-      viewedFiles.setMany([path], markViewed);
-      if (!markViewed) return;
       if (!collapsedPaths.has(path)) {
         setSeed((prev) => ({ ...prev, owned: new Set(prev.owned).add(path) }));
       }
       clearReveal(path);
       setCollapsedPaths((prev) => (prev.has(path) ? prev : new Set(prev).add(path)));
     },
-    [viewedFiles, clearReveal, collapsedPaths],
+    [clearReveal, collapsedPaths],
   );
+  // Hide viewed can remove the file just marked, and with it the focused box. Focus then moves to
+  // the next shown file's Viewed box, or to Hide viewed when no file follows.
+  const viewedRowRef = useRef<HTMLDivElement>(null);
+  const [focusAfterHide, setFocusAfterHide] = useState<{ nextPath: string | null } | null>(null);
+  useEffect(() => {
+    if (!focusAfterHide) return;
+    const nextBox = focusAfterHide.nextPath
+      ? scrollRef.current?.querySelector<HTMLElement>(
+          `[role="checkbox"][aria-label="${CSS.escape(`Viewed ${focusAfterHide.nextPath}`)}"]`,
+        )
+      : null;
+    (nextBox ?? viewedRowRef.current?.querySelector<HTMLElement>('[role="checkbox"]'))?.focus();
+  }, [focusAfterHide]);
+  // Unmarking leaves the file's current state alone.
+  const toggleViewed = useCallback(
+    (path: string) => {
+      const markViewed = !viewedFiles.viewed.has(path);
+      viewedFiles.setMany([path], markViewed);
+      if (!markViewed) return;
+      if (view.hideViewed && reviewing) {
+        const index = visibleFiles.findIndex((file) => file.path === path);
+        setFocusAfterHide({ nextPath: visibleFiles[index + 1]?.path ?? null });
+      }
+      collapseMarked(path);
+    },
+    [viewedFiles, collapseMarked, view.hideViewed, reviewing, visibleFiles],
+  );
+  // Marks another tab stores arrive as storage events. A file that becomes viewed on the same head
+  // collapses here. A head change or an unavailable snapshot resets the baseline instead.
+  const previousViewed = useRef<{ head: string | null; viewed: ReadonlySet<string> } | null>(null);
+  useEffect(() => {
+    const previous = previousViewed.current;
+    previousViewed.current = viewedFiles.available
+      ? { head: renderedHead, viewed: viewedFiles.viewed }
+      : null;
+    if (!previous || !viewedFiles.available || previous.head !== renderedHead) return;
+    for (const path of viewedFiles.viewed) {
+      if (!previous.viewed.has(path)) collapseMarked(path);
+    }
+  }, [viewedFiles.available, viewedFiles.viewed, renderedHead, collapseMarked]);
 
   // Fixed id keeps repeated failures from stacking toasts.
   useEffect(() => {
@@ -815,9 +875,9 @@ export function PullRequestChangesTab({
       // trailing-region count) is served by loadDiffFiles on demand.
       expansionLineCount: 10,
       // A commit's unchanged lines need its parent revision, so its context can't expand.
-      loadDiffFiles: commitView ? undefined : loadDiffFiles,
+      loadDiffFiles: patchView ? undefined : loadDiffFiles,
     }),
-    [themeType, diffStyle, loadDiffFiles, commitView],
+    [themeType, diffStyle, loadDiffFiles, patchView],
   );
 
   // The stacked diff scrolls as one; the sidebar highlights the file at the top
@@ -1015,8 +1075,8 @@ export function PullRequestChangesTab({
   const patchReady = !!shownDiff.data?.patch && !parseError && !shownDiff.isLoading;
   // A disabled commit query has no data, which is not a commit without changes.
   const commitUnavailable =
-    commitView && !commitDiff.data && !commitDiff.isLoading && !commitDiff.error;
-  const emptyChangesMessage = emptyChangesText(commitView, commitUnavailable);
+    patchView && !commitDiff.data && !commitDiff.isLoading && !commitDiff.error;
+  const emptyChangesMessage = emptyChangesText(commitView, sinceView, commitUnavailable);
   const coverageNote =
     findOpen && patchReady && (listing.data?.has_more || withoutText > 0)
       ? `Search covers the fetched patch: ${patchFileCount} of ${listing.data?.total_count ?? files.length} files${withoutText > 0 ? `, ${withoutText} without text` : ""}`
@@ -1034,7 +1094,7 @@ export function PullRequestChangesTab({
       headRepoUrl: pr.head_repository_url,
       baseRepoUrl,
       headSha: commitView ? view.commitSha : renderedHeadSha,
-      baseSha: commitView ? null : renderedBaseSha,
+      baseSha: patchView ? null : renderedBaseSha,
       path: file.path,
       previousPath: renamedFrom,
       status: file.status,
@@ -1046,8 +1106,10 @@ export function PullRequestChangesTab({
         openLabel={`Open in ${providerLabel}`}
         openUrl={openUrl}
         openUnavailableReason={
-          commitView && file.status === "deleted"
-            ? "Deleted in this commit"
+          patchView && file.status === "deleted"
+            ? commitView
+              ? "Deleted in this commit"
+              : "Deleted since that commit"
             : openUnavailableReason(providerLabel, !!baseRepoUrl, sourceRepoUrl)
         }
       />
@@ -1225,10 +1287,27 @@ export function PullRequestChangesTab({
           onToggleAll={toggleAll}
           modeSwitch={
             commitsSupported ? (
-              <PullRequestChangesModeSwitch
-                value={commitsView || commitView ? "commits" : "changes"}
-                onChange={view.setMode}
-              />
+              <>
+                <PullRequestChangesModeSwitch
+                  value={commitsView || commitView ? "commits" : "changes"}
+                  onChange={view.setMode}
+                />
+                {mode === "changes" && (
+                  <PullRequestChangesSince
+                    commits={commitList}
+                    headSha={renderedHeadSha}
+                    hasMore={!!commits.data?.has_more}
+                    loading={commits.isLoading}
+                    errorMessage={commits.error ? readErrorText(commits.error) : null}
+                    sinceSha={sinceSha}
+                    onChange={setSinceSha}
+                    onOpen={() => {
+                      setCommitsWanted(true);
+                      if (commits.error) void commits.refetch();
+                    }}
+                  />
+                )}
+              </>
             ) : undefined
           }
           navigation={
@@ -1262,6 +1341,7 @@ export function PullRequestChangesTab({
                 mobile={mobile}
                 hideViewed={view.hideViewed}
                 onHideViewedChange={view.setHideViewed}
+                rowRef={viewedRowRef}
               />
             ) : undefined
           }

@@ -1527,6 +1527,8 @@ def test_create_filesystem_registry_linked_worktree(tmp_path: Path) -> None:
         ("D  staged_del.py", ("staged_del.py", "deleted")),
         # Unstaged deletion (worktree 'D') → deleted
         (" D unstaged_del.py", ("unstaged_del.py", "deleted")),
+        # Intent-to-add (`git add -N`, worktree 'A') has no HEAD version → created
+        (" A intent_to_add.py", ("intent_to_add.py", "created")),
         # Rename: destination path (after ' -> ') is used, operation is modified
         ("R  old.py -> new.py", ("new.py", "modified")),
         # git-quoted path (spaces in filename) → quotes are stripped
@@ -1558,6 +1560,7 @@ def test_create_filesystem_registry_linked_worktree(tmp_path: Path) -> None:
         "both-staged-and-unstaged-modified",
         "staged-deleted",
         "unstaged-deleted",
+        "intent-to-add",
         "rename",
         "quoted-path-with-spaces",
         "quoted-rename-destination",

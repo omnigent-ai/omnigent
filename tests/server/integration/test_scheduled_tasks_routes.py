@@ -534,6 +534,31 @@ async def test_profile_schedules_are_rejected_before_persistence(
             assert tasks[0]["execution_target"] == "connected_host"
 
 
+async def test_profile_schedules_with_a_default_profile_are_saved(auth_app, auth_client, db_uri):
+    import dataclasses
+
+    from omnigent.server.sandbox_profiles import SandboxProfileCatalog
+
+    _make_user(db_uri)
+    deployment = _sandbox_deployment(manages_profiles=True)
+    factory = Mock(side_effect=AssertionError("Schedule validation must not construct providers"))
+    deployment = ManagedSandboxDeployment.single(
+        dataclasses.replace(
+            deployment.default, launcher_factory=factory, default_profile_id="build"
+        )
+    )
+    auth_app.state.sandbox_config = deployment
+    auth_app.state.sandbox_profiles = SandboxProfileCatalog(
+        SqlAlchemyConversationStore(db_uri), deployment
+    )
+    body = _create_body(execution_target="managed_sandbox")
+    del body["host_id"], body["workspace"]
+    response = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+    assert response.status_code == 200, response.text
+    assert response.json()["execution_target"] == "managed_sandbox"
+    factory.assert_not_called()
+
+
 async def test_patch_execution_target_roundtrip_clears_host_and_workspace(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
@@ -844,6 +869,7 @@ async def test_create_rejects_invalid_permission_mode(
     )
     assert resp.status_code == 400, resp.text
     assert "Unsupported permission_mode" in resp.text
+    assert "JSON null (not the string 'null') for the agent default" in resp.text
 
 
 async def test_create_rejects_relative_workspace(

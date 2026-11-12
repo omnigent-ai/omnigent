@@ -212,6 +212,7 @@ from omnigent.onboarding.sandboxes.base import (
     SandboxGoneError,
     resolve_managed_keepalive_interval_s,
 )
+from omnigent.onboarding.sandboxes.profiles import PROFILE_ID_PATTERN
 
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
@@ -391,6 +392,43 @@ MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 # Server-owned routing id from a managed create's or fork's ``host_id``:
 # available before the host binds, and never copied from a fork's source.
 REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
+
+# A move onto a new sandbox holds the session's runner with an id of this shape
+# until the sandbox binds. It keeps the token-bound prefix, so checks that
+# require a runner's tunnel token stay strict, but no real token-bound id (hex
+# after the prefix) can equal it, so every replica can tell a move is underway.
+MOVE_CLAIM_RUNNER_ID_PREFIX = "runner_token_move_"
+# Only the move releases its claim, so nothing else can take the session while
+# it settles. A claim older than this was left by a server that stopped
+# mid-move, and may be cleared: longer than any provider's provisioning plus
+# the host-registration wait and the runner's start.
+MOVE_CLAIM_LEASE_S = MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S + 3600
+# Hex digits of the claim's creation time (seconds), after the prefix.
+_MOVE_CLAIM_TIME_DIGITS = 12
+
+
+def new_move_claim() -> str:
+    """Return a fresh runner id for a move to claim a session with."""
+    created = f"{int(time.time()):0{_MOVE_CLAIM_TIME_DIGITS}x}"
+    return MOVE_CLAIM_RUNNER_ID_PREFIX + created + secrets.token_hex(16)
+
+
+def is_move_claim(runner_id: str | None) -> bool:
+    """Whether *runner_id* is a move's claim rather than a real runner."""
+    return runner_id is not None and runner_id.startswith(MOVE_CLAIM_RUNNER_ID_PREFIX)
+
+
+def move_claim_is_live(runner_id: str | None) -> bool:
+    """Whether *runner_id* is a move's claim still within its lease."""
+    if not is_move_claim(runner_id):
+        return False
+    assert runner_id is not None
+    start = len(MOVE_CLAIM_RUNNER_ID_PREFIX)
+    try:
+        created = int(runner_id[start : start + _MOVE_CLAIM_TIME_DIGITS], 16)
+    except ValueError:
+        return False
+    return time.time() - created < MOVE_CLAIM_LEASE_S
 
 
 def managed_host_name(host_id: str) -> str:
@@ -609,6 +647,10 @@ class ManagedLaunch:
     settled: asyncio.Event
     error: str | None = None
     bound: asyncio.Event = dataclass_field(default_factory=asyncio.Event)
+    # Set when another host took the session before its sandbox was ready.
+    superseded: bool = False
+    # The sandbox host this launch bound the session to, once it has.
+    host_id: str | None = None
     host_online_failure_hint: Callable[[], str | None] | None = None
 
 
@@ -750,6 +792,9 @@ class ManagedSandboxConfig:
         the picker then blocks launch instead of offering Default.
     :param manages_profiles: Static opt-in copied from plugin metadata. Embedding
         deployments set it explicitly for launchers that require profile selection.
+    :param default_profile_id: Profile a new managed session takes when its caller
+        names none, from ``sandbox.default_profile_id``. Authorized and saved like an
+        explicit selection. ``None`` keeps a selection mandatory.
     """
 
     server_url: str
@@ -768,6 +813,7 @@ class ManagedSandboxConfig:
     # Internal continuation permission, scoped to one already-admitted legacy host.
     unprofiled_host_id: str | None = None
     manages_profiles: bool = False
+    default_profile_id: str | None = None
 
 
 class NoReachableModels(Exception):
@@ -980,7 +1026,12 @@ class ManagedSandboxDeployment:
         for config in self.configs:
             if config.managed_launch_supported and config.provider is not None:
                 launcher = config.launcher_factory()
-                caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
+                caps[config.provider] = {
+                    "multi_repo": launcher.capabilities.multi_repo,
+                    # A provider that manages sandbox profiles binds one at session
+                    # create, so the move route refuses it as a destination.
+                    "accepts_session_move": not config.manages_profiles,
+                }
                 from omnigent.inference_config import parse_inference_config
                 from omnigent.server.inference_catalog import ambient_gateway_providers
 
@@ -1633,6 +1684,11 @@ def _parse_multi_provider_sandbox_config(
             "server config 'sandbox.providers' must be a non-empty list of "
             "provider mappings, e.g. [{provider: modal}, {provider: e2b}]"
         )
+    if "default_profile_id" in raw:
+        raise ValueError(
+            "server config 'sandbox.default_profile_id' names one provider's profile; "
+            "set it inside that provider's 'sandbox.providers' entry"
+        )
     # Shared keys describe THIS server, so they ride into every entry
     # instead of being repeated per entry.
     shared = {
@@ -2046,6 +2102,20 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                 "300 to 31536000 seconds (5 minutes to 365 days), or null for the provider default"
             )
         token_ttl_s = configured_token_ttl_s
+    default_profile_id = raw.get("default_profile_id")
+    if default_profile_id is not None:
+        if not manages_profiles:
+            raise ValueError(
+                "server config 'sandbox.default_profile_id' requires a provider that "
+                "manages sandbox profiles"
+            )
+        if not isinstance(default_profile_id, str) or not re.fullmatch(
+            PROFILE_ID_PATTERN, default_profile_id
+        ):
+            raise ValueError(
+                "server config 'sandbox.default_profile_id' must be a profile id: "
+                "lowercase letters, digits, '_' or '-', at most 64 characters"
+            )
     return ManagedSandboxConfig(
         server_url=server_url.strip().rstrip("/"),
         launcher_factory=launcher_factory,
@@ -2058,6 +2128,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         model_discovery=model_discovery,
         git_clone=git_clone,
         manages_profiles=manages_profiles,
+        default_profile_id=default_profile_id,
     )
 
 

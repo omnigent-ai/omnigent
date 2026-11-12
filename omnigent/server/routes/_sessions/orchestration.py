@@ -239,6 +239,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _runner_status_probe_inflight,
     _RunnerStatusProbeBackoff,
     _session_active_response_cache,
+    _session_background_agents_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_blocked_on_cache,
@@ -275,6 +276,7 @@ from omnigent.server.routes._sessions.helpers import (
     _delete_stored_session_bundle_after_failure,
     _derive_terminal_launch_args_from_spec,
     _devin_subagent_labels_from_body,
+    _drop_claude_launch_args_from_another_host,
     _emit_server_routing_decision,
     _error_item_from_sse,
     _extract_claude_native_runner_failure,
@@ -316,6 +318,7 @@ from omnigent.server.routes._sessions.helpers import (
     _NativeTerminalEnsureOutcome,
     _owner_from_grants,
     _owns_host_runner,
+    _parse_background_tasks,
     _parse_external_conversation_item,
     _pending_elicitation_snapshot_for_session,
     _permission_level_from_grants,
@@ -826,6 +829,10 @@ _pending_archive_stops: dict[str, asyncio.Task[None]] = {}
 # failure, not a sustained outage.
 _ARCHIVE_STOP_LOOKUP_ATTEMPTS = 3
 _ARCHIVE_STOP_LOOKUP_RETRY_S = 0.2
+# A session that archives itself keeps its runner until the turn that asked
+# ends. The wait is bounded so a turn that never settles still gets torn down.
+_SELF_ARCHIVE_TURN_POLL_S = 2.0
+_SELF_ARCHIVE_TURN_WAIT_S = 60 * 60
 _RUNNER_STOP_STATUS_BATCH_SIZE = 200
 
 
@@ -1065,6 +1072,54 @@ async def _archive_stop(
             )
 
 
+async def _await_archived_turn_end(session_id: str, conversation_store: ConversationStore) -> bool:
+    """
+    Wait until an archived session's own turn ends, or the wait runs out.
+
+    The status comes from this replica's relay cache, falling back to the row's
+    persisted live status, so the wait works on a replica without the tunnel.
+    Each poll reads only the session's activity, never its labels. A failed
+    read says nothing about the turn, so the wait keeps polling.
+
+    :returns: ``False`` once the session is no longer archived (an Undo), so the
+        caller skips the teardown; ``True`` otherwise.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _SELF_ARCHIVE_TURN_WAIT_S
+    while True:
+        try:
+            activity = await asyncio.to_thread(
+                conversation_store.get_session_activity, [session_id]
+            )
+        except Exception:  # noqa: BLE001
+            _logger.debug(
+                "Self-archive turn check failed for %s; retrying",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        else:
+            row = activity.get(session_id)
+            # A missing row is a deleted session. A store that doesn't report
+            # the flag (None) keeps waiting; _archive_stop re-reads it anyway.
+            if row is None or row.archived is False:
+                return False
+            # No relay status here and none persisted says nothing about the
+            # turn (the first status write may have failed), so keep waiting.
+            known = session_id in _session_status_cache or row.live_status is not None
+            if known and _session_status_from_cache(session_id, row.live_status) != "running":
+                return True
+        if loop.time() >= deadline:
+            _logger.warning(
+                "Self-archived session %s still running after %ss; tearing it down",
+                session_id,
+                _SELF_ARCHIVE_TURN_WAIT_S,
+                extra={"session_id": session_id},
+            )
+            return True
+        await asyncio.sleep(_SELF_ARCHIVE_TURN_POLL_S)
+
+
 def _spawn_archive_stop(
     session_id: str,
     conversation_store: ConversationStore,
@@ -1073,6 +1128,7 @@ def _spawn_archive_stop(
     *,
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
+    after_turn: bool = False,
 ) -> None:
     """
     Defer :func:`_archive_stop` past the undo grace, as a retained task.
@@ -1101,6 +1157,11 @@ def _spawn_archive_stop(
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
     :param delete_worktree: Forwarded to :func:`_archive_stop`.
+    :param after_turn: Also wait for the session's current turn to end before
+        tearing it down; set when the session archived itself. That wait, like
+        the grace, lives only in this replica's memory: if the replica restarts
+        first, the archived session's runner keeps running until its idle
+        timeout or a later stop.
     """
     # Replace any pending stop from an earlier archive of this session.
     _cancel_pending_archive_stop(session_id)
@@ -1112,6 +1173,8 @@ def _spawn_archive_stop(
 
         try:
             await asyncio.sleep(_facade._ARCHIVE_STOP_UNDO_GRACE_S)
+            if after_turn and not await _await_archived_turn_end(session_id, conversation_store):
+                return
         except asyncio.CancelledError:
             return
         await _archive_stop(
@@ -1423,6 +1486,7 @@ def _build_session_response(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     side_chat_sealed: bool = False,
+    background_agents: list[BackgroundTaskInfo] | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -1442,6 +1506,9 @@ def _build_session_response(
         when none are tracked.
     :param background_tasks: Per-shell detail for that tally, so a reload can
         restore it. ``None`` when none are tracked.
+    :param background_agents: Background agents a finished claude-native turn
+        left running while its session waits on them (the snapshot *status*
+        still reads ``"running"``). ``None`` otherwise.
     :param permission_level: The requesting user's numeric level
         on this session (1=read, 2=edit, 3=manage), or ``None``
         when permissions are disabled.
@@ -1537,6 +1604,7 @@ def _build_session_response(
         agent_id=conv.agent_id,
         agent_name=agent_name,
         status=status,
+        background_agents=background_agents or None,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
         created_at=conv.created_at,
@@ -4390,6 +4458,17 @@ async def _mark_runner_sessions_offline_once(
             continue
         if binding is None or binding[0] != conv.runner_id:
             continue
+        if _runner_stamp_is_live_elsewhere(
+            stamp=binding[1], reference_stamp=conv.runner_last_seen
+        ):
+            _relinquish_session_live_state(conv.id)
+            _logger.info(
+                "Runner %s renewed liveness for session %s during offline sweep; "
+                "leaving the session to its adopting replica",
+                conv.runner_id,
+                conv.id,
+            )
+            continue
         _publish_status(
             conv.id,
             "failed",
@@ -4590,6 +4669,7 @@ async def _run_managed_launch(
     agent_id: str | None = None,
     host_id: str | None = None,
     sandbox_profiles: Any = None,
+    held_runner_id: str | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -4655,6 +4735,9 @@ async def _run_managed_launch(
         classifier, or ``None`` to leave it unstamped.
     :param host_id: Host id a managed create asked for, or
         ``None`` to mint one. Ignored on a relaunch.
+    :param held_runner_id: The claim a move holds on the session's runner
+        while it provisions, or ``None``. The sandbox binds only while that
+        claim stands, and any failure releases it.
     """
     from omnigent.server.managed_hosts import (
         deployment_with_inference_snapshot,
@@ -4669,6 +4752,7 @@ async def _run_managed_launch(
             session_id,
             user_id=owner,
             host_id=relaunch_host.host_id if relaunch_host is not None else None,
+            bind_host=False,
         )
         if profile is not None:
             sandbox_config = deployment_with_sandbox_profile(sandbox_config, profile)
@@ -4679,9 +4763,19 @@ async def _run_managed_launch(
                     sandbox_config, None, unprofiled_host=relaunch_host
                 )
             else:
-                await asyncio.to_thread(
-                    sandbox_profiles.require_selection, provider, user_id=owner
+                # A launch without a create-time selection (a scheduled fresh sandbox)
+                # takes the provider's default, saved like an explicit selection.
+                default = await asyncio.to_thread(
+                    sandbox_profiles.default_selection, provider, user_id=owner
                 )
+                if default is None:
+                    await asyncio.to_thread(
+                        sandbox_profiles.require_selection, provider, user_id=owner
+                    )
+                else:
+                    await asyncio.to_thread(sandbox_profiles.bind_session, session_id, default)
+                    sandbox_config = deployment_with_sandbox_profile(sandbox_config, default)
+                    provider = default["provider"]
     except (OmnigentError, HTTPException) as exc:
         reason = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
         tracker.fail(session_id, reason)
@@ -4748,7 +4842,16 @@ async def _run_managed_launch(
             tunnel_registry=tunnel_registry,
             relaunch_host=relaunch_host,
             sandbox_profiles=sandbox_profiles,
+            sandbox_profile=profile,
+            held_runner_id=held_runner_id,
         )
+
+
+class _SessionReboundDuringProvision(Exception):
+    """The session gained a host or runner while its sandbox provisioned."""
+
+
+_SESSION_REBOUND_REASON = "session was bound to another host while its sandbox was provisioning"
 
 
 async def _bind_and_launch_managed_runner(
@@ -4763,6 +4866,8 @@ async def _bind_and_launch_managed_runner(
     tunnel_registry: TunnelRegistry | None,
     relaunch_host: Host | None = None,
     sandbox_profiles: Any = None,
+    sandbox_profile: dict[str, Any] | None = None,
+    held_runner_id: str | None = None,
 ) -> None:
     """
     Bind a provisioned managed host to its session and launch a runner.
@@ -4795,24 +4900,41 @@ async def _bind_and_launch_managed_runner(
     :param relaunch_host: Existing managed host row being relaunched, or
         ``None`` for a first launch (a fresh host identity was just
         minted for ``managed.host_id``).
+    :param held_runner_id: The claim a move holds on the session's runner,
+        or ``None``. The sandbox binds only while it stands; if the claim was
+        released and another host took the session, that binding wins, the
+        fresh sandbox is torn down, and the launch settles without failing the
+        session. :func:`_start_managed_launch_task` releases the claim when the
+        launch fails.
     """
     from omnigent.server.managed_hosts import terminate_managed_host
 
     def persist_binding() -> Conversation:
-        snapshot = (
+        snapshot = sandbox_profile or (
             sandbox_profiles.get_session_snapshot(session_id)
             if sandbox_profiles is not None
             else None
         )
-        if snapshot is None:
-            return conversation_store.set_host_id(session_id, managed.host_id, managed.workspace)
-        conversation_store.bind_profiled_host(
-            session_id, managed.host_id, managed.workspace, snapshot
-        )
-        conv = conversation_store.get_conversation(session_id)
-        if conv is None:
-            raise ConversationNotFoundError(f"conversation {session_id!r} does not exist")
-        return conv
+        if snapshot is None and held_runner_id is not None:
+            try:
+                conv = conversation_store.set_host_id(
+                    session_id,
+                    managed.host_id,
+                    managed.workspace,
+                    expected_runner_id=held_runner_id,
+                )
+            except ValueError as exc:
+                raise _SessionReboundDuringProvision from exc
+        elif snapshot is None:
+            conv = conversation_store.set_host_id(session_id, managed.host_id, managed.workspace)
+        else:
+            conversation_store.bind_profiled_host(
+                session_id, managed.host_id, managed.workspace, snapshot
+            )
+            conv = conversation_store.get_conversation(session_id)
+            if conv is None:
+                raise ConversationNotFoundError(f"conversation {session_id!r} does not exist")
+        return _drop_claude_launch_args_from_another_host(conversation_store, conv)
 
     bind = asyncio.create_task(asyncio.to_thread(persist_binding))
 
@@ -4838,12 +4960,16 @@ async def _bind_and_launch_managed_runner(
             await terminate_managed_host(host, host_store, sandbox_config, keep_if_bound=True)
 
     reason: str | None = None
+    superseded = False
     cancelled = False
     try:
         try:
             conv = await asyncio.shield(bind)
         except ConversationNotFoundError:
             reason = "session was deleted while its sandbox was provisioning"
+            return
+        except _SessionReboundDuringProvision:
+            reason, superseded = _SESSION_REBOUND_REASON, True
             return
         except Exception:  # noqa: BLE001 — settle the tracker and release the fresh sandbox
             _logger.exception("Failed to bind managed host", extra={"session_id": session_id})
@@ -4852,13 +4978,21 @@ async def _bind_and_launch_managed_runner(
         if (launch_task := asyncio.current_task()) is not None:
             _unbound_managed_launch_tasks.discard(launch_task)
         if (launch := tracker.get(session_id)) is not None:
+            launch.host_id = managed.host_id
             launch.bound.set()
         if relaunch_host is not None:
             await _note_workspace_reset_on_recreate(session_id, conversation_store)
         _publish_sandbox_status(session_id, "connecting")
         runner_id: str | None = None
+        host_conn = host_registry.get(managed.host_id) if host_registry is not None else None
+        if host_conn is None and held_runner_id is not None:
+            # The host's replica starts the runner, and only once none is bound,
+            # so hand the session over without the move's claim on it.
+            with contextlib.suppress(ConversationNotFoundError, ValueError):
+                await asyncio.to_thread(
+                    conversation_store.clear_runner_id, session_id, expected_binding=conv
+                )
         if host_registry is not None:
-            host_conn = host_registry.get(managed.host_id)
             if host_conn is not None:
                 try:
                     launch_attempt = await _launch_runner_on_host(
@@ -4866,6 +5000,8 @@ async def _bind_and_launch_managed_runner(
                         conversation_store,
                         host_registry,
                         host_conn,
+                        # Only a move's launch replaces its own claim.
+                        **({"replace_move_claim": True} if held_runner_id is not None else {}),
                     )
                     runner_id = launch_attempt.runner_id
                     reason = (
@@ -4873,6 +5009,9 @@ async def _bind_and_launch_managed_runner(
                         if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
                         else None
                     )
+                    if launch_attempt.error_code == "session_binding_changed":
+                        # Taken after the move's claim was released.
+                        reason, superseded = _SESSION_REBOUND_REASON, True
                 except OmnigentError as exc:
                     reason = str(exc)
                 except Exception as exc:  # noqa: BLE001 — admission can fail after provisioning
@@ -4909,24 +5048,34 @@ async def _bind_and_launch_managed_runner(
         if reason is not None or cancelled:
 
             async def settle_failure() -> None:
-                nonlocal reason
+                nonlocal reason, superseded
                 # A cancelled thread can still commit the binding before raising.
                 try:
                     await bind
                 except ConversationNotFoundError:
                     reason = "session was deleted while its sandbox was provisioning"
+                except _SessionReboundDuringProvision:
+                    reason, superseded = _SESSION_REBOUND_REASON, True
                 except Exception:  # noqa: BLE001 — drain the transaction before compensating
                     reason = "failed to bind managed host"
                 if reason is None:
                     # The binding committed; the host's replica can finish startup.
                     if (launch := tracker.get(session_id)) is not None:
+                        launch.host_id = managed.host_id
                         launch.bound.set()
                     return
                 try:
                     await rollback_fresh_host()
                 finally:
-                    tracker.fail(session_id, reason)
-                    _publish_sandbox_status(session_id, "failed", reason)
+                    if superseded:
+                        # The session runs on the host that took it; nothing failed.
+                        if (launch := tracker.get(session_id)) is not None:
+                            launch.superseded = True
+                        tracker.finish(session_id)
+                        _publish_sandbox_status(session_id, "ready")
+                    else:
+                        tracker.fail(session_id, reason)
+                        _publish_sandbox_status(session_id, "failed", reason)
 
             cleanup = asyncio.create_task(settle_failure())
             cleanup_cancelled = False
@@ -9655,6 +9804,9 @@ async def _relay_runner_stream_once(
                                     if isinstance(raw_blocked_on, str) and raw_blocked_on
                                     else None
                                 ),
+                                background_agents=_parse_background_tasks(
+                                    event.get("background_agents")
+                                ),
                             )
                         if status == "running":
                             text_acc.clear()
@@ -14093,12 +14245,22 @@ async def _get_session_snapshot(
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+    # A claude-native turn waiting on its background agent keeps the collapsed
+    # ``running`` status: released headless ``-p`` clients stop polling on any
+    # other value and would return before the agent's result. The agents ride
+    # alongside, and clients that know the field read the session as waiting.
+    background_agents = (
+        _session_background_agents_cache.get(session_id)
+        if status == "running" and _session_status_cache.get(session_id) == "waiting"
+        else None
+    )
     response = _build_session_response(
         conv,
         items,
         status,
         permission_level,
         side_chat_sealed=await _codex_side_chat_fork_sealed(conv, conv_store),
+        background_agents=background_agents,
         background_task_count=_session_background_task_count_cache.get(session_id),
         background_tasks=_session_background_tasks_cache.get(session_id),
         llm_model=llm_model,

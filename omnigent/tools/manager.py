@@ -29,6 +29,8 @@ from omnigent.tools.builtins import (
     SysCallAsyncTool,
     SysCancelAsyncTool,
     SysListModelsTool,
+    SysProjectListTool,
+    SysProjectUpdateTool,
     SysReadInboxTool,
     SysScheduledTaskCreateTool,
     SysScheduledTaskDeleteTool,
@@ -42,6 +44,7 @@ from omnigent.tools.builtins import (
     SysSessionRenameTool,
     SysSessionSendTool,
     SysSessionShareTool,
+    SysSessionUpdateTool,
     SysTimerCancelTool,
     SysTimerSetTool,
     UpdateCommentTool,
@@ -161,6 +164,7 @@ class ToolManager:
         self._register_sub_agent_tools()
         self._register_session_tools()
         self._register_agent_mgmt_tools()
+        self._register_project_tools()
         self._register_os_env_tools(schema_only=os_env_schema_only)
         self._register_terminal_tools()
         self._register_local_tools(workdir)
@@ -536,6 +540,20 @@ class ToolManager:
         self._tools[SysAgentGetTool.name()] = SysAgentGetTool()
         self._tools[SysAgentDownloadTool.name()] = SysAgentDownloadTool()
         self._tools[SysAgentListTool.name()] = SysAgentListTool()
+
+    def _register_project_tools(self) -> None:
+        """
+        Register the project and session organizing tools.
+
+        They proxy the owner-gated projects and session PATCH endpoints the
+        sidebar uses, so they grant no access the caller lacks;
+        ``tool_groups.projects: false`` drops the pair.
+        """
+        if not self._spec.tool_groups.projects:
+            return
+        self._tools[SysProjectListTool.name()] = SysProjectListTool()
+        self._tools[SysSessionUpdateTool.name()] = SysSessionUpdateTool()
+        self._tools[SysProjectUpdateTool.name()] = SysProjectUpdateTool()
 
     def _register_task_lifecycle_tools(self) -> None:
         """

@@ -29,6 +29,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
+    effective_admin,
 )
 from omnigent.server.sharing_settings import effective_public_level
 from omnigent.stores.permission_store import PermissionStore
@@ -541,7 +542,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """Return the user's effective permission level. See base class for contract."""
         if user_id is None:
             return None
-        if self.is_admin(user_id):
+        if effective_admin(self.is_admin(user_id)):
             return LEVEL_OWNER
         grant = self.get(user_id, conversation_id)
         public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
