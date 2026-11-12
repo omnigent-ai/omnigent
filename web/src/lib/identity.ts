@@ -17,7 +17,7 @@
 
 import { stripBasePath, withBasePath } from "./basePath";
 import { isAdminViewEnabled } from "./adminView";
-import { getCachedServerInfo } from "./capabilities";
+import { getCachedServerInfo, resolveServerInfo } from "./capabilities";
 import {
   getOmnigentHostConfig,
   hostFetch,
@@ -432,6 +432,8 @@ async function probeIdentity(): Promise<boolean> {
       };
       currentUserId = data.user_id;
       currentIsAdmin = data.is_admin ?? false;
+      // Resolve support before consumers cache an off cookie's effective role.
+      if (currentIsAdmin && !isAdminViewEnabled()) await resolveServerInfo();
       return true;
     }
     return !isTransientIdentityStatus(res.status);
