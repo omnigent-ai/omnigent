@@ -1851,12 +1851,20 @@ describe("WorkspacePanel sub-agent tabs", () => {
     const before = useChatStore.getState();
     const send = vi.fn(() => Promise.resolve());
     useChatStore.setState({ sessionHarness: "codex-native", boundAgentId: "agent_x", send });
+    let acceptReveal = true;
+    const guard = vi.fn((_path, _options, commit: () => void) => {
+      if (acceptReveal) commit();
+    });
     try {
       writeSessionWorkspaceState("conv_ws", {
-        openSideChats: ["pending:one"],
+        openSideChats: ["pending:one", "pending:two"],
         selectedSideChatId: "pending:one",
       });
-      renderWorkspace({ rightRailTab: "sidechat", queryClient: clientWithSubagent() });
+      const view = renderWorkspace({
+        rightRailTab: "sidechat",
+        queryClient: clientWithSubagent(),
+        fileGuard: guard,
+      });
       const rail = screen.getByRole("complementary", { name: "Workspace" });
       fireEvent.click(screen.getByRole("button", { name: "Start side chat" }));
       await waitFor(() => expect(send).toHaveBeenCalled());
@@ -1867,18 +1875,48 @@ describe("WorkspacePanel sub-agent tabs", () => {
       expect(within(rail).getByRole("tab", { name: "Research agent" })).toBeInTheDocument();
       expect(within(rail).getByRole("tab", { name: "Side chat 1" })).toBeInTheDocument();
 
-      // The fork that arrives next still replaces the pending tab, not the sub-agent's.
+      // Start a distinct second request before either native child arrives.
+      fireEvent.click(within(rail).getByRole("tab", { name: "Side chat 2" }));
+      fireEvent.click(screen.getByRole("button", { name: "Start side chat" }));
+      await waitFor(() => expect(send).toHaveBeenCalledTimes(2));
+      act(() => {
+        for (const id of ["pending:one", "pending:two"]) {
+          useChatStore.getState().updateSideChatComposer(id, (draft) => ({ ...draft, text: id }));
+        }
+      });
+      view.rerender({ selectedFilePath: "notes.md", rightRailTab: "files" });
+      acceptReveal = false;
+      view.onRightRailTabChange.mockClear();
       act(() => {
         useChatStore.setState({ sideChatToOpen: { childId: "conv_fork", parentId: "conv_ws" } });
       });
+      expect(view.onRightRailTabChange).not.toHaveBeenCalled();
+      expect(readSessionWorkspaceState("conv_ws").openSideChats).toEqual([
+        "conv_fork",
+        "pending:two",
+      ]);
+      expect(useChatStore.getState().sideChatComposers["pending:one"]).toBeUndefined();
+      expect(useChatStore.getState().sideChatComposers["pending:two"]?.text).toBe("pending:two");
+      expect(useChatStore.getState().sideChatToOpen).toBeNull();
+
+      acceptReveal = true;
+      act(() => {
+        useChatStore.setState({ sideChatToOpen: { childId: "conv_second", parentId: "conv_ws" } });
+      });
+      expect(readSessionWorkspaceState("conv_ws").openSideChats).toEqual([
+        "conv_fork",
+        "conv_second",
+      ]);
+      expect(readSessionWorkspaceState("conv_ws").selectedSideChatId).toBe("conv_second");
+      expect(useChatStore.getState().sideChatComposers["pending:two"]).toBeUndefined();
+      expect(view.onRightRailTabChange).toHaveBeenCalledWith("sidechat");
       expect(within(rail).getByRole("tab", { name: "Research agent" })).toBeInTheDocument();
-      fireEvent.click(within(rail).getByRole("tab", { name: "Side chat 1" }));
-      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_fork");
     } finally {
       useChatStore.setState({
         sessionHarness: before.sessionHarness,
         boundAgentId: before.boundAgentId,
         send: before.send,
+        sideChatComposers: before.sideChatComposers,
       });
     }
   });

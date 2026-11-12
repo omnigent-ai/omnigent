@@ -5537,9 +5537,15 @@ async function bindStream(
     else set({ sessionUsageLoading: false });
     racedNativeModelOptions.delete(id);
   } catch (err) {
-    if (isConversationDisposed(id)) return;
+    if (
+      isConversationDisposed(id) ||
+      controller.signal.aborted ||
+      get().abortController !== controller
+    )
+      return;
     set({
       loadingConversation: false,
+      sessionUsageLoading: false,
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),
     });
   }

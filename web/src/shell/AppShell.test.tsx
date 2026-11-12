@@ -3130,6 +3130,18 @@ describe("Right workspace card visibility", () => {
       expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
       expect(screen.getByTestId("url-params")).not.toHaveTextContent("file=");
       expect(input).toHaveValue("keep my query");
+      expect(readSessionWorkspaceState("conv_search_hotkey").open).toBe(true);
+      expect(readDefaultWorkspacePanelOpen()).toBe(true);
+      cleanup();
+      renderShell(
+        "/c/conv_search_hotkey",
+        serverInfo({ features: { workspace_content_search: true } }),
+      );
+      expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+      expect(screen.getByRole("tab", { name: "Content search" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
     },
   );
 

@@ -1134,26 +1134,23 @@ function WorkspacePanelImpl({
     if (sideChatToOpen.parentId !== conversationId) return;
     const { childId } = sideChatToOpen;
     clearSideChatToOpen();
+    const subagentId = subagentSessionIdFromTab(childId);
+    // Completing a fork retires its pending identity even if the user keeps editing.
+    if (!childId.startsWith("pending:") && subagentId === null) {
+      const awaiting = awaitingPendingIdsRef.current.shift();
+      if (awaiting !== undefined) {
+        sideChats.rekey(awaiting, childId);
+        useChatStore.getState().clearSideChatComposer(awaiting);
+      }
+    }
     const visit = sessionVisitRef.current;
     const commit = () => {
       if (sessionVisitRef.current !== visit) return;
-      const subagentId = subagentSessionIdFromTab(childId);
       if (subagentId !== null && sideChats.tabs.includes(subagentId)) {
         // Already open as a side chat (a Codex /side fork is listed as a sub-agent).
         sideChats.select(subagentId);
-      } else if (childId.startsWith("pending:") || subagentId !== null) {
-        // "Ask in side chat" (a not-yet-forked tab) and sub-agent tabs (an
-        // existing session) must not take a slot in the Codex awaiting queue.
-        sideChats.open(childId);
       } else {
-        const awaiting = awaitingPendingIdsRef.current.shift();
-        if (awaiting !== undefined) {
-          sideChats.rekey(awaiting, childId);
-          useChatStore.getState().clearSideChatComposer(awaiting);
-        } else {
-          // Generic already rekeyed its own tab; this just re-selects it (idempotent).
-          sideChats.open(childId);
-        }
+        sideChats.open(childId);
       }
       onRightRailTabChange("sidechat");
       onRevealSideChat?.();

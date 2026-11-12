@@ -3380,16 +3380,38 @@ describe("chatStore — send (first-send ordering)", () => {
       expect(sessionReads).toHaveLength(1);
     });
 
-    it("fails a missing session at once", async () => {
-      seedSession("conv_missing", []);
-      const { gets } = failSnapshots("conv_missing", [404, 404, 404]);
+    it.each([
+      [403, false],
+      [404, false],
+      [404, true],
+    ] as const)(
+      "ends initial usage loading on %s only for its request owner (replaced=%s)",
+      async (status, replaced) => {
+        seedSession("conv_missing", []);
+        const { gets } = failSnapshots("conv_missing", [status]);
+        const failingFetch = fetchMock.getMockImplementation()!;
+        let previousController: AbortController | null = null;
+        if (replaced) {
+          fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+            if (String(input).split("?")[0] === "/v1/sessions/conv_missing") {
+              const entry = conversationRegistry.peek("conv_missing")!;
+              previousController = entry.getState().abortController;
+              entry.setState({ abortController: new AbortController() });
+            }
+            return failingFetch(input, init);
+          });
+        }
 
-      await useChatStore.getState().switchTo("conv_missing");
+        await useChatStore.getState().switchTo("conv_missing");
 
-      const error = conversationRegistry.peek("conv_missing")!.getState().conversationLoadError;
-      expect(error).toMatchObject({ status: 404 });
-      expect(gets.metadata).toHaveLength(1);
-    });
+        const state = conversationRegistry.peek("conv_missing")!.getState();
+        expect(state.sessionUsageLoading).toBe(replaced);
+        if (replaced) expect(state.conversationLoadError).toBeNull();
+        else expect(state.conversationLoadError).toMatchObject({ status });
+        expect(gets.metadata).toHaveLength(1);
+        (previousController as AbortController | null)?.abort();
+      },
+    );
 
     it("loads again in place once the retries run out", async () => {
       vi.useFakeTimers();
@@ -3401,6 +3423,7 @@ describe("chatStore — send (first-send ordering)", () => {
       await switched;
       const entry = conversationRegistry.peek("conv_down")!;
       expect(entry.getState().conversationLoadError).not.toBeNull();
+      expect(entry.getState().sessionUsageLoading).toBe(false);
       expect(gets.metadata).toHaveLength(3);
       // The stream stays up meanwhile, partway through a reply.
       streams[0]!.push(previewDelta("Hello ", 0));
