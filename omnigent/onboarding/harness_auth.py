@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 from collections.abc import Callable
 from typing import Literal, NamedTuple, Protocol
 
@@ -281,14 +280,6 @@ def detect_adoptable_credentials() -> list[DetectedCredential]:
         _logger.debug("detect_adoptable_credentials: Databricks detection failed", exc_info=True)
     if databricks_source is not None:
         result.append(DetectedCredential("databricks", databricks_source, None))
-    else:
-        try:
-            isaac_available = shutil.which("isaac") is not None
-        except Exception:
-            isaac_available = False
-            _logger.debug("detect_adoptable_credentials: isaac detection failed", exc_info=True)
-        if isaac_available:
-            result.append(DetectedCredential("databricks", "isaac CLI", None))
 
     try:
         from omnigent.onboarding.ambient import detect_providers
