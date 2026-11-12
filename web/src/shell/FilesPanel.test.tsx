@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { type ComponentProps, useState } from "react";
+import { type ComponentProps, type ReactNode, useState } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -25,7 +25,6 @@ vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 import { useSession } from "@/hooks/useSession";
 import { FilesPanel, fileListStatus, revealFolderInFilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
-import type { ReactNode } from "react";
 
 vi.mock("./WorkspaceUploads", () => ({
   WorkspaceUploadProvider: ({ children }: { children: ReactNode }) => children,
