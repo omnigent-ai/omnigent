@@ -36,6 +36,7 @@ import httpx
 from omnigent.debug_logging import debug_event
 from omnigent.runner import pending_approvals
 from omnigent.runner.mcp_execution_registry import (
+    MCP_INITIAL_STEP,
     MCP_OPERATION_ID_PARAM,
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
     McpExecutionRegistry,
@@ -556,9 +557,9 @@ class ProxyMcpManager:
                     ) from exc
                 held_s = monotonic() - started
                 registry = self._execution_registry
-                # The runner keeps executing a severed call, so re-POSTing the same
-                # operation attaches to it. The server consumes an approval on first
-                # use, so an approved reply is never re-sent.
+                # Only a step the runner registry already holds can be reattached;
+                # server-side tools never reach it. The server consumes an approval
+                # on first use, so an approved reply is never re-sent.
                 if (
                     isinstance(exc, httpx.HTTPStatusError)
                     and exc.response.status_code in _GATEWAY_SEVER_STATUSES
@@ -567,15 +568,16 @@ class ProxyMcpManager:
                     and approval_retries == 0
                     and monotonic() < request_deadline
                     and registry is not None
-                    and registry.has_operation(self._session_id, operation_id)
+                    and registry.has_step(self._session_id, operation_id, MCP_INITIAL_STEP)
                 ):
-                    _logger.warning(
-                        "MCP proxy request for operation %s was severed with HTTP %d "
-                        "after %.0fs; reattaching",
-                        operation_id,
-                        exc.response.status_code,
-                        held_s,
-                    )
+                    with suppress(Exception):
+                        _logger.warning(
+                            "MCP proxy request for operation %s was severed with HTTP %d "
+                            "after %.0fs; reattaching",
+                            operation_id,
+                            exc.response.status_code,
+                            held_s,
+                        )
                     reattach_deadline = request_deadline
                     request_id += 1
                     payload = cast("_JsonObject", {**payload, "id": request_id})

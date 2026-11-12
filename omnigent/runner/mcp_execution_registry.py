@@ -25,6 +25,7 @@ _MAX_COMPLETED = 1024
 # Private runner/server protocol fields. The detached error is only actionable
 # when the caller can prove it still owns the matching operation locally.
 MCP_OPERATION_ID_PARAM = "_omnigent_operation_id"
+MCP_INITIAL_STEP = "initial"
 RUNNER_MCP_EXECUTION_DETACHED_CODE = -32098
 RUNNER_MCP_EXECUTION_DETACHED_MESSAGE = "Runner MCP execution detached."
 
@@ -94,6 +95,11 @@ class McpExecutionRegistry:
             stored_session == session_id and stored_operation == operation_id
             for stored_session, stored_operation, _step in self._entries
         )
+
+    def has_step(self, session_id: str, operation_id: str, step: str) -> bool:
+        """Return whether one operation step is running or retained."""
+        self._prune()
+        return (session_id, operation_id, step) in self._entries
 
     async def execute(
         self,

@@ -544,17 +544,37 @@ async def test_call_tool_reattaches_expired_execution_after_server_disconnect(
     assert first_params[MCP_OPERATION_ID_PARAM].startswith("mcpop_")
 
 
+async def _runner_step_result() -> McpExecutionResult:
+    return McpExecutionResult(status_code=200, content={})
+
+
 class _HeldResponseTransport(httpx.AsyncBaseTransport):
     """Return scripted responses, advancing a fake clock by each response's hold."""
 
-    def __init__(self, responses: list[tuple[float, httpx.Response | Exception]]) -> None:
+    def __init__(
+        self,
+        responses: list[tuple[float, httpx.Response | Exception]],
+        *,
+        runner_registry: McpExecutionRegistry | None = None,
+    ) -> None:
         self.now = 0.0
         self.calls: list[_Call] = []
         self.read_timeouts: list[float] = []
         self._responses = list(responses)
+        # Each call first reaches the runner's initial step, as a server forward would.
+        self._runner_registry = runner_registry
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        self.calls.append(_Call(url=str(request.url), body=json.loads(request.content)))
+        body = json.loads(request.content)
+        self.calls.append(_Call(url=str(request.url), body=body))
+        if self._runner_registry is not None:
+            await self._runner_registry.execute(
+                session_id="conv_test",
+                operation_id=body["params"][MCP_OPERATION_ID_PARAM],
+                step="initial",
+                params={},
+                run=_runner_step_result,
+            )
         read_timeout = request.extensions["timeout"]["read"]
         self.read_timeouts.append(read_timeout)
         held_s, response = self._responses.pop(0)
@@ -640,12 +660,21 @@ async def test_call_tool_reattaches_after_gateway_severs_held_request(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("tool_name", "status", "held_s", "call_budget_s"),
+    ("tool_name", "status", "held_s", "call_budget_s", "runner_executes"),
     [
-        pytest.param("sys_os_shell", 504, 1.0, 7260.0, id="fast-failure"),
-        pytest.param("sys_os_shell", 500, 300.0, 7260.0, id="server-error"),
-        pytest.param("tracker__read_ticket", 504, 300.0, 7260.0, id="registry-route"),
-        pytest.param("sys_os_shell", 504, 300.0, 300.0, id="call-budget-spent"),
+        pytest.param("sys_os_shell", 504, 1.0, 7260.0, True, id="fast-failure"),
+        pytest.param("sys_os_shell", 500, 300.0, 7260.0, True, id="server-error"),
+        pytest.param("tracker__read_ticket", 504, 300.0, 7260.0, True, id="registry-route"),
+        pytest.param("sys_os_shell", 504, 300.0, 300.0, True, id="call-budget-spent"),
+        pytest.param("sys_advise_models", 504, 300.0, 7260.0, False, id="server-side-tool"),
+        pytest.param(
+            "mcp__omnigent__sys_advise_models",
+            504,
+            300.0,
+            7260.0,
+            False,
+            id="namespaced-server-side-tool",
+        ),
     ],
 )
 async def test_call_tool_does_not_repost_unattachable_http_failures(
@@ -654,11 +683,16 @@ async def test_call_tool_does_not_repost_unattachable_http_failures(
     status: int,
     held_s: float,
     call_budget_s: float,
+    runner_executes: bool,
 ) -> None:
-    """Only a held gateway sever on a runner-retained operation is re-POSTed."""
+    """Only a held gateway sever on a runner-held execution is re-POSTed."""
     from omnigent.runner import proxy_mcp_manager
 
-    transport = _HeldResponseTransport([(held_s, httpx.Response(status))])
+    registry = McpExecutionRegistry()
+    transport = _HeldResponseTransport(
+        [(held_s, httpx.Response(status))],
+        runner_registry=registry if runner_executes else None,
+    )
     monkeypatch.setattr(proxy_mcp_manager, "monotonic", lambda: transport.now)
     monkeypatch.setattr(proxy_mcp_manager, "MCP_PROXY_CALL_TIMEOUT_S", call_budget_s)
     spec = AgentSpec(
@@ -668,7 +702,7 @@ async def test_call_tool_does_not_repost_unattachable_http_failures(
     )
     async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
         manager = ProxyMcpManager(
-            session_id="conv_test", ap_client=client, execution_registry=McpExecutionRegistry()
+            session_id="conv_test", ap_client=client, execution_registry=registry
         )
         with pytest.raises(RuntimeError, match=str(status)):
             await manager.call_tool(spec, tool_name, {})
@@ -709,13 +743,16 @@ async def test_call_tool_bounds_reattach_by_remaining_call_budget(
     """A reattach admitted just before the deadline gets only the remaining budget."""
     from omnigent.runner import proxy_mcp_manager
 
-    transport = _HeldResponseTransport([(299.5, httpx.Response(504)), retry])
+    registry = McpExecutionRegistry()
+    transport = _HeldResponseTransport(
+        [(299.5, httpx.Response(504)), retry], runner_registry=registry
+    )
     monkeypatch.setattr(proxy_mcp_manager, "monotonic", lambda: transport.now)
     monkeypatch.setattr(proxy_mcp_manager, "MCP_PROXY_CALL_TIMEOUT_S", 300.0)
     monkeypatch.setattr(proxy_mcp_manager, "_SERVER_RECONNECT_WAIT_S", 5.0)
     async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
         manager = ProxyMcpManager(
-            session_id="conv_test", ap_client=client, execution_registry=McpExecutionRegistry()
+            session_id="conv_test", ap_client=client, execution_registry=registry
         )
         with pytest.raises(RuntimeError, match=error):
             await manager.call_tool(None, "sys_os_shell", {})
@@ -737,6 +774,7 @@ async def test_call_tool_bounds_whole_reattach_by_remaining_call_budget(
                 await asyncio.sleep(5.0)
             return response
 
+    registry = McpExecutionRegistry()
     transport = _StallingReattachTransport(
         [
             (299.9, httpx.Response(504)),
@@ -750,13 +788,14 @@ async def test_call_tool_bounds_whole_reattach_by_remaining_call_budget(
                     }
                 ),
             ),
-        ]
+        ],
+        runner_registry=registry,
     )
     monkeypatch.setattr(proxy_mcp_manager, "monotonic", lambda: transport.now)
     monkeypatch.setattr(proxy_mcp_manager, "MCP_PROXY_CALL_TIMEOUT_S", 300.0)
     async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
         manager = ProxyMcpManager(
-            session_id="conv_test", ap_client=client, execution_registry=McpExecutionRegistry()
+            session_id="conv_test", ap_client=client, execution_registry=registry
         )
         with pytest.raises(RuntimeError, match="did not finish within 300s"):
             await manager.call_tool(None, "sys_os_shell", {})
@@ -808,6 +847,7 @@ async def test_call_tool_excludes_approval_wait_from_reattach_budget(
     from omnigent.runner import proxy_mcp_manager
 
     elicitation_id = "elicit_after_reattach"
+    registry = McpExecutionRegistry()
     transport = _HeldResponseTransport(
         [
             (200.0, httpx.Response(504)),
@@ -822,14 +862,15 @@ async def test_call_tool_excludes_approval_wait_from_reattach_budget(
                     }
                 ),
             ),
-        ]
+        ],
+        runner_registry=registry,
     )
     monkeypatch.setattr(proxy_mcp_manager, "monotonic", lambda: transport.now)
     monkeypatch.setattr(proxy_mcp_manager, "MCP_PROXY_CALL_TIMEOUT_S", 300.0)
     pending_approvals.reset_for_tests()
     async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
         manager = ProxyMcpManager(
-            session_id="conv_test", ap_client=client, execution_registry=McpExecutionRegistry()
+            session_id="conv_test", ap_client=client, execution_registry=registry
         )
         task = asyncio.create_task(manager.call_tool(None, "sys_os_shell", {}))
         try:
@@ -1017,6 +1058,43 @@ async def test_call_tool_failed_diagnostics_preserves_original_error(
 
     assert isinstance(failure.value.__cause__, httpx.HTTPStatusError)
     assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_call_tool_failed_diagnostics_do_not_abort_reattach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner import proxy_mcp_manager
+
+    def broken_sink(*args: Any, **kwargs: Any) -> None:
+        raise ValueError("logging unavailable")
+
+    registry = McpExecutionRegistry()
+    transport = _HeldResponseTransport(
+        [
+            (300.0, httpx.Response(504)),
+            (
+                1.0,
+                _json_resp(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {"content": [{"type": "text", "text": "done"}]},
+                    }
+                ),
+            ),
+        ],
+        runner_registry=registry,
+    )
+    monkeypatch.setattr(proxy_mcp_manager, "monotonic", lambda: transport.now)
+    monkeypatch.setattr(proxy_mcp_manager._logger, "warning", broken_sink)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
+        manager = ProxyMcpManager(
+            session_id="conv_test", ap_client=client, execution_registry=registry
+        )
+        assert await manager.call_tool(None, "sys_os_shell", {}) == "done"
+
+    assert len(transport.calls) == 2
 
 
 @pytest.mark.asyncio

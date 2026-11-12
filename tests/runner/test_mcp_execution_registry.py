@@ -83,6 +83,7 @@ async def test_live_operation_lease_survives_result_eviction(
 
     registry.retain_operation("conv_restart", "mcpop_restart")
     assert registry.has_operation("conv_restart", "mcpop_restart")
+    assert not registry.has_step("conv_restart", "mcpop_restart", "initial")
 
     request = {"name": "deploy", "arguments": {}}
     first = await registry.execute(
@@ -92,6 +93,7 @@ async def test_live_operation_lease_survives_result_eviction(
         params=request,
         run=_external_work,
     )
+    assert registry.has_step("conv_restart", "mcpop_restart", "initial")
     second = await registry.execute(
         session_id="conv_restart",
         operation_id="mcpop_restart",
