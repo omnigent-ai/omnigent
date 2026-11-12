@@ -190,7 +190,7 @@ describe("ServerSelectorV2", () => {
     expect(onStartLocal).not.toHaveBeenCalled();
   });
 
-  it("still installs the CLI when explicitly opening a local installation", async () => {
+  it("never installs the CLI from a picked local installation, even a stopped one", async () => {
     const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
     const onStartLocal = vi.fn().mockResolvedValue({ ok: true });
     render(
@@ -204,9 +204,9 @@ describe("ServerSelectorV2", () => {
         })}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start Omnigent" }));
     await waitFor(() => expect(onStartLocal).toHaveBeenCalledOnce());
-    expect(onInstallCli).toHaveBeenCalledOnce();
+    expect(onInstallCli).not.toHaveBeenCalled();
   });
 
   it("re-checks on click: a local install that stopped since the list loaded is booted", async () => {
@@ -266,11 +266,19 @@ describe("ServerSelectorV2", () => {
     expect(screen.getByText(/connecting to the local server/i)).toBeInTheDocument();
   });
 
-  it("a new MDM user's typed URL goes through the runner step", async () => {
-    const getRunnerOptions = vi.fn().mockResolvedValue({ remote: false });
+  it("a new MDM user's typed URL with no runner to set up opens directly, without installing", async () => {
+    const getRunnerOptions = vi.fn().mockResolvedValue({ remote: false, bundledCli: false });
+    const onConnect = vi.fn().mockResolvedValue({});
+    const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
     render(
       <ServerSelectorV2
-        setup={makeSetup({ managedServers: ["https://team.example.com/"], getRunnerOptions })}
+        setup={makeSetup({
+          installed: false,
+          managedServers: ["https://team.example.com/"],
+          getRunnerOptions,
+          onConnect,
+          onInstallCli,
+        })}
       />,
     );
     fireEvent.pointerDown(screen.getByRole("button", { name: /choose team url/i }), { button: 0 });
@@ -279,14 +287,16 @@ describe("ServerSelectorV2", () => {
     });
     fireEvent.keyDown(screen.getByLabelText("Server URL"), { key: "Enter" });
     fireEvent.click(screen.getByRole("button", { name: "Join your team (typed.example.com)" }));
-    expect(
-      await screen.findByRole("heading", { name: /where do you work today/i }),
-    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("https://typed.example.com/", expect.any(Function)),
+    );
     expect(getRunnerOptions).toHaveBeenCalledWith("https://typed.example.com/");
+    expect(screen.queryByRole("heading", { name: /where do you work today/i })).toBeNull();
+    expect(onInstallCli).not.toHaveBeenCalled();
   });
 
   it("picking a preset offers only this laptop when the shell reports no remote environment", async () => {
-    const getRunnerOptions = vi.fn().mockResolvedValue({ remote: false });
+    const getRunnerOptions = vi.fn().mockResolvedValue({ remote: false, bundledCli: true });
     render(
       <ServerSelectorV2
         setup={makeSetup({ managedServers: ["https://team.example.com/"], getRunnerOptions })}
@@ -312,7 +322,7 @@ describe("ServerSelectorV2", () => {
             resolveFirst = resolve;
           }),
       )
-      .mockResolvedValue({ remote: false });
+      .mockResolvedValue({ remote: false, bundledCli: true });
     const onConnect = vi.fn().mockResolvedValue({});
     render(
       <ServerSelectorV2
@@ -342,18 +352,22 @@ describe("ServerSelectorV2", () => {
     );
   });
 
-  it("a failed runner lookup still opens the runner step, laptop only", async () => {
+  it("a failed runner lookup opens the server directly", async () => {
+    const onConnect = vi.fn().mockResolvedValue({});
     render(
       <ServerSelectorV2
         setup={makeSetup({
           managedServers: ["https://team.example.com/"],
           getRunnerOptions: vi.fn().mockRejectedValue(new Error("ipc down")),
+          onConnect,
         })}
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
-    expect(await screen.findByRole("radio", { name: /my laptop/i })).toBeChecked();
-    expect(screen.getAllByRole("radio")).toHaveLength(1);
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", expect.any(Function)),
+    );
+    expect(screen.queryByRole("radio")).toBeNull();
   });
 
   it("the runner step shows a direct connect's error", async () => {
@@ -362,6 +376,7 @@ describe("ServerSelectorV2", () => {
         setup={makeSetup({
           installed: true,
           managedServers: ["https://team.example.com/"],
+          getRunnerOptions: vi.fn().mockResolvedValue({ bundledCli: true }),
           onConnect: vi.fn().mockResolvedValue({ error: "unreachable" }),
         })}
       />,
@@ -388,11 +403,13 @@ describe("ServerSelectorV2", () => {
 
   it("the runner step connects to the preset, and Back returns to the landing", async () => {
     const onConnect = vi.fn().mockResolvedValue({});
+    const getRunnerOptions = vi.fn().mockResolvedValue({ bundledCli: true });
     const { unmount } = render(
       <ServerSelectorV2
         setup={makeSetup({
           installed: true,
           managedServers: ["https://team.example.com/"],
+          getRunnerOptions,
           onConnect,
         })}
       />,
@@ -405,7 +422,9 @@ describe("ServerSelectorV2", () => {
     unmount();
 
     render(
-      <ServerSelectorV2 setup={makeSetup({ managedServers: ["https://team.example.com/"] })} />,
+      <ServerSelectorV2
+        setup={makeSetup({ managedServers: ["https://team.example.com/"], getRunnerOptions })}
+      />,
     );
     fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
     fireEvent.click(await screen.findByRole("button", { name: "Back" }));
@@ -527,13 +546,16 @@ describe("ServerSelectorV2", () => {
   it.each(["install", "laptop", "server"])(
     "does not offer Continue anyway after a %s failure",
     async (failure) => {
-      await installFromRunnerStep({
-        installed: false,
-        onInstallCli: vi.fn().mockResolvedValue({ ok: failure !== "install", error: "failed" }),
-        onConnectRunner: vi.fn().mockResolvedValue({ ok: failure !== "laptop", error: "failed" }),
-        onConnect: vi.fn().mockResolvedValue({ error: "failed" }),
-        getRunnerOptions: vi.fn().mockResolvedValue({ remote: failure === "server" }),
-      });
+      await installFromRunnerStep(
+        {
+          installed: false,
+          onInstallCli: vi.fn().mockResolvedValue({ ok: failure !== "install", error: "failed" }),
+          onConnectRunner: vi.fn().mockResolvedValue({ ok: failure !== "laptop", error: "failed" }),
+          onConnect: vi.fn().mockResolvedValue({ error: "failed" }),
+          getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
+        },
+        failure === "server" ? undefined : /my laptop/i,
+      );
       expect(await screen.findByText("failed")).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
     },
@@ -700,8 +722,14 @@ describe("ServerSelectorV2", () => {
       return {};
     });
     await installFromRunnerStep(
-      { installed: false, onInstallCli, onConnectRunner, onConnect },
-      undefined,
+      {
+        installed: false,
+        onInstallCli,
+        onConnectRunner,
+        onConnect,
+        getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
+      },
+      /my laptop/i,
       "Install Omnigent",
     );
     await waitFor(() => expect(calls).toEqual(["install", "runner", "connect"]));
@@ -711,7 +739,15 @@ describe("ServerSelectorV2", () => {
   it("still installs for explicit laptop setup on shells without runner support", async () => {
     const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
     const onConnect = vi.fn().mockResolvedValue({});
-    await installFromRunnerStep({ installed: false, onInstallCli, onConnect });
+    await installFromRunnerStep(
+      {
+        installed: false,
+        onInstallCli,
+        onConnect,
+        getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
+      },
+      /my laptop/i,
+    );
     await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
     expect(onInstallCli).toHaveBeenCalledOnce();
     expect(onInstallCli.mock.invocationCallOrder[0]).toBeLessThan(
@@ -845,24 +881,20 @@ describe("onboarding parity", () => {
     [{}, "Server ready"],
     [{ error: "Server unavailable" }, "Server unavailable"],
     [{ cancelled: true }, "Connection cancelled."],
-  ])(
-    "opens a selected local server without retrying failed installation (%j)",
-    async (result, message) => {
-      const setup = makeSetup({
-        installed: false,
-        recentServers: ["http://localhost:6767/"],
-        onInstallCli: vi.fn().mockResolvedValue({ ok: false, error: "Installer failed" }),
-        onConnect: vi.fn().mockResolvedValue(result),
-      });
-      render(<ServerSelectorV2 setup={setup} />);
-      fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
-      fireEvent.click(await screen.findByRole("button", { name: "Continue anyway" }));
-      await screen.findByText(message);
-      expect(setup.onConnect).toHaveBeenCalledWith("http://localhost:6767/", expect.any(Function));
-      expect(setup.onInstallCli).toHaveBeenCalledOnce();
-      expect(setup.onStartLocal).not.toHaveBeenCalled();
-    },
-  );
+  ])("opens a running local server without installing the CLI (%j)", async (result, message) => {
+    const setup = makeSetup({
+      installed: false,
+      recentServers: ["http://localhost:6767/"],
+      onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+      onConnect: vi.fn().mockResolvedValue(result),
+    });
+    render(<ServerSelectorV2 setup={setup} />);
+    fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
+    await screen.findByText(message);
+    expect(setup.onConnect).toHaveBeenCalledWith("http://localhost:6767/", expect.any(Function));
+    expect(setup.onInstallCli).not.toHaveBeenCalled();
+    expect(setup.onStartLocal).not.toHaveBeenCalled();
+  });
 
   it("does not offer Continue anyway when new local setup has no server destination", async () => {
     const setup = makeSetup({
@@ -898,6 +930,7 @@ describe("onboarding parity", () => {
     const setup = makeSetup({
       installed: true,
       managedServers: ["http://team.example.com/"],
+      getRunnerOptions: vi.fn().mockResolvedValue({ bundledCli: true }),
       onConnectRunner: vi.fn().mockResolvedValue({ ok: true }),
     });
     render(<ServerSelectorV2 setup={setup} />);
@@ -924,16 +957,15 @@ describe("onboarding parity", () => {
     },
   );
 
-  it("can open an existing local server from manual installation instructions", async () => {
+  it("opens a running local server without manual installation instructions", async () => {
     const setup = makeSetup({
       installed: false,
       installSupported: false,
       recentServers: ["http://localhost:6767/"],
     });
     render(<ServerSelectorV2 setup={setup} />);
-    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
-    expect(screen.getByRole("link", { name: "Installation instructions" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Continue anyway" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
+    expect(screen.queryByRole("link", { name: "Installation instructions" })).toBeNull();
     await waitFor(() => expect(setup.onConnect).toHaveBeenCalledOnce());
     expect(setup.onStartLocal).not.toHaveBeenCalled();
   });
