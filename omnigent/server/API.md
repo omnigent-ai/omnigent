@@ -664,16 +664,15 @@ already uploaded or registered an agent. The response is the full
     launches the runner there. With `"managed"`, `workspace` must
     NOT be set (422) — the server chooses it — and `host_id`, when
     set, names the NEW sandbox host rather than an existing one: 32
-    lowercase hex characters, sent only when `GET /v1/info` reports
-    `request_managed_sandbox_host_id`, so the caller can route the
+    lowercase hex characters, always sent by clients, so the caller can route the
     session's requests by it before the host connects. It is recorded
     in the `omnigent.sandbox.requested_host_id` label until the host
     binds; null lets the server mint one. A malformed id, or one on a
     child (`parent_session_id`) create, is a 422; an id that names an
     existing host, or whose `managed-<first 8 hex>` name one of the
     caller's hosts already uses, is a 409 `already_exists`, raised
-    before the session is created. JSON creates only: the multipart
-    bundle create does not take it.
+    before the session is created. The multipart bundle create takes
+    it in `metadata` the same way.
     Provisioning runs in the BACKGROUND: the create returns
     immediately with `host_id` / `workspace` null, and they appear
     on `GET /v1/sessions/{id}` once the sandbox host registers. A
@@ -1312,8 +1311,7 @@ Request body matches `SessionForkRequest`:
 
   host_id (string | null, optional)
     Id for the fork's new sandbox host: 32 lowercase hex characters,
-    sent only when `GET /v1/info` reports
-    `request_managed_sandbox_host_id`. Recorded in the
+    always sent by clients. Recorded in the
     `omnigent.sandbox.requested_host_id` label until the host binds;
     null lets the server mint one. Only valid with
     `host_type: "managed"` (422 otherwise).
@@ -1402,8 +1400,8 @@ it does on a `host_type: "managed"` fork:
     server's first.
 
   host_id (string | null, optional)
-    Id for the new sandbox host: 32 lowercase hex characters, sent
-    only when `GET /v1/info` reports `request_managed_sandbox_host_id`.
+    Id for the new sandbox host: 32 lowercase hex characters. Clients
+    always send it; servers older than v0.19 reject it.
     Recorded in the `omnigent.sandbox.requested_host_id` label until
     the host binds; null lets the server mint one.
 

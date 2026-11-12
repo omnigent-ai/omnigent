@@ -680,6 +680,7 @@ describe("SwitchHostDialog", () => {
       expect(launchManagedHostMock).toHaveBeenCalledWith("conv_1", {
         provider: "modal",
         workspace: null,
+        hostId: expect.any(String),
       });
     });
 

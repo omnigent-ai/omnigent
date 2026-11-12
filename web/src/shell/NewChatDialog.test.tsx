@@ -8609,7 +8609,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-repo-select")).toBeNull();
   });
 
-  it("creates a managed session without host_id/workspace and no provisioning subtext", async () => {
+  it("creates a managed session with a minted host_id and no workspace and no provisioning subtext", async () => {
     // Controlled promise so the in-flight state is observable
     // deterministically before the create resolves.
     let resolveCreate!: (res: Response) => void;
@@ -8640,7 +8640,7 @@ describe("NewChatLandingScreen", () => {
     const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
     expect(body.host_type).toBe("managed");
     expect(body.agent_id).toBe("a1");
-    expect("host_id" in body).toBe(false);
+    expect(body.host_id).toMatch(/^[0-9a-f]{32}$/);
     expect("workspace" in body).toBe(false);
     expect("git" in body).toBe(false);
     resolveCreate({
@@ -8866,34 +8866,26 @@ describe("NewChatLandingScreen", () => {
     expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it.each([true, false])(
-    "chooses the sandbox host's id only on a server that accepts it (%s)",
-    async (accepts) => {
-      authenticatedFetchMock.mockResolvedValue({
-        ok: true,
-        json: async () => ({ id: "conv_new" }),
-      } as unknown as Response);
-      renderLanding({
-        managed_sandboxes_enabled: true,
-        sandbox_provider: "modal",
-        request_managed_sandbox_host_id: accepts,
-      });
-      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
-        target: { value: "audit the repo" },
-      });
-      expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
-      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
-      await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
-      const [, init] = authenticatedFetchMock.mock.calls[0];
-      const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
-      expect(body.host_type).toBe("managed");
-      if (accepts) {
-        expect(body.host_id).toMatch(/^[0-9a-f]{32}$/);
-      } else {
-        expect("host_id" in body).toBe(false);
-      }
-    },
-  );
+  it("sends a fresh sandbox host id on every managed JSON create", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "audit the repo" },
+    });
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.host_type).toBe("managed");
+    expect(body.host_id).toMatch(/^[0-9a-f]{32}$/);
+  });
 
   it("sends the added repositories as the managed workspaces list", async () => {
     authenticatedFetchMock.mockResolvedValue({
@@ -8934,7 +8926,7 @@ describe("NewChatLandingScreen", () => {
     // in parallel. host_id/git stay absent (422 otherwise).
     expect(body.workspaces).toEqual(["https://github.com/org/api", "https://github.com/org/web"]);
     expect(body.host_type).toBe("managed");
-    expect("host_id" in body).toBe(false);
+    expect(body.host_id).toMatch(/^[0-9a-f]{32}$/);
     expect("git" in body).toBe(false);
   });
 
@@ -9015,8 +9007,10 @@ describe("NewChatLandingScreen", () => {
       target: { value: "start fresh" },
     });
     fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
-    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
-    const [, init] = authenticatedFetchMock.mock.calls[0];
+    await waitFor(() =>
+      expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(true),
+    );
+    const [, init] = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
     const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
     expect(body.host_type).toBe("managed");
     // No selections carried over → an empty workspaces list (empty server-created
@@ -9609,7 +9603,7 @@ describe("NewChatLandingScreen skills menu", () => {
           },
         },
       });
-      expect(body.host_id).toBeUndefined();
+      expect(body.host_id).toMatch(/^[0-9a-f]{32}$/);
     },
   );
 
@@ -13428,7 +13422,7 @@ describe("managed sandbox gateway preview", () => {
       model_override: astra.id,
       reasoning_effort: "max",
     });
-    expect(body.host_id).toBeUndefined();
+    expect(body.host_id).toMatch(/^[0-9a-f]{32}$/);
     expect(body.inference_configuration_revision).toBeUndefined();
     expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
       "arclet",

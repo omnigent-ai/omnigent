@@ -1,6 +1,7 @@
 """Tool wire contracts, native discovery, and uncertain delivery handling."""
 
 import json
+import re
 from unittest.mock import Mock
 from uuid import uuid4
 
@@ -434,9 +435,7 @@ async def test_same_host_first_task_failure_returns_created_session(status, monk
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "placement,reserves_host", [("same_host", False), ("managed", False), ("managed", True)]
-)
+@pytest.mark.parametrize("placement,reserves_host", [("same_host", False), ("managed", True)])
 @pytest.mark.parametrize(
     "failure",
     ["timeout", "non_json", "null", "list", "missing_id", "invalid_id", 408, 429, 503],
@@ -492,7 +491,7 @@ async def test_independent_creation_uncertain_result_is_not_retried(
     assert "sys_session_get_info" in result["error"]
     assert result["agent_id"] == "worker"
     assert result["title"] == "Review worker"
-    if reserves_host:
+    if placement == "managed":
         assert result["host_id"] == json.loads(requests[0].content)["host_id"]
     else:
         assert "host_id" not in result
@@ -751,8 +750,7 @@ async def test_independent_initial_message_is_validated_before_creation(placemen
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("supported", [False, True])
-async def test_managed_create_routes_to_reserved_host_through_auth_retry(monkeypatch, supported):
+async def test_managed_create_routes_to_reserved_host_through_auth_retry(monkeypatch):
     from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, open_server_client
     from omnigent.runner._entry import _RunnerDatabricksAuth
 
@@ -763,7 +761,7 @@ async def test_managed_create_routes_to_reserved_host_through_auth_retry(monkeyp
     def respond(request):
         if request.url.path == "/v1/info":
             return httpx.Response(
-                200, json={"request_managed_sandbox_host_id": supported, "sibling_sessions": True}
+                200, json={"request_managed_sandbox_host_id": True, "sibling_sessions": True}
             )
         requests.append((dict(request.headers), json.loads(request.content)))
         if len(requests) == 1:
@@ -789,7 +787,7 @@ async def test_managed_create_routes_to_reserved_host_through_auth_retry(monkeyp
     assert requests[0] == requests[1]
     headers, body = requests[-1]
     assert headers.get(OMNIGENT_SLICE_KEY_HEADER.lower()) == body.get("host_id")
-    assert ("host_id" in body) is supported
+    assert re.fullmatch(r"[0-9a-f]{32}", body["host_id"])
 
 
 _PROJECT_ID = "ab" * 16

@@ -3823,12 +3823,9 @@ async def _execute_session_create(
                             "no session was created."
                         }
                     )
-            host_id = (
-                uuid.uuid4().hex if info_data.get("request_managed_sandbox_host_id") else None
-            )
-            if host_id is not None:
-                body["host_id"] = host_id
-                unconfirmed_creation["host_id"] = host_id
+            host_id = uuid.uuid4().hex
+            body["host_id"] = host_id
+            unconfirmed_creation["host_id"] = host_id
         project_error = await _add_named_project(body, args, server_client, info_data, headers)
         if project_error is not None:
             return project_error

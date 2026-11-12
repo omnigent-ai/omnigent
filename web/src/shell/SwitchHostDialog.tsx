@@ -33,7 +33,7 @@ import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
-import { randomUUID } from "@/lib/randomUUID";
+import { managedSandboxHostId } from "@/lib/managedSandboxHost";
 import { composeSandboxWorkspace, sandboxRepoProblem } from "@/lib/sandboxRepositories";
 import { launchManagedHost, launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
@@ -310,13 +310,12 @@ function SupportedSwitchHostDialog({
         // The launch's own events report progress from here, but its first ones
         // may go to another replica's stream; the response shows where it is.
         const showLaunch = captureLaunchStatus(sessionId);
+        // Route the launch by the new sandbox's host id.
+        const sandboxHostId = managedSandboxHostId();
         const moved = await launchManagedHost(sessionId, {
           provider: sandboxProvider,
           workspace: composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch) ?? null,
-          // Route the launch by the new sandbox's host id.
-          ...(info !== "loading" && info.request_managed_sandbox_host_id
-            ? { hostId: randomUUID().replace(/-/g, "") }
-            : {}),
+          ...(sandboxHostId ? { hostId: sandboxHostId } : {}),
         });
         showLaunch(moved);
       } else if (selectedHostId !== null) {
