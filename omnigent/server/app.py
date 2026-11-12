@@ -85,6 +85,7 @@ from omnigent.server import (
     session_live_state,
     session_pull_requests,
     shutdown_state,
+    workflows,
 )
 from omnigent.server.auth import (
     RESERVED_USER_LOCAL,
@@ -339,6 +340,9 @@ class ServerInfoResponse(BaseModel):
     # GET/POST /v1/sessions/{id}/journal and session.journal.appended; absent on
     # older servers, which clients treat as unsupported.
     session_journal: bool = False
+    # /v1/workflows, the caller's saved workflows; absent on older servers, which
+    # clients treat as unsupported.
+    workflows: bool = False
     # GET/PUT /v1/settings/session-title-instructions; absent on older servers,
     # which clients treat as unsupported.
     session_title_instructions: bool = False
@@ -3746,6 +3750,7 @@ def create_app(
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
                 is not None,
                 "session_journal": session_journal.open_store(conversation_store) is not None,
+                "workflows": workflows.open_store(conversation_store) is not None,
                 "session_title_instructions": user_settings_store is not None,
                 "filesystem_attachments": {
                     "extensions": sorted(filesystem_attachment_policy.extensions),
@@ -4024,6 +4029,15 @@ def create_app(
         ),
         prefix="/v1",
         tags=["session_journal"],
+    )
+    app.include_router(
+        workflows.create_workflows_router(
+            conversation_store,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["workflows"],
     )
     if comment_store is not None:
         app.include_router(
