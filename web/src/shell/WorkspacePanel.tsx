@@ -1305,10 +1305,20 @@ function WorkspacePanelImpl({
   );
   const [previewTarget, setPreviewTarget] = useState<HTMLDivElement | null>(null);
   const previewPath = fileTreeSplitEnabled && !pending ? treePreviewPath : null;
-  const standalonePath = !pending && !terminalShown ? selectedFileRequest : null;
+  // What the rail's one editor holds: a file and the citation it was opened at. A file it
+  // already holds stays loaded while hidden (another tab, a narrow rail, lost access).
+  const [held, setHeld] = useState<{
+    session: string;
+    path: string;
+    position?: FilePosition;
+  } | null>(null);
+  const heldPath = held?.session === conversationId ? held.path : null;
+  // Without file access, a tab's file loads only if the editor already holds it.
+  const standalonePath =
+    !pending && !terminalShown && (canBrowseWorkspace || heldPath === selectedFileRequest)
+      ? selectedFileRequest
+      : null;
   const standaloneShown = !pending && !terminalShown && selectedFilePath !== null;
-  // Whether an editor holds a file, on screen or not; leaving it may need its consent.
-  const fileLoaded = standalonePath !== null || previewPath !== null;
   const closeTreePreview = useCallback(() => onCloseTreePreview?.(), [onCloseTreePreview]);
   useEffect(() => {
     if (!showContentSearch || !showFilesPanel || pending || isMobile) return;
@@ -1662,22 +1672,31 @@ function WorkspacePanelImpl({
   const treeShown = filesPanelActive && rightRailTab !== "changes";
   const previewShown = treeSplitEnabled && treeSplitFits && treeShown && previewPath !== null;
   const viewerShown = standaloneShown || previewShown;
-  // The file beside the tree loads once the editor holds it (beside the tree, or as the same
-  // tab), then stays loaded in this session. Guards rely on it: leaving a tab keeps it open.
-  const [loadedPreview, setLoadedPreview] = useState<{ session: string; path: string } | null>(
-    null,
-  );
-  const editorHoldsPreview =
-    previewPath !== null && (previewShown || standalonePath === previewPath);
-  const previewLoaded =
-    previewPath !== null &&
-    loadedPreview?.session === conversationId &&
-    loadedPreview.path === previewPath;
-  if (editorHoldsPreview && !previewLoaded)
-    setLoadedPreview({ session: conversationId, path: previewPath });
-  // One editor for the rail: the selected file tab's file, else the file beside the tree.
-  // It stays mounted while hidden (another tab, a narrow rail, lost access), keeping drafts.
-  const documentPath = standalonePath ?? (editorHoldsPreview || previewLoaded ? previewPath : null);
+  // The selected tab's file, else the file beside the tree once shown or already held. Guards
+  // rely on it: leaving a tab whose file is the one beside the tree keeps that file loaded.
+  const previewHeld = previewPath !== null && (previewShown || heldPath === previewPath);
+  const documentPath = standalonePath ?? (previewHeld ? previewPath : null);
+  // The held file keeps its tab's citation, and the source view it implies, while hidden.
+  const keptPosition = heldPath !== null && heldPath === documentPath ? held?.position : undefined;
+  const viewerPosition = standalonePath !== null ? filePosition : keptPosition;
+  const heldChanged =
+    documentPath === null
+      ? held !== null
+      : heldPath !== documentPath || held?.position !== viewerPosition;
+  if (heldChanged) {
+    setHeld(
+      documentPath === null
+        ? null
+        : { session: conversationId, path: documentPath, position: viewerPosition },
+    );
+  }
+  // Whether the editor holds a file, on screen or not; leaving it may need its consent.
+  const fileLoaded = documentPath !== null;
+  // Opening the held file beside the tree again starts it afresh, without a kept citation.
+  const showFileInTree = (path: string) => {
+    if (path === documentPath && held?.position) setHeld({ ...held, position: undefined });
+    openFileInTree?.(path);
+  };
   // Desktop Close (⌘W / Ctrl+W) while the rail, or its embedded browser view,
   // has focus: close the tab on screen, or hide the rail on a fixed page.
   // Otherwise AppShell's handler leaves the session.
@@ -2239,7 +2258,7 @@ function WorkspacePanelImpl({
                 frameless
                 onFileSelect={
                   treeSplitEnabled && treeSplitFits && openFileInTree && rightRailTab !== "changes"
-                    ? openFileInTree
+                    ? showFileInTree
                     : openFileViewer
                 }
                 onFileOpenInTab={treeSplitEnabled ? openFileViewer : undefined}
@@ -2334,8 +2353,7 @@ function WorkspacePanelImpl({
                 mediaActive={viewerShown && (isMobile ? mobileFileTarget != null : open)}
                 conversationId={conversationId}
                 path={documentPath}
-                // Hidden but still the tab's file, it keeps its citation and the view it implies.
-                position={documentPath === standalonePath ? filePosition : undefined}
+                position={viewerPosition}
                 onClose={viewerClose}
                 onCloseTab={viewerShown ? viewerCloseTab : undefined}
                 onNavigateTo={viewerShown ? openFileViewer : undefined}

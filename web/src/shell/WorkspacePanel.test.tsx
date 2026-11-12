@@ -2484,6 +2484,72 @@ describe("WorkspacePanel file tree split", () => {
     expect(draftIn(editor)).toHaveValue("Keep this draft");
   });
 
+  it("keeps a tab's citation while its file stays beside the tree, until opened there again", async () => {
+    measureRail(800);
+    const fileGuard = vi.fn<FileNavigationGuard>((destination, _options, commit) => {
+      if (destination === "docs/a.md") commit();
+    });
+    const { rerender, openFileInTree } = renderWorkspace({
+      ...split,
+      showBrowserTab: true,
+      treePreviewPath: "docs/a.md",
+      openFiles: ["docs/a.md"],
+      selectedFilePath: "docs/a.md",
+      filePosition: { line: 3 },
+      fileGuard,
+    });
+    const editor = viewer();
+    expect(editor).toHaveAttribute("data-line", "3");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Browser" }));
+    expect(fileGuard).toHaveBeenCalledWith("docs/a.md", undefined, expect.any(Function));
+
+    // Hiding keeps the citation, so the viewer has no view change to confirm afterwards.
+    rerender({ selectedFilePath: null, rightRailTab: "browser" });
+    expect(viewer()).toBe(editor);
+    expect(editor).toHaveAttribute("data-line", "3");
+    rerender({ rightRailTab: "files" });
+    expect(within(screen.getByTestId("preview-pane")).getByTestId("file-viewer-stub")).toBe(editor);
+    expect(editor).toHaveAttribute("data-line", "3");
+
+    fireEvent.click(screen.getByRole("button", { name: "tree: a.md" }));
+    expect(openFileInTree).toHaveBeenCalledWith("docs/a.md");
+    expect(editor).not.toHaveAttribute("data-line");
+  });
+
+  it("drops a tab's citation once another file is beside the tree", () => {
+    measureRail(800);
+    const { rerender } = renderWorkspace({
+      ...split,
+      treePreviewPath: "docs/b.md",
+      openFiles: ["docs/a.md"],
+      selectedFilePath: "docs/a.md",
+      filePosition: { line: 3 },
+    });
+    rerender({ selectedFilePath: null });
+    expect(viewer()).toHaveTextContent("docs/b.md");
+    expect(viewer()).not.toHaveAttribute("data-line");
+    rerender({ treePreviewPath: "docs/a.md" });
+    expect(viewer()).not.toHaveAttribute("data-line");
+  });
+
+  it("loads no file for a grid cell that has never had file access", () => {
+    const { rerender } = renderWorkspace({
+      ...split,
+      contained: true,
+      canBrowseWorkspace: false,
+      showFilesPanel: false,
+      openFiles: ["docs/guide.md"],
+      selectedFilePath: "docs/guide.md",
+    });
+    expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+    rerender({ canBrowseWorkspace: true, showFilesPanel: true });
+    expect(viewer()).toHaveTextContent("docs/guide.md");
+  });
+
   it("loads a saved preview only once it is shown", () => {
     const resize = measureRail(400);
     renderWorkspace({ ...split, treePreviewPath: "docs/a.md" });
