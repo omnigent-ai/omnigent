@@ -6291,7 +6291,12 @@ def create_runner_app(
             except ValueError as exc:
                 return JSONResponse(
                     status_code=400,
-                    content={"error": {"code": "invalid_input", "message": str(exc)}},
+                    content={
+                        "error": {
+                            "code": "invalid_input",
+                            "message": _client_safe_error_detail(exc, context="harness config"),
+                        }
+                    },
                 )
             except (httpx.HTTPError, RuntimeError) as exc:
                 return JSONResponse(

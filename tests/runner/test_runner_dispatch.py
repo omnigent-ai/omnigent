@@ -1514,12 +1514,12 @@ def test_spec_resolve_error_detail_names_structured_cause(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("policy_rejection", [False, True])
+@pytest.mark.parametrize("failure", ["outage", "unsupported-policy", "invalid-spec"])
 async def test_runner_post_releases_turn_when_spec_resolution_fails(
     caplog: pytest.LogCaptureFixture,
     pinned_runner_log: Path,
     monkeypatch: pytest.MonkeyPatch,
-    policy_rejection: bool,
+    failure: str,
 ) -> None:
     """Resolver outages and policy rejection must release the turn before retry."""
 
@@ -1531,13 +1531,15 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
         agent_id: str, session_id: str | None = None
     ) -> AgentSpec | None:
         """Return an unsupported policy or raise a resolver outage."""
-        if policy_rejection:
+        if failure == "unsupported-policy":
             return AgentSpec(
                 spec_version=1,
                 name="restricted-agent",
                 executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity"}),
                 os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
             )
+        if failure == "invalid-spec":
+            raise ValueError("invalid spec from internal-host:6767/private/agent.yaml")
         raise RuntimeError(f"spec resolver unavailable for {agent_id}")
 
     manager = _FakeProcessManager()
@@ -1561,7 +1563,7 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
                         "content": [],
                     },
                 )
-                assert response.status_code == (400 if policy_rejection else 503)
+                assert response.status_code == (503 if failure == "outage" else 400)
                 assert "conv_spec_resolver_failed" not in app.state.active_turns
                 assert not app.state.session_message_buffers.get("conv_spec_resolver_failed")
                 statuses = await _drain_published_statuses(
@@ -1574,9 +1576,18 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
 
     get_client.assert_not_called()
     body = response.json()
-    if policy_rejection:
+    if failure != "outage":
         assert body["error"]["code"] == "invalid_input"
-        assert "Antigravity cannot enforce" in body["error"]["message"]
+        assert body["error"]["message"] == (
+            f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+        )
+        cause = (
+            "Antigravity cannot enforce"
+            if failure == "unsupported-policy"
+            else "invalid spec from internal-host:6767/private/agent.yaml"
+        )
+        assert cause not in response.text
+        assert cause in caplog.text
         return
     # The structured error slug is preserved for the caller; the detail names
     # the runner log holding the cause. The raw resolver exception text must
