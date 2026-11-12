@@ -1,5 +1,8 @@
 import { cn } from "@/lib/utils";
-import { APPROVAL_SKIPPING_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
+import {
+  APPROVAL_SKIPPING_PERMISSION_MODES,
+  nativeDefaultPermissionMode,
+} from "@/lib/nativeHarnessModes";
 import { pickerTriggerClass } from "./pickerStyles";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { Label } from "./Label";
@@ -100,6 +103,11 @@ export function TriggerWorkerSettingsFields({
     value.permissionMode && !permissions.some((option) => option.value === value.permissionMode)
       ? value.permissionMode
       : "";
+  // An omitted mode inherits the automation's, so choosing Default names the harness's own.
+  const defaultMode = nativeDefaultPermissionMode(settings.harness);
+  const chosenDefault = permissions.some((option) => option.value === defaultMode)
+    ? (defaultMode ?? "")
+    : "";
   const unappliedLabel =
     settings.permissions.find((option) => option.value === unappliedMode)?.label ?? unappliedMode;
   return (
@@ -121,7 +129,9 @@ export function TriggerWorkerSettingsFields({
           })
         }
         onEffortChange={(effort) => onChange({ ...value, effort })}
-        onPermissionModeChange={(permissionMode) => onChange({ ...value, permissionMode })}
+        onPermissionModeChange={(permissionMode) =>
+          onChange({ ...value, permissionMode: permissionMode || chosenDefault })
+        }
         onSelectOpenChange={onSelectOpenChange}
       />
       {unappliedMode && (

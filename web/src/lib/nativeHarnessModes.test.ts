@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   canonicalNativeHarness,
   harnessAccountKey,
+  nativeDefaultPermissionMode,
   nativePermissionOptions,
   permissionModeConcept,
 } from "./nativeHarnessModes";
@@ -23,6 +24,22 @@ describe("nativePermissionOptions", () => {
   ] as const)("returns the create-time permission vocabulary for %s", (harness, values) => {
     const options = nativePermissionOptions(harness);
     expect(options.map((option) => option.value).sort()).toEqual([...values].sort());
+  });
+});
+
+describe("nativeDefaultPermissionMode", () => {
+  it.each([
+    ["claude-native", "default"],
+    ["codex-native", "default"],
+    ["cursor-native", "default"],
+    ["antigravity-native", "default"],
+    ["devin-native", "normal"],
+    ["unknown-harness", null],
+    [null, null],
+  ] as const)("names %s's default mode from its own vocabulary", (harness, mode) => {
+    expect(nativeDefaultPermissionMode(harness)).toBe(mode);
+    if (mode !== null)
+      expect(nativePermissionOptions(harness).map((option) => option.value)).toContain(mode);
   });
 });
 

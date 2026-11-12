@@ -3213,14 +3213,21 @@ describe("automation trigger type", () => {
   });
 
   it("starts matching sessions with the polling session's settings unless changed", async () => {
-    render(dialog());
+    render(dialog({}, { managed_sandboxes_enabled: true }));
     await choose("Slack");
     type("task-trigger-scope", "support");
     type("task-trigger-instructions", "Answer the question.");
     await choose("Opus", "task-worker-model-trigger");
-    // Choosing another agent clears the workers' own settings with the polling ones.
+    // Choosing another agent resets the workers to follow the polling session.
     fireEvent.click(screen.getByTestId("pick-agent-polly"));
     fireEvent.click(screen.getByTestId("pick-harness-claude"));
+    expect(screen.getByTestId("task-worker-model-trigger")).toHaveTextContent("Default");
+    // So does choosing where it runs.
+    await choose("Opus", "task-worker-model-trigger");
+    const hostTrigger = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostTrigger);
+    fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
     expect(screen.getByTestId("task-worker-model-trigger")).toHaveTextContent("Default");
     await choose("Haiku", "task-model-trigger");
     await choose("Low", "task-effort-trigger");
@@ -4317,6 +4324,26 @@ describe("CreateScheduledTaskDialog trigger template", () => {
       }
     },
   );
+
+  it("starts workers in their harness's default mode when Default is chosen for them", async () => {
+    renderTrigger("jira", {
+      session_create_permission_modes: true,
+      scheduled_task_approval_skipping_modes: true,
+    });
+    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Bypass permissions" }));
+    // An omitted mode would inherit the polling session's bypass.
+    fireEvent.keyDown(screen.getByTestId("task-worker-permission-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Auto" }));
+    fireEvent.keyDown(screen.getByTestId("task-worker-permission-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+    expect(screen.getByTestId("task-worker-permission-trigger")).toHaveTextContent("Manual");
+    type("task-trigger-scope", "ES");
+    type("task-trigger-instructions", "Triage it.");
+    const prompt = await submittedPrompt();
+    expect(mutateAsync.mock.calls[0][0].permissionMode).toBe("bypassPermissions");
+    expect(readTriggerWorkerSettings(prompt)?.permissionMode).toBe("default");
+  });
 
   it("separates the rendered system and user prompts on Edit as prompt", async () => {
     renderTrigger("github");
