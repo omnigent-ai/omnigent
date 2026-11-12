@@ -54,6 +54,7 @@ import {
   PencilLineIcon,
   RowsIcon,
   SearchIcon,
+  Share2Icon,
   SquareArrowOutUpRightIcon,
   Trash2Icon,
   WrapTextIcon,
@@ -345,6 +346,9 @@ interface FileViewerProps {
 
   /** Called when the user navigates to a different file via the prev/next buttons. */
   onNavigateTo?: (path: string) => void;
+  /** Opens session sharing with a fullscreen link to this file. */
+  onShare?: () => void;
+  shareDisabledReason?: string;
   /**
    * Numeric permission level for the current user on this session
    * (1 = read, 2 = edit, 3 = manage, 4 = owner). ``null`` means
@@ -405,6 +409,8 @@ function FileViewerBody({
   onClose,
   onCloseTab,
   onNavigateTo,
+  onShare,
+  shareDisabledReason,
   permissionLevel,
   frameless,
   mobileOverlay = false,
@@ -1213,6 +1219,7 @@ function FileViewerBody({
     icon: ReactNode;
     onSelect?: () => void;
     active?: boolean;
+    disabled?: boolean;
     /** When set, render a picker (dropdown/submenu) over these mutually
      * exclusive choices instead of a single button. `onSelect` is ignored. */
     options?: ToolbarOption[];
@@ -1461,6 +1468,16 @@ function FileViewerBody({
     ),
     onSelect: copyFileLink,
   });
+  if (onShare) {
+    toolbarActions.push({
+      key: "share-file",
+      label: "Share file",
+      tooltip: shareDisabledReason ?? "Share file",
+      icon: <Share2Icon className="size-4" />,
+      disabled: !!shareDisabledReason,
+      onSelect: onShare,
+    });
+  }
   if (openInActions.length) {
     toolbarActions.push({
       key: "open-in",
@@ -1590,16 +1607,19 @@ function FileViewerBody({
         <TooltipProvider key={action.key}>
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant={action.active ? "default" : "ghost"}
-                size="icon-sm"
-                aria-label={action.label}
-                tabIndex={interactive ? undefined : -1}
-                onClick={interactive ? action.onSelect : undefined}
-              >
-                {action.icon}
-              </Button>
+              <span className="inline-flex">
+                <Button
+                  type="button"
+                  variant={action.active ? "default" : "ghost"}
+                  size="icon-sm"
+                  aria-label={action.label}
+                  disabled={action.disabled}
+                  tabIndex={interactive ? undefined : -1}
+                  onClick={interactive ? action.onSelect : undefined}
+                >
+                  {action.icon}
+                </Button>
+              </span>
             </TooltipTrigger>
             <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
           </Tooltip>
@@ -1817,6 +1837,20 @@ function FileViewerBody({
                               )}
                             </DropdownMenuItem>
                           ))
+                        ) : action.disabled ? (
+                          <TooltipProvider key={action.key}>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span className="block">
+                                  <DropdownMenuItem disabled className="whitespace-nowrap">
+                                    {action.icon}
+                                    {action.label}
+                                  </DropdownMenuItem>
+                                </span>
+                              </TooltipTrigger>
+                              <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
                         ) : (
                           <DropdownMenuItem
                             key={action.key}

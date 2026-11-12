@@ -49,7 +49,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { copyText } from "@/lib/clipboard";
 import { updateSession } from "@/lib/sessionsApi";
 import { getOmnigentUserSearch } from "@/lib/host";
-import { getShareableSessionLink } from "@/lib/shareLink";
+import { getSessionSharePath, getShareableSessionLink } from "@/lib/shareLink";
 import { workspaceSharingBlocked } from "@/lib/permissionsApi";
 import { useRebasePath } from "@/lib/routing";
 import { cn } from "@/lib/utils";
@@ -67,6 +67,7 @@ const LEVEL_LABELS: Record<number, string> = {
 interface PermissionsModalProps {
   sessionId: string;
   workspace?: string | null;
+  filePath?: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }
@@ -74,6 +75,7 @@ interface PermissionsModalProps {
 export function PermissionsModal({
   sessionId,
   workspace,
+  filePath,
   open,
   onOpenChange,
 }: PermissionsModalProps) {
@@ -122,23 +124,60 @@ export function PermissionsModal({
   // chat agent has none, so the toggle would be inert — hide it there.
   const hasWorkspace = !!session?.workspace;
   const workspaceShared = session?.shareWorkspaceFiles ?? false;
+  const fileShareUnavailable = !!filePath && (!session || workspaceBlocked);
+  const shareBusy = grant.isPending || revoke.isPending || shareWorkspace.isPending;
+
+  async function prepareFileShare() {
+    if (!filePath) return;
+    if (fileShareUnavailable) throw new Error("Workspace files are unavailable for sharing.");
+    if (!workspaceShared) await shareWorkspace.mutateAsync(true);
+  }
+
+  async function openMobileLink() {
+    setError(null);
+    try {
+      await prepareFileShare();
+      setShowQr(true);
+    } catch {
+      // The workspace mutation displays its error in the dialog.
+    }
+  }
 
   const userGrants = (permissions ?? []).filter((p) => p.user_id !== PUBLIC_USER);
   const publicGrant = (permissions ?? []).find((p) => p.user_id === PUBLIC_USER);
   const publicLevel = publicGrant ? Math.min(publicGrant.level, publicMaxLevel) : 0;
 
-  function handleGrant(e: FormEvent) {
+  async function handleGrant(e: FormEvent) {
     e.preventDefault();
     const trimmed = newUserId.trim();
-    if (!trimmed || workspaceBlocked) return;
+    if (
+      !trimmed ||
+      workspaceBlocked ||
+      fileShareUnavailable ||
+      (!!filePath && permissions === undefined)
+    )
+      return;
     setError(null);
+    if (filePath) {
+      try {
+        await prepareFileShare();
+      } catch {
+        return;
+      }
+    }
+    const resetForm = () => {
+      setNewUserId("");
+      setNewLevel("1");
+    };
+    const existingGrant = filePath ? userGrants.find((p) => p.user_id === trimmed) : undefined;
+    if (existingGrant && existingGrant.level >= parseInt(newLevel, 10)) {
+      resetForm();
+      return;
+    }
     grant.mutate(
       { userId: trimmed, level: parseInt(newLevel, 10) },
       {
-        onSuccess: () => {
-          setNewUserId("");
-          setNewLevel("1");
-        },
+        onSuccess: resetForm,
         onError: (err) => setError(err.message),
       },
     );
@@ -157,11 +196,18 @@ export function PermissionsModal({
     grant.mutate({ userId, level }, { onError: (err) => setError(err.message) });
   }
 
-  function handlePublicLevel(value: string) {
+  async function handlePublicLevel(value: string) {
     const level = Number(value);
     if (level > 0 && (workspaceBlocked || !publicSharingEnabled)) return;
     setError(null);
     if (level > 0) {
+      if (filePath) {
+        try {
+          await prepareFileShare();
+        } catch {
+          return;
+        }
+      }
       grant.mutate({ userId: PUBLIC_USER, level }, { onError: (err) => setError(err.message) });
     } else {
       revoke.mutate(PUBLIC_USER, {
@@ -196,14 +242,24 @@ export function PermissionsModal({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">Share this session</DialogTitle>
+          <DialogTitle className="flex items-center gap-2">
+            {filePath ? "Share this file" : "Share this session"}
+          </DialogTitle>
           <DialogDescription asChild>
             <div className="space-y-3">
               <p>
-                {sharingReadOnly
-                  ? "This server allows read-only sharing — invite others to view this session."
-                  : "Invite others to view or collaborate on this session."}
+                {filePath
+                  ? "This link opens the file in full screen. Sharing grants access to the entire session, including its messages and other files."
+                  : sharingReadOnly
+                    ? "This server allows read-only sharing — invite others to view this session."
+                    : "Invite others to view or collaborate on this session."}
               </p>
+              {filePath && (
+                <p>
+                  Granting access, copying the link, or opening the mobile link enables Workspace
+                  files for everyone with Read access to this session.
+                </p>
+              )}
               {sharingReadOnly && (
                 <p>
                   Please be careful when sharing. Read access will allow for reading of all session
@@ -213,6 +269,7 @@ export function PermissionsModal({
             </div>
           </DialogDescription>
         </DialogHeader>
+        {filePath && <p className="break-all font-mono text-sm">{filePath}</p>}
 
         {(publicSharingEnabled || publicGrant) && (
           <div className="flex min-w-0 items-center justify-between gap-3 rounded-lg border px-3 py-2">
@@ -226,10 +283,7 @@ export function PermissionsModal({
               value={String(publicLevel)}
               onValueChange={handlePublicLevel}
               disabled={
-                isLoading ||
-                grant.isPending ||
-                revoke.isPending ||
-                (workspaceBlocked && !publicGrant)
+                isLoading || shareBusy || fileShareUnavailable || (workspaceBlocked && !publicGrant)
               }
               componentId="diagnostics.permissions.public_level"
               valueHasNoPii
@@ -309,7 +363,7 @@ export function PermissionsModal({
                     permission={p}
                     onRevoke={handleRevoke}
                     onChangeLevel={handleChangeLevel}
-                    busy={grant.isPending || revoke.isPending}
+                    busy={shareBusy}
                     readOnly={sharingReadOnly}
                   />
                 ))}
@@ -359,8 +413,13 @@ export function PermissionsModal({
           <Button
             type="submit"
             size="sm"
-            loading={grant.isPending}
-            disabled={workspaceBlocked || !newUserId.trim()}
+            loading={grant.isPending || shareWorkspace.isPending}
+            disabled={
+              workspaceBlocked ||
+              !newUserId.trim() ||
+              fileShareUnavailable ||
+              (!!filePath && permissions === undefined)
+            }
             aria-describedby={workspaceBlocked ? blockedNoticeId : undefined}
             componentId="diagnostics.permissions.grant"
           >
@@ -375,10 +434,16 @@ export function PermissionsModal({
             Done overflows a phone-width dialog and widens the whole grid. */}
         <DialogFooter className="sm:justify-between">
           <div className="flex items-center gap-2">
-            <CopyLinkButton sessionId={sessionId} />
+            <CopyLinkButton
+              sessionId={sessionId}
+              filePath={filePath}
+              beforeCopy={filePath ? prepareFileShare : undefined}
+              disabled={fileShareUnavailable || shareBusy}
+            />
             <Button
               variant="ghost"
-              onClick={() => setShowQr(true)}
+              onClick={openMobileLink}
+              disabled={fileShareUnavailable || shareBusy}
               className="gap-1.5 text-primary"
             >
               <QrCodeIcon className="size-3.5" />
@@ -392,7 +457,12 @@ export function PermissionsModal({
       </DialogContent>
 
       {/* Separate modal for the QR code so the share dialog stays compact. */}
-      <QrCodeDialog sessionId={sessionId} open={showQr} onOpenChange={setShowQr} />
+      <QrCodeDialog
+        sessionId={sessionId}
+        filePath={filePath}
+        open={showQr}
+        onOpenChange={setShowQr}
+      />
     </Dialog>
   );
 }
@@ -583,18 +653,33 @@ function AddUserCombobox({ value, onChange, disabled }: AddUserFieldProps) {
  * off of (see `electron/src/deepLink.js`). The path is always basename-less
  * `/c/<id>`; the workspace mount is server-determined and intentionally absent.
  */
-function getDeepLink(sessionId: string, rebasePath: (path: string) => string): string {
-  const url = getShareableSessionLink(sessionId, rebasePath);
+function getDeepLink(
+  sessionId: string,
+  rebasePath: (path: string) => string,
+  filePath?: string,
+): string {
+  const url = getShareableSessionLink(sessionId, rebasePath, filePath);
+  const path = getSessionSharePath(sessionId, filePath);
   try {
     const { host } = new URL(url);
-    return `omnigent://${host}/c/${sessionId}`;
+    return `omnigent://${host}${path}`;
   } catch {
     // Unparseable transform output: fall back to the current origin's host.
-    return `omnigent://${window.location.host}/c/${sessionId}`;
+    return `omnigent://${window.location.host}${path}`;
   }
 }
 
-function CopyLinkButton({ sessionId }: { sessionId: string }) {
+function CopyLinkButton({
+  sessionId,
+  filePath,
+  beforeCopy,
+  disabled,
+}: {
+  sessionId: string;
+  filePath?: string;
+  beforeCopy?: () => Promise<void>;
+  disabled?: boolean;
+}) {
   const [copied, setCopied] = useState(false);
   const rebasePath = useRebasePath();
 
@@ -604,20 +689,22 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
     return () => clearTimeout(id);
   }, [copied]);
 
-  const handleCopy = useCallback(() => {
-    const url = getShareableSessionLink(sessionId, rebasePath);
-    copyText(url).then(
-      () => setCopied(true),
-      (err) => {
-        console.warn("Failed to copy link to clipboard", err);
-      },
-    );
-  }, [sessionId, rebasePath]);
+  const handleCopy = useCallback(async () => {
+    const url = getShareableSessionLink(sessionId, rebasePath, filePath);
+    setCopied(false);
+    try {
+      await Promise.all([copyText(url), beforeCopy?.()]);
+      setCopied(true);
+    } catch (err) {
+      console.warn("Failed to copy link to clipboard", err);
+    }
+  }, [sessionId, rebasePath, filePath, beforeCopy]);
 
   return (
     <Button
       variant="ghost"
       onClick={handleCopy}
+      disabled={disabled}
       className="gap-1.5 text-primary"
       componentId="diagnostics.permissions.copy_link"
     >
@@ -637,15 +724,17 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
  */
 function QrCodeDialog({
   sessionId,
+  filePath,
   open,
   onOpenChange,
 }: {
   sessionId: string;
+  filePath?: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
   const rebasePath = useRebasePath();
-  const deepLink = getDeepLink(sessionId, rebasePath);
+  const deepLink = getDeepLink(sessionId, rebasePath, filePath);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -656,7 +745,9 @@ function QrCodeDialog({
             Open in mobile app
           </DialogTitle>
           <DialogDescription>
-            Scan with your phone's camera to open this session in the Omnigent app.
+            {filePath
+              ? "Scan with your phone's camera to open this file in the Omnigent app."
+              : "Scan with your phone's camera to open this session in the Omnigent app."}
           </DialogDescription>
         </DialogHeader>
         <div className="flex justify-center">
@@ -669,7 +760,7 @@ function QrCodeDialog({
               // mode; the padding also serves as the QR quiet zone.
               bgColor="#ffffff"
               fgColor="#000000"
-              aria-label="QR code to open this session in the Omnigent app"
+              aria-label={`QR code to open this ${filePath ? "file" : "session"} in the Omnigent app`}
             />
           </div>
         </div>

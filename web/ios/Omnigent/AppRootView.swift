@@ -271,7 +271,16 @@ extension AppRootView {
 
   /// Append a conversation under the mount without moving it into the server's query or fragment.
   static func conversationURL(for serverURL: URL, path: String) -> URL {
-    serverURL.appendingPathComponent(path)
+    guard let route = URLComponents(string: path), let query = route.percentEncodedQuery else {
+      return serverURL.appendingPathComponent(path)
+    }
+    let destination = serverURL.appendingPathComponent(route.path)
+    guard var components = URLComponents(url: destination, resolvingAgainstBaseURL: false) else {
+      return destination
+    }
+    components.percentEncodedQuery = [components.percentEncodedQuery, query]
+      .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "&")
+    return components.url ?? destination
   }
 }
 

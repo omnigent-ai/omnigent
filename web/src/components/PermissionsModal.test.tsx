@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo, SharingMode } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { PermissionsModal } from "./PermissionsModal";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
@@ -983,6 +984,442 @@ describe("PermissionsModal", () => {
       });
       await chooseGeneralAccess("No access");
       await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "__public__"));
+    });
+  });
+
+  describe("file sharing", () => {
+    beforeEach(() => {
+      useSessionMock.mockReturnValue({
+        session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: true }),
+        isLoading: false,
+        error: null,
+      });
+    });
+
+    it("leaves workspace files private when the file sharing dialog is only opened", async () => {
+      listMock.mockResolvedValue([]);
+      useSessionMock.mockReturnValue({
+        session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: false }),
+        isLoading: false,
+        error: null,
+      });
+      render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          filePath="report.html"
+          open
+          onOpenChange={() => {}}
+        />,
+        {
+          wrapper: createWrapper(),
+        },
+      );
+
+      expect(
+        screen.getByText(/enables Workspace files for everyone with Read access/),
+      ).toBeInTheDocument();
+      await screen.findByText("No grants yet.");
+      expect(updateSessionMock).not.toHaveBeenCalled();
+      expect(grantMock).not.toHaveBeenCalled();
+    });
+
+    it("enables workspace file access before granting a new recipient Read access", async () => {
+      listMock.mockResolvedValue([]);
+      useSessionMock.mockReturnValue({
+        session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: false }),
+        isLoading: false,
+        error: null,
+      });
+      let enableFiles!: (session: Session) => void;
+      updateSessionMock.mockReturnValue(
+        new Promise((resolve) => {
+          enableFiles = resolve;
+        }),
+      );
+      grantMock.mockResolvedValue({ user_id: "carol", conversation_id: "conv_abc", level: 1 });
+      render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          filePath="report.html"
+          open
+          onOpenChange={() => {}}
+        />,
+        {
+          wrapper: createWrapper(),
+        },
+      );
+      await screen.findByText("No grants yet.");
+      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+        target: { value: "carol" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Grant" }));
+
+      await waitFor(() =>
+        expect(updateSessionMock).toHaveBeenCalledWith("conv_abc", { shareWorkspaceFiles: true }),
+      );
+      expect(grantMock).not.toHaveBeenCalled();
+      enableFiles(sessionWith({ workspace: "/repo", shareWorkspaceFiles: true }));
+      await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", "carol", 1));
+    });
+
+    it("enables file access for an existing viewer without changing the viewer's grant", async () => {
+      listMock.mockResolvedValue([{ user_id: "alice", conversation_id: "conv_abc", level: 1 }]);
+      useSessionMock.mockReturnValue({
+        session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: false }),
+        isLoading: false,
+        error: null,
+      });
+      render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          filePath="report.html"
+          open
+          onOpenChange={() => {}}
+        />,
+        {
+          wrapper: createWrapper(),
+        },
+      );
+      await screen.findByText("alice");
+      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+        target: { value: "alice" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Grant" }));
+
+      await waitFor(() =>
+        expect(updateSessionMock).toHaveBeenCalledWith("conv_abc", { shareWorkspaceFiles: true }),
+      );
+      await waitFor(() => expect(screen.getByPlaceholderText("alice@example.com")).toHaveValue(""));
+      expect(grantMock).not.toHaveBeenCalled();
+    });
+
+    it("stops the invitation and shows the error if workspace file sharing cannot be enabled", async () => {
+      listMock.mockResolvedValue([]);
+      useSessionMock.mockReturnValue({
+        session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: false }),
+        isLoading: false,
+        error: null,
+      });
+      updateSessionMock.mockRejectedValue(new Error("Workspace sharing failed"));
+      render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          filePath="report.html"
+          open
+          onOpenChange={() => {}}
+        />,
+        {
+          wrapper: createWrapper(),
+        },
+      );
+      await screen.findByText("No grants yet.");
+      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+        target: { value: "carol" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Grant" }));
+
+      expect(await screen.findByText("Workspace sharing failed")).toBeInTheDocument();
+      expect(grantMock).not.toHaveBeenCalled();
+    });
+
+    it.each(["/repo", null])(
+      "copies immediately and confirms after sharing workspace files (snapshot workspace: %s)",
+      async (workspace) => {
+        listMock.mockResolvedValue([]);
+        useSessionMock.mockReturnValue({
+          session: sessionWith({ workspace, shareWorkspaceFiles: false }),
+          isLoading: false,
+          error: null,
+        });
+        const writeText = vi.fn().mockResolvedValue(undefined);
+        Object.assign(navigator, { clipboard: { writeText } });
+        let enableFiles!: (session: Session) => void;
+        updateSessionMock.mockReturnValue(
+          new Promise((resolve) => {
+            enableFiles = resolve;
+          }),
+        );
+        render(
+          <PermissionsModal
+            sessionId="conv_abc"
+            filePath="report.html"
+            open
+            onOpenChange={() => {}}
+          />,
+          {
+            wrapper: createWrapper(),
+          },
+        );
+        fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+
+        expect(writeText).toHaveBeenCalled();
+        await waitFor(() =>
+          expect(updateSessionMock).toHaveBeenCalledWith("conv_abc", { shareWorkspaceFiles: true }),
+        );
+        expect(screen.queryByRole("button", { name: "Copied!" })).toBeNull();
+        enableFiles(sessionWith({ workspace, shareWorkspaceFiles: true }));
+        expect(await screen.findByRole("button", { name: "Copied!" })).toBeInTheDocument();
+      },
+    );
+
+    it("shows the workspace sharing error without confirming copy success if preparation fails", async () => {
+      listMock.mockResolvedValue([]);
+      useSessionMock.mockReturnValue({
+        session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: false }),
+        isLoading: false,
+        error: null,
+      });
+      updateSessionMock.mockRejectedValue(new Error("Workspace sharing failed"));
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.assign(navigator, { clipboard: { writeText } });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        render(
+          <PermissionsModal
+            sessionId="conv_abc"
+            filePath="report.html"
+            open
+            onOpenChange={() => {}}
+          />,
+          {
+            wrapper: createWrapper(),
+          },
+        );
+        fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+
+        expect(writeText).toHaveBeenCalled();
+        expect(await screen.findByText("Workspace sharing failed")).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: "Copied!" })).toBeNull();
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("enables workspace files before displaying the mobile QR code", async () => {
+      listMock.mockResolvedValue([]);
+      useSessionMock.mockReturnValue({
+        session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: false }),
+        isLoading: false,
+        error: null,
+      });
+      render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          filePath="report.html"
+          open
+          onOpenChange={() => {}}
+        />,
+        {
+          wrapper: createWrapper(),
+        },
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Open in mobile app" }));
+
+      await screen.findByTestId("share-qr-code");
+      expect(updateSessionMock).toHaveBeenCalledWith("conv_abc", { shareWorkspaceFiles: true });
+    });
+
+    it("enables workspace files when granting general Read access from a file share", async () => {
+      listMock.mockResolvedValue([]);
+      grantMock.mockResolvedValue({ user_id: "__public__", conversation_id: "conv_abc", level: 1 });
+      useSessionMock.mockReturnValue({
+        session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: false }),
+        isLoading: false,
+        error: null,
+      });
+      render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          filePath="report.html"
+          open
+          onOpenChange={() => {}}
+        />,
+        {
+          wrapper: createWrapper(),
+        },
+      );
+      await chooseGeneralAccess("Read");
+
+      await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", "__public__", 1));
+      expect(updateSessionMock).toHaveBeenCalledWith("conv_abc", { shareWorkspaceFiles: true });
+      expect(updateSessionMock.mock.invocationCallOrder[0]).toBeLessThan(
+        grantMock.mock.invocationCallOrder[0],
+      );
+    });
+
+    it("waits for the session workspace before enabling file sharing controls", async () => {
+      listMock.mockResolvedValue([]);
+      useSessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+      render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          filePath="report.html"
+          open
+          onOpenChange={() => {}}
+        />,
+        {
+          wrapper: createWrapper(),
+        },
+      );
+      await screen.findByText("No grants yet.");
+      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+        target: { value: "carol" },
+      });
+
+      expect(screen.getByRole("button", { name: "Grant" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Copy link" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Open in mobile app" })).toBeDisabled();
+      expect(updateSessionMock).not.toHaveBeenCalled();
+    });
+
+    it("explains session access and grants new recipients read access", async () => {
+      listMock.mockResolvedValue([]);
+      grantMock.mockResolvedValue({ user_id: "carol", conversation_id: "conv_abc", level: 1 });
+
+      render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          filePath="artifacts/report.html"
+          open={true}
+          onOpenChange={() => {}}
+        />,
+        { wrapper: createWrapper() },
+      );
+
+      expect(screen.getByRole("heading", { name: "Share this file" })).toBeInTheDocument();
+      expect(
+        screen.getByText(/access to the entire session, including its messages and other files/),
+      ).toBeInTheDocument();
+      expect(screen.getByText("artifacts/report.html")).toBeInTheDocument();
+      await waitFor(() => expect(screen.getByText("No grants yet.")).toBeInTheDocument());
+      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+        target: { value: "carol" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Grant" }));
+      await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", "carol", 1));
+    });
+
+    it.each([1, 2, 3, 4])(
+      "preserves an existing level %i grant when sharing a file",
+      async (level) => {
+        listMock.mockResolvedValue([
+          { user_id: "alice@example.com", conversation_id: "conv_abc", level },
+        ]);
+
+        render(
+          <PermissionsModal
+            sessionId="conv_abc"
+            filePath="report.md"
+            open={true}
+            onOpenChange={() => {}}
+          />,
+          { wrapper: createWrapper() },
+        );
+
+        await screen.findByText("alice@example.com");
+        fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+          target: { value: "alice@example.com" },
+        });
+        fireEvent.click(screen.getByRole("button", { name: "Grant" }));
+        expect(grantMock).not.toHaveBeenCalled();
+        expect(revokeMock).not.toHaveBeenCalled();
+        await waitFor(() =>
+          expect(screen.getByPlaceholderText("alice@example.com")).toHaveValue(""),
+        );
+      },
+    );
+
+    it("waits for existing permissions before granting file access", () => {
+      listMock.mockReturnValue(new Promise(() => {}));
+
+      render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          filePath="report.md"
+          open={true}
+          onOpenChange={() => {}}
+        />,
+        { wrapper: createWrapper() },
+      );
+
+      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+        target: { value: "alice@example.com" },
+      });
+      expect(screen.getByRole("button", { name: "Grant" })).toBeDisabled();
+    });
+
+    it("copies an encoded fullscreen file link without current viewer parameters", async () => {
+      listMock.mockResolvedValue([]);
+      const filePath = "artifacts/财务 report #1 & + %.html";
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.assign(navigator, { clipboard: { writeText } });
+      const original = window.location;
+      Object.defineProperty(window, "location", {
+        configurable: true,
+        value: {
+          ...original,
+          origin: "https://app.example.com",
+          href: "https://app.example.com/c/other?file=old&diff=1&comment=stale&view=terminal",
+        },
+      });
+      try {
+        render(
+          <PermissionsModal
+            sessionId="conv_abc"
+            filePath={filePath}
+            open={true}
+            onOpenChange={() => {}}
+          />,
+          { wrapper: createWrapper() },
+        );
+        fireEvent.click(screen.getByRole("button", { name: /copy link/i }));
+        await waitFor(() => expect(writeText).toHaveBeenCalled());
+        const link = new URL(writeText.mock.calls[0][0]);
+        expect(link.origin).toBe("https://app.example.com");
+        expect(link.pathname).toBe("/c/conv_abc");
+        expect([...link.searchParams]).toEqual([
+          ["file", filePath],
+          ["fullscreen", "1"],
+        ]);
+        expect(grantMock).not.toHaveBeenCalled();
+      } finally {
+        Object.defineProperty(window, "location", { configurable: true, value: original });
+      }
+    });
+
+    it("rebases and transforms file links and preserves the file target in the app QR code", async () => {
+      listMock.mockResolvedValue([]);
+      const filePath = "artifacts/report #1.html";
+      const query = new URLSearchParams({ file: filePath, fullscreen: "1" }).toString();
+      const transform = vi.fn((path: string) => `https://host.example.com:8443/embed#${path}`);
+      transformLinkMock.mockReturnValue(transform);
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.assign(navigator, { clipboard: { writeText } });
+
+      render(
+        <RoutingProvider value={basenamedRouting("/workspace/omni")}>
+          <PermissionsModal
+            sessionId="conv_abc"
+            filePath={filePath}
+            open={true}
+            onOpenChange={() => {}}
+          />
+        </RoutingProvider>,
+        { wrapper: createWrapper() },
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: /copy link/i }));
+      await waitFor(() => {
+        expect(writeText).toHaveBeenCalledWith(
+          `https://host.example.com:8443/embed#/workspace/omni/c/conv_abc?${query}`,
+        );
+      });
+      expect(transform).toHaveBeenCalledWith("/workspace/omni/c/conv_abc");
+      fireEvent.click(screen.getByRole("button", { name: /open in mobile app/i }));
+      expect(await screen.findByTestId("share-qr-code")).toHaveAttribute(
+        "data-value",
+        `omnigent://host.example.com:8443/c/conv_abc?${query}`,
+      );
     });
   });
 

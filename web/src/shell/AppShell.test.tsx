@@ -13,6 +13,7 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as UseWorkspaceModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
@@ -83,7 +84,8 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   useCreateTerminal: vi.fn(() => ({ mutate: vi.fn(), launch: vi.fn(), isPending: false })),
 }));
 
-vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseWorkspaceModule>()),
   useWorkspaceEnvironment: vi.fn(() => ({ data: undefined, isLoading: true })),
   useWorkspaceChangedFiles: vi.fn(() => ({ data: undefined, isLoading: true })),
 }));
@@ -201,12 +203,16 @@ vi.mock("./FileViewer", () => ({
     position,
     onClose,
     frameless,
+    onShare,
+    shareDisabledReason,
   }: {
     open: boolean;
     path: string;
     position?: { line: number; column?: number; endLine?: number };
     onClose: () => void;
     frameless?: boolean;
+    onShare?: () => void;
+    shareDisabledReason?: string;
   }) => (
     <div
       data-testid={frameless ? "file-viewer-inline" : "file-viewer"}
@@ -219,6 +225,17 @@ vi.mock("./FileViewer", () => ({
       <button type="button" aria-label="file-viewer: close" onClick={onClose}>
         close
       </button>
+      {onShare && (
+        <button
+          type="button"
+          aria-label="file-viewer: share"
+          disabled={!!shareDisabledReason}
+          title={shareDisabledReason}
+          onClick={onShare}
+        >
+          share
+        </button>
+      )}
     </div>
   ),
 }));
@@ -4411,6 +4428,256 @@ describe("AppShell URL sync — file param", () => {
     expect(afterReopen).not.toContain("diff=");
     expect(afterReopen).not.toContain("comment=");
   });
+});
+
+describe("AppShell fullscreen file links", () => {
+  beforeEach(() => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: "/repo" },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_abc", permission_level: 1 },
+      { id: "conv_other", permission_level: 1 },
+    ]);
+  });
+
+  it("opens a linked file fullscreen even when the recipient last collapsed the workspace", () => {
+    writeSessionWorkspaceState("conv_abc", { open: false });
+    const path = "artifacts/report #1.html";
+    renderShell(`/c/conv_abc?${new URLSearchParams({ file: path, fullscreen: "1" })}`);
+
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", path);
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveClass("md:absolute");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    expect(screen.getByRole("button", { name: "Exit full screen" })).toBeInTheDocument();
+  });
+
+  it("keeps ordinary file links docked", () => {
+    renderShell("/c/conv_abc?file=README.md");
+
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).not.toHaveClass("md:absolute");
+    expect(screen.getByRole("button", { name: "Full screen" })).toBeInTheDocument();
+  });
+
+  it("maximizes a remembered file from a bare session URL and keeps it selected on exit", () => {
+    writeSessionWorkspaceState("conv_abc", {
+      open: true,
+      selectedFilePath: "artifacts/report.html",
+      openFiles: ["artifacts/report.html"],
+    });
+    renderShell("/c/conv_abc");
+
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute(
+      "data-path",
+      "artifacts/report.html",
+    );
+    expect(screen.getByTestId("url-params")).toHaveTextContent(/^$/);
+    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveClass("md:absolute");
+    expect(screen.getByRole("button", { name: "Exit full screen" })).toBeInTheDocument();
+    const params = new URLSearchParams(screen.getByTestId("url-params").textContent ?? "");
+    expect(params.get("file")).toBe("artifacts/report.html");
+    expect(params.get("fullscreen")).toBe("1");
+
+    fireEvent.click(screen.getByRole("button", { name: "Exit full screen" }));
+
+    expect(screen.getByRole("complementary", { name: "Workspace" })).not.toHaveClass("md:absolute");
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute(
+      "data-path",
+      "artifacts/report.html",
+    );
+    const afterExit = new URLSearchParams(screen.getByTestId("url-params").textContent ?? "");
+    expect(afterExit.get("file")).toBe("artifacts/report.html");
+    expect(afterExit.has("fullscreen")).toBe(false);
+  });
+
+  it("follows a fullscreen link within the current session and restores the sidebar on exit", () => {
+    renderShell("/c/conv_abc?file=README.md", undefined, {
+      sessionNavTo: "/c/conv_abc?file=AGENTS.md&fullscreen=1",
+    });
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    fireEvent.click(screen.getByTestId("nav-session"));
+
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "AGENTS.md");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveClass("md:absolute");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    fireEvent.click(screen.getByRole("button", { name: "Exit full screen" }));
+
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "AGENTS.md");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).not.toHaveClass("md:absolute");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("file=AGENTS.md");
+    expect(screen.getByTestId("url-params").textContent).not.toContain("fullscreen");
+  });
+
+  it("clears fullscreen and viewer parameters when the linked file is closed", () => {
+    renderShell("/c/conv_abc", undefined, {
+      sessionNavTo: "/c/conv_abc?file=AGENTS.md&fullscreen=1&diff=1&comment=c1&view=chat",
+    });
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    fireEvent.click(screen.getByTestId("nav-session"));
+    fireEvent.click(
+      within(screen.getByTestId("file-viewer-inline")).getByRole("button", {
+        name: "file-viewer: close",
+      }),
+    );
+
+    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+    expect(screen.getByTestId("url-params")).toHaveTextContent(/^view=chat$/);
+    expect(screen.getByRole("complementary", { name: "Workspace" })).not.toHaveClass("md:absolute");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("restores the sidebar and docked layout when switching away from a fullscreen file", () => {
+    renderShell("/c/conv_abc?file=README.md", undefined, { sessionNavTo: "/c/conv_other" });
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+    expect(screen.getByTestId("url-params")).toHaveTextContent("fullscreen=1");
+
+    fireEvent.click(screen.getByTestId("nav-session"));
+
+    expect(screen.getByRole("complementary", { name: "Workspace" })).not.toHaveClass("md:absolute");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+    expect(screen.getByTestId("url-params")).toHaveTextContent(/^$/);
+  });
+
+  it("captures the current sidebar state for later links after leaving a maximized session", () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      sessionShellTree(
+        client,
+        "/c/conv_abc?file=README.md",
+        <>
+          <Link to="/c/conv_other">Open other session</Link>
+          <Link to="/c/conv_other?file=AGENTS.md&fullscreen=1">Open shared file</Link>
+          <LocationDisplay />
+        </>,
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+    fireEvent.click(screen.getByRole("link", { name: "Open other session" }));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+
+    fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    fireEvent.click(screen.getByRole("link", { name: "Open shared file" }));
+    fireEvent.click(screen.getByRole("button", { name: "Exit full screen" }));
+
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "AGENTS.md");
+  });
+
+  it("keeps a shared file fullscreen when the link leaves Canvas for the same session", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <CapabilitiesProvider info={serverInfo({ features: { canvas: true } })}>
+        {shellTree(
+          client,
+          "/canvas/c/conv_abc?file=README.md&fullscreen=1",
+          <>
+            <Route
+              path="canvas/c/:conversationId"
+              element={<Link to="/c/conv_abc?file=README.md&fullscreen=1">Open session link</Link>}
+            />
+            <Route path="c/:conversationId" element={<LocationDisplay />} />
+          </>,
+        )}
+      </CapabilitiesProvider>,
+    );
+    expect(await screen.findByRole("button", { name: "Exit full screen" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("link", { name: "Open session link" }));
+
+    expect(screen.getByRole("button", { name: "Exit full screen" })).toBeInTheDocument();
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveClass("md:absolute");
+  });
+
+  it("ignores fullscreen without a file target", () => {
+    renderShell("/c/conv_abc?fullscreen=1");
+
+    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+    expect(screen.getByRole("complementary", { name: "Workspace" })).not.toHaveClass("md:absolute");
+  });
+});
+
+describe("AppShell file sharing", () => {
+  beforeEach(() => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: "/repo" },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: 4 }]);
+  });
+
+  it("shares an in-workspace absolute path as a relative file link and resets the target for session sharing", () => {
+    withWindowOrigin("https://app.example.com", () => {
+      renderShell("/c/conv_abc?file=%2Frepo%2Fartifacts%2Freport.html");
+      fireEvent.click(
+        within(screen.getByTestId("file-viewer-inline")).getByRole("button", {
+          name: "file-viewer: share",
+        }),
+      );
+
+      const dialog = screen.getByRole("dialog", { name: "Share this file" });
+      expect(within(dialog).getByText("artifacts/report.html")).toBeInTheDocument();
+      fireEvent.click(within(dialog).getByRole("button", { name: "Done" }));
+      fireEvent.click(screen.getByRole("button", { name: "Share session" }));
+      expect(screen.getByRole("heading", { name: "Share this session" })).toBeInTheDocument();
+      expect(screen.queryByText("artifacts/report.html")).toBeNull();
+    });
+  });
+
+  it.each([
+    "/outside/report.html",
+    "/repo-other/report.html",
+    "../report.html",
+    "~/report.html",
+    "C:\\report.html",
+  ])("hides file sharing for paths that recipients cannot read: %s", (path) => {
+    withWindowOrigin("https://app.example.com", () => {
+      renderShell(`/c/conv_abc?${new URLSearchParams({ file: path })}`);
+      expect(screen.queryByRole("button", { name: "file-viewer: share" })).toBeNull();
+    });
+  });
+
+  it.each([1, 2, 3])("hides file sharing from a non-owner at level %i", (permissionLevel) => {
+    mockConversations([{ id: "conv_abc", permission_level: permissionLevel }]);
+    withWindowOrigin("https://app.example.com", () => {
+      renderShell("/c/conv_abc?file=README.md");
+      expect(screen.queryByRole("button", { name: "file-viewer: share" })).toBeNull();
+    });
+  });
+
+  it("hides file sharing in single-user mode", () => {
+    withWindowOrigin("https://app.example.com", () => {
+      renderShell("/c/conv_abc?file=README.md", serverInfo({ single_user: true }));
+      expect(screen.queryByRole("button", { name: "file-viewer: share" })).toBeNull();
+    });
+  });
+
+  it.each([
+    ["http://localhost:6767", "on", "Sharing is unavailable from a local server."],
+    ["https://app.example.com", "off", "Sharing has been disabled for this Omnigent server."],
+  ] as const)(
+    "disables file sharing for %s with sharing mode %s",
+    (origin, sharingMode, reason) => {
+      withWindowOrigin(origin, () => {
+        renderShell("/c/conv_abc?file=README.md", serverInfo({ sharing_mode: sharingMode }));
+        const button = within(screen.getByTestId("file-viewer-inline")).getByRole("button", {
+          name: "file-viewer: share",
+        });
+        expect(button).toBeDisabled();
+        expect(button).toHaveAttribute("title", reason);
+      });
+    },
+  );
 });
 
 describe("Files/Changes tabs drive the panel scope", () => {
