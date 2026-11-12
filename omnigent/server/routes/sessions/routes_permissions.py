@@ -244,14 +244,13 @@ def register_permissions_routes(
         # access is the floor for the self case — enough to prove the session
         # exists and is visible to the caller without leaking others' via
         # 403/404.
+        leaving_self = target_user_id == user_id
+        target_ids = [target_user_id]
         canonical_target = _canonical_user_id(auth_provider, target_user_id)
-        # A manager revoke also removes a grant stored under the typed ID before
-        # canonicalization. Leaving removes only the caller's grant, since the other
-        # spelling may be a distinct principal such as an earlier machine subject.
-        target_ids = list(dict.fromkeys((target_user_id, canonical_target)))
-        leaving_self = user_id in target_ids
-        if leaving_self:
-            target_ids = [target for target in target_ids if target == user_id]
+        # A manager revoke also reaches the canonical spelling of a typed ID, but not
+        # the caller's own grant, which only leaving by the exact ID removes.
+        if not leaving_self and canonical_target not in (target_user_id, user_id):
+            target_ids.append(canonical_target)
         await _require_access(
             user_id,
             session_id,
@@ -283,21 +282,30 @@ def register_permissions_routes(
                     f"Leave the parent session {conv.parent_conversation_id!r} instead.",
                     code=ErrorCode.INVALID_INPUT,
                 )
-        for revoked_user_id in target_ids:
-            existing = await asyncio.to_thread(permission_store.get, revoked_user_id, session_id)
-            if existing is not None and existing.level == LEVEL_OWNER:
+        # The owner grant is never revoked. Reached only through the canonical
+        # spelling, it is skipped so a stale alias of the owner can still be removed.
+        revoked_ids: list[str] = []
+        for candidate_id in target_ids:
+            existing = await asyncio.to_thread(permission_store.get, candidate_id, session_id)
+            if existing is None or existing.level != LEVEL_OWNER:
+                revoked_ids.append(candidate_id)
+            elif candidate_id == target_user_id:
                 raise OmnigentError(
                     "Cannot leave a session you own. Delete or archive it instead."
                     if leaving_self
                     else "Cannot revoke owner permissions",
                     code=ErrorCode.FORBIDDEN,
                 )
-        for revoked_user_id in target_ids:
+        for revoked_user_id in revoked_ids:
             await asyncio.to_thread(permission_store.revoke, revoked_user_id, session_id)
         # The leaver's own tab drops the row via the client mutation's success
         # handler; their other tabs converge on the next watch-set diff, which
         # reports the now-inaccessible id as removed. No extra push needed.
-        add_audit_attrs(target_user_id=target_ids[-1], left_self=leaving_self)
+        add_audit_attrs(
+            target_user_id=target_user_id,
+            revoked_user_ids=",".join(revoked_ids),
+            left_self=leaving_self,
+        )
         return Response(status_code=204)
 
     @router.get(
