@@ -40,14 +40,13 @@ async def execute_link_pr_tool(
         headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
         payload = {"url": url, "action": action}
         requested = True
-        response = await post_on_host(
-            client,
-            path,
-            host_id=host_id,
-            headers=headers,
-            json=payload,
-            timeout=60,
-        )
+        if host_id:
+            response = await post_on_host(
+                client, path, host_id=host_id, headers=headers, json=payload, timeout=60
+            )
+        else:
+            # Hostless runners use the client's existing replica affinity.
+            response = await client.post(path, headers=headers, json=payload, timeout=60)
         if host_id and is_wrong_replica(response):
             # Older hosts can be registered on the unkeyed replica. This explicit
             # routing refusal precedes mutation; ambiguous outcomes are never replayed.

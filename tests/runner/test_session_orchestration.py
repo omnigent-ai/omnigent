@@ -1248,27 +1248,33 @@ async def test_invalid_host_options_do_not_create(arguments):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "action,supported,explicit_target,legacy_host",
+    "action,supported,explicit_target,host_routing",
     [
-        ("attach", True, False, False),
-        ("remove", True, False, False),
-        ("attach", True, True, False),
-        ("attach", True, True, True),
-        ("attach", False, False, False),
-        ("attach", None, False, False),
+        ("attach", True, False, "host"),
+        ("remove", True, False, "host"),
+        ("attach", True, True, "host"),
+        ("attach", True, True, "legacy"),
+        ("attach", True, False, "hostless"),
+        ("remove", True, False, "hostless"),
+        ("attach", False, False, "host"),
+        ("attach", None, False, "host"),
     ],
 )
 async def test_pr_link_routes_to_target_and_requires_capability(
-    action, supported, explicit_target, legacy_host
+    monkeypatch, action, supported, explicit_target, host_routing
 ):
-    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, open_server_client
+    from omnigent.runner._entry import _RunnerDatabricksAuth
     from omnigent.runner.session_requests import REQUEST_HOST_EXTENSION
 
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "source-route")
     requests = []
     delivered = []
     source = uuid4().hex
     target = uuid4().hex if explicit_target else source
-    host = uuid4().hex
+    host = None if host_routing == "hostless" else uuid4().hex
+    legacy_host = host_routing == "legacy"
 
     def respond(request):
         requests.append(request)
@@ -1284,10 +1290,10 @@ async def test_pr_link_routes_to_target_and_requires_capability(
         delivered.append(request)
         return httpx.Response(200, json={"prs": []})
 
-    async with httpx.AsyncClient(
+    async with open_server_client(
+        "http://sharded",
+        auth=_RunnerDatabricksAuth(lambda: "test-token", "http://sharded"),
         transport=httpx.MockTransport(respond),
-        base_url="http://server",
-        headers={"Authorization": "Bearer test-token", OMNIGENT_SLICE_KEY_HEADER: "source-host"},
     ) as client:
         result = json.loads(
             await execute_tool(
@@ -1303,7 +1309,7 @@ async def test_pr_link_routes_to_target_and_requires_capability(
                 conversation_id=source,
             )
         )
-        assert client.headers[OMNIGENT_SLICE_KEY_HEADER] == "source-host"
+        assert client.headers[OMNIGENT_SLICE_KEY_HEADER] == "source-route"
     posts = [r for r in requests if r.method == "POST"]
     if supported is not True:
         assert "unavailable" in result["error"]
@@ -1312,13 +1318,15 @@ async def test_pr_link_routes_to_target_and_requires_capability(
     assert result == {"prs": []}
     assert len(posts) == (2 if legacy_host else 1)
     assert len(delivered) == 1
-    assert [r.extensions[REQUEST_HOST_EXTENSION] for r in posts] == (
+    assert [r.extensions.get(REQUEST_HOST_EXTENSION) for r in posts] == (
         [host, ""] if legacy_host else [host]
+    )
+    assert [r.headers.get(OMNIGENT_SLICE_KEY_HEADER) for r in posts] == (
+        [host, None] if legacy_host else [host or "source-route"]
     )
     assert all(r.headers[ORCHESTRATION_SOURCE_HEADER] == source for r in posts)
     assert all(r.headers["Authorization"] == "Bearer test-token" for r in posts)
     assert posts[0].url.path == f"/v1/sessions/{target}/resources/github/prs/orchestrated"
-    assert posts[0].extensions["omnigent_host_id"] == host
     assert posts[0].headers[ORCHESTRATION_SOURCE_HEADER] == source
     assert json.loads(posts[0].content)["action"] == action
 
