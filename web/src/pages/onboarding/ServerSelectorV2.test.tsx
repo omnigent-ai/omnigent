@@ -352,15 +352,14 @@ describe("ServerSelectorV2", () => {
     );
   });
 
-  it("a failed runner lookup opens the server directly", async () => {
+  it.each<[string, Partial<ServerSelectorV2Setup>]>([
+    ["a failed lookup", { getRunnerOptions: vi.fn().mockRejectedValue(new Error("ipc down")) }],
+    ["no lookup", {}],
+  ])("opens the server directly with no runner options (%s)", async (_name, over) => {
     const onConnect = vi.fn().mockResolvedValue({});
     render(
       <ServerSelectorV2
-        setup={makeSetup({
-          managedServers: ["https://team.example.com/"],
-          getRunnerOptions: vi.fn().mockRejectedValue(new Error("ipc down")),
-          onConnect,
-        })}
+        setup={makeSetup({ managedServers: ["https://team.example.com/"], onConnect, ...over })}
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
@@ -736,7 +735,7 @@ describe("ServerSelectorV2", () => {
     expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "local");
   });
 
-  it("still installs for explicit laptop setup on shells without runner support", async () => {
+  it("still installs for explicit laptop setup on shells without connectRunner", async () => {
     const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
     const onConnect = vi.fn().mockResolvedValue({});
     await installFromRunnerStep(
