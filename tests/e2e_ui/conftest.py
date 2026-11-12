@@ -62,6 +62,7 @@ from tests._helpers.compat import (
     apply_server_env,
     compat_runner_cwd,
     compat_server_cwd,
+    compat_server_python,
     runner_executable,
     server_executable,
 )
@@ -1108,6 +1109,11 @@ def live_server(
     # drop PYTHONPATH so the pinned old build in the compat venv resolves
     # instead of being shadowed by the worktree.
     apply_server_env(env, _REPO_ROOT)
+    # The shared server keeps the per-task timers; automations_v2 suites start their
+    # own server. Older compat servers already default to the timers.
+    features = env.get("OMNIGENT_FEATURES", "")
+    if compat_server_python() is None and "automations_v2" not in features:
+        env["OMNIGENT_FEATURES"] = ",".join(filter(None, (features, "-automations_v2")))
     log_handle = open(log_path, "w")  # noqa: SIM115 — handle lives for Popen lifetime; closed in finally
     server_argv = [
         server_executable(),
